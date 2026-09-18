@@ -276,14 +276,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.append_tool_output(&id, &chunk);
         }
         RuntimeEvent::PlanUpdated { plan } => {
-            state.plan_settled = false;
-            // Fully succeeded plans (incl. 1/1) clear immediately so the chrome
-            // does not linger after the last ✓; open/failed plans stay.
-            if crate::workbench::plan_panel_should_show(&plan) {
-                state.plan = Some(plan);
-            } else {
-                state.plan = None;
-            }
+            // This is the runtime's latest declaration for the active turn.
+            // Rendering may hide a fully-done plan, but the reducer keeps the
+            // exact value until the terminal transition archives it.
+            state.plan = Some(plan);
         }
         RuntimeEvent::VerificationUpdated { verification } => {
             state.turn_verification = Some(verification.clone());
@@ -418,6 +414,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             };
             state.transcript.push_failure(block);
             let summary = turn_end_summary(state, TurnEndStatus::Failed);
+            archive_active_plan(state);
             state.transcript.push_turn_end(
                 TurnEndStatus::Failed,
                 state.turn_tool_calls,
@@ -438,6 +435,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.cancel_armed = false;
             state.force_cancel_armed = false;
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
+            archive_active_plan(state);
             state.turn_verification = None;
             state.turn_diff_files = None;
             state.transcript.push_turn_end(
@@ -850,32 +848,26 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BackgroundTaskExited {
             task_id,
             exit_code,
-            duration_ms,
+            duration_ms: _,
             ok,
         } => {
             let t = state.t();
-            // The same lifecycle settling: name what finished, not its id.
-            // A missing label (exit seen without its start, e.g. after a
-            // reconnect) falls back to a truthful generic — never invented.
-            let label = if let Some(chrome) = state.background_task_labels.get_mut(&task_id) {
-                chrome.ok = Some(ok);
-                chrome.exit_code = exit_code;
-                chrome.duration_ms = Some(duration_ms);
-                chrome.label.clone()
-            } else {
-                let chrome = crate::state::BackgroundTaskChrome {
-                    label: t.background_task_generic.to_string(),
-                    started_elapsed_secs: state.elapsed_secs,
-                    ok: Some(ok),
-                    exit_code,
-                    duration_ms: Some(duration_ms),
-                    output: String::new(),
-                };
-                let label = chrome.label.clone();
-                state.background_task_labels.insert(task_id.clone(), chrome);
-                label
-            };
-            crate::activity::prune_completed_background(state);
+            // Terminal is history, never active chrome. Retained registry
+            // records remain available to `get`/`wait`, but the TUI's active
+            // projection removes the task on the authoritative exit event.
+            let label = state
+                .background_task_labels
+                .remove(&task_id)
+                .map(|chrome| chrome.label)
+                .unwrap_or_else(|| t.background_task_generic.to_string());
+            if matches!(&state.activity_selected, Some(crate::activity::ActivityId::Background(open)) if open == &task_id)
+            {
+                state.activity_selected = None;
+            }
+            if matches!(&state.activity_open, Some(crate::activity::ActivityId::Background(open)) if open == &task_id)
+            {
+                state.activity_open = None;
+            }
             let message = if ok {
                 t.background_task_done.replace("{}", &label)
             } else {
@@ -885,6 +877,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     None => failed,
                 }
             };
+            state.transcript.push_note(message.clone());
             state.notification = Some(Notification {
                 level: if ok {
                     NotificationLevel::Info
@@ -893,6 +886,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 },
                 message,
             });
+        }
+        RuntimeEvent::BackgroundTasksReconciled { tasks } => {
+            replace_active_background_tasks(state, &tasks);
         }
     }
 }
@@ -939,23 +935,6 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     };
     state.cancel_armed = false;
     state.force_cancel_armed = false;
-    // The plan is the agent's declared progress and NOT the completion
-    // authority: a task may finish with steps still open, and nothing here
-    // marks them done, because the runtime cannot prove they ran. An open plan
-    // stays as the last record of what was declared — the turn is no longer
-    // running, so the dock presents it as that record, not as work under way.
-    // A finished task's plan is dropped when the next turn starts; an
-    // unfinished task's plan is the continuation context and stays. A
-    // fully-done plan is dropped whatever the outcome — the answer is already
-    // in the transcript.
-    if state
-        .plan
-        .as_ref()
-        .is_some_and(|p| !crate::workbench::plan_panel_should_show(p))
-    {
-        state.plan = None;
-    }
-    state.plan_settled = state.plan.is_some() && work_is_finished(status);
     // If the provider never reported usage, still drive the context gauge from
     // the visible transcript so it is not stuck at empty capacity forever.
     if state.context_tokens == 0 && state.token_input == 0 {
@@ -974,6 +953,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
             (status == TurnEndStatus::Incomplete).then(|| state.t().suggestion_continue.to_string())
         });
     let summary = turn_end_summary(state, status);
+    archive_active_plan(state);
     state.turn_verification = None;
     state.turn_diff_files = None;
     state.transcript.push_turn_end(
@@ -1236,6 +1216,47 @@ fn clear_activity(state: &mut AppState) {
     state.reconnected_until = None;
 }
 
+fn replace_active_background_tasks(
+    state: &mut AppState,
+    tasks: &[leveler_client_protocol::UiActiveBackgroundTask],
+) {
+    let still_active = |id: &str| tasks.iter().any(|task| task.task_id == id);
+    if matches!(&state.activity_selected, Some(crate::activity::ActivityId::Background(id)) if !still_active(id))
+    {
+        state.activity_selected = None;
+    }
+    if matches!(&state.activity_open, Some(crate::activity::ActivityId::Background(id)) if !still_active(id))
+    {
+        state.activity_open = None;
+    }
+    state.background_task_labels.clear();
+    for task in tasks {
+        let label = crate::render::tool_summary_for(
+            "run_command",
+            &serde_json::json!({ "program": task.program, "args": task.args }).to_string(),
+            state.t(),
+        );
+        let label = if label.is_empty() {
+            task.program.clone()
+        } else {
+            label
+        };
+        state.background_task_labels.insert(
+            task.task_id.clone(),
+            crate::state::BackgroundTaskChrome::running(
+                label,
+                state.elapsed_secs.saturating_sub(task.elapsed_ms / 1000),
+            ),
+        );
+    }
+}
+
+fn archive_active_plan(state: &mut AppState) {
+    if let Some(plan) = state.plan.take() {
+        state.transcript.push_plan(plan);
+    }
+}
+
 pub(super) fn start_turn(state: &mut AppState) {
     // A new turn owns the current activity view. The previous turn's settled
     // children are history now — the transcript kept them — and must not keep
@@ -1244,10 +1265,6 @@ pub(super) fn start_turn(state: &mut AppState) {
     state.team.retire_settled(state.elapsed_secs);
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
-    if state.plan_settled {
-        state.plan = None;
-        state.plan_settled = false;
-    }
     state.finalization_stage = None;
     state.project_rule_sources.clear();
     // The previous turn's next step is spent — a new turn is under way.
@@ -1442,10 +1459,12 @@ fn apply_session_with(
         }
     }
 
-    state.plan = session
-        .plan
-        .filter(crate::workbench::plan_panel_should_show);
-    state.plan_settled = false;
+    // Snapshot `plan` is live-view state. Adopt it only while the runtime says
+    // this session is actually running; idle/terminal history is rebuilt from
+    // durable events below, through the same reducer as the live stream.
+    state.plan = (state.status == RuntimeStatus::Busy)
+        .then_some(session.plan)
+        .flatten();
     state.verification = session.verification.clone();
     state.diff = session.diff.clone();
     if state
@@ -1484,6 +1503,11 @@ fn apply_session_with(
         state.btw = crate::btw::BtwThread::default();
         state.btw.draft.set_image_token_template(&template);
     }
+    // A reconnect snapshot replaces (rather than merges) the active process
+    // projection. Its entries come from the process registry, so terminal
+    // records retained by the registry or replayed transcript events cannot
+    // resurrect here.
+    replace_active_background_tasks(state, &session.active_background_tasks);
     state.team.restore(&session.children, state.elapsed_secs);
 
     // A confirmation keeps the view it confirmed; only an empty one has

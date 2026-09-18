@@ -2119,8 +2119,6 @@ const AUDIT_MARKER: &str = "Treat completion as unproven";
 
 // ── Plan freshness: the plan must track the work ────────────────────────────
 
-const FRESHNESS_MARKER: &str = "active plan has not been updated";
-
 /// A workspace with `n` distinct files to edit, one per work round.
 fn plan_freshness_dir(tag: &str, files: usize) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -2154,23 +2152,6 @@ fn edit_call(id: &str, file: usize) -> ModelResponse {
     )
 }
 
-/// How many times the freshness advisory reached the model.
-fn freshness_hits(runtime: &Arc<MockRuntime>) -> usize {
-    runtime
-        .recorded_requests()
-        .last()
-        .map(|req| {
-            req.messages
-                .iter()
-                .filter(|m| {
-                    m.role == leveler_model::Role::User
-                        && m.text_content().contains(FRESHNESS_MARKER)
-                })
-                .count()
-        })
-        .unwrap_or(0)
-}
-
 async fn run_plan_script(dir: &std::path::Path, script: Vec<ModelResponse>) -> Arc<MockRuntime> {
     let workspace = Workspace::new(dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -2194,10 +2175,11 @@ async fn run_plan_script(dir: &std::path::Path, script: Vec<ModelResponse>) -> A
     runtime
 }
 
-/// F5: reading and searching are work INSIDE a step. A plan that stands still
-/// through them is not stale, and the reminder must not fire.
+/// Read/search work can advance an investigation step even without mutating
+/// the workspace. The final declaration must therefore be newer than those
+/// calls; the runtime still never invents the resulting statuses.
 #[tokio::test]
-async fn reading_within_one_step_never_ages_the_plan() {
+async fn readonly_work_requires_a_model_declared_final_plan() {
     let dir = plan_freshness_dir("reads", 2);
     let mut script = vec![plan_call(
         "p1",
@@ -2211,17 +2193,29 @@ async fn reading_within_one_step_never_ages_the_plan() {
         )
     }));
     script.push(assistant_text("done"));
+    script.push(plan_call(
+        "p2",
+        &[("build", "completed"), ("verify", "pending")],
+    ));
+    script.push(assistant_text("done; verification remains pending"));
     let runtime = run_plan_script(&dir, script).await;
     assert_eq!(
-        freshness_hits(&runtime),
-        0,
-        "no workspace change, no staleness"
+        runtime.recorded_requests().len(),
+        16,
+        "the first final answer must buy a reconciliation round after read-only work"
+    );
+    let requests = runtime.recorded_requests();
+    assert!(
+        requests[15].messages.iter().any(|message| message
+            .text_content()
+            .contains("Real tool work happened after your latest plan declaration")),
+        "the final plan is model-declared in response to the truth-layer nudge"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// F5b: the reminder is advisory. It never edits the plan, so the only plan
-/// the UI ever sees is the one the model sent.
+/// F5b: the reminder is advisory. It never edits the plan, so every plan the
+/// UI sees is one the model sent, including the required final declaration.
 #[tokio::test]
 async fn the_reminder_never_changes_a_single_plan_status() {
     let dir = plan_freshness_dir("readonly", 8);
@@ -2230,6 +2224,10 @@ async fn the_reminder_never_changes_a_single_plan_status() {
         &[("build", "in_progress"), ("verify", "pending")],
     )];
     script.extend((0..8).map(|i| edit_call(&format!("e{i}"), i)));
+    script.push(plan_call(
+        "p2",
+        &[("build", "completed"), ("verify", "pending")],
+    ));
     script.push(assistant_text("done"));
 
     let workspace = Workspace::new(&dir).unwrap();
@@ -2256,17 +2254,20 @@ async fn the_reminder_never_changes_a_single_plan_status() {
         )
         .await
         .unwrap();
-    assert_eq!(plans.len(), 1, "only the model's own update: {plans:?}");
+    assert_eq!(plans.len(), 2, "only the model's own updates: {plans:?}");
     assert_eq!(plans[0][0].status, "in_progress", "{plans:?}");
-    assert_eq!(plans[0][1].status, "pending", "{plans:?}");
+    assert_eq!(plans[1][0].status, "completed", "{plans:?}");
+    assert_eq!(plans[1][1].status, "pending", "{plans:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// F10: a resumed turn continues from the last plan the MODEL published, and
-/// the runtime republishes nothing. A host-side guess would put a second,
-/// competing plan on screen.
+/// F10: a resumed turn continues from the last plan the MODEL published and
+/// explicitly re-activates that exact declaration for the new live turn. This
+/// is not a host guess: the payload is byte-for-byte the persisted plan seed.
+/// Without the activation event, a client that correctly archived the prior
+/// terminal plan could only make it live again by retaining stale UI state.
 #[tokio::test]
-async fn a_resumed_turn_carries_the_persisted_plan_and_invents_no_other() {
+async fn a_resumed_turn_reactivates_the_persisted_plan_and_invents_no_other() {
     let dir = plan_freshness_dir("resume", 2);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -2286,10 +2287,9 @@ async fn a_resumed_turn_carries_the_persisted_plan_and_invents_no_other() {
             },
         ],
     };
-    let runtime = Arc::new(MockRuntime::new(vec![
-        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "f0.txt"})),
-        assistant_text("picked up where I left off"),
-    ]));
+    let runtime = Arc::new(MockRuntime::new(vec![assistant_text(
+        "picked up where I left off",
+    )]));
     let executor = Executor::new(
         runtime,
         Arc::new(default_registry()),
@@ -2297,7 +2297,7 @@ async fn a_resumed_turn_carries_the_persisted_plan_and_invents_no_other() {
         ModelRef::new("mock", "m"),
         0,
     )
-    .with_seeded_plan(seeded);
+    .with_seeded_plan(seeded.clone());
 
     let mut plans = Vec::new();
     executor
@@ -2313,9 +2313,10 @@ async fn a_resumed_turn_carries_the_persisted_plan_and_invents_no_other() {
         )
         .await
         .unwrap();
-    assert!(
-        plans.is_empty(),
-        "resume republishes nothing of its own: {plans:?}"
+    assert_eq!(plans.len(), 1, "one explicit activation, no competing plan");
+    assert_eq!(
+        plans[0], seeded.steps,
+        "activation is the durable seed exactly"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -4301,9 +4302,9 @@ async fn a_pending_plan_step_does_not_block_completion() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The plan keeps working as a plan: it is recorded and reported, it simply
-/// has no authority. A run that never reconciles its last step still
-/// completes, and the steps the model wrote are still there to read.
+/// The plan remains a declaration rather than execution authority. After real
+/// work, goal closeout requires one fresh declaration but does not rewrite or
+/// require completion of any row.
 #[tokio::test]
 async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
     let dir = std::env::temp_dir().join(format!(
@@ -4333,6 +4334,16 @@ async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
         ),
         assistant_tool_call(
             "c3",
+            "update_plan",
+            serde_json::json!({
+                "plan": [
+                    {"step": "a", "status": "completed"},
+                    {"step": "b", "status": "pending"}
+                ]
+            }),
+        ),
+        assistant_tool_call(
+            "c4",
             "update_goal",
             serde_json::json!({"status": "complete", "summary": "shipped"}),
         ),
@@ -4366,10 +4377,234 @@ async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
         })
         .expect("the plan the model wrote must still be reported");
     assert_eq!(plan.len(), 2, "the plan is preserved as written: {plan:?}");
+    assert_eq!(plan[0].status, "completed");
+    assert_eq!(plan[1].status, "pending");
     assert!(
         dir.join("done.txt").exists(),
         "and the work itself still happened"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A plan update is a declaration, not an execution inference. Once real work
+/// has happened after that declaration, a normal chat closeout must give the
+/// model one chance to publish the final table instead of leaving the initial
+/// 0/N snapshot as if it were current. The final declaration may honestly stay
+/// partial; reconciliation is not an all-completed gate.
+#[tokio::test]
+async fn chat_reconciles_the_plan_after_the_last_work_without_fabricating_completion() {
+    let dir = plan_freshness_dir("final-reconcile-chat", 41);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[("implement", "in_progress"), ("publish", "pending")],
+        ),
+        edit_call("e1", 0),
+        assistant_text("implementation is done; publishing was not requested"),
+        plan_call("p2", &[("implement", "completed"), ("publish", "pending")]),
+        assistant_text("implementation is done; publishing remains pending"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "implement but do not publish",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        runtime.requests.lock().unwrap().len(),
+        5,
+        "the first quiet answer must buy one final-plan reconciliation round"
+    );
+    let final_plan = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::PlanUpdated { steps } => Some(steps),
+            _ => None,
+        })
+        .expect("the model's final plan declaration is preserved");
+    assert_eq!(final_plan[0].status, "completed");
+    assert_eq!(
+        final_plan[1].status, "pending",
+        "partial is truthful, not 2/2"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Goal completion uses the same contract. A stale declaration cannot be
+/// closed by update_goal; after a successful final update_plan, update_goal in
+/// that same tool batch may close normally. No extra all-done requirement is
+/// introduced.
+#[tokio::test]
+async fn goal_requires_post_work_plan_reconciliation_and_accepts_a_partial_final_table() {
+    let dir = plan_freshness_dir("final-reconcile-goal", 43);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[("implement", "in_progress"), ("publish", "pending")],
+        ),
+        edit_call("e1", 0),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "implemented only"}),
+        ),
+        assistant_tool_calls(vec![
+            (
+                "p2",
+                "update_plan",
+                serde_json::json!({
+                    "plan": [
+                        {"step": "implement", "status": "completed"},
+                        {"step": "publish", "status": "pending"}
+                    ]
+                }),
+            ),
+            (
+                "g2",
+                "update_goal",
+                serde_json::json!({"status": "complete", "summary": "implemented only"}),
+            ),
+        ]),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "implement but do not publish",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(runtime.requests.lock().unwrap().len(), 4);
+    assert!(events.iter().any(|event| {
+        matches!(event, AgentEvent::ToolResult { id, is_error: true, .. } if id == "g1")
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(event, AgentEvent::ToolResult { id, is_error: false, .. } if id == "g2")
+    }));
+    let final_plan = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::PlanUpdated { steps } => Some(steps),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(final_plan[0].status, "completed");
+    assert_eq!(final_plan[1].status, "pending");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A plan in the same assistant batch as a serial edit was authored before the
+/// edit result existed. It is recorded, but cannot satisfy final freshness.
+#[tokio::test]
+async fn same_batch_serial_work_then_plan_still_requires_post_result_reconciliation() {
+    let dir = plan_freshness_dir("same-batch-serial", 47);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call("p1", &[("implement", "in_progress")]),
+        assistant_tool_calls(vec![
+            (
+                "e1",
+                "replace",
+                serde_json::json!({"path": "f0.txt", "old": "old 0", "new": "new 0"}),
+            ),
+            (
+                "p2",
+                "update_plan",
+                serde_json::json!({"plan": [{"step": "implement", "status": "completed"}]}),
+            ),
+        ]),
+        assistant_text("done"),
+        plan_call("p3", &[("implement", "completed")]),
+        assistant_text("done after observing the edit result"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let outcome = executor
+        .run(
+            "implement",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(runtime.recorded_requests().len(), 5);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Parallel reads execute after the serial pass, so their same-batch plan is
+/// necessarily pre-result too. Deferral must not accidentally make it fresh.
+#[tokio::test]
+async fn same_batch_parallel_read_then_plan_still_requires_post_result_reconciliation() {
+    let dir = plan_freshness_dir("same-batch-parallel", 53);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call("p1", &[("investigate", "in_progress")]),
+        assistant_tool_calls(vec![
+            ("r1", "read_file", serde_json::json!({"path": "f0.txt"})),
+            (
+                "p2",
+                "update_plan",
+                serde_json::json!({"plan": [{"step": "investigate", "status": "completed"}]}),
+            ),
+        ]),
+        assistant_text("done"),
+        plan_call("p3", &[("investigate", "completed")]),
+        assistant_text("done after observing the read result"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        ToolContext::new(Workspace::new(&dir).unwrap(), PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let outcome = executor
+        .run(
+            "investigate",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(runtime.recorded_requests().len(), 5);
     std::fs::remove_dir_all(&dir).ok();
 }
 

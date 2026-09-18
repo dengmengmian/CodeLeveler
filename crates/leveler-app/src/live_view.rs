@@ -135,6 +135,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         | RuntimeEvent::TurnCancelled => {
             view.active_tools.clear();
             view.tool_started.clear();
+            view.plan = None;
             view.finalization_stage = None;
         }
         _ => {}
@@ -145,6 +146,16 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
 mod tests {
     use super::*;
     use leveler_core::ToolCallId;
+
+    fn plan() -> UiPlan {
+        UiPlan {
+            steps: vec![leveler_client_protocol::UiPlanStep {
+                index: 0,
+                description: "inspect lifecycle".to_string(),
+                status: leveler_client_protocol::PlanStepStatus::Running,
+            }],
+        }
+    }
 
     #[test]
     fn live_view_tracks_only_tools_that_are_still_running() {
@@ -240,5 +251,47 @@ mod tests {
 
         views.apply(&session_id, &RuntimeEvent::TurnCompleted);
         assert_eq!(views.view(&session_id).finalization_stage, None);
+    }
+
+    #[test]
+    fn every_turn_terminal_removes_the_plan_from_the_live_view() {
+        let terminal_events = [
+            RuntimeEvent::TurnCompleted,
+            RuntimeEvent::TurnCompletedWithWarnings {
+                reason: "warning".to_string(),
+            },
+            RuntimeEvent::TurnAnswered,
+            RuntimeEvent::TurnTruncated {
+                error: "truncated".to_string(),
+            },
+            RuntimeEvent::TurnIncomplete {
+                reason: "incomplete".to_string(),
+            },
+            RuntimeEvent::TurnCompletedUnverified {
+                reason: "unverified".to_string(),
+            },
+            RuntimeEvent::TurnCompletedChecksFailed {
+                reason: "checks failed".to_string(),
+            },
+            RuntimeEvent::TurnFailed {
+                error: "failed".to_string(),
+                failure: None,
+            },
+            RuntimeEvent::TurnCancelled,
+        ];
+
+        for terminal in terminal_events {
+            let session_id = SessionId::new("s1");
+            let views = LiveViews::default();
+            views.apply(&session_id, &RuntimeEvent::PlanUpdated { plan: plan() });
+            assert!(views.view(&session_id).plan.is_some());
+
+            views.apply(&session_id, &terminal);
+
+            assert!(
+                views.view(&session_id).plan.is_none(),
+                "terminal event left an active plan behind: {terminal:?}"
+            );
+        }
     }
 }

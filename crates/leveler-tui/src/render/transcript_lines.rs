@@ -136,6 +136,7 @@ pub fn item_render(
         TranscriptItem::UserShell(shell) => {
             out.extend(user_shell_lines(shell, theme, wrap_width, t, 0));
         }
+        TranscriptItem::Plan(plan) => historical_plan_lines(plan, theme, wrap_width, &mut out, t),
         TranscriptItem::Completion(report) => completion_lines(report, theme, &mut out, t),
         TranscriptItem::Error(text) => {
             push_prefixed(
@@ -173,6 +174,50 @@ pub fn item_render(
         TranscriptItem::GoalRecap(block) => goal_recap_lines(block, theme, wrap_width, &mut out, t),
     }
     out
+}
+
+fn historical_plan_lines(
+    plan: &leveler_client_protocol::UiPlan,
+    theme: &Theme,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+    t: &crate::i18n::UiText,
+) {
+    let (done, total) = crate::workbench::plan_done_total(plan);
+    let summary = t
+        .plan_last_recorded
+        .replace("{done}", &done.to_string())
+        .replace("{total}", &total.to_string());
+    out.push(Line::from(Span::styled(
+        format!("{} · {summary}", t.active_plan),
+        Style::default()
+            .fg(theme.text.secondary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let body_width = width.saturating_sub(4).max(1);
+    for step in &plan.steps {
+        let color = match step.status {
+            leveler_client_protocol::PlanStepStatus::Done => theme.status.success,
+            leveler_client_protocol::PlanStepStatus::Failed => theme.status.error,
+            _ => theme.text.secondary,
+        };
+        let text = format!("{}. {}", step.index + 1, step.description);
+        let mut wrapped = wrap(&text, body_width);
+        if wrapped.is_empty() {
+            wrapped.push(String::new());
+        }
+        for (line_index, line) in wrapped.into_iter().enumerate() {
+            let prefix = if line_index == 0 {
+                format!("  {} ", crate::plan_cell::plan_glyph(step.status))
+            } else {
+                "    ".to_string()
+            };
+            out.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(color)),
+                Span::styled(line, Style::default().fg(theme.text.secondary)),
+            ]));
+        }
+    }
 }
 
 /// Durable goal recap (`✽ 阶段回顾`): compact 1–2 lines by default; expanded,

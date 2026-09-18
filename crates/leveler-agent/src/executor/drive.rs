@@ -155,6 +155,10 @@ pub(crate) struct Drive<'a> {
     epoch_duration_at_start: std::time::Duration,
     budget_note_sent: bool,
     plan_state: PlanState,
+    /// True after an actually dispatched non-plan tool call until the model
+    /// successfully publishes another full plan table. This is freshness only:
+    /// the final table may truthfully retain open steps.
+    plan_needs_reconciliation: bool,
     /// Set whenever the model-visible messages gain something the durable
     /// transcript does not — a transient nudge, a fold.
     context_diverged: bool,
@@ -335,6 +339,7 @@ impl Executor {
             commands_run: progress.cumulative_commands,
             budget_note_sent: false,
             plan_state: self.seeded_plan.clone(),
+            plan_needs_reconciliation: false,
             context_diverged,
             session_approved: HashSet::new(),
             background_children: BackgroundChildren {
@@ -366,6 +371,16 @@ impl Executor {
             progress,
             objective,
         };
+
+        // A resumed unfinished task activates the exact persisted declaration
+        // in this turn. Terminal UI state can therefore archive the old plan;
+        // it never has to keep stale presentation state around to guess that a
+        // real continuation started.
+        if !harness.plan_state.is_empty() {
+            (harness.observer)(AgentEvent::PlanUpdated {
+                steps: harness.plan_state.steps.clone(),
+            });
+        }
 
         // Hard step limits (spec §27) as the kernel enforces them: the epoch's
         // prior spend is what makes them task-level rather than per-drive.
@@ -561,6 +576,9 @@ impl<'a> Drive<'a> {
             }
         }
         for child in settled {
+            if !self.plan_state.is_empty() {
+                self.plan_needs_reconciliation = true;
+            }
             let BackgroundChild {
                 id,
                 nickname,
@@ -1280,6 +1298,7 @@ impl AgentHarness for Drive<'_> {
                 can_continue: has_next_round,
                 budget_remaining: self.closeout_budget.remaining(),
                 human_boundary_seen: self.progress.human_boundary_seen(),
+                plan_needs_reconciliation: self.plan_needs_reconciliation,
             });
             // Whether the harness accepted the quiet round or bought itself
             // another model call is the difference between "the model is
@@ -1307,6 +1326,14 @@ impl AgentHarness for Drive<'_> {
                         Role::User,
                         "Your last message was empty. Reply with the actual answer to the \
                              request — do not send an empty message.",
+                    ),
+                    CloseoutReason::PlanUnreconciled => Message::text(
+                        Role::User,
+                        "Real tool work happened after your latest plan declaration. Before \
+                             finishing, call update_plan with the complete final step table. \
+                             Report statuses truthfully: leave unfinished work pending or \
+                             in_progress; do not mark it completed merely to close the turn. \
+                             Then provide the final answer.",
                     ),
                 };
                 // Persist BOTH the quiet-round assistant text and the nudge:
@@ -1360,6 +1387,14 @@ impl AgentHarness for Drive<'_> {
                         Some(stalled_detail(
                             reason,
                             "目标模式结束但未调用 update_goal(complete/blocked)",
+                        )),
+                    )
+                } else if action == CloseoutAction::Stall(CloseoutReason::PlanUnreconciled) {
+                    (
+                        StopReason::Incomplete,
+                        Some(stalled_detail(
+                            CloseoutReason::PlanUnreconciled,
+                            "explicit plan was not reconciled after the last tool work",
                         )),
                     )
                 } else {
@@ -1426,6 +1461,11 @@ impl AgentHarness for Drive<'_> {
         // round is still committed (results + spend) before Cancelled
         // surfaces — completed tools' side effects are already on disk.
         let mut cancelled_mid_batch = false;
+        // A plan emitted in the same assistant response as actual work cannot
+        // reconcile that work: the model generated it before seeing any of
+        // this batch's tool results. Only a work-free batch may clear an
+        // existing freshness obligation.
+        let mut actual_work_admitted_this_batch = false;
         // Ids/names survive the consuming loop below so calls the cancel
         // cut short can still be refused in place (transcript pairing).
         let call_snapshot: Vec<ToolCall> = calls.clone();
@@ -1553,6 +1593,34 @@ impl AgentHarness for Drive<'_> {
                     (self.observer)(AgentEvent::GoalIntercepted {
                         kind: "outstanding_children".to_string(),
                         detail: waiting.join(", "),
+                    });
+                    (self.observer)(AgentEvent::ToolResult {
+                        exit_code: None,
+                        stop: None,
+                        id: call.id.as_str().to_string(),
+                        name: UPDATE_GOAL_TOOL.to_string(),
+                        is_error: true,
+                        preview: preview(&feedback),
+                        applied_diff: None,
+                    });
+                    results[index] = Some(ContentPart::ToolResult {
+                        result: ToolResultContent {
+                            call_id: call.id,
+                            content: feedback,
+                            is_error: true,
+                        },
+                    });
+                    continue;
+                }
+                if self.plan_needs_reconciliation {
+                    let feedback = "Cannot resolve the goal yet: real tool work happened after \
+                         the latest plan declaration. Call update_plan with the complete final \
+                         table first. Keep unfinished steps pending or in_progress; do not mark \
+                         them completed merely to close the goal. Then call update_goal again."
+                        .to_string();
+                    (self.observer)(AgentEvent::GoalIntercepted {
+                        kind: "plan_unreconciled".to_string(),
+                        detail: "tool work occurred after the latest plan update".to_string(),
                     });
                     (self.observer)(AgentEvent::ToolResult {
                         exit_code: None,
@@ -2326,6 +2394,12 @@ impl AgentHarness for Drive<'_> {
                 .await
             {
                 Ok(admitted) if parallel => {
+                    if admitted.call.name != "update_plan" && !self.plan_state.is_empty() {
+                        self.plan_needs_reconciliation = true;
+                    }
+                    if admitted.call.name != "update_plan" {
+                        actual_work_admitted_this_batch = true;
+                    }
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
@@ -2333,6 +2407,12 @@ impl AgentHarness for Drive<'_> {
                     continue;
                 }
                 Ok(admitted) => {
+                    if admitted.call.name != "update_plan" && !self.plan_state.is_empty() {
+                        self.plan_needs_reconciliation = true;
+                    }
+                    if admitted.call.name != "update_plan" {
+                        actual_work_admitted_this_batch = true;
+                    }
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
@@ -2505,6 +2585,9 @@ impl AgentHarness for Drive<'_> {
                 match PlanState::from_model_explicit(steps) {
                     Ok(next) => {
                         self.plan_state = next;
+                        if !actual_work_admitted_this_batch {
+                            self.plan_needs_reconciliation = false;
+                        }
                         (self.observer)(AgentEvent::PlanUpdated {
                             steps: self.plan_state.steps.clone(),
                         });
@@ -2971,6 +3054,9 @@ impl AgentHarness for Drive<'_> {
                     read_only,
                     spec: Some(spec.clone()),
                 });
+                if !self.plan_state.is_empty() {
+                    self.plan_needs_reconciliation = true;
+                }
                 accepted.push((
                     index, call.id, role, files, task, id, nickname, spec, brief, background, token,
                 ));

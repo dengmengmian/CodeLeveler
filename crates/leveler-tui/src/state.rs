@@ -115,8 +115,8 @@ pub struct RemoteState {
 ///
 /// `started_elapsed_secs` is the turn clock when the TUI applied the start
 /// event — a projection timestamp, not a process clock, and never refreshed
-/// by redraws. Completed entries stay until prune so Activity Detail can
-/// reopen them; this map is not a second task runtime.
+/// by redraws. Terminal events remove their entry immediately; historical
+/// completion belongs to the transcript, not this active projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundTaskChrome {
     pub label: String,
@@ -231,12 +231,9 @@ pub struct AppState {
     /// presentation-only disclosure/selection.
     pub context: crate::context::ContextView,
 
-    /// Latest plan / verification / diff from the current run, if any.
+    /// Active plan from the current run, if any. Terminal plans move into the
+    /// transcript and never remain in this slot.
     pub plan: Option<UiPlan>,
-    /// `plan` belongs to a task whose work finished. It stays on screen as the
-    /// last record of what was declared, and is dropped when the next turn
-    /// starts: the runtime carries a plan only into a resumed unfinished task.
-    pub plan_settled: bool,
     /// Workspace-relative instruction sources active for the current turn.
     pub project_rule_sources: Vec<String>,
     pub verification: Option<UiVerification>,
@@ -470,7 +467,6 @@ impl AppState {
             trace: crate::observability::TraceView::default(),
             context: crate::context::ContextView::default(),
             plan: None,
-            plan_settled: false,
             project_rule_sources: Vec::new(),
             verification: None,
             turn_verification: None,

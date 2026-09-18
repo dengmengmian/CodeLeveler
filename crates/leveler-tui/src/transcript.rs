@@ -4,7 +4,7 @@
 //! independently. It carries the blocks the base shell needs; extensions
 //! add Tool/Plan/Diff/Verification/Attachment/Agent blocks.
 
-use leveler_client_protocol::{MessageId, ToolCallId, UiCompletionReport};
+use leveler_client_protocol::{MessageId, ToolCallId, UiCompletionReport, UiPlan};
 
 use crate::markdown::MdDoc;
 
@@ -317,6 +317,9 @@ pub enum TranscriptItem {
     /// Visible model reasoning. Not a disclosure: rendered directly.
     SubAgent(SubAgentBlock),
     UserShell(UserShellBlock),
+    /// The exact last plan declaration when its owning turn reached a terminal.
+    /// Historical only: active plan chrome lives in `AppState::plan`.
+    Plan(UiPlan),
     Completion(UiCompletionReport),
     Error(String),
     /// A terminal failure, presented once (see [`FailureBlock`]).
@@ -438,6 +441,12 @@ impl TranscriptState {
         self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Completion(report));
+    }
+
+    pub fn push_plan(&mut self, plan: UiPlan) {
+        self.bump();
+        self.close_tool_group();
+        self.items.push(TranscriptItem::Plan(plan));
     }
 
     pub fn push_turn_end(

@@ -43,8 +43,8 @@ pub use approval::{
 };
 pub use artifact::{ArtifactRef, ArtifactStore};
 pub use background::{
-    BackgroundCleanupTicket, BackgroundSettlement, BackgroundTaskRegistry, BackgroundTaskSnapshot,
-    BackgroundTaskStatus, MutationBaseline,
+    BackgroundCleanupTicket, BackgroundSettlement, BackgroundTaskEvent, BackgroundTaskRegistry,
+    BackgroundTaskSnapshot, BackgroundTaskStatus, MutationBaseline,
 };
 pub use checkpoint::Checkpoint;
 pub use clarify::{

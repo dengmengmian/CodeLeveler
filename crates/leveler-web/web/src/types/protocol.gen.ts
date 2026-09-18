@@ -267,10 +267,8 @@ export type RuntimeEvent =
   | { type: 'agent_activity'; label: string }
   /** Heartbeat while a long command tool runs (runtime observability). Lets a client show "运行 cargo test" with a live elapsed instead of a bare "等待模型". Structured so TUI/Web/logs can consume it uniformly. */
   | { type: 'command_progress'; elapsed_ms: number; label: string }
-  /** A model round is about to retry the same request (transient). Belongs in ephemeral status, NOT the transcript: a brief network blip must not spam the conversation. `attempt` is 1-based (the retry about to happen) and `max_attempts` the lane's bound. */
+  /** A model round is about to retry the same request (transient). Belongs in ephemeral status, NOT the transcript: a brief network blip must not spam the conversation. `attempt` is 1-based (the retry about to happen) and `max_attempts` the retry budget; once `attempt == max_attempts` fails the turn is surfaced, not hidden behind an unbounded wait. */
   | { type: 'model_retrying'; attempt: number; delay_ms: number; max_attempts: number }
-  /** The retry budget is spent on a `Safe` failure and the runtime is waiting for the network rather than failing the task (transient). Ephemeral status only. `elapsed_ms` is how long the wait has lasted. */
-  | { type: 'model_waiting_for_network'; elapsed_ms: number }
   /** Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome. */
   | { type: 'project_rules_loaded'; sources: string[] }
   /** A tool call started . */
@@ -351,6 +349,8 @@ export type RuntimeEvent =
   | { type: 'background_task_started'; args: string[]; program: string; task_id: string }
   /** A background task finished (exit or kill). */
   | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; task_id: string }
+  /** Authoritative replacement of a session's active background projection. Emitted after a lifecycle broadcast lag; history is unaffected. */
+  | { type: 'background_tasks_reconciled'; tasks: UiActiveBackgroundTask[] }
   /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
   | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[] }
   /** Side-question (`/btw`) started; not persisted to session history. */
@@ -386,6 +386,15 @@ export type TokenCountKind =
 
 /** Identifies a tool call. Must be stable across streaming reassembly. */
 export type ToolCallId = string;
+
+/** One background process that is still lifecycle-active in the runtime. This is a reconnect projection, not history. Terminal tasks never appear here even though the execution registry may retain their records for `get`/`wait`. */
+export interface UiActiveBackgroundTask {
+  args: string[];
+  /** Runtime-observed age at snapshot time. */
+  elapsed_ms: number;
+  program: string;
+  task_id: string;
+}
 
 /** A tool invocation that was still running when a client took its snapshot. */
 export interface UiActiveToolCall {
@@ -672,6 +681,8 @@ export interface UiFailure {
   provider_code?: string | null;
   /** The provider's correlation id for the failing request, when the response exposed one. The single most useful field for a support report against a vendor. */
   request_id?: string | null;
+  /** Automatic retries the runtime spent before this became terminal. Absent when the failure never went through a retry loop. */
+  retries?: number | null;
   retryability: FailureRetryability;
   source: FailureSource;
   /** HTTP status, when the failure had one. */
@@ -913,6 +924,8 @@ export interface UiSessionObservation {
 
 /** Everything a client needs to render a session's header and transcript. */
 export interface UiSessionSnapshot {
+  /** Registry-backed background processes still active for this session. Additive/defaulted so older runtimes decode as no known live process. */
+  active_background_tasks?: UiActiveBackgroundTask[];
   /** Live render state needed to reconnect while a long turn is still running. All fields are additive/defaulted for protocol compatibility. */
   active_tools?: UiActiveToolCall[];
   /** Models the user can switch to (for the model picker, ). */

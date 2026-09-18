@@ -446,6 +446,7 @@ impl AdvisoryKind {
             AdvisoryKind::CloseoutNudge(reason) => match reason {
                 closeout::CloseoutReason::GoalUnresolved => "nudge_goal_unresolved",
                 closeout::CloseoutReason::EmptyAnswer => "nudge_empty_answer",
+                closeout::CloseoutReason::PlanUnreconciled => "nudge_plan_unreconciled",
             },
         }
     }

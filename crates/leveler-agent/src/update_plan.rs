@@ -90,7 +90,9 @@ impl Tool for UpdatePlanTool {
          Call this again when your work moves on to another step, and when the \
          plan itself changes: a step is no longer needed, the work splits \
          differently, or a new fact adds a step. Send the whole list every \
-         time.\n\n\
+         time. After the last real tool work, send the whole final table before \
+         finishing. This is a freshness rule, not an all-completed rule: leave \
+         unfinished steps pending or in_progress.\n\n\
          Keep each step at a readable density: the action, the object it acts \
          on, and — only when it clarifies acceptance — the intent. A step that \
          reads `fix the Windows subprocess fixture timing` is right; `fix \

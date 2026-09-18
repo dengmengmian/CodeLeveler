@@ -37,6 +37,9 @@ pub enum CloseoutReason {
     GoalUnresolved,
     /// The model ended with an empty answer.
     EmptyAnswer,
+    /// An explicit plan exists, real work happened after its latest declaration,
+    /// and the model has not published the final table yet.
+    PlanUnreconciled,
 }
 
 impl CloseoutReason {
@@ -46,6 +49,7 @@ impl CloseoutReason {
         match self {
             Self::GoalUnresolved => "goal_unresolved",
             Self::EmptyAnswer => "empty_answer",
+            Self::PlanUnreconciled => "plan_unreconciled",
         }
     }
 
@@ -53,6 +57,7 @@ impl CloseoutReason {
         match key {
             "goal_unresolved" => Some(Self::GoalUnresolved),
             "empty_answer" => Some(Self::EmptyAnswer),
+            "plan_unreconciled" => Some(Self::PlanUnreconciled),
             _ => None,
         }
     }
@@ -118,15 +123,19 @@ pub struct CloseoutInput {
     /// The user explicitly denied a permission this task epoch.
     /// Harness must not buy extra model rounds to pressure past that boundary.
     pub human_boundary_seen: bool,
+    /// Real tool work occurred after the latest successful explicit plan update.
+    pub plan_needs_reconciliation: bool,
 }
 
 /// Decide the fate of one quiet round. At most one nudge per round, chosen by
-/// priority: EmptyAnswer > GoalUnresolved
+/// priority: EmptyAnswer > PlanUnreconciled > GoalUnresolved
 /// (an empty answer means the model said nothing at all, so it outranks even
 /// the goal-mode prompt).
 pub fn decide(input: &CloseoutInput) -> CloseoutAction {
     let candidate = if !input.has_final_text && !input.cancelled {
         Some(CloseoutReason::EmptyAnswer)
+    } else if input.plan_needs_reconciliation && !input.cancelled {
+        Some(CloseoutReason::PlanUnreconciled)
     } else if input.goal_mode {
         Some(CloseoutReason::GoalUnresolved)
     } else {
@@ -148,7 +157,7 @@ pub fn decide(input: &CloseoutInput) -> CloseoutAction {
     }
     if input.can_continue && input.budget_remaining > 0 {
         CloseoutAction::NudgeOnce(reason)
-    } else if input.goal_mode {
+    } else if input.goal_mode || reason == CloseoutReason::PlanUnreconciled {
         CloseoutAction::Stall(reason)
     } else {
         CloseoutAction::Finish
@@ -167,6 +176,7 @@ mod tests {
             can_continue: true,
             budget_remaining: CLOSEOUT_NUDGE_BUDGET,
             human_boundary_seen: false,
+            plan_needs_reconciliation: false,
         }
     }
 
@@ -203,6 +213,21 @@ mod tests {
     #[test]
     fn clean_quiet_round_finishes() {
         assert_eq!(decide(&input()), CloseoutAction::Finish);
+    }
+
+    #[test]
+    fn stale_explicit_plan_gets_one_reconciliation_then_stalls_even_in_chat() {
+        let mut i = input();
+        i.plan_needs_reconciliation = true;
+        assert_eq!(
+            decide(&i),
+            CloseoutAction::NudgeOnce(CloseoutReason::PlanUnreconciled)
+        );
+        i.budget_remaining = 0;
+        assert_eq!(
+            decide(&i),
+            CloseoutAction::Stall(CloseoutReason::PlanUnreconciled)
+        );
     }
 
     #[test]

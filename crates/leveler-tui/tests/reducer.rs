@@ -100,6 +100,7 @@ fn snapshot() -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
         plan: None,
         verification: None,
         diff: None,
@@ -4627,10 +4628,15 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
         "the still-running task keeps its label"
     );
     assert!(
-        s.background_task_labels
-            .get("bg-7f3a")
-            .is_some_and(|c| !c.is_running()),
-        "a settled task stays reopenable, not running"
+        !s.background_task_labels.contains_key("bg-7f3a"),
+        "a settled task is history, not active chrome"
+    );
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .any(|item| format!("{item:?}").contains("cargo test")),
+        "the terminal fact remains visible in transcript history"
     );
 
     // Failure stays truthful and prominent, with the exit code.
@@ -7077,27 +7083,38 @@ fn stale_open_plan(s: &mut AppState) {
     );
 }
 
+fn historical_plans(s: &AppState) -> Vec<&UiPlan> {
+    s.transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            leveler_tui::transcript::TranscriptItem::Plan(plan) => Some(plan),
+            _ => None,
+        })
+        .collect()
+}
+
 /// D1: a task can finish while the plan the agent declared is still open —
-/// the plan is not the completion authority. The plan stays as the last
-/// record of what was declared, untouched (no invented N/N), and the turn is
-/// no longer running, so nothing presents it as work under way.
+/// the plan is not the completion authority. The exact declaration moves to
+/// history (no invented N/N) and leaves the active slot.
 #[test]
-fn a_completed_turn_keeps_the_open_plan_as_its_last_record() {
+fn a_completed_turn_archives_the_open_plan_as_its_last_record() {
     use leveler_client_protocol::PlanStepStatus as P;
     let mut s = busy_state();
     stale_open_plan(&mut s);
     let declared = s.plan.clone();
     answer(&mut s, "m-final", "做完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
-    assert_eq!(s.plan, declared, "the declaration is kept exactly as sent");
+    assert!(s.plan.is_none(), "terminal work is not active");
+    assert_eq!(historical_plans(&s), vec![declared.as_ref().unwrap()]);
     assert_ne!(s.status, RuntimeStatus::Busy, "the turn is not running");
-    let steps = &s.plan.as_ref().unwrap().steps;
+    let steps = &historical_plans(&s)[0].steps;
     assert_eq!(steps.iter().filter(|x| x.status == P::Done).count(), 5);
 }
 
 /// D2 / D3: the same holds for the two "done, with a caveat" outcomes.
 #[test]
-fn unverified_and_checks_failed_turns_also_keep_the_last_record() {
+fn unverified_and_checks_failed_turns_also_archive_the_last_record() {
     for event in [
         RuntimeEvent::TurnCompletedUnverified {
             reason: "无自动验证".into(),
@@ -7110,7 +7127,8 @@ fn unverified_and_checks_failed_turns_also_keep_the_last_record() {
         stale_open_plan(&mut s);
         let declared = s.plan.clone();
         reduce(&mut s, Action::Runtime(event.clone()));
-        assert_eq!(s.plan, declared, "{event:?}");
+        assert!(s.plan.is_none(), "{event:?}");
+        assert_eq!(historical_plans(&s), vec![declared.as_ref().unwrap()]);
     }
 }
 
@@ -7123,7 +7141,7 @@ fn the_next_turn_does_not_run_under_a_finished_tasks_plan() {
     stale_open_plan(&mut s);
     answer(&mut s, "m-final", "做完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
-    assert!(s.plan.is_some());
+    assert!(s.plan.is_none());
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AgentActivity {
@@ -7137,10 +7155,10 @@ fn the_next_turn_does_not_run_under_a_finished_tasks_plan() {
     );
 }
 
-/// D4b: an unfinished task may be resumed with its plan, so starting the next
-/// turn keeps it.
+/// D4b: a terminal event closes the old activity even when its outcome is
+/// incomplete. A later runtime resume must explicitly restore a live plan.
 #[test]
-fn the_next_turn_keeps_an_unfinished_tasks_plan() {
+fn the_next_turn_does_not_resurrect_an_incomplete_turns_plan() {
     let mut s = busy_state();
     stale_open_plan(&mut s);
     reduce(
@@ -7155,13 +7173,14 @@ fn the_next_turn_keeps_an_unfinished_tasks_plan() {
             label: "continue".into(),
         }),
     );
-    assert!(s.plan.is_some());
+    assert!(s.plan.is_none());
+    assert_eq!(historical_plans(&s).len(), 1);
 }
 
-/// D4 / D5: an unfinished turn keeps its plan — that is exactly the
-/// continuation context the user needs to decide what happens next.
+/// D4 / D5: every turn terminal archives its exact plan. Whether work may be
+/// resumed later does not make the old turn active now.
 #[test]
-fn an_unfinished_turn_keeps_its_plan_as_continuation_context() {
+fn incomplete_and_cancelled_turns_archive_their_plan() {
     for event in [
         RuntimeEvent::TurnIncomplete {
             reason: "预算用尽".into(),
@@ -7171,7 +7190,8 @@ fn an_unfinished_turn_keeps_its_plan_as_continuation_context() {
         let mut s = busy_state();
         stale_open_plan(&mut s);
         reduce(&mut s, Action::Runtime(event.clone()));
-        assert!(s.plan.is_some(), "{event:?} may still be continued");
+        assert!(s.plan.is_none(), "{event:?} is terminal for this turn");
+        assert_eq!(historical_plans(&s).len(), 1);
     }
 }
 
@@ -8171,11 +8191,9 @@ fn compaction_leaves_a_line_in_the_conversation() {
 
 // --- Plan resume authority -------------------------------------------------
 //
-// The snapshot is the plan's resume authority; history replay is not. Replay
-// rebuilds the transcript in a scratch state and keeps only that, so the
-// `PlanUpdated` entries it replays must never reach `state.plan`. These two
-// tests pin that split — the live projection is restored from the snapshot,
-// and a replay arriving afterwards cannot move it.
+// The snapshot is the active plan's reconnect authority only while its session
+// is running. Durable history rebuilds terminal plan blocks through the same
+// reducer, in scratch state, and only that transcript is adopted.
 
 use leveler_client_protocol::{PlanStepStatus, UiHistoryEntry};
 
@@ -8215,7 +8233,7 @@ fn a_completed_plan_is_not_restored_from_a_snapshot() {
 }
 
 #[test]
-fn a_failed_plan_survives_resume_so_the_user_sees_what_broke() {
+fn an_idle_snapshot_never_restores_a_failed_plan_as_active() {
     let mut s = state();
     let mut snap = snapshot();
     snap.plan = Some(plan_of(&[
@@ -8228,18 +8246,17 @@ fn a_failed_plan_survives_resume_so_the_user_sees_what_broke() {
         Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
     );
 
-    let plan = s
-        .plan
-        .as_ref()
-        .expect("a failed plan is not a finished plan");
-    assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[1].status, PlanStepStatus::Failed);
+    assert!(
+        s.plan.is_none(),
+        "an idle snapshot's failed plan is historical, not active"
+    );
 }
 
 #[test]
 fn history_replay_does_not_overwrite_the_plan_the_snapshot_restored() {
     let mut s = state();
     let mut snap = snapshot();
+    snap.status = "running".into();
     snap.plan = Some(plan_of(&[(
         "the plan the user is resuming",
         PlanStepStatus::Running,

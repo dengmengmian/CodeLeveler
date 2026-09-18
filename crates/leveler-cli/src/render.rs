@@ -233,6 +233,9 @@ fn render_event_text(event: AgentEvent) {
                         "nudge: goal unresolved"
                     }
                     leveler_agent::closeout::CloseoutReason::EmptyAnswer => "nudge: empty answer",
+                    leveler_agent::closeout::CloseoutReason::PlanUnreconciled => {
+                        "nudge: plan unreconciled"
+                    }
                 },
             };
             println!("  {} {label}", console::style("⋯").yellow());

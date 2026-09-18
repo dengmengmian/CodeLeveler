@@ -218,6 +218,112 @@ fn request_blob(req: &ModelRequest) -> String {
         .join("\n")
 }
 
+fn partial_plan(id: &str) -> ModelResponse {
+    tool_call(
+        id,
+        "update_plan",
+        serde_json::json!({
+            "plan": [
+                {"step": "implemented", "status": "completed"},
+                {"step": "publish later", "status": "pending"}
+            ]
+        }),
+    )
+}
+
+#[tokio::test]
+async fn fresh_chat_keeps_a_terminal_partial_plan_historical_only() {
+    let h = harness(vec![
+        partial_plan("p1"),
+        text("implementation finished; publishing remains pending"),
+        text("answering a different follow-up"),
+    ])
+    .await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let mut first = Vec::new();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "summarize the implementation plan".into(),
+            }],
+            &mut |event| first.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first chat");
+    assert!(
+        first
+            .iter()
+            .any(|event| matches!(event, EngineEvent::PlanUpdated { .. })),
+        "the final partial declaration remains durable history"
+    );
+
+    let mut second = Vec::new();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "a completely different question".into(),
+            }],
+            &mut |event| second.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second chat");
+    assert!(
+        !second
+            .iter()
+            .any(|event| matches!(event, EngineEvent::PlanUpdated { .. })),
+        "a fresh turn must not reactivate the prior terminal plan: {second:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_resume_reactivates_the_persisted_unfinished_plan() {
+    let h = harness(vec![
+        partial_plan("p1"),
+        tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "blocked", "summary": "waiting for publication authority"}),
+        ),
+    ])
+    .await;
+    let mut s = spec(&h, "prepare but do not publish");
+    s.runtime.continuation = ContinuationPolicy::bounded(1);
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let first = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("bounded first window");
+    assert_ne!(first.outcome, TaskOutcome::Completed);
+
+    let mut resumed = Vec::new();
+    h.engine
+        .resume(
+            &session,
+            &s,
+            &mut |event| resumed.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("explicit resume");
+    let activated = resumed.iter().find_map(|event| match event {
+        EngineEvent::PlanUpdated { steps } => Some(steps),
+        _ => None,
+    });
+    let activated = activated.expect("explicit resume must reactivate the persisted plan");
+    assert_eq!(activated[0].status, "completed");
+    assert_eq!(activated[1].status, "pending");
+}
+
 async fn seed_oversized_login_history(db: &Database, session: &leveler_core::SessionId) {
     let mut payloads = Vec::new();
     payloads.push(serde_json::to_string(&Message::text(Role::User, "修改登录模块")).unwrap());

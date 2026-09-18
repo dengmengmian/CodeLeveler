@@ -11,8 +11,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use leveler_client_protocol::{
-    RuntimeEvent, RuntimeStatus, SessionId, UiChildAgent, UiChildState, UiHistoryEntry,
-    UiSessionSnapshot,
+    PlanStepStatus, RuntimeEvent, RuntimeStatus, SessionId, UiChildAgent, UiChildState,
+    UiHistoryEntry, UiPlan, UiPlanStep, UiSessionSnapshot,
 };
 use leveler_tui::action::Action;
 use leveler_tui::multi_agent::ChildStatus;
@@ -59,6 +59,7 @@ fn snapshot() -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
         plan: None,
         verification: None,
         diff: None,
@@ -162,6 +163,195 @@ fn rendered(state: &mut AppState, w: u16, h: u16) -> String {
 /// activity strip carries the `↗`; the transcript's sub-agent head does not.
 fn strip_has_activity_row(frame: &str, name: &str) -> bool {
     frame.lines().any(|l| l.contains(name) && l.contains('↗'))
+}
+
+fn plan(steps: &[(&str, PlanStepStatus)]) -> UiPlan {
+    UiPlan {
+        steps: steps
+            .iter()
+            .enumerate()
+            .map(|(index, (description, status))| UiPlanStep {
+                index,
+                description: (*description).to_string(),
+                status: *status,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn a_terminal_turn_moves_the_exact_partial_plan_into_history() {
+    let mut s = opened();
+    ask(&mut s, "问题 A");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&[
+                ("步骤一", PlanStepStatus::Done),
+                ("步骤二", PlanStepStatus::Done),
+                ("步骤三", PlanStepStatus::Pending),
+            ]),
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+
+    assert!(s.plan.is_none(), "terminal work cannot remain active");
+    let terminal = rendered(&mut s, 120, 40);
+    assert!(
+        terminal.contains("步骤三"),
+        "final plan stays in history:\n{terminal}"
+    );
+    assert!(
+        terminal.contains("2/3"),
+        "partial progress is not forged:\n{terminal}"
+    );
+
+    ask(&mut s, "问题 B");
+    assert!(
+        s.plan.is_none(),
+        "the old plan must not become Turn 2 activity"
+    );
+    let next = rendered(&mut s, 120, 40);
+    assert!(
+        next.contains("步骤三"),
+        "Turn 1 history remains visible:\n{next}"
+    );
+}
+
+#[test]
+fn a_fully_done_plan_is_kept_until_terminal_then_archived_verbatim() {
+    let mut s = opened();
+    ask(&mut s, "问题 A");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&[
+                ("步骤一", PlanStepStatus::Done),
+                ("步骤二", PlanStepStatus::Done),
+                ("步骤三", PlanStepStatus::Done),
+            ]),
+        }),
+    );
+    assert!(
+        s.plan.is_some(),
+        "the reducer retains lifecycle truth until terminal"
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert!(s.plan.is_none());
+    let frame = rendered(&mut s, 120, 40);
+    assert!(
+        frame.contains("3/3"),
+        "the historical snapshot is exact:\n{frame}"
+    );
+}
+
+#[test]
+fn replay_archives_a_terminal_plan_without_making_it_live() {
+    let mut s = opened();
+    let query_id = leveler_client_protocol::CommandId::generate();
+    s.history_query = Some(query_id.clone());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: Some(query_id),
+            session_id: SessionId::new("s1"),
+            omitted_turns: 0,
+            entries: vec![
+                UiHistoryEntry {
+                    turn_elapsed_ms: 0,
+                    turn_start: true,
+                    event: RuntimeEvent::PlanUpdated {
+                        plan: plan(&[("历史步骤", PlanStepStatus::Running)]),
+                    },
+                },
+                UiHistoryEntry {
+                    turn_elapsed_ms: 10,
+                    turn_start: false,
+                    event: RuntimeEvent::TurnIncomplete {
+                        reason: "blocked".into(),
+                    },
+                },
+            ],
+        }),
+    );
+
+    assert!(
+        s.plan.is_none(),
+        "history replay cannot populate active plan"
+    );
+    let frame = rendered(&mut s, 120, 40);
+    assert!(
+        frame.contains("历史步骤"),
+        "replay reconstructs plan history:\n{frame}"
+    );
+}
+
+#[test]
+fn failed_turn_archives_its_exact_plan_without_leaving_active_work() {
+    let mut s = opened();
+    ask(&mut s, "问题 A");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&[
+                ("已完成", PlanStepStatus::Done),
+                ("失败步骤", PlanStepStatus::Failed),
+                ("未开始", PlanStepStatus::Pending),
+            ]),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "boom".into(),
+            failure: None,
+        }),
+    );
+
+    assert!(s.plan.is_none(), "a failed turn is terminal");
+    let frame = rendered(&mut s, 120, 40);
+    assert!(
+        frame.contains("1/3"),
+        "failure does not forge progress:\n{frame}"
+    );
+    assert!(
+        frame.contains("失败步骤") && frame.contains("未开始"),
+        "the exact declaration remains historical:\n{frame}"
+    );
+}
+
+#[test]
+fn historical_and_current_plans_render_on_separate_surfaces() {
+    let mut s = opened();
+    ask(&mut s, "问题 A");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&[("旧计划步骤", PlanStepStatus::Pending)]),
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCancelled));
+    ask(&mut s, "问题 B");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: plan(&[("当前计划步骤", PlanStepStatus::Running)]),
+        }),
+    );
+
+    assert_eq!(
+        s.plan.as_ref().unwrap().steps[0].description,
+        "当前计划步骤"
+    );
+    let frame = rendered(&mut s, 120, 40);
+    assert!(
+        frame.contains("旧计划步骤"),
+        "history plan missing:\n{frame}"
+    );
+    assert!(
+        frame.contains("当前计划步骤"),
+        "active plan missing:\n{frame}"
+    );
 }
 
 /// The core regression: a child that reached its terminal in Turn 1 is not
@@ -363,6 +553,80 @@ fn a_cross_turn_background_task_keeps_running_into_the_next_turn() {
         strip_has_activity_row(&frame, "cargo test"),
         "the background task still shows as live activity:\n{frame}"
     );
+}
+
+#[test]
+fn reconnect_rebuilds_only_registry_active_background_tasks() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "terminal-before-reconnect".into(),
+            program: "false".into(),
+            args: vec![],
+        }),
+    );
+    let mut snap = snapshot();
+    snap.active_background_tasks = vec![leveler_client_protocol::UiActiveBackgroundTask {
+        task_id: "still-running".into(),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        elapsed_ms: 4_000,
+    }];
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+
+    assert!(
+        !s.background_task_labels
+            .contains_key("terminal-before-reconnect")
+    );
+    assert!(
+        s.background_task_labels
+            .get("still-running")
+            .is_some_and(|task| task.is_running())
+    );
+}
+
+#[test]
+fn lifecycle_lag_reconciliation_replaces_stale_active_background_tasks() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "missed-terminal".into(),
+            program: "false".into(),
+            args: vec![],
+        }),
+    );
+    s.activity_selected = Some(leveler_tui::activity::ActivityId::Background(
+        "missed-terminal".into(),
+    ));
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background(
+        "missed-terminal".into(),
+    ));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTasksReconciled {
+            tasks: vec![leveler_client_protocol::UiActiveBackgroundTask {
+                task_id: "still-running".into(),
+                program: "cargo".into(),
+                args: vec!["check".into()],
+                elapsed_ms: 2_000,
+            }],
+        }),
+    );
+
+    assert!(!s.background_task_labels.contains_key("missed-terminal"));
+    assert!(
+        s.background_task_labels
+            .get("still-running")
+            .is_some_and(|task| task.is_running())
+    );
+    assert!(s.activity_selected.is_none());
+    assert!(s.activity_open.is_none());
 }
 
 /// Reopening a session must not rebuild a settled child as current activity,

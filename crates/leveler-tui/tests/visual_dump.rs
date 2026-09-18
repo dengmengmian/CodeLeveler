@@ -63,6 +63,7 @@ fn opened() -> AppState {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
         plan: None,
         verification: None,
         diff: None,

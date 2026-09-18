@@ -60,6 +60,7 @@ fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
         plan: None,
         verification: None,
         diff: None,
@@ -222,6 +223,58 @@ fn the_history_replaces_the_text_only_view_with_what_ran() {
     // A replay is history: the live session stays as the snapshot left it.
     assert_eq!(s.status, RuntimeStatus::Idle);
     assert!(s.notification.is_none(), "{:?}", s.notification);
+}
+
+#[test]
+fn replayed_background_lifecycle_is_history_and_cannot_replace_live_activity() {
+    let mut s = state();
+    let effects = open(&mut s, vec![message(UiRole::User, "继续")]);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "live-now".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            omitted_turns: 0,
+            entries: vec![
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 0,
+                    turn_start: true,
+                    event: RuntimeEvent::BackgroundTaskStarted {
+                        task_id: "old".into(),
+                        program: "false".into(),
+                        args: vec![],
+                    },
+                },
+                leveler_client_protocol::UiHistoryEntry {
+                    turn_elapsed_ms: 10,
+                    turn_start: false,
+                    event: RuntimeEvent::BackgroundTaskExited {
+                        task_id: "old".into(),
+                        exit_code: Some(1),
+                        duration_ms: 10,
+                        ok: false,
+                    },
+                },
+            ],
+        }),
+    );
+
+    assert!(s.background_task_labels.contains_key("live-now"));
+    assert!(!s.background_task_labels.contains_key("old"));
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Note(note) if note.contains("后台任务")))
+    );
 }
 
 #[test]

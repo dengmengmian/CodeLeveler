@@ -79,6 +79,7 @@ fn opened(goal: &str) -> AppState {
         vision: false,
         last_sequence: None,
         active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
         plan: None,
         verification: None,
         diff: None,
@@ -742,6 +743,7 @@ fn s10_resume() {
         vision: false,
         last_sequence: Some(84),
         active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
         plan: Some(plan(&[
             ("盘点现有 refund 流程", Done),
             ("设计审计事件", Done),

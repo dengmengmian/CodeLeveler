@@ -132,7 +132,11 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             state, that every requirement is done (build/tests run and passed \
             since your last edit); `blocked` when you are genuinely and \
             repeatedly stuck and cannot make progress. Going silent does NOT end \
-            the task — you must call this. Do not mark complete on unproven or \
+            the task — you must call this. If you declared a plan and performed \
+            real tool work after its latest update, first call update_plan with \
+            the truthful final table; unfinished steps stay pending or \
+            in_progress. You may call update_plan then update_goal in the same \
+            assistant turn. Do not mark complete on unproven or \
             indirect evidence, and do not redefine success down to what already \
             exists. `complete` means the objective AS THE USER STATED IT. If the \
             stated objective cannot be satisfied — it conflicts with something \
@@ -724,9 +728,9 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
 }
 
 /// Agent plan synchronization contract. The plan is the user's live view of
-/// the work and the seed a resumed turn reads, so keeping it current is the
-/// model's job — stated where the model reads it, never enforced by the
-/// runtime (the plan is not a completion gate).
+/// the work and the seed a resumed turn reads. The runtime enforces only that
+/// the model publishes a fresh final declaration after real tool work; it does
+/// not infer statuses or require every step to be completed.
 #[cfg(test)]
 mod plan_sync_contract_tests {
     const BASE_PROMPT: &str = include_str!("../prompts/base.md");
@@ -811,23 +815,24 @@ mod plan_sync_contract_tests {
         );
     }
 
-    /// No terminal reconciliation instruction. Asking for the plan to be
-    /// brought up to date right before `update_goal` is not needed for
-    /// correctness, and in an A/B run (10 runs per arm) removing it took final
-    /// multi-step catch-up updates from 9/10 to 5/10 with no loss in task
-    /// success or final plan completeness. It is kept out unless new evidence
-    /// says otherwise. No causal link to false completions is claimed.
+    /// Terminal reconciliation is freshness, never an instruction to turn all
+    /// rows green. Both ordinary closeout and goal closeout state the same
+    /// contract where the model reads it.
     #[test]
-    fn there_is_no_final_plan_reconciliation_instruction() {
+    fn final_plan_reconciliation_preserves_partial_statuses() {
         let section = plan_section();
         assert!(
-            !section.contains("Before `update_goal`"),
-            "final reconciliation is back in the plan section:\n{section}"
+            section.contains("before `update_goal`")
+                && section.contains("leave unfinished steps `pending` or `in_progress`"),
+            "plan closeout contract is missing or fabricates completion:\n{section}"
         );
         let def = super::update_goal_tool_definition();
         assert!(
-            !def.description.contains("update_plan"),
-            "final reconciliation is back in update_goal: {}",
+            def.description.contains("update_plan")
+                && def
+                    .description
+                    .contains("unfinished steps stay pending or in_progress"),
+            "goal closeout contract is missing or fabricates completion: {}",
             def.description
         );
     }
@@ -870,17 +875,11 @@ mod plan_sync_contract_tests {
     }
 
     #[test]
-    fn plan_sync_is_not_described_as_enforced() {
-        let def = super::update_goal_tool_definition();
-        for text in [plan_section(), def.description.as_str()] {
-            let lower = text.to_ascii_lowercase();
-            for claim in ["refuse", "reject", "gate"] {
-                assert!(
-                    !lower.contains(claim),
-                    "plan sync must not be described as enforced (`{claim}`):\n{text}"
-                );
-            }
-        }
+    fn plan_sync_is_described_as_freshness_not_completion_inference() {
+        let section = plan_section();
+        assert!(section.contains("freshness requirement"));
+        assert!(section.contains("not an all-done requirement"));
+        assert!(section.contains("never mark them `completed` merely to close"));
     }
 }
 

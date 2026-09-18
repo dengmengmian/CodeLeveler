@@ -11,8 +11,6 @@ use crate::render::truncate_display;
 use crate::state::{AppState, BackgroundTaskChrome};
 use crate::status_line::fmt_elapsed;
 
-/// How many completed background entries the TUI keeps reopenable.
-pub(crate) const MAX_COMPLETED_BACKGROUND: usize = 8;
 /// Compact status-strip cap: how many ACTIVITIES are shown. Remaining stay
 /// available on the Activity screen. A child occupies two physical lines, so
 /// the strip's own row cap is derived from this in the workbench layout.
@@ -246,35 +244,6 @@ fn activity_glyph(status: ActivityStatus) -> &'static str {
         ActivityStatus::Failed => "✕",
         ActivityStatus::Interrupted => "⏸",
         ActivityStatus::Unreported => "?",
-    }
-}
-
-pub(crate) fn prune_completed_background(state: &mut AppState) {
-    let completed: Vec<String> = state
-        .background_task_labels
-        .iter()
-        .filter(|(_, c)| !c.is_running())
-        .map(|(id, _)| id.clone())
-        .collect();
-    if completed.len() <= MAX_COMPLETED_BACKGROUND {
-        return;
-    }
-    let mut ranked: Vec<(u64, String)> = completed
-        .into_iter()
-        .filter_map(|id| {
-            state
-                .background_task_labels
-                .get(&id)
-                .map(|c| (c.started_elapsed_secs, id))
-        })
-        .collect();
-    ranked.sort_by_key(|(started, _)| *started);
-    let drop_n = ranked.len().saturating_sub(MAX_COMPLETED_BACKGROUND);
-    for (_, id) in ranked.into_iter().take(drop_n) {
-        state.background_task_labels.remove(&id);
-        if matches!(&state.activity_selected, Some(ActivityId::Background(open)) if open == &id) {
-            state.activity_selected = None;
-        }
     }
 }
 
@@ -615,49 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn background_completed_stays_reopenable() {
-        let mut state = test_state();
-        state.background_task_labels.insert(
-            "bg-2".into(),
-            BackgroundTaskChrome {
-                label: "cargo test --workspace".into(),
-                started_elapsed_secs: 0,
-                ok: Some(true),
-                exit_code: Some(0),
-                duration_ms: Some(48_000),
-                output: "ok".into(),
-            },
-        );
-        let rows = summaries(&state);
-        assert_eq!(rows[0].status, ActivityStatus::Completed);
-        assert_eq!(rows[0].duration_secs, 48);
-        assert!(background_chrome(&state, "bg-2").is_some());
-        let line = compact_row(&rows[0], false, 80);
-        assert!(line.contains('✓'), "{line}");
-    }
-
-    #[test]
-    fn background_failed_activity_render() {
-        let mut state = test_state();
-        state.background_task_labels.insert(
-            "bg-fail".into(),
-            BackgroundTaskChrome {
-                label: "cargo test --workspace".into(),
-                started_elapsed_secs: 0,
-                ok: Some(false),
-                exit_code: Some(101),
-                duration_ms: Some(74_000),
-                output: "failed".into(),
-            },
-        );
-        let rows = summaries(&state);
-        assert_eq!(rows[0].status, ActivityStatus::Failed);
-        let line = compact_row(&rows[0], false, 80);
-        assert!(line.contains('✕'), "{line}");
-        assert!(!line.contains("运行中"), "{line}");
-    }
-
-    #[test]
     fn child_activity_row_render() {
         let mut state = test_state();
         state.elapsed_secs = 58;
@@ -859,36 +785,6 @@ second line ignored"
         let line = compact_row(&summaries(&state)[0], false, 80);
         assert!(!line.contains('{'), "{line}");
         assert!(!line.contains("task_id"), "{line}");
-    }
-
-    #[test]
-    fn prune_keeps_running_and_bounds_completed() {
-        let mut state = test_state();
-        for i in 0..12u64 {
-            state.background_task_labels.insert(
-                format!("done-{i}"),
-                BackgroundTaskChrome {
-                    label: format!("cmd {i}"),
-                    started_elapsed_secs: i,
-                    ok: Some(true),
-                    exit_code: Some(0),
-                    duration_ms: Some(1),
-                    output: String::new(),
-                },
-            );
-        }
-        state.background_task_labels.insert(
-            "live".into(),
-            BackgroundTaskChrome::running("cargo test", 99),
-        );
-        prune_completed_background(&mut state);
-        assert!(state.background_task_labels.contains_key("live"));
-        let completed = state
-            .background_task_labels
-            .values()
-            .filter(|c| !c.is_running())
-            .count();
-        assert_eq!(completed, MAX_COMPLETED_BACKGROUND);
     }
 
     #[test]

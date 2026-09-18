@@ -12,6 +12,13 @@
     "status"
   ],
   "properties": {
+    "active_background_tasks": {
+      "description": "Registry-backed background processes still active for this session. Additive/defaulted so older runtimes decode as no known live process.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UiActiveBackgroundTask"
+      }
+    },
     "active_tools": {
       "description": "Live render state needed to reconnect while a long turn is still running. All fields are additive/defaulted for protocol compatibility.",
       "default": [],
@@ -431,6 +438,36 @@
     "ToolCallId": {
       "description": "Identifies a tool call. Must be stable across streaming reassembly.",
       "type": "string"
+    },
+    "UiActiveBackgroundTask": {
+      "description": "One background process that is still lifecycle-active in the runtime.\n\nThis is a reconnect projection, not history. Terminal tasks never appear here even though the execution registry may retain their records for `get`/`wait`.",
+      "type": "object",
+      "required": [
+        "args",
+        "elapsed_ms",
+        "program",
+        "task_id"
+      ],
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "elapsed_ms": {
+          "description": "Runtime-observed age at snapshot time.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "program": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      }
     },
     "UiActiveToolCall": {
       "description": "A tool invocation that was still running when a client took its snapshot.",

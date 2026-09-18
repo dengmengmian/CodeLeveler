@@ -853,6 +853,7 @@ impl EventBridge {
                     AdvisoryKind::CloseoutNudge(reason) => match reason {
                         CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
                         CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
+                        CloseoutReason::PlanUnreconciled => "催办:计划未收口,再询一轮",
                     },
                 };
                 let _ = self.events.send(RuntimeEvent::AgentActivity {

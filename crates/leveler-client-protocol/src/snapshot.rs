@@ -103,6 +103,7 @@ mod tests {
             vision: false,
             last_sequence: None,
             active_tools: Vec::new(),
+            active_background_tasks: Vec::new(),
             plan: None,
             verification: None,
             diff: None,
@@ -146,6 +147,7 @@ mod tests {
             vision: false,
             last_sequence: None,
             active_tools: Vec::new(),
+            active_background_tasks: Vec::new(),
             plan: None,
             verification: None,
             diff: None,
@@ -358,6 +360,21 @@ pub struct UiSessionSummary {
     pub repository: Option<String>,
 }
 
+/// One background process that is still lifecycle-active in the runtime.
+///
+/// This is a reconnect projection, not history. Terminal tasks never appear
+/// here even though the execution registry may retain their records for
+/// `get`/`wait`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiActiveBackgroundTask {
+    pub task_id: String,
+    pub program: String,
+    pub args: Vec<String>,
+    /// Runtime-observed age at snapshot time.
+    pub elapsed_ms: u64,
+}
+
 /// Everything a client needs to render a session's header and transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -396,6 +413,10 @@ pub struct UiSessionSnapshot {
     /// running. All fields are additive/defaulted for protocol compatibility.
     #[serde(default)]
     pub active_tools: Vec<UiActiveToolCall>,
+    /// Registry-backed background processes still active for this session.
+    /// Additive/defaulted so older runtimes decode as no known live process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_background_tasks: Vec<UiActiveBackgroundTask>,
     #[serde(default)]
     pub plan: Option<UiPlan>,
     #[serde(default)]

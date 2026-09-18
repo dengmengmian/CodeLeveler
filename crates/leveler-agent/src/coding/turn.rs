@@ -65,6 +65,11 @@ pub async fn drive_turn(
     ports: TurnPorts,
     cancellation: CancellationToken,
 ) -> Result<TurnFacts<AgentOutcome>, TurnFailure> {
+    // Only an explicit resume continues the prior task epoch's active Plan.
+    // Fresh Goal/Content turns still seed runtime truth such as ledger,
+    // progress and running children, but a terminal historical Plan must not
+    // become active merely because its final declaration retained open rows.
+    let resumes_task_epoch = matches!(&input, TurnInput::Resume(_));
     let TurnPorts {
         turn_id,
         emitter,
@@ -127,10 +132,11 @@ pub async fn drive_turn(
         )));
     }
 
-    // Resume / same unfinished task: Coding seeds its Plan/Ledger/Progress so
-    // Delivery and closeout stay consistent.
+    // Open task state keeps ledger/progress (including running-child truth)
+    // across boundaries. Plan is narrower: only explicit Resume makes the
+    // prior declaration active again; fresh inputs retain it as history.
     if let Some(seeds) = seeds {
-        if let Some(plan) = seeds.plan {
+        if resumes_task_epoch && let Some(plan) = seeds.plan {
             executor = executor.with_seeded_plan(plan);
         }
         if let Some(ledger) = seeds.ledger {

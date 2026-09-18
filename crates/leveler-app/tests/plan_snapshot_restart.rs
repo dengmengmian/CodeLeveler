@@ -10,7 +10,9 @@ use std::sync::Arc;
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{InteractiveRuntimeClient, PlanStepStatus};
 use leveler_core::SessionId;
+use leveler_engine::EngineEvent;
 use leveler_execution::PermissionProfile;
+use leveler_lifecycle::{StopReason, TaskOutcome, VerificationStatus};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::EventRepository;
@@ -50,6 +52,23 @@ async fn persist_plan(app: &Application, session_id: &SessionId, steps: serde_js
             &payload.to_string(),
             leveler_core::now(),
         )
+        .await
+        .unwrap();
+}
+
+async fn persist_task_terminal(app: &Application, session_id: &SessionId) {
+    let db = app.open_database().await.unwrap();
+    let event = EngineEvent::TaskFinished {
+        outcome: TaskOutcome::Completed,
+        verification: VerificationStatus::NotRun,
+        reason: None,
+        stop: Some(StopReason::Completed),
+        failure: None,
+        warnings: Vec::new(),
+    };
+    let (event_type, payload) = event.to_row().unwrap();
+    EventRepository::new(&db)
+        .append(session_id, None, &event_type, &payload, leveler_core::now())
         .await
         .unwrap();
 }
@@ -130,4 +149,75 @@ async fn a_restarted_runtime_honours_a_cleared_plan() {
         snapshot.plan.is_none_or(|plan| plan.steps.is_empty()),
         "the cut plan must stay cut"
     );
+}
+
+#[tokio::test]
+async fn a_restarted_runtime_does_not_resurrect_a_plan_from_a_terminal_task_epoch() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let session_id = {
+        let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+        let session_id = app
+            .create_session(&ModelRef::new("mock", "m"), "terminal plan")
+            .await
+            .unwrap();
+        persist_plan(
+            &app,
+            &session_id,
+            serde_json::json!([
+                {"step": "done", "status": "completed"},
+                {"step": "not done", "status": "in_progress"}
+            ]),
+        )
+        .await;
+        persist_task_terminal(&app, &session_id).await;
+        session_id
+    };
+
+    let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+    let snapshot = client(app).snapshot(&session_id).await.unwrap();
+
+    assert!(
+        snapshot.plan.is_none(),
+        "a terminal epoch's final plan is history, not an active reconnect plan"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_updated_after_the_latest_terminal_is_active_on_restart() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let session_id = {
+        let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+        let session_id = app
+            .create_session(&ModelRef::new("mock", "m"), "next epoch plan")
+            .await
+            .unwrap();
+        persist_plan(
+            &app,
+            &session_id,
+            serde_json::json!([{"step": "historical", "status": "in_progress"}]),
+        )
+        .await;
+        persist_task_terminal(&app, &session_id).await;
+        persist_plan(
+            &app,
+            &session_id,
+            serde_json::json!([{"step": "current", "status": "in_progress"}]),
+        )
+        .await;
+        session_id
+    };
+
+    let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+    let snapshot = client(app).snapshot(&session_id).await.unwrap();
+    let plan = snapshot
+        .plan
+        .expect("the new epoch plan must remain active");
+
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].description, "current");
+    assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
 }

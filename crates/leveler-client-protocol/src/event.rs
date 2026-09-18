@@ -575,6 +575,11 @@ pub enum RuntimeEvent {
         duration_ms: u64,
         ok: bool,
     },
+    /// Authoritative replacement of a session's active background projection.
+    /// Emitted after a lifecycle broadcast lag; history is unaffected.
+    BackgroundTasksReconciled {
+        tasks: Vec<crate::UiActiveBackgroundTask>,
+    },
     /// Project memory listing (response to [`crate::ClientCommand::ListMemory`]).
     MemoryList {
         memory_dir: String,
@@ -742,6 +747,7 @@ mod tests {
             vision: false,
             last_sequence: Some(7),
             active_tools: Vec::new(),
+            active_background_tasks: Vec::new(),
             plan: None,
             verification: None,
             diff: None,

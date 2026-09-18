@@ -484,6 +484,92 @@ async fn a_live_background_task_holds_the_handover_open() {
         .expect("once nothing is left running, the runtime retires");
 }
 
+/// A real registry spawn/settlement is projected onto the owning session's
+/// structured runtime stream. The UI does not parse tool output to invent
+/// lifecycle events.
+#[tokio::test]
+async fn registry_background_lifecycle_reaches_the_session_event_stream() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let session_id = runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "background lifecycle".into(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .expect("create session")
+        .session
+        .id;
+    let mut events = runtime.subscribe_session(&session_id);
+
+    let spawned_id = app
+        .background_tasks()
+        .spawn_owned(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".to_string()],
+                tmp.path().to_path_buf(),
+            ),
+            None,
+            Some(session_id.as_str()),
+        )
+        .await
+        .expect("background task starts");
+    let started = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .expect("start event arrives")
+        .expect("stream open");
+    assert!(matches!(
+        started,
+        RuntimeEvent::BackgroundTaskStarted { ref task_id, .. } if task_id == &spawned_id
+    ));
+    let active = runtime
+        .snapshot(&session_id)
+        .await
+        .expect("active snapshot");
+    assert_eq!(active.active_background_tasks.len(), 1);
+    assert_eq!(active.active_background_tasks[0].task_id, spawned_id);
+
+    app.background_tasks()
+        .kill(&spawned_id)
+        .await
+        .expect("kill");
+    let exited = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("exit event arrives")
+            .expect("stream open");
+        if matches!(event, RuntimeEvent::BackgroundTaskExited { .. }) {
+            break event;
+        }
+    };
+    assert!(matches!(
+        exited,
+        RuntimeEvent::BackgroundTaskExited { task_id: ref exited_id, ok: false, .. }
+            if exited_id == &spawned_id
+    ));
+    let terminal = runtime
+        .snapshot(&session_id)
+        .await
+        .expect("terminal snapshot");
+    assert!(terminal.active_background_tasks.is_empty());
+}
+
 /// A running turn holds the handover open — and with it every child agent,
 /// because a child cannot outlive the turn that spawned it: `drive` drains
 /// its background children on every exit path before returning, so a live

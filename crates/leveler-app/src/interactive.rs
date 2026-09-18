@@ -745,6 +745,60 @@ impl InProcessRuntimeClient {
                 }
             }
         });
+        let background_registry = self.app.background_tasks().clone();
+        let mut background_events = background_registry.subscribe();
+        let background_session_id = session_id.clone();
+        let background_sender = events.clone();
+        tokio::spawn(async move {
+            loop {
+                match background_events.recv().await {
+                    Ok(leveler_execution::BackgroundTaskEvent::Started { owner_scope, task })
+                        if owner_scope.as_deref() == Some(background_session_id.as_str()) =>
+                    {
+                        let _ = background_sender.send(RuntimeEvent::BackgroundTaskStarted {
+                            task_id: task.id,
+                            program: task.program,
+                            args: task.args,
+                        });
+                    }
+                    Ok(leveler_execution::BackgroundTaskEvent::Exited { owner_scope, task })
+                        if owner_scope.as_deref() == Some(background_session_id.as_str()) =>
+                    {
+                        let ok = task.status == leveler_execution::BackgroundTaskStatus::Exited
+                            && task.exit_code == Some(0);
+                        let _ = background_sender.send(RuntimeEvent::BackgroundTaskExited {
+                            task_id: task.id,
+                            exit_code: task.exit_code,
+                            duration_ms: task.duration_ms,
+                            ok,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "background lifecycle stream lagged");
+                        // Drop the lagged cursor first. Events after this
+                        // subscription either appear in the snapshot or remain
+                        // queued for the next receive, so the replacement
+                        // cannot leave a stale active id behind.
+                        background_events = background_registry.subscribe();
+                        let tasks = background_registry
+                            .active_snapshots_for_scope(background_session_id.as_str())
+                            .await
+                            .into_iter()
+                            .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
+                                task_id: task.id,
+                                program: task.program,
+                                args: task.args,
+                                elapsed_ms: task.duration_ms,
+                            })
+                            .collect();
+                        let _ = background_sender
+                            .send(RuntimeEvent::BackgroundTasksReconciled { tasks });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         events
     }
 
@@ -3687,9 +3741,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let stores = leveler_storage::EngineStores::from_database(&db);
 
         // The live view only knows what THIS process forwarded. After a
-        // restart it is empty while the persisted plan — the one a resumed
-        // turn seeds from — still stands, so answer from that row instead of
-        // reporting no plan.
+        // restart it is empty, so reconstruct the active-plan projection from
+        // durable lifecycle order. A plan older than the latest task terminal
+        // is historical: `last seen plan` must never mean `still active`.
+        // Conversely, a later PlanUpdated belongs to an open/new epoch and is
+        // exactly the state a resumed turn seeds from.
         let plan = match live.plan {
             Some(plan) => Some(plan),
             None => match stores
@@ -3698,18 +3754,29 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 .await
                 .map_err(|e| ClientError::Runtime(e.to_string()))?
             {
-                Some(row) => match leveler_engine::EngineEvent::from_payload(&row.payload)
-                    .map_err(|e| ClientError::Runtime(e.to_string()))?
-                {
-                    leveler_engine::EngineEvent::PlanUpdated { steps } => {
-                        Some(crate::event_bridge::ui_plan(steps))
+                Some(row) => {
+                    let latest_terminal = stores
+                        .events
+                        .load_last_by_type(session_id, "task_finished", None)
+                        .await
+                        .map_err(|e| ClientError::Runtime(e.to_string()))?;
+                    if latest_terminal.is_some_and(|terminal| terminal.sequence > row.sequence) {
+                        None
+                    } else {
+                        match leveler_engine::EngineEvent::from_payload(&row.payload)
+                            .map_err(|e| ClientError::Runtime(e.to_string()))?
+                        {
+                            leveler_engine::EngineEvent::PlanUpdated { steps } => {
+                                Some(crate::event_bridge::ui_plan(steps))
+                            }
+                            _ => {
+                                return Err(ClientError::Runtime(
+                                    "plan_updated row carried a different event".into(),
+                                ));
+                            }
+                        }
                     }
-                    _ => {
-                        return Err(ClientError::Runtime(
-                            "plan_updated row carried a different event".into(),
-                        ));
-                    }
-                },
+                }
                 None => None,
             },
         };
@@ -3756,6 +3823,19 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let children = crate::children::project_children(&db, session_id, runtime_active)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
+        let active_background_tasks = self
+            .app
+            .background_tasks()
+            .active_snapshots_for_scope(session_id.as_str())
+            .await
+            .into_iter()
+            .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
+                task_id: task.id,
+                program: task.program,
+                args: task.args,
+                elapsed_ms: task.duration_ms,
+            })
+            .collect();
 
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
@@ -3772,6 +3852,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             vision,
             last_sequence,
             active_tools: live.active_tools,
+            active_background_tasks,
             plan,
             verification: live.verification,
             diff: live.diff,
@@ -4041,6 +4122,18 @@ async fn compact_conversation(
             .ok()
             .flatten();
         let live = live_views.view(session_id);
+        let active_background_tasks = app
+            .background_tasks()
+            .active_snapshots_for_scope(session_id.as_str())
+            .await
+            .into_iter()
+            .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
+                task_id: task.id,
+                program: task.program,
+                args: task.args,
+                elapsed_ms: task.duration_ms,
+            })
+            .collect();
         let _ = events.send(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
                 id: session_id.clone(),
@@ -4063,6 +4156,7 @@ async fn compact_conversation(
                 vision,
                 last_sequence,
                 active_tools: live.active_tools,
+                active_background_tasks,
                 plan: live.plan,
                 verification: live.verification,
                 diff: live.diff,

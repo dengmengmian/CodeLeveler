@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::command::{CommandRunner, ManagedProcess, ProcessIdentity, ProcessRequest};
@@ -83,6 +83,19 @@ pub struct BackgroundTaskSnapshot {
     pub exit_code: Option<i32>,
     pub log: String,
     pub duration_ms: u64,
+}
+
+/// Registry-owned lifecycle facts for UI/runtime projections.
+#[derive(Debug, Clone)]
+pub enum BackgroundTaskEvent {
+    Started {
+        owner_scope: Option<String>,
+        task: BackgroundTaskSnapshot,
+    },
+    Exited {
+        owner_scope: Option<String>,
+        task: BackgroundTaskSnapshot,
+    },
 }
 
 /// Tracks live process identities for kill-on-drop of the registry handle.
@@ -162,6 +175,7 @@ pub struct BackgroundTaskRegistry {
     spawn_registration_hook: Arc<std::sync::Mutex<Option<Arc<SpawnRegistrationHook>>>>,
     /// The one spawn path, shared with foreground execution (PR 4).
     runner: CommandRunner,
+    lifecycle_events: broadcast::Sender<BackgroundTaskEvent>,
     /// Dropped when the last registry handle is dropped (session end).
     kill_on_drop: Arc<KillOnDrop>,
 }
@@ -278,6 +292,7 @@ impl BackgroundTaskRegistry {
     }
 
     pub fn with_environment(environment: Arc<leveler_core::EnvSnapshot>) -> Self {
+        let (lifecycle_events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(Mutex::new(RegistryState::default())),
             pending_spawns: Arc::new(AtomicUsize::new(0)),
@@ -285,6 +300,7 @@ impl BackgroundTaskRegistry {
             spawn_registration_hook: Arc::new(std::sync::Mutex::new(None)),
             kill_on_drop: Arc::new(KillOnDrop::default()),
             runner: CommandRunner::with_environment(environment),
+            lifecycle_events,
         }
     }
 
@@ -379,12 +395,29 @@ impl BackgroundTaskRegistry {
                 sandbox_scratch,
             },
         );
+        if let Some(task) = st.tasks.get(&id) {
+            let _ = self.lifecycle_events.send(BackgroundTaskEvent::Started {
+                owner_scope: task.owner_scope.clone(),
+                task: snapshot(task),
+            });
+        }
         reservation.commit();
         drop(st);
 
-        spawn_log_pump(reg.clone(), tid.clone(), stdout);
-        spawn_log_pump(reg.clone(), tid.clone(), stderr);
+        spawn_log_pump(
+            reg.clone(),
+            tid.clone(),
+            stdout,
+            self.lifecycle_events.clone(),
+        );
+        spawn_log_pump(
+            reg.clone(),
+            tid.clone(),
+            stderr,
+            self.lifecycle_events.clone(),
+        );
 
+        let lifecycle_events = self.lifecycle_events.clone();
         tokio::spawn(async move {
             let code = {
                 let mut st = reg.lock().await;
@@ -419,7 +452,12 @@ impl BackgroundTaskRegistry {
                 task.exit_code = code;
                 task.identity = None;
                 task.settlement = settlement;
-                finalize_if_drained(task);
+                if finalize_if_drained(task) {
+                    let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
+                        owner_scope: task.owner_scope.clone(),
+                        task: snapshot(task),
+                    });
+                }
             }
             if let Some(kod) = kill_on_drop.upgrade() {
                 kod.remove(&tid);
@@ -432,6 +470,11 @@ impl BackgroundTaskRegistry {
     pub async fn get(&self, id: &str) -> Option<BackgroundTaskSnapshot> {
         let st = self.inner.lock().await;
         st.tasks.get(id).map(snapshot)
+    }
+
+    /// Subscribe to authoritative process lifecycle transitions.
+    pub fn subscribe(&self) -> broadcast::Receiver<BackgroundTaskEvent> {
+        self.lifecycle_events.subscribe()
     }
 
     /// Take the settlement exactly once, so a task's file changes are reported
@@ -561,6 +604,23 @@ impl BackgroundTaskRegistry {
         }
     }
 
+    /// Snapshot the tasks that are genuinely still live for one session.
+    ///
+    /// Reconnect projections use this rather than replaying task-start events:
+    /// the registry owns process lifecycle truth, while terminal records are
+    /// retained only for later `get`/`wait` calls.
+    pub async fn active_snapshots_for_scope(&self, scope: &str) -> Vec<BackgroundTaskSnapshot> {
+        let st = self.inner.lock().await;
+        let mut snapshots: Vec<_> = st
+            .tasks
+            .values()
+            .filter(|task| task.owner_scope.as_deref() == Some(scope) && task.status.is_active())
+            .map(snapshot)
+            .collect();
+        snapshots.sort_by(|a, b| a.id.cmp(&b.id));
+        snapshots
+    }
+
     /// Detach an immutable cleanup ticket for one scope. The registry never
     /// holds its lock across process I/O, so this synchronization is bounded
     /// to an in-memory snapshot; process signalling happens only when the
@@ -656,8 +716,12 @@ fn prune_terminal_tasks(state: &mut RegistryState) {
     }
 }
 
-fn spawn_log_pump<R>(reg: Arc<Mutex<RegistryState>>, tid: String, stream: Option<R>)
-where
+fn spawn_log_pump<R>(
+    reg: Arc<Mutex<RegistryState>>,
+    tid: String,
+    stream: Option<R>,
+    lifecycle_events: broadcast::Sender<BackgroundTaskEvent>,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     let Some(stream) = stream else {
@@ -676,7 +740,12 @@ where
         let mut st = reg.lock().await;
         if let Some(task) = st.tasks.get_mut(&tid) {
             task.log_pumps_remaining = task.log_pumps_remaining.saturating_sub(1);
-            finalize_if_drained(task);
+            if finalize_if_drained(task) {
+                let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
+                    owner_scope: task.owner_scope.clone(),
+                    task: snapshot(task),
+                });
+            }
         }
     });
 }
@@ -743,9 +812,12 @@ fn path_allows(allowed: &str, modified: &str) -> bool {
     modified == allowed || modified.starts_with(&format!("{allowed}/"))
 }
 
-fn finalize_if_drained(task: &mut TaskInner) {
+fn finalize_if_drained(task: &mut TaskInner) -> bool {
     if !task.process_done || task.log_pumps_remaining != 0 {
-        return;
+        return false;
+    }
+    if task.status.is_terminal() {
+        return false;
     }
     task.status = match task.status {
         BackgroundTaskStatus::Killing => BackgroundTaskStatus::Killed,
@@ -757,6 +829,7 @@ fn finalize_if_drained(task: &mut TaskInner) {
     // Release potentially large temp files independently of history retention.
     task.sandbox_scratch.take();
     task.done.notify_waiters();
+    true
 }
 
 async fn append_log(reg: &Arc<Mutex<RegistryState>>, id: &str, bytes: &[u8]) {
@@ -1285,6 +1358,67 @@ mod tests {
             );
             let _ = reg.kill(id).await;
         }
+    }
+
+    #[tokio::test]
+    async fn active_snapshots_for_scope_excludes_terminal_and_other_owners() {
+        let reg = BackgroundTaskRegistry::new();
+        let mk = || ProcessRequest::new("sleep", vec!["30".into()], std::env::temp_dir());
+        let active = reg
+            .spawn_owned(mk(), None, Some("session-a"))
+            .await
+            .expect("spawn active");
+        let terminal = reg
+            .spawn_owned(mk(), None, Some("session-a"))
+            .await
+            .expect("spawn terminal");
+        let other = reg
+            .spawn_owned(mk(), None, Some("session-b"))
+            .await
+            .expect("spawn other");
+        reg.kill(&terminal).await.expect("kill terminal");
+        reg.wait(
+            &terminal,
+            Some(Duration::from_secs(5)),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("terminal settles");
+
+        let snapshots = reg.active_snapshots_for_scope("session-a").await;
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, active);
+        assert!(snapshots[0].status.is_active());
+
+        for id in [&active, &other] {
+            let _ = reg.kill(id).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lagged_lifecycle_stream_can_reconcile_from_active_snapshots() {
+        let reg = BackgroundTaskRegistry::new();
+        let mut events = reg.subscribe();
+        for _ in 0..130 {
+            let id = reg
+                .spawn_owned(
+                    ProcessRequest::new("true", vec![], std::env::temp_dir()),
+                    None,
+                    Some("session-a"),
+                )
+                .await
+                .expect("spawn");
+            reg.wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+                .await
+                .expect("settles");
+        }
+
+        assert!(matches!(
+            events.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        assert!(reg.active_snapshots_for_scope("session-a").await.is_empty());
     }
 
     /// R004 F7 / T7: kill_all reaps everything for daemon shutdown paths.
