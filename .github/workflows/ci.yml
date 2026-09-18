@@ -5,6 +5,12 @@ on:
     branches: [main, master]
   pull_request:
 
+# A newer push to the same branch/PR supersedes the run in flight: its result
+# would be stale before it finished, and it holds runners the new run needs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -27,14 +33,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Caches dependencies only (the workspace's own artifacts are pruned),
+      # falls back to the newest cache of an older Cargo.lock, and saves from
+      # main only. Caching all of `target` made each OS entry 2–3 GiB: the set
+      # overran the repository's 10 GB cache limit and evicted itself, and the
+      # Windows save alone took ~8 minutes on the critical path.
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Linux sandbox runtime
         if: runner.os == 'Linux'
