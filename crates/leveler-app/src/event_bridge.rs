@@ -84,7 +84,13 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
         ModelErrorKind::Transport | ModelErrorKind::StreamInterrupted => FailureCategory::Network,
         ModelErrorKind::Timeout => FailureCategory::Timeout,
         ModelErrorKind::Cancelled => FailureCategory::Cancelled,
-        ModelErrorKind::Other => FailureCategory::Internal,
+        ModelErrorKind::ConversationProtocol | ModelErrorKind::Other => FailureCategory::Internal,
+    };
+    // A request refused before sending is the runtime's own failure; every
+    // other kind came back from the provider call.
+    let source = match error.kind {
+        ModelErrorKind::ConversationProtocol => FailureSource::Runtime,
+        _ => FailureSource::Provider,
     };
     let retryability = match error.retryability() {
         Retryability::Safe => FailureRetryability::Safe,
@@ -113,12 +119,15 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
         FailureCategory::Network => "无法连接模型服务。",
         FailureCategory::Timeout => "模型服务未及时响应。",
         FailureCategory::Cancelled => "请求已取消。",
+        _ if error.kind == ModelErrorKind::ConversationProtocol => {
+            "内部会话协议错误，请求未发送给模型服务。"
+        }
         _ => "请求失败。",
     }
     .to_string();
     UiFailure {
         category,
-        source: FailureSource::Provider,
+        source,
         provider: error.provider.clone(),
         model: error.model().map(str::to_string),
         provider_code: error.provider_code().map(str::to_string),
@@ -1280,6 +1289,30 @@ mod bridge_tests {
         );
         assert_eq!(failure.request_id.as_deref(), Some("req_abc"));
         assert_eq!(failure.status, Some(400));
+    }
+
+    /// A request CodeLeveler refused to send because it broke the
+    /// tool-exchange invariant is an internal defect. It must not read as
+    /// "模型服务拒绝了当前请求" with a provider subtitle — the provider never
+    /// saw it.
+    #[test]
+    fn a_refused_tool_exchange_reads_as_an_internal_protocol_error() {
+        use leveler_model::{DeliveryState, ModelError, ModelErrorKind};
+        let error = ModelError::new(
+            ModelErrorKind::ConversationProtocol,
+            "internal conversation protocol error: orphan tool result",
+        )
+        .with_delivery_state(DeliveryState::NotSent)
+        .with_provider("deepseek")
+        .with_model("deepseek-flash");
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(failure.category, FailureCategory::Internal);
+        assert!(!failure.category.is_provider());
+        assert_eq!(failure.source, FailureSource::Runtime);
+        assert_eq!(failure.retryability, FailureRetryability::Never);
+        assert_eq!(failure.delivery, FailureDelivery::NotSent);
+        assert_eq!(failure.summary, "内部会话协议错误，请求未发送给模型服务。");
+        assert!(failure.detail.contains("orphan tool result"));
     }
 
     /// A failed turn's structured failure survives the durable `TaskFinished`

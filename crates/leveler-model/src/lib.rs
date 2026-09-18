@@ -21,6 +21,7 @@ pub mod protocol;
 pub mod request;
 pub mod response;
 pub mod runtime;
+pub mod tool_exchange;
 
 pub use context_accounting::{
     COMPACTION_BREADCRUMB_MARKER, CompactionRecord, ContextAccounting, ContextCategory,
@@ -43,3 +44,4 @@ pub use protocol::{
 pub use request::{ModelRef, ModelRequest, RequestMetadata, TransportPolicy};
 pub use response::ModelResponse;
 pub use runtime::{ModelEventStream, ModelRuntime, stream_from_response};
+pub use tool_exchange::{ToolExchangeViolation, validate_tool_exchange};

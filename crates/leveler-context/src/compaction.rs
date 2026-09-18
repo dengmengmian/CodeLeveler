@@ -48,73 +48,25 @@ pub(crate) const COMPACT_UPDATE_PROMPT: &str = "You are performing a CONTEXT CHE
      Keep the same sections (progress, learnings, failed approaches, constraints, next steps). \
      Be specific and cite real paths. Reply with ONLY the updated briefing.";
 
-/// Whether `assistant` requested the tool result `tool` (matches the
-/// `tool_calls` id to the result's `call_id`).
-fn assistant_owns_tool_result(assistant: &Message, tool: &Message) -> bool {
-    if assistant.role != Role::Assistant {
-        return false;
-    }
-    let result_id = tool.content.iter().find_map(|part| match part {
-        ContentPart::ToolResult { result } => Some(&result.call_id),
-        _ => None,
-    });
-    let Some(result_id) = result_id else {
-        return false;
-    };
-    assistant
-        .content
-        .iter()
-        .any(|part| matches!(part, ContentPart::ToolCall { call } if &call.id == result_id))
-}
-
-/// The first index at or after `start` where a transcript tail may legally
+/// The first index at or before `start` where a transcript tail may legally
 /// begin.
 ///
-/// A `role: tool` message is valid only directly after the assistant message
-/// whose `tool_calls` it answers; providers reject an orphan with "role 'tool'
-/// must be a response to a preceding message with 'tool_calls'". A tail bounded
-/// by message count or token budget can land in the middle of that pair, so
-/// every slice of a transcript passes through here. Backs up to the owning
-/// assistant when it is still inside the slice; when no owner is reachable (the
-/// run begins at the slice's own start), the unanswerable results are dropped
-/// instead of sent.
+/// A tool exchange — an assistant `tool_calls` message and the tool message(s)
+/// answering it — is one unit: every provider rejects a `role: tool` message
+/// whose `tool_calls` are not directly before it. A tail bounded by message
+/// count or token budget can land inside an exchange, so every slice of a
+/// transcript passes through here and moves back over the exchange's results
+/// to the assistant that opened it.
+///
+/// It never moves forward past a result. A leading result the input itself
+/// cannot pair is left in place for the provider boundary to refuse; dropping
+/// it here would hide whatever built that input wrong.
 pub fn round_boundary(messages: &[Message], start: usize) -> usize {
     let mut start = start.min(messages.len());
-    // Step down over a run of results to the assistant that requested them.
-    while start > 0
-        && start < messages.len()
-        && messages[start].role == Role::Tool
-        && !assistant_owns_tool_result(&messages[start - 1], &messages[start])
-    {
+    while start > 0 && start < messages.len() && messages[start].role == Role::Tool {
         start -= 1;
-    }
-    if start > 0 && start < messages.len() && messages[start].role == Role::Tool {
-        start -= 1;
-    }
-    // No owning assistant was reachable: drop the orphans rather than send them.
-    while start < messages.len() && messages[start].role == Role::Tool {
-        start += 1;
     }
     start
-}
-
-/// Append `tail` to `out` without emitting an orphaned tool result.
-///
-/// A snapshot and a transcript tail are joined at a watermark that can fall
-/// between an assistant `tool_calls` message and its results. A leading result
-/// is kept only when `out` already ends with the assistant that owns it;
-/// otherwise it is dropped rather than sent to a provider that rejects it.
-pub fn append_tool_safe(out: &mut Vec<Message>, tail: &[Message]) {
-    let mut start = 0;
-    while start < tail.len()
-        && tail[start].role == Role::Tool
-        && !out
-            .last()
-            .is_some_and(|previous| assistant_owns_tool_result(previous, &tail[start]))
-    {
-        start += 1;
-    }
-    out.extend_from_slice(&tail[start..]);
 }
 
 /// The head/middle/tail split for compaction: `(head_end, tail_start)`, or None
@@ -583,29 +535,76 @@ mod span_tests {
     }
 
     #[test]
-    fn round_boundary_drops_a_result_whose_owner_is_outside_the_slice() {
-        let msgs = vec![tool_result("c1"), msg(Role::User, "task")];
-        assert_eq!(round_boundary(&msgs, 0), 1);
+    fn round_boundary_keeps_a_multi_call_exchange_whole() {
+        let mut call = assistant_call("a", "read");
+        call.content.extend(assistant_call("b", "read").content);
+        let msgs = vec![
+            msg(Role::User, "task"),
+            call,
+            tool_result("a"),
+            tool_result("b"),
+            msg(Role::Assistant, "done"),
+        ];
+        // A cut on either result moves back to the call that opened them.
+        assert_eq!(round_boundary(&msgs, 2), 1);
+        assert_eq!(round_boundary(&msgs, 3), 1);
+        leveler_model::validate_tool_exchange(&msgs[round_boundary(&msgs, 3)..])
+            .expect("the trimmed tail keeps the exchange whole");
+        // A cut that is already on a round boundary stays put.
+        assert_eq!(round_boundary(&msgs, 4), 4);
     }
 
+    /// A result whose call is not in the input at all cannot be paired by
+    /// moving the cut. The boundary does not skip it — skipping would drop
+    /// history nobody can account for — so the sequence stays invalid and the
+    /// provider boundary refuses it.
     #[test]
-    fn append_tool_safe_keeps_an_owned_result_and_drops_an_orphan() {
-        // The snapshot already ends with the assistant call → its result is legal.
-        let mut owned = vec![assistant_call("c1", "read")];
-        append_tool_safe(&mut owned, &[tool_result("c1"), msg(Role::User, "next")]);
-        assert_eq!(owned[1].role, Role::Tool);
+    fn round_boundary_never_skips_a_result_it_cannot_pair() {
+        let msgs = vec![tool_result("c1"), msg(Role::User, "task")];
+        assert_eq!(round_boundary(&msgs, 0), 0);
+        assert_eq!(round_boundary(&msgs, 1), 1);
+    }
 
-        // Without the owner in `out`, the leading result is dropped, not sent.
-        let mut orphan = vec![msg(Role::User, "task")];
-        append_tool_safe(
-            &mut orphan,
-            &[tool_result("c9"), msg(Role::Assistant, "done")],
-        );
-        assert!(
-            orphan.iter().all(|m| m.role != Role::Tool),
-            "orphaned result must not reach the request: {orphan:?}"
-        );
-        assert_eq!(orphan[1].role, Role::Assistant);
+    /// Every count window and token budget, over a transcript mixing
+    /// single- and multi-call rounds with large results: the fold keeps each
+    /// exchange whole, so its output always satisfies the provider-bound
+    /// tool-exchange invariant.
+    #[test]
+    fn every_fold_of_a_tool_transcript_keeps_exchanges_whole() {
+        let mut msgs = vec![msg(Role::System, "sys"), msg(Role::User, "task")];
+        for round in 0..8 {
+            let ids: Vec<String> = (0..=round % 3).map(|k| format!("r{round}_{k}")).collect();
+            let mut call = assistant_call(&ids[0], "read");
+            for id in &ids[1..] {
+                call.content.extend(assistant_call(id, "read").content);
+            }
+            msgs.push(call);
+            // Alternate one grouped result message with one message per result.
+            if round % 2 == 0 {
+                let mut grouped = tool_result(&ids[0]);
+                for id in &ids[1..] {
+                    grouped.content.extend(tool_result(id).content);
+                }
+                msgs.push(grouped);
+            } else {
+                msgs.extend(ids.iter().map(|id| tool_result(id)));
+            }
+            if round == 4 {
+                msgs.push(msg(Role::Assistant, "midway"));
+                msgs.push(msg(Role::User, "keep going"));
+            }
+        }
+        msgs.push(msg(Role::Assistant, "done"));
+        leveler_model::validate_tool_exchange(&msgs).expect("the input is valid");
+
+        for keep in 1..=msgs.len() {
+            for tokens in [0u64, 1, 5, 20, 80] {
+                let folded = compact_messages(&msgs, keep, tokens, Some("brief"), Some("task"));
+                if let Err(violation) = leveler_model::validate_tool_exchange(&folded) {
+                    panic!("keep={keep} tokens={tokens}: {violation}");
+                }
+            }
+        }
     }
 
     #[test]

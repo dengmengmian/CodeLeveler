@@ -39,6 +39,10 @@ pub enum ModelErrorKind {
     Timeout,
     /// The request was cancelled by the caller.
     Cancelled,
+    /// CodeLeveler built a message sequence that breaks the tool-exchange
+    /// invariant, and refused to send it. An internal defect, not a provider
+    /// rejection: the request never left this process.
+    ConversationProtocol,
     /// Anything not covered above.
     Other,
 }
@@ -281,6 +285,7 @@ impl ModelError {
             | K::Truncated
             | K::ContentFiltered
             | K::Cancelled
+            | K::ConversationProtocol
             | K::Other => return Retryability::Never,
             K::RateLimit
             | K::ProviderUnavailable

@@ -176,6 +176,21 @@ impl ProviderRegistry {
     }
 }
 
+/// The provider-bound tool-exchange invariant, checked once for every
+/// protocol before anything is encoded. A sequence that breaks it was built
+/// wrong inside CodeLeveler; sending it would only turn that defect into a
+/// provider 400 that reads like the provider's fault. It is refused as a
+/// typed internal error and never repaired here.
+fn refuse_broken_tool_exchange(request: &ModelRequest) -> Result<(), ModelError> {
+    leveler_model::validate_tool_exchange(&request.messages).map_err(|violation| {
+        ModelError::new(
+            ModelErrorKind::ConversationProtocol,
+            format!("internal conversation protocol error: {violation}"),
+        )
+        .with_delivery_state(leveler_model::DeliveryState::NotSent)
+    })
+}
+
 #[async_trait]
 impl ModelRuntime for ProviderRegistry {
     async fn stream(
@@ -194,6 +209,7 @@ impl ModelRuntime for ProviderRegistry {
             let entry = self.entry(&request.model)?;
             let mut context = self.context(provider, &entry.profile);
 
+            refuse_broken_tool_exchange(&request)?;
             let encoded = provider
                 .adapter
                 .encode_request(&request, &context, true)
@@ -250,6 +266,7 @@ impl ModelRuntime for ProviderRegistry {
             let entry = self.entry(&request.model)?;
             let mut context = self.context(provider, &entry.profile);
 
+            refuse_broken_tool_exchange(&request)?;
             let encoded = provider
                 .adapter
                 .encode_request(&request, &context, false)

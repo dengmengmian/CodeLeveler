@@ -31,14 +31,14 @@ fn default_registry() -> leveler_tools::ToolRegistry {
 }
 
 struct MockRuntime {
-    responses: Mutex<VecDeque<ModelResponse>>,
+    responses: Arc<Mutex<VecDeque<ModelResponse>>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
 }
 
 impl MockRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
         Self {
-            responses: Mutex::new(VecDeque::from(responses)),
+            responses: Arc::new(Mutex::new(VecDeque::from(responses))),
             requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -133,6 +133,7 @@ struct Harness {
     db: Database,
     dir: tempfile::TempDir,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
+    responses: Arc<Mutex<VecDeque<ModelResponse>>>,
 }
 
 async fn harness(responses: Vec<ModelResponse>) -> Harness {
@@ -143,6 +144,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let runtime = Arc::new(MockRuntime::new(responses));
     let requests = runtime.requests.clone();
+    let responses = runtime.responses.clone();
     let db = Database::connect_in_memory().await.unwrap();
     let engine = CodingRuntime {
         engine: TaskEngine {
@@ -180,6 +182,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         db,
         dir,
         requests,
+        responses,
     }
 }
 
@@ -1156,4 +1159,308 @@ fn no_engine_path_hands_a_model_an_unassembled_transcript() {
         "every path that supplies prior context assembles it: {paths} \
          turn-input path(s) against {assemblies} assembly call(s)"
     );
+}
+
+/// One tool round as the runtime persists it: the assistant `tool_calls`
+/// message and the tool message answering it.
+fn tool_round_payloads(id: &str, pad: &str) -> [String; 2] {
+    let call = Message {
+        role: Role::Assistant,
+        content: vec![ContentPart::ToolCall {
+            call: ToolCall {
+                id: ToolCallId::new(id),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            },
+        }],
+    };
+    let result = Message {
+        role: Role::Tool,
+        content: vec![ContentPart::ToolResult {
+            result: leveler_model::ToolResultContent {
+                call_id: ToolCallId::new(id),
+                content: format!("{id} {pad}"),
+                is_error: false,
+            },
+        }],
+    };
+    [
+        serde_json::to_string(&call).unwrap(),
+        serde_json::to_string(&result).unwrap(),
+    ]
+}
+
+/// Every request the model saw satisfies the provider-bound tool-exchange
+/// invariant.
+fn assert_every_request_pairs_tool_results(requests: &[ModelRequest]) {
+    for (n, request) in requests.iter().enumerate() {
+        if let Err(violation) = leveler_model::validate_tool_exchange(&request.messages) {
+            let roles: Vec<Role> = request.messages.iter().map(|m| m.role).collect();
+            panic!("request {n} breaks the tool-exchange invariant: {violation}; roles: {roles:?}");
+        }
+    }
+}
+
+/// The DeepSeek 400 "Messages with role 'tool' must be a response to a
+/// preceding message with 'tool_calls'" as it happened in session 26fc1890:
+///
+/// 1. A long tool-heavy session compacts and persists a snapshot watermarked
+///    at transcript ordinal `n`.
+/// 2. More tool rounds follow, so the next turn's transcript provably cannot
+///    fit and `load_bounded` reads only the rows from `n` (offset `n`).
+/// 3. The merge indexed that offset-loaded tail with the ABSOLUTE watermark,
+///    missed, fell back to "snapshot + last 12 raw messages", and the 12th-
+///    from-last message was a tool result whose `tool_calls` were cut off.
+///
+/// Every request the next turn makes must still pair each result with its
+/// call, and the tail after the snapshot must not be lost.
+#[tokio::test]
+async fn a_bounded_load_after_a_watermarked_snapshot_never_sends_an_orphan_tool_result() {
+    let h = harness(vec![
+        text("SUMMARY_ONE"),
+        text("turn one answer"),
+        text("SUMMARY_TWO"),
+        text("turn two answer"),
+        text("spare"),
+    ])
+    .await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let pad = "tool-output-line-with-enough-bytes-to-matter ".repeat(40);
+
+    // 1. A tool-heavy history over the pre-request threshold.
+    let mut payloads = vec![serde_json::to_string(&Message::text(Role::User, "ship it")).unwrap()];
+    for i in 0..60 {
+        payloads.extend(tool_round_payloads(&format!("early_{i}"), &pad));
+    }
+    MessageRepository::new(&h.db)
+        .append(&session, &payloads, leveler_core::now())
+        .await
+        .unwrap();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "turn one".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn one");
+    let watermark = {
+        let stores = leveler_storage::EngineStores::from_database(&h.db);
+        let log = leveler_engine::EventLog::new(stores.events.as_ref(), session.clone());
+        log.latest_context_snapshot(None)
+            .await
+            .unwrap()
+            .and_then(|view| view.through_ordinal)
+            .expect("turn one persisted a watermarked snapshot")
+    };
+
+    // 2. More tool rounds after the watermark. The last 12 messages begin on a
+    //    tool result: 40 rounds and a closing answer.
+    let mut tail = vec![serde_json::to_string(&Message::text(Role::User, "push it")).unwrap()];
+    for i in 0..40 {
+        tail.extend(tool_round_payloads(&format!("late_{i}"), &pad));
+    }
+    tail.push(serde_json::to_string(&Message::text(Role::Assistant, "LATE_TAIL_DONE")).unwrap());
+    MessageRepository::new(&h.db)
+        .append(&session, &tail, leveler_core::now())
+        .await
+        .unwrap();
+    let stored = MessageRepository::new(&h.db).count(&session).await.unwrap();
+    assert!(stored > watermark, "the tail post-dates the snapshot");
+
+    let before = h.requests.lock().unwrap().len();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "turn two".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn two");
+
+    let requests = h.requests.lock().unwrap();
+    assert!(requests.len() > before, "turn two made a request");
+    assert_every_request_pairs_tool_results(&requests[before..]);
+    let last = requests.last().unwrap();
+    assert!(
+        request_blob(last).contains("turn two"),
+        "the last request is turn two's own"
+    );
+}
+
+/// Session 26fc1890's state after the failure: the pre-fix merge persisted
+/// its own orphan-carrying context as the latest snapshot, watermarked with
+/// the LOCAL length of a bounded load (74) instead of the transcript ordinal.
+/// Every later turn loaded that snapshot and failed the same way. The
+/// snapshot is a derived view and the transcript is intact, so the next turn
+/// must be served from the transcript and pair every result.
+#[tokio::test]
+async fn a_persisted_snapshot_carrying_an_orphan_does_not_poison_later_turns() {
+    let h = harness(vec![text("SUMMARY"), text("turn answer"), text("spare")]).await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let pad = "tool-output-line-with-enough-bytes-to-matter ".repeat(40);
+
+    let mut payloads = vec![serde_json::to_string(&Message::text(Role::User, "ship it")).unwrap()];
+    for i in 0..100 {
+        payloads.extend(tool_round_payloads(&format!("r_{i}"), &pad));
+    }
+    MessageRepository::new(&h.db)
+        .append(&session, &payloads, leveler_core::now())
+        .await
+        .unwrap();
+
+    // Ordinal 74 is a tool result in this transcript: a load bounded there
+    // would itself open on an orphan.
+    assert!(payloads[74].contains("\"tool_result\""));
+    let poisoned = vec![
+        Message::text(Role::User, "summary"),
+        serde_json::from_str::<Message>(&payloads[74]).unwrap(),
+        Message::text(Role::Assistant, "after"),
+    ];
+    assert!(leveler_model::validate_tool_exchange(&poisoned).is_err());
+    let stores = leveler_storage::EngineStores::from_database(&h.db);
+    leveler_engine::EventLog::new(stores.events.as_ref(), session.clone())
+        .append(
+            None,
+            EngineEvent::ContextSnapshot {
+                messages: poisoned,
+                through_ordinal: Some(74),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+    let before = h.requests.lock().unwrap().len();
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "next turn".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the next turn runs");
+    let requests = h.requests.lock().unwrap();
+    assert!(requests.len() > before);
+    assert_every_request_pairs_tool_results(&requests[before..]);
+}
+
+/// One assistant turn calling `read_file` once per id — a parallel round.
+fn tool_calls(ids: &[&str]) -> ModelResponse {
+    let mut response = tool_call(
+        ids[0],
+        "read_file",
+        serde_json::json!({"path": "src/lib.rs"}),
+    );
+    for id in &ids[1..] {
+        response.message.content.push(ContentPart::ToolCall {
+            call: ToolCall {
+                id: ToolCallId::new(*id),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            },
+        });
+    }
+    response
+}
+
+/// The ordinary lifecycle, driven through the real runtime with real tool
+/// execution: single and parallel tool rounds, a follow-up turn over that
+/// history, a provider failure after a tool round, the user's retry, and an
+/// explicit resume. Every request the model sees pairs every result with its
+/// call, and the rounds before the failure stay in the history.
+#[tokio::test]
+async fn tool_rounds_stay_paired_across_follow_up_failure_retry_and_resume() {
+    let h = harness(vec![
+        tool_calls(&["single_1"]),
+        tool_calls(&["multi_a", "multi_b"]),
+        text("first answer"),
+    ])
+    .await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+    let chat = |text: &'static str| {
+        let h = &h;
+        let s = &s;
+        let session = session.clone();
+        async move {
+            h.engine
+                .chat(
+                    &session,
+                    s,
+                    vec![ContentPart::Text { text: text.into() }],
+                    &mut |_| {},
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    };
+
+    chat("turn one").await.expect("turn one");
+
+    // Follow-up turn over the tool history, then a provider failure right
+    // after its own tool round (the script runs dry: a non-retryable error).
+    h.responses
+        .lock()
+        .unwrap()
+        .extend([text("follow-up answer"), tool_calls(&["before_failure"])]);
+    chat("turn two").await.expect("turn two");
+    let _ = chat("turn three fails").await;
+
+    // The user retries; then the session is resumed explicitly.
+    h.responses.lock().unwrap().push_back(text("recovered"));
+    chat("turn four retries").await.expect("retry turn");
+    SessionRepository::new(&h.db)
+        .set_execution(
+            &session,
+            "assisted",
+            false,
+            ExecutionKind::Direct.as_str(),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    SessionRepository::new(&h.db)
+        .set_outcome(&session, TaskOutcome::Interrupted, leveler_core::now())
+        .await
+        .unwrap();
+    // Resume may continue for several windows; script enough answers.
+    h.responses
+        .lock()
+        .unwrap()
+        .extend((0..8).map(|_| text("resumed")));
+    h.engine
+        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("resume");
+
+    let requests = h.requests.lock().unwrap();
+    assert_every_request_pairs_tool_results(&requests);
+    let resumed = requests.last().unwrap();
+    for id in ["single_1", "multi_a", "multi_b", "before_failure"] {
+        let paired = resumed.messages.windows(2).any(|pair| {
+            let called = pair[0].content.iter().any(
+                |p| matches!(p, ContentPart::ToolCall { call } if call.id.as_str() == id),
+            );
+            let answered = pair[1].content.iter().any(
+                |p| matches!(p, ContentPart::ToolResult { result } if result.call_id.as_str() == id),
+            );
+            called && answered
+        });
+        assert!(paired, "{id} is in the resumed history with its result");
+    }
 }

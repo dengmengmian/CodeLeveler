@@ -517,6 +517,62 @@ mod tests {
         assert_eq!(messages[3]["content"][0]["type"], "text");
     }
 
+    /// A multi-call round: every `tool_use` of one assistant turn is answered
+    /// by the next user turn's `tool_result` blocks, same ids, same order.
+    #[test]
+    fn a_multi_call_round_pairs_tool_use_with_tool_result_blocks() {
+        let calls = ["tu_a", "tu_b"];
+        let req = ModelRequest::new(
+            ModelRef::new("anthropic", "claude-sonnet-5"),
+            vec![
+                Message::text(Role::User, "go"),
+                Message {
+                    role: Role::Assistant,
+                    content: calls
+                        .iter()
+                        .map(|id| ContentPart::ToolCall {
+                            call: ToolCall {
+                                id: ToolCallId::new(*id),
+                                name: "read_file".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                        })
+                        .collect(),
+                },
+                Message {
+                    role: Role::Tool,
+                    content: calls
+                        .iter()
+                        .map(|id| ContentPart::ToolResult {
+                            result: leveler_model::ToolResultContent {
+                                call_id: ToolCallId::new(*id),
+                                content: "ok".into(),
+                                is_error: false,
+                            },
+                        })
+                        .collect(),
+                },
+            ],
+        );
+        let enc = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap();
+        let messages = enc.body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "{messages:#?}");
+        let ids = |m: &serde_json::Value, key: &str| -> Vec<String> {
+            m["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b[key].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(ids(&messages[1], "id"), calls);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(ids(&messages[2], "tool_use_id"), calls);
+    }
+
     #[test]
     fn tool_result_becomes_a_user_tool_result_block() {
         let req = ModelRequest::new(

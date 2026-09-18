@@ -977,6 +977,9 @@ fn infrastructure_cause_from_model_error(
         // Wire/protocol contract violations: the provider rejected the request
         // as invalid, or sent a body we could not decode.
         K::InvalidRequest | K::Decode => Some(leveler_eval::FailureCategory::ProviderProtocol),
+        // CodeLeveler refused its own malformed request before sending it:
+        // a framework failure, like any other internal one.
+        K::ConversationProtocol => Some(leveler_eval::FailureCategory::Runtime),
         // Reachability, credentials, and provider-side behavior: the
         // environment around the run, not the protocol contract.
         K::Auth

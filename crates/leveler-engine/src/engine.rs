@@ -74,14 +74,16 @@ pub(crate) fn merge_prior_messages(
     }
 
     let base = match snapshot {
+        Some(view) if !snapshot_is_usable(&view) => raw,
         Some(view) if !view.messages.is_empty() => match view.through_ordinal {
             Some(n) => match n.checked_sub(raw_offset) {
                 // Exact watermark: everything after transcript ordinal `n`
-                // post-dates the snapshot. The join only keeps a leading tool
-                // result when the snapshot already ends with its assistant.
+                // post-dates the snapshot. The tail is appended as-is: a join
+                // that opens on a result the snapshot does not own is refused
+                // at the provider boundary, never repaired here.
                 Some(local) if local as usize <= raw.len() => {
                     let mut out = view.messages;
-                    leveler_context::append_tool_safe(&mut out, &raw[local as usize..]);
+                    out.extend_from_slice(&raw[local as usize..]);
                     out
                 }
                 // A watermark beyond the live transcript means the transcript
@@ -97,12 +99,16 @@ pub(crate) fn merge_prior_messages(
                     );
                     merge_snapshot_with_raw_tail(view.messages, &raw)
                 }
-                // The snapshot predates this load entirely: every loaded row
-                // post-dates it.
+                // The snapshot predates this load: the rows between its
+                // watermark and the load's start were never read. Never guess
+                // a slice here either.
                 None => {
-                    let mut out = view.messages;
-                    leveler_context::append_tool_safe(&mut out, &raw);
-                    out
+                    tracing::warn!(
+                        through_ordinal = n,
+                        raw_offset,
+                        "context snapshot watermark precedes the loaded transcript; using overlap merge"
+                    );
+                    merge_snapshot_with_raw_tail(view.messages, &raw)
                 }
             },
             None => merge_snapshot_with_raw_tail(view.messages, &raw),
@@ -166,16 +172,50 @@ fn merge_snapshot_with_raw_tail(
         for i in (0..=raw.len() - k).rev() {
             if messages_slice_eq(suffix, &raw[i..i + k]) {
                 let mut out = snap;
-                leveler_context::append_tool_safe(&mut out, &raw[i + k..]);
+                out.extend_from_slice(&raw[i + k..]);
                 return out;
             }
         }
     }
-    // No overlap (pure summary snapshot): keep snap + trailing raw window.
+    // No overlap (pure summary snapshot): keep snap + trailing raw window,
+    // widened to the round boundary so the window never opens on a result.
     let keep = leveler_context::COMPACT_KEEP_RECENT.min(raw.len());
+    let start = leveler_context::round_boundary(raw, raw.len() - keep);
     let mut out = snap;
-    leveler_context::append_tool_safe(&mut out, &raw[raw.len() - keep..]);
+    out.extend_from_slice(&raw[start..]);
     out
+}
+
+/// Whether a persisted snapshot may stand in for the transcript it was cut
+/// from. A snapshot is a derived view; one that breaks the tool-exchange
+/// invariant (a pre-fix merge wrote such views) would make every later request
+/// fail, while the transcript it came from is intact. Such a snapshot is
+/// ignored — the same path as having no snapshot — and says so.
+///
+/// The snapshot is a prefix: an exchange still open at its end is answered by
+/// the tail it is joined to, and the joined request is validated as a whole at
+/// the provider boundary.
+pub(crate) fn snapshot_is_usable(view: &SnapshotView) -> bool {
+    use leveler_model::ToolExchangeViolation::UnansweredCall;
+    let messages = &view.messages;
+    match leveler_model::validate_tool_exchange(messages) {
+        Ok(()) => true,
+        Err(UnansweredCall { index, .. })
+            if messages[index + 1..]
+                .iter()
+                .all(|m| m.role == leveler_model::Role::Tool) =>
+        {
+            true
+        }
+        Err(violation) => {
+            tracing::warn!(
+                %violation,
+                through_ordinal = view.through_ordinal,
+                "ignoring a context snapshot that breaks the tool-exchange invariant"
+            );
+            false
+        }
+    }
 }
 
 fn messages_slice_eq(a: &[leveler_model::Message], b: &[leveler_model::Message]) -> bool {
@@ -560,9 +600,12 @@ impl TaskEngine {
         strict: Option<&str>,
     ) -> Result<crate::RawTranscript, EngineError> {
         let threshold = leveler_context::PRE_REQUEST_COMPACT_THRESHOLD;
+        // An unusable snapshot bounds nothing: the merge will not use it, so
+        // the rows before its watermark are still reachable.
         let snapshot_ordinal = EventLog::new(self.stores.events.as_ref(), session_id.clone())
             .latest_context_snapshot(None)
             .await?
+            .filter(snapshot_is_usable)
             .and_then(|view| view.through_ordinal);
         crate::RawTranscript::load_bounded(
             self.stores.messages.as_ref(),
@@ -673,22 +716,86 @@ mod multi_turn_session_tests {
         }
     }
 
-    /// A bounded load starts after the assistant that requested its first
-    /// result; the join must drop that unanswerable result rather than emit
-    /// the orphan DeepSeek rejects with "role 'tool' must follow 'tool_calls'".
+    /// The incident join (session 26fc1890): the transcript was loaded from
+    /// the snapshot's own watermark, so `raw[0]` IS ordinal `n`. The absolute
+    /// watermark rebased by the offset appends the whole post-snapshot tail.
     #[test]
-    fn a_bounded_load_never_joins_an_orphaned_tool_result() {
+    fn a_bounded_load_joins_the_tail_at_the_absolute_watermark() {
+        let raw = vec![
+            msg(Role::User, "push it"),
+            assistant_call("c1"),
+            tool_result("c1"),
+            msg(Role::Assistant, "after"),
+        ];
+        let snap = SnapshotView {
+            messages: vec![msg(Role::User, "summary")],
+            through_ordinal: Some(170),
+        };
+        let (out, _) = merge_prior_messages(raw.clone(), 170, Some(snap), 0);
+        assert_eq!(out[1..], raw[..], "the whole tail follows the snapshot");
+        leveler_model::validate_tool_exchange(&out).expect("pairs intact");
+    }
+
+    /// A join whose tail begins on a result the snapshot does not own is a
+    /// broken input, not a boundary to smooth over: the result is kept, so the
+    /// provider boundary refuses the request instead of sending a history
+    /// with an unexplained hole.
+    #[test]
+    fn an_unpairable_join_is_not_silently_repaired() {
         let raw = vec![tool_result("c1"), msg(Role::Assistant, "after")];
         let snap = SnapshotView {
             messages: vec![msg(Role::User, "summary")],
             through_ordinal: Some(2),
         };
         let (out, _) = merge_prior_messages(raw, 2, Some(snap), 0);
-        assert!(
-            out.iter().all(|m| m.role != Role::Tool),
-            "orphaned result leaked into the request: {out:?}"
+        assert_eq!(out[1].role, Role::Tool, "nothing dropped: {out:?}");
+        assert!(leveler_model::validate_tool_exchange(&out).is_err());
+    }
+
+    /// The watermark-less fallback keeps the last `COMPACT_KEEP_RECENT` raw
+    /// messages. When that count lands on a result, the exchange is kept whole
+    /// — the pre-fix fallback started the tail on the orphaned result.
+    #[test]
+    fn the_overlap_fallback_keeps_the_exchange_at_its_count_boundary() {
+        let mut raw = vec![msg(Role::User, "task")];
+        for i in 0..6 {
+            raw.push(assistant_call(&format!("c{i}")));
+            raw.push(tool_result(&format!("c{i}")));
+        }
+        raw.push(msg(Role::Assistant, "done"));
+        assert_eq!(raw.len() - leveler_context::COMPACT_KEEP_RECENT, 2);
+        assert_eq!(raw[2].role, Role::Tool, "the count lands on a result");
+        let snap = SnapshotView {
+            messages: vec![msg(Role::User, "summary with no overlap")],
+            through_ordinal: None,
+        };
+        let (out, _) = merge_prior_messages(raw.clone(), 0, Some(snap), 0);
+        leveler_model::validate_tool_exchange(&out).expect("fallback tail pairs");
+        assert_eq!(
+            out[1..],
+            raw[1..],
+            "tail begins on the call, not its result"
         );
-        assert!(out.iter().any(|m| m.text_content() == "after"));
+    }
+
+    /// A persisted snapshot that itself breaks the tool-exchange invariant
+    /// (written by the pre-fix merge) is a derived view that can no longer be
+    /// trusted. The merge uses the transcript it was derived from instead —
+    /// exactly the no-snapshot path — rather than sending it.
+    #[test]
+    fn a_snapshot_that_breaks_the_invariant_is_not_used() {
+        let raw = vec![
+            msg(Role::User, "task"),
+            assistant_call("c1"),
+            tool_result("c1"),
+            msg(Role::Assistant, "done"),
+        ];
+        let poisoned = SnapshotView {
+            messages: vec![msg(Role::User, "summary"), tool_result("c0")],
+            through_ordinal: Some(0),
+        };
+        let (out, _) = merge_prior_messages(raw.clone(), 0, Some(poisoned), 0);
+        assert_eq!(out, raw, "the transcript, not the poisoned snapshot");
     }
 
     /// The same join keeps a result the snapshot already ends with — the

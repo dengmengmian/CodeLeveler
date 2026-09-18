@@ -523,6 +523,7 @@ mod retry_decision_tests {
         error: ModelError,
         fail_times: u32,
         calls: Arc<Mutex<u32>>,
+        seen: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
     #[async_trait::async_trait]
@@ -536,9 +537,10 @@ mod retry_decision_tests {
         }
         async fn stream(
             &self,
-            _r: ModelRequest,
+            r: ModelRequest,
             _c: CancellationToken,
         ) -> Result<leveler_model::ModelEventStream, ModelError> {
+            self.seen.lock().unwrap().push(r);
             let n = {
                 let mut c = self.calls.lock().unwrap();
                 *c += 1;
@@ -667,6 +669,7 @@ mod retry_decision_tests {
             error,
             fail_times,
             calls: calls.clone(),
+            seen: Arc::default(),
         };
         let result = run_model_round_with(
             &runtime,
@@ -700,6 +703,76 @@ mod retry_decision_tests {
                 },
             },
         )
+    }
+
+    /// A retry re-sends the round's request as built — the tool exchange in
+    /// it is not rebuilt, trimmed or reordered between attempts.
+    #[tokio::test]
+    async fn a_retried_round_resends_the_same_tool_exchange() {
+        let exchange = vec![
+            Message::text(Role::User, "hi"),
+            Message {
+                role: Role::Assistant,
+                content: ["a", "b"]
+                    .iter()
+                    .map(|id| leveler_model::ContentPart::ToolCall {
+                        call: leveler_model::ToolCall {
+                            id: leveler_core::ToolCallId::new(*id),
+                            name: "read_file".into(),
+                            arguments: serde_json::json!({}),
+                        },
+                    })
+                    .collect(),
+            },
+            Message {
+                role: Role::Tool,
+                content: ["a", "b"]
+                    .iter()
+                    .map(|id| leveler_model::ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: leveler_core::ToolCallId::new(*id),
+                            content: "ok".into(),
+                            is_error: false,
+                        },
+                    })
+                    .collect(),
+            },
+        ];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runtime = FlakyRuntime {
+            error: not_sent(),
+            fail_times: 1,
+            calls: Arc::default(),
+            seen: seen.clone(),
+        };
+        let request = ModelRequest::new(ModelRef::new("mock", "m"), exchange.clone());
+        let result = run_model_round_with(
+            &runtime,
+            request,
+            &CancellationToken::new(),
+            &mut |_| {},
+            instant_policy(),
+        )
+        .await;
+        assert!(result.is_ok());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one failure, one retry");
+        for attempt in seen.iter() {
+            assert_eq!(attempt.messages, exchange);
+            leveler_model::validate_tool_exchange(&attempt.messages).expect("paired");
+        }
+    }
+
+    /// A request refused for breaking the tool-exchange invariant never left
+    /// the process, yet re-sending it cannot help: it is not retried.
+    #[tokio::test]
+    async fn a_refused_tool_exchange_is_never_retried() {
+        let error = ModelError::new(ModelErrorKind::ConversationProtocol, "orphan tool result")
+            .with_delivery_state(DeliveryState::NotSent);
+        let mut events = Vec::new();
+        let (result, calls) = run(error, 100, &CancellationToken::new(), &mut events).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "an internal protocol error is terminal: {calls}");
     }
 
     /// P0-1: once output exists, re-POSTing the whole request is a REPLAY.
@@ -921,6 +994,7 @@ mod retry_decision_tests {
             error,
             fail_times: 1,
             calls: calls.clone(),
+            seen: Arc::default(),
         };
         let policy = RetryPolicy {
             max_retries: MAX_RETRIES,
@@ -953,6 +1027,7 @@ mod retry_decision_tests {
             error: not_sent(),
             fail_times: 1_000,
             calls: calls.clone(),
+            seen: Arc::default(),
         };
         let canceller = cancel.clone();
         tokio::spawn(async move {

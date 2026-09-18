@@ -646,3 +646,144 @@ async fn the_two_policies_do_not_share_a_watchdog() {
     assert!(patient_result.is_ok(), "{patient_result:?}");
     assert!(ordinary_result.is_err(), "{ordinary_result:?}");
 }
+
+fn tool_call_message(ids: &[&str]) -> leveler_model::Message {
+    leveler_model::Message {
+        role: Role::Assistant,
+        content: ids
+            .iter()
+            .map(|id| leveler_model::ContentPart::ToolCall {
+                call: leveler_model::ToolCall {
+                    id: leveler_core::ToolCallId::new(*id),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "a.rs"}),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn tool_result_message(ids: &[&str]) -> leveler_model::Message {
+    leveler_model::Message {
+        role: Role::Tool,
+        content: ids
+            .iter()
+            .map(|id| leveler_model::ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new(*id),
+                    content: format!("result {id}"),
+                    is_error: false,
+                },
+            })
+            .collect(),
+    }
+}
+
+fn request_with(messages: Vec<leveler_model::Message>) -> ModelRequest {
+    ModelRequest::new(ModelRef::new("mock", "m"), messages)
+}
+
+fn assert_refused_before_send(error: &leveler_model::ModelError, needle: &str) {
+    assert_eq!(
+        error.kind,
+        leveler_model::ModelErrorKind::ConversationProtocol,
+        "{error}"
+    );
+    assert_eq!(error.delivery_state, leveler_model::DeliveryState::NotSent);
+    assert_eq!(error.retryability(), leveler_model::Retryability::Never);
+    assert!(error.message.contains(needle), "{}", error.message);
+}
+
+/// The DeepSeek 400 "Messages with role 'tool' must be a response to a
+/// preceding message with 'tool_calls'" is a CodeLeveler defect when it
+/// happens. The registry is the one provider boundary; an orphan result is
+/// refused there, typed as an internal protocol error, and never sent.
+#[tokio::test]
+async fn an_orphan_tool_result_is_refused_before_it_is_sent() {
+    let server = MockServer::start_one(MockResponse::sse(&[
+        r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+    ]))
+    .await;
+    let reg = registry(&server);
+    let orphan = || {
+        request_with(vec![
+            leveler_model::Message::text(Role::User, "hi"),
+            leveler_model::Message::text(Role::Assistant, "sure"),
+            tool_result_message(&["call_orphan"]),
+        ])
+    };
+
+    let Err(streamed) = reg.stream(orphan(), CancellationToken::new()).await else {
+        panic!("stream must refuse an orphan tool result");
+    };
+    assert_refused_before_send(&streamed, "call_orphan");
+    assert_eq!(streamed.provider.as_deref(), Some("mock"));
+
+    let generated = reg
+        .generate(orphan(), CancellationToken::new())
+        .await
+        .expect_err("generate must refuse an orphan tool result");
+    assert_refused_before_send(&generated, "call_orphan");
+
+    assert_eq!(server.request_count(), 0, "nothing reached the provider");
+}
+
+#[tokio::test]
+async fn a_mismatched_tool_call_id_is_refused_before_it_is_sent() {
+    let server = MockServer::start_one(MockResponse::sse(&[
+        r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+    ]))
+    .await;
+    let reg = registry(&server);
+    let request = request_with(vec![
+        leveler_model::Message::text(Role::User, "hi"),
+        tool_call_message(&["call_a"]),
+        tool_result_message(&["call_b"]),
+    ]);
+    let Err(error) = reg.stream(request, CancellationToken::new()).await else {
+        panic!("a result for a call nobody made must be refused");
+    };
+    assert_refused_before_send(&error, "call_b");
+    assert_eq!(server.request_count(), 0);
+}
+
+/// A valid multi-call round reaches the Chat Completions wire as one
+/// `assistant.tool_calls` followed by one `role: tool` per call, in order.
+#[tokio::test]
+async fn a_multi_call_round_reaches_the_wire_paired() {
+    let server = MockServer::start_one(MockResponse::sse(&[
+        r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+    ]))
+    .await;
+    let reg = registry(&server);
+    let request = request_with(vec![
+        leveler_model::Message::text(Role::User, "hi"),
+        tool_call_message(&["call_a", "call_b"]),
+        tool_result_message(&["call_a", "call_b"]),
+        leveler_model::Message::text(Role::Assistant, "done"),
+        leveler_model::Message::text(Role::User, "again"),
+    ]);
+    let stream = reg.stream(request, CancellationToken::new()).await.unwrap();
+    let _ = collect(stream).await;
+
+    let bodies = server.request_bodies().await;
+    let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "tool", "tool", "assistant", "user"]
+    );
+    let call_ids: Vec<&str> = messages[1]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(call_ids, ["call_a", "call_b"]);
+    assert_eq!(messages[2]["tool_call_id"], "call_a");
+    assert_eq!(messages[3]["tool_call_id"], "call_b");
+}
