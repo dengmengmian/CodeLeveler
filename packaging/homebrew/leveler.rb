@@ -1,11 +1,7 @@
 class Leveler < Formula
   desc "Local-first coding agent CLI: terminal UI, typed tools, resumable sessions"
   homepage "https://github.com/dengmengmian/CodeLeveler"
-  # Tracks the latest STABLE release. Betas are published as GitHub
-  # pre-releases and are installed by name
-  # (`LEVELER_VERSION=v0.1.0-beta.1 … install.sh`), never through this tap:
-  # `livecheck`'s :github_latest skips pre-releases by design.
-  version "0.1.4"
+  version "1.0.0"
   license "Apache-2.0"
 
   livecheck do
@@ -13,30 +9,20 @@ class Leveler < Formula
     strategy :github_latest
   end
 
-  # Release archives are `leveler-v<version>-<triple>.tar.gz`, each unpacking to
-  # a single `leveler-v<version>-<triple>/` dir holding the `leveler` binary.
-  # Homebrew strips that single top-level dir, so `bin.install "leveler"` works.
-  #
-  # SHA256s below are placeholders. After a release is published, regenerate this
-  # file with `packaging/homebrew/update-formula.sh v<version>` (it pulls the
-  # real digests from the release's *.sha256 assets), then copy it into the tap's
-  # Formula/leveler.rb.
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "1e2a751c9b278a353339a3d0e0955cdc7c6f1117ec48854d693b3040fabce578"
     else
       url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "d0d8b23940868cf53a54bea4fd4fe650f62acf9d3a50c96a0a06375c1f3905c0"
     end
   end
 
   on_linux do
-    # Only x86_64 Linux has a prebuilt binary; arm64 Linux builds from source
-    # via `cargo install` (see the README) or `brew install --build-from-source`.
     on_intel do
       url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "3ed2880f84e842dd50b56b845901ec1166049887dc9939ce8206b35a00617bd1"
     end
   end
 

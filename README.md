@@ -34,9 +34,25 @@ leveler run "find the failing tests and fix them"
 
 ## Install
 
+### Install script (macOS, Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh | sh
+```
+
+It picks the archive for your platform from the latest stable release, refuses to install unless the SHA-256 checksum matches, and puts `leveler` in `~/.local/bin` (override with `LEVELER_BIN_DIR`). `LEVELER_VERSION=v1.0.0` pins a version.
+
+### Homebrew (macOS, Linux x86_64)
+
+```sh
+brew install dengmengmian/tap/leveler
+```
+
+Update with `brew upgrade leveler`. The built-in updater does not know about Homebrew and would replace the binary behind Homebrew's back, so a Homebrew install should set `auto_update = false` under `[update]` (see [Updates](#updates)).
+
 ### Release archive
 
-Every release publishes signed-checksummed archives for the supported platforms:
+Every release publishes archives with a SHA-256 checksum for the supported platforms:
 
 | Platform | Archive |
 | --- | --- |

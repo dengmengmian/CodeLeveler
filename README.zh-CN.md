@@ -34,6 +34,22 @@ leveler run "找出失败的测试并修好"
 
 ## 安装
 
+### 安装脚本（macOS、Linux）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dengmengmian/CodeLeveler/main/install.sh | sh
+```
+
+脚本会从最新稳定版中挑选当前平台的压缩包，SHA-256 校验不通过就拒绝安装，并把 `leveler` 放到 `~/.local/bin`（可用 `LEVELER_BIN_DIR` 改目录）。`LEVELER_VERSION=v1.0.0` 可固定版本。
+
+### Homebrew（macOS、Linux x86_64）
+
+```sh
+brew install dengmengmian/tap/leveler
+```
+
+更新用 `brew upgrade leveler`。内置更新器不识别 Homebrew，会绕过 Homebrew 直接替换二进制，所以通过 Homebrew 安装时请在 `[update]` 里设置 `auto_update = false`（见[更新](#更新)）。
+
 ### 发布包
 
 每个 release 都会为支持的平台发布带 SHA-256 校验的压缩包：
