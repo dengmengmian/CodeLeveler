@@ -176,24 +176,29 @@ impl RawTranscript {
         active_objective: Option<&str>,
         threshold: u64,
     ) -> Result<SessionContext, EngineError> {
-        let through_ordinal = self.messages.len() as u64;
+        // The watermark is an ABSOLUTE transcript ordinal: a bounded load may
+        // start at a non-zero `offset`, and the next load indexes the snapshot
+        // watermark against its own rows.
+        let through_ordinal = self.stored_len();
+        let raw_offset = self.offset;
         let snapshot = log.latest_context_snapshot(None).await?;
-        let (prior, compacted) = match merge_prior_messages(self.messages, snapshot, threshold) {
-            (base, PriorMerge::Fits { merged }) => (base, merged),
-            (base, PriorMerge::Over { base_tokens }) => {
-                let summary = match summarizer {
-                    Some(summarizer) => summarizer.summarize(&base).await,
-                    None => None,
-                };
-                fold_prior_messages(
-                    base,
-                    base_tokens,
-                    summary.as_deref(),
-                    active_objective,
-                    threshold,
-                )
-            }
-        };
+        let (prior, compacted) =
+            match merge_prior_messages(self.messages, raw_offset, snapshot, threshold) {
+                (base, PriorMerge::Fits { merged }) => (base, merged),
+                (base, PriorMerge::Over { base_tokens }) => {
+                    let summary = match summarizer {
+                        Some(summarizer) => summarizer.summarize(&base).await,
+                        None => None,
+                    };
+                    fold_prior_messages(
+                        base,
+                        base_tokens,
+                        summary.as_deref(),
+                        active_objective,
+                        threshold,
+                    )
+                }
+            };
         Ok(SessionContext {
             prior,
             compacted,

@@ -523,6 +523,9 @@ impl leveler_engine::ContextSummarizer for ModelSummarizer<'_> {
     }
 }
 /// Keep only the last `max` messages for Goal history injection (bounded).
+///
+/// The cut is moved to a round boundary so the tail never begins on a tool
+/// result whose owning assistant call fell off the front.
 pub(crate) fn bound_goal_history(
     messages: Vec<leveler_model::Message>,
     max: usize,
@@ -530,7 +533,8 @@ pub(crate) fn bound_goal_history(
     if messages.len() <= max {
         return messages;
     }
-    messages[messages.len() - max..].to_vec()
+    let start = leveler_context::round_boundary(&messages, messages.len() - max);
+    messages[start..].to_vec()
 }
 impl CodingRuntime {
     async fn open_or_reuse_goal(
@@ -661,10 +665,12 @@ impl CodingRuntime {
                     observer,
                 )
                 .await?;
-                let tail_start = raw
-                    .messages
-                    .len()
-                    .saturating_sub(leveler_context::COMPACT_KEEP_RECENT);
+                let tail_start = leveler_context::round_boundary(
+                    &raw.messages,
+                    raw.messages
+                        .len()
+                        .saturating_sub(leveler_context::COMPACT_KEEP_RECENT),
+                );
                 let mut prior = Vec::with_capacity(1 + raw.messages.len() - tail_start);
                 prior.push(leveler_model::Message {
                     role: leveler_model::Role::User,
@@ -3251,6 +3257,38 @@ mod goal_history_tests {
             bound.last().unwrap().text_content(),
             raw.last().unwrap().text_content()
         );
+    }
+
+    /// A count bound can land on a tool result. Goal history is prepended to a
+    /// fresh System + User, so a leading result would be the orphan DeepSeek
+    /// rejects with "role 'tool' must follow 'tool_calls'".
+    #[test]
+    fn bound_goal_history_never_starts_on_an_orphan_result() {
+        let call = Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: leveler_model::ToolCall {
+                    id: leveler_core::ToolCallId::new("c1"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({}),
+                },
+            }],
+        };
+        let result = Message {
+            role: Role::Tool,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new("c1"),
+                    content: "ok".into(),
+                    is_error: false,
+                },
+            }],
+        };
+        // `max = 1` would slice exactly the result.
+        let raw = vec![Message::text(Role::User, "task"), call, result];
+        let bound = bound_goal_history(raw, 1);
+        assert_ne!(bound[0].role, Role::Tool, "tail began on a tool result");
+        assert_eq!(bound[0].role, Role::Assistant);
     }
 }
 

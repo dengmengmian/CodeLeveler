@@ -38,7 +38,7 @@ pub fn budget_prior_messages(
     active_objective: Option<&str>,
     threshold: u64,
 ) -> (Vec<leveler_model::Message>, bool) {
-    match merge_prior_messages(raw, snapshot, threshold) {
+    match merge_prior_messages(raw, 0, snapshot, threshold) {
         (base, PriorMerge::Fits { merged }) => (base, merged),
         (base, PriorMerge::Over { base_tokens }) => {
             fold_prior_messages(base, base_tokens, summary, active_objective, threshold)
@@ -61,6 +61,10 @@ pub(crate) enum PriorMerge {
 /// producing only after seeing `PriorMerge::Over`.
 pub(crate) fn merge_prior_messages(
     raw: Vec<leveler_model::Message>,
+    // Absolute ordinal `raw[0]` sits at. Non-zero when the caller loaded only
+    // the reachable tail; the snapshot watermark is absolute, so it must be
+    // rebased before it indexes `raw`.
+    raw_offset: u64,
     snapshot: Option<SnapshotView>,
     threshold: u64,
 ) -> (Vec<leveler_model::Message>, PriorMerge) {
@@ -71,27 +75,36 @@ pub(crate) fn merge_prior_messages(
 
     let base = match snapshot {
         Some(view) if !view.messages.is_empty() => match view.through_ordinal {
-            Some(n) if (n as usize) <= raw.len() => {
-                // Exact watermark: everything after the first `n` transcript
-                // messages post-dates the snapshot. No inference, so rounds
-                // that repeat earlier text verbatim are never mistaken for
-                // the snapshot's own tail and dropped.
-                let mut out = view.messages;
-                out.extend_from_slice(&raw[n as usize..]);
-                out
-            }
-            Some(n) => {
+            Some(n) => match n.checked_sub(raw_offset) {
+                // Exact watermark: everything after transcript ordinal `n`
+                // post-dates the snapshot. The join only keeps a leading tool
+                // result when the snapshot already ends with its assistant.
+                Some(local) if local as usize <= raw.len() => {
+                    let mut out = view.messages;
+                    leveler_context::append_tool_safe(&mut out, &raw[local as usize..]);
+                    out
+                }
                 // A watermark beyond the live transcript means the transcript
                 // was truncated after the snapshot (context ops normally
                 // rewrite the snapshot too). Never guess a slice: fall back
                 // to the legacy overlap merge and say so.
-                tracing::warn!(
-                    through_ordinal = n,
-                    raw_len = raw.len(),
-                    "context snapshot watermark exceeds transcript; using overlap merge"
-                );
-                merge_snapshot_with_raw_tail(view.messages, &raw)
-            }
+                Some(_) => {
+                    tracing::warn!(
+                        through_ordinal = n,
+                        raw_offset,
+                        raw_len = raw.len(),
+                        "context snapshot watermark exceeds transcript; using overlap merge"
+                    );
+                    merge_snapshot_with_raw_tail(view.messages, &raw)
+                }
+                // The snapshot predates this load entirely: every loaded row
+                // post-dates it.
+                None => {
+                    let mut out = view.messages;
+                    leveler_context::append_tool_safe(&mut out, &raw);
+                    out
+                }
+            },
             None => merge_snapshot_with_raw_tail(view.messages, &raw),
         },
         _ => raw,
@@ -153,7 +166,7 @@ fn merge_snapshot_with_raw_tail(
         for i in (0..=raw.len() - k).rev() {
             if messages_slice_eq(suffix, &raw[i..i + k]) {
                 let mut out = snap;
-                out.extend_from_slice(&raw[i + k..]);
+                leveler_context::append_tool_safe(&mut out, &raw[i + k..]);
                 return out;
             }
         }
@@ -161,7 +174,7 @@ fn merge_snapshot_with_raw_tail(
     // No overlap (pure summary snapshot): keep snap + trailing raw window.
     let keep = leveler_context::COMPACT_KEEP_RECENT.min(raw.len());
     let mut out = snap;
-    out.extend_from_slice(&raw[raw.len() - keep..]);
+    leveler_context::append_tool_safe(&mut out, &raw[raw.len() - keep..]);
     out
 }
 
@@ -628,10 +641,67 @@ pub async fn acknowledge_crash_window(
 #[cfg(test)]
 mod multi_turn_session_tests {
     use super::*;
-    use leveler_model::{Message, Role};
+    use leveler_model::{ContentPart, Message, Role};
 
     fn msg(role: Role, text: &str) -> Message {
         Message::text(role, text)
+    }
+
+    fn assistant_call(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: leveler_model::ToolCall {
+                    id: leveler_core::ToolCallId::new(id),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({}),
+                },
+            }],
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new(id),
+                    content: "ok".into(),
+                    is_error: false,
+                },
+            }],
+        }
+    }
+
+    /// A bounded load starts after the assistant that requested its first
+    /// result; the join must drop that unanswerable result rather than emit
+    /// the orphan DeepSeek rejects with "role 'tool' must follow 'tool_calls'".
+    #[test]
+    fn a_bounded_load_never_joins_an_orphaned_tool_result() {
+        let raw = vec![tool_result("c1"), msg(Role::Assistant, "after")];
+        let snap = SnapshotView {
+            messages: vec![msg(Role::User, "summary")],
+            through_ordinal: Some(2),
+        };
+        let (out, _) = merge_prior_messages(raw, 2, Some(snap), 0);
+        assert!(
+            out.iter().all(|m| m.role != Role::Tool),
+            "orphaned result leaked into the request: {out:?}"
+        );
+        assert!(out.iter().any(|m| m.text_content() == "after"));
+    }
+
+    /// The same join keeps a result the snapshot already ends with — the
+    /// boundary must not drop legal pairs.
+    #[test]
+    fn a_bounded_load_keeps_a_tool_result_the_snapshot_owns() {
+        let raw = vec![tool_result("c1"), msg(Role::Assistant, "after")];
+        let snap = SnapshotView {
+            messages: vec![assistant_call("c1")],
+            through_ordinal: Some(1),
+        };
+        let (out, _) = merge_prior_messages(raw, 1, Some(snap), 0);
+        assert_eq!(out[1].role, Role::Tool, "owned pair must survive: {out:?}");
     }
 
     fn long_prior(n: usize) -> Vec<Message> {

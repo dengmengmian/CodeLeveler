@@ -48,6 +48,75 @@ pub(crate) const COMPACT_UPDATE_PROMPT: &str = "You are performing a CONTEXT CHE
      Keep the same sections (progress, learnings, failed approaches, constraints, next steps). \
      Be specific and cite real paths. Reply with ONLY the updated briefing.";
 
+/// Whether `assistant` requested the tool result `tool` (matches the
+/// `tool_calls` id to the result's `call_id`).
+fn assistant_owns_tool_result(assistant: &Message, tool: &Message) -> bool {
+    if assistant.role != Role::Assistant {
+        return false;
+    }
+    let result_id = tool.content.iter().find_map(|part| match part {
+        ContentPart::ToolResult { result } => Some(&result.call_id),
+        _ => None,
+    });
+    let Some(result_id) = result_id else {
+        return false;
+    };
+    assistant
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::ToolCall { call } if &call.id == result_id))
+}
+
+/// The first index at or after `start` where a transcript tail may legally
+/// begin.
+///
+/// A `role: tool` message is valid only directly after the assistant message
+/// whose `tool_calls` it answers; providers reject an orphan with "role 'tool'
+/// must be a response to a preceding message with 'tool_calls'". A tail bounded
+/// by message count or token budget can land in the middle of that pair, so
+/// every slice of a transcript passes through here. Backs up to the owning
+/// assistant when it is still inside the slice; when no owner is reachable (the
+/// run begins at the slice's own start), the unanswerable results are dropped
+/// instead of sent.
+pub fn round_boundary(messages: &[Message], start: usize) -> usize {
+    let mut start = start.min(messages.len());
+    // Step down over a run of results to the assistant that requested them.
+    while start > 0
+        && start < messages.len()
+        && messages[start].role == Role::Tool
+        && !assistant_owns_tool_result(&messages[start - 1], &messages[start])
+    {
+        start -= 1;
+    }
+    if start > 0 && start < messages.len() && messages[start].role == Role::Tool {
+        start -= 1;
+    }
+    // No owning assistant was reachable: drop the orphans rather than send them.
+    while start < messages.len() && messages[start].role == Role::Tool {
+        start += 1;
+    }
+    start
+}
+
+/// Append `tail` to `out` without emitting an orphaned tool result.
+///
+/// A snapshot and a transcript tail are joined at a watermark that can fall
+/// between an assistant `tool_calls` message and its results. A leading result
+/// is kept only when `out` already ends with the assistant that owns it;
+/// otherwise it is dropped rather than sent to a provider that rejects it.
+pub fn append_tool_safe(out: &mut Vec<Message>, tail: &[Message]) {
+    let mut start = 0;
+    while start < tail.len()
+        && tail[start].role == Role::Tool
+        && !out
+            .last()
+            .is_some_and(|previous| assistant_owns_tool_result(previous, &tail[start]))
+    {
+        start += 1;
+    }
+    out.extend_from_slice(&tail[start..]);
+}
+
 /// The head/middle/tail split for compaction: `(head_end, tail_start)`, or None
 /// when there is nothing worth folding. Cuts only at round boundaries so a
 /// tool-call is never separated from its tool-result (the provider rejects
@@ -88,9 +157,7 @@ pub(crate) fn compaction_span(
 
     // Never begin the tail on a Tool result — back up to its owning assistant so
     // the pair stays whole (the provider rejects orphaned tool results).
-    while tail_start > head_end && messages[tail_start].role == Role::Tool {
-        tail_start -= 1;
-    }
+    tail_start = round_boundary(messages, tail_start).max(head_end);
 
     // Nothing meaningful in the middle → leave it alone.
     if tail_start <= head_end || tail_start - head_end < 2 {
@@ -471,6 +538,88 @@ mod span_tests {
 
     fn msg(role: Role, text: &str) -> Message {
         Message::text(role, text)
+    }
+
+    fn assistant_call(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                call: leveler_model::ToolCall {
+                    id: leveler_core::ToolCallId::new(id),
+                    name: name.into(),
+                    arguments: Default::default(),
+                },
+            }],
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: vec![ContentPart::ToolResult {
+                result: leveler_model::ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new(id),
+                    content: "ok".into(),
+                    is_error: false,
+                },
+            }],
+        }
+    }
+
+    // ── Round boundaries: a tool result never travels without its call ──────
+
+    #[test]
+    fn round_boundary_backs_up_to_the_owning_assistant_call() {
+        let msgs = vec![
+            msg(Role::User, "task"),
+            assistant_call("c1", "read"),
+            tool_result("c1"),
+            tool_result("c1"),
+        ];
+        // Cutting onto the second result must include the assistant that owns it.
+        let start = round_boundary(&msgs, 3);
+        assert_eq!(start, 1);
+        assert_eq!(msgs[start].role, Role::Assistant);
+    }
+
+    #[test]
+    fn round_boundary_drops_a_result_whose_owner_is_outside_the_slice() {
+        let msgs = vec![tool_result("c1"), msg(Role::User, "task")];
+        assert_eq!(round_boundary(&msgs, 0), 1);
+    }
+
+    #[test]
+    fn append_tool_safe_keeps_an_owned_result_and_drops_an_orphan() {
+        // The snapshot already ends with the assistant call → its result is legal.
+        let mut owned = vec![assistant_call("c1", "read")];
+        append_tool_safe(&mut owned, &[tool_result("c1"), msg(Role::User, "next")]);
+        assert_eq!(owned[1].role, Role::Tool);
+
+        // Without the owner in `out`, the leading result is dropped, not sent.
+        let mut orphan = vec![msg(Role::User, "task")];
+        append_tool_safe(
+            &mut orphan,
+            &[tool_result("c9"), msg(Role::Assistant, "done")],
+        );
+        assert!(
+            orphan.iter().all(|m| m.role != Role::Tool),
+            "orphaned result must not reach the request: {orphan:?}"
+        );
+        assert_eq!(orphan[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn compaction_tail_never_begins_on_a_tool_result() {
+        // A one-message tail would land exactly on the result; the span backs up.
+        let msgs = vec![
+            msg(Role::User, "task"),
+            msg(Role::Assistant, "a"),
+            msg(Role::User, "u"),
+            assistant_call("c1", "read"),
+            tool_result("c1"),
+        ];
+        let (_, tail_start) = compaction_span(&msgs, 1, 0).expect("a foldable middle");
+        assert_ne!(msgs[tail_start].role, Role::Tool);
     }
 
     #[test]
