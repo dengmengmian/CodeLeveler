@@ -1,21 +1,18 @@
-# CodeLeveler 1.0.0
+# CodeLeveler 1.0.1
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-The first stable release. macOS, Linux, and Windows.
+A bug-fix release on top of 1.0.0. Installed 1.0.0 builds pick it up automatically, or run `leveler update` / `/update`.
 
-From 1.0.0 on, CodeLeveler tracks [Semantic Versioning](https://semver.org/): `1.0.x` are bug fixes, `1.x.0` are backwards-compatible features, and `2.0.0` would be a breaking change. Installed builds check for and install newer stable releases automatically — at start-up, or with `leveler update` / `/update`.
+## Fixed
 
-## Included
-
-- Terminal UI (`leveler tui`), Web UI (`leveler web`), and CLI (`leveler run`)
-- Sessions stored on your machine, so you can resume later
-- `/develop` workflow: Analyze → Coding → Verify → Review
-- Custom agents: a directory with `agent.yaml` and `instructions.md`
-- Mobile app and host-side remote bridge (`leveler remote`)
-- Approval for file writes and commands
-- Command isolation: Seatbelt on macOS, bubblewrap on Linux, Low integrity on Windows
-- Self-update from GitHub Releases, with SHA-256 verification before anything is installed
+- Starting the TUI while an older local runtime is still busy no longer fails after 10 seconds: the client waits for the old runtime to finish and hands over to the new one
+- A handover no longer hangs when another client has already started the replacement runtime
+- A development build is recognised by the runtime it started, so it no longer restarts an identical runtime on every launch
+- An idle background runtime shuts itself down once no client is attached and no work is running
+- Every visible tool row in the TUI names what ran
+- A message typed while a turn runs is sent automatically as the next turn once the runtime is ready, in order and only into the session it was written for; waiting no longer shows as "status unknown"
+- Option lists in questions, pickers and approvals are numbered, and labels stay aligned when moving the cursor or past 9 → 10
 
 ## Known limits
 

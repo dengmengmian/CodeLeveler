@@ -1,21 +1,18 @@
-# CodeLeveler 1.0.0
+# CodeLeveler 1.0.1
 
 英文版：[`RELEASE.md`](RELEASE.md)
 
-第一个稳定版。支持 macOS、Linux 和 Windows。
+1.0.0 之上的修复版。已安装的 1.0.0 会自动更新，也可以用 `leveler update` 或 `/update`。
 
-从 1.0.0 起，CodeLeveler 遵循 [语义化版本](https://semver.org/lang/zh-CN/)：`1.0.x` 是修复，`1.x.0` 是向后兼容的新功能，`2.0.0` 才是破坏性变更。已安装的版本会自动检查并安装更新的稳定版——启动时自动进行，也可以用 `leveler update` 或 `/update`。
+## 修复
 
-## 这一版有什么
-
-- 终端界面（`leveler tui`）、网页界面（`leveler web`）和命令行（`leveler run`）
-- 会话保存在本机，之后可以继续
-- `/develop` 工作流：分析 → 编码 → 验证 → 验收
-- 自定义 Agent：一个目录，里面是 `agent.yaml` 和 `instructions.md`
-- 移动端，以及宿主机上的远程桥（`leveler remote`）
-- 写文件和执行命令需要批准
-- 命令隔离：macOS 用 Seatbelt，Linux 用 bubblewrap，Windows 用 Low integrity
-- 从 GitHub Release 自升级，安装前先校验 SHA-256
+- 旧的本地 runtime 还在忙时启动 TUI，不再等 10 秒后失败：客户端会等旧 runtime 做完，再交接给新的
+- 另一个客户端已经拉起替代 runtime 时，交接不再卡住
+- 开发构建能认出自己启动的 runtime，不会每次启动都重启一个相同的 runtime
+- 没有客户端连接、也没有任务在跑时，空闲的后台 runtime 会自行退出
+- TUI 里每一行可见的工具记录都写明执行了什么
+- 任务运行中输入的消息，会在 runtime 就绪后按顺序自动作为下一轮发送，且只发往写它时所在的会话；排队等待不再显示为"状态未知"
+- 提问、选择器和批准里的选项带编号，移动光标或从 9 到 10 时标签不再错位
 
 ## 已知限制
 
