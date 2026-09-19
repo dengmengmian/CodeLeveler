@@ -9,30 +9,62 @@ use ratatui::widgets::Paragraph;
 
 use crate::screen::Screen;
 use crate::state::AppState;
+use crate::theme::Theme;
 use crate::tool_cell::render_tools_screen;
 
 /// Shell Details: one user shell execution — status, live runtime, source,
-/// cwd, the user's exact command (never the `sh -c` wrapper), and the
-/// bounded output tail. Esc backs out; `x` stops a running one.
+/// cwd, the user's exact command (never the `sh -c` wrapper), and the bounded
+/// output tail. A Secondary Surface like every other Detail Page: Esc backs
+/// out, `x` stops a running one, and the body sits on the shared content
+/// gutter.
 fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
-    let area = crate::secondary::legacy_frame(frame, area, state);
     use crate::transcript::UserShellStatus;
     let theme = &state.theme;
     let t = state.t();
+    let hint = if state
+        .focused_user_shell()
+        .is_some_and(|s| s.status == UserShellStatus::Running)
+    {
+        t.shell_hint_running
+    } else {
+        t.shell_hint_done
+    };
+    let page = crate::secondary::SecondaryPage {
+        title: t.shell_details_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let lines = shell_detail_lines(state, body.width as usize, theme, t);
+    // Keep the tail visible by default; PgUp/PgDn (screen_scroll) pages back.
+    let height = body.height as usize;
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = state.screen_scroll.min(max_scroll);
+    let offset = max_scroll.saturating_sub(scroll);
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), body);
+}
+
+/// The Shell Details body, without chrome.
+fn shell_detail_lines(
+    state: &AppState,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    use crate::transcript::UserShellStatus;
     let dim = Style::default().fg(theme.text.muted);
     let text_style = Style::default().fg(theme.text.primary);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        t.shell_details_title.to_string(),
-        Style::default()
-            .fg(theme.text.primary)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
     let Some(shell) = state.focused_user_shell() else {
         lines.push(Line::from(Span::styled(t.shell_no_output.to_string(), dim)));
-        frame.render_widget(Paragraph::new(lines), area);
-        return;
+        return lines;
     };
     let (status_text, status_style) = match shell.status {
         UserShellStatus::Running => (
@@ -88,7 +120,7 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
     // Cut them ourselves and mark it: a value that merely ends mid-path reads
     // as the whole value. A path keeps its tail — that is what names it — and
     // a command keeps its head, which is what it does.
-    let value_width = (area.width as usize).saturating_sub(FIELD_LABEL_WIDTH + 1);
+    let value_width = width.saturating_sub(FIELD_LABEL_WIDTH + 1).max(4);
     lines.push(field(
         t.shell_cwd_label,
         Span::styled(text::elide_head(&shell.cwd, value_width), text_style),
@@ -111,45 +143,24 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
         ));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("{}:", t.shell_output_label),
-        dim,
-    )));
+    lines.push(section_line(t.shell_output_label, theme));
     if shell.output_truncated {
-        lines.push(Line::from(Span::styled(t.shell_truncated.to_string(), dim)));
+        lines.push(detail_line(t.shell_truncated.to_string(), dim, width));
     }
     if shell.output.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", t.shell_no_output),
-            dim,
-        )));
+        lines.push(detail_line(t.shell_no_output.to_string(), dim, width));
     } else {
-        let width = area.width.saturating_sub(2) as usize;
         for raw in shell.output.lines() {
             let line = sanitize_terminal_line(raw);
-            lines.push(Line::from(Span::styled(
-                truncate_display(&format!("  {line}"), width.max(4)),
+            lines.push(detail_line(
+                line,
                 Style::default().fg(theme.text.secondary),
-            )));
+                width,
+            ));
         }
     }
-    lines.push(Line::from(""));
-    let hint = if shell.status == UserShellStatus::Running {
-        t.shell_hint_running
-    } else {
-        t.shell_hint_done
-    };
-    lines.push(Line::from(Span::styled(hint.to_string(), dim)));
-
-    // Keep the tail visible by default; PgUp/PgDn (screen_scroll) pages back.
-    let height = area.height as usize;
-    let max_scroll = lines.len().saturating_sub(height);
-    let scroll = state.screen_scroll.min(max_scroll);
-    let offset = max_scroll.saturating_sub(scroll);
-    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    lines
 }
-
 /// Whether the child behind this activity was stopped at a bound rather than
 /// failing. Reads the typed stop, never the summary prose: `Incomplete`,
 /// `Budget`, `Cancelled` and `Lost` are all "did not finish", and only a
@@ -177,201 +188,250 @@ fn child_stopped_at_a_bound(state: &AppState, id: &crate::activity::ActivityId) 
         })
 }
 
-/// Activity Detail: observational overlay-as-screen. Does not cancel work.
+/// Activity Detail: a Secondary Surface over the conversation.
+///
+/// Observational: Esc backs out without cancelling anything, and `x` stops a
+/// running task only through the runtime's own cancellation path. The page owns
+/// no lifecycle — it renders the same [`crate::activity::summaries`] projection
+/// the status strip does, inside the same shell every other Secondary Surface
+/// uses.
 fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
-    let area = crate::secondary::legacy_frame(frame, area, state);
-    use crate::activity::{ActivityId, ActivityKind, ActivityStatus, summaries};
-    let theme = &state.theme;
+    use crate::activity::ActivityKind;
     let t = state.t();
-    let dim = Style::default().fg(theme.text.muted);
-    let text_style = Style::default().fg(theme.text.primary);
-    let mut lines: Vec<Line<'static>> = Vec::new();
     let Some(id) = state.activity_open.clone() else {
-        lines.push(Line::from(Span::styled(t.activity_stale.to_string(), dim)));
-        frame.render_widget(Paragraph::new(lines), area);
+        render_activity_stale(frame, area, state);
         return;
     };
-    let summary = summaries(state).into_iter().find(|s| s.id == id);
-    let Some(summary) = summary else {
-        lines.push(Line::from(Span::styled(t.activity_stale.to_string(), dim)));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(t.activity_esc.to_string(), dim)));
-        frame.render_widget(Paragraph::new(lines), area);
+    let Some(summary) = crate::activity::summaries(state)
+        .into_iter()
+        .find(|s| s.id == id)
+    else {
+        render_activity_stale(frame, area, state);
         return;
     };
     let detail_title = match summary.kind {
         ActivityKind::BackgroundTask => t.activity_title_background,
         ActivityKind::ChildAgent => t.activity_title_child,
     };
-    lines.push(screen_title(&format!("‹ {detail_title}"), theme));
-    lines.push(Line::from(""));
-    let status_text = match summary.status {
-        ActivityStatus::Running => t.wait_target_running,
-        ActivityStatus::Waiting => t.sub_agent_waiting,
-        ActivityStatus::Completed => t.title_completed,
-        // A child stopped at a bound (budget, cancel, lost) did not FAIL —
-        // it did not finish. "失败" over a partial result is the same
-        // conflation the typed reason beside it exists to undo.
-        ActivityStatus::Failed if child_stopped_at_a_bound(state, &id) => t.sub_agent_incomplete,
-        ActivityStatus::Failed => t.title_failed,
-        ActivityStatus::Interrupted => t.sub_agent_interrupted,
-        ActivityStatus::Unreported => t.sub_agent_unreported,
+    let layout = crate::secondary::layout(area, 0);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    // Measure the body first: the follow chip in the footer reads the viewport
+    // state this frame publishes, so the hint and the body agree on which frame
+    // the user is looking at.
+    let lines = activity_screen_lines(state, &id, &summary, body.width as usize, &state.theme, t);
+    let height = body.height as usize;
+    crate::activity::sync_view(state, lines.len(), height);
+    let theme = &state.theme;
+    let hint = activity_footer_hint(state, &id, &summary, t);
+    let page = crate::secondary::SecondaryPage {
+        title: detail_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: &hint,
     };
-    let status_style = match summary.status {
-        ActivityStatus::Running | ActivityStatus::Waiting => {
-            Style::default().fg(theme.accent.primary)
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let offset = state
+        .activity_view
+        .scroll
+        .min(state.activity_view.max_scroll);
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), body);
+}
+
+/// A closed / retired activity: still inside the shared shell, so the chrome
+/// never flickers between two layouts.
+fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let theme = &state.theme;
+    let t = state.t();
+    let page = crate::secondary::SecondaryPage {
+        title: t.activity_title_background,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.activity_esc,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let lines = vec![Line::from(Span::styled(
+        t.activity_stale.to_string(),
+        Style::default().fg(theme.text.muted),
+    ))];
+    frame.render_widget(Paragraph::new(lines), layout.content);
+}
+
+/// The Background Jobs list page: running tasks first, then recently finished
+/// ones. Enter opens the selected task's Detail Page, `x` stops a selected
+/// running task, Esc returns to the conversation. Acknowledging the current
+/// failures happens when the page opens (`activity::open_background_list`), so
+/// this renderer stays pure.
+fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let theme = &state.theme;
+    let t = state.t();
+    let list = crate::activity::background_job_list(state);
+    let hint = if list.running.is_empty() {
+        t.background_hint_list_idle
+    } else {
+        t.background_hint_list_running
+    };
+    let page = crate::secondary::SecondaryPage {
+        title: t.background_list_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let (lines, selected_line) = background_list_body(state, &list, body.width as usize, theme, t);
+    let height = body.height as usize;
+    // Keep the selection visible without a second scroll owner: the offset is
+    // derived from the selection, so the list needs no scroll state and a
+    // resize can never strand the highlighted row.
+    let max_offset = lines.len().saturating_sub(height);
+    let offset = selected_line
+        .map(|line| line.saturating_sub(height.saturating_sub(1)))
+        .unwrap_or(0)
+        .min(max_offset);
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), body);
+}
+
+/// The list body plus the line index of the selected row, or `None` when
+/// nothing is selected (or the list is empty).
+fn background_list_body(
+    state: &AppState,
+    list: &crate::activity::BackgroundJobList,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut selected_line = None;
+    let selected = state.background_list_selected.as_deref();
+    if list.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t.background_list_empty.to_string(),
+            Style::default().fg(theme.text.muted),
+        )));
+        return (lines, None);
+    }
+    if !list.running.is_empty() {
+        lines.push(section_line(
+            &format!("{} · {}", t.background_list_running, list.running.len()),
+            theme,
+        ));
+        for summary in &list.running {
+            let on = selected == Some(summary.id.as_key());
+            if on {
+                selected_line = Some(lines.len());
+            }
+            lines.push(background_list_row(summary, on, width, theme));
         }
+    }
+    if !list.finished.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(section_line(
+            &format!("{} · {}", t.background_list_finished, list.finished.len()),
+            theme,
+        ));
+        for summary in &list.finished {
+            let on = selected == Some(summary.id.as_key());
+            if on {
+                selected_line = Some(lines.len());
+            }
+            lines.push(background_list_row(summary, on, width, theme));
+        }
+    }
+    (lines, selected_line)
+}
+
+/// One job row: `→ ● label … duration`. The glyph carries the status ink, the
+/// duration is right-aligned in muted grey, and the label truncates first so a
+/// long command can never push the duration off the edge.
+fn background_list_row(
+    summary: &crate::activity::ActivitySummary,
+    selected: bool,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    use crate::activity::ActivityStatus;
+    let indent = crate::layout::DETAIL_BODY_INDENT;
+    let prefix = if selected { "→ " } else { "  " };
+    let glyph = crate::activity::activity_glyph(summary.status);
+    let dur = crate::status_line::fmt_elapsed(summary.duration_secs);
+    let accent = Style::default().fg(theme.accent.primary);
+    let glyph_style = match summary.status {
+        ActivityStatus::Running | ActivityStatus::Waiting => accent,
         ActivityStatus::Completed => Style::default().fg(theme.status.success),
         ActivityStatus::Failed => Style::default().fg(theme.status.error),
+        ActivityStatus::Stopped => Style::default().fg(theme.text.muted),
         ActivityStatus::Interrupted | ActivityStatus::Unreported => {
             Style::default().fg(theme.status.warning)
         }
     };
-    let heading = match &summary.secondary {
-        Some(sec) if summary.kind == crate::activity::ActivityKind::ChildAgent => {
-            format!("{} · {sec}", summary.title)
-        }
-        _ => summary.title.clone(),
-    };
-    lines.push(Line::from(Span::styled(
-        truncate_display(&heading, area.width.saturating_sub(1) as usize),
-        Style::default()
-            .fg(theme.text.primary)
-            .add_modifier(Modifier::BOLD),
-    )));
-    let mut meta = format!(
-        "{} · {}",
-        status_text,
-        crate::status_line::fmt_elapsed(summary.duration_secs)
+    let label_style = Style::default().fg(if selected {
+        theme.text.primary
+    } else {
+        theme.text.secondary
+    });
+    let head = format!("{indent}{prefix}{glyph} ");
+    let head_w = unicode_width::UnicodeWidthStr::width(head.as_str());
+    let dur_w = unicode_width::UnicodeWidthStr::width(dur.as_str());
+    const GAP: usize = 2;
+    let label_budget = width.saturating_sub(head_w + GAP + dur_w).max(4);
+    let label = truncate_display(&summary.title, label_budget);
+    let label_w = unicode_width::UnicodeWidthStr::width(label.as_str());
+    let pad = width.saturating_sub(head_w + label_w + dur_w);
+    Line::from(vec![
+        Span::styled(head, glyph_style),
+        Span::styled(label, label_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(dur, Style::default().fg(theme.text.muted)),
+    ])
+}
+
+/// The Detail Page's interaction hint. Every Detail Page reads `Esc 返回`; a
+/// task the runtime can still stop adds `x 停止`; the background follow chip
+/// lives here rather than in the body so it never scrolls away from the output
+/// it describes.
+fn activity_footer_hint(
+    state: &AppState,
+    id: &crate::activity::ActivityId,
+    summary: &crate::activity::ActivitySummary,
+    t: &crate::i18n::UiText,
+) -> String {
+    use crate::activity::{ActivityId, ActivityStatus};
+    let running = matches!(
+        summary.status,
+        ActivityStatus::Running | ActivityStatus::Waiting
     );
-    match &id {
-        ActivityId::Background(task_id) => {
-            if let Some(chrome) = crate::activity::background_chrome(state, task_id)
-                && let Some(code) = chrome.exit_code
-            {
-                meta.push_str(&format!(" · exit {code}"));
-            }
-        }
-        // How it ended is the question the detail page exists to answer. The
-        // runtime types the stop; `status_text` alone only says "失败", which
-        // does not distinguish a child that was cut off from one that ran out
-        // of budget or was never heard from again.
-        ActivityId::Child(child_id) => {
-            if let Some(reason) = state
-                .team
-                .children
-                .iter()
-                .find(|c| &c.id == child_id)
-                .and_then(|c| crate::multi_agent::child_stop_label(c.stop, c.limit, t))
-            {
-                meta.push_str(&format!(" · {reason}"));
-            }
-        }
+    // A child can always be cancelled. A background task only advertises the
+    // stop while the runtime still holds it running — a terminal one has
+    // nothing to stop, and the footer must not promise a key that does nothing.
+    let stoppable = running
+        && match id {
+            ActivityId::Child(_) => true,
+            ActivityId::Background(task_id) => state
+                .background_task_labels
+                .get(task_id)
+                .is_some_and(|c| c.is_running()),
+        };
+    let mut hint = t.activity_esc.to_string();
+    if stoppable {
+        hint.push_str(" · ");
+        hint.push_str(t.activity_stop);
     }
-    lines.push(Line::from(Span::styled(meta, status_style)));
-    lines.push(Line::from(""));
-
-    let mut background_output = false;
-    match &id {
-        ActivityId::Background(task_id) => {
-            lines.push(Line::from(Span::styled(
-                format!("$ {}", summary.title),
-                text_style,
-            )));
-            lines.push(Line::from(""));
-            let chrome = crate::activity::background_chrome(state, task_id);
-            let output = chrome.map(|c| c.output.as_str()).unwrap_or("");
-            if output.trim().is_empty() {
-                lines.push(Line::from(Span::styled(
-                    t.activity_no_output.to_string(),
-                    dim,
-                )));
-            } else {
-                background_output = true;
-                let width = area.width.saturating_sub(2) as usize;
-                for raw in output.lines() {
-                    let line = sanitize_terminal_line(raw);
-                    lines.push(Line::from(Span::styled(
-                        truncate_display(&format!("  {line}"), width.max(4)),
-                        Style::default().fg(theme.text.secondary),
-                    )));
-                }
-            }
-        }
-        ActivityId::Child(child_id) => {
-            let child = state.team.children.iter().find(|c| &c.id == child_id);
-            if let Some(child) = child {
-                if !child.purpose.is_empty() {
-                    lines.push(Line::from(Span::styled(t.activity_goal.to_string(), dim)));
-                    lines.push(Line::from(Span::styled(child.purpose.clone(), text_style)));
-                    lines.push(Line::from(""));
-                }
-                if let Some(step) = child.recent_step.as_deref().filter(|s| !s.is_empty()) {
-                    lines.push(Line::from(Span::styled(
-                        t.activity_current.to_string(),
-                        dim,
-                    )));
-                    lines.push(Line::from(Span::styled(step.to_string(), text_style)));
-                    lines.push(Line::from(""));
-                }
-                if !child.steps.is_empty() {
-                    lines.push(Line::from(Span::styled(t.activity_steps.to_string(), dim)));
-                    for step in &child.steps {
-                        let current = child.recent_step.as_deref() == Some(step.as_str());
-                        let active = matches!(
-                            child.status,
-                            crate::multi_agent::ChildStatus::Running
-                                | crate::multi_agent::ChildStatus::Waiting
-                        );
-                        // A step the child moved past did finish. The one it
-                        // was on when it was stopped did not — and it used to
-                        // carry a success check, the same untruth the
-                        // collaboration glyph was fixed for: a call that ran
-                        // is not an outcome that succeeded.
-                        let g = match (current, active) {
-                            (true, true) => "●",
-                            (true, false) => "·",
-                            (false, _) => "✓",
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!("  {g} {step}"),
-                            Style::default().fg(theme.text.secondary),
-                        )));
-                    }
-                    lines.push(Line::from(""));
-                }
-                if let Some(block) = state.transcript.items().iter().find_map(|item| match item {
-                    crate::transcript::TranscriptItem::SubAgent(b) if &b.id == child_id => Some(b),
-                    _ => None,
-                }) && block.status != crate::transcript::ToolStatus::Running
-                    && !block.detail.trim().is_empty()
-                {
-                    lines.push(Line::from(Span::styled(t.activity_result.to_string(), dim)));
-                    lines.push(Line::from(Span::styled(
-                        sub_agent_detail(block.detail.trim(), t),
-                        text_style,
-                    )));
-                    lines.push(Line::from(""));
-                }
-                if let Some(rows) = crate::multi_agent::inspector_rows(child, t) {
-                    for row in rows {
-                        lines.push(Line::from(Span::styled(row.text, dim)));
-                    }
-                }
-            }
-        }
-    }
-
-    lines.push(Line::from(""));
-    let running_child = matches!(&id, ActivityId::Child(_))
-        && matches!(
-            summary.status,
-            ActivityStatus::Running | ActivityStatus::Waiting
-        );
-    // The follow chip belongs to a background task that actually has output to
-    // follow: a tail state on an empty page would describe nothing.
-    if background_output {
-        let glyph = crate::activity::activity_glyph(summary.status);
+    if let ActivityId::Background(task_id) = id
+        && state
+            .background_task_labels
+            .get(task_id)
+            .is_some_and(|c| !c.output.trim().is_empty())
+    {
         let chip = if state.activity_view.follow {
             t.activity_follow_on.to_string()
         } else if state.activity_view.unread > 0 {
@@ -384,43 +444,316 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         } else {
             t.activity_follow_paused.to_string()
         };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{glyph} {} · {} · {chip}",
-                status_text,
-                crate::status_line::fmt_elapsed(summary.duration_secs)
-            ),
-            status_style,
-        )));
-        lines.push(Line::from(""));
+        hint.push_str(" · ");
+        hint.push_str(&chip);
     }
-    let height = area.height as usize;
-    // The footer advertises scrolling only when the page can actually scroll,
-    // so a short detail does not promise keys that do nothing.
-    let can_scroll = lines.len().saturating_add(1) > height;
-    let scroll_hint = if can_scroll {
-        format!(" · {}", t.activity_hint_scroll)
-    } else {
-        String::new()
-    };
-    let footer = if running_child {
-        format!(
-            "{} · {}{}",
-            t.activity_esc, t.activity_cancel_child, scroll_hint
-        )
-    } else {
-        format!("{}{}", t.activity_esc, scroll_hint)
-    };
-    lines.push(Line::from(Span::styled(footer, dim)));
+    hint.push_str(" · ");
+    hint.push_str(t.activity_hint_scroll);
+    hint
+}
 
-    let total = lines.len();
-    crate::activity::sync_view(state, total, height);
-    let offset = state
-        .activity_view
-        .scroll
-        .min(state.activity_view.max_scroll);
-    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
-    frame.render_widget(Paragraph::new(visible), area);
+/// The Detail Page body, without chrome. Pure (no Frame, no scroll state) so
+/// renderer tests assert the exact content at a given width.
+fn activity_screen_lines(
+    state: &AppState,
+    id: &crate::activity::ActivityId,
+    summary: &crate::activity::ActivitySummary,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    use crate::activity::ActivityId;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The object itself owns the strongest ink: the page exists to name it.
+    lines.push(Line::from(Span::styled(
+        truncate_display(&summary.title, width.max(8)),
+        Style::default()
+            .fg(theme.text.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let (status_text, status_style) = activity_status_text(state, id, summary, t, theme);
+    let glyph = crate::activity::activity_glyph(summary.status);
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{glyph} {status_text} · {}",
+            crate::status_line::fmt_elapsed(summary.duration_secs)
+        ),
+        status_style,
+    )));
+    match id {
+        ActivityId::Background(task_id) => {
+            background_detail_body(state, task_id, summary, width, theme, t, &mut lines)
+        }
+        ActivityId::Child(child_id) => {
+            child_detail_body(state, child_id, summary, width, theme, t, &mut lines)
+        }
+    }
+    lines
+}
+
+/// Status word + ink for one activity, including the typed stop reason and a
+/// background task's exit code. Shared by every Detail Page so the wording can
+/// never drift from the summary projection.
+fn activity_status_text(
+    state: &AppState,
+    id: &crate::activity::ActivityId,
+    summary: &crate::activity::ActivitySummary,
+    t: &crate::i18n::UiText,
+    theme: &Theme,
+) -> (String, Style) {
+    use crate::activity::{ActivityId, ActivityStatus};
+    let mut text = match summary.status {
+        ActivityStatus::Running => t.wait_target_running.to_string(),
+        ActivityStatus::Waiting => t.sub_agent_waiting.to_string(),
+        ActivityStatus::Completed => t.title_completed.to_string(),
+        // A child stopped at a bound did not FAIL — it did not finish.
+        ActivityStatus::Failed if child_stopped_at_a_bound(state, id) => {
+            t.sub_agent_incomplete.to_string()
+        }
+        ActivityStatus::Failed => t.title_failed.to_string(),
+        // A stopped task did not fail: user/agent cancel or session cleanup.
+        // Its own word, never the failure branch.
+        ActivityStatus::Stopped => t.background_status_stopped.to_string(),
+        ActivityStatus::Interrupted => t.sub_agent_interrupted.to_string(),
+        ActivityStatus::Unreported => t.sub_agent_unreported.to_string(),
+    };
+    let style = match summary.status {
+        ActivityStatus::Running | ActivityStatus::Waiting => {
+            Style::default().fg(theme.accent.primary)
+        }
+        ActivityStatus::Completed => Style::default().fg(theme.status.success),
+        ActivityStatus::Failed => Style::default().fg(theme.status.error),
+        // Stopped is neutral, not alarming: it yields to failed and to a live
+        // running accent.
+        ActivityStatus::Stopped => Style::default().fg(theme.text.secondary),
+        ActivityStatus::Interrupted | ActivityStatus::Unreported => {
+            Style::default().fg(theme.status.warning)
+        }
+    };
+    match id {
+        ActivityId::Background(task_id) => {
+            if let Some(chrome) = crate::activity::background_chrome(state, task_id)
+                && let Some(code) = chrome.exit_code
+            {
+                text.push_str(&format!(" · exit {code}"));
+            }
+        }
+        // How it ended is the question the detail page exists to answer.
+        ActivityId::Child(child_id) => {
+            if let Some(reason) = state
+                .team
+                .children
+                .iter()
+                .find(|c| &c.id == child_id)
+                .and_then(|c| crate::multi_agent::child_stop_label(c.stop, c.limit, t))
+            {
+                text.push_str(&format!(" · {reason}"));
+            }
+        }
+    }
+    (text, style)
+}
+
+/// A background task's body: the command it runs and its retained output, each
+/// under its own section. Output is real (the task projection's retained tail);
+/// when none has arrived the section says so in place rather than leaving the
+/// page's left edge bare.
+fn background_detail_body(
+    state: &AppState,
+    task_id: &str,
+    summary: &crate::activity::ActivitySummary,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let dim = Style::default().fg(theme.text.muted);
+    let text = Style::default().fg(theme.text.primary);
+    lines.push(Line::from(""));
+    lines.push(section_line(t.activity_command_label, theme));
+    lines.push(detail_line(format!("$ {}", summary.title), text, width));
+    lines.push(Line::from(""));
+    lines.push(section_line(t.activity_output_label, theme));
+    let chrome = crate::activity::background_chrome(state, task_id);
+    let output = chrome.map(|c| c.output.as_str()).unwrap_or("");
+    if output.trim().is_empty() {
+        lines.push(detail_line(t.activity_no_output.to_string(), dim, width));
+        return;
+    }
+    for raw in output.lines() {
+        let line = sanitize_terminal_line(raw);
+        lines.push(detail_line(
+            line,
+            Style::default().fg(theme.text.secondary),
+            width,
+        ));
+    }
+}
+
+/// A sub-agent's body. The semantic task, then either the running call or the
+/// settled result, then the folded activity. Capability facts (profile,
+/// read-only, usage) are demoted to one muted metadata line: they are useful,
+/// but they are not the answer the reader came for.
+fn child_detail_body(
+    state: &AppState,
+    child_id: &str,
+    summary: &crate::activity::ActivitySummary,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+    lines: &mut Vec<Line<'static>>,
+) {
+    use crate::activity::ActivityStatus;
+    let dim = Style::default().fg(theme.text.muted);
+    let text = Style::default().fg(theme.text.primary);
+    let Some(child) = state.team.children.iter().find(|c| c.id == child_id) else {
+        lines.push(Line::from(""));
+        lines.push(detail_line(t.activity_stale.to_string(), dim, width));
+        return;
+    };
+    if let Some(meta) = child_metadata_line(child, t) {
+        lines.push(Line::from(Span::styled(meta, dim)));
+    }
+    // The goal: the semantic title the runtime fixed at spawn, else the
+    // purpose (the same text the transcript head already names).
+    let goal = child
+        .title
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| (!child.purpose.trim().is_empty()).then_some(child.purpose.as_str()));
+    if let Some(goal) = goal {
+        lines.push(Line::from(""));
+        lines.push(section_line(t.activity_goal, theme));
+        lines.push(detail_line(goal.to_string(), text, width));
+    }
+    let settled = !matches!(
+        summary.status,
+        ActivityStatus::Running | ActivityStatus::Waiting
+    );
+    let block = state.transcript.items().iter().find_map(|item| match item {
+        crate::transcript::TranscriptItem::SubAgent(b) if b.id == child_id => Some(b),
+        _ => None,
+    });
+    if settled {
+        // Prefer the runtime's own final message. A settled child with none
+        // falls back to its contribution projection — never an invented
+        // "result" harvested from tool logs.
+        let result = block
+            .filter(|b| !b.detail.trim().is_empty())
+            .map(|b| sub_agent_detail(b.detail.trim(), t))
+            .or_else(|| crate::multi_agent::contribution_line(child, t));
+        if let Some(result) = result.filter(|s| !s.trim().is_empty()) {
+            lines.push(Line::from(""));
+            lines.push(section_line(t.activity_result, theme));
+            for row in wrap(&result, content_width(width)) {
+                lines.push(detail_line(row, text, width));
+            }
+        }
+    } else if let Some(current) = child_current_line(child, state.locale, t) {
+        lines.push(Line::from(""));
+        lines.push(section_line(t.activity_current, theme));
+        lines.push(detail_line(current, text, width));
+    }
+    lines.push(Line::from(""));
+    lines.push(section_line(t.activity_steps, theme));
+    let avail = content_width(width);
+    let activity = crate::activity_stream::child_activity_lines(
+        &child.activity,
+        theme,
+        state.locale,
+        t,
+        !settled,
+        avail,
+    );
+    for line in activity {
+        lines.push(prefix_indent(line, crate::layout::DETAIL_BODY_INDENT));
+    }
+}
+
+/// The current call of a running child, in the same user language the main
+/// activity stream uses. Falls back to the raw `recent_step` only when no typed
+/// call has arrived.
+fn child_current_line(
+    child: &crate::multi_agent::ChildAgentView,
+    locale: crate::i18n::Locale,
+    t: &crate::i18n::UiText,
+) -> Option<String> {
+    if let Some(call) = child.activity.last() {
+        let action = crate::tool_cell::tool_action_label_for(&call.tool, locale);
+        let summary = crate::tool_cell::tool_summary_for(&call.tool, &call.arguments, t);
+        return Some(if summary.is_empty() {
+            action
+        } else {
+            format!("{action} {summary}")
+        });
+    }
+    child.recent_step.clone().filter(|s| !s.trim().is_empty())
+}
+
+/// One muted metadata line for a child: the capability bounds and usage. The
+/// declared agent already rides on the identity line, so only a profile with no
+/// agent name is repeated here.
+fn child_metadata_line(
+    child: &crate::multi_agent::ChildAgentView,
+    t: &crate::i18n::UiText,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if child.agent_name.is_none()
+        && let Some(profile) = child.profile_id.as_deref().filter(|p| !p.trim().is_empty())
+    {
+        parts.push(profile.to_string());
+    }
+    if child.read_only {
+        parts.push(t.inspector_read_only.to_string());
+    }
+    if child.input_tokens > 0 || child.output_tokens > 0 {
+        parts.push(format!(
+            "↑ {} · ↓ {}",
+            crate::status_line::fmt_tokens(child.input_tokens),
+            crate::status_line::fmt_tokens(child.output_tokens)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// A section title at the page gutter.
+fn section_line(title: &str, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_string(),
+        Style::default()
+            .fg(theme.text.secondary)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// A section body row at [`crate::layout::DETAIL_BODY_INDENT`], truncated to
+/// the section's own width so a long value never overruns the right gutter.
+fn detail_line(value: impl Into<String>, style: Style, width: usize) -> Line<'static> {
+    let value = value.into();
+    let avail = content_width(width);
+    Line::from(Span::styled(
+        format!(
+            "{}{}",
+            crate::layout::DETAIL_BODY_INDENT,
+            truncate_display(&value, avail)
+        ),
+        style,
+    ))
+}
+
+/// Prefix an already-built line with the shared detail indent.
+fn prefix_indent(line: Line<'static>, indent: &str) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::raw(indent.to_string()));
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+/// Columns available to a section body once the detail indent is spent.
+fn content_width(width: usize) -> usize {
+    width
+        .saturating_sub(crate::layout::DETAIL_BODY_INDENT.len())
+        .max(4)
 }
 
 #[cfg(test)]
@@ -435,6 +768,7 @@ mod screens;
 pub(crate) mod text;
 mod transcript_lines;
 
+pub(crate) use footer::background_footer_spans;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
 pub use transcript_lines::{
@@ -495,6 +829,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Remote => render_remote_screen(frame, area, state),
         Screen::Shell => render_shell_screen(frame, area, state),
         Screen::Activity => render_activity_screen(frame, area, state),
+        Screen::ActivityList => render_background_list_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
         Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
         Screen::Context => crate::context::render_context_screen(frame, area, state),
@@ -1261,6 +1596,25 @@ mod tests {
         }
     }
 
+    /// An empty output section is still a section: the muted state sits at the
+    /// section body indent, not drifting on the page's left edge.
+    #[test]
+    fn background_detail_empty_output_is_an_indented_section_state() {
+        let mut state = test_state();
+        state.background_task_labels.insert(
+            "bg-empty".into(),
+            crate::state::BackgroundTaskChrome::running("make up", 0),
+        );
+        state.activity_open = Some(crate::activity::ActivityId::Background("bg-empty".into()));
+        state.active_screen = Screen::Activity;
+        let text = render_text(&mut state, 90, 24);
+        assert!(text.contains("  输出"), "section present: {text}");
+        assert!(
+            text.lines().any(|l| l.trim_end() == "    暂无输出"),
+            "empty state is indented under its section:\n{text}"
+        );
+    }
+
     /// A background Activity Detail shows the real command, its retained
     /// output, and the viewport's follow state — the same surface the child
     /// detail uses, not a second background-specific screen.
@@ -1273,6 +1627,7 @@ mod tests {
                 label: "cargo test --workspace".into(),
                 started_elapsed_secs: 0,
                 ok: None,
+                stopped: false,
                 exit_code: None,
                 duration_ms: None,
                 output: "Compiling leveler-core ...\ntest result: ok\n".into(),
@@ -1305,6 +1660,7 @@ mod tests {
                 label: "cargo test --workspace".into(),
                 started_elapsed_secs: 0,
                 ok: Some(true),
+                stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(133_000),
                 output: "test result: ok. 428 passed\n".into(),
@@ -1316,6 +1672,226 @@ mod tests {
         assert!(text.contains("Background Task"), "{text}");
         assert!(text.contains("test result: ok"), "{text}");
         assert!(text.contains("exit 0"), "{text}");
+        assert!(
+            !text.contains("x 停止"),
+            "a terminal task has nothing left to stop:\n{text}"
+        );
+    }
+
+    /// A running child with a known activity log: six reads, nine commands and
+    /// a live `grep`. Builds the read model directly so the page can be asserted
+    /// without a runtime.
+    fn running_child_with_activity() -> AppState {
+        use crate::multi_agent::ChildUpdate;
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.team.apply_update(ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done: false,
+            ok: false,
+            detail: "调查 portal-web 的选择器归属".into(),
+            title: Some("调查选择器归属".into()),
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 0,
+        });
+        for _ in 0..6 {
+            state.team.apply_activity(
+                "c1",
+                "tool_started",
+                "read_file",
+                r#"{"path":"public-order.css"}"#,
+                false,
+            );
+            state
+                .team
+                .apply_activity("c1", "tool_finished", "read_file", "ok", false);
+        }
+        for _ in 0..9 {
+            state.team.apply_activity(
+                "c1",
+                "tool_started",
+                "run_command",
+                r#"{"program":"rg","args":["selector","."]}"#,
+                false,
+            );
+            state
+                .team
+                .apply_activity("c1", "tool_finished", "run_command", "match", false);
+        }
+        state.team.apply_activity(
+            "c1",
+            "tool_started",
+            "grep",
+            r#"{"pattern":"public-order","path":"web"}"#,
+            false,
+        );
+        state.activity_open = Some(crate::activity::ActivityId::Child("c1".into()));
+        state.active_screen = Screen::Activity;
+        state
+    }
+
+    /// A Detail Page is not a bare renderer: the navigation owns the edge, the
+    /// page body sits on the shared content gutter, and a section's body is one
+    /// level deeper. The spacing comes from the shared tokens, so both detail
+    /// pages line up at the same columns.
+    #[test]
+    fn detail_pages_share_one_content_gutter() {
+        let mut state = test_state();
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            crate::state::BackgroundTaskChrome {
+                label: "cargo test --workspace".into(),
+                started_elapsed_secs: 0,
+                ok: None,
+                stopped: false,
+                exit_code: None,
+                duration_ms: None,
+                output: "Compiling leveler-tui\n".into(),
+            },
+        );
+        state.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
+        state.active_screen = Screen::Activity;
+        let text = render_text(&mut state, 90, 30);
+        let lines: Vec<&str> = text.lines().collect();
+        let header = lines
+            .iter()
+            .find(|l| l.contains("Background Task"))
+            .expect("identity header");
+        assert!(
+            header.starts_with('←'),
+            "back nav owns the edge: {header:?}"
+        );
+        for expected in [
+            "  cargo test --workspace",
+            "  命令",
+            "    $ cargo test --workspace",
+            "  输出",
+            "    Compiling leveler-tui",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.trim_end() == expected),
+                "missing {expected:?} in:\n{text}"
+            );
+        }
+    }
+
+    /// The Sub-agent page is not a tool trace. Repeated calls fold into one
+    /// semantic line, the live call is the only expanded one, and no raw tool
+    /// name leaks.
+    #[test]
+    fn sub_agent_detail_folds_tool_runs_and_never_shows_raw_tool_names() {
+        let mut state = running_child_with_activity();
+        let text = render_text(&mut state, 90, 40);
+        assert!(text.contains("读取 6 个文件"), "{text}");
+        assert!(text.contains("执行了 9 个命令"), "{text}");
+        assert!(
+            !text.contains("run_command"),
+            "raw tool name leaked:\n{text}"
+        );
+        assert!(!text.contains("read_file"), "raw tool name leaked:\n{text}");
+        // The live call is expanded: its action and its target are both shown.
+        assert!(text.contains("● 搜索代码"), "{text}");
+        assert!(text.contains("public-order"), "{text}");
+        // No row may claim two contradictory states at once.
+        for line in text.lines() {
+            assert!(
+                !(line.contains('●') && line.contains('✓')),
+                "conflicting status glyphs: {line:?}"
+            );
+        }
+    }
+
+    /// The footer is the same language on every Detail Page: a running task can
+    /// be stopped, a settled one cannot, and `Esc 返回` is always present.
+    #[test]
+    fn detail_footer_says_stop_only_while_stoppable() {
+        let mut running = running_child_with_activity();
+        let run_text = render_text(&mut running, 90, 30);
+        assert!(run_text.contains("Esc 返回"), "{run_text}");
+        assert!(run_text.contains("x 停止"), "{run_text}");
+
+        let mut settled = running_child_with_activity();
+        settled.team.apply_update(crate::multi_agent::ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            done: true,
+            ok: true,
+            detail: "调查完成".into(),
+            title: None,
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 0,
+        });
+        let settled_text = render_text(&mut settled, 90, 30);
+        assert!(settled_text.contains("Esc 返回"), "{settled_text}");
+        assert!(
+            !settled_text.contains("x 停止"),
+            "a settled child has nothing to stop:\n{settled_text}"
+        );
+    }
+
+    /// Every Detail Page survives a terminal too narrow for its own columns.
+    #[test]
+    fn detail_pages_do_not_panic_on_a_narrow_terminal() {
+        for (w, h) in [(12u16, 5u16), (20, 6), (30, 5), (40, 24)] {
+            let mut bg = test_state();
+            bg.background_task_labels.insert(
+                "bg-1".into(),
+                crate::state::BackgroundTaskChrome {
+                    label: "a-very-long-command --with a-very-long-argument".into(),
+                    started_elapsed_secs: 0,
+                    ok: None,
+                    stopped: false,
+                    exit_code: None,
+                    duration_ms: None,
+                    output: "a line of output that is much wider than the terminal\n".into(),
+                },
+            );
+            bg.activity_open = Some(crate::activity::ActivityId::Background("bg-1".into()));
+            bg.active_screen = Screen::Activity;
+            let _ = render_text(&mut bg, w, h);
+
+            let mut child = running_child_with_activity();
+            let _ = render_text(&mut child, w, h);
+        }
+    }
+
+    /// Resizing the terminal re-lays out every frame; the page must keep its
+    /// identity, gutter and footer at each size and leave no ghost of the
+    /// previous geometry.
+    #[test]
+    fn detail_page_relayouts_cleanly_across_resizes() {
+        let mut state = running_child_with_activity();
+        for (w, h) in [(100u16, 40u16), (40, 12), (80, 24), (30, 8)] {
+            let text = render_text(&mut state, w, h);
+            assert!(text.starts_with('←'), "w={w}: nav at the edge:\n{text}");
+            assert!(
+                text.contains("Sub-agent"),
+                "w={w}: page identity survives resize:\n{text}"
+            );
+            assert!(
+                text.contains("Esc 返回") && text.contains("x 停止"),
+                "w={w}: footer stays fixed:\n{text}"
+            );
+            for line in text.lines() {
+                assert!(
+                    line.chars().count() as u16 <= w,
+                    "w={w}: a row overran the terminal: {line:?}"
+                );
+            }
+        }
     }
 
     /// A child that was stopped and a child that finished are not the same
@@ -1423,8 +1999,7 @@ mod tests {
     fn the_steps_of_a_stopped_child_are_not_marked_done() {
         let mut state = stopped_child_state();
         let text = render_text(&mut state, 90, 30);
-        // The step LIST rows, not the "当前" line that names the same tool
-        // above them: a step row is indented and carries a status glyph.
+        // The activity rows carry a status glyph and a user-language label.
         let row = |needle: &str| {
             text.lines()
                 .filter(|l| l.starts_with("  ") && l.contains(needle))
@@ -1435,18 +2010,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("the fixture must list {needle} as a step:\n{text}"))
                 .to_string()
         };
-        // It was on `list_files` when it was stopped: that step never finished.
+        // It was on `grep` when it was stopped: that step never finished, so
+        // it must not wear a check.
         assert!(
-            !row("list_files").contains('✓'),
+            !row("搜索").contains('✓'),
             "the step it died on is not a completed one: {:?}",
-            row("list_files")
+            row("搜索")
         );
         // It had already moved past `read_file`, so that one did finish —
         // marking it unknown would lose true information.
         assert!(
-            row("read_file").contains('✓'),
+            row("读取").contains('✓'),
             "a step the child moved past did finish: {:?}",
-            row("read_file")
+            row("读取")
         );
     }
 
@@ -1474,8 +2050,12 @@ mod tests {
             started_elapsed_secs: 0,
         };
         state.team.apply_update(update(false, None));
-        state.team.apply_activity("c1", "read_file");
-        state.team.apply_activity("c1", "list_files");
+        state
+            .team
+            .apply_activity("c1", "tool_started", "read_file", "{}", false);
+        state
+            .team
+            .apply_activity("c1", "tool_started", "grep", "{}", false);
         state.team.apply_update(update(
             true,
             Some(leveler_client_protocol::ChildStop::Budget),
@@ -2497,16 +3077,21 @@ mod tests {
 
         let text = render_text(&mut s, 100, 32);
         assert!(text.contains("计划"), "{text}");
-        assert!(text.contains("读取约束与现状"), "{text}");
-        assert!(text.contains("修复运行链"), "{text}");
+        assert!(
+            text.contains("修复运行链"),
+            "the running step stays on the panel: {text}"
+        );
+        assert!(
+            !text.contains("读取约束与现状"),
+            "a settled step no longer claims a row: {text}"
+        );
     }
 
     #[test]
-    fn a_long_plan_shows_every_step_in_a_tall_terminal() {
-        // The panel used to be capped at six rows (title + 5 steps), so an
-        // eight-step plan lost items 6..8 with nothing on screen saying so.
-        // It is still chrome — bounded by the layout budget — but on a 40-row
-        // terminal that budget is the whole plan.
+    fn a_long_plan_hides_finished_steps_and_shows_the_open_ones() {
+        // The panel is a summary, not a full checklist: finished steps drop
+        // out, so an eight-step plan with two open steps shows those two
+        // instead of one row per completed step.
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.plan = Some(leveler_client_protocol::UiPlan {
@@ -2524,12 +3109,15 @@ mod tests {
         });
 
         let text = render_text(&mut s, 100, 40);
-        for index in 1..=8 {
+        for index in 7..=8 {
             assert!(text.contains(&format!("计划步骤{index}")), "{text}");
         }
+        for index in 1..=6 {
+            assert!(!text.contains(&format!("计划步骤{index}")), "{text}");
+        }
         assert!(
-            !text.contains('↑') && !text.contains('↓'),
-            "nothing is hidden, so no overflow indicator: {text}"
+            !text.contains('⋯'),
+            "every open step fits, so no count row: {text}"
         );
     }
 
@@ -2538,10 +3126,10 @@ mod tests {
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.plan = Some(leveler_client_protocol::UiPlan {
-            steps: (0..8)
+            steps: (0..20)
                 .map(|index| leveler_client_protocol::UiPlanStep {
                     index,
-                    description: format!("计划步骤{}", index + 1),
+                    description: format!("计划步骤{:02}", index + 1),
                     status: match index {
                         0..=5 => leveler_client_protocol::PlanStepStatus::Done,
                         6 => leveler_client_protocol::PlanStepStatus::Running,
@@ -2553,13 +3141,19 @@ mod tests {
 
         let text = render_text(&mut s, 100, 22);
         assert!(
-            text.contains("计划步骤7"),
+            text.contains("计划步骤07"),
             "the running step survives: {text}"
         );
         assert!(
-            text.contains('↑') || text.contains('↓'),
-            "what is cut must name itself: {text}"
+            text.contains('⋯'),
+            "the hidden open steps must name their count: {text}"
         );
+        for index in 1..=6 {
+            assert!(
+                !text.contains(&format!("计划步骤{index:02}")),
+                "a finished step stays hidden even when the panel is squeezed: {text}"
+            );
+        }
     }
 
     #[test]

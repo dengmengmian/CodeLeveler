@@ -388,6 +388,21 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.cancel_armed = false;
             state.force_cancel_armed = false;
             seal_analysis_segment(state);
+            // A recoverable provider failure is a continuation point, not a
+            // dead task. The runtime re-checks before it resumes; this only
+            // decides what the user is told.
+            state.resumable_task = failure.as_ref().is_some_and(failure_is_resumable);
+            // A resumable failure is a continuation point: show it as paused,
+            // which is what `继续` can re-enter. A hard failure stays red.
+            let resumable = state.resumable_task;
+            if let Some(goal) = state.active_goal.as_mut() {
+                let now = std::time::Instant::now();
+                if resumable {
+                    goal.pause(now);
+                } else {
+                    goal.fail(now);
+                }
+            }
             // ONE terminal failure → ONE primary block. The turn-end marker
             // states the outcome but must not carry a second copy of the
             // failure text.
@@ -397,7 +412,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     Some(f) => crate::transcript::FailureBlock {
                         title: t.failure_title.to_string(),
                         summary: failure_summary(f, t),
-                        subtitle: failure_subtitle(f),
+                        subtitle: failure_subtitle(
+                            f,
+                            state.resumable_task.then_some(t.resumable_hint),
+                        ),
                         detail: failure_detail_text(f, t),
                         expanded: false,
                     },
@@ -434,6 +452,12 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.team.mark_unreported_at_turn_end(state.elapsed_secs);
             state.cancel_armed = false;
             state.force_cancel_armed = false;
+            state.resumable_task = true;
+            // An interrupted turn keeps its goal: the clock freezes and the
+            // indicator waits for `继续` instead of disappearing.
+            if let Some(goal) = state.active_goal.as_mut() {
+                goal.pause(std::time::Instant::now());
+            }
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
             archive_active_plan(state);
             state.turn_verification = None;
@@ -449,6 +473,22 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.notification = Some(Notification {
                 level: NotificationLevel::Warning,
                 message: state.t().cancelled_continue.to_string(),
+            });
+        }
+        RuntimeEvent::TaskCancelled => {
+            // The user cancelled the LOGICAL task. It is terminal: the resume
+            // affordance is withdrawn so a `继续` cannot reopen it.
+            state.status = RuntimeStatus::Idle;
+            state.finalization_stage = None;
+            clear_activity(state);
+            state.goal_mode_active = false;
+            state.resumable_task = false;
+            state.cancel_armed = false;
+            state.force_cancel_armed = false;
+            state.active_goal = None;
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: state.t().task_cancelled.to_string(),
             });
         }
         RuntimeEvent::SubAgentUpdated {
@@ -582,9 +622,12 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             id,
             phase,
             tool,
+            preview,
             is_error,
-            ..
         } => {
+            // The activity projection and the transcript's one-word head are
+            // fed the same event. `recent_step` keeps its compact wording; the
+            // detail page reads the typed calls (tool, previews, status).
             let step = if phase == "tool_finished" {
                 if is_error {
                     format!("{tool} ✗")
@@ -592,9 +635,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     format!("{tool} ✓")
                 }
             } else {
-                tool
+                tool.clone()
             };
-            state.team.apply_activity(&id, &step);
+            state
+                .team
+                .apply_activity(&id, &phase, &tool, &preview, is_error);
             state.transcript.update_sub_agent_activity(&id, step);
         }
         RuntimeEvent::MemoryList {
@@ -850,16 +895,24 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             exit_code,
             duration_ms,
             ok,
+            stopped,
+            output,
         } => {
             let t = state.t();
             // Terminal is history, but the TUI keeps the entry so the Activity
-            // row and its detail stay reopenable until the next turn boundary.
-            // The registry record is the runtime's; this is only the view.
+            // row and its detail stay reopenable. The registry record is the
+            // runtime's; this is only the view.
             let label = match state.background_task_labels.get_mut(&task_id) {
                 Some(chrome) => {
                     chrome.ok = Some(ok);
+                    chrome.stopped = stopped;
                     chrome.exit_code = exit_code;
                     chrome.duration_ms = Some(duration_ms);
+                    // The final log is authoritative over the streamed chunks:
+                    // a lifecycle broadcast lag could have dropped one.
+                    if !output.is_empty() {
+                        chrome.output = output;
+                    }
                     chrome.label.clone()
                 }
                 // An exit for a task this session never saw start: report it in
@@ -868,24 +921,40 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 None => t.background_task_generic.to_string(),
             };
             crate::activity::bound_terminal_background(state);
-            let message = if ok {
-                t.background_task_done.replace("{}", &label)
+            // Stopped is its own terminal outcome: a cancel is not a failure.
+            // The wording and the notice level both follow the runtime fact.
+            let (message, level) = if ok {
+                (
+                    t.background_task_done.replace("{}", &label),
+                    NotificationLevel::Info,
+                )
+            } else if stopped {
+                (
+                    t.background_task_stopped.replace("{}", &label),
+                    NotificationLevel::Info,
+                )
             } else {
                 let failed = t.background_task_failed.replace("{}", &label);
-                match exit_code {
+                let message = match exit_code {
                     Some(code) => format!("{failed} · exit {code}"),
                     None => failed,
-                }
+                };
+                (message, NotificationLevel::Warning)
             };
             state.transcript.push_note(message.clone());
-            state.notification = Some(Notification {
-                level: if ok {
-                    NotificationLevel::Info
-                } else {
-                    NotificationLevel::Warning
-                },
-                message,
-            });
+            state.notification = Some(Notification { level, message });
+        }
+        RuntimeEvent::BackgroundTaskOutput { task_id, chunk } => {
+            // Live tail from the runtime. Sanitize again (the client never
+            // trusts raw terminal bytes) and bound the stored tail so a chatty
+            // server cannot grow the projection without bound.
+            if let Some(chrome) = state.background_task_labels.get_mut(&task_id) {
+                let clean = leveler_core::sanitize_terminal_output(&chunk);
+                if !clean.is_empty() {
+                    chrome.output.push_str(&clean);
+                    cap_background_output(&mut chrome.output);
+                }
+            }
         }
         RuntimeEvent::BackgroundTasksReconciled { tasks } => {
             replace_active_background_tasks(state, &tasks);
@@ -919,6 +988,7 @@ fn dismiss_resolved_interaction(
 fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<String>) {
     state.status = RuntimeStatus::Idle;
     state.finalization_stage = None;
+    state.resumable_task = false;
     clear_activity(state);
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
@@ -933,6 +1003,24 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         }
         other => other,
     };
+    // Active Goal terminal. Done (green) fades on its own; a turn that stopped
+    // short of done (amber) stays because it owes work; a failure the user may
+    // have to act on (red) never hides on a timer.
+    if let Some(goal) = state.active_goal.as_mut() {
+        let now = std::time::Instant::now();
+        match status {
+            TurnEndStatus::Completed
+            | TurnEndStatus::CompletedWithWarnings
+            | TurnEndStatus::Answered
+            | TurnEndStatus::Unverified => goal.complete(now),
+            TurnEndStatus::Truncated | TurnEndStatus::Incomplete | TurnEndStatus::Cancelled => {
+                goal.pause(now)
+            }
+            TurnEndStatus::ChecksFailed | TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => {
+                goal.fail(now)
+            }
+        }
+    }
     state.cancel_armed = false;
     state.force_cancel_armed = false;
     // If the provider never reported usage, still drive the context gauge from
@@ -1058,7 +1146,10 @@ fn failure_summary(
 /// HTTP status when there was one (`kimi · invalid_request · HTTP 400`). The
 /// status is the first thing a provider report needs, so it rides on the
 /// always-visible line rather than only the disclosure.
-fn failure_subtitle(failure: &leveler_client_protocol::UiFailure) -> Option<String> {
+fn failure_subtitle(
+    failure: &leveler_client_protocol::UiFailure,
+    resumable_hint: Option<&str>,
+) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(provider) = failure.provider.as_deref().filter(|p| !p.is_empty()) {
         parts.push(provider.to_string());
@@ -1067,7 +1158,24 @@ fn failure_subtitle(failure: &leveler_client_protocol::UiFailure) -> Option<Stri
     if let Some(status) = failure.status {
         parts.push(format!("HTTP {status}"));
     }
+    if let Some(hint) = resumable_hint {
+        parts.push(hint.to_string());
+    }
     Some(parts.join(" · "))
+}
+
+/// Whether a typed failure is one a continuation may re-enter.
+///
+/// Mirrors the runtime's classification (`ModelErrorKind` → recoverable
+/// provider/network faults) in product terms. It is a presentation mirror only.
+fn failure_is_resumable(failure: &leveler_client_protocol::UiFailure) -> bool {
+    matches!(
+        failure.category,
+        leveler_client_protocol::FailureCategory::Network
+            | leveler_client_protocol::FailureCategory::Timeout
+            | leveler_client_protocol::FailureCategory::Provider
+            | leveler_client_protocol::FailureCategory::RateLimit
+    )
 }
 
 /// The failure's disclosure text: every machine fact the runtime proved, one
@@ -1216,6 +1324,20 @@ fn clear_activity(state: &mut AppState) {
     state.reconnected_until = None;
 }
 
+/// Retained background-output cap. The runtime caps its own log too; the
+/// client keeps a same-sized tail so a reconnect or a long-running server does
+/// not grow the view model without bound.
+const BACKGROUND_OUTPUT_CAP: usize = 64 * 1024;
+
+fn cap_background_output(output: &mut String) {
+    if output.len() <= BACKGROUND_OUTPUT_CAP {
+        return;
+    }
+    let dropped = leveler_core::ceil_char_boundary(output, output.len() - BACKGROUND_OUTPUT_CAP);
+    let marker = format!("\u{2026}[truncated {dropped} bytes]\u{2026}");
+    *output = leveler_core::truncate_tail_bytes(output, BACKGROUND_OUTPUT_CAP, &marker);
+}
+
 fn replace_active_background_tasks(
     state: &mut AppState,
     tasks: &[leveler_client_protocol::UiActiveBackgroundTask],
@@ -1238,13 +1360,22 @@ fn replace_active_background_tasks(
         } else {
             label
         };
-        state.background_task_labels.insert(
-            task.task_id.clone(),
-            crate::state::BackgroundTaskChrome::running(
-                label,
-                state.elapsed_secs.saturating_sub(task.elapsed_ms / 1000),
-            ),
+        // Carry the already-retained output across a reconcile: the runtime's
+        // snapshot names the task, not its log, and re-inserting a blank entry
+        // would silently drop everything the detail page had shown.
+        let previous_output = state
+            .background_task_labels
+            .get(&task.task_id)
+            .map(|chrome| chrome.output.clone())
+            .unwrap_or_default();
+        let mut chrome = crate::state::BackgroundTaskChrome::running(
+            label,
+            state.elapsed_secs.saturating_sub(task.elapsed_ms / 1000),
         );
+        chrome.output = previous_output;
+        state
+            .background_task_labels
+            .insert(task.task_id.clone(), chrome);
     }
     let known = |id: &str| state.background_task_labels.contains_key(id);
     if matches!(&state.activity_selected, Some(crate::activity::ActivityId::Background(id)) if !known(id))
@@ -1269,16 +1400,22 @@ pub(super) fn start_turn(state: &mut AppState) {
     // rendering as work in flight. A child still open at the boundary stays:
     // the runtime continues or settles it in a later turn.
     state.team.retire_settled(state.elapsed_secs);
-    // The previous turn's finished background tasks retire the same way. A
-    // still-running one (a dev server) is not finished work and stays.
-    crate::activity::retire_terminal_background_tasks(state);
+    // Finished background tasks stay in the projection as the list page's
+    // "recently finished" window; the footer never shows them. A still-running
+    // one (a dev server) stays reachable too.
     state.turn_tool_calls = 0;
     state.status = RuntimeStatus::Busy;
+    state.resumable_task = false;
     state.finalization_stage = None;
     state.project_rule_sources.clear();
     // The previous turn's next step is spent — a new turn is under way.
     crate::suggestion::clear(state);
     seal_analysis_segment(state);
+    // The Active Goal indicator begins with the turn: a new task replaces the
+    // last goal with a fresh clock, a continuation keeps its identity and its
+    // banked active time.
+    let staged = state.staged_goal.take();
+    crate::active_goal::begin(state, staged, std::time::Instant::now());
 }
 
 /// A segment boundary (tool start, assistant start, turn end): the live
@@ -1289,6 +1426,10 @@ fn seal_analysis_segment(state: &mut AppState) {
 }
 
 fn mark_turn_busy(state: &mut AppState) {
+    // Real runtime progress: a goal that was waiting to resume is now running.
+    if let Some(goal) = state.active_goal.as_mut() {
+        goal.note_progress();
+    }
     if !state.is_busy() {
         start_turn(state);
     }
@@ -1352,6 +1493,7 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     state.session_id = session.id.clone();
     state.repository = session.repository.clone();
     state.branch = session.branch.clone();
+    state.goal = session.goal.clone();
     state.model_label = session
         .model
         .as_ref()
@@ -1516,6 +1658,15 @@ fn apply_session_with(
         }
         state.btw = crate::btw::BtwThread::default();
         state.btw.draft.set_image_token_template(&template);
+        // The Active Goal belongs to one session's task; another session never
+        // continues it.
+        state.active_goal = None;
+    }
+    // A live turn this client did not submit (a reconnect, another client)
+    // still owns an Active Goal: adopt the session's authoritative objective so
+    // the header reflects the running task.
+    if state.status == RuntimeStatus::Busy && state.active_goal.is_none() {
+        crate::active_goal::begin(state, None, std::time::Instant::now());
     }
     // A reconnect snapshot replaces (rather than merges) the active process
     // projection. Its entries come from the process registry, so terminal

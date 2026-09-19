@@ -163,18 +163,19 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             KeyCode::Esc => {
                 crate::activity::close(state);
             }
-            // `x` stops exactly the open child; its parent turn keeps running.
-            // Esc backs out without stopping anything.
-            KeyCode::Char('x') | KeyCode::Char('X') => {
-                if let Some(crate::activity::ActivityId::Child(id)) = &state.activity_open
-                    && state.team.children.iter().any(|child| {
+            // `x` stops exactly the open activity; its parent turn keeps
+            // running. Esc backs out without stopping anything. Both cases go
+            // through the runtime's own cancellation path — never a PID.
+            KeyCode::Char('x') | KeyCode::Char('X') => match &state.activity_open {
+                Some(crate::activity::ActivityId::Child(id))
+                    if state.team.children.iter().any(|child| {
                         child.id == *id
                             && matches!(
                                 child.status,
                                 crate::multi_agent::ChildStatus::Running
                                     | crate::multi_agent::ChildStatus::Waiting
                             )
-                    })
+                    }) =>
                 {
                     return vec![Effect::Send(
                         leveler_client_protocol::ClientCommand::CancelChild {
@@ -183,9 +184,21 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                         },
                     )];
                 }
-                // A background task has no cancel contract from the client, so
-                // `x` is deliberately inert here rather than faking a stop.
-            }
+                Some(crate::activity::ActivityId::Background(task_id))
+                    if state
+                        .background_task_labels
+                        .get(task_id)
+                        .is_some_and(|c| c.is_running()) =>
+                {
+                    return vec![Effect::Send(
+                        leveler_client_protocol::ClientCommand::CancelBackgroundTask {
+                            session_id: state.session_id.clone(),
+                            task_id: task_id.clone(),
+                        },
+                    )];
+                }
+                _ => {}
+            },
             // Follow the newest output until the user scrolls back; reaching
             // the bottom resumes. Home/End and g/G jump to the ends.
             KeyCode::Up | KeyCode::Char('k') => crate::activity::scroll_lines(state, -1),
@@ -194,6 +207,32 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             KeyCode::PageDown => crate::activity::scroll_page(state, 1),
             KeyCode::Home | KeyCode::Char('g') => crate::activity::to_top(state),
             KeyCode::End | KeyCode::Char('G') => crate::activity::to_bottom(state),
+            _ => {}
+        },
+        Screen::ActivityList => match key.code {
+            KeyCode::Esc => crate::activity::close_background_list(state),
+            KeyCode::Up | KeyCode::Char('k') => crate::activity::move_list_selection(state, -1),
+            KeyCode::Down | KeyCode::Char('j') => crate::activity::move_list_selection(state, 1),
+            KeyCode::Enter => return crate::activity::open_list_selected(state),
+            // `x` stops exactly the selected running task, through the runtime's
+            // own cancellation path. A terminal row advertises nothing to stop.
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                let Some(task_id) = crate::activity::selected_list_task(state) else {
+                    return Vec::new();
+                };
+                if state
+                    .background_task_labels
+                    .get(&task_id)
+                    .is_some_and(|c| c.is_running())
+                {
+                    return vec![Effect::Send(
+                        leveler_client_protocol::ClientCommand::CancelBackgroundTask {
+                            session_id: state.session_id.clone(),
+                            task_id,
+                        },
+                    )];
+                }
+            }
             _ => {}
         },
         Screen::Help => {

@@ -782,7 +782,14 @@ fn a_plan_transition_repaints_on_the_same_frame() {
         after.contains("已完成 1/3"),
         "the header follows the transition: {after}"
     );
-    assert!(after.contains("骨架") && after.contains("首页"), "{after}");
+    assert!(
+        after.contains("首页") && after.contains("验证"),
+        "the open steps stay on the summary: {after}"
+    );
+    assert!(
+        !after.contains("骨架"),
+        "the step that just finished drops out of the summary: {after}"
+    );
 }
 
 #[test]
@@ -1476,7 +1483,7 @@ fn goal_recap_and_plan_dock_do_not_mix() {
         .expect("recap in history");
     let plan_line = text
         .lines()
-        .position(|l| l.contains("审查架构"))
+        .position(|l| l.contains("实现持久化"))
         .expect("plan dock");
     assert!(
         recap_line < plan_line,

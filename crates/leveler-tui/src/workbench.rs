@@ -18,7 +18,6 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::i18n::UiText;
-use crate::plan_viewport::PlanViewportRow;
 use crate::render::{
     COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, render_attachments,
     render_slash_popup,
@@ -40,7 +39,7 @@ pub(crate) fn plan_done_total(plan: &UiPlan) -> (usize, usize) {
     let k = plan
         .steps
         .iter()
-        .filter(|s| matches!(s.status, PlanStepStatus::Done | PlanStepStatus::Skipped))
+        .filter(|s| crate::plan_viewport::is_plan_step_settled(s.status))
         .count();
     (k, n)
 }
@@ -58,7 +57,7 @@ pub(crate) fn plan_panel_should_show(plan: &UiPlan) -> bool {
     let all_success = plan
         .steps
         .iter()
-        .all(|s| matches!(s.status, PlanStepStatus::Done | PlanStepStatus::Skipped));
+        .all(|s| crate::plan_viewport::is_plan_step_settled(s.status));
     !all_success
 }
 
@@ -306,13 +305,48 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
         ..status
     };
     frame.render_widget(
-        Paragraph::new(header_status_line(state, text_area.width as usize)),
+        Paragraph::new(header_line(state, text_area.width as usize)),
         text_area,
     );
     frame.render_widget(
         Paragraph::new(header_rule_line(area.width as usize, state)),
         rule_area,
     );
+}
+
+/// The header row: the identity strip on the left, the Active Goal indicator
+/// flushed right.
+///
+/// The goal never starves the identity: it is offered only the columns left
+/// after `CodeLeveler`, and as the row narrows it drops its title first and
+/// then itself. The identity strip is the row's floor.
+fn header_line(state: &AppState, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+    // "CodeLeveler" plus a gap is the minimum the identity strip keeps.
+    const MIN_IDENTITY: usize = 10;
+    const GAP: usize = 2;
+    let goal = crate::active_goal::header(state, width.saturating_sub(MIN_IDENTITY + GAP));
+    if goal.is_empty() {
+        return header_status_line(state, width);
+    }
+    let goal_w: usize = goal
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let left_room = width.saturating_sub(goal_w + 1);
+    let left = header_status_line(state, left_room);
+    let left_w: usize = left
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let gap = width.saturating_sub(left_w + goal_w).max(1);
+    let mut spans = left.spans;
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(goal);
+    Line::from(spans)
 }
 
 /// The header underline: always a static hairline. The status spinner above
@@ -421,18 +455,22 @@ fn repo_basename(repo: &str) -> String {
 /// Plan chrome only while the plan has open work (or failures). Empty /
 /// fully-succeeded plans (including 1/1 ✓) take no rows.
 /// `budget` is the rows the layout can actually spare for the dock (after the
-/// header, composer, footer and the conversation's own minimum). The plan asks
-/// for one row per step and takes what it can get — never a fixed five, which
-/// is what silently dropped items 6..9 of a nine-step plan.
+/// header, composer, footer and the conversation's own minimum). The body is
+/// the summary window: finished steps drop out and at most five unfinished
+/// steps remain, so a long plan no longer claims a row per completed step.
 fn plan_panel_height(state: &AppState, budget: u16) -> u16 {
     match &state.plan {
         Some(p) if plan_panel_should_show(p) => {
             if state.plan_collapsed {
                 1
             } else {
-                let desired = 1 + crate::plan_viewport::plan_desired_body_rows(p) as u16;
-                // The header always survives, exactly like a collapsed dock.
-                desired.min(budget.max(1))
+                // The header always survives, exactly like a collapsed dock;
+                // the body gets whatever rows are left. The window already
+                // knows it must fit that body, so a twenty-step plan with three
+                // open steps asks for four rows, not twenty-one.
+                let body = budget.saturating_sub(1) as usize;
+                let window = crate::plan_viewport::plan_summary_window(p, body);
+                (1 + window.desired_rows() as u16).min(budget.max(1))
             }
         }
         _ => 0,
@@ -652,67 +690,54 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
 
     if !state.plan_collapsed {
         let body_width = area.width.saturating_sub(3 + STEP_INDENT.len() as u16) as usize;
-        for row in crate::plan_viewport::plan_viewport_rows(plan, area.height as usize - 1) {
-            match row {
-                PlanViewportRow::Step(step) => {
-                    let c = match step.status {
-                        PlanStepStatus::Done => theme.status.success,
-                        PlanStepStatus::Running if live => theme.accent.primary,
-                        PlanStepStatus::Failed => theme.status.error,
-                        PlanStepStatus::Running
-                        | PlanStepStatus::Skipped
-                        | PlanStepStatus::Pending => theme.text.secondary,
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{STEP_INDENT}{} ",
-                                crate::plan_cell::plan_glyph(step.status)
-                            ),
-                            Style::default().fg(c),
-                        ),
-                        Span::styled(
-                            truncate(
-                                format!("{}. {}", step.index + 1, step.description),
-                                body_width,
-                            ),
-                            Style::default().fg(
-                                if live && step.status == PlanStepStatus::Running {
-                                    theme.text.primary
-                                } else {
-                                    theme.text.secondary
-                                },
-                            ),
-                        ),
-                    ]));
-                }
-                // Overflow is never silent: the exact count of what sits off
-                // screen rides on its own row.
-                PlanViewportRow::HiddenBefore(n) => lines.push(overflow_line(
-                    &t.plan_hidden_before.replace("{}", &n.to_string()),
-                    theme,
-                    area.width as usize,
-                )),
-                PlanViewportRow::HiddenAfter(n) => lines.push(overflow_line(
-                    &t.plan_hidden_after.replace("{}", &n.to_string()),
-                    theme,
-                    area.width as usize,
-                )),
-                PlanViewportRow::HiddenBoth { before, after } => lines.push(overflow_line(
-                    &t.plan_hidden_both
-                        .replace("{before}", &before.to_string())
-                        .replace("{after}", &after.to_string()),
-                    theme,
-                    area.width as usize,
-                )),
-            }
+        let window = crate::plan_viewport::plan_summary_window(plan, area.height as usize - 1);
+        for step in window.visible {
+            // Only unfinished steps reach the summary, so a settled glyph never
+            // appears here; the running step is the one that earns emphasis.
+            let glyph_color = match step.status {
+                PlanStepStatus::Running if live => theme.accent.primary,
+                PlanStepStatus::Failed => theme.status.error,
+                _ => theme.text.secondary,
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{STEP_INDENT}{} ",
+                        crate::plan_cell::plan_glyph(step.status)
+                    ),
+                    Style::default().fg(glyph_color),
+                ),
+                Span::styled(
+                    truncate(
+                        format!("{}. {}", step.index + 1, step.description),
+                        body_width,
+                    ),
+                    Style::default().fg(if live && step.status == PlanStepStatus::Running {
+                        theme.text.primary
+                    } else {
+                        theme.text.secondary
+                    }),
+                ),
+            ]));
+        }
+        // The count row is a caption, not a step: no glyph, no number, and one
+        // text level dimmer than a pending step.
+        if window.show_hidden_line {
+            lines.push(overflow_line(
+                &t.plan_hidden_active
+                    .replace("{}", &window.hidden_active.to_string()),
+                theme,
+                area.width as usize,
+            ));
         }
     }
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One quiet `↑ / ↓ 还有 N 项` row under the plan dock's step indent.
+/// One quiet count row under the plan dock's step indent: `⋯ 另有 N 项待办`.
+/// It is a caption, not a step — no glyph, no step number, and one text level
+/// dimmer than a pending step.
 fn overflow_line(text: &str, theme: &crate::theme::Theme, width: usize) -> Line<'static> {
     Line::from(Span::styled(
         truncate(format!("  {text}"), width),
@@ -777,37 +802,87 @@ fn render_input(frame: &mut Frame, area: Rect, state: &mut AppState) {
 /// chips yield to it, and hints (lowest) simply truncate into whatever the
 /// right-hand block leaves. The row is always one physical row, so hints
 /// appearing or disappearing never reflow the transcript.
-fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if area.height == 0 || area.width == 0 {
+        state.background_footer_hit = None;
         return;
     }
     let width = area.width as usize;
     let dim = Style::default().fg(state.theme.text.secondary);
-    // Breathing room between the hints, the usage chips, and the clock.
+    // Breathing room between the hints, the background summary, the usage chips
+    // and the clock.
     const GAP: usize = 2;
 
-    let clock = state.clock_label.as_str();
-    let clock_w = UnicodeWidthStr::width(clock);
-    let clock_shown = clock_w > 0 && clock_w <= width;
-    let clock_start = width.saturating_sub(clock_w);
-
+    let clock = state.clock_label.clone();
+    let clock_w = UnicodeWidthStr::width(clock.as_str());
     let usage = crate::status_line::footer_usage_line(state);
     let usage_w = usage.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
-    let usage_limit = if clock_shown {
-        clock_start.saturating_sub(GAP)
-    } else {
-        width
-    };
-    let usage_shown = usage_w > 0 && usage_w <= usage_limit;
-    let usage_start = usage_limit.saturating_sub(usage_w);
 
-    let left_limit = if usage_shown {
-        usage_start.saturating_sub(GAP)
-    } else if clock_shown {
-        clock_start.saturating_sub(GAP)
+    // The background summary is placed before the usage/clock chips. It is the
+    // only place background work is visible on the main screen, so a long task
+    // label is clipped to keep the right-side chips on screen rather than
+    // pushing them off. An unread failure outranks those chips entirely: a
+    // failure the user cannot see is the one thing the footer must not hide.
+    let has_failure = crate::activity::footer_summary(state).is_some_and(|s| s.unread_failed > 0);
+    let right_reserve = if has_failure {
+        0
+    } else {
+        (if clock_w > 0 { clock_w + GAP } else { 0 })
+            + (if usage_w > 0 { usage_w + GAP } else { 0 })
+    };
+    let bg_cap = width
+        .saturating_sub(right_reserve)
+        .saturating_sub(if right_reserve > 0 { GAP } else { 0 })
+        .max(1);
+    let bg_spans = crate::render::background_footer_spans(state, bg_cap);
+    let bg_w = bg_spans
+        .as_ref()
+        .map(|spans| {
+            spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+
+    // Place from the right: clock, then usage, then the summary. An unread
+    // failure owns the row over those chips: the badge must never be the thing
+    // squeezed out.
+    let reserve_chips = !has_failure;
+    let mut cursor = width;
+    let clock_start = if reserve_chips && clock_w > 0 && clock_w <= cursor {
+        cursor -= clock_w;
+        Some(cursor)
+    } else {
+        None
+    };
+    let usage_start = if reserve_chips && usage_w > 0 && cursor >= GAP + usage_w {
+        cursor -= GAP + usage_w;
+        Some(cursor)
+    } else {
+        None
+    };
+    let sep = if clock_start.is_some() || usage_start.is_some() {
+        GAP
+    } else {
+        0
+    };
+    let bg_start = if bg_w > 0 && cursor >= sep + bg_w {
+        cursor -= sep + bg_w;
+        Some(cursor)
+    } else {
+        None
+    };
+    let any_right = clock_start.is_some() || usage_start.is_some() || bg_start.is_some();
+    let left_limit = if any_right {
+        cursor.saturating_sub(GAP)
     } else {
         width
     };
+
+    // Record the painted summary for click-to-open; the mouse handler reads it.
+    state.background_footer_hit =
+        bg_start.map(|start| (area.y, start as u16, (start + bg_w) as u16));
 
     if left_limit > 0
         && let Some(line) = crate::render::key_hint_line(state, left_limit)
@@ -824,22 +899,36 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
             },
         );
     }
-    if usage_shown && let Some(text) = usage {
+    if let (Some(start), Some(spans)) = (bg_start, bg_spans) {
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: area.x + start as u16,
+                y: area.y,
+                width: bg_w as u16,
+                height: 1,
+            },
+        );
+    }
+    if usage_start.is_some()
+        && let Some(text) = usage
+    {
+        let start = usage_start.unwrap_or(0);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(text, dim))),
             Rect {
-                x: area.x + usage_start as u16,
+                x: area.x + start as u16,
                 y: area.y,
                 width: usage_w as u16,
                 height: 1,
             },
         );
     }
-    if clock_shown {
+    if let Some(start) = clock_start {
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(clock.to_string(), dim))),
+            Paragraph::new(Line::from(Span::styled(clock, dim))),
             Rect {
-                x: area.x + clock_start as u16,
+                x: area.x + start as u16,
                 y: area.y,
                 width: clock_w as u16,
                 height: 1,
@@ -2133,7 +2222,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });
@@ -2646,7 +2735,7 @@ mod tests {
         assert_eq!(plan_panel_height(&state, 40), 1);
 
         state.plan_collapsed = false;
-        assert_eq!(plan_panel_height(&state, 40), 4); // title + 3 steps
+        assert_eq!(plan_panel_height(&state, 40), 3); // title + 2 open steps
     }
 
     #[test]
@@ -2806,109 +2895,88 @@ mod tests {
         }
     }
 
-    /// P1: nine steps and room for all of them — the dock used to stop at five
-    /// because its height was `min(6)`, dropping items 6..9 with no indicator.
+    /// The default summary keeps open work and drops finished history: a
+    /// nine-step plan with step 6 running shows 6..9, not 1..9.
     #[test]
-    fn a_nine_step_plan_shows_every_step_when_there_is_room() {
+    fn a_deep_plan_hides_finished_steps_and_shows_open_work() {
         let mut state = test_state();
         state.plan = Some(running_plan(9, 5));
         let rows = plan_panel_rows(&state, 10);
-        for i in 1..=9 {
+        let flat = squash(&rows.join("\n"));
+        for i in 6..=9 {
             assert!(
-                rows.iter()
-                    .any(|r| squash(r).contains(&format!("{i}.步骤{i}"))),
-                "step {i} must be on screen:\n{}",
+                flat.contains(&format!("{i}.步骤{i}")),
+                "open step {i} must be on screen:\n{}",
                 rows.join("\n")
             );
         }
+        for i in 1..=5 {
+            assert!(
+                !flat.contains(&format!("{i}.步骤{i}")),
+                "finished step {i} must not occupy a row:\n{}",
+                rows.join("\n")
+            );
+        }
+        assert!(!flat.contains('⋯'), "nothing is hidden: {flat}");
     }
 
-    /// P2: not enough room — the running step must survive the cut and the
-    /// hidden remainder must name its own count.
+    /// A dock too short for every open step keeps the running step and says how
+    /// many open steps it left off — a count, not a fabricated step.
     #[test]
-    fn a_short_plan_dock_keeps_the_running_step_and_names_the_overflow() {
+    fn a_short_plan_dock_keeps_the_running_step_and_counts_the_hidden_open_work() {
         let mut state = test_state();
-        state.plan = Some(running_plan(9, 5));
+        state.plan = Some(running_plan(9, 1));
         let rows = plan_panel_rows(&state, 6);
         let body = rows.join("\n");
-        assert!(squash(&body).contains("6.步骤6"), "{body}");
+        let flat = squash(&body);
+        assert!(flat.contains("2.步骤2"), "the running step stays: {body}");
         assert!(
-            body.contains('↓') || body.contains('↑'),
-            "overflow must be explicit: {body}"
+            flat.contains("⋯另有4项待办"),
+            "the exact open-step remainder rides on its own row: {body}"
         );
-        let shown = (1..=9)
-            .filter(|i| squash(&body).contains(&format!("{i}.步骤{i}")))
-            .count();
-        let hidden: usize = body
-            .lines()
-            .filter(|l| l.contains('↑') || l.contains('↓'))
-            .map(|l| {
-                l.chars()
-                    .filter(char::is_ascii_digit)
-                    .collect::<String>()
-                    .parse::<usize>()
-                    .unwrap()
-            })
-            .sum();
-        assert_eq!(shown + hidden, 9, "every step is shown or counted: {body}");
+        assert!(
+            !flat.contains("1.步骤1"),
+            "the finished step stays hidden: {body}"
+        );
+        let count_row = rows
+            .iter()
+            .find(|r| r.contains('⋯'))
+            .unwrap_or_else(|| panic!("no hidden-count row: {rows:?}"));
+        assert!(
+            count_row.trim_start().starts_with('⋯'),
+            "the count row is a caption, not a step: {count_row:?}"
+        );
     }
 
-    /// P3: a 30-step plan with the current item deep inside it.
+    /// A deep plan windows the open steps: five rows and a count of the rest.
     #[test]
-    fn a_deep_plan_windows_around_the_current_step_with_exact_hidden_counts() {
+    fn a_deep_plan_shows_five_open_steps_and_counts_the_rest() {
         let mut state = test_state();
         state.plan = Some(running_plan(30, 17));
         let rows = plan_panel_rows(&state, 7);
-        let body = squash(&rows.join("\n"));
-        assert!(body.contains("18.步骤18"), "{body}");
-        assert!(!body.contains("1.步骤1\n"), "{body}");
-        // 6 body rows: ↑ n, four steps, ↓ m — counts must add up to 30.
-        let before: usize = body
-            .split('↑')
-            .nth(1)
-            .and_then(|s| s.matches(char::is_numeric).count().checked_sub(0))
-            .map(|_| ())
-            .and_then(|_| {
-                body.split('↑')
-                    .nth(1)?
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .ok()
-            })
-            .unwrap_or_else(|| panic!("no top overflow count: {body}"));
-        let after: usize = body
-            .split('↓')
-            .nth(1)
-            .and_then(|s| {
-                s.chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .ok()
-            })
-            .unwrap_or_else(|| panic!("no bottom overflow count: {body}"));
+        let body = rows.join("\n");
+        let flat = squash(&body);
+        assert!(flat.contains("18.步骤18"), "{body}");
+        assert!(!flat.contains("1.步骤1"), "{body}");
+        assert!(flat.contains("⋯另有8项待办"), "{body}");
         let shown = rows
             .iter()
             .filter(|r| {
                 let s = squash(r);
-                s.contains("步骤") && !s.contains('↑') && !s.contains('↓')
+                s.contains("步骤") && !s.contains('⋯')
             })
             .count();
-        assert_eq!(before + shown + after, 30, "{body}");
+        assert_eq!(shown, 5, "at most five open steps: {body}");
     }
 
-    /// P6: a plan that fits shows no overflow chrome at all.
+    /// P6: a plan whose open steps fit shows no hidden-count row.
     #[test]
-    fn a_plan_that_fits_shows_no_overflow_indicator() {
+    fn a_plan_that_fits_shows_no_hidden_count_row() {
         let mut state = test_state();
         state.plan = Some(running_plan(4, 1));
         let rows = plan_panel_rows(&state, 8);
         let body = rows.join("\n");
-        assert!(!body.contains('↑') && !body.contains('↓'), "{body}");
+        assert!(!body.contains('⋯'), "{body}");
     }
 
     /// P7: a one-row body must not panic and must spend that row on the
@@ -2969,17 +3037,65 @@ mod tests {
         assert_eq!(plan_panel_height(&state, 40), 0);
     }
 
-    /// The dock grows with the plan instead of stopping at the old `min(6)`,
-    /// but never past the rows the layout can spare.
+    /// The dock asks only for its open steps — plus one count row when needed
+    /// — and never more rows than the layout can spare.
     #[test]
-    fn plan_dock_height_follows_the_plan_and_the_layout_budget() {
+    fn plan_dock_height_follows_the_open_work_and_the_layout_budget() {
         let mut state = test_state();
         state.plan = Some(running_plan(9, 5));
-        assert_eq!(plan_panel_height(&state, 40), 10, "header + nine steps");
-        assert_eq!(plan_panel_height(&state, 6), 6, "capped by the budget");
+        assert_eq!(plan_panel_height(&state, 40), 5, "header + four open steps");
+        assert_eq!(plan_panel_height(&state, 6), 5, "all four open steps fit");
+        assert_eq!(
+            plan_panel_height(&state, 4),
+            4,
+            "capped by the budget, so the window shrinks"
+        );
         assert_eq!(plan_panel_height(&state, 0), 1, "the header survives");
         state.plan_collapsed = true;
         assert_eq!(plan_panel_height(&state, 40), 1);
+    }
+
+    /// Acceptance: a 6/10 plan shows the four open steps and no settled
+    /// history, while the header keeps the global 6/10.
+    #[test]
+    fn six_of_ten_shows_the_four_open_steps_and_keeps_the_global_count() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.plan = Some(running_plan(10, 6));
+        let rows = plan_panel_rows(&state, 12);
+        let body = rows.join("\n");
+        let flat = squash(&body);
+        assert!(
+            flat.contains("计划") && flat.contains("已完成6/10"),
+            "{body}"
+        );
+        for i in 7..=10 {
+            assert!(flat.contains(&format!("{i}.步骤{i}")), "{body}");
+        }
+        for i in 1..=6 {
+            assert!(!flat.contains(&format!("{i}.步骤{i}")), "{body}");
+        }
+        assert!(!body.contains('⋯'), "{body}");
+    }
+
+    /// Acceptance: a 3/20 plan shows five open steps and counts the other 12.
+    #[test]
+    fn three_of_twenty_shows_five_open_steps_and_twelve_hidden() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.plan = Some(running_plan(20, 3));
+        let rows = plan_panel_rows(&state, 12);
+        let body = rows.join("\n");
+        let flat = squash(&body);
+        assert!(flat.contains("已完成3/20"), "{body}");
+        assert!(flat.contains("⋯另有12项待办"), "{body}");
+        let shown = (1..=20)
+            .filter(|i| flat.contains(&format!("{i}.步骤{i}")))
+            .count();
+        assert_eq!(shown, 5, "{body}");
+        for i in 1..=3 {
+            assert!(!flat.contains(&format!("{i}.步骤{i}")), "{body}");
+        }
     }
 
     // ── Notice Surface ─────────────────────────────────────────────────────
@@ -3203,5 +3319,329 @@ mod tests {
             message: "second".into(),
         });
         assert_eq!(s.notification.as_ref().unwrap().message, "second");
+    }
+
+    // ── Background jobs in the input footer ────────────────────────────────
+
+    fn bg_running(label: &str, started: u64) -> crate::state::BackgroundTaskChrome {
+        crate::state::BackgroundTaskChrome::running(label, started)
+    }
+
+    fn bg_terminal(
+        label: &str,
+        ok: bool,
+        stopped: bool,
+        started: u64,
+        duration_ms: u64,
+    ) -> crate::state::BackgroundTaskChrome {
+        crate::state::BackgroundTaskChrome {
+            label: label.into(),
+            started_elapsed_secs: started,
+            ok: Some(ok),
+            stopped,
+            exit_code: if ok { Some(0) } else { Some(1) },
+            duration_ms: Some(duration_ms),
+            output: String::new(),
+        }
+    }
+
+    fn render_background_case(
+        width: u16,
+        height: u16,
+        tasks: Vec<(&str, crate::state::BackgroundTaskChrome)>,
+        seen: &[&str],
+        focus: crate::state::WorkbenchFocus,
+    ) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut state = AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        state.elapsed_secs = 90;
+        state.clock_label = "09:30".into();
+        state.background_task_labels.clear();
+        for (id, chrome) in tasks {
+            state.background_task_labels.insert(id.into(), chrome);
+        }
+        for id in seen {
+            state.background_failures_seen.insert((*id).into());
+        }
+        state.workbench_focus = focus;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0u16;
+                while x < buf.area.width {
+                    let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+                    row.push_str(sym);
+                    // Advance past a wide glyph's continuation cell so display
+                    // columns (CJK) stay aligned with the painted row.
+                    x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// Case A — nothing running, no unread failure: no background section at
+    /// all, and the footer stays the single existing row.
+    #[test]
+    fn no_background_tasks_add_nothing_to_the_footer() {
+        let lines =
+            render_background_case(100, 30, vec![], &[], crate::state::WorkbenchFocus::Input);
+        let all = lines.join("\n");
+        assert!(!all.contains("后台"), "{all}");
+        assert!(!all.contains('↗'), "{all}");
+        // The footer is still one row: hints and clock share it.
+        assert_eq!(row_of(&lines, "09:30"), row_of(&lines, "Ctrl+?"));
+    }
+
+    /// Case B — one running task shows its name in the footer, not a body row.
+    #[test]
+    fn one_running_task_is_named_in_the_footer_only() {
+        let lines = render_background_case(
+            100,
+            30,
+            vec![("bg-1", bg_running("make up", 28))],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(all.contains("make up"), "{all}");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("make up")).count(),
+            1,
+            "the task appears once, in the footer: {all}"
+        );
+        assert!(lines[row_of(&lines, "make up")].contains('↗'), "{all}");
+    }
+
+    /// Case C — several running tasks aggregate into a single count, never one
+    /// row per task, and the whole block occupies the existing footer row.
+    #[test]
+    fn several_running_tasks_aggregate_into_one_footer_block() {
+        let lines = render_background_case(
+            100,
+            30,
+            vec![
+                ("bg-1", bg_running("make up", 10)),
+                ("bg-2", bg_running("cargo test", 20)),
+                ("bg-3", bg_running("dev server", 30)),
+            ],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(all.contains("后台 3"), "{all}");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains('↗')).count(),
+            1,
+            "one aggregate block: {all}"
+        );
+        for label in ["make up", "cargo test", "dev server"] {
+            assert!(
+                !all.contains(label),
+                "{label} must not get its own row: {all}"
+            );
+        }
+    }
+
+    /// Case D — running and failed are separate counts with separate inks.
+    #[test]
+    fn running_and_failed_are_separate_counts() {
+        let lines = render_background_case(
+            120,
+            30,
+            vec![
+                ("bg-1", bg_running("make up", 10)),
+                ("bg-2", bg_running("cargo test", 20)),
+                ("bg-3", bg_terminal("npm start", false, false, 0, 30_000)),
+            ],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(all.contains("后台 2"), "{all}");
+        assert!(all.contains("失败 1"), "{all}");
+        assert!(
+            !all.contains("后台 3"),
+            "failed is not folded into running: {all}"
+        );
+    }
+
+    /// Case E — only failures: the short failure block, not a count of tasks.
+    #[test]
+    fn failures_alone_read_as_a_failure_block() {
+        let lines = render_background_case(
+            120,
+            30,
+            vec![
+                ("bg-1", bg_terminal("npm start", false, false, 0, 30_000)),
+                ("bg-2", bg_terminal("cargo test", false, false, 0, 24_000)),
+            ],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(all.contains("后台失败 2"), "{all}");
+        assert!(!all.contains("后台 2"), "{all}");
+    }
+
+    /// A completed task never lingers in the footer — its history is the list.
+    #[test]
+    fn a_completed_task_does_not_linger_in_the_footer() {
+        let lines = render_background_case(
+            120,
+            30,
+            vec![("bg-1", bg_terminal("cargo check", true, false, 0, 18_000))],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(!all.contains("cargo check"), "{all}");
+        assert!(!all.contains('↗'), "{all}");
+    }
+
+    /// A stopped task is not a failure: no badge, no error ink.
+    #[test]
+    fn a_stopped_task_is_not_counted_as_a_failure() {
+        let lines = render_background_case(
+            120,
+            30,
+            vec![("bg-1", bg_terminal("npm start", false, true, 0, 24_000))],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(!all.contains("失败"), "{all}");
+        assert!(!all.contains('↗'), "{all}");
+    }
+
+    /// An acknowledged failure stops reminding; the task itself is untouched.
+    #[test]
+    fn acknowledged_failures_leave_the_footer() {
+        let lines = render_background_case(
+            120,
+            30,
+            vec![("bg-1", bg_terminal("npm start", false, false, 0, 30_000))],
+            &["bg-1"],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(!all.contains("失败"), "{all}");
+        assert!(!all.contains('↗'), "{all}");
+    }
+
+    /// A focused summary is reachable: it carries the `→` marker and the hint
+    /// row names Enter.
+    #[test]
+    fn a_focused_background_summary_advertises_enter() {
+        let lines = render_background_case(
+            120,
+            30,
+            vec![("bg-1", bg_running("make up", 10))],
+            &[],
+            crate::state::WorkbenchFocus::Background,
+        );
+        let all = lines.join("\n");
+        assert!(all.contains("→ ● make up"), "{all}");
+        assert!(all.contains("Enter 后台任务"), "{all}");
+    }
+
+    /// Long command labels truncate; the clock and the right chips survive.
+    #[test]
+    fn a_long_command_truncates_before_the_right_chips() {
+        let label = "API_PROXY_TARGET=http://localhost:8080 exec npm start -- --watch";
+        let lines = render_background_case(
+            60,
+            30,
+            vec![("bg-1", bg_running(label, 10))],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let row = &lines[row_of(&lines, "09:30")];
+        assert!(row.contains("09:30"), "the clock survives: {row:?}");
+        assert!(row.chars().count() <= 60, "no overflow: {row:?}");
+        assert!(!row.contains("--watch"), "the tail is dropped: {row:?}");
+    }
+
+    /// CJK labels are measured in display columns, not bytes, and never panic.
+    #[test]
+    fn a_cjk_command_keeps_display_width() {
+        let lines = render_background_case(
+            48,
+            30,
+            vec![("bg-1", bg_running("构建前端生产包并部署到预发环境", 10))],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        for row in &lines {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(row.as_str()) <= 48,
+                "row overflows: {row:?}"
+            );
+        }
+    }
+
+    /// Narrow terminals never underflow, overlap or panic. A running task
+    /// keeps the clock; an unread failure outranks the clock, which is exactly
+    /// the responsive contract.
+    #[test]
+    fn narrow_terminals_are_safe_with_a_background_summary() {
+        for width in [12u16, 16, 20, 24, 32, 40] {
+            let running_only = render_background_case(
+                width,
+                24,
+                vec![("bg-1", bg_running("make up", 10))],
+                &[],
+                crate::state::WorkbenchFocus::Input,
+            );
+            assert_eq!(running_only.len(), 24, "one row per line at width {width}");
+            assert!(
+                running_only.join("\n").contains("09:30"),
+                "the clock survives a running summary at width {width}"
+            );
+            for row in &running_only {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(row.as_str()) <= width as usize,
+                    "width {width} row overflows: {row:?}"
+                );
+            }
+
+            let with_failure = render_background_case(
+                width,
+                24,
+                vec![
+                    ("bg-1", bg_running("make up", 10)),
+                    ("bg-2", bg_terminal("npm start", false, false, 0, 30_000)),
+                ],
+                &[],
+                crate::state::WorkbenchFocus::Input,
+            );
+            assert_eq!(with_failure.len(), 24);
+            for row in &with_failure {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(row.as_str()) <= width as usize,
+                    "width {width} failure row overflows: {row:?}"
+                );
+            }
+        }
     }
 }

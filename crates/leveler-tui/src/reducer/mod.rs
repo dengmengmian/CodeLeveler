@@ -520,6 +520,11 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         .iter()
         .find(|(y, _)| *y == mouse.row)
         .map(|(_, id)| id.clone());
+    // The footer background summary opens the jobs list; the row was published
+    // by the last footer paint.
+    let footer_hit = state
+        .background_footer_hit
+        .is_some_and(|(row, x0, x1)| mouse.row == row && (x0..x1).contains(&mouse.column));
     let over_jump = point_in_rect(mouse.column, mouse.row, state.conv.scroll_bottom_rect);
 
     // 待发送 rows: hover reveals an item's actions; a click sends, deletes, or
@@ -582,6 +587,12 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
                 return crate::activity::open(state, id);
+            }
+            if footer_hit {
+                interaction::clear_selection_drag(state);
+                state.conv.selection.clear();
+                crate::activity::open_background_list(state);
+                return Vec::new();
             }
             if over_input {
                 state.workbench_focus = WorkbenchFocus::Input;
@@ -949,6 +960,12 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Activity => {
             return crate::activity::open_selected(state);
         }
+        // Background focus: Enter opens the aggregated jobs list. The list page
+        // is what acknowledges the failures, so the badge clears on return.
+        KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Background => {
+            crate::activity::open_background_list(state);
+            return Vec::new();
+        }
         // Command focus: Enter toggles the focused command's output, exactly
         // as clicking its row does.
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Command => {
@@ -1050,7 +1067,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     }
                 }
                 WorkbenchFocus::Command => ensure_activity_focus(state),
-                WorkbenchFocus::Activity => WorkbenchFocus::Input,
+                WorkbenchFocus::Activity => {
+                    if crate::activity::footer_summary(state).is_some() {
+                        WorkbenchFocus::Background
+                    } else {
+                        WorkbenchFocus::Input
+                    }
+                }
+                WorkbenchFocus::Background => WorkbenchFocus::Input,
                 WorkbenchFocus::Pending => WorkbenchFocus::Conversation,
             };
         }
@@ -1269,11 +1293,15 @@ fn forget_pending_input_row(state: &mut AppState) {
 /// Move the workbench focus to the activity strip, or back to the composer
 /// when there is no activity to select.
 fn ensure_activity_focus(state: &mut AppState) -> WorkbenchFocus {
-    crate::activity::ensure_selection(state);
-    if crate::activity::summaries(state).is_empty() {
-        WorkbenchFocus::Input
-    } else {
+    if crate::activity::has_status_activities(state) {
+        crate::activity::ensure_selection(state);
         WorkbenchFocus::Activity
+    } else if crate::activity::footer_summary(state).is_some() {
+        // No child rows in the status strip, but background work is running or
+        // a failure is unread: the footer summary is the reachable focus.
+        WorkbenchFocus::Background
+    } else {
+        WorkbenchFocus::Input
     }
 }
 

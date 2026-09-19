@@ -646,6 +646,11 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
         // here — stopping belongs to the object's own detail page, and a
         // background task has no client cancel contract to advertise.
         t.activity_focus_hint.to_string()
+    } else if state.workbench_focus == crate::state::WorkbenchFocus::Background
+        && crate::activity::footer_summary(state).is_some()
+    {
+        // The footer summary is focused: Enter opens the background-jobs list.
+        format!("Enter {}", t.background_list_title)
     } else if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
     } else if state.composer.text().starts_with('!') {
@@ -667,6 +672,92 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
         truncate_display(&hints, width.max(1)),
         Style::default().fg(state.theme.text.muted),
     ))]
+}
+
+/// The input footer's aggregated background-jobs summary.
+///
+/// `None` when there is nothing to say, so the footer keeps its existing
+/// layout and height. Running work is one accent block (a single named task, or
+/// a count with the oldest elapsed); unacknowledged failures are one error
+/// block. Never a per-task row. Clipped to `max_width` so a long command cannot
+/// push the right-side chips off the terminal.
+pub(crate) fn background_footer_spans(
+    state: &AppState,
+    max_width: usize,
+) -> Option<Vec<Span<'static>>> {
+    let summary = crate::activity::footer_summary(state)?;
+    if max_width == 0 {
+        return None;
+    }
+    let theme = &state.theme;
+    let t = state.t();
+    let accent = Style::default().fg(theme.accent.primary);
+    let error = Style::default().fg(theme.status.error);
+    let muted = Style::default().fg(theme.text.muted);
+    let focused = state.workbench_focus == crate::state::WorkbenchFocus::Background;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if focused {
+        spans.push(Span::styled("→ ", accent));
+    }
+    if summary.running > 0 {
+        let dur = crate::status_line::fmt_elapsed(summary.oldest_running_secs);
+        let text = match (summary.single_label.as_deref(), summary.running) {
+            (Some(label), 1) => format!("{label} · {dur}"),
+            _ => format!(
+                "{} · {dur}",
+                t.background_running_count
+                    .replace("{}", &summary.running.to_string())
+            ),
+        };
+        spans.push(Span::styled(format!("● {text}"), accent));
+    }
+    if summary.unread_failed > 0 {
+        if summary.running > 0 {
+            spans.push(Span::styled(" ", muted));
+        }
+        let text = if summary.running > 0 {
+            t.background_failed_count
+                .replace("{}", &summary.unread_failed.to_string())
+        } else {
+            t.background_failed_only
+                .replace("{}", &summary.unread_failed.to_string())
+        };
+        // Running + failure reads `● 后台 2 ×失败 1`; failures alone read
+        // `× 后台失败 2`.
+        let prefix = if summary.running > 0 { "×" } else { "× " };
+        spans.push(Span::styled(format!("{prefix}{text}"), error));
+    }
+    // The open affordance follows the primary tone: failure ink when the only
+    // thing to say is a failure, otherwise the running accent.
+    let arrow = if summary.running == 0 { error } else { accent };
+    spans.push(Span::styled(" ↗", arrow));
+    Some(clip_spans(spans, max_width))
+}
+
+/// Truncate a styled line to `max` display columns, preserving each span's
+/// style. Unicode display width, never byte length.
+fn clip_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        if used >= max {
+            break;
+        }
+        let content = span.content.to_string();
+        let w = UnicodeWidthStr::width(content.as_str());
+        if used + w <= max {
+            used += w;
+            out.push(span);
+        } else {
+            let remaining = max - used;
+            let clipped = take_display_prefix(&content, remaining).0;
+            if !clipped.is_empty() {
+                out.push(Span::styled(clipped, span.style));
+            }
+            break;
+        }
+    }
+    out
 }
 
 /// The attachments strip above the composer (spec §40): compact when many.

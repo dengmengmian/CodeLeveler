@@ -475,7 +475,7 @@ mod tests {
                 started_elapsed_secs: 8,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });

@@ -1164,8 +1164,12 @@ mod tests {
             .join("\n")
     }
 
+    /// A turn blocked on `wait_task` is main execution state: the strip names
+    /// the wait. The task itself no longer occupies a strip row — its summary
+    /// lives in the input footer and its detail is reachable from the jobs
+    /// list.
     #[test]
-    fn status_strip_names_a_background_wait_and_its_target() {
+    fn status_strip_names_a_background_wait_without_a_task_row() {
         use crate::state::BackgroundTaskChrome;
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
@@ -1184,8 +1188,11 @@ mod tests {
         state.activity = Some("等待任务".into());
         let text = status_text(&state);
         assert!(text.contains("等待后台任务"), "{text}");
-        assert!(text.contains("cargo test --workspace"), "{text}");
-        assert!(text.contains('↗'), "{text}");
+        assert!(
+            !text.contains("cargo test --workspace"),
+            "the task row left the strip: {text}"
+        );
+        assert!(!text.contains('↗'), "the row affordance left too: {text}");
         assert!(text.contains(WAIT_MARKER), "{text}");
         for line in text.lines() {
             if line.contains("等待任务") {
@@ -1208,20 +1215,22 @@ mod tests {
         );
         let text = status_text(&state);
         assert!(text.contains("正在汇总审计结果"), "{text}");
-        assert!(text.contains("cargo test --workspace"), "{text}");
-        assert!(text.contains('↗'), "{text}");
+        assert!(
+            !text.contains("cargo test --workspace"),
+            "a running background task never occupies a strip row: {text}"
+        );
         assert!(!text.contains("等待后台任务"), "{text}");
     }
 
-    /// A background process outlives its turn, so its row stays reachable while
-    /// Main is idle — both a still-running one and a finished one kept for
-    /// reopening. Without this, the detail would only be openable mid-turn.
+    /// A background process outlives its turn. It stays reachable while Main is
+    /// idle through the input footer's aggregated summary, not a strip row.
     #[test]
-    fn an_idle_strip_keeps_background_activities_reachable() {
+    fn an_idle_strip_keeps_background_out_of_the_strip_but_in_the_footer() {
         use crate::state::BackgroundTaskChrome;
         let mut state = test_state();
         state.status = RuntimeStatus::Idle;
         state.activity = None;
+        state.elapsed_secs = 90;
         state.background_task_labels.insert(
             "bg-1".into(),
             BackgroundTaskChrome::running("npm run dev", 0),
@@ -1232,16 +1241,21 @@ mod tests {
                 label: "cargo test --workspace".into(),
                 started_elapsed_secs: 0,
                 ok: Some(true),
+                stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(1_000),
                 output: String::new(),
             },
         );
         let text = status_text(&state);
-        assert!(text.contains("npm run dev"), "{text}");
-        assert!(text.contains("cargo test --workspace"), "{text}");
-        assert!(text.contains('↗'), "{text}");
+        assert!(!text.contains("npm run dev"), "{text}");
+        assert!(!text.contains("cargo test --workspace"), "{text}");
+        assert!(!text.contains('↗'), "{text}");
         assert!(!text.contains("等待后台任务"), "{text}");
+        // Still reachable: the footer summary reports the running task.
+        let summary = crate::activity::footer_summary(&state).expect("footer summary");
+        assert_eq!(summary.running, 1);
+        assert_eq!(summary.single_label.as_deref(), Some("npm run dev"));
     }
 
     /// A live reconnect is the one fact that must survive the busy status line:

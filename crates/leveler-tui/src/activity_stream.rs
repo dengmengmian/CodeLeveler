@@ -2154,6 +2154,165 @@ pub(crate) fn render_activity(
         .collect()
 }
 
+/// The Sub-agent Detail's activity body: the delegated child's own tool calls,
+/// grouped and summarized with the SAME taxonomy, visibility rules, disclosure
+/// wording and status glyphs as the Conversation activity stream.
+///
+/// A child reports a reduced shape over `SubAgentActivity` (tool name, an
+/// arguments preview, a result preview, an error bit), so the calls are adapted
+/// into neutral [`ToolCallBlock`]s here and then run through the module's own
+/// [`disclosure_label`]. The only deliberate difference from Conversation is
+/// the fold: a finished run of the same tool reads as one settled line
+/// ("读取 6 个文件") instead of a per-call row, because a child's steps are a
+/// transient summary, not the evidence surface the parent transcript is.
+///
+/// Returned lines are relative to the caller's body indent.
+pub(crate) fn child_activity_lines(
+    calls: &[crate::multi_agent::ChildActivityCall],
+    theme: &Theme,
+    locale: Locale,
+    t: &UiText,
+    child_running: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if calls.is_empty() {
+        return vec![Line::from(Span::styled(
+            t.activity_no_activity.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))];
+    }
+    let mut blocks: Vec<ToolCallBlock> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ToolCallBlock {
+            id: leveler_client_protocol::ToolCallId::new(format!("child-{i}")),
+            name: c.tool.clone(),
+            arguments: c.arguments.clone(),
+            status: c.status,
+            preview: c.preview.clone(),
+            duration_ms: None,
+            parallel: false,
+            batch: None,
+            started_elapsed_secs: 0,
+            exit_code: None,
+            output: String::new(),
+            output_truncated: false,
+            expanded: false,
+            stop: StopRequest::None,
+            applied_diff: None,
+        })
+        .collect::<Vec<_>>();
+    // Only the newest call can still be in flight. A call the child moved past
+    // finished — marking it running would show work the child had already left
+    // (the same untruth the step list used to carry). The last call's own
+    // event decides it.
+    if let Some(last_running) = blocks.iter().rposition(|b| b.status == ToolStatus::Running) {
+        for b in blocks.iter_mut().take(last_running) {
+            if b.status == ToolStatus::Running {
+                b.status = ToolStatus::Ok;
+            }
+        }
+    }
+    // Silent probes stay out unless they failed — the same rule the
+    // Conversation stream applies, so the detail cannot surface noise the
+    // parent never would.
+    let visible: Vec<&ToolCallBlock> = blocks
+        .iter()
+        .filter(|c| is_conversation_visible(c))
+        .collect();
+    if visible.is_empty() {
+        return vec![Line::from(Span::styled(
+            t.activity_no_activity.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))];
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < visible.len() {
+        let mut j = i + 1;
+        while j < visible.len() && visible[j].name == visible[i].name {
+            j += 1;
+        }
+        child_activity_group_lines(
+            &visible[i..j],
+            theme,
+            locale,
+            t,
+            child_running,
+            width,
+            &mut out,
+        );
+        i = j;
+    }
+    out
+}
+
+/// One run of same-tool calls, relative to the body indent. A run with a live
+/// call names its tool and shows that call's target; a settled run folds to one
+/// semantic line with the count.
+fn child_activity_group_lines(
+    group: &[&ToolCallBlock],
+    theme: &Theme,
+    locale: Locale,
+    t: &UiText,
+    child_running: bool,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let live = group
+        .iter()
+        .find(|c| c.status == ToolStatus::Running)
+        .copied();
+    if let Some(current) = live {
+        // A live call is not a settled count: the row must name what it is
+        // doing now, with its target. `●` says it is in flight; a child that
+        // already settled while this call was open never got its terminal, so
+        // it reads `·` instead — never a check.
+        let (glyph, glyph_style) = if child_running {
+            ("● ", Style::default().fg(theme.accent.primary))
+        } else {
+            ("· ", Style::default().fg(theme.text.muted))
+        };
+        let action = crate::tool_cell::tool_call_label(&current.name, &current.arguments, locale);
+        out.push(Line::from(vec![
+            Span::styled(glyph, glyph_style),
+            Span::styled(
+                truncate_display(&action, width.saturating_sub(2).max(4)),
+                Style::default().fg(theme.ink(Ink::Active)),
+            ),
+        ]));
+        let summary = strip_inline_md(&tool_summary_pub(&current.name, &current.arguments, t));
+        if !summary.is_empty() && summary != "{}" {
+            let avail = width.saturating_sub(ACTIVITY_INDENT.len()).max(4);
+            out.push(Line::from(vec![
+                Span::raw(ACTIVITY_INDENT),
+                Span::styled(
+                    truncate_display(&summary, avail),
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ]));
+        }
+        return;
+    }
+    let failed = group
+        .iter()
+        .filter(|c| c.status == ToolStatus::Failed)
+        .count();
+    let (glyph, color) = if failed > 0 {
+        ("✗", theme.status.error)
+    } else {
+        ("✓", theme.status.success)
+    };
+    let label = disclosure_label(group, failed, t);
+    out.push(Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(
+            truncate_display(&label, width.saturating_sub(2).max(4)),
+            Style::default().fg(theme.ink(Ink::Settled)),
+        ),
+    ]));
+}
+
 /// Plain-text lines for tests (no styling).
 #[cfg(test)]
 pub(crate) fn render_group_text(

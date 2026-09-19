@@ -1419,7 +1419,7 @@ mod tests {
         let lines = item_render(&item, &theme, 100, false, t);
         assert_eq!(lines.len(), 1, "soft unverified stays one line");
         let text = line_text(&lines[0]);
-        assert!(text.contains("完成 · 未自动验证"), "{text}");
+        assert!(text.contains("实现完成 · 验证未运行"), "{text}");
         assert!(text.contains("3 次工具"), "{text}");
         // Product philosophy / browser disclaimer must not flood the marker.
         assert!(!text.contains("浏览器预览"), "{text}");
@@ -1439,7 +1439,10 @@ mod tests {
         });
         let lines = item_render(&item, &theme, 140, false, t);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("done · not auto-verified"), "{text}");
+        assert!(
+            text.contains("implementation done · verification not run"),
+            "{text}"
+        );
         assert!(!text.contains("browser preview"), "{text}");
         assert!(
             !text.contains("no applicable automatic verification"),

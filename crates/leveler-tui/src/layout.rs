@@ -18,6 +18,15 @@ pub const INPUT_INTERNAL_PADDING_X: u16 = 1;
 /// Blank rows under the footer strip so Context is not flush on the edge.
 pub const FOOTER_BOTTOM_PADDING: u16 = 1;
 
+/// Indentation *inside* a Secondary/Detail page's content gutter. The shell
+/// already insets the whole content rect by [`WORKSPACE_GUTTER_X`]; these name
+/// the levels within a page so a Detail Page body never scatters magic spaces.
+///
+/// A section title sits at the gutter itself (`""`); the section's own body
+/// sits at [`DETAIL_BODY_INDENT`]; a body's nested detail is indented once more
+/// from there (the activity stream owns that rail via its own token).
+pub const DETAIL_BODY_INDENT: &str = "  ";
+
 /// Horizontal inset: `x + gutter`, `width - 2*gutter`. Never underflows.
 pub fn horizontal_inset(outer: Rect, gutter: u16) -> Rect {
     let width = outer.width.saturating_sub(gutter.saturating_mul(2));

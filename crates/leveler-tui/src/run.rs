@@ -363,6 +363,18 @@ pub async fn run(
             state.elapsed_secs = 0;
         }
 
+        // A completed goal fades itself out. The tick already wakes this loop,
+        // so the boundary is checked here instead of on a sleep or a second
+        // timer; a failure never expires and needs no work.
+        if state
+            .active_goal
+            .as_ref()
+            .is_some_and(|goal| goal.is_expired(Instant::now()))
+        {
+            state.active_goal = None;
+            paint_now = true;
+        }
+
         // Wall clock in the footer — repaint when the minute rolls over.
         let clock = crate::status_line::fmt_clock(chrono::Local::now().time());
         if clock != state.clock_label {

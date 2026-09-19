@@ -44,6 +44,9 @@ pub enum ActivityStatus {
     Waiting,
     Completed,
     Failed,
+    /// A background task the runtime reported `Killed`: a user/agent cancel or
+    /// session cleanup. Never counted as a failure.
+    Stopped,
     /// A child whose activation died with its runtime window.
     Interrupted,
     /// A child whose turn ended without its terminal reaching this view.
@@ -81,10 +84,11 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             Some(ms) => ms / 1000,
             None => now.saturating_sub(chrome.started_elapsed_secs),
         };
-        let status = match chrome.ok {
-            None => ActivityStatus::Running,
-            Some(true) => ActivityStatus::Completed,
-            Some(false) => ActivityStatus::Failed,
+        let status = match chrome.outcome() {
+            crate::state::BackgroundOutcome::Running => ActivityStatus::Running,
+            crate::state::BackgroundOutcome::Completed => ActivityStatus::Completed,
+            crate::state::BackgroundOutcome::Failed => ActivityStatus::Failed,
+            crate::state::BackgroundOutcome::Stopped => ActivityStatus::Stopped,
         };
         let row = ActivitySummary {
             id: ActivityId::Background(task_id.clone()),
@@ -102,7 +106,9 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             ActivityStatus::Waiting | ActivityStatus::Interrupted | ActivityStatus::Unreported => {
                 waiting.push(row)
             }
-            ActivityStatus::Completed | ActivityStatus::Failed => done.push(row),
+            ActivityStatus::Completed | ActivityStatus::Failed | ActivityStatus::Stopped => {
+                done.push(row)
+            }
         }
     }
 
@@ -152,7 +158,9 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
             ActivityStatus::Waiting | ActivityStatus::Interrupted | ActivityStatus::Unreported => {
                 waiting.push(row)
             }
-            ActivityStatus::Completed | ActivityStatus::Failed => done.push(row),
+            ActivityStatus::Completed | ActivityStatus::Failed | ActivityStatus::Stopped => {
+                done.push(row)
+            }
         }
     }
 
@@ -242,6 +250,7 @@ pub(crate) fn activity_glyph(status: ActivityStatus) -> &'static str {
         ActivityStatus::Waiting => "◌",
         ActivityStatus::Completed => "✓",
         ActivityStatus::Failed => "✕",
+        ActivityStatus::Stopped => "■",
         ActivityStatus::Interrupted => "⏸",
         ActivityStatus::Unreported => "?",
     }
@@ -262,13 +271,216 @@ pub(crate) fn background_chrome<'a>(
     state.background_task_labels.get(id)
 }
 
+/// Whether the status strip has any child-agent row to focus. Background tasks
+/// no longer occupy that strip, so they never make `WorkbenchFocus::Activity`
+/// reachable.
+pub(crate) fn has_status_activities(state: &AppState) -> bool {
+    summaries(state)
+        .iter()
+        .any(|s| s.kind == ActivityKind::ChildAgent)
+}
+
+/// Aggregated background-job state for the input footer.
+///
+/// `None` when there is nothing to say: no running task and no unacknowledged
+/// failure. A completed or stopped task never earns a footer slot — its place
+/// is the list page's "recently finished" history. This is the whole reason
+/// background work no longer renders as rows in the conversation body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundFooterSummary {
+    pub running: usize,
+    /// The oldest running task's elapsed seconds, for the aggregate duration.
+    pub oldest_running_secs: u64,
+    /// The single running task's label, when exactly one is running.
+    pub single_label: Option<String>,
+    /// Failed tasks the user has not acknowledged yet.
+    pub unread_failed: usize,
+}
+
+impl BackgroundFooterSummary {
+    pub fn is_empty(&self) -> bool {
+        self.running == 0 && self.unread_failed == 0
+    }
+}
+
+pub(crate) fn footer_summary(state: &AppState) -> Option<BackgroundFooterSummary> {
+    let now = state.elapsed_secs;
+    let mut running = 0usize;
+    let mut oldest = 0u64;
+    let mut single: Option<String> = None;
+    let mut unread_failed = 0usize;
+    for (id, chrome) in &state.background_task_labels {
+        match chrome.outcome() {
+            crate::state::BackgroundOutcome::Running => {
+                running += 1;
+                let elapsed = now.saturating_sub(chrome.started_elapsed_secs);
+                if running == 1 || elapsed > oldest {
+                    oldest = elapsed;
+                }
+                single = Some(chrome.label.clone());
+            }
+            crate::state::BackgroundOutcome::Failed => {
+                if !state.background_failures_seen.contains(id) {
+                    unread_failed += 1;
+                }
+            }
+            crate::state::BackgroundOutcome::Completed
+            | crate::state::BackgroundOutcome::Stopped => {}
+        }
+    }
+    let summary = BackgroundFooterSummary {
+        running,
+        oldest_running_secs: oldest,
+        // A name is only shown when it is unambiguous; two tasks read as a
+        // count, never as a rotating carousel.
+        single_label: (running == 1).then_some(single).flatten(),
+        unread_failed,
+    };
+    (!summary.is_empty()).then_some(summary)
+}
+
+/// Mark every currently-failed task as seen.
+///
+/// The footer badge is an attention signal, not durable data: acknowledging
+/// clears the reminder only. Terminal state, exit code, output and history are
+/// all untouched, so the list page still shows the failures.
+pub(crate) fn acknowledge_failures(state: &mut AppState) {
+    let failed: Vec<String> = state
+        .background_task_labels
+        .iter()
+        .filter(|(id, chrome)| chrome.is_failed() && !state.background_failures_seen.contains(*id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in failed {
+        state.background_failures_seen.insert(id);
+    }
+}
+
+/// Acknowledge one task's failure, if it has one. Used when its detail opens.
+pub(crate) fn acknowledge_failure(state: &mut AppState, id: &str) {
+    if state
+        .background_task_labels
+        .get(id)
+        .is_some_and(|c| c.is_failed())
+    {
+        state.background_failures_seen.insert(id.to_string());
+    }
+}
+
+/// The background-jobs list page's two ordered sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundJobList {
+    /// Still running, oldest first (the durable servers lead).
+    pub running: Vec<ActivitySummary>,
+    /// Recently finished, newest first.
+    pub finished: Vec<ActivitySummary>,
+}
+
+impl BackgroundJobList {
+    pub fn is_empty(&self) -> bool {
+        self.running.is_empty() && self.finished.is_empty()
+    }
+
+    /// Flat row order the selection index addresses: running, then finished.
+    pub fn rows(&self) -> impl Iterator<Item = &ActivitySummary> {
+        self.running.iter().chain(self.finished.iter())
+    }
+}
+
+pub(crate) fn background_job_list(state: &AppState) -> BackgroundJobList {
+    let mut running = Vec::new();
+    let mut finished = Vec::new();
+    for summary in summaries(state)
+        .into_iter()
+        .filter(|s| s.kind == ActivityKind::BackgroundTask)
+    {
+        match summary.status {
+            ActivityStatus::Running => running.push(summary),
+            _ => finished.push(summary),
+        }
+    }
+    BackgroundJobList { running, finished }
+}
+
+pub(crate) fn ensure_list_selection(state: &mut AppState) {
+    let list = background_job_list(state);
+    if list.is_empty() {
+        state.background_list_selected = None;
+        return;
+    }
+    if state
+        .background_list_selected
+        .as_ref()
+        .is_none_or(|id| !list.rows().any(|s| s.id.as_key() == id))
+    {
+        state.background_list_selected = list.rows().next().map(|s| s.id.as_key().to_string());
+    }
+}
+
+pub(crate) fn move_list_selection(state: &mut AppState, delta: isize) {
+    ensure_list_selection(state);
+    let list = background_job_list(state);
+    if list.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = list.rows().map(|s| s.id.as_key().to_string()).collect();
+    let current = state
+        .background_list_selected
+        .as_ref()
+        .and_then(|id| ids.iter().position(|c| c == id))
+        .unwrap_or(0);
+    let next = if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current + delta as usize).min(ids.len().saturating_sub(1))
+    };
+    state.background_list_selected = ids.get(next).cloned();
+}
+
+pub(crate) fn selected_list_task(state: &AppState) -> Option<String> {
+    state.background_list_selected.clone()
+}
+
+/// Open the background-jobs list. Opening is what acknowledges the current
+/// failures, so returning to the conversation no longer shows the badge while
+/// the task history is unchanged.
+pub(crate) fn open_background_list(state: &mut AppState) {
+    acknowledge_failures(state);
+    ensure_list_selection(state);
+    state.active_screen = crate::screen::Screen::ActivityList;
+    state.screen_scroll = 0;
+}
+
+pub(crate) fn close_background_list(state: &mut AppState) {
+    state.active_screen = crate::screen::Screen::Conversation;
+    state.screen_scroll = 0;
+}
+
+/// Open the selected list row's detail page.
+pub(crate) fn open_list_selected(state: &mut AppState) -> Vec<crate::action::Effect> {
+    ensure_list_selection(state);
+    let Some(id) = selected_list_task(state) else {
+        return Vec::new();
+    };
+    open(state, ActivityId::Background(id))
+}
+
 /// Status-strip activity lines and the summary index each line belongs to.
+///
+/// Only child agents reach this strip. Background tasks are aggregated into
+/// the input footer ([`footer_summary`]) and listed on the background-jobs
+/// page, so a long-lived process never occupies a row in the conversation
+/// body. When the agent is actively waiting on a task, `wait_status` still
+/// names it — that is main execution state, not the background summary.
 pub(crate) fn status_activity_lines(
     state: &AppState,
     width: usize,
     t: &UiText,
 ) -> Vec<ActivityRow> {
-    let all = summaries(state);
+    let all: Vec<ActivitySummary> = summaries(state)
+        .into_iter()
+        .filter(|s| s.kind == ActivityKind::ChildAgent)
+        .collect();
     if all.is_empty() {
         return Vec::new();
     }
@@ -303,7 +515,10 @@ pub(crate) fn status_activity_lines(
 }
 
 pub(crate) fn select_delta(state: &mut AppState, delta: isize) {
-    let all = summaries(state);
+    let all: Vec<ActivitySummary> = summaries(state)
+        .into_iter()
+        .filter(|s| s.kind == ActivityKind::ChildAgent)
+        .collect();
     if all.is_empty() {
         state.activity_selected = None;
         return;
@@ -355,7 +570,12 @@ pub(crate) fn open(state: &mut AppState, id: ActivityId) -> Vec<crate::action::E
                 )]
             }
         }
-        ActivityId::Background(_) => Vec::new(),
+        ActivityId::Background(task_id) => {
+            // Opening a failed task is seeing it: clear its footer reminder
+            // without touching the terminal record.
+            acknowledge_failure(state, &task_id);
+            Vec::new()
+        }
     }
 }
 
@@ -472,23 +692,17 @@ pub(crate) fn to_bottom(state: &mut AppState) {
     state.activity_view.scroll = state.activity_view.max_scroll;
 }
 
-/// Retire terminal background tasks at a turn boundary, the same way settled
-/// children retire: the previous turn's finished work is history, and the
-/// transcript keeps it. A still-running task (a dev server) stays.
-pub(crate) fn retire_terminal_background_tasks(state: &mut AppState) -> bool {
-    let before = state.background_task_labels.len();
-    state.background_task_labels.retain(|_, c| c.is_running());
-    before != state.background_task_labels.len()
-}
-
-/// Cap on terminal background tasks kept reopenable within a turn. Live tasks
-/// are bounded by the runtime's concurrency limit; terminal ones would
-/// otherwise accumulate over a long turn with many sequential commands.
+/// Cap on terminal background tasks kept reopenable. Live tasks are bounded
+/// by the runtime's concurrency limit; terminal ones would otherwise
+/// accumulate over a long session with many sequential commands. This is the
+/// list page's "recently finished" window; the runtime registry and the
+/// transcript remain the durable history behind it.
 const MAX_TERMINAL_BACKGROUND: usize = 8;
 
-/// Drop the oldest terminal entries past the cap so a long turn cannot grow the
-/// projection without bound. Ordered by start time, which is monotonic on the
-/// turn clock. A dropped entry that is still open falls back to the stale view.
+/// Drop the oldest terminal entries past the cap so a long session cannot grow
+/// the projection without bound. Ordered by start time, which is monotonic on
+/// the turn clock. A dropped entry that is still open falls back to the stale
+/// view. The durable history is the transcript and the runtime registry.
 pub(crate) fn bound_terminal_background(state: &mut AppState) {
     let mut terminal: Vec<(String, u64)> = state
         .background_task_labels
@@ -503,6 +717,10 @@ pub(crate) fn bound_terminal_background(state: &mut AppState) {
     terminal.sort_by_key(|(_, started)| *started);
     for (id, _) in terminal.into_iter().take(excess) {
         state.background_task_labels.remove(&id);
+        state.background_failures_seen.remove(&id);
+        if matches!(&state.background_list_selected, Some(sel) if sel == &id) {
+            state.background_list_selected = None;
+        }
         if matches!(&state.activity_open, Some(ActivityId::Background(open)) if open == &id) {
             state.activity_open = None;
         }
@@ -513,7 +731,10 @@ pub(crate) fn bound_terminal_background(state: &mut AppState) {
 }
 
 pub(crate) fn ensure_selection(state: &mut AppState) {
-    let all = summaries(state);
+    let all: Vec<ActivitySummary> = summaries(state)
+        .into_iter()
+        .filter(|s| s.kind == ActivityKind::ChildAgent)
+        .collect();
     if all.is_empty() {
         state.activity_selected = None;
         if state.workbench_focus == crate::state::WorkbenchFocus::Activity {
@@ -756,7 +977,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });
@@ -801,7 +1022,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });
@@ -842,7 +1063,7 @@ second line ignored"
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });
@@ -874,7 +1095,7 @@ second line ignored"
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });
@@ -892,6 +1113,7 @@ second line ignored"
                 label: "cargo check".into(),
                 started_elapsed_secs: 0,
                 ok: Some(true),
+                stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(1000),
                 output: String::new(),
@@ -943,8 +1165,9 @@ second line ignored"
             "bg-2".into(),
             BackgroundTaskChrome::running("cargo test --workspace", 0),
         );
-        crate::activity::ensure_selection(&mut state);
-        let effects = crate::activity::open_selected(&mut state);
+        // Background rows are not in the status strip, so the detail opens from
+        // the jobs list (or a footer click) by id, not via `open_selected`.
+        let effects = crate::activity::open(&mut state, ActivityId::Background("bg-2".into()));
         assert!(
             effects.is_empty(),
             "opening a background row sends no command"
@@ -1079,7 +1302,7 @@ second line ignored"
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: vec!["read_file".into()],
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });
@@ -1130,7 +1353,7 @@ second line ignored"
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: vec!["read_file".into()],
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });
@@ -1219,6 +1442,7 @@ second line ignored"
                 label: "cargo test --workspace".into(),
                 started_elapsed_secs: 0,
                 ok: Some(true),
+                stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(8_000),
                 output: "test result: ok\n".into(),
@@ -1234,10 +1458,10 @@ second line ignored"
         assert!(compact_row(&rows[0], false, 80).contains('↗'));
     }
 
-    /// Terminal tasks retire at the turn boundary; running ones (a dev server)
-    /// are not finished work and stay.
+    /// Finished tasks do not retire at a turn boundary: they are the list
+    /// page's "recently finished" history, reopenable after their turn ends.
     #[test]
-    fn a_terminal_background_task_retires_at_the_turn_boundary() {
+    fn a_terminal_background_task_stays_reopenable_across_turns() {
         let mut state = test_state();
         state.background_task_labels.insert(
             "bg-server".into(),
@@ -1249,14 +1473,20 @@ second line ignored"
                 label: "cargo test".into(),
                 started_elapsed_secs: 0,
                 ok: Some(true),
+                stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(1_000),
                 output: String::new(),
             },
         );
-        assert!(retire_terminal_background_tasks(&mut state));
+        // `bound_terminal_background` is the only pruning left, and it keeps
+        // terminal entries under the cap.
+        bound_terminal_background(&mut state);
         assert!(state.background_task_labels.contains_key("bg-server"));
-        assert!(!state.background_task_labels.contains_key("bg-done"));
+        assert!(state.background_task_labels.contains_key("bg-done"));
+        let list = background_job_list(&state);
+        assert_eq!(list.running.len(), 1);
+        assert_eq!(list.finished.len(), 1);
     }
 
     /// The retained terminal set is bounded so a long turn with many sequential
@@ -1271,6 +1501,7 @@ second line ignored"
                     label: format!("cmd {i}"),
                     started_elapsed_secs: i as u64,
                     ok: Some(true),
+                    stopped: false,
                     exit_code: Some(0),
                     duration_ms: Some(1_000),
                     output: String::new(),
@@ -1286,5 +1517,215 @@ second line ignored"
         assert!(!state.background_task_labels.contains_key("bg-0"));
         assert!(!state.background_task_labels.contains_key("bg-1"));
         assert!(state.background_task_labels.contains_key("bg-2"));
+    }
+
+    // ── Footer aggregation and failure acknowledgement ─────────────────────
+
+    fn finished(
+        label: &str,
+        ok: bool,
+        stopped: bool,
+        started: u64,
+        ms: u64,
+    ) -> BackgroundTaskChrome {
+        BackgroundTaskChrome {
+            label: label.into(),
+            started_elapsed_secs: started,
+            ok: Some(ok),
+            stopped,
+            exit_code: if ok { Some(0) } else { Some(1) },
+            duration_ms: Some(ms),
+            output: String::new(),
+        }
+    }
+
+    /// Case A: nothing to say. A completed or stopped task alone earns no
+    /// footer slot.
+    #[test]
+    fn footer_summary_is_none_without_running_or_unread_failures() {
+        let mut state = test_state();
+        state.elapsed_secs = 90;
+        assert!(footer_summary(&state).is_none());
+        state.background_task_labels.insert(
+            "bg-done".into(),
+            finished("cargo check", true, false, 0, 18_000),
+        );
+        state.background_task_labels.insert(
+            "bg-stopped".into(),
+            finished("npm start", false, true, 0, 24_000),
+        );
+        assert!(
+            footer_summary(&state).is_none(),
+            "completed and stopped tasks are not footer activity"
+        );
+    }
+
+    /// Case B: one running task is named.
+    #[test]
+    fn footer_summary_names_a_single_running_task() {
+        let mut state = test_state();
+        state.elapsed_secs = 90;
+        state
+            .background_task_labels
+            .insert("bg-1".into(), BackgroundTaskChrome::running("make up", 28));
+        let summary = footer_summary(&state).expect("summary");
+        assert_eq!(summary.running, 1);
+        assert_eq!(summary.single_label.as_deref(), Some("make up"));
+        assert_eq!(summary.oldest_running_secs, 62);
+        assert_eq!(summary.unread_failed, 0);
+    }
+
+    /// Case C: several running tasks aggregate to a count, and the duration is
+    /// the oldest running task's, never a carousel of names.
+    #[test]
+    fn footer_summary_aggregates_several_running_tasks() {
+        let mut state = test_state();
+        state.elapsed_secs = 90;
+        state
+            .background_task_labels
+            .insert("bg-1".into(), BackgroundTaskChrome::running("make up", 10));
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            BackgroundTaskChrome::running("cargo test", 30),
+        );
+        let summary = footer_summary(&state).expect("summary");
+        assert_eq!(summary.running, 2);
+        assert!(summary.single_label.is_none(), "a name is ambiguous");
+        assert_eq!(summary.oldest_running_secs, 80);
+    }
+
+    /// Case D/E: running and failed are separate counts.
+    #[test]
+    fn footer_summary_keeps_running_and_failed_separate() {
+        let mut state = test_state();
+        state.elapsed_secs = 90;
+        state
+            .background_task_labels
+            .insert("bg-1".into(), BackgroundTaskChrome::running("make up", 10));
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            BackgroundTaskChrome::running("cargo test", 20),
+        );
+        state.background_task_labels.insert(
+            "bg-3".into(),
+            finished("npm start", false, false, 0, 30_000),
+        );
+        let summary = footer_summary(&state).expect("summary");
+        assert_eq!(summary.running, 2);
+        assert_eq!(summary.unread_failed, 1);
+    }
+
+    /// The authoritative stop distinction: a killed task is not a failure.
+    #[test]
+    fn a_stopped_task_is_never_a_failure() {
+        let mut state = test_state();
+        state.elapsed_secs = 90;
+        state
+            .background_task_labels
+            .insert("bg-1".into(), finished("npm start", false, true, 0, 24_000));
+        let chrome = state.background_task_labels.get("bg-1").unwrap();
+        assert_eq!(chrome.outcome(), crate::state::BackgroundOutcome::Stopped);
+        assert!(!chrome.is_failed());
+        assert!(footer_summary(&state).is_none());
+        assert_eq!(
+            summaries(&state)[0].status,
+            ActivityStatus::Stopped,
+            "the view maps the runtime Killed state to Stopped"
+        );
+    }
+
+    /// An unexpected non-zero exit IS a failure.
+    #[test]
+    fn an_unexpected_nonzero_exit_is_a_failure() {
+        let mut state = test_state();
+        state.elapsed_secs = 90;
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            finished("npm start", false, false, 0, 30_000),
+        );
+        let chrome = state.background_task_labels.get("bg-1").unwrap();
+        assert_eq!(chrome.outcome(), crate::state::BackgroundOutcome::Failed);
+        assert!(chrome.is_failed());
+        assert_eq!(footer_summary(&state).unwrap().unread_failed, 1);
+    }
+
+    /// Acknowledging clears the reminder only: terminal state, exit code and
+    /// history are untouched.
+    #[test]
+    fn acknowledging_failures_clears_the_badge_but_keeps_history() {
+        let mut state = test_state();
+        state.elapsed_secs = 90;
+        state.background_task_labels.insert(
+            "bg-1".into(),
+            finished("npm start", false, false, 0, 30_000),
+        );
+        state.background_task_labels.insert(
+            "bg-2".into(),
+            finished("cargo test", false, false, 0, 24_000),
+        );
+        assert_eq!(footer_summary(&state).unwrap().unread_failed, 2);
+        acknowledge_failures(&mut state);
+        assert!(
+            footer_summary(&state).is_none(),
+            "nothing left to remind about"
+        );
+        // History and terminal facts survive.
+        assert!(state.background_task_labels.contains_key("bg-1"));
+        assert!(state.background_task_labels.contains_key("bg-2"));
+        assert!(
+            state
+                .background_task_labels
+                .get("bg-1")
+                .unwrap()
+                .is_failed()
+        );
+        assert_eq!(background_job_list(&state).finished.len(), 2);
+    }
+
+    /// The list page groups running first, then recently finished newest first.
+    #[test]
+    fn the_list_orders_running_before_recently_finished() {
+        let mut state = test_state();
+        state.elapsed_secs = 200;
+        state.background_task_labels.insert(
+            "bg-r".into(),
+            BackgroundTaskChrome::running("dev server", 190),
+        );
+        state.background_task_labels.insert(
+            "bg-old".into(),
+            finished("cargo check", true, false, 10, 5_000),
+        );
+        state.background_task_labels.insert(
+            "bg-new".into(),
+            finished("npm start", false, false, 100, 30_000),
+        );
+        let list = background_job_list(&state);
+        let running: Vec<&str> = list.running.iter().map(|s| s.title.as_str()).collect();
+        let done: Vec<&str> = list.finished.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(running, vec!["dev server"]);
+        assert_eq!(done, vec!["npm start", "cargo check"]);
+    }
+
+    /// Selection is stable by id and walks running → finished in order.
+    #[test]
+    fn list_selection_walks_running_then_finished() {
+        let mut state = test_state();
+        state.elapsed_secs = 200;
+        state.background_task_labels.insert(
+            "bg-r".into(),
+            BackgroundTaskChrome::running("dev server", 190),
+        );
+        state.background_task_labels.insert(
+            "bg-new".into(),
+            finished("npm start", false, false, 100, 30_000),
+        );
+        ensure_list_selection(&mut state);
+        assert_eq!(state.background_list_selected.as_deref(), Some("bg-r"));
+        move_list_selection(&mut state, 1);
+        assert_eq!(state.background_list_selected.as_deref(), Some("bg-new"));
+        move_list_selection(&mut state, 1);
+        assert_eq!(state.background_list_selected.as_deref(), Some("bg-new"));
+        move_list_selection(&mut state, -5);
+        assert_eq!(state.background_list_selected.as_deref(), Some("bg-r"));
     }
 }

@@ -21,6 +21,10 @@
 //! full-width rules, the horizontal content padding, the footer hint, and the
 //! content rect. It owns no page logic, no business state, and no key handling
 //! — each surface still builds its own body and (optionally) its own composer.
+//!
+//! The navigation header is the one element that owns the terminal edge: the
+//! back glyph sits at column 0 and only the content (and the footer hints) are
+//! inset, so the page hierarchy reads nav → body → nested detail.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,8 +37,8 @@ use crate::state::AppState;
 use crate::status_line::{StatusPhase, status_lines, status_phase};
 use crate::theme::Theme;
 
-/// Horizontal breathing room for Secondary Surface content, header text and
-/// footer hints. The framework (rules) touches the edge; content does not.
+/// Horizontal breathing room for Secondary Surface content and footer hints.
+/// The rules and the navigation header touch the edge; the body does not.
 pub(crate) const PADDING_X: u16 = 2;
 
 /// One Secondary Surface's identity and interaction contract.
@@ -92,7 +96,10 @@ pub(crate) fn draw_header(
     if l.header.height == 0 {
         return;
     }
-    let inner = crate::layout::horizontal_inset(l.header, PADDING_X);
+    // The navigation row owns the full width: the back glyph anchors the left
+    // edge, the parent status the right. Unlike the body it is not inset, so
+    // the nav reads as chrome above the page rather than content inside it.
+    let inner = l.header;
     if inner.width == 0 {
         draw_rule(frame, l.rule_top, theme);
         return;

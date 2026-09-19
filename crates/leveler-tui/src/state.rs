@@ -87,6 +87,8 @@ pub struct Notification {
 /// - [`Input`](WorkbenchFocus::Input): history browse, typing
 /// - [`Conversation`](WorkbenchFocus::Conversation): viewport scroll
 /// - [`Activity`](WorkbenchFocus::Activity): compact activity rows (Enter opens detail)
+/// - [`Background`](WorkbenchFocus::Background): the footer's aggregated
+///   background summary (Enter opens the background-jobs list)
 /// - [`Command`](WorkbenchFocus::Command): the transcript's running command
 ///   rows (Enter toggles output, `x` stops the focused execution)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,6 +101,8 @@ pub enum WorkbenchFocus {
     Pending,
     /// A running command row in the transcript holds the keyboard focus.
     Command,
+    /// The footer's aggregated background-jobs summary holds the focus.
+    Background,
 }
 
 /// The `/remote` invite, as the screen shows it.
@@ -116,14 +120,20 @@ pub struct RemoteState {
 /// `started_elapsed_secs` is the turn clock when the TUI applied the start
 /// event — a projection timestamp, not a process clock, and never refreshed
 /// by redraws. A terminal event marks the entry terminal in place so its
-/// Activity row and detail stay reopenable; the entry retires at the next turn
-/// boundary. Historical completion also belongs to the transcript.
+/// Activity row and detail stay reopenable; finished entries are bounded by
+/// `activity::MAX_TERMINAL_BACKGROUND`. Historical completion also belongs to
+/// the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundTaskChrome {
     pub label: String,
     pub started_elapsed_secs: u64,
-    /// `None` while Running. `Some(true)` completed ok; `Some(false)` failed.
+    /// `None` while Running. `Some(true)` completed ok; `Some(false)` failed or
+    /// was stopped — read [`Self::stopped`] to tell those apart.
     pub ok: Option<bool>,
+    /// The runtime's authoritative `Killed` terminal state: a user/agent cancel
+    /// or session cleanup. A stopped task is not a failure, whatever its exit
+    /// code. Never inferred from `exit_code` in the presentation layer.
+    pub stopped: bool,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     /// Output retained from authoritative events. Empty means none arrived.
@@ -136,6 +146,7 @@ impl BackgroundTaskChrome {
             label: label.into(),
             started_elapsed_secs,
             ok: None,
+            stopped: false,
             exit_code: None,
             duration_ms: None,
             output: String::new(),
@@ -144,6 +155,34 @@ impl BackgroundTaskChrome {
 
     pub fn is_running(&self) -> bool {
         self.ok.is_none()
+    }
+
+    /// Terminal and unsuccessful because the work itself failed — not because
+    /// it was stopped. This is the only state that counts toward the failure
+    /// badge.
+    pub fn is_failed(&self) -> bool {
+        self.ok == Some(false) && !self.stopped
+    }
+}
+
+/// A task's terminal outcome, projected from the runtime facts the chrome
+/// carries. The single place the UI reads "how did it end".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundOutcome {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl BackgroundTaskChrome {
+    pub fn outcome(&self) -> BackgroundOutcome {
+        match self.ok {
+            None => BackgroundOutcome::Running,
+            Some(true) => BackgroundOutcome::Completed,
+            Some(false) if self.stopped => BackgroundOutcome::Stopped,
+            Some(false) => BackgroundOutcome::Failed,
+        }
     }
 }
 
@@ -363,6 +402,16 @@ pub struct AppState {
     pub activity_view: crate::activity::ActivityView,
     /// Last-painted status-strip hits: (row y, activity). Mouse open uses this.
     pub activity_hits: Vec<(u16, crate::activity::ActivityId)>,
+    /// Keyboard selection into the background-jobs list page, by task id.
+    /// Stable across reordering; `None` selects the first row.
+    pub background_list_selected: Option<String>,
+    /// Task ids whose failure the user has already seen. Session-local: it
+    /// suppresses the footer `×失败 N` reminder, never the task's terminal
+    /// state or history. Deliberately not persisted — "unread" is a live
+    /// attention signal, not durable data.
+    pub background_failures_seen: std::collections::HashSet<String>,
+    /// Last-painted footer background-summary hit (row, x_start, x_end).
+    pub background_footer_hit: Option<(u16, u16, u16)>,
     /// The running command row under the Command workbench focus, by the
     /// execution's authoritative [`ToolCallId`]. Presentation only: the stop
     /// path re-checks it against the live transcript before acting, so a
@@ -398,6 +447,18 @@ pub struct AppState {
     /// Header/welcome metadata, filled from the session snapshot.
     pub repository: String,
     pub branch: Option<String>,
+    /// The session's goal, verbatim from the runtime snapshot. This is the
+    /// authoritative task objective and the fallback title for the Active Goal
+    /// when a turn was started by something other than this client.
+    pub goal: String,
+    /// The goal title staged for the turn that is about to start, consumed by
+    /// [`crate::reducer::runtime_apply::start_turn`]. `None` when no user input
+    /// announced this turn.
+    pub staged_goal: Option<crate::active_goal::StagedGoal>,
+    /// The Active Goal indicator's read model. Presentation only: the runtime
+    /// owns the task, its status and its resumability; this projects what the
+    /// header shows and tracks active execution time across interruptions.
+    pub active_goal: Option<crate::active_goal::ActiveGoal>,
     pub model_label: String,
     /// Resolved reasoning effort for the active model (`max`, `high`, …).
     /// `None` means the runtime did not report one.
@@ -421,6 +482,11 @@ pub struct AppState {
     /// Set after ForceCancel was sent while still busy. A further Ctrl+C quits
     /// so a hung turn cannot trap the user in cancel-only key handling.
     pub force_cancel_armed: bool,
+    /// The session's last turn ended in a state a continuation can re-enter
+    /// (interrupted, or a recoverable provider failure). Purely presentational:
+    /// the runtime re-checks before it resumes, and the client never decides
+    /// resume vs. chat from this flag.
+    pub resumable_task: bool,
     pub quit_armed: bool,
 
     /// Monotonic frame counter driving the busy spinner animation.
@@ -525,6 +591,9 @@ impl AppState {
             activity_selected: None,
             activity_view: crate::activity::ActivityView::default(),
             activity_hits: Vec::new(),
+            background_list_selected: None,
+            background_failures_seen: std::collections::HashSet::new(),
+            background_footer_hit: None,
             command_selected: None,
             plan_collapsed: false,
             collaboration_collapsed: false,
@@ -538,6 +607,9 @@ impl AppState {
             skill_catalog_root: None,
             repository: String::new(),
             branch: None,
+            goal: String::new(),
+            staged_goal: None,
+            active_goal: None,
             model_label: "—".to_string(),
             reasoning_effort: boot.reasoning_effort.clone(),
             mode_label: "—".to_string(),
@@ -547,6 +619,7 @@ impl AppState {
             editor_chord_armed: false,
             cancel_armed: false,
             force_cancel_armed: false,
+            resumable_task: false,
             quit_armed: false,
             tick: 0,
             turn_started_at: None,

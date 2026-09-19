@@ -100,8 +100,14 @@ pub struct ChildAgentView {
     /// inspector queries when the user opens a detail view, because findings
     /// are ledger facts and streaming them would duplicate the record.
     pub detail: Option<leveler_client_protocol::UiChildContribution>,
-    /// Bounded projection of [`SubAgentActivity`] steps, newest last.
-    pub steps: Vec<String>,
+    /// Bounded projection of [`SubAgentActivity`] calls, oldest first.
+    ///
+    /// The child protocol carries a reduced shape (tool name, an arguments
+    /// preview, a result preview and an error bit) rather than a full
+    /// [`crate::transcript::ToolCallBlock`]; this is the typed read model the
+    /// activity presenter consumes. It is a projection of runtime events, not
+    /// a second lifecycle.
+    pub activity: Vec<ChildActivityCall>,
 }
 
 impl ChildAgentView {
@@ -121,6 +127,28 @@ impl ChildAgentView {
         self.read_only
     }
 }
+
+/// One delegated tool invocation, as the runtime reported it over
+/// `SubAgentActivity`.
+///
+/// `tool_started` opens the call with its arguments preview; the matching
+/// `tool_finished` closes it with the result preview and the error bit. A
+/// child's tool calls are sequential, so the close pairs with the most recent
+/// still-running call of the same tool — order is the pairing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildActivityCall {
+    pub tool: String,
+    /// The `tool_started` arguments preview (the runtime may have truncated
+    /// it). Empty for a call first seen on `tool_finished` (a reconnect).
+    pub arguments: String,
+    /// The `tool_finished` result preview, once it arrived.
+    pub preview: Option<String>,
+    pub status: crate::transcript::ToolStatus,
+}
+
+/// Cap on the per-child activity projection. Bounded so a long-running child
+/// cannot grow the view model without bound; the newest calls are kept.
+const CHILD_ACTIVITY_CAP: usize = 48;
 
 /// One `SubAgentUpdated`, as the view model consumes it.
 ///
@@ -305,7 +333,7 @@ impl TaskTeamView {
             started_elapsed_secs,
             settled_elapsed_secs: done.then_some(started_elapsed_secs),
             detail: None,
-            steps: Vec::new(),
+            activity: Vec::new(),
         });
         self.restamp_settlement(started_elapsed_secs);
     }
@@ -379,7 +407,7 @@ impl TaskTeamView {
                 // settled one never joins the live team.
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
             });
         }
         self.restamp_settlement(now_elapsed);
@@ -472,15 +500,71 @@ impl TaskTeamView {
         }
     }
 
-    pub fn apply_activity(&mut self, id: &str, tool: &str) {
-        if let Some(c) = self.children.iter_mut().find(|c| c.id == id) {
-            c.recent_step = Some(tool.to_string());
-            if c.steps.last().map(String::as_str) != Some(tool) {
-                c.steps.push(tool.to_string());
-                if c.steps.len() > 16 {
-                    c.steps.remove(0);
-                }
+    /// Record one `SubAgentActivity` event for a running sub-agent.
+    ///
+    /// A `tool_started` opens a call with its arguments preview; the matching
+    /// `tool_finished` closes the most recent still-running call of the same
+    /// tool with the result preview and the error bit. `recent_step` keeps the
+    /// compact one-word line the transcript head already uses, so this is
+    /// purely an enrichment of the same event — never a second lifecycle.
+    pub fn apply_activity(
+        &mut self,
+        id: &str,
+        phase: &str,
+        tool: &str,
+        preview: &str,
+        is_error: bool,
+    ) {
+        use crate::transcript::ToolStatus;
+        let Some(c) = self.children.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        if phase == "tool_finished" {
+            // A call that ran is not an outcome that succeeded: the terminal
+            // carries its own status. `recent_step` reads it back to the head.
+            c.recent_step = Some(if is_error {
+                format!("{tool} ✗")
+            } else {
+                format!("{tool} ✓")
+            });
+            let closed = c
+                .activity
+                .iter_mut()
+                .rev()
+                .find(|call| call.status == ToolStatus::Running && call.tool == tool);
+            if let Some(call) = closed {
+                call.status = if is_error {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Ok
+                };
+                call.preview = Some(preview.to_string());
+                return;
             }
+            // No live start for this terminal (a reconnect): keep the fact
+            // instead of dropping it. It has no arguments to show.
+            c.activity.push(ChildActivityCall {
+                tool: tool.to_string(),
+                arguments: String::new(),
+                preview: Some(preview.to_string()),
+                status: if is_error {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Ok
+                },
+            });
+        } else {
+            c.recent_step = Some(tool.to_string());
+            c.activity.push(ChildActivityCall {
+                tool: tool.to_string(),
+                arguments: preview.to_string(),
+                preview: None,
+                status: ToolStatus::Running,
+            });
+        }
+        if c.activity.len() > CHILD_ACTIVITY_CAP {
+            let excess = c.activity.len() - CHILD_ACTIVITY_CAP;
+            c.activity.drain(0..excess);
         }
     }
 }
@@ -814,7 +898,7 @@ mod tests {
                 started_elapsed_secs: 0,
                 settled_elapsed_secs: None,
                 detail: None,
-                steps: Vec::new(),
+                activity: Vec::new(),
                 stop: None,
                 limit: None,
             });

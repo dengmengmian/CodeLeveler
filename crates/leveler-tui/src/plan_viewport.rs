@@ -1,29 +1,53 @@
-//! Plan viewport: which plan steps fit the rows the layout can actually spare.
+//! Plan summary window: which steps the sticky plan dock shows by default.
 //!
-//! Pure presentation. The sticky plan dock used to hardcode "header + at most
-//! five steps" and then `take()` whatever the row count allowed, so a 9-step
-//! plan silently lost items 6..9 — including the one that was running. This
-//! module answers the real question instead: given N rows, which steps are
-//! shown, and how many are hidden on each side.
+//! The dock is a summary surface, not the plan's full history — the archived
+//! plan in the transcript owns completeness. A finished step is no longer worth
+//! a permanent row, so the default window drops every settled step and keeps
+//! only unfinished work: at most [`MAX_VISIBLE_ACTIVE_STEPS`], always including
+//! the step the plan declares in progress, with one quiet row naming whatever it
+//! left off. This module never mutates the plan; it only chooses what to paint.
 
 use leveler_client_protocol::{PlanStepStatus, UiPlan, UiPlanStep};
 
-/// One row of the rendered plan body (the header is the caller's).
+/// How many unfinished steps the default summary keeps on screen.
+///
+/// This is a cap on *unfinished* steps, not a fixed row count: a plan with two
+/// open steps shows two rows and is not padded with finished history.
+pub(crate) const MAX_VISIBLE_ACTIVE_STEPS: usize = 5;
+
+/// The default plan summary: settled steps drop out, at most
+/// [`MAX_VISIBLE_ACTIVE_STEPS`] unfinished steps remain, and the step the plan
+/// declares in progress stays visible even when unusual ordering would push it
+/// outside the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PlanViewportRow<'a> {
-    Step(&'a UiPlanStep),
-    /// `n` steps scrolled off the top.
-    HiddenBefore(usize),
-    /// `n` steps scrolled off the bottom.
-    HiddenAfter(usize),
-    /// Both sides hidden with only one row to say so (very short terminals).
-    HiddenBoth {
-        before: usize,
-        after: usize,
-    },
+pub(crate) struct PlanSummaryWindow<'a> {
+    /// Unfinished steps to render, in plan order.
+    pub visible: Vec<&'a UiPlanStep>,
+    /// Unfinished steps left off the window: the exact count behind
+    /// "… N more to do". Never the settled history, never a step of its own.
+    pub hidden_active: usize,
+    /// Whether the hidden-count row fits in the body budget.
+    pub show_hidden_line: bool,
 }
 
-/// The step the viewport must keep visible: the running one, else the first
+impl PlanSummaryWindow<'_> {
+    /// Body rows this window paints: the visible steps plus the optional
+    /// hidden-count row.
+    pub(crate) fn desired_rows(&self) -> usize {
+        self.visible.len() + usize::from(self.show_hidden_line)
+    }
+}
+
+/// A settled step is one the plan will not return to.
+///
+/// The header's [`crate::workbench::plan_done_total`] counts on this same
+/// predicate, so the summary and the global count cannot disagree about what
+/// finished means.
+pub(crate) fn is_plan_step_settled(status: PlanStepStatus) -> bool {
+    matches!(status, PlanStepStatus::Done | PlanStepStatus::Skipped)
+}
+
+/// The step the window must keep visible: the running one, else the first
 /// failure, else the next pending. Never invents a "current" step.
 pub(crate) fn plan_focus_index(plan: &UiPlan) -> usize {
     let find = |want: PlanStepStatus| plan.steps.iter().position(|s| s.status == want);
@@ -33,62 +57,61 @@ pub(crate) fn plan_focus_index(plan: &UiPlan) -> usize {
         .unwrap_or(0)
 }
 
-/// Rows the plan body wants when nothing is cut: one per step.
-pub(crate) fn plan_desired_body_rows(plan: &UiPlan) -> usize {
-    plan.steps.len()
-}
-
-/// The body rows for `budget` available rows.
+/// The default summary window for a body with `body_budget` rows available.
 ///
-/// Invariants: the result never exceeds `budget`; every step is present when
-/// they all fit; the focus step is always present; the hidden counts are the
-/// exact number of steps outside the window.
-pub(crate) fn plan_viewport_rows(plan: &UiPlan, budget: usize) -> Vec<PlanViewportRow<'_>> {
-    let n = plan.steps.len();
-    if budget == 0 || n == 0 {
-        return Vec::new();
+/// Invariants: settled steps never appear in `visible`; `visible` holds at most
+/// [`MAX_VISIBLE_ACTIVE_STEPS`] unfinished steps in plan order; the focus step
+/// is always present when `body_budget > 0`; `hidden_active` is exactly the
+/// number of unfinished steps not shown; and [`PlanSummaryWindow::desired_rows`]
+/// never exceeds `body_budget`.
+pub(crate) fn plan_summary_window(plan: &UiPlan, body_budget: usize) -> PlanSummaryWindow<'_> {
+    // (plan position, step) so the focus step can be matched without trusting
+    // `UiPlanStep::index` to equal its slice position.
+    let active: Vec<(usize, &UiPlanStep)> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !is_plan_step_settled(s.status))
+        .collect();
+    if active.is_empty() || body_budget == 0 {
+        return PlanSummaryWindow {
+            visible: Vec::new(),
+            hidden_active: active.len(),
+            show_hidden_line: false,
+        };
     }
-    if n <= budget {
-        return plan.steps.iter().map(PlanViewportRow::Step).collect();
+    let focus_plan_pos = plan_focus_index(plan);
+    let focus = active
+        .iter()
+        .position(|(i, _)| *i == focus_plan_pos)
+        .unwrap_or(0);
+    // Default cap: five unfinished steps, plus one row for the count when
+    // anything is left over. A short dock shrinks the window further rather
+    // than overflowing.
+    let mut take = active.len().min(MAX_VISIBLE_ACTIVE_STEPS);
+    while take > 0 && take + usize::from(active.len() > take) > body_budget {
+        take -= 1;
     }
-    let focus = plan_focus_index(plan);
-    // Largest step window that still fits once its overflow indicators are
-    // counted. `budget < n` here, so this always shrinks to a real answer.
-    for cap in (1..=budget).rev() {
-        let (start, end) = window(n, focus, cap);
-        let before = start;
-        let after = n - end;
-        let rows = (end - start) + usize::from(before > 0) + usize::from(after > 0);
-        if rows <= budget {
-            let mut out = Vec::with_capacity(rows);
-            if before > 0 {
-                out.push(PlanViewportRow::HiddenBefore(before));
-            }
-            out.extend(plan.steps[start..end].iter().map(PlanViewportRow::Step));
-            if after > 0 {
-                out.push(PlanViewportRow::HiddenAfter(after));
-            }
-            return out;
-        }
+    if take == 0 {
+        // One row left: the focus step wins it and the count row yields.
+        take = 1;
     }
-    // Too short for a step plus both indicators: the focus step wins the row,
-    // and the overflow degrades to one compact line if there is a row left.
-    let (start, end) = window(n, focus, 1);
-    let mut out = vec![PlanViewportRow::Step(&plan.steps[start])];
-    if budget >= 2 {
-        out.push(PlanViewportRow::HiddenBoth {
-            before: start,
-            after: n - end,
-        });
+    // First `take` unfinished steps, shifted only enough to keep the focus step
+    // on screen. Plan order is never rearranged.
+    let mut start = 0;
+    let mut end = take;
+    if focus >= end {
+        end = focus + 1;
+        start = end - take;
     }
-    out
-}
-
-/// A `cap`-wide window over `0..n` that contains `focus`, kept in range.
-fn window(n: usize, focus: usize, cap: usize) -> (usize, usize) {
-    debug_assert!(cap <= n && cap > 0);
-    let start = focus.saturating_sub(cap / 2).min(n - cap);
-    (start, start + cap)
+    let visible: Vec<&UiPlanStep> = active[start..end].iter().map(|(_, s)| *s).collect();
+    let hidden_active = active.len() - visible.len();
+    let show_hidden_line = hidden_active > 0 && visible.len() < body_budget;
+    PlanSummaryWindow {
+        visible,
+        hidden_active,
+        show_hidden_line,
+    }
 }
 
 #[cfg(test)]
@@ -109,7 +132,7 @@ mod tests {
         }
     }
 
-    /// `done` steps, then one running, then pending up to `total`.
+    /// `done` finished steps, then one running, then pending up to `total`.
     fn running_at(total: usize, current: usize) -> UiPlan {
         let statuses: Vec<PlanStepStatus> = (0..total)
             .map(|i| match i.cmp(&current) {
@@ -121,113 +144,187 @@ mod tests {
         plan(&statuses)
     }
 
-    fn step_indices(rows: &[PlanViewportRow<'_>]) -> Vec<usize> {
-        rows.iter()
-            .filter_map(|r| match r {
-                PlanViewportRow::Step(s) => Some(s.index),
-                _ => None,
-            })
-            .collect()
+    fn shown_indices(window: &PlanSummaryWindow<'_>) -> Vec<usize> {
+        window.visible.iter().map(|s| s.index).collect()
     }
 
     #[test]
-    fn every_step_shows_when_the_budget_is_large_enough() {
-        let p = running_at(9, 5);
-        let rows = plan_viewport_rows(&p, 9);
-        assert_eq!(step_indices(&rows), (0..9).collect::<Vec<_>>());
+    fn four_active_steps_show_four_and_hide_none() {
+        let p = running_at(10, 6); // 6 done, 1 running, 3 pending
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(shown_indices(&w), vec![6, 7, 8, 9]);
+        assert_eq!(w.hidden_active, 0);
+        assert!(!w.show_hidden_line);
+        assert_eq!(w.desired_rows(), 4);
+    }
+
+    #[test]
+    fn seventeen_active_steps_show_five_and_count_twelve() {
+        let p = running_at(20, 3); // 3 done, 1 running, 16 pending
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(w.visible.len(), 5);
+        assert_eq!(w.hidden_active, 12);
+        assert!(w.show_hidden_line);
+        assert_eq!(w.desired_rows(), 6);
+    }
+
+    #[test]
+    fn exactly_five_open_steps_show_five_without_a_count_row() {
+        let p = running_at(10, 5); // 5 done, running + 4 pending = 5 open
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(w.visible.len(), 5);
+        assert_eq!(w.hidden_active, 0);
+        assert!(!w.show_hidden_line);
+    }
+
+    #[test]
+    fn three_open_steps_show_three_without_padding() {
+        let p = running_at(10, 7); // 7 done, running + 2 pending = 3 open
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(w.visible.len(), 3);
+        assert_eq!(w.hidden_active, 0);
+        assert!(!w.show_hidden_line);
+    }
+
+    #[test]
+    fn a_fully_settled_plan_hides_every_step() {
+        let p = plan(&[PlanStepStatus::Done; 10]);
+        let w = plan_summary_window(&p, 10);
+        assert!(w.visible.is_empty());
+        assert_eq!(w.hidden_active, 0);
+        assert!(!w.show_hidden_line);
+        assert_eq!(w.desired_rows(), 0);
+    }
+
+    #[test]
+    fn settled_steps_never_reach_the_default_window() {
+        let p = plan(&[
+            PlanStepStatus::Done,
+            PlanStepStatus::Skipped,
+            PlanStepStatus::Running,
+            PlanStepStatus::Done,
+            PlanStepStatus::Pending,
+        ]);
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(shown_indices(&w), vec![2, 4]);
+    }
+
+    #[test]
+    fn skipped_counts_as_settled_like_done() {
+        let p = plan(&[PlanStepStatus::Skipped, PlanStepStatus::Pending]);
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(shown_indices(&w), vec![1]);
+    }
+
+    #[test]
+    fn a_failure_is_unfinished_and_kept_ahead_of_trailing_pending() {
+        let p = plan(&[
+            PlanStepStatus::Done,
+            PlanStepStatus::Failed,
+            PlanStepStatus::Pending,
+        ]);
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(shown_indices(&w), vec![1, 2]);
+    }
+
+    #[test]
+    fn the_focus_step_survives_a_one_row_body() {
+        let p = running_at(30, 17);
+        let w = plan_summary_window(&p, 1);
+        assert_eq!(shown_indices(&w), vec![17]);
+        assert_eq!(w.hidden_active, 12); // 13 unfinished minus the one shown
+        assert!(!w.show_hidden_line);
+        assert_eq!(w.desired_rows(), 1);
+    }
+
+    #[test]
+    fn a_short_body_shrinks_the_window_and_keeps_the_count_exact() {
+        let p = running_at(30, 17); // active = 18..30 -> 13 steps
+        let w = plan_summary_window(&p, 2);
+        assert_eq!(w.visible.len(), 1);
+        assert!(w.show_hidden_line);
+        assert_eq!(w.hidden_active, 12);
         assert!(
-            !rows.iter().any(|r| !matches!(r, PlanViewportRow::Step(_))),
-            "no overflow indicator when nothing is hidden"
+            shown_indices(&w).contains(&17),
+            "the running step stays on screen: {:?}",
+            shown_indices(&w)
         );
     }
 
     #[test]
-    fn the_running_step_stays_visible_when_the_budget_is_short() {
-        let p = running_at(9, 5);
-        let rows = plan_viewport_rows(&p, 6);
-        assert!(rows.len() <= 6);
-        assert!(step_indices(&rows).contains(&5), "{rows:?}");
-        let hidden: usize = rows
-            .iter()
-            .map(|r| match r {
-                PlanViewportRow::HiddenBefore(n) | PlanViewportRow::HiddenAfter(n) => *n,
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(hidden, 9 - step_indices(&rows).len());
-    }
-
-    #[test]
-    fn a_deep_plan_windows_around_the_running_step_with_exact_counts() {
-        let p = running_at(30, 17);
-        let rows = plan_viewport_rows(&p, 6);
-        assert!(rows.len() <= 6);
-        let shown = step_indices(&rows);
-        assert!(shown.contains(&17), "{rows:?}");
-        let before = match rows.first() {
-            Some(PlanViewportRow::HiddenBefore(n)) => *n,
-            other => panic!("expected a top indicator, got {other:?}"),
-        };
-        let after = match rows.last() {
-            Some(PlanViewportRow::HiddenAfter(n)) => *n,
-            other => panic!("expected a bottom indicator, got {other:?}"),
-        };
-        assert_eq!(before, *shown.first().unwrap());
-        assert_eq!(after, 30 - 1 - *shown.last().unwrap());
-        assert_eq!(before + shown.len() + after, 30);
-    }
-
-    #[test]
-    fn no_top_overflow_is_invented_near_the_start() {
-        let p = running_at(9, 1);
-        let rows = plan_viewport_rows(&p, 5);
+    fn the_focus_step_is_visible_when_ordering_would_push_it_past_the_cap() {
+        // Six unfinished steps before the running one: a naive "first five"
+        // window would drop the step that is actually executing.
+        let mut statuses = vec![PlanStepStatus::Pending; 6];
+        statuses.push(PlanStepStatus::Running);
+        statuses.push(PlanStepStatus::Pending);
+        let p = plan(&statuses);
+        let w = plan_summary_window(&p, 10);
+        assert_eq!(w.visible.len(), MAX_VISIBLE_ACTIVE_STEPS);
         assert!(
-            !matches!(rows.first(), Some(PlanViewportRow::HiddenBefore(_))),
-            "{rows:?}"
+            shown_indices(&w).contains(&6),
+            "running step missing: {:?}",
+            shown_indices(&w)
         );
-        assert_eq!(step_indices(&rows).first(), Some(&0));
+        assert_eq!(w.hidden_active, 3);
     }
 
     #[test]
-    fn the_tail_wins_when_the_current_step_is_last() {
-        let p = running_at(30, 28);
-        let rows = plan_viewport_rows(&p, 6);
-        let shown = step_indices(&rows);
-        assert!(shown.contains(&28), "{rows:?}");
-        assert_eq!(shown.last(), Some(&29), "the end of the plan is visible");
-        assert!(
-            !matches!(rows.last(), Some(PlanViewportRow::HiddenAfter(_))),
-            "nothing is hidden below the last step: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn a_single_body_row_keeps_the_current_step() {
+    fn a_zero_budget_renders_nothing_and_hides_the_count_row() {
         let p = running_at(30, 17);
-        let rows = plan_viewport_rows(&p, 1);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(step_indices(&rows), vec![17]);
+        let w = plan_summary_window(&p, 0);
+        assert!(w.visible.is_empty());
+        assert_eq!(w.hidden_active, 13);
+        assert!(!w.show_hidden_line);
+        assert_eq!(w.desired_rows(), 0);
     }
 
     #[test]
-    fn two_body_rows_degrade_overflow_to_one_compact_line() {
-        let p = running_at(30, 17);
-        let rows = plan_viewport_rows(&p, 2);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(step_indices(&rows), vec![17]);
-        assert_eq!(
-            rows[1],
-            PlanViewportRow::HiddenBoth {
-                before: 17,
-                after: 12
+    fn an_empty_plan_is_empty() {
+        let p = UiPlan { steps: vec![] };
+        let w = plan_summary_window(&p, 10);
+        assert!(w.visible.is_empty());
+        assert_eq!(w.hidden_active, 0);
+        assert!(!w.show_hidden_line);
+    }
+
+    #[test]
+    fn the_count_row_only_ever_names_hidden_unfinished_steps() {
+        for (total, current) in [(10usize, 6usize), (20, 3), (10, 5), (10, 7), (30, 17)] {
+            let p = running_at(total, current);
+            let w = plan_summary_window(&p, 10);
+            let active = total - current; // done = current, rest unfinished
+            assert_eq!(
+                w.visible.len() + w.hidden_active,
+                active,
+                "{total}/{current}: shown + hidden must equal unfinished"
+            );
+            assert_eq!(w.show_hidden_line, w.hidden_active > 0);
+        }
+    }
+
+    #[test]
+    fn every_budget_keeps_focus_and_never_overflows() {
+        for total in 1..=30usize {
+            for current in 0..total {
+                let p = running_at(total, current);
+                for budget in 0..=(total + 2) {
+                    let w = plan_summary_window(&p, budget);
+                    assert!(
+                        w.desired_rows() <= budget.max(0),
+                        "{total}/{current}/{budget}: {:?}",
+                        w.desired_rows()
+                    );
+                    if budget > 0 {
+                        assert!(
+                            w.visible.iter().any(|s| s.index == current),
+                            "focus lost at {total}/{current}/{budget}: {:?}",
+                            shown_indices(&w)
+                        );
+                    }
+                }
             }
-        );
-    }
-
-    #[test]
-    fn a_zero_budget_renders_nothing_instead_of_panicking() {
-        let p = running_at(30, 17);
-        assert!(plan_viewport_rows(&p, 0).is_empty());
+        }
     }
 
     #[test]
@@ -244,24 +341,5 @@ mod tests {
             PlanStepStatus::Pending,
         ]);
         assert_eq!(plan_focus_index(&p), 2);
-    }
-
-    #[test]
-    fn every_budget_and_focus_respects_the_row_cap_and_keeps_focus() {
-        for total in 1..=30usize {
-            for current in 0..total {
-                let p = running_at(total, current);
-                for budget in 0..=(total + 2) {
-                    let rows = plan_viewport_rows(&p, budget);
-                    assert!(rows.len() <= budget.max(0), "{total}/{current}/{budget}");
-                    if budget > 0 {
-                        assert!(
-                            step_indices(&rows).contains(&current),
-                            "focus lost at {total}/{current}/{budget}: {rows:?}"
-                        );
-                    }
-                }
-            }
-        }
     }
 }

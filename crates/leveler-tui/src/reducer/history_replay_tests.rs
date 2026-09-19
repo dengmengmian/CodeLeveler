@@ -261,6 +261,8 @@ fn replayed_background_lifecycle_is_history_and_cannot_replace_live_activity() {
                         exit_code: Some(1),
                         duration_ms: 10,
                         ok: false,
+                        stopped: false,
+                        output: String::new(),
                     },
                 },
             ],
