@@ -33,6 +33,13 @@ pub enum WorkspaceError {
          user to confirm it"
     )]
     AgentDefinition(String),
+    /// A skill definition, which only the skill store writes.
+    #[error(
+        "path `{0}` is a skill definition; tools do not edit it. Change skills \
+         with save_skill or delete_skill, which validate the change and ask the \
+         user to confirm it"
+    )]
+    SkillDefinition(String),
     #[error("failed to canonicalize workspace root {0}")]
     Root(String),
 }
@@ -349,6 +356,13 @@ impl Workspace {
                 original.display().to_string(),
             ));
         }
+        // Skill definitions are written through the skill store (validated,
+        // confirmed by a person, atomic), so no tool patches them in place.
+        if access == PathAccess::Write && self.is_in_project_skills_dir(normalized) {
+            return Err(WorkspaceError::SkillDefinition(
+                original.display().to_string(),
+            ));
+        }
 
         for comp in normalized.components() {
             if let Component::Normal(os) = comp {
@@ -372,14 +386,23 @@ impl Workspace {
     /// compare ASCII-case-insensitively: on macOS and Windows `.LEVELER/Agents`
     /// is the directory the registry reads.
     fn is_in_project_agents_dir(&self, normalized: &Path) -> bool {
+        self.is_in_leveler_dir(normalized, "agents")
+    }
+
+    /// Whether `normalized` is inside `<root>/.leveler/skills`.
+    fn is_in_project_skills_dir(&self, normalized: &Path) -> bool {
+        self.is_in_leveler_dir(normalized, "skills")
+    }
+
+    fn is_in_leveler_dir(&self, normalized: &Path, child: &str) -> bool {
         let Ok(rest) = normalized.strip_prefix(&self.root) else {
             return false;
         };
         let mut parts = rest.components();
         matches!(
             (parts.next(), parts.next()),
-            (Some(Component::Normal(dir)), Some(Component::Normal(agents)))
-                if dir.eq_ignore_ascii_case(".leveler") && agents.eq_ignore_ascii_case("agents")
+            (Some(Component::Normal(dir)), Some(Component::Normal(name)))
+                if dir.eq_ignore_ascii_case(".leveler") && name.eq_ignore_ascii_case(child)
         )
     }
 
@@ -660,19 +683,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Skill definitions are written through the skill store — validated,
+    /// confirmed by a person, atomic — never patched in place by a tool. Reads
+    /// stay allowed so the agent can show them.
+    #[test]
+    fn writes_to_project_skill_definitions_are_denied() {
+        let (ws, dir) = workspace();
+        std::fs::create_dir_all(dir.join(".leveler/skills/existing")).unwrap();
+        std::fs::write(dir.join(".leveler/skills/existing/SKILL.md"), "x").unwrap();
+        for name in [
+            ".leveler/skills/existing/SKILL.md",
+            ".leveler/skills/new/references/note.md",
+            "src/../.leveler/skills/new/SKILL.md",
+            ".LEVELER/skills/new/SKILL.md",
+            ".leveler/Skills/new/SKILL.md",
+            ".leveler/skills",
+        ] {
+            match ws.resolve_for_write(name, &ws_scope(&ws)) {
+                Err(error @ WorkspaceError::SkillDefinition(_)) => {
+                    assert!(error.to_string().contains("save_skill"), "{error}");
+                }
+                other => panic!("{name} must not be writable: {other:?}"),
+            }
+            assert!(
+                ws.resolve_for_read(name).is_ok(),
+                "{name} must stay readable"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn other_leveler_files_and_same_named_files_elsewhere_stay_writable() {
         let (ws, dir) = workspace();
         for name in [
             ".leveler/config.yaml",
-            ".leveler/skills/pack/SKILL.md",
-            // Only the two files under `.leveler/` are gated — a project's own
-            // `hooks.yaml` elsewhere in the tree is an ordinary file.
+            // Only the trust-gated files and the agents/skills stores under
+            // `.leveler/` are guarded — a same-named file elsewhere in the
+            // tree is an ordinary file.
             "ci/hooks.yaml",
             "config/permissions.yaml",
             // Only the project's own agents directory is guarded.
             "docs/agents/security-reviewer/agent.yaml",
+            "docs/skills/security-reviewer/SKILL.md",
             ".leveler/agents-notes.md",
+            ".leveler/skills-notes.md",
         ] {
             assert!(
                 ws.resolve_for_write(name, &ws_scope(&ws)).is_ok(),

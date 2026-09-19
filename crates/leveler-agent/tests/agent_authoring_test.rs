@@ -473,7 +473,13 @@ async fn delegated_children_are_never_offered_the_authoring_tools() {
         .collect();
     assert!(!child.is_empty(), "the child ran");
     for t in child {
-        for authoring in ["list_agents", "save_agent", "delete_agent"] {
+        for authoring in [
+            "list_agents",
+            "save_agent",
+            "delete_agent",
+            "save_skill",
+            "delete_skill",
+        ] {
             assert!(
                 !t.iter().any(|n| n == authoring),
                 "{authoring} reached a child: {t:?}"

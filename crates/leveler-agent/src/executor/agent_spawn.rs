@@ -107,18 +107,25 @@ impl Executor {
             }
         }
         let root = self.tool_context.execution.workspace.root();
+        // One resolved registry for every bound skill, built from this
+        // execution's environment: the same answer `load_skill`, `$mention` and
+        // `Agent.skills` see.
+        let environment = &self.tool_context.execution.environment;
+        let registry = leveler_skills::SkillRegistry::load(
+            &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
+        );
         let mut skills = Vec::new();
-        let mut missing_skills = Vec::new();
+        let mut unavailable = Vec::new();
         for skill in &def.skills {
-            match leveler_skills::load(root, skill) {
-                Some(detail) => skills.push(detail),
-                None => missing_skills.push(skill.as_str()),
+            match registry.load_skill(skill) {
+                Ok(detail) => skills.push(detail),
+                Err(error) => unavailable.push(error.to_string()),
             }
         }
-        if !missing_skills.is_empty() {
+        if !unavailable.is_empty() {
             return Err(format!(
-                "Agent \"{name}\" binds skill {} which is not installed; the agent cannot run here.",
-                missing_skills.join(", ")
+                "Agent \"{name}\" binds {}; the agent cannot run here.",
+                unavailable.join("; ")
             ));
         }
         if let Some(model) = &def.model

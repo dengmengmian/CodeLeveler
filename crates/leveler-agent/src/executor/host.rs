@@ -411,17 +411,28 @@ impl Executor {
             ));
         }
 
-        // An agent definition changes what future sessions run, so a human
-        // confirms each exact proposal in every profile, full access included,
-        // and no permission rule or earlier grant stands in for that. The
-        // proposal is validated first: a contradiction is refused to the model,
-        // never put to the user as a question.
-        if crate::agent_registry::is_agent_definition_write(&call.name) {
-            let description = match crate::agent_registry::authoring_preflight(
+        // An agent or skill definition changes what future sessions run, so a
+        // human confirms each exact proposal in every profile, full access
+        // included, and no permission rule or earlier grant stands in for that.
+        // The proposal is validated first: a contradiction is refused to the
+        // model, never put to the user as a question.
+        let definition_write = if crate::agent_registry::is_agent_definition_write(&call.name) {
+            Some(crate::agent_registry::authoring_preflight(
                 &call.name,
                 &call.arguments,
                 ctx,
-            ) {
+            ))
+        } else if leveler_tools::tools::is_skill_definition_write(&call.name) {
+            Some(leveler_tools::tools::skill_authoring_preflight(
+                &call.name,
+                &call.arguments,
+                ctx,
+            ))
+        } else {
+            None
+        };
+        if let Some(proposal) = definition_write {
+            let description = match proposal {
                 Ok(description) => description,
                 Err(reason) => return deny(reason),
             };

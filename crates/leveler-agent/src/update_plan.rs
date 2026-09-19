@@ -62,6 +62,10 @@ pub fn register_harness_controls(registry: &mut ToolRegistry) {
     registry.register(std::sync::Arc::new(crate::agent_registry::ListAgentsTool));
     registry.register(std::sync::Arc::new(crate::agent_registry::SaveAgentTool));
     registry.register(std::sync::Arc::new(crate::agent_registry::DeleteAgentTool));
+    // Skill authoring: like agents, only the top-level agent holds these, and
+    // only a person confirms a write.
+    registry.register(std::sync::Arc::new(leveler_tools::tools::SaveSkillTool));
+    registry.register(std::sync::Arc::new(leveler_tools::tools::DeleteSkillTool));
 }
 
 pub struct UpdatePlanTool;

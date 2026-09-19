@@ -200,9 +200,11 @@ impl ChildProfile {
             ToolAccess::ReadSearch | ToolAccess::ReadTest => registry.read_only_subset(),
             ToolAccess::WriteScoped | ToolAccess::Inherit => registry.without_mcp_tools(),
         };
-        // Agent authoring changes what future sessions run; it is the
-        // top-level agent's, never a delegated child's.
-        class.without_named(crate::agent_registry::AUTHORING_TOOLS)
+        // Agent and skill authoring change what future sessions run; they are
+        // the top-level agent's, never a delegated child's.
+        class
+            .without_named(crate::agent_registry::AUTHORING_TOOLS)
+            .without_named(leveler_tools::tools::SKILL_AUTHORING_TOOLS)
     }
 
     /// The unnamed child `spawn_agent(task)` has always produced.

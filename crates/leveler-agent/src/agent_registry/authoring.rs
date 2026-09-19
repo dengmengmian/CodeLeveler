@@ -51,6 +51,15 @@ fn roots_for(context: &ToolContext) -> AgentRoots {
     }
 }
 
+/// The resolved skill registry in the tool's own environment, so an agent
+/// definition is validated against the skills the runtime will actually load.
+fn skill_registry_for(context: &ToolContext) -> leveler_skills::SkillRegistry {
+    let root = context.execution.workspace.root();
+    leveler_skills::SkillRegistry::load(&leveler_skills::SkillRoots::for_project_in(root, &|k| {
+        context.execution.environment.var_os(k)
+    }))
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SaveAction {
@@ -158,12 +167,12 @@ pub(crate) fn preflight(
 ) -> Result<String, String> {
     let roots = roots_for(context);
     let registry = AgentRegistry::load(&roots);
+    let skills = skill_registry_for(context);
     match tool {
         SAVE_AGENT_TOOL => {
             let args: SaveArgs = serde_json::from_value(arguments.clone())
                 .map_err(|e| format!("save_agent: {e}"))?;
-            let (manifest, dir) =
-                check_save(&args, &roots, &registry, context.execution.workspace.root())?;
+            let (manifest, dir) = check_save(&args, &roots, &registry, &skills)?;
             Ok(save_preview(&args, &manifest, &dir))
         }
         DELETE_AGENT_TOOL => {
@@ -212,7 +221,7 @@ fn check_save(
     args: &SaveArgs,
     roots: &AgentRoots,
     registry: &AgentRegistry,
-    workspace: &Path,
+    skills: &leveler_skills::SkillRegistry,
 ) -> Result<(AgentManifest, PathBuf), String> {
     let manifest = args.manifest();
     let name = manifest.name.as_str();
@@ -240,17 +249,17 @@ fn check_save(
         Some(dir.clone()),
     )
     .map_err(|e| format!("the proposed agent \"{name}\" is invalid: {e}"))?;
-    let missing: Vec<&str> = manifest
+    // The same resolved registry the runtime uses, so "installed" means the
+    // same thing here as it does to `load_skill` and `$mention`.
+    let unavailable: Vec<String> = manifest
         .skills
         .iter()
-        .filter(|s| leveler_skills::load(workspace, s).is_none())
-        .map(String::as_str)
+        .filter_map(|s| skills.resolve(s).err().map(|error| error.to_string()))
         .collect();
-    if !missing.is_empty() {
+    if !unavailable.is_empty() {
         return Err(format!(
-            "skill {} is not installed. Remove it from the proposal, or create the skill \
-             separately first.",
-            missing.join(", ")
+            "{}. Remove it from the proposal, or create the skill separately first.",
+            unavailable.join("; ")
         ));
     }
     let exists = dir.is_dir();
@@ -508,11 +517,11 @@ impl Tool for SaveAgentTool {
         let args: SaveArgs = parse_input(self.name(), input)?;
         let roots = roots_for(&context);
         let registry = AgentRegistry::load(&roots);
-        let manifest =
-            match check_save(&args, &roots, &registry, context.execution.workspace.root()) {
-                Ok((manifest, _)) => manifest,
-                Err(error) => return Ok(ToolOutput::error(error)),
-            };
+        let skills = skill_registry_for(&context);
+        let manifest = match check_save(&args, &roots, &registry, &skills) {
+            Ok((manifest, _)) => manifest,
+            Err(error) => return Ok(ToolOutput::error(error)),
+        };
         let store = AgentStore::new(roots);
         let saved = match args.action {
             SaveAction::Create => store.create(args.scope, &manifest, &args.instructions),

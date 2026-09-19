@@ -45,7 +45,10 @@ pub use read_file::ReadFileTool;
 pub use read_symbol::ReadSymbolTool;
 pub use run_command::RunCommandTool;
 pub use shell_command::ShellCommandTool;
-pub use skills::LoadSkillTool;
+pub use skills::{
+    DELETE_SKILL_TOOL, DeleteSkillTool, LoadSkillTool, SAVE_SKILL_TOOL, SKILL_AUTHORING_TOOLS,
+    SaveSkillTool, is_skill_definition_write, skill_authoring_preflight,
+};
 pub use task_control::{GetTaskTool, KillTaskTool, WaitTaskTool, wait_interval};
 pub use view_image::ViewImageTool;
 pub use web_fetch::WebFetchTool;

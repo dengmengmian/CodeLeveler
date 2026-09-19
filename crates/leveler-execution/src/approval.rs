@@ -191,12 +191,15 @@ pub fn is_memory_write_tool(tool: &str) -> bool {
     matches!(tool, "remember" | "forget")
 }
 
-/// Tools that write an agent definition (`save_agent`, `delete_agent`). Like a
-/// memory write, a definition changes what future sessions do, so only a
-/// person may approve one — never an auto-approver, a standing rule, or the
-/// full-access shortcut.
+/// Tools that write an agent or skill definition (`save_agent`, `delete_agent`,
+/// `save_skill`, `delete_skill`). Like a memory write, a definition changes what
+/// future sessions do, so only a person may approve one — never an
+/// auto-approver, a standing rule, or the full-access shortcut.
 pub fn is_agent_definition_write_tool(tool: &str) -> bool {
-    matches!(tool, "save_agent" | "delete_agent")
+    matches!(
+        tool,
+        "save_agent" | "delete_agent" | "save_skill" | "delete_skill"
+    )
 }
 
 /// Tools only a person may approve.
