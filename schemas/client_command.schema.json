@@ -103,6 +103,29 @@
       }
     },
     {
+      "description": "Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn.\n\nThe client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message.\n\n`content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it.",
+      "type": "object",
+      "required": [
+        "content",
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "resume_task"
+          ]
+        }
+      }
+    },
+    {
       "description": "Import a file as an attachment; the runtime processes and stores it.\n\n`name` overrides the display name that would otherwise come from the file name. A terminal that answers Cmd+V on an image by writing a scratch file and pasting its path knows the file name is its own bookkeeping (`clipboard-2026-09-16-215212-CE7C9522.png`) and not something the user chose — only the client that made the gesture knows that, so only it can say so.",
       "type": "object",
       "required": [
@@ -231,6 +254,25 @@
           "type": "string",
           "enum": [
             "force_cancel_current_turn"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Cancel the logical task, not just the running turn.\n\nDistinct from [`Self::CancelCurrentTurn`]: that interrupts the current work window and leaves the task resumable, while this is the user saying the task itself is over. The runtime commits a terminal `cancelled` outcome, settles the goal, and refuses a later continuation — a `继续` must not silently reopen it.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_task"
           ]
         }
       }
@@ -894,6 +936,29 @@
           "type": "string",
           "enum": [
             "cancel_user_shell"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Stop one background task the runtime is still running. The registry signals the process tree through its own lifecycle; the task settles as killed. Deliberately separate from `CancelCurrentTurn` and `CancelUserShell`: a background task outlives the turn that started it, and stopping it must not stop the turn.",
+      "type": "object",
+      "required": [
+        "session_id",
+        "task_id",
+        "type"
+      ],
+      "properties": {
+        "session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "cancel_background_task"
           ]
         }
       }

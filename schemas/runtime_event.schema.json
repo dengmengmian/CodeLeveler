@@ -1048,6 +1048,21 @@
       }
     },
     {
+      "description": "The logical task was explicitly cancelled by the user. Terminal: unlike [`Self::TurnCancelled`] a continuation must not reopen it.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "task_cancelled"
+          ]
+        }
+      }
+    },
+    {
       "description": "A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done.",
       "type": "object",
       "required": [
@@ -1549,7 +1564,30 @@
       }
     },
     {
-      "description": "A background task finished (exit or kill).",
+      "description": "A live chunk of a background task's combined stdout/stderr, already sanitized and capped by the runtime. Additive; older clients ignore the unknown type. The final [`Self::BackgroundTaskExited`] log stays authoritative.",
+      "type": "object",
+      "required": [
+        "chunk",
+        "task_id",
+        "type"
+      ],
+      "properties": {
+        "chunk": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "background_task_output"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A background task finished (exit or kill). `output` is the task's final retained log, authoritative over the streamed chunks (a lifecycle broadcast lag can drop a chunk). Empty when the runtime produced none.",
       "type": "object",
       "required": [
         "duration_ms",
@@ -1571,6 +1609,14 @@
           "format": "int32"
         },
         "ok": {
+          "type": "boolean"
+        },
+        "output": {
+          "type": "string"
+        },
+        "stopped": {
+          "description": "The runtime's terminal state was `Killed`, not a natural exit: a user cancel, an agent cancel, or session cleanup stopped it. This is the authoritative distinction between \"stopped\" and \"failed\" — a stopped task is not a failure however its exit code reads. Additive; older clients ignore the unknown field.",
+          "default": false,
           "type": "boolean"
         },
         "task_id": {
@@ -3656,6 +3702,21 @@
           }
         },
         {
+          "description": "The logical task was explicitly cancelled by the user. Terminal: unlike [`Self::TurnCancelled`] a continuation must not reopen it.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "task_cancelled"
+              ]
+            }
+          }
+        },
+        {
           "description": "A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done.",
           "type": "object",
           "required": [
@@ -4157,7 +4218,30 @@
           }
         },
         {
-          "description": "A background task finished (exit or kill).",
+          "description": "A live chunk of a background task's combined stdout/stderr, already sanitized and capped by the runtime. Additive; older clients ignore the unknown type. The final [`Self::BackgroundTaskExited`] log stays authoritative.",
+          "type": "object",
+          "required": [
+            "chunk",
+            "task_id",
+            "type"
+          ],
+          "properties": {
+            "chunk": {
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "background_task_output"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A background task finished (exit or kill). `output` is the task's final retained log, authoritative over the streamed chunks (a lifecycle broadcast lag can drop a chunk). Empty when the runtime produced none.",
           "type": "object",
           "required": [
             "duration_ms",
@@ -4179,6 +4263,14 @@
               "format": "int32"
             },
             "ok": {
+              "type": "boolean"
+            },
+            "output": {
+              "type": "string"
+            },
+            "stopped": {
+              "description": "The runtime's terminal state was `Killed`, not a natural exit: a user cancel, an agent cancel, or session cleanup stopped it. This is the authoritative distinction between \"stopped\" and \"failed\" — a stopped task is not a failure however its exit code reads. Additive; older clients ignore the unknown field.",
+              "default": false,
               "type": "boolean"
             },
             "task_id": {

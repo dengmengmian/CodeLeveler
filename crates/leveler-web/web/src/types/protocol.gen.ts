@@ -323,6 +323,8 @@ export type RuntimeEvent =
   | { type: 'turn_failed'; error: string; failure?: UiFailure | null }
   /** The current turn was cancelled (resumable). */
   | { type: 'turn_cancelled' }
+  /** The logical task was explicitly cancelled by the user. Terminal: unlike [`Self::TurnCancelled`] a continuation must not reopen it. */
+  | { type: 'task_cancelled' }
   /** A spawned sub-agent started or finished (multi-agent delegation). One block per agent id, updated in place from running → done. */
   | { type: 'sub_agent_updated'; agent?: UiChildAgentIdentity | null; background?: boolean | null; contribution?: ChildContribution | null; detail: string; done: boolean; id: string; limit?: ChildLimit | null; nickname: string; ok: boolean; outcome?: ChildOutcome | null; profile_id?: string | null; profile_role?: string | null; read_only?: boolean; role: string; scope?: string[]; stop?: ChildStop | null; title?: string | null }
   /** A child's lifecycle moved without a start or a terminal: its activation died with a runtime window (`interrupted`) or a new one began under the same id (`running`). Clients update the child they already hold. */
@@ -347,8 +349,10 @@ export type RuntimeEvent =
   | { type: 'notification'; level: NotificationLevel; message: string }
   /** A background process task was started (`run_command` background=true). */
   | { type: 'background_task_started'; args: string[]; program: string; task_id: string }
-  /** A background task finished (exit or kill). */
-  | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; task_id: string }
+  /** A live chunk of a background task's combined stdout/stderr, already sanitized and capped by the runtime. Additive; older clients ignore the unknown type. The final [`Self::BackgroundTaskExited`] log stays authoritative. */
+  | { type: 'background_task_output'; chunk: string; task_id: string }
+  /** A background task finished (exit or kill). `output` is the task's final retained log, authoritative over the streamed chunks (a lifecycle broadcast lag can drop a chunk). Empty when the runtime produced none. */
+  | { type: 'background_task_exited'; duration_ms: number; exit_code?: number | null; ok: boolean; output?: string; stopped?: boolean; task_id: string }
   /** Authoritative replacement of a session's active background projection. Emitted after a lifecycle broadcast lag; history is unaffected. */
   | { type: 'background_tasks_reconciled'; tasks: UiActiveBackgroundTask[] }
   /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
@@ -1053,6 +1057,8 @@ export type ClientCommand =
   | { type: 'run_goal'; content: string; session_id: SessionId }
   /** Run the Develop workflow on an explicit goal: `Analyze → Coding → Verify → Review`. Distinct from [`Self::RunGoal`] because it is a different product promise, not a different phrasing of the same one: the user is asking for the change to be investigated before it is written and read back after it is verified. An ordinary message never becomes one of these. */
   | { type: 'run_develop'; content: string; session_id: SessionId }
+  /** Continue the session's interrupted logical task through the runtime's existing resume path, instead of starting a fresh turn. The client sends this when the user expressed continuation intent (see [`crate::parse_continuation`]); the runtime remains the authority on whether a resumable task actually exists. When none does, the runtime falls back to the ordinary submit path, so a `ResumeTask` is never lost — it is either a resume or a normal message. `content` is the user's own text (for example `继续，但是先不要跑测试`): the runtime parses the amendment off it, preserving the original objective and adding the instruction, never replacing it. */
+  | { type: 'resume_task'; content: string; session_id: SessionId }
   /** Import a file as an attachment; the runtime processes and stores it. `name` overrides the display name that would otherwise come from the file name. A terminal that answers Cmd+V on an image by writing a scratch file and pasting its path knows the file name is its own bookkeeping (`clipboard-2026-09-16-215212-CE7C9522.png`) and not something the user chose — only the client that made the gesture knows that, so only it can say so. */
   | { type: 'add_attachment'; name?: string | null; path: string; session_id: SessionId }
   /** Import an attachment from immutable base64-encoded bytes already read by a trusted client. This avoids reopening an ambient path after a security-sensitive upload or file-picker validation. */
@@ -1065,6 +1071,8 @@ export type ClientCommand =
   | { type: 'cancel_current_turn'; session_id: SessionId }
   /** Escalate a cancel the user has already requested once. */
   | { type: 'force_cancel_current_turn'; session_id: SessionId }
+  /** Cancel the logical task, not just the running turn. Distinct from [`Self::CancelCurrentTurn`]: that interrupts the current work window and leaves the task resumable, while this is the user saying the task itself is over. The runtime commits a terminal `cancelled` outcome, settles the goal, and refuses a later continuation — a `继续` must not silently reopen it. */
+  | { type: 'cancel_task'; session_id: SessionId }
   /** Cancel ONE running delegated child of the session's turn. The child settles as cancelled; its parent turn keeps running. */
   | { type: 'cancel_child'; child_id: string; session_id: SessionId }
   /** Stop ONE running tool call of the session's turn (for a command, its whole process tree). The call settles with its own stop outcome; the turn keeps running. Rejected when no such call is executing. */
@@ -1125,6 +1133,8 @@ export type ClientCommand =
   | { type: 'run_user_shell'; command: string; session_id: SessionId }
   /** Cancel exactly one user shell execution. Deliberately separate from `CancelCurrentTurn`: a user shell is not an agent turn, and the id match ensures a stale cancel can never kill a newer execution. */
   | { type: 'cancel_user_shell'; execution_id: UserShellId; session_id: SessionId }
+  /** Stop one background task the runtime is still running. The registry signals the process tree through its own lifecycle; the task settles as killed. Deliberately separate from `CancelCurrentTurn` and `CancelUserShell`: a background task outlives the turn that started it, and stopping it must not stop the turn. */
+  | { type: 'cancel_background_task'; session_id: SessionId; task_id: string }
   | { type: 'btw'; question: string; session_id: SessionId }
   /** Stop the in-flight `/btw` side answer for a session. Deliberately separate from `CancelCurrentTurn`: a side thread's answer has its own lifecycle, and stopping it must never stop the main turn. */
   | { type: 'cancel_btw'; session_id: SessionId }
