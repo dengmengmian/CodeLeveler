@@ -27,7 +27,8 @@ struct AppEnvironment {
     /// The model an agent without its own runs on; `None` when no model is
     /// configured at all.
     session_model: Option<ModelRef>,
-    root: std::path::PathBuf,
+    /// Skill names the resolved registry accepts, read once per listing.
+    skills: std::collections::HashSet<String>,
 }
 
 impl AgentEnvironment for AppEnvironment {
@@ -50,7 +51,7 @@ impl AgentEnvironment for AppEnvironment {
     }
 
     fn skill_exists(&self, name: &str) -> bool {
-        leveler_skills::load(&self.root, name).is_some()
+        self.skills.contains(name)
     }
 }
 
@@ -89,7 +90,14 @@ impl Application {
         AppEnvironment {
             profiles,
             session_model: session_model.cloned(),
-            root: self.layout.repo_root.clone(),
+            skills: leveler_skills::SkillRegistry::load(
+                &leveler_skills::SkillRoots::for_project_in(&self.layout.repo_root, &|key| {
+                    self.environment.var_os(key)
+                }),
+            )
+            .available_names()
+            .into_iter()
+            .collect(),
         }
     }
 

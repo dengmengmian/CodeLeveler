@@ -1015,6 +1015,25 @@ Agent Registry（Coding Harness：解析、校验、优先级）
 
 参见 [自定义 Agent](AGENT_EXTENSIBILITY.zh-CN.md)。
 
+### 15.2 声明式 Skill 与 Skill Registry
+
+Skill（`SKILL.md` + 可选的 `scripts/`、`references/`）是领域知识包，不是新的运行时角色。它们和声明式 Agent 一样位于 Engine 之上：
+
+```text
+兼容 Skill 来源（project/user × native/Codex/Agent Skills/Claude）
+        ↓
+Skill Registry（解析、校验、identity、优先级、shadowing、状态）
+        ↓
+load_skill · $mention · 每回合 index · Agent.skills · /skills · CLI
+```
+
+- **identity 唯一**：目录名就是 canonical skill name；frontmatter 里的 `name` 与之不一致就是 `invalid`，不会被静默地当成第二个名字。discover 与 load 永远指向同一个 Skill。
+- **来源按 locality 排序**：project 高于 user，user 高于 builtin；同 scope 内按固定来源顺序。被覆盖的定义仍可诊断（`shadowed`），高优先级定义坏了也不会悄悄回退到低优先级同名 Skill。
+- **直接消费，不复制**：本机已安装的兼容 Skill 在原目录读取（`~/.codex/skills`、`~/.agents/skills`、`~/.claude/skills`），另一个工具更新后，下一次 resolve 就能看到。
+- **读侧与写侧分离**：Registry 只读；CodeLeveler 自己管理的 project/user Skill 通过 Skill Store 写入——先校验、再让用户确认、最后原子替换。builtin 与外部 Skill 可以加载，但不能在这里改写或删除。
+- **progressive disclosure 不变**：index 只有 name + scope + description，完整 `SKILL.md` 由 `load_skill` 或 `$name` 按需加载。
+- Registry 与 Skill Store 都不得下沉到 Engine：Skill 是产品与领域概念，Engine 只负责生命周期、所有权与持久化。
+
 ---
 
 ## 16. 依赖方向：越往下越通用

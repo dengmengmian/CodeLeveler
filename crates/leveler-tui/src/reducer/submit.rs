@@ -142,6 +142,15 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     let attachments = std::mem::take(&mut state.pending_attachments);
     let shown = state.message_with_images(attachments.len(), &content);
     state.transcript.push_user_if_new(shown);
+    // Stage the turn's goal identity before it flips to Busy. A continuation
+    // phrase re-enters the goal already shown (and the runtime's own resume
+    // path); any other input opens a new one.
+    let continuation =
+        attachments.is_empty() && leveler_client_protocol::parse_continuation(&content).is_some();
+    state.staged_goal = Some(crate::active_goal::StagedGoal {
+        title: crate::active_goal::short_title(&content),
+        continuation,
+    });
     // Go Busy immediately (not on the first runtime event): closes the
     // submit→first-event window where a second submit would send instead of
     // queue, double-driving the runtime.
@@ -150,12 +159,34 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
     // Runtime maps collaboration=goal SubmitMessage → goal turn profile.
     state.goal_mode_active =
         state.collaboration.eq_ignore_ascii_case("goal") && attachments.is_empty();
-    let command = ClientCommand::SubmitMessage {
+    let command = turn_input_command(state, content, attachments);
+    submit_turn_input(state, command)
+}
+
+/// The command a user's turn input becomes.
+///
+/// A continuation phrase (`继续`, `继续，但是先不要跑测试`, `go on`, …) is sent as
+/// [`ClientCommand::ResumeTask`] so the runtime can re-enter the session's
+/// logical task through its resume path. The runtime remains the authority on
+/// whether a resumable task exists: when none does, it treats the same text as
+/// an ordinary message. Attachments stay ordinary messages — a continuation is
+/// text.
+fn turn_input_command(
+    state: &AppState,
+    content: String,
+    attachments: Vec<leveler_client_protocol::AttachmentRef>,
+) -> ClientCommand {
+    if attachments.is_empty() && leveler_client_protocol::parse_continuation(&content).is_some() {
+        return ClientCommand::ResumeTask {
+            session_id: state.session_id.clone(),
+            content,
+        };
+    }
+    ClientCommand::SubmitMessage {
         session_id: state.session_id.clone(),
         content,
         attachments,
-    };
-    submit_turn_input(state, command)
+    }
 }
 
 /// Send one 待发送 item through the ordinary turn-input delivery. While a turn
@@ -185,12 +216,13 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
     } else {
         // The runtime announces an admitted turn's message itself
         // (`UserMessageAdded`); only the optimistic Busy is ours to set.
+        let continuation = leveler_client_protocol::parse_continuation(&content).is_some();
+        state.staged_goal = Some(crate::active_goal::StagedGoal {
+            title: crate::active_goal::short_title(&content),
+            continuation,
+        });
         start_turn(state);
-        ClientCommand::SubmitMessage {
-            session_id: state.session_id.clone(),
-            content,
-            attachments: Vec::new(),
-        }
+        turn_input_command(state, content, Vec::new())
     };
     let effects = submit_turn_input(state, command);
     if let Some(Effect::Submit { command_id, .. }) = effects.first() {
@@ -308,7 +340,8 @@ pub(super) fn turn_input_text(command: &ClientCommand) -> Option<&str> {
     match command {
         ClientCommand::SubmitMessage { content, .. }
         | ClientCommand::SteerCurrentTurn { content, .. }
-        | ClientCommand::RunGoal { content, .. } => Some(content),
+        | ClientCommand::RunGoal { content, .. }
+        | ClientCommand::ResumeTask { content, .. } => Some(content),
         _ => None,
     }
 }
@@ -324,6 +357,7 @@ pub(super) fn restore_turn_input(state: &mut AppState, command: ClientCommand) {
         } => (content, attachments),
         ClientCommand::SteerCurrentTurn { content, .. } => (content, Vec::new()),
         ClientCommand::RunGoal { content, .. } => (format!("/goal {content}"), Vec::new()),
+        ClientCommand::ResumeTask { content, .. } => (content, Vec::new()),
         _ => return,
     };
     if state.composer.canonical_text().trim().is_empty() {
@@ -481,6 +515,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "collab" => set_collab_cmd(state, command),
         "memory" => memory_slash(state, command),
         "agents" => agents_slash(state, command),
+        "skills" => skills_slash(state, command),
         "remember" => remember_slash(state, command),
         "web" => start_web(state),
         "remote" => start_remote(state, false),
@@ -816,6 +851,23 @@ pub(super) fn refresh_skill_catalog(state: &mut AppState) {
     state.skill_catalog_root = Some(key);
 }
 
+/// `/skills` lists the resolved skill registry; `/skills <name>` shows one
+/// entry. Read-only, and local: it reads the same registry `$name` and
+/// `load_skill` use, so the listing cannot drift from what loads.
+fn skills_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let root = skill_root(state);
+    let registry = leveler_skills::describe(&root);
+    let name = command.strip_prefix("skills").unwrap_or(command).trim();
+    let t = state.t();
+    let note = if name.is_empty() {
+        crate::skills_view::listing_note(&registry, t)
+    } else {
+        crate::skills_view::detail_note(&registry, name, t)
+    };
+    state.transcript.push_note(note);
+    Vec::new()
+}
+
 /// `/agents` lists the agents this project resolves; `/agents <name>` shows one
 /// definition. Read-only: the TUI does not write agent files.
 fn agents_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
@@ -1000,6 +1052,10 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
                 return submit_turn_input(state, command);
             }
             state.transcript.push_user_if_new(rest.clone());
+            state.staged_goal = Some(crate::active_goal::StagedGoal {
+                title: crate::active_goal::short_title(&rest),
+                continuation: false,
+            });
             start_turn(state);
             state.goal_mode_active = true;
             let command = ClientCommand::RunGoal {
@@ -1040,6 +1096,10 @@ fn run_develop(state: &mut AppState, command: &str) -> Vec<Effect> {
         return Vec::new();
     }
     state.transcript.push_user_if_new(goal.clone());
+    state.staged_goal = Some(crate::active_goal::StagedGoal {
+        title: crate::active_goal::short_title(&goal),
+        continuation: false,
+    });
     start_turn(state);
     let command = ClientCommand::RunDevelop {
         session_id: state.session_id.clone(),
@@ -1075,6 +1135,10 @@ fn clear_goal(state: &mut AppState) -> Vec<Effect> {
     let was_busy_goal = state.is_busy() && state.goal_mode_active;
     let flipped_collab = state.collaboration == "goal";
     state.goal_mode_active = false;
+    // An explicit clear is one of the two ways the Active Goal leaves the
+    // header besides completion (the other is a new goal replacing it).
+    state.active_goal = None;
+    state.staged_goal = None;
     if flipped_collab {
         state.collaboration = "chat".into();
     }
@@ -1087,12 +1151,15 @@ fn clear_goal(state: &mut AppState) -> Vec<Effect> {
             collaboration: state.collaboration.clone(),
         }));
     }
-    if was_busy_goal {
+    // `/goal cancel` is the explicit-task-cancellation entry: it cancels the
+    // logical task, not just the current window, so a later `继续` cannot
+    // reopen it. With nothing to cancel it is only a goal-mode clear.
+    if was_busy_goal || state.resumable_task {
         state.notification = Some(Notification {
             level: NotificationLevel::Info,
             message: t.goal_cleared_and_cancel.to_string(),
         });
-        effects.push(Effect::Send(ClientCommand::CancelCurrentTurn {
+        effects.push(Effect::Send(ClientCommand::CancelTask {
             session_id: state.session_id.clone(),
         }));
     } else {

@@ -689,6 +689,69 @@ pub enum AgentError {
     Persistence(String),
 }
 
+impl AgentError {
+    /// Whether a logical task that ended on this error can be continued
+    /// through the resume path.
+    ///
+    /// Only the recoverable model-plane failures qualify: transport/network
+    /// faults and retry-exhausted provider unavailability. A schema/protocol
+    /// defect, an ownership loss, or a persistence failure is not something a
+    /// second model round repairs, so it must not be handed a resume affordance.
+    pub fn is_resumable(&self) -> bool {
+        match self {
+            AgentError::Model(error) => matches!(
+                error.kind,
+                leveler_model::ModelErrorKind::ProviderUnavailable
+                    | leveler_model::ModelErrorKind::Transport
+                    | leveler_model::ModelErrorKind::StreamInterrupted
+                    | leveler_model::ModelErrorKind::Timeout
+                    | leveler_model::ModelErrorKind::RateLimit
+            ),
+            AgentError::Cancelled => true,
+            AgentError::StaleOwnership(_)
+            | AgentError::InvalidBudget(_)
+            | AgentError::Persistence(_) => false,
+        }
+    }
+}
+
+/// Facts the loop already proved when it aborted.
+///
+/// A failed or interrupted turn must still record what it actually did; the
+/// engine's turn terminal is written from these. Without them an interruption
+/// reports `rounds = 0, modified_files = []` and erases real work.
+#[derive(Debug, Clone, Default)]
+pub struct AbortedFacts {
+    /// Model rounds this drive started.
+    pub rounds: u32,
+    /// Files this drive confirmed it modified.
+    pub modified_files: Vec<String>,
+}
+
+/// A drive that aborted, carrying both the error and the facts proven before
+/// the abort.
+#[derive(Debug)]
+pub struct DriveAborted {
+    pub error: AgentError,
+    pub facts: AbortedFacts,
+}
+
+impl From<AgentError> for DriveAborted {
+    /// An abort with no proven facts (a failure before the loop started).
+    fn from(error: AgentError) -> Self {
+        Self {
+            error,
+            facts: AbortedFacts::default(),
+        }
+    }
+}
+
+impl From<PortError> for DriveAborted {
+    fn from(error: PortError) -> Self {
+        AgentError::from(error).into()
+    }
+}
+
 impl From<PortError> for AgentError {
     /// A lifecycle port refused. Both cases abort the run: the engine could
     /// not make a fact durable, or this runtime no longer owns the task.
@@ -1822,11 +1885,25 @@ impl Executor {
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
+        self.run_tracked(goal, observer, sink, cancellation)
+            .await
+            .map_err(|aborted| aborted.error)
+    }
+
+    /// [`Self::run`], but an abort carries the facts the drive had already
+    /// proven so the caller can record what the turn actually did.
+    pub async fn run_tracked(
+        &self,
+        goal: &str,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        sink: &mut dyn TranscriptSink,
+        cancellation: CancellationToken,
+    ) -> Result<AgentOutcome, DriveAborted> {
         let objective = self
             .seeded_objective
             .clone()
             .unwrap_or_else(|| ObjectiveAnchor::from_session_goal(goal));
-        self.run_with_content_and_objective(
+        self.run_with_content_and_objective_tracked(
             vec![ContentPart::Text {
                 text: goal.to_string(),
             }],
@@ -1838,19 +1915,22 @@ impl Executor {
         .await
     }
 
-    async fn run_with_content_and_objective(
+    async fn run_with_content_and_objective_tracked(
         &self,
         content: Vec<ContentPart>,
         objective: ObjectiveAnchor,
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
-    ) -> Result<AgentOutcome, AgentError> {
+    ) -> Result<AgentOutcome, DriveAborted> {
         let request = text_of(&content);
         let mut seed = vec![Message::text(Role::System, self.system_prompt(&request))];
         // `$skill` mentions: inject full SKILL.md bodies for this turn (S1).
         if let Some(injection) = self.skill_turn_injection(&request) {
             seed.push(Message::text(Role::System, injection));
+        }
+        if let Some(index) = self.skill_index_injection() {
+            seed.push(Message::text(Role::System, index));
         }
         if let Some(catalog) = self.agent_catalog_injection() {
             seed.push(Message::text(Role::System, catalog));
@@ -1862,8 +1942,9 @@ impl Executor {
             role: Role::User,
             content,
         });
-        sink.append(&seed).await?;
-        self.drive(seed, objective, observer, sink, cancellation)
+        sink.append(&seed).await.map_err(AgentError::from)?;
+        let mut facts = AbortedFacts::default();
+        self.drive(seed, objective, observer, sink, cancellation, &mut facts)
             .await
     }
 
@@ -1876,10 +1957,33 @@ impl Executor {
             .then(|| self.load_agent_registry().render_catalog())
     }
 
+    /// The per-turn index of skills available to this agent: name + scope +
+    /// description only, so progressive disclosure still holds. Rebuilt each
+    /// turn, so a skill created or edited between turns is visible on the next
+    /// one, and bounded so a large library cannot crowd the conversation.
+    fn skill_index_injection(&self) -> Option<String> {
+        let root = self.tool_context.execution.workspace.root();
+        let environment = &self.tool_context.execution.environment;
+        let registry = leveler_skills::SkillRegistry::load(
+            &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
+        );
+        let index = leveler_skills::render_capped_index(
+            &registry.summaries(),
+            leveler_skills::MAX_SKILL_INDEX_BYTES,
+        );
+        (!index.is_empty()).then_some(index)
+    }
+
     /// Resolve `$name` mentions in the user request into a system injection block.
     fn skill_turn_injection(&self, request: &str) -> Option<String> {
-        let resolution =
-            leveler_skills::resolve_mentions(self.tool_context.execution.workspace.root(), request);
+        // Built from this execution's own environment, so `$mention` and
+        // `save_skill` agree about where the user's skills live.
+        let root = self.tool_context.execution.workspace.root();
+        let environment = &self.tool_context.execution.environment;
+        let registry = leveler_skills::SkillRegistry::load(
+            &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
+        );
+        let resolution = registry.resolve_mentions(request);
         leveler_skills::render_turn_injection(&resolution)
     }
 
@@ -1955,6 +2059,20 @@ impl Executor {
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
+        self.run_conversation_tracked(prior, content, observer, sink, cancellation)
+            .await
+            .map_err(|aborted| aborted.error)
+    }
+
+    /// [`Self::run_conversation`], preserving the facts an abort proved.
+    pub async fn run_conversation_tracked(
+        &self,
+        prior: Vec<Message>,
+        content: Vec<ContentPart>,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        sink: &mut dyn TranscriptSink,
+        cancellation: CancellationToken,
+    ) -> Result<AgentOutcome, DriveAborted> {
         let request = text_of(&content);
         // Active objective is THIS message — never the first user in `prior`.
         let objective = self.seeded_objective.clone().unwrap_or_else(|| {
@@ -1969,11 +2087,16 @@ impl Executor {
             content,
         };
         // Persist only the new user message; prior + system are not re-stored.
-        sink.append(std::slice::from_ref(&user)).await?;
+        sink.append(std::slice::from_ref(&user))
+            .await
+            .map_err(AgentError::from)?;
 
         let mut seed = vec![Message::text(Role::System, self.system_prompt(&request))];
         if let Some(injection) = self.skill_turn_injection(&request) {
             seed.push(Message::text(Role::System, injection));
+        }
+        if let Some(index) = self.skill_index_injection() {
+            seed.push(Message::text(Role::System, index));
         }
         // Drop any stale system messages from the prior transcript.
         seed.extend(prior.into_iter().filter(|m| m.role != Role::System));
@@ -1984,7 +2107,8 @@ impl Executor {
             seed.push(Message::text(Role::System, recall));
         }
         seed.push(user);
-        self.drive(seed, objective, observer, sink, cancellation)
+        let mut facts = AbortedFacts::default();
+        self.drive(seed, objective, observer, sink, cancellation, &mut facts)
             .await
     }
 
@@ -1996,11 +2120,28 @@ impl Executor {
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
+        self.resume_tracked(prior, observer, sink, cancellation)
+            .await
+            .map_err(|aborted| aborted.error)
+    }
+
+    /// [`Self::resume`], preserving the facts an abort proved.
+    ///
+    /// `prior` is the seeded transcript, already including any continuation
+    /// amendment this turn carries (the caller persists that message).
+    pub async fn resume_tracked(
+        &self,
+        prior: Vec<Message>,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        sink: &mut dyn TranscriptSink,
+        cancellation: CancellationToken,
+    ) -> Result<AgentOutcome, DriveAborted> {
         let objective = self
             .seeded_objective
             .clone()
             .unwrap_or_else(|| ObjectiveAnchor::from_user_message(first_user_text(&prior)));
-        self.drive(prior, objective, observer, sink, cancellation)
+        let mut facts = AbortedFacts::default();
+        self.drive(prior, objective, observer, sink, cancellation, &mut facts)
             .await
     }
 }

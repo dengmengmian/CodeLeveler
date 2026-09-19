@@ -21,6 +21,10 @@ pub enum Screen {
     /// First-class Activity Detail (background task or child agent).
     /// Observational: Esc closes the viewer without cancelling the work.
     Activity,
+    /// The background-jobs list: running and recently finished tasks. Opened by
+    /// Enter on the input footer's background summary; Enter on a row opens its
+    /// [`Screen::Activity`] detail, `x` stops the selected running task.
+    ActivityList,
     Help,
     /// Durable runtime observatory (`/trace`).
     Trace,
@@ -164,6 +168,16 @@ pub const SLASH_DEFS: &[SlashDef] = &[
     // inspects. Creating and editing agents is a conversation or Web task.
     slash(
         "/agents",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
+    // Read-only view of the resolved skill registry: `/skills` lists,
+    // `/skills <name>` inspects. Creating and editing skills is a conversation
+    // (skill-creator + save_skill/delete_skill) or Web task.
+    slash(
+        "/skills",
         &[],
         SlashCategory::Agent,
         SlashVisibility::Searchable,
@@ -377,6 +391,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/work-mode" | "/work_mode" => s.work_mode,
         "/collab" => s.collab,
         "/agents" => s.agents,
+        "/skills" => s.skills,
         "/memory" => s.memory,
         "/remember" => s.remember,
         "/diff" => s.diff,
@@ -649,6 +664,7 @@ mod surface_tests {
                 "/work-mode",
                 "/collab",
                 "/agents",
+                "/skills",
                 "/diff",
                 "/trace",
                 "/context",
@@ -853,6 +869,7 @@ mod ghost_tests {
         for hidden in [
             "/work-mode",
             "/agents",
+            "/skills",
             "/trace",
             "/sessions",
             "/memory",
@@ -1165,6 +1182,7 @@ mod reachability_tests {
             Screen::Remote => Some("`/remote` — reducer/mod.rs"),
             Screen::Shell => Some("`!command` — reducer/submit.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
+            Screen::ActivityList => Some("Enter on the footer background summary — reducer/mod.rs"),
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Context => Some("`/context` — screen_nav::open_context"),
@@ -1181,6 +1199,7 @@ mod reachability_tests {
             Screen::Remote,
             Screen::Shell,
             Screen::Activity,
+            Screen::ActivityList,
             Screen::Help,
             Screen::Trace,
             Screen::Context,

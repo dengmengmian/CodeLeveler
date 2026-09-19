@@ -29,6 +29,7 @@ pub mod runtime_boot;
 mod runtime_identity;
 mod session;
 pub mod session_history;
+pub mod skills;
 mod user_shell;
 mod vcs;
 mod workspace_view;
@@ -897,6 +898,7 @@ impl Application {
             },
             approver,
             clarifier,
+            task_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

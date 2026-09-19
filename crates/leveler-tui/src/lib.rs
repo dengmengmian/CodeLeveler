@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod action;
+pub mod active_goal;
 pub mod activity;
 mod activity_stream;
 pub mod agents_view;
@@ -40,6 +41,7 @@ pub mod render;
 pub mod screen;
 mod secondary;
 mod selection;
+pub mod skills_view;
 mod splash;
 pub mod state;
 mod status_line;

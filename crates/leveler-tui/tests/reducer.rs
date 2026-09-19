@@ -2536,13 +2536,14 @@ fn slash_new_starts_a_fresh_session() {
 
 /// Entry points closed by the command-surface closure. Each capability lives
 /// elsewhere: `/new` (was `/clear`), `/collab plan`, `$skill`, Ctrl+V,
-/// Ctrl+X Ctrl+E, Ctrl+T, `leveler doctor`, Ctrl+C.
+/// Ctrl+X Ctrl+E, Ctrl+T, `leveler doctor`, Ctrl+C. `/skill` is not listed
+/// here: it is now the prefix of the `/skills` inspector, so Enter completes
+/// it rather than reporting it unknown.
 #[test]
 fn closed_commands_are_unknown_and_send_nothing() {
     for command in [
         "/clear",
         "/plan",
-        "/skill",
         "/skill demo please ship",
         "/paste",
         "/editor",
@@ -2596,7 +2597,10 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
         );
     }
     for closed in [
-        "/quit", "/paste", "/editor", "/clear", "/skill", "/plan", "/doctor",
+        "/quit", "/paste", "/editor", "/clear",
+        // `/skills` is a live inspector, so the guard is the bare command with
+        // a trailing gap — `/skills` never matches this.
+        "/skill ", "/plan", "/doctor",
     ] {
         assert!(
             !frame.contains(closed),
@@ -4320,6 +4324,55 @@ fn plain_message_with_goal_collab_marks_goal_mode() {
 }
 
 #[test]
+fn a_continuation_phrase_is_sent_as_a_resume_intent() {
+    let mut s = opened();
+    typed(&mut s, "继续");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit { command: ClientCommand::ResumeTask { content, .. }, .. }]
+                if content == "继续"
+        ),
+        "`继续` must express resume intent, not a plain message: {effects:?}"
+    );
+    assert!(
+        !s.goal_mode_active,
+        "a resume is not a fresh goal turn; the runtime decides the profile"
+    );
+}
+
+#[test]
+fn a_continuation_amendment_travels_with_the_resume_intent() {
+    let mut s = opened();
+    typed(&mut s, "继续，但是先不要跑测试");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit { command: ClientCommand::ResumeTask { content, .. }, .. }]
+                if content == "继续，但是先不要跑测试"
+        ),
+        "the runtime parses the amendment off the original text: {effects:?}"
+    );
+}
+
+#[test]
+fn a_new_request_starting_with_continue_is_a_plain_message() {
+    let mut s = opened();
+    typed(&mut s, "继续之前的退款审计任务");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit { command: ClientCommand::SubmitMessage { content, .. }, .. }]
+                if content == "继续之前的退款审计任务"
+        ),
+        "a new request is not a continuation: {effects:?}"
+    );
+}
+
+#[test]
 fn plain_message_with_chat_collab_stays_chat() {
     let mut s = opened();
     s.collaboration = "chat".into();
@@ -4615,6 +4668,8 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
             exit_code: Some(0),
             duration_ms: 12_000,
             ok: true,
+            stopped: false,
+            output: String::new(),
         }),
     );
     let msg = s.notification.as_ref().unwrap().message.clone();
@@ -4649,6 +4704,8 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
             exit_code: Some(1),
             duration_ms: 900,
             ok: false,
+            stopped: false,
+            output: String::new(),
         }),
     );
     let note = s.notification.as_ref().unwrap();
@@ -4671,6 +4728,8 @@ fn an_unlabeled_background_exit_falls_back_to_a_truthful_generic() {
             exit_code: Some(0),
             duration_ms: 5,
             ok: true,
+            stopped: false,
+            output: String::new(),
         }),
     );
     let msg = s.notification.as_ref().unwrap().message.clone();
@@ -4678,8 +4737,69 @@ fn an_unlabeled_background_exit_falls_back_to_a_truthful_generic() {
     assert!(msg.contains("后台任务"), "generic but truthful: {msg}");
 }
 
+/// Live output is appended to the same projection the detail page reads, so a
+/// running task's page grows as the process writes. Output for a task this
+/// session never saw does not invent an entry.
 #[test]
-fn x_on_a_background_detail_is_inert_without_a_cancel_contract() {
+fn background_output_streams_into_the_task_projection() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-out".into(),
+            program: "make".into(),
+            args: vec!["up".into()],
+        }),
+    );
+    for chunk in ["[+] Building web\n", "server listening on :3000\n"] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BackgroundTaskOutput {
+                task_id: "bg-out".into(),
+                chunk: chunk.into(),
+            }),
+        );
+    }
+    let output = &s.background_task_labels.get("bg-out").unwrap().output;
+    assert!(output.contains("[+] Building web"), "{output:?}");
+    assert!(output.contains("server listening on :3000"), "{output:?}");
+
+    // The terminal log is authoritative over the streamed tail: a lagged
+    // chunk can never leave the finished page short.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-out".into(),
+            exit_code: Some(0),
+            duration_ms: 1234,
+            ok: true,
+            stopped: false,
+            output: "[+] Building web\nserver listening on :3000\nrequest 200 OK\n".into(),
+        }),
+    );
+    assert_eq!(
+        s.background_task_labels.get("bg-out").unwrap().output,
+        "[+] Building web\nserver listening on :3000\nrequest 200 OK\n"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskOutput {
+            task_id: "bg-never-started".into(),
+            chunk: "stray".into(),
+        }),
+    );
+    assert!(
+        !s.background_task_labels.contains_key("bg-never-started"),
+        "output for an unseen task must not fabricate a row"
+    );
+}
+
+/// `x` on a running background-task detail stops exactly that task, through
+/// the runtime's own cancellation command — never a PID, never just closing
+/// the page. Esc keeps the old non-destructive meaning.
+#[test]
+fn x_on_a_running_background_detail_cancels_that_task_only() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -4694,14 +4814,26 @@ fn x_on_a_background_detail_is_inert_without_a_cancel_contract() {
     s.active_screen = Screen::Activity;
     let effects = reduce(&mut s, raw_char('x'));
     assert!(
-        effects.is_empty(),
-        "no client command stops a background task, so x must not fake one: {effects:?}"
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Send(
+                leveler_client_protocol::ClientCommand::CancelBackgroundTask { task_id, .. }
+            ) if task_id == "bg-2"
+        )),
+        "x must stop the shown task through the runtime: {effects:?}"
     );
+    // Esc is not a stop: it only leaves the page.
+    let esc = reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+    assert!(esc.is_empty(), "Esc must not stop the task: {esc:?}");
+    assert_eq!(s.active_screen, Screen::Conversation);
     assert!(
         s.background_task_labels
             .get("bg-2")
             .is_some_and(|c| c.is_running()),
-        "the background task keeps running"
+        "leaving the page must not settle the task"
     );
 }
 
@@ -4734,6 +4866,8 @@ fn a_finished_background_task_keeps_its_detail_and_reopens_from_the_row() {
             exit_code: Some(0),
             duration_ms: 8_000,
             ok: true,
+            stopped: false,
+            output: String::new(),
         }),
     );
     assert_eq!(
@@ -4758,9 +4892,17 @@ fn a_finished_background_task_keeps_its_detail_and_reopens_from_the_row() {
     assert!(s.activity_open.is_none());
     assert!(s.background_task_labels.contains_key("bg-2"));
 
-    // The row is still in the projection, so Enter opens the retained detail.
-    s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
-    s.workbench_focus = leveler_tui::state::WorkbenchFocus::Activity;
+    // The task is still in the projection, so the list page reopens it: the
+    // footer summary is the entry point now that no task row sits in the
+    // conversation body.
+    s.workbench_focus = leveler_tui::state::WorkbenchFocus::Background;
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "opening the list sends nothing: {effects:?}"
+    );
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    // Only one task exists, so it is selected; Enter opens its detail.
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(
         effects.is_empty(),
@@ -4785,13 +4927,24 @@ fn activity_enter_opens_detail_and_esc_closes_without_cancel() {
     );
     reduce(&mut s, key(KeyCode::Tab));
     reduce(&mut s, key(KeyCode::Tab));
+    // A background-only session focuses the footer summary, never a strip row.
+    assert_eq!(
+        s.workbench_focus,
+        leveler_tui::state::WorkbenchFocus::Background
+    );
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.active_screen, Screen::Activity);
+    assert_eq!(s.active_screen, Screen::ActivityList);
     assert!(
         !effects
             .iter()
             .any(|e| format!("{e:?}").contains("Cancel") || format!("{e:?}").contains("Kill")),
         "Enter must not cancel: {effects:?}"
+    );
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::Activity);
+    assert!(
+        effects.is_empty(),
+        "opening a background detail sends nothing: {effects:?}"
     );
     let effects = reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
@@ -4805,6 +4958,152 @@ fn activity_enter_opens_detail_and_esc_closes_without_cancel() {
         effects.is_empty(),
         "Esc close sends no command: {effects:?}"
     );
+}
+
+/// The full three-level flow: conversation → footer summary → list → detail.
+/// Opening the list acknowledges the current failures and never deletes them.
+#[test]
+fn the_background_list_acknowledges_failures_and_keeps_history() {
+    let mut s = opened();
+    s.locale = leveler_tui::Locale::En;
+    for (id, program, args) in [
+        ("bg-run", "make", vec!["up"]),
+        ("bg-fail", "npm", vec!["start"]),
+    ] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+                task_id: id.into(),
+                program: program.into(),
+                args: args.into_iter().map(String::from).collect(),
+            }),
+        );
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-fail".into(),
+            exit_code: Some(1),
+            duration_ms: 30_000,
+            ok: false,
+            stopped: false,
+            output: "Error: listen EADDRINUSE\n".into(),
+        }),
+    );
+    assert!(!s.background_failures_seen.contains("bg-fail"));
+
+    // Footer focus → Enter opens the list; opening is the acknowledgement.
+    s.workbench_focus = leveler_tui::state::WorkbenchFocus::Background;
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "opening sends nothing: {effects:?}");
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    assert!(
+        s.background_failures_seen.contains("bg-fail"),
+        "opening the list acknowledges the failure"
+    );
+    // The history is untouched: the terminal record and its output survive.
+    assert!(s.background_task_labels.contains_key("bg-fail"));
+    assert!(s.background_task_labels.contains_key("bg-run"));
+
+    let frame = render_screen_text(&mut s);
+    assert!(frame.contains("Running"), "{frame}");
+    assert!(frame.contains("Recently finished"), "{frame}");
+    assert!(frame.contains("npm") && frame.contains("make"), "{frame}");
+
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+    assert!(
+        s.background_task_labels.contains_key("bg-fail"),
+        "returning keeps the history"
+    );
+}
+
+/// `x` stops exactly the selected running task and is inert on a finished one.
+#[test]
+fn x_in_the_background_list_stops_only_the_selected_running_task() {
+    let mut s = opened();
+    for id in ["bg-run", "bg-done"] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+                task_id: id.into(),
+                program: "npm".into(),
+                args: vec!["start".into()],
+            }),
+        );
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-done".into(),
+            exit_code: Some(0),
+            duration_ms: 5_000,
+            ok: true,
+            stopped: false,
+            output: String::new(),
+        }),
+    );
+    s.workbench_focus = leveler_tui::state::WorkbenchFocus::Background;
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    // The running task leads the list and is selected first.
+    assert_eq!(s.background_list_selected.as_deref(), Some("bg-run"));
+    let effects = reduce(&mut s, key(KeyCode::Char('x')));
+    let debug = format!("{effects:?}");
+    assert!(
+        debug.contains("CancelBackgroundTask") && debug.contains("bg-run"),
+        "x stops the selected running task: {debug}"
+    );
+    // The finished row advertises no stop.
+    reduce(&mut s, key(KeyCode::Down));
+    assert_eq!(s.background_list_selected.as_deref(), Some("bg-done"));
+    let effects = reduce(&mut s, key(KeyCode::Char('x')));
+    assert!(
+        effects.is_empty(),
+        "a terminal row has nothing to stop: {effects:?}"
+    );
+}
+
+/// A stopped task is its own terminal state: the detail says Stopped, never
+/// Failed, and the footer shows no failure badge. The distinction comes from the
+/// runtime's `stopped` bit, not the exit code.
+#[test]
+fn a_stopped_background_task_is_shown_as_stopped_not_failed() {
+    let mut s = opened();
+    s.locale = leveler_tui::Locale::En;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-1".into(),
+            program: "npm".into(),
+            args: vec!["start".into()],
+        }),
+    );
+    // A kill reads `ok: false` but `stopped: true` in the runtime's authority.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-1".into(),
+            exit_code: None,
+            duration_ms: 24_000,
+            ok: false,
+            stopped: true,
+            output: String::new(),
+        }),
+    );
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background("bg-1".into()));
+    s.active_screen = Screen::Activity;
+    let frame = render_screen_text(&mut s);
+    assert!(frame.contains("Stopped"), "{frame}");
+    assert!(
+        !frame.contains("Failed"),
+        "a stop is not a failure: {frame}"
+    );
+    // Back on the conversation the footer has nothing to remind about.
+    s.active_screen = Screen::Conversation;
+    s.activity_open = None;
+    let frame = render_screen_text(&mut s);
+    assert!(!frame.contains('×'), "no failure badge: {frame}");
 }
 
 #[test]
@@ -6099,8 +6398,46 @@ fn slash_goal_clear_cancels_a_busy_goal_turn() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::Send(ClientCommand::CancelCurrentTurn { .. }))),
+            .any(|e| matches!(e, Effect::Send(ClientCommand::CancelTask { .. }))),
+        "/goal cancel must cancel the logical task, not just the turn: {effects:?}"
+    );
+}
+
+/// `/goal cancel` on an interrupted (idle, resumable) task is the explicit
+/// "give up on this task" entry: it sends CancelTask so a later `继续` cannot
+/// reopen it.
+#[test]
+fn slash_goal_cancel_on_a_resumable_task_sends_cancel_task() {
+    let mut s = opened();
+    s.resumable_task = true;
+    s.composer.replace("/goal cancel");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Send(ClientCommand::CancelTask { .. }))),
         "{effects:?}"
+    );
+}
+
+/// The runtime's terminal task-cancel withdraws the resume affordance.
+#[test]
+fn a_task_cancelled_event_withdraws_resumability() {
+    let mut s = opened();
+    s.resumable_task = true;
+    s.goal_mode_active = true;
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TaskCancelled));
+    assert!(
+        !s.resumable_task,
+        "an explicitly cancelled task must not stay resumable"
+    );
+    assert!(!s.goal_mode_active);
+    assert!(
+        s.notification
+            .as_ref()
+            .is_some_and(|n| n.message.contains("取消")),
+        "{:?}",
+        s.notification
     );
 }
 
@@ -7987,7 +8324,7 @@ fn child_detail_state(status: leveler_tui::multi_agent::ChildStatus) -> AppState
             started_elapsed_secs: 0,
             settled_elapsed_secs: None,
             detail: None,
-            steps: Vec::new(),
+            activity: Vec::new(),
         });
     s.activity_open = Some(leveler_tui::activity::ActivityId::Child("c1".into()));
     s.active_screen = Screen::Activity;
@@ -8011,11 +8348,11 @@ fn x_in_a_running_child_detail_cancels_that_child_only() {
     let mut settled = child_detail_state(leveler_tui::multi_agent::ChildStatus::Completed);
     // Wide glyphs occupy two cells; compare without the padding spaces.
     let running_frame = render_screen_text(&mut s).replace(' ', "");
-    assert!(running_frame.contains("x:停止此子Agent"), "{running_frame}");
+    assert!(running_frame.contains("x停止"), "{running_frame}");
     assert!(
         !render_screen_text(&mut settled)
             .replace(' ', "")
-            .contains("x:停止此子Agent")
+            .contains("x停止")
     );
     assert!(
         reduce(&mut settled, raw_char('x')).is_empty(),
@@ -8102,6 +8439,37 @@ fn slash_agents_lists_and_slash_agents_name_inspects() {
         )),
         "effects={effects:?}"
     );
+}
+
+#[test]
+fn slash_skills_reads_the_local_registry_without_a_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".leveler/skills/deploy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Ship safely.\n---\n\nBODY_MARKER\n",
+    )
+    .unwrap();
+    let mut s = opened();
+    s.repository = tmp.path().display().to_string();
+
+    typed(&mut s, "/skills");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "the registry is local: {effects:?}");
+    let note = last_note(&s);
+    assert!(note.contains("$deploy"), "{note}");
+    assert!(
+        !note.contains("BODY_MARKER"),
+        "the listing must stay metadata-only: {note}"
+    );
+
+    typed(&mut s, "/skills deploy");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    let detail = last_note(&s);
+    assert!(detail.contains("Skill $deploy"), "{detail}");
+    assert!(!detail.contains("BODY_MARKER"), "{detail}");
 }
 
 #[test]

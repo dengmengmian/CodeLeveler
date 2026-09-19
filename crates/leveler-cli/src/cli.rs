@@ -157,6 +157,10 @@ pub enum Command {
     #[command(subcommand)]
     Agents(AgentsCommand),
 
+    /// List and inspect skills (project, user, external, built-in).
+    #[command(subcommand)]
+    Skills(SkillsCommand),
+
     /// Probe a model's text and streaming behavior.
     Model(ModelCommand),
 
@@ -749,6 +753,24 @@ pub enum AgentsCommand {
     Show {
         /// Agent name, e.g. `security-reviewer`.
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsCommand {
+    /// List the skills this project resolves, with status and shadowing.
+    List {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one skill's description, body and bundled files.
+    Show {
+        /// Skill name, e.g. `windows-ci-debug`.
+        name: String,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
 }
 

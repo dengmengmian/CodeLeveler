@@ -1034,6 +1034,25 @@ The same durable multi-agent Runtime
 
 See [Custom Agents](AGENT_EXTENSIBILITY.md).
 
+### 15.2 Declarative Skills and the Skill Registry
+
+A skill (`SKILL.md` plus optional `scripts/` and `references/`) is a domain knowledge pack, not a new runtime role. Like declarative agents, skills live above the Engine:
+
+```text
+Compatible skill sources (project/user × native/Codex/Agent Skills/Claude)
+        ↓
+Skill Registry (resolve, validate, identity, precedence, shadowing, status)
+        ↓
+load_skill · $mention · per-turn index · Agent.skills · /skills · CLI
+```
+
+- **One identity**: the directory name is the canonical skill name; a frontmatter `name` that disagrees is `invalid` rather than a silent second name. Discovery and loading always point at the same skill.
+- **Sources rank by locality**: project over user over built-in, and a fixed source order within a scope. A covered definition stays diagnosable (`shadowed`), and a broken higher-precedence definition never silently falls back to a lower-precedence one of the same name.
+- **Consume in place, never copy**: compatible skills already installed on the machine are read where they live (`~/.codex/skills`, `~/.agents/skills`, `~/.claude/skills`), so another tool's update is visible on the next resolve.
+- **Read side and write side are separate**: the Registry is read-only; the project/user skills CodeLeveler itself manages are written through the Skill Store — validated, confirmed by a person, then replaced atomically. Built-in and external skills can be loaded but not rewritten or deleted here.
+- **Progressive disclosure holds**: the index carries name + scope + description only; the full `SKILL.md` is loaded on demand by `load_skill` or a `$name` mention.
+- Neither the Registry nor the Skill Store may move down into the Engine: a skill is a product and domain concept, and the Engine keeps owning only lifecycle, ownership and persistence.
+
 ---
 
 ## 16. Dependency Direction: Lower Means More General

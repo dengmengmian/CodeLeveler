@@ -41,6 +41,7 @@ mod approval;
 mod client;
 mod command;
 mod command_envelope;
+mod continuation;
 mod contribution;
 mod event;
 mod failure;
@@ -51,6 +52,7 @@ mod origin;
 mod progress;
 /// WebSocket framing for a session: the shapes every session client speaks.
 pub mod session_wire;
+mod skills;
 mod snapshot;
 mod version;
 mod wire_types;
@@ -66,9 +68,14 @@ pub use approval::{
 pub use client::{ClientError, InteractiveRuntimeClient};
 pub use command::{ClientCommand, RestartReason};
 pub use command_envelope::{CommandEnvelope, CommandReceipts, Receipt};
+pub use continuation::{Continuation, parse_continuation};
 pub use contribution::{CONTRIBUTION_FINDINGS_MAX, UiChildContribution, UiFinding};
 pub use failure::{
     FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
+};
+pub use skills::{
+    UiShadowedSkill, UiSkillDetail, UiSkillEntry, UiSkillProblem, UiSkillScope, UiSkillSource,
+    UiSkillStatus,
 };
 
 pub use event::{

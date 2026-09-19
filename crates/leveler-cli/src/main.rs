@@ -26,6 +26,7 @@ mod remote_invite;
 mod render;
 mod run_cmds;
 mod sessions_cmd;
+mod skills_cmds;
 mod trace_cmd;
 mod trust_cmds;
 mod upgrade_cmd;
@@ -38,7 +39,7 @@ use leveler_project::Layout;
 
 use cli::{
     AgentsCommand, Cli, Command, ConfigCommand, ModelSubcommand, ModelsCommand, RunMode,
-    ThemeCommand,
+    SkillsCommand, ThemeCommand,
 };
 use eval_cmd::cmd_eval;
 use info_cmds::{
@@ -281,6 +282,10 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
         Command::Theme(ThemeCommand::Preview { id }) => cmd_theme_preview(id),
         Command::Agents(AgentsCommand::List { json }) => agents_cmds::list(layout, json).await,
         Command::Agents(AgentsCommand::Show { name }) => agents_cmds::show(layout, &name).await,
+        Command::Skills(command) => match command {
+            SkillsCommand::List { json } => skills_cmds::list(layout, json).await,
+            SkillsCommand::Show { name, json } => skills_cmds::show(layout, &name, json).await,
+        },
         Command::Models(ModelsCommand::List) => cmd_models_list(layout),
         Command::Models(ModelsCommand::Show { model }) => cmd_models_show(layout, &model).await,
         Command::Model(m) => match m.command {
