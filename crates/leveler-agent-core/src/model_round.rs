@@ -133,8 +133,22 @@ impl RetryPolicy {
     }
 }
 
-/// Stream one round, retrying the SAME request on a retryable error
-/// (rate-limit, timeout, mid-stream interruption). Non-retryable errors and
+/// Whether the logical round may make another bounded attempt.
+///
+/// `Safe` remains the normal delivery-truth rule. The one runtime-level
+/// exception is a send-boundary transport failure whose delivery is unknown:
+/// at this point no response stream exists, so the round may recover from the
+/// transient fault within its fixed budget. Once a stream exists,
+/// [`stream_round`] rewrites transport failures to `StreamInterrupted`; partial
+/// output therefore remains `Caution` and is never replayed.
+fn should_retry_round(error: &ModelError) -> bool {
+    error.retryability() == Retryability::Safe
+        || (error.kind == ModelErrorKind::Transport
+            && error.delivery_state == DeliveryState::Unknown)
+}
+
+/// Stream one round, retrying the SAME request after a safe delivery failure or
+/// a bounded pre-stream/send transport failure. Non-retryable errors and
 /// cancellation propagate immediately. Each attempt starts with an explicit
 /// [`AgentEvent::StreamAttemptStarted`] so retries can stream a divergent
 /// prefix without corrupting consumers.
@@ -189,12 +203,11 @@ async fn run_model_round_with(
             Err(AgentCoreError::Model(e)) => e,
             Err(e) => return Err(e),
         };
-        // ONLY `Safe` is auto-retried. A `Caution` error (the provider may
-        // already have generated/billed output, e.g. a stream cut after
-        // partial text) or an `Unknown`-delivery error is NEVER blind-replayed:
-        // re-POSTing the whole logical request would be a replay, not a
-        // reconnect, and there is no protocol-level stream resume here.
-        if error.retryability() != Retryability::Safe {
+        // Safe delivery failures and the narrow pre-stream/send transport
+        // exception are retried. A `Caution` error (the provider may already
+        // have generated/billed output, e.g. a stream cut after partial text)
+        // is never blind-replayed: there is no protocol-level stream resume.
+        if !should_retry_round(&error) {
             return Err(AgentCoreError::Model(error));
         }
         if retries >= policy.max_retries {
@@ -506,9 +519,10 @@ mod backoff_tests {
 #[cfg(test)]
 mod retry_decision_tests {
     //! The retry decision is a function of delivery truth, not of the kind or
-    //! the message alone. These tests pin the boundary: only a failure that
-    //! provably did no provider-side work may be re-sent automatically, at most
-    //! `MAX_RETRIES` times, after which the last failure is surfaced.
+    //! the message alone. These tests pin the boundary: safe failures and the
+    //! narrow pre-stream `Transport + Unknown` send exception may be re-sent
+    //! automatically, at most `MAX_RETRIES` times, after which the last failure
+    //! is surfaced. A partial stream is never replayed.
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -687,6 +701,10 @@ mod retry_decision_tests {
         ModelError::new(ModelErrorKind::Transport, "connect refused")
             .with_delivery_state(DeliveryState::NotSent)
     }
+    fn send_transport_unknown() -> ModelError {
+        ModelError::new(ModelErrorKind::Transport, "error sending request for url")
+            .with_delivery_state(DeliveryState::Unknown)
+    }
     fn no_output_cut() -> ModelError {
         ModelError::new(ModelErrorKind::StreamInterrupted, "cut").with_delivery_state(
             DeliveryState::StreamInterrupted {
@@ -822,6 +840,28 @@ mod retry_decision_tests {
         let (result, calls) = run(not_sent(), 1, &CancellationToken::new(), &mut events).await;
         assert!(result.is_ok());
         assert_eq!(calls, 2, "a NotSent failure is retried once: {calls}");
+    }
+
+    /// Reqwest can report a transient send failure without proving whether any
+    /// bytes left the process. It still happens before a response stream exists,
+    /// so the bounded logical retry lifecycle owns recovery.
+    #[tokio::test]
+    async fn an_unknown_delivery_send_transport_failure_is_retried() {
+        let mut events = Vec::new();
+        let (result, calls) = run(
+            send_transport_unknown(),
+            1,
+            &CancellationToken::new(),
+            &mut events,
+        )
+        .await;
+        assert!(result.is_ok(), "the bounded retry should recover");
+        assert_eq!(calls, 2, "one send failure, one retry");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelRetrying { attempt: 1, .. }))
+        );
     }
 
     #[tokio::test]

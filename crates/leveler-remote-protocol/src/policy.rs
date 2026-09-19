@@ -160,11 +160,18 @@ impl RemotePolicy {
             ClientCommand::SubmitMessage { .. }
             | ClientCommand::SteerCurrentTurn { .. }
             | ClientCommand::RunGoal { .. }
+            // Same authority as SubmitMessage: it either continues the
+            // session's own interrupted task or falls back to an ordinary
+            // message. It starts nothing a message could not.
+            | ClientCommand::ResumeTask { .. }
             // Same authority as RunGoal: it starts a task that may write code.
             // The extra reading stages narrow nothing and widen nothing.
             | ClientCommand::RunDevelop { .. }
             | ClientCommand::CancelCurrentTurn { .. }
             | ClientCommand::ForceCancelCurrentTurn { .. }
+            // Cancelling the logical task is a strictly stronger stop than
+            // cancelling its turn, which is already allowed.
+            | ClientCommand::CancelTask { .. }
             // Stopping one child or one command is a narrower act than
             // stopping the turn.
             | ClientCommand::CancelChild { .. }
@@ -246,12 +253,12 @@ impl RemotePolicy {
             // capability this policy exists to withhold. The user-shell
             // product surface is the local TUI; remote gets nothing, not
             // even cancel (it could kill work it cannot see).
-            ClientCommand::RunUserShell { .. } | ClientCommand::CancelUserShell { .. } => {
-                RemoteVerdict::Deny {
-                    code: DENIED_COMMAND,
-                    reason: "user shell execution is not available remotely",
-                }
-            }
+            ClientCommand::RunUserShell { .. }
+            | ClientCommand::CancelUserShell { .. }
+            | ClientCommand::CancelBackgroundTask { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "user shell execution is not available remotely",
+            },
 
             // Local-only observatory: path/command summaries must not leave
             // the machine. PublicEvent remains the remote projection.

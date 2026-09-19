@@ -11,17 +11,17 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::SessionId;
 use leveler_engine::{
-    EngineError, EngineEvent, LostChild, LostChildNote, LostChildVoice, TurnFacts, TurnFailure,
-    TurnPorts,
+    EngineError, EngineEvent, LostChild, LostChildNote, LostChildVoice, TranscriptSink, TurnFacts,
+    TurnFailure, TurnPorts,
 };
 use leveler_lifecycle::{EvidenceLedger, PlanState, ProgressLedger};
-use leveler_model::{ContentPart, Message};
+use leveler_model::{ContentPart, Message, Role};
 use leveler_storage::EventStore;
 
 use crate::coding::checkpoint::{CodingCheckpointContext, CodingCompactionCheckpoint};
 use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::sub_agent::SettledChildNotice;
-use crate::{AgentError, AgentEvent, AgentOutcome, Executor};
+use crate::{AgentError, AgentEvent, AgentOutcome, DriveAborted, Executor};
 
 /// What the executor starts from this turn.
 pub enum TurnInput {
@@ -29,7 +29,16 @@ pub enum TurnInput {
     /// bounded session history so multi-turn Goal can refer to earlier turns.
     Goal { goal: String, prior: Vec<Message> },
     /// A resumed transcript (drive continues mid-conversation).
-    Resume(Vec<Message>),
+    ///
+    /// `instruction` is the continuation message the user just sent (a bare
+    /// `继续` or an amendment such as `继续，但是先不要跑测试`). It is already
+    /// persisted by the caller; the driver appends it after the seeded prior
+    /// so the model reads it in context, and the original objective stays the
+    /// first user message rather than the continuation phrase.
+    Resume {
+        prior: Vec<Message>,
+        instruction: Option<Message>,
+    },
     /// A conversational turn: prior transcript + new content parts.
     Content {
         prior: Vec<Message>,
@@ -69,7 +78,7 @@ pub async fn drive_turn(
     // Fresh Goal/Content turns still seed runtime truth such as ledger,
     // progress and running children, but a terminal historical Plan must not
     // become active merely because its final declaration retained open rows.
-    let resumes_task_epoch = matches!(&input, TurnInput::Resume(_));
+    let resumes_task_epoch = matches!(&input, TurnInput::Resume { .. });
     let TurnPorts {
         turn_id,
         emitter,
@@ -101,7 +110,7 @@ pub async fn drive_turn(
             let text = content_text(content);
             (!text.is_empty()).then_some(text)
         }
-        TurnInput::Resume(_) => None,
+        TurnInput::Resume { .. } => None,
     };
 
     let mut executor: Executor = factory
@@ -112,6 +121,8 @@ pub async fn drive_turn(
             detail: error.to_string(),
             stale_ownership: false,
             model: None,
+            rounds: 0,
+            modified_files: Vec::new(),
         })?
         .with_approver(approver)
         .with_clarifier(clarifier)
@@ -205,14 +216,14 @@ pub async fn drive_turn(
             if prior.is_empty() {
                 executor
                     .with_objective(objective)
-                    .run(&goal, &mut forward, &mut sink, cancellation.clone())
+                    .run_tracked(&goal, &mut forward, &mut sink, cancellation.clone())
                     .await
             } else {
                 // Multi-turn Goal: carry bounded history so deictic follow-ups
                 // ("刚才那个") resolve against prior work.
                 executor
                     .with_objective(objective)
-                    .run_conversation(
+                    .run_conversation_tracked(
                         prior,
                         vec![ContentPart::Text { text: goal }],
                         &mut forward,
@@ -222,9 +233,37 @@ pub async fn drive_turn(
                     .await
             }
         }
-        TurnInput::Resume(prior) => {
+        TurnInput::Resume {
+            mut prior,
+            instruction,
+        } => {
+            // Persist the continuation message before running: it is this
+            // turn's user input, and the transcript must match what the user
+            // sent (the engine's write-ahead payload already names it for
+            // crash recovery).
+            if let Some(message) = instruction {
+                if let Err(error) =
+                    TranscriptSink::append(&mut sink, std::slice::from_ref(&message)).await
+                {
+                    return Err(unstarted_failure(AgentError::from(error)));
+                }
+                prior.push(message);
+                // The continuation message is the user's live instruction, and
+                // the goal-resolution contract asks for proof the user may have
+                // just withheld (`继续，但是先不要跑测试`). State the priority once
+                // so a later goal nudge cannot silently outrank the person. The
+                // note is transient: it is re-derived from the instruction on
+                // every continuation.
+                prior.push(Message::text(
+                    Role::System,
+                    "You are continuing an interrupted task. The user's continuation message \
+                     above is part of the objective and a binding constraint for this work \
+                     window; honor it as stated, even where the resolution contract would \
+                     otherwise ask for more.",
+                ));
+            }
             executor
-                .resume(prior, &mut forward, &mut sink, cancellation.clone())
+                .resume_tracked(prior, &mut forward, &mut sink, cancellation.clone())
                 .await
         }
         TurnInput::Content { prior, content } => {
@@ -236,7 +275,7 @@ pub async fn drive_turn(
             };
             executor
                 .with_objective(objective)
-                .run_conversation(
+                .run_conversation_tracked(
                     prior,
                     content,
                     &mut forward,
@@ -286,6 +325,8 @@ fn seed_failure(error: EngineError) -> TurnFailure {
         ),
         detail: error.to_string(),
         model: None,
+        rounds: 0,
+        modified_files: Vec::new(),
     }
 }
 
@@ -342,7 +383,8 @@ pub(crate) async fn last_persisted_progress(
 /// Report an executor error to the engine. Cancellation is called out so the
 /// turn is recorded as `interrupted` rather than `failed`: the run was
 /// stopped, it did not break.
-fn failure(error: AgentError) -> TurnFailure {
+fn failure(aborted: DriveAborted) -> TurnFailure {
+    let error = aborted.error;
     TurnFailure {
         cancelled: matches!(error, AgentError::Cancelled),
         stale_ownership: matches!(error, AgentError::StaleOwnership(_)),
@@ -353,6 +395,25 @@ fn failure(error: AgentError) -> TurnFailure {
             AgentError::Model(error) => Some(error),
             _ => None,
         },
+        // The loop's proven work before it aborted: a failed turn that ran
+        // rounds and changed files must not record none of that.
+        rounds: aborted.facts.rounds,
+        modified_files: aborted.facts.modified_files,
+    }
+}
+
+/// Refuse before the loop starts: no round ran, no file changed.
+fn unstarted_failure(error: AgentError) -> TurnFailure {
+    TurnFailure {
+        cancelled: matches!(error, AgentError::Cancelled),
+        stale_ownership: matches!(error, AgentError::StaleOwnership(_)),
+        detail: error.to_string(),
+        model: match error {
+            AgentError::Model(error) => Some(error),
+            _ => None,
+        },
+        rounds: 0,
+        modified_files: Vec::new(),
     }
 }
 

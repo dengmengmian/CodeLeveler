@@ -7,6 +7,7 @@
 //! consume `EngineEvent` directly (plan B6).
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tokio_util::sync::CancellationToken;
 
@@ -559,6 +560,8 @@ impl Application {
             sandbox,
             // Headless: nobody is at a keyboard to steer.
             None,
+            // Headless: nobody is at a keyboard to explicitly cancel a task.
+            Arc::new(AtomicBool::new(false)),
             // Legacy AgentEvent observer (headless CLI renderer): adapt from
             // the canonical stream one-way.
             &mut |event| forward_engine_event(event, observer),
@@ -587,6 +590,8 @@ impl Application {
         sandbox: bool,
         // Mid-turn user input; `None` disables steering for this run.
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
+        // Set when the user cancels the logical task rather than interrupting.
+        task_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
@@ -599,6 +604,7 @@ impl Application {
             clarifier,
             sandbox,
             steering,
+            task_cancel,
             observer,
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
@@ -622,6 +628,7 @@ impl Application {
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
+        task_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
@@ -634,6 +641,7 @@ impl Application {
             clarifier,
             sandbox,
             steering,
+            task_cancel,
             observer,
             cancellation,
             leveler_agent::ContinuationPolicy::UntilTerminal,
@@ -671,6 +679,8 @@ impl Application {
             Arc::new(AutoClarify),
             sandbox,
             steering,
+            // Eval runs never carry an interactive task cancel.
+            Arc::new(AtomicBool::new(false)),
             // Legacy AgentEvent observer (eval collectors): adapt one-way.
             &mut |event| forward_engine_event(event, observer),
             cancellation,
@@ -717,6 +727,7 @@ impl Application {
         clarifier: Arc<dyn Clarifier>,
         sandbox: bool,
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
+        task_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
         continuation: leveler_agent::ContinuationPolicy,
@@ -742,7 +753,8 @@ impl Application {
                 Some(session_id.as_str()),
             )
             .await?
-            .with_steering(steering);
+            .with_steering(steering)
+            .with_task_cancel(task_cancel);
         // Candidate extraction moved to the caller that owns a client
         // connection (`InteractiveRuntime`), because a pending candidate nobody
         // is told about is the same as none. Doing it here could only log.
@@ -779,6 +791,7 @@ impl Application {
         // the one TUI, Web and phone submit, so without it neither a steer
         // nor a "stop this child" can reach the running turn.
         steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
+        task_cancel: Arc<AtomicBool>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
@@ -797,7 +810,8 @@ impl Application {
                 Some(session_id.as_str()),
             )
             .await?
-            .with_steering(steering);
+            .with_steering(steering)
+            .with_task_cancel(task_cancel);
         let goal = goal_from_content(&content);
         // See the note in `run_in_session_with_policy`: the notice belongs to
         // the layer with a client to notify.
@@ -839,6 +853,78 @@ impl Application {
         closed.map_err(app_error_from_engine)
     }
 
+    /// Cancel the logical task behind `session_id` when no turn is running.
+    ///
+    /// Commits a terminal `cancelled` outcome (settling any running goal), so
+    /// the task is no longer resumable and a later `继续` cannot silently
+    /// reopen it. Returns the terminal event for the caller to publish, or
+    /// `None` when there is no task or it was already cancelled (idempotent).
+    pub async fn cancel_task(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<Option<EngineEvent>, AppError> {
+        use leveler_engine::TaskTerminal;
+        use leveler_lifecycle::{AgentState, SessionStatus, VerificationStatus};
+
+        let db = self.open_database().await?;
+        let engine = self.task_engine(&db)?;
+        let Some(task) = engine.stores.tasks.task_for_session(session_id).await? else {
+            return Ok(None);
+        };
+        // Idempotent: an already-cancelled task writes nothing more.
+        if let Some(row) = engine
+            .stores
+            .events
+            .load_last_by_type(session_id, "task_finished", None)
+            .await?
+            && let Ok(EngineEvent::TaskFinished { outcome, .. }) =
+                EngineEvent::from_payload(&row.payload)
+            && outcome == TaskOutcome::Cancelled
+        {
+            return Ok(None);
+        }
+        let token = engine
+            .acquire_ownership(session_id)
+            .await
+            .map_err(app_error_from_engine)?;
+        // The logical task is what ends here: any goal still owing work is
+        // settled, not left running for a future continuation to pick up.
+        let goal = engine
+            .stores
+            .goals
+            .for_task(&task)
+            .await?
+            .into_iter()
+            .find(|goal| goal.state == leveler_storage::GoalState::Running)
+            .map(|goal| leveler_storage::GoalTerminalUpdate {
+                goal_id: goal.id,
+                // Cancelling is not a work window.
+                windows_delta: 0,
+                settle: true,
+            });
+        let mut events = Vec::new();
+        engine
+            .finish_task(
+                &token,
+                session_id,
+                TaskTerminal {
+                    outcome: TaskOutcome::Cancelled,
+                    verification: VerificationStatus::NotRun,
+                    reason: Some("user_cancelled_task".to_string()),
+                    failure: None,
+                    stop: None,
+                    status: SessionStatus::Cancelled,
+                    state: AgentState::Cancelled,
+                    goal,
+                    warnings: Vec::new(),
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+            .map_err(app_error_from_engine)?;
+        Ok(events.into_iter().next())
+    }
+
     /// (work_profile / collaboration). Application in-memory defaults are not
     /// the SoT for resume — the session row is (CLI `leveler resume` may
     /// `assemble()` with balanced default).
@@ -849,6 +935,68 @@ impl Application {
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
+        let (engine, spec) = self
+            .resume_prepare(
+                session_id,
+                approver,
+                Arc::new(AutoClarify),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await?;
+        let result = engine
+            .resume(
+                session_id,
+                &spec,
+                &mut |event| forward_engine_event(event, observer),
+                cancellation,
+            )
+            .await;
+        match result {
+            Ok(report) => report_to_result(report),
+            Err(error) => Err(app_error_from_engine(error)),
+        }
+    }
+
+    /// Continue an interrupted session with the user's continuation message.
+    ///
+    /// Same persisted execution config, product axes and goal identity as
+    /// [`Self::resume_session`]; the difference is that this path is driveable
+    /// from a live client (its clarifier and mid-turn steering), and the
+    /// continuation message is recorded as the turn's own user input.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resume_in_session_with_instruction(
+        &self,
+        session_id: &leveler_core::SessionId,
+        instruction: leveler_model::Message,
+        approver: Arc<dyn Approver>,
+        clarifier: Arc<dyn Clarifier>,
+        steering: Option<Arc<dyn leveler_agent::SteeringSource>>,
+        task_cancel: Arc<AtomicBool>,
+        observer: &mut (dyn FnMut(leveler_engine::EngineEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> Result<AgentOutcome, AppError> {
+        let (engine, spec) = self
+            .resume_prepare(session_id, approver, clarifier, task_cancel)
+            .await?;
+        let engine = engine.with_steering(steering);
+        let result = engine
+            .resume_with_instruction(session_id, &spec, instruction, observer, cancellation)
+            .await;
+        match result {
+            Ok(report) => report_to_result(report),
+            Err(error) => Err(app_error_from_engine(error)),
+        }
+    }
+
+    /// Build the engine and spec a resume runs under, from the persisted
+    /// session row — never from caller-supplied config.
+    async fn resume_prepare(
+        &self,
+        session_id: &leveler_core::SessionId,
+        approver: Arc<dyn Approver>,
+        clarifier: Arc<dyn Clarifier>,
+        task_cancel: Arc<AtomicBool>,
+    ) -> Result<(leveler_agent::coding::CodingRuntime, TaskSpec), AppError> {
         let db = self.open_database().await?;
         let repo = SessionRepository::new(&db);
         let record = repo
@@ -874,27 +1022,17 @@ impl Application {
                 mode,
                 sandbox,
                 approver,
-                Arc::new(AutoClarify),
+                clarifier,
                 work_profile,
                 read_only,
                 Some(session_id.as_str()),
             )
-            .await?;
+            .await?
+            .with_task_cancel(task_cancel);
         let mut spec = self.direct_spec(record.goal.clone(), mode, sandbox);
         // Resume with the persisted strategy, not an assumed one.
         spec.runtime.kind = kind;
-        let result = engine
-            .resume(
-                session_id,
-                &spec,
-                &mut |event| forward_engine_event(event, observer),
-                cancellation,
-            )
-            .await;
-        match result {
-            Ok(report) => report_to_result(report),
-            Err(error) => Err(app_error_from_engine(error)),
-        }
+        Ok((engine, spec))
     }
 }
 

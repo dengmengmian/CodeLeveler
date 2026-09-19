@@ -319,6 +319,52 @@ pub(crate) fn collaboration_routes_submit_to_goal(collaboration: &str) -> bool {
     collaboration.eq_ignore_ascii_case("goal")
 }
 
+/// Whether a persisted task terminal is one a `继续` may re-enter through the
+/// resume path.
+///
+/// Resumable work windows: a user interruption (Esc / force-cancel) and an
+/// explicit resource boundary (a task stopped at its budget still owes work).
+/// A `failed` run is resumable only when the runtime typed the failure as a
+/// recoverable provider/network fault — a schema defect, a protocol violation
+/// or an internal invariant has no repaired path that another model round
+/// follows. `completed` and `blocked` are terminal statements the model made
+/// about the goal, not a window that ended early.
+pub(crate) fn task_outcome_is_resumable(
+    outcome: &leveler_lifecycle::TaskOutcome,
+    failure: Option<&leveler_model::ModelError>,
+) -> bool {
+    match outcome {
+        leveler_lifecycle::TaskOutcome::Interrupted
+        | leveler_lifecycle::TaskOutcome::BudgetLimited => true,
+        leveler_lifecycle::TaskOutcome::Failed => failure.is_some_and(|error| {
+            matches!(
+                error.kind,
+                leveler_model::ModelErrorKind::ProviderUnavailable
+                    | leveler_model::ModelErrorKind::Transport
+                    | leveler_model::ModelErrorKind::StreamInterrupted
+                    | leveler_model::ModelErrorKind::Timeout
+                    | leveler_model::ModelErrorKind::RateLimit
+            )
+        }),
+        leveler_lifecycle::TaskOutcome::Completed
+        | leveler_lifecycle::TaskOutcome::Blocked
+        | leveler_lifecycle::TaskOutcome::Cancelled => false,
+    }
+}
+
+/// What a continuation intent means for a session's persisted terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContinuationState {
+    /// An interrupted or recoverable-failed task with a transcript to rebuild
+    /// from. A `继续` resumes it.
+    Resumable,
+    /// The user explicitly cancelled the task. A `继续` must not reopen it.
+    Cancelled,
+    /// Nothing to resume: completed, blocked, non-recoverably failed, already
+    /// running, or no terminal at all. A `继续` is an ordinary message.
+    NotResumable,
+}
+
 use crate::Application;
 use crate::active_turns::ActiveTurns;
 
@@ -861,9 +907,22 @@ impl InProcessRuntimeClient {
                             args: task.args,
                         });
                     }
+                    Ok(leveler_execution::BackgroundTaskEvent::Output {
+                        owner_scope,
+                        task_id,
+                        chunk,
+                    }) if owner_scope.as_deref() == Some(background_session_id.as_str()) => {
+                        let _ = background_sender
+                            .send(RuntimeEvent::BackgroundTaskOutput { task_id, chunk });
+                    }
                     Ok(leveler_execution::BackgroundTaskEvent::Exited { owner_scope, task })
                         if owner_scope.as_deref() == Some(background_session_id.as_str()) =>
                     {
+                        // The runtime status is the authority, never the exit
+                        // code: a killed task can read either way, and a user
+                        // or session cleanup stop is not a failure.
+                        let stopped =
+                            task.status == leveler_execution::BackgroundTaskStatus::Killed;
                         let ok = task.status == leveler_execution::BackgroundTaskStatus::Exited
                             && task.exit_code == Some(0);
                         let _ = background_sender.send(RuntimeEvent::BackgroundTaskExited {
@@ -871,6 +930,8 @@ impl InProcessRuntimeClient {
                             exit_code: task.exit_code,
                             duration_ms: task.duration_ms,
                             ok,
+                            stopped,
+                            output: task.log,
                         });
                     }
                     Ok(_) => {}
@@ -1782,6 +1843,7 @@ impl InProcessRuntimeClient {
                         clarifier,
                         sandbox,
                         Some(steering as Arc<dyn leveler_agent::SteeringSource>),
+                        admission.task_cancel(),
                         &mut observer,
                         cancel,
                     )
@@ -1805,6 +1867,248 @@ impl InProcessRuntimeClient {
                 // settlement (finish_from_result) so chat-routed continuations
                 // are covered too — one reap site, not one per spawn function
                 // (R006 R6-P4).
+            });
+        });
+        accepted_rx
+    }
+
+    /// Route an ordinary user message: memory commands, the vision gate, then
+    /// a chat/content or goal turn chosen by the session's collaboration axis.
+    async fn handle_submit_message(
+        &self,
+        session_id: SessionId,
+        content: String,
+        attachments: Vec<AttachmentRef>,
+    ) -> Result<(), ClientError> {
+        // A message that is ONLY a memory command is the user's own write, not
+        // a task. Classified HERE, before `stage_turn`, so TUI, Web, mobile and
+        // remote all get the same answer — doing it in a client reducer would
+        // mean one client saving and another handing the same sentence to the
+        // model.
+        if attachments.is_empty() && self.handle_direct_memory_message(&session_id, &content) {
+            return Ok(());
+        }
+        let config = self.runtime_config(&session_id).await?;
+        // The TUI asks the user about this first, but the reducer is one
+        // client. Every other one — web, headless, a model changed between
+        // staging and sending — arrives here, and here the answer is the same:
+        // a model that cannot read an image is told so, never handed the text
+        // with the picture removed.
+        self.refuse_unreadable_images(&config.model, &attachments)
+            .await?;
+        let cancel = self
+            .stage_turn(&session_id, &content, true, image_count(&attachments))
+            .await?;
+        // CollaborationMode is the single source of turn profile:
+        // goal → goal_mode / update_goal path; chat|plan → content turn.
+        // Plan read_only is applied inside engine from session.collaboration.
+        let accepted = if collaboration_routes_submit_to_goal(&config.collaboration) {
+            if !attachments.is_empty() {
+                // Goal path is text-first; attachments still need the
+                // multimodal content turn (goal_mode stays false unless the
+                // user used /goal). Prefer content when media present.
+                self.spawn_turn(session_id, content, attachments, cancel, config)
+            } else {
+                self.spawn_goal_turn(session_id, content, cancel, config)
+            }
+        } else {
+            self.spawn_turn(session_id, content, attachments, cancel, config)
+        };
+        if self.durable_wire_ack {
+            await_turn_acceptance(accepted).await
+        } else {
+            drop(accepted);
+            Ok(())
+        }
+    }
+
+    /// Route a continuation intent (`继续`, `继续，但是先不要跑测试`, …).
+    ///
+    /// The runtime owns the mapping: continuation intent AND a resumable task
+    /// must both hold before this becomes a resume. Otherwise the message is an
+    /// ordinary submit, so a `继续` in a fresh session, or one that is really a
+    /// new request, reaches the model exactly as before.
+    async fn handle_resume_task(
+        &self,
+        session_id: SessionId,
+        content: String,
+    ) -> Result<(), ClientError> {
+        // No continuation intent: the client mislabelled an ordinary message.
+        let Some(continuation) = leveler_client_protocol::parse_continuation(&content) else {
+            return self
+                .handle_submit_message(session_id, content, Vec::new())
+                .await;
+        };
+        // Continuation intent is not enough: the runtime must also own a
+        // resumable task. An explicitly cancelled task must never be silently
+        // reopened, so it is told apart from the ordinary "nothing to resume".
+        match self.continuation_state(&session_id).await? {
+            ContinuationState::Resumable => {}
+            ContinuationState::Cancelled => {
+                // Refuse as a rejected submission, not a silent no-op: the
+                // client optimistically went busy and showed the input, and it
+                // must roll both back. A plain notification would leave it
+                // waiting for a turn that never starts.
+                return Err(ClientError::Runtime(
+                    "该任务已被取消，无法继续；如需重新开始，请直接描述任务。".to_string(),
+                ));
+            }
+            ContinuationState::NotResumable => {
+                // Nothing to resume: the same text is a normal message.
+                return self
+                    .handle_submit_message(session_id, content, Vec::new())
+                    .await;
+            }
+        }
+        // The instruction is the user's own words. The original objective stays
+        // the task's first user message and the resume path seeds the prior
+        // plan/ledger; `continuation.amendment` travels inside that text, so an
+        // amendment is an addition and never a replacement.
+        if let Some(amendment) = &continuation.amendment {
+            tracing::info!(
+                session = %session_id.as_str(),
+                phrase = %continuation.phrase,
+                amendment = %amendment,
+                "continuation intent resumes the session's logical task"
+            );
+        }
+        let instruction = Message::text(Role::User, content.clone());
+        let cancel = self.stage_turn(&session_id, &content, false, 0).await?;
+        let accepted = self.spawn_resume_turn(session_id, instruction, cancel);
+        if self.durable_wire_ack {
+            await_turn_acceptance(accepted).await
+        } else {
+            drop(accepted);
+            Ok(())
+        }
+    }
+
+    /// What a continuation intent (`继续`) means for this session.
+    ///
+    /// The persisted terminal is the authority: an `interrupted` turn (user
+    /// Esc, force-cancel) or a `failed` turn whose typed failure is a
+    /// recoverable provider/network fault is resumable. A task the user
+    /// explicitly cancelled is reported as such (a continuation must not
+    /// reopen it); everything else — completed, blocked, non-recoverably
+    /// failed, or no terminal at all — has simply nothing to resume.
+    async fn continuation_state(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ContinuationState, ClientError> {
+        if self.active.is_running(session_id) {
+            return Ok(ContinuationState::NotResumable);
+        }
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let Some(row) = stores
+            .events
+            .load_last_by_type(session_id, "task_finished", None)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+        else {
+            return Ok(ContinuationState::NotResumable);
+        };
+        let event = leveler_engine::EngineEvent::from_payload(&row.payload)
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let leveler_engine::EngineEvent::TaskFinished {
+            outcome, failure, ..
+        } = event
+        else {
+            return Ok(ContinuationState::NotResumable);
+        };
+        if outcome == leveler_lifecycle::TaskOutcome::Cancelled {
+            return Ok(ContinuationState::Cancelled);
+        }
+        if !task_outcome_is_resumable(&outcome, failure.as_ref()) {
+            return Ok(ContinuationState::NotResumable);
+        }
+        // Resume rebuilds from the transcript; an empty one has nothing to
+        // continue and would be refused by the engine anyway.
+        let messages = MessageRepository::new(&db)
+            .count(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        Ok(if messages > 0 {
+            ContinuationState::Resumable
+        } else {
+            ContinuationState::NotResumable
+        })
+    }
+
+    /// Drive `AgentEngine::resume` with the user's continuation message.
+    ///
+    /// The same plumbing as a goal turn — admission, approver/clarifier,
+    /// steering, terminal publication — so cancelling, approving and resuming
+    /// behave exactly as they do for any other turn. Only the harness entry
+    /// point (`resume_with_instruction`) and what it seeds differ.
+    fn spawn_resume_turn(
+        &self,
+        session_id: SessionId,
+        instruction: Message,
+        admission: crate::active_turns::TurnLease,
+    ) -> oneshot::Receiver<Result<(), ClientError>> {
+        let app = self.app.clone();
+        let events = self.events_for(&session_id);
+        let active = self.active.clone();
+        let repo = self.app.layout.repo_root.clone();
+        let cancel = admission.cancellation();
+        let approver = self.approver(&session_id, cancel.clone());
+        let clarifier = self.clarifier(&session_id, cancel.clone());
+        let steering = self.steering_for(&session_id);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                emit_project_rules(&events, &repo);
+                let terminal_active = active.clone();
+                let terminal_admission = admission.clone();
+                let mut bridge =
+                    EventBridge::new(events.clone()).with_terminal_callback(move || {
+                        terminal_active.finish(&terminal_admission);
+                    });
+                let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
+                let observer_acceptance = accepted_tx.clone();
+                let result = {
+                    let mut observer = |event: leveler_engine::EngineEvent| {
+                        if matches!(event, leveler_engine::EngineEvent::TurnStarted { .. })
+                            && let Some(tx) = observer_acceptance
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            let _ = tx.send(Ok(()));
+                            hit_after_turn_started_test_barrier();
+                        }
+                        bridge.forward(event);
+                    };
+                    app.resume_in_session_with_instruction(
+                        &session_id,
+                        instruction,
+                        approver,
+                        clarifier,
+                        Some(steering as Arc<dyn leveler_agent::SteeringSource>),
+                        admission.task_cancel(),
+                        &mut observer,
+                        cancel,
+                    )
+                    .await
+                };
+                if let Some(tx) = accepted_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = tx.send(Err(turn_rejection(&result)));
+                }
+                if !bridge.terminal_published() {
+                    let _ = events.send(turn_runtime_event(result));
+                }
+                active.finish(&admission);
             });
         });
         accepted_rx
@@ -1870,6 +2174,7 @@ impl InProcessRuntimeClient {
                         clarifier,
                         sandbox,
                         Some(steering as Arc<dyn leveler_agent::SteeringSource>),
+                        admission.task_cancel(),
                         &mut observer,
                         cancel,
                     )
@@ -2322,6 +2627,7 @@ impl InProcessRuntimeClient {
                         clarifier,
                         sandbox,
                         Some(steering as Arc<dyn leveler_agent::SteeringSource>),
+                        admission.task_cancel(),
                         &mut observer,
                         cancel,
                     )
@@ -2522,49 +2828,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 content,
                 attachments,
             } => {
-                // A message that is ONLY a memory command is the user's own
-                // write, not a task. Classified HERE, before `stage_turn`, so
-                // TUI, Web, mobile and remote all get the same answer — doing
-                // it in a client reducer would mean one client saving and
-                // another handing the same sentence to the model.
-                if attachments.is_empty()
-                    && self.handle_direct_memory_message(&session_id, &content)
-                {
-                    return Ok(());
-                }
-                let config = self.runtime_config(&session_id).await?;
-                // The TUI asks the user about this first, but the reducer is
-                // one client. Every other one — web, headless, a model changed
-                // between staging and sending — arrives here, and here the
-                // answer is the same: a model that cannot read an image is
-                // told so, never handed the text with the picture removed.
-                self.refuse_unreadable_images(&config.model, &attachments)
-                    .await?;
-                let cancel = self
-                    .stage_turn(&session_id, &content, true, image_count(&attachments))
-                    .await?;
-                // CollaborationMode is the single source of turn profile:
-                // goal → goal_mode / update_goal path; chat|plan → content turn.
-                // Plan read_only is applied inside engine from session.collaboration.
-                let accepted = if collaboration_routes_submit_to_goal(&config.collaboration) {
-                    if !attachments.is_empty() {
-                        // Goal path is text-first; attachments still need the
-                        // multimodal content turn (goal_mode stays false unless
-                        // the user used /goal). Prefer content when media present.
-                        self.spawn_turn(session_id, content, attachments, cancel, config)
-                    } else {
-                        self.spawn_goal_turn(session_id, content, cancel, config)
-                    }
-                } else {
-                    self.spawn_turn(session_id, content, attachments, cancel, config)
-                };
-                if self.durable_wire_ack {
-                    await_turn_acceptance(accepted).await
-                } else {
-                    drop(accepted);
-                    Ok(())
-                }
+                self.handle_submit_message(session_id, content, attachments)
+                    .await
             }
+            ClientCommand::ResumeTask {
+                session_id,
+                content,
+            } => self.handle_resume_task(session_id, content).await,
             ClientCommand::RunGoal {
                 session_id,
                 content,
@@ -3250,6 +3520,27 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
+            ClientCommand::CancelTask { session_id } => {
+                // A running turn carries the flag to its terminal, so the
+                // engine records `cancelled` (not resumable `interrupted`).
+                // With nothing running, commit that terminal here.
+                if !self.active.cancel_task(&session_id) {
+                    match self.app.cancel_task(&session_id).await {
+                        Ok(Some(event)) => {
+                            let mut bridge = EventBridge::new(self.events_for(&session_id));
+                            bridge.forward(event);
+                        }
+                        Ok(None) => self.notify_error(
+                            &session_id,
+                            "没有可取消的任务；直接描述新任务即可".to_string(),
+                        ),
+                        Err(error) => {
+                            self.notify_error(&session_id, error.to_string());
+                        }
+                    }
+                }
+                Ok(())
+            }
             ClientCommand::CancelChild {
                 session_id,
                 child_id,
@@ -3294,6 +3585,31 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     None => {
                         self.notify_error(&session_id, "该命令已结束或不存在,无需停止".to_string())
                     }
+                }
+                Ok(())
+            }
+            ClientCommand::CancelBackgroundTask {
+                session_id,
+                task_id,
+            } => {
+                // Ownership is enforced before signalling: only a task the
+                // runtime still attributes to THIS session may be stopped. A
+                // task id alone is not authorisation.
+                let registry = self.app.background_tasks();
+                let owned = registry
+                    .active_ids_for_scope(session_id.as_str())
+                    .await
+                    .iter()
+                    .any(|id| id == &task_id);
+                if !owned {
+                    self.notify_error(
+                        &session_id,
+                        "该后台任务已结束或不属于当前会话,无需停止".to_string(),
+                    );
+                    return Ok(());
+                }
+                if let Err(err) = registry.kill(&task_id).await {
+                    self.notify_error(&session_id, err);
                 }
                 Ok(())
             }
@@ -4647,6 +4963,67 @@ mod collab_route_tests {
         assert!(!collaboration_routes_submit_to_goal("chat"));
         assert!(!collaboration_routes_submit_to_goal("plan"));
         assert!(!collaboration_routes_submit_to_goal(""));
+    }
+}
+
+#[cfg(test)]
+mod resumable_task_tests {
+    use super::task_outcome_is_resumable;
+    use leveler_lifecycle::TaskOutcome;
+    use leveler_model::{ModelError, ModelErrorKind};
+
+    fn failed(kind: ModelErrorKind) -> bool {
+        task_outcome_is_resumable(&TaskOutcome::Failed, Some(&ModelError::new(kind, "x")))
+    }
+
+    #[test]
+    fn interruption_and_budget_windows_are_resumable() {
+        assert!(task_outcome_is_resumable(&TaskOutcome::Interrupted, None));
+        assert!(task_outcome_is_resumable(&TaskOutcome::BudgetLimited, None));
+    }
+
+    #[test]
+    fn recoverable_provider_failures_are_resumable() {
+        for kind in [
+            ModelErrorKind::ProviderUnavailable,
+            ModelErrorKind::Transport,
+            ModelErrorKind::StreamInterrupted,
+            ModelErrorKind::Timeout,
+            ModelErrorKind::RateLimit,
+        ] {
+            assert!(failed(kind), "{kind:?} must be resumable");
+        }
+    }
+
+    #[test]
+    fn non_recoverable_failures_are_not_resumable() {
+        for kind in [
+            ModelErrorKind::InvalidRequest,
+            ModelErrorKind::Auth,
+            ModelErrorKind::Decode,
+            ModelErrorKind::ConversationProtocol,
+            ModelErrorKind::Other,
+        ] {
+            assert!(!failed(kind), "{kind:?} must not be resumable");
+        }
+        assert!(
+            !task_outcome_is_resumable(&TaskOutcome::Failed, None),
+            "an untyped failure has no proven resume path"
+        );
+    }
+
+    #[test]
+    fn completed_and_blocked_are_terminal() {
+        assert!(!task_outcome_is_resumable(&TaskOutcome::Completed, None));
+        assert!(!task_outcome_is_resumable(&TaskOutcome::Blocked, None));
+    }
+
+    #[test]
+    fn an_explicitly_cancelled_task_is_not_resumable() {
+        assert!(
+            !task_outcome_is_resumable(&TaskOutcome::Cancelled, None),
+            "an explicit task cancel must not be resumable"
+        );
     }
 }
 

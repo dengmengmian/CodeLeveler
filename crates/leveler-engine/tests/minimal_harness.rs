@@ -17,7 +17,8 @@ use std::sync::Arc;
 use leveler_core::{RuntimeId, SessionId};
 use leveler_engine::{
     EngineEvent, EventLog, ExecutionKind, NewSession, ReapScope, TaskEngine, TranscriptSink,
-    TurnFacts, TurnFailure, TurnKind, TurnPorts, TurnRunner, TurnStart, reap_after_restart,
+    TurnFacts, TurnFailure, TurnKind, TurnOutcome, TurnPorts, TurnRunner, TurnStart,
+    reap_after_restart,
 };
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, AutoClarify};
 use leveler_lifecycle::{AgentState, SessionStatus, StopReason, TaskOutcome, VerificationStatus};
@@ -59,6 +60,8 @@ async fn minimal_turn(
         detail,
         stale_ownership: false,
         model: None,
+        rounds: 0,
+        modified_files: Vec::new(),
     };
 
     ports.emitter.emit(EngineEvent::AssistantMessage {
@@ -568,6 +571,8 @@ async fn a_child_left_open_by_a_cancelled_turn_is_settled_as_cancelled() {
                     detail: "stopped".into(),
                     stale_ownership: false,
                     model: None,
+                    rounds: 0,
+                    modified_files: Vec::new(),
                 })
             },
         )
@@ -579,4 +584,75 @@ async fn a_child_left_open_by_a_cancelled_turn_is_settled_as_cancelled() {
         _ => None,
     });
     assert_eq!(stop, Some(Some(leveler_lifecycle::ChildStop::Cancelled)));
+}
+
+/// An interrupted turn is not nothing: the terminal record keeps the rounds it
+/// ran and the files it changed, so the next turn can see what already
+/// happened instead of being handed a blank slate.
+#[tokio::test]
+async fn an_interrupted_turn_keeps_its_rounds_and_modified_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::connect(&dir.path().join("minimal.sqlite"))
+        .await
+        .unwrap();
+    let session = open_session(&db).await;
+    let engine = engine(&db);
+    let token = engine
+        .mark_running(&session, AgentState::Understand)
+        .await
+        .unwrap();
+    let log = EventLog::new_owned(&db, session.clone(), token.clone());
+    let runner = TurnRunner {
+        stores: &engine.stores,
+        token,
+        session_id: session.clone(),
+        log: &log,
+        approver: Arc::new(NoHuman),
+        clarifier: Arc::new(AutoClarify),
+        lost_child_voice: None,
+    };
+    let mut events = Vec::new();
+    let _ = runner
+        .run_turn(
+            TurnKind::User,
+            TurnStart::Fresh(Message::text(Role::User, "go")),
+            &mut |event| events.push(event),
+            CancellationToken::new(),
+            |_ports: TurnPorts| async move {
+                Err::<TurnFacts<MinimalResult>, _>(TurnFailure {
+                    cancelled: true,
+                    detail: "esc".into(),
+                    stale_ownership: false,
+                    model: None,
+                    rounds: 7,
+                    modified_files: vec!["inventory/core.py".into(), "inventory/storage.py".into()],
+                })
+            },
+        )
+        .await;
+    let finished = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::TurnFinished {
+                outcome,
+                rounds,
+                modified_files,
+                ..
+            } => Some((*outcome, *rounds, modified_files.clone())),
+            _ => None,
+        })
+        .expect("the interrupted turn still records a terminal");
+    assert_eq!(finished.0, TurnOutcome::Interrupted);
+    assert_eq!(
+        finished.1, 7,
+        "an interruption must not erase the rounds that actually ran"
+    );
+    assert_eq!(
+        finished.2,
+        vec![
+            "inventory/core.py".to_string(),
+            "inventory/storage.py".to_string()
+        ],
+        "an interruption must not erase the files that actually changed"
+    );
 }

@@ -29,9 +29,9 @@ pub use child_profile::child_profile_trace;
 pub use executor::DelegatedChildResult;
 pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
-    AdvisoryKind, AdvisorySpend, AgentError, AgentEvent, AgentOutcome, CompactionCheckpoint,
-    ContinuationPolicy, Executor, NoopSink, SteeringSource, StepLimits, SubAgentExecutionPolicies,
-    SubAgentExecutionPolicy, TurnPolicy, closeout,
+    AbortedFacts, AdvisoryKind, AdvisorySpend, AgentError, AgentEvent, AgentOutcome,
+    CompactionCheckpoint, ContinuationPolicy, DriveAborted, Executor, NoopSink, SteeringSource,
+    StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy, closeout,
 };
 pub use leveler_agent_core::{BudgetDimension, BudgetExhaustion};
 pub use leveler_context::{

@@ -92,6 +92,14 @@ pub enum BackgroundTaskEvent {
         owner_scope: Option<String>,
         task: BackgroundTaskSnapshot,
     },
+    /// A chunk of the task's combined stdout/stderr, after sanitization and
+    /// the registry's own log cap. Live output for a detail view; the final
+    /// snapshot on [`Self::Exited`] stays authoritative.
+    Output {
+        owner_scope: Option<String>,
+        task_id: String,
+        chunk: String,
+    },
     Exited {
         owner_scope: Option<String>,
         task: BackgroundTaskSnapshot,
@@ -733,7 +741,15 @@ fn spawn_log_pump<R>(
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => append_log(&reg, &tid, &buf[..n]).await,
+                Ok(n) => {
+                    if let Some((owner_scope, chunk)) = append_log(&reg, &tid, &buf[..n]).await {
+                        let _ = lifecycle_events.send(BackgroundTaskEvent::Output {
+                            owner_scope,
+                            task_id: tid.clone(),
+                            chunk,
+                        });
+                    }
+                }
                 Err(_) => break,
             }
         }
@@ -832,14 +848,26 @@ fn finalize_if_drained(task: &mut TaskInner) -> bool {
     true
 }
 
-async fn append_log(reg: &Arc<Mutex<RegistryState>>, id: &str, bytes: &[u8]) {
+/// Append one read to the task log and return the sanitized chunk with the
+/// task's owner scope, so the caller can publish live output. `None` when the
+/// task is gone or the read carried nothing printable.
+async fn append_log(
+    reg: &Arc<Mutex<RegistryState>>,
+    id: &str,
+    bytes: &[u8],
+) -> Option<(Option<String>, String)> {
     let mut st = reg.lock().await;
-    let Some(task) = st.tasks.get_mut(id) else {
-        return;
-    };
-    let chunk = String::from_utf8_lossy(bytes);
+    let task = st.tasks.get_mut(id)?;
+    let raw = String::from_utf8_lossy(bytes);
+    // Sanitize BEFORE the registry buffer: the log cap and every projection are
+    // then measured on the same clean text.
+    let chunk = leveler_core::sanitize_terminal_output(&raw);
+    if chunk.is_empty() {
+        return None;
+    }
     task.log.push_str(&chunk);
     truncate_log(&mut task.log);
+    Some((task.owner_scope.clone(), chunk))
 }
 
 fn truncate_log(log: &mut String) {

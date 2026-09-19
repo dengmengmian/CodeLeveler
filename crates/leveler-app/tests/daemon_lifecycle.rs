@@ -680,6 +680,158 @@ async fn registry_background_lifecycle_reaches_the_session_event_stream() {
     assert!(terminal.active_background_tasks.is_empty());
 }
 
+/// The client's stop for one background task goes through the registry's own
+/// lifecycle: the task is signalled, settles, and the session projection drops
+/// it. No PID is touched by the client, and Esc never reaches here.
+#[tokio::test]
+async fn cancel_background_task_command_stops_the_owned_task() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let session_id = runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "cancel background".into(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .expect("create session")
+        .session
+        .id;
+    let mut events = runtime.subscribe_session(&session_id);
+
+    let spawned_id = app
+        .background_tasks()
+        .spawn_owned(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".to_string()],
+                tmp.path().to_path_buf(),
+            ),
+            None,
+            Some(session_id.as_str()),
+        )
+        .await
+        .expect("background task starts");
+    let started = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .expect("start event arrives")
+        .expect("stream open");
+    assert!(matches!(
+        started,
+        RuntimeEvent::BackgroundTaskStarted { .. }
+    ));
+
+    // The command the TUI's `x` sends. The runtime owns the kill.
+    runtime
+        .send(ClientCommand::CancelBackgroundTask {
+            session_id: session_id.clone(),
+            task_id: spawned_id.clone(),
+        })
+        .await
+        .expect("cancel command accepted");
+
+    let exited = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("exit event arrives")
+            .expect("stream open");
+        if matches!(event, RuntimeEvent::BackgroundTaskExited { .. }) {
+            break event;
+        }
+    };
+    assert!(
+        matches!(
+            exited,
+            RuntimeEvent::BackgroundTaskExited { task_id: ref id, ok: false, .. } if id == &spawned_id
+        ),
+        "a stopped task settles as not-ok: {exited:?}"
+    );
+    let terminal = runtime.snapshot(&session_id).await.expect("snapshot");
+    assert!(terminal.active_background_tasks.is_empty());
+}
+
+/// A background task's stdout reaches the owning session's structured stream
+/// as it is written — the data a live Detail Page renders. Without this the
+/// page could only ever show an empty output section.
+#[cfg(unix)]
+#[tokio::test]
+async fn background_task_output_reaches_the_session_event_stream() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let session_id = runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "live output".into(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .expect("create session")
+        .session
+        .id;
+    let mut events = runtime.subscribe_session(&session_id);
+
+    let spawned_id = app
+        .background_tasks()
+        .spawn_owned(
+            leveler_execution::ProcessRequest::new(
+                "sh",
+                vec!["-c".to_string(), "echo live-line; sleep 30".to_string()],
+                tmp.path().to_path_buf(),
+            ),
+            None,
+            Some(session_id.as_str()),
+        )
+        .await
+        .expect("background task starts");
+
+    let mut output = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !output.contains("live-line") && std::time::Instant::now() < deadline {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("event arrives")
+            .expect("stream open");
+        if let RuntimeEvent::BackgroundTaskOutput { task_id, chunk, .. } = event
+            && task_id == spawned_id
+        {
+            output.push_str(&chunk);
+        }
+    }
+    assert!(
+        output.contains("live-line"),
+        "live output reached the TUI: {output:?}"
+    );
+    app.background_tasks().kill(&spawned_id).await.ok();
+}
+
 /// A running turn holds the handover open — and with it every child agent,
 /// because a child cannot outlive the turn that spawned it: `drive` drains
 /// its background children on every exit path before returning, so a live

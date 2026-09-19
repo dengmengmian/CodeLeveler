@@ -24,8 +24,8 @@ use super::dispatch::{
 };
 use super::host::AdmitError;
 use super::{
-    AdvisoryKind, AgentError, AgentEvent, AgentOutcome, ChildToolEvent, Executor,
-    ModelRequestRecord, StopReason, TranscriptSink,
+    AbortedFacts, AdvisoryKind, AgentError, AgentEvent, AgentOutcome, ChildToolEvent, DriveAborted,
+    Executor, ModelRequestRecord, StopReason, TranscriptSink,
 };
 use crate::authorization::{
     collect_scoped_paths_from_call, is_verification_program, push_unique_path,
@@ -146,6 +146,9 @@ pub(crate) struct Drive<'a> {
     /// The tool table every request advertises.
     tools: Vec<ToolDefinition>,
     modified_files: Vec<String>,
+    /// Model rounds this drive has started. Reported on abort so an
+    /// interrupted/failed turn records what it actually spent.
+    rounds: u32,
     scoped_paths: Vec<String>,
     progress_caps: ProgressCaps,
     progress: ProgressLedger,
@@ -213,7 +216,8 @@ impl Executor {
         observer: &mut (dyn FnMut(AgentEvent) + Send),
         sink: &mut dyn TranscriptSink,
         cancellation: CancellationToken,
-    ) -> Result<AgentOutcome, AgentError> {
+        aborted: &mut AbortedFacts,
+    ) -> Result<AgentOutcome, DriveAborted> {
         let mut tools = self.registry.definitions();
         // Primary name, plus legacy ask_user for older models and prompts.
         tools.push(request_user_input_tool_definition());
@@ -310,14 +314,14 @@ impl Executor {
         }
 
         let (bg_progress_tx, bg_progress_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let seeded_ledger = {
-            let mut led = self.seeded_ledger.clone();
-            let plan = self.seeded_plan.clone();
-            if !plan.is_empty() {
-                led.plan = plan;
-            }
-            led
-        };
+        // The drive owns ONE plan: `self.seeded_plan`. The evidence ledger
+        // mirrors that same plan, never a different one. A resume/continuation
+        // seeds a real plan and the ledger carries it; a fresh turn seeds
+        // neither, so the previous epoch's plan stays history instead of
+        // reappearing inside the ledger. Initializing the two together is what
+        // keeps a later tool call from "clearing" a plan this turn never held.
+        let mut seeded_ledger = self.seeded_ledger.clone();
+        seeded_ledger.plan = self.seeded_plan.clone();
         // One handle for the fold record: the harness writes it when it folds;
         // the kernel reads it when it builds the accounting snapshot.
         let compaction_record: Arc<std::sync::Mutex<Option<CompactionRecord>>> =
@@ -328,6 +332,7 @@ impl Executor {
             sink,
             tools,
             modified_files: Vec::new(),
+            rounds: 0,
             scoped_paths: Vec::new(),
             progress_caps: ProgressCaps::default(),
             epoch_rounds_at_start: progress.cumulative_rounds,
@@ -426,7 +431,15 @@ impl Executor {
             // after the scope is gone.
             harness.stop_background_children().await;
         }
-        result
+        // An abort still leaves the loop's proven facts behind: the rounds it
+        // started and the files it confirmed it changed. Report them so a
+        // failed/interrupted turn never claims it did nothing.
+        aborted.rounds = harness.rounds;
+        aborted.modified_files = harness.modified_files.clone();
+        result.map_err(|error| DriveAborted {
+            error,
+            facts: aborted.clone(),
+        })
     }
 }
 
@@ -965,6 +978,7 @@ impl AgentHarness for Drive<'_> {
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
         let round = rt.round();
+        self.rounds = round;
         let _ = rt;
         // Nested AGENTS.md rules for directories touched so far. Appended at
         // the tail rather than folded into the system prompt: rewriting the

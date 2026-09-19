@@ -26,17 +26,27 @@ pub(crate) struct TurnLease {
     session_id: SessionId,
     generation: u64,
     cancellation: CancellationToken,
+    /// Set when the user asks to cancel the logical task rather than merely
+    /// interrupt the running turn. The engine reads it at terminal time to
+    /// distinguish `cancelled` from `interrupted`.
+    task_cancel: Arc<AtomicBool>,
 }
 
 impl TurnLease {
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
     }
+
+    /// The explicit-task-cancellation flag this turn runs under.
+    pub(crate) fn task_cancel(&self) -> Arc<AtomicBool> {
+        self.task_cancel.clone()
+    }
 }
 
 struct ActiveTurn {
     generation: u64,
     cancellation: CancellationToken,
+    task_cancel: Arc<AtomicBool>,
 }
 
 pub(crate) struct ActiveTurns {
@@ -93,18 +103,21 @@ impl ActiveTurns {
             return Err(TurnAdmissionError::Capacity(self.capacity));
         }
         let token = CancellationToken::new();
+        let task_cancel = Arc::new(AtomicBool::new(false));
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         active.insert(
             session_id.clone(),
             ActiveTurn {
                 generation,
                 cancellation: token.clone(),
+                task_cancel: task_cancel.clone(),
             },
         );
         Ok(TurnLease {
             session_id: session_id.clone(),
             generation,
             cancellation: token,
+            task_cancel,
         })
     }
 
@@ -121,6 +134,22 @@ impl ActiveTurns {
 
     pub(crate) fn cancel(&self, session_id: &SessionId) -> bool {
         if let Some(turn) = self.active.lock().unwrap().get(session_id) {
+            turn.cancellation.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancel the LOGICAL task: mark the running turn as an explicit task
+    /// cancellation (so its terminal is `cancelled`, not resumable
+    /// `interrupted`) and stop it.
+    ///
+    /// Returns `false` when nothing is running — the caller then commits the
+    /// cancellation against the persisted task instead.
+    pub(crate) fn cancel_task(&self, session_id: &SessionId) -> bool {
+        if let Some(turn) = self.active.lock().unwrap().get(session_id) {
+            turn.task_cancel.store(true, Ordering::SeqCst);
             turn.cancellation.cancel();
             true
         } else {
@@ -201,6 +230,26 @@ mod tests {
         assert!(token_a.cancellation().is_cancelled());
         assert!(!token_b.cancellation().is_cancelled());
         assert!(!turns.cancel(&SessionId::new("missing")));
+    }
+
+    /// The explicit-task-cancel flag is shared with the lease: the engine reads
+    /// the same flag the runtime sets, so a cooperative stop becomes terminal.
+    #[test]
+    fn cancel_task_marks_the_lease_and_interrupt_does_not() {
+        let turns = ActiveTurns::default();
+        let session = SessionId::new("cancel-task-share");
+        let lease = turns.admit(&session).unwrap();
+        assert!(!lease.task_cancel().load(Ordering::SeqCst));
+
+        assert!(turns.cancel_task(&session));
+        assert!(lease.task_cancel().load(Ordering::SeqCst));
+        assert!(lease.cancellation().is_cancelled());
+
+        // A plain interrupt must not mark the task as cancelled.
+        let other = SessionId::new("plain-interrupt");
+        let plain = turns.admit(&other).unwrap();
+        assert!(turns.cancel(&other));
+        assert!(!plain.task_cancel().load(Ordering::SeqCst));
     }
 
     #[test]

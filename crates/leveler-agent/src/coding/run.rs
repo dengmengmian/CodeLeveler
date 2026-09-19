@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
@@ -130,6 +131,10 @@ pub struct CodingRuntime {
     pub factory: ExecutorFactory,
     pub approver: Arc<dyn Approver>,
     pub clarifier: Arc<dyn Clarifier>,
+    /// Set while the user has asked to cancel the LOGICAL task. Read at
+    /// terminal time so a cooperative stop is recorded as `cancelled` rather
+    /// than resumable `interrupted`.
+    pub task_cancel: Arc<AtomicBool>,
 }
 
 /// The domain-neutral half of a task: what to do and how long the runtime
@@ -558,6 +563,35 @@ impl CodingRuntime {
         self.engine.open_goal(token, objective).await
     }
 
+    /// Rebind a resume to the task's own running goal.
+    ///
+    /// The logical task is the TASK, and the goal it owns is the one that was
+    /// running when the turn was interrupted. Matching by objective text is not
+    /// enough: a continuation phrased differently (`继续`) must not open a
+    /// second goal, and a session whose goal column was never populated must
+    /// not create an empty one. `fallback_objective` is used only when the task
+    /// has no running goal at all (a goal-less chat task).
+    async fn resume_goal(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        fallback_objective: &str,
+    ) -> Result<leveler_core::GoalId, EngineError> {
+        // `for_task` returns newest-opened first; the newest running goal is
+        // the one being continued.
+        if let Some(goal) = self
+            .engine
+            .stores
+            .goals
+            .for_task(&token.task_id)
+            .await?
+            .into_iter()
+            .find(|goal| goal.state == leveler_storage::GoalState::Running)
+        {
+            return Ok(goal.id);
+        }
+        self.engine.open_goal(token, fallback_objective).await
+    }
+
     async fn load_request_transcript(
         &self,
         session_id: &SessionId,
@@ -746,6 +780,16 @@ impl CodingRuntime {
         self
     }
 
+    /// Attach the explicit-task-cancellation flag this turn runs under.
+    ///
+    /// The flag is created with the turn's admission slot and set by the
+    /// runtime when the user cancels the logical task rather than merely
+    /// interrupting the turn. It is read once, at terminal time.
+    pub fn with_task_cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.task_cancel = flag;
+        self
+    }
+
     /// Shared terminal handling for run/chat/resume: derive the lifecycle
     /// columns from the result and commit them with the TaskFinished event.
     async fn finish_from_result(
@@ -795,11 +839,19 @@ impl CodingRuntime {
         );
         let resolution_phase =
             begin_finalization_phase(&log, FINALIZATION_RESOLVING_OUTCOME, observer).await;
-        let goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
+        let mut goal_update = goal.map(|goal_id| leveler_storage::GoalTerminalUpdate {
             goal_id: goal_id.clone(),
             windows_delta: result.as_ref().map(|report| report.windows).unwrap_or(1),
             settle: goal_owes_no_more_work(result),
         });
+        // A cooperative stop is `interrupted` (resumable) by default. When the
+        // user explicitly cancelled the LOGICAL task, the same stop is
+        // `cancelled`: terminal, and it settles the goal instead of leaving it
+        // owed, so a later `继续` cannot reopen it.
+        let explicit_task_cancel = interrupted && self.task_cancel.load(Ordering::SeqCst);
+        if explicit_task_cancel && let Some(goal) = goal_update.as_mut() {
+            goal.settle = true;
+        }
         let mut terminal = match result {
             Ok(report) => {
                 let (status, state) = terminal_status_for(report);
@@ -815,6 +867,17 @@ impl CodingRuntime {
                     warnings: report.completion_warnings.clone(),
                 }
             }
+            Err(EngineError::Cancelled) if explicit_task_cancel => leveler_engine::TaskTerminal {
+                outcome: TaskOutcome::Cancelled,
+                verification: VerificationStatus::NotRun,
+                reason: Some("user_cancelled_task".to_string()),
+                failure: None,
+                stop: None,
+                status: SessionStatus::Cancelled,
+                state: AgentState::Cancelled,
+                goal: goal_update,
+                warnings: Vec::new(),
+            },
             Err(EngineError::Cancelled) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Interrupted,
                 verification: VerificationStatus::NotRun,
@@ -923,7 +986,10 @@ impl CodingRuntime {
         // cancellation owns the outcome throughout Finalizing, right up to
         // the canonical terminal commit's invocation.
         let cancelled_at_commit = cancellation.is_cancelled();
-        if cancelled_at_commit {
+        // The generic cancellation guard rewrites a finalizing window to
+        // resumable `interrupted`. An explicit task cancel is a stronger,
+        // user-declared outcome and keeps its terminal.
+        if cancelled_at_commit && !explicit_task_cancel {
             terminal.outcome = TaskOutcome::Interrupted;
             terminal.verification = VerificationStatus::NotRun;
             terminal.reason = None;
@@ -1313,6 +1379,38 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
+        self.resume_inner(session_id, spec, None, observer, cancellation)
+            .await
+    }
+
+    /// Continue the session's interrupted logical task with the user's
+    /// continuation message (a bare `继续` or an amendment on top of it).
+    ///
+    /// Same resume path as [`Self::resume`]: the logical task, goal, plan,
+    /// ledger and progress are the ones the session already owns. The
+    /// instruction is recorded as this turn's user message and appended after
+    /// the seeded transcript, so the original objective remains the anchor and
+    /// the amendment is an addition to it, never a replacement.
+    pub async fn resume_with_instruction(
+        &self,
+        session_id: &SessionId,
+        spec: &TaskSpec,
+        instruction: Message,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> Result<TaskReport, EngineError> {
+        self.resume_inner(session_id, spec, Some(instruction), observer, cancellation)
+            .await
+    }
+
+    async fn resume_inner(
+        &self,
+        session_id: &SessionId,
+        spec: &TaskSpec,
+        instruction: Option<Message>,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> Result<TaskReport, EngineError> {
         let (_, _, kind, outcome) = self
             .engine
             .stores
@@ -1353,7 +1451,11 @@ impl CodingRuntime {
             .engine
             .mark_running(session_id, AgentState::Execute)
             .await?;
-        let goal = match self.open_or_reuse_goal(&token, &spec.runtime.goal).await {
+        // Resume rebinds the goal by IDENTITY: the task's running goal is the
+        // logical task being continued, regardless of how the continuation
+        // message is phrased. `spec.runtime.goal` is only the fallback for a
+        // session that lost its goal row.
+        let goal = match self.resume_goal(&token, &spec.runtime.goal).await {
             Ok(goal) => goal,
             Err(error) => {
                 let result = Err(error);
@@ -1412,7 +1514,15 @@ impl CodingRuntime {
 
         let terminal_cancellation = cancellation.clone();
         let result = self
-            .resume_direct(&log, &runner, spec, prior, observer, cancellation)
+            .resume_direct(
+                &log,
+                &runner,
+                spec,
+                prior,
+                instruction,
+                observer,
+                cancellation,
+            )
             .await;
         let result = if terminal_cancellation.is_cancelled() {
             Err(EngineError::Cancelled)
@@ -1576,32 +1686,37 @@ impl CodingRuntime {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         prior: Vec<leveler_model::Message>,
+        instruction: Option<leveler_model::Message>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        let recorded = runner
-            .run_turn(
+        // A continuation message is this turn's persisted user input; without
+        // one (headless resume) the turn carries no new initiating message and
+        // the engine records it as a pure resume.
+        let (kind, start) = match &instruction {
+            Some(message) => (
                 TurnKind::User,
-                leveler_engine::TurnStart::Resume,
-                observer,
-                cancellation.clone(),
-                |ports| {
-                    drive_turn(
-                        &self.factory,
-                        goal_profile(spec),
-                        TurnInput::Resume(prior),
-                        true,
-                        runner.session_id.clone(),
-                        self.engine.stores.events.clone(),
-                        Some(crate::coding::checkpoint::CodingCheckpointContext::new(
-                            self.engine.clone(),
-                            Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
-                        )),
-                        ports,
-                        cancellation.clone(),
-                    )
-                },
-            )
+                leveler_engine::TurnStart::Fresh(message.clone()),
+            ),
+            None => (TurnKind::User, leveler_engine::TurnStart::Resume),
+        };
+        let recorded = runner
+            .run_turn(kind, start, observer, cancellation.clone(), |ports| {
+                drive_turn(
+                    &self.factory,
+                    goal_profile(spec),
+                    TurnInput::Resume { prior, instruction },
+                    true,
+                    runner.session_id.clone(),
+                    self.engine.stores.events.clone(),
+                    Some(crate::coding::checkpoint::CodingCheckpointContext::new(
+                        self.engine.clone(),
+                        Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
+                    )),
+                    ports,
+                    cancellation.clone(),
+                )
+            })
             .await?;
         self.conclude_direct(
             log,

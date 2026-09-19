@@ -195,7 +195,12 @@ pub(crate) fn note_tool_side_effects(
     if !record_paths.is_empty() {
         ledger.record_mutation(tool_call_id, tool, record_paths);
     }
-    ledger.plan = plan_state.clone();
+    // The ledger mirrors the drive's live plan. A drive whose in-memory plan
+    // is still empty must not erase a plan the turn was seeded with: the plan
+    // is only ever replaced by a real declaration, never by "nothing yet".
+    if !plan_state.is_empty() {
+        ledger.plan = plan_state.clone();
+    }
     observer(AgentEvent::EvidenceLedgerUpdated {
         ledger: ledger.clone(),
     });
@@ -408,6 +413,59 @@ mod mutation_ledger_tests {
         assert_eq!(ledger.mutations[0].tool, "run_command");
         assert_eq!(ledger.mutations[0].paths, vec!["generated.rs".to_string()]);
         assert_eq!(events, 1);
+    }
+
+    /// The evidence ledger mirrors the drive's live plan. A resume seeds both,
+    /// but a mutating call whose in-memory plan has not been populated yet must
+    /// not bleed the seeded plan empty — that would silently discard the
+    /// interruption's progress. A real declaration still replaces it.
+    #[test]
+    fn an_empty_live_plan_does_not_erase_a_seeded_ledger_plan() {
+        let seeded = PlanState {
+            steps: vec![leveler_lifecycle::PlanStep {
+                step: "implement core".into(),
+                status: "in_progress".into(),
+                id: Some("s1".into()),
+                origin: leveler_lifecycle::PlanOrigin::ModelExplicit,
+            }],
+        };
+        let mut ledger = EvidenceLedger {
+            plan: seeded.clone(),
+            ..Default::default()
+        };
+        note_tool_side_effects(
+            &mut ledger,
+            "c1",
+            "apply_patch",
+            vec!["a.rs".into()],
+            &PlanState::default(),
+            &mut |_| {},
+        );
+        assert_eq!(
+            ledger.plan, seeded,
+            "a seeded plan must survive an empty live plan"
+        );
+
+        let declared = PlanState {
+            steps: vec![leveler_lifecycle::PlanStep {
+                step: "done".into(),
+                status: "completed".into(),
+                id: None,
+                origin: leveler_lifecycle::PlanOrigin::ModelExplicit,
+            }],
+        };
+        note_tool_side_effects(
+            &mut ledger,
+            "c2",
+            "apply_patch",
+            vec![],
+            &declared,
+            &mut |_| {},
+        );
+        assert_eq!(
+            ledger.plan, declared,
+            "a real declaration still replaces the mirrored plan"
+        );
     }
 }
 

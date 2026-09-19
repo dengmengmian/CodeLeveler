@@ -255,6 +255,7 @@ async fn direct_content_run_reports_checks_failed_when_post_edit_verification_fa
             Arc::new(AutoClarify),
             false,
             None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &mut |event| events.push(event),
             CancellationToken::new(),
         )
@@ -447,6 +448,7 @@ async fn a_verification_tool_that_is_missing_is_written_as_tool_missing() {
         Arc::new(AutoClarify),
         false,
         None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         &mut |event| {
             if let leveler_engine::EngineEvent::VerificationCheck { status, .. } = event {
                 statuses.push(status);
@@ -511,6 +513,7 @@ async fn direct_content_run_emits_verification_events() {
             Arc::new(AutoClarify),
             false,
             None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &mut |event| events.push(event),
             CancellationToken::new(),
         )

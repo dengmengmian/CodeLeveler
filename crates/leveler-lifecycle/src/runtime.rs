@@ -43,6 +43,10 @@ pub enum SessionStatus {
     Blocked,
     /// Cancelled or crashed; resumable.
     Interrupted,
+    /// The user explicitly cancelled the logical task. Terminal: unlike
+    /// [`SessionStatus::Interrupted`] this is not resumable, because "stop this
+    /// task" was the instruction, not "pause it".
+    Cancelled,
     /// The run errored before producing a verdict.
     Failed,
 }
@@ -56,6 +60,7 @@ impl SessionStatus {
             SessionStatus::Incomplete => "incomplete",
             SessionStatus::Blocked => "blocked",
             SessionStatus::Interrupted => "interrupted",
+            SessionStatus::Cancelled => "cancelled",
             SessionStatus::Failed => "failed",
         }
     }
@@ -72,6 +77,7 @@ impl FromStr for SessionStatus {
             "incomplete" => SessionStatus::Incomplete,
             "blocked" => SessionStatus::Blocked,
             "interrupted" => SessionStatus::Interrupted,
+            "cancelled" | "canceled" => SessionStatus::Cancelled,
             "failed" => SessionStatus::Failed,
             other => {
                 return Err(UnknownVariant {
@@ -110,6 +116,10 @@ pub enum TaskOutcome {
     /// user cancellation. Like [`TaskOutcome::Failed`], this is not the model
     /// declaring the goal unreachable — that is [`TaskOutcome::Blocked`].
     Interrupted,
+    /// The user explicitly cancelled the logical task. Unlike
+    /// [`TaskOutcome::Interrupted`] this is terminal: it is not resumable, and
+    /// a continuation must not silently reopen the work.
+    Cancelled,
 }
 
 impl TaskOutcome {
@@ -120,6 +130,7 @@ impl TaskOutcome {
             TaskOutcome::BudgetLimited => "budget_limited",
             TaskOutcome::Failed => "failed",
             TaskOutcome::Interrupted => "interrupted",
+            TaskOutcome::Cancelled => "cancelled",
         }
     }
 
@@ -142,6 +153,7 @@ impl FromStr for TaskOutcome {
             "budget_limited" => TaskOutcome::BudgetLimited,
             "failed" => TaskOutcome::Failed,
             "interrupted" => TaskOutcome::Interrupted,
+            "cancelled" | "canceled" => TaskOutcome::Cancelled,
             other => {
                 return Err(UnknownVariant {
                     kind: "task outcome",

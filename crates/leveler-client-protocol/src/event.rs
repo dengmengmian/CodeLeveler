@@ -426,6 +426,9 @@ pub enum RuntimeEvent {
     },
     /// The current turn was cancelled (resumable).
     TurnCancelled,
+    /// The logical task was explicitly cancelled by the user. Terminal: unlike
+    /// [`Self::TurnCancelled`] a continuation must not reopen it.
+    TaskCancelled,
     /// A spawned sub-agent started or finished (multi-agent delegation). One
     /// block per agent id, updated in place from running → done.
     SubAgentUpdated {
@@ -568,12 +571,28 @@ pub enum RuntimeEvent {
         program: String,
         args: Vec<String>,
     },
-    /// A background task finished (exit or kill).
+    /// A live chunk of a background task's combined stdout/stderr, already
+    /// sanitized and capped by the runtime. Additive; older clients ignore the
+    /// unknown type. The final [`Self::BackgroundTaskExited`] log stays
+    /// authoritative.
+    BackgroundTaskOutput { task_id: String, chunk: String },
+    /// A background task finished (exit or kill). `output` is the task's final
+    /// retained log, authoritative over the streamed chunks (a lifecycle
+    /// broadcast lag can drop a chunk). Empty when the runtime produced none.
     BackgroundTaskExited {
         task_id: String,
         exit_code: Option<i32>,
         duration_ms: u64,
         ok: bool,
+        /// The runtime's terminal state was `Killed`, not a natural exit: a
+        /// user cancel, an agent cancel, or session cleanup stopped it. This is
+        /// the authoritative distinction between "stopped" and "failed" — a
+        /// stopped task is not a failure however its exit code reads. Additive;
+        /// older clients ignore the unknown field.
+        #[serde(default)]
+        stopped: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output: String,
     },
     /// Authoritative replacement of a session's active background projection.
     /// Emitted after a lifecycle broadcast lag; history is unaffected.
@@ -1316,9 +1335,34 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: 12,
                 ok: true,
+                stopped: false,
+                output: "done\n".into(),
             },
             "background_task_exited",
         );
+    }
+
+    /// Older runtimes predate the stop distinction: the field defaults to
+    /// `false`, so a task whose exit code is non-zero still reads as a failure
+    /// rather than a stop.
+    #[test]
+    fn background_task_exited_defaults_a_missing_stopped_bit_to_false() {
+        let json = serde_json::json!({
+            "type": "background_task_exited",
+            "task_id": "bg-1",
+            "exit_code": 1,
+            "duration_ms": 5,
+            "ok": false,
+            "output": ""
+        });
+        let event: RuntimeEvent = serde_json::from_value(json).expect("parse");
+        match event {
+            RuntimeEvent::BackgroundTaskExited { stopped, ok, .. } => {
+                assert!(!stopped, "unknown stop state is not a stop");
+                assert!(!ok);
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
     }
 
     #[test]

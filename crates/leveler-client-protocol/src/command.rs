@@ -71,6 +71,22 @@ pub enum ClientCommand {
         session_id: SessionId,
         content: String,
     },
+    /// Continue the session's interrupted logical task through the runtime's
+    /// existing resume path, instead of starting a fresh turn.
+    ///
+    /// The client sends this when the user expressed continuation intent
+    /// (see [`crate::parse_continuation`]); the runtime remains the authority
+    /// on whether a resumable task actually exists. When none does, the
+    /// runtime falls back to the ordinary submit path, so a `ResumeTask` is
+    /// never lost — it is either a resume or a normal message.
+    ///
+    /// `content` is the user's own text (for example `继续，但是先不要跑测试`):
+    /// the runtime parses the amendment off it, preserving the original
+    /// objective and adding the instruction, never replacing it.
+    ResumeTask {
+        session_id: SessionId,
+        content: String,
+    },
     /// Import a file as an attachment; the runtime processes and stores it.
     ///
     /// `name` overrides the display name that would otherwise come from the
@@ -107,6 +123,14 @@ pub enum ClientCommand {
     CancelCurrentTurn { session_id: SessionId },
     /// Escalate a cancel the user has already requested once.
     ForceCancelCurrentTurn { session_id: SessionId },
+    /// Cancel the logical task, not just the running turn.
+    ///
+    /// Distinct from [`Self::CancelCurrentTurn`]: that interrupts the current
+    /// work window and leaves the task resumable, while this is the user
+    /// saying the task itself is over. The runtime commits a terminal
+    /// `cancelled` outcome, settles the goal, and refuses a later
+    /// continuation — a `继续` must not silently reopen it.
+    CancelTask { session_id: SessionId },
     /// Cancel ONE running delegated child of the session's turn. The child
     /// settles as cancelled; its parent turn keeps running.
     CancelChild {
@@ -264,6 +288,15 @@ pub enum ClientCommand {
         session_id: SessionId,
         execution_id: leveler_core::UserShellId,
     },
+    /// Stop one background task the runtime is still running. The registry
+    /// signals the process tree through its own lifecycle; the task settles
+    /// as killed. Deliberately separate from `CancelCurrentTurn` and
+    /// `CancelUserShell`: a background task outlives the turn that started it,
+    /// and stopping it must not stop the turn.
+    CancelBackgroundTask {
+        session_id: SessionId,
+        task_id: String,
+    },
     Btw {
         session_id: SessionId,
         question: String,
@@ -400,12 +433,14 @@ impl ClientCommand {
             ClientCommand::SubmitMessage { session_id, .. }
             | ClientCommand::SteerCurrentTurn { session_id, .. }
             | ClientCommand::RunGoal { session_id, .. }
+            | ClientCommand::ResumeTask { session_id, .. }
             | ClientCommand::RunDevelop { session_id, .. }
             | ClientCommand::AddAttachment { session_id, .. }
             | ClientCommand::AddAttachmentData { session_id, .. }
             | ClientCommand::AddClipboardImage { session_id }
             | ClientCommand::CancelCurrentTurn { session_id }
             | ClientCommand::ForceCancelCurrentTurn { session_id }
+            | ClientCommand::CancelTask { session_id }
             | ClientCommand::CancelChild { session_id, .. }
             | ClientCommand::CancelToolCall { session_id, .. }
             | ClientCommand::SelectModel { session_id, .. }
@@ -429,6 +464,7 @@ impl ClientCommand {
             | ClientCommand::RestoreCheckpoint { session_id, .. }
             | ClientCommand::RunUserShell { session_id, .. }
             | ClientCommand::CancelUserShell { session_id, .. }
+            | ClientCommand::CancelBackgroundTask { session_id, .. }
             | ClientCommand::Btw { session_id, .. }
             | ClientCommand::CancelBtw { session_id }
             | ClientCommand::Recap { session_id }
@@ -519,6 +555,17 @@ mod tests {
                 content: "修复测试".to_string(),
             },
             "run_goal",
+        );
+    }
+
+    #[test]
+    fn resume_task_roundtrips_through_serde() {
+        roundtrip(
+            ClientCommand::ResumeTask {
+                session_id: SessionId::new("s1"),
+                content: "继续，但是先不要跑测试".to_string(),
+            },
+            "resume_task",
         );
     }
 
@@ -618,6 +665,16 @@ mod tests {
                 session_id: SessionId::new("s1"),
             },
             "force_cancel_current_turn",
+        );
+    }
+
+    #[test]
+    fn cancel_task_roundtrips() {
+        roundtrip(
+            ClientCommand::CancelTask {
+                session_id: SessionId::new("s1"),
+            },
+            "cancel_task",
         );
     }
 

@@ -137,6 +137,12 @@ pub struct TurnFailure {
     pub stale_ownership: bool,
     /// The provider failure behind this stop, when there was one.
     pub model: Option<leveler_model::ModelError>,
+    /// Model rounds the harness started before it failed. An interruption is
+    /// not nothing: the terminal record keeps the work that actually happened.
+    pub rounds: u32,
+    /// Files the harness had confirmed it modified before it failed, in the
+    /// order it first recorded them.
+    pub modified_files: Vec<String>,
 }
 
 impl From<TurnFailure> for EngineError {
@@ -593,9 +599,25 @@ impl TurnRunner<'_> {
         // A pump failure outranks whatever the harness reported: losing
         // canonical history is the more serious fact, and the harness's
         // outcome was computed against a log that is now incomplete.
-        let run_result: Result<TurnFacts<T>, EngineError> = match pump_result {
-            Ok(()) => exec_result.map_err(EngineError::from),
-            Err(error) => Err(error),
+        //
+        // The harness may report a failure that still proved something: how
+        // many model rounds it started and which files it changed. Those
+        // travel with the failure so the terminal row can record them instead
+        // of erasing a turn's real work (R012).
+        let (run_result, aborted_rounds, aborted_files): (
+            Result<TurnFacts<T>, EngineError>,
+            u32,
+            Vec<String>,
+        ) = match pump_result {
+            Ok(()) => match exec_result {
+                Ok(facts) => (Ok(facts), 0, Vec::new()),
+                Err(failure) => {
+                    let rounds = failure.rounds;
+                    let files = failure.modified_files.clone();
+                    (Err(EngineError::from(failure)), rounds, files)
+                }
+            },
+            Err(error) => (Err(error), 0, Vec::new()),
         };
         // Every activation announced by this turn must have a durable ending
         // before the turn itself closes. This is lifecycle settlement, not
@@ -627,10 +649,16 @@ impl TurnRunner<'_> {
                 TurnOutcome::Interrupted,
                 "cancelled".to_string(),
                 None,
-                0,
-                Vec::new(),
+                aborted_rounds,
+                aborted_files.clone(),
             ),
-            Err(error) => (TurnOutcome::Failed, error.to_string(), None, 0, Vec::new()),
+            Err(error) => (
+                TurnOutcome::Failed,
+                error.to_string(),
+                None,
+                aborted_rounds,
+                aborted_files.clone(),
+            ),
         };
         let event = EngineEvent::TurnFinished {
             turn_id: turn_id.clone(),

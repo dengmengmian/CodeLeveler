@@ -304,6 +304,8 @@ fn task_finished_event(
     }
     match outcome {
         leveler_lifecycle::TaskOutcome::Interrupted => RuntimeEvent::TurnCancelled,
+        // Explicit task cancellation is terminal, not a resumable pause.
+        leveler_lifecycle::TaskOutcome::Cancelled => RuntimeEvent::TaskCancelled,
         leveler_lifecycle::TaskOutcome::Failed => RuntimeEvent::TurnFailed {
             error: reason.unwrap_or_else(|| "任务执行失败".to_string()),
             failure: failure.as_ref().map(ui_failure_from_model),
