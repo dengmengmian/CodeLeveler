@@ -14,7 +14,7 @@ use leveler_execution::{AutoApprove, PermissionProfile};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::{EngineStores, GoalState, TurnRepository};
-use leveler_test_support::{MockResponse, MockServer};
+use leveler_test_support::{MockResponse, MockServer, sleep_command};
 use tokio_util::sync::CancellationToken;
 
 fn isolate_global_config() {
@@ -154,14 +154,12 @@ fn interrupted_work() -> Vec<MockResponse> {
 
 /// A turn that stays running: one tool call blocks for a while.
 fn blocking_work() -> Vec<MockResponse> {
+    let (program, args) = sleep_command(30);
     vec![sse(vec![
         tool_call_frame(
             "c-sleep",
             "run_command",
-            serde_json::json!({
-                "program": "python3",
-                "args": ["-c", "import time; time.sleep(30)"]
-            }),
+            serde_json::json!({ "program": program, "args": args }),
         ),
         finish_frame("tool_calls"),
     ])]

@@ -1117,7 +1117,7 @@ async fn the_checkpoint_watermark_binds_when_it_reaches_further_back() {
 /// number one deletion can make wrong.
 #[test]
 fn no_engine_path_hands_a_model_an_unassembled_transcript() {
-    const MARKER: &str = "TurnInput::Resume(";
+    const MARKER: &str = "TurnInput::Resume {";
     let source = include_str!("../src/coding/run.rs");
     // Split at the test MODULE, not at any `#[cfg(test)]` attribute: the file
     // carries a cfg-gated field mid-implementation, and cutting there would
@@ -1130,7 +1130,7 @@ fn no_engine_path_hands_a_model_an_unassembled_transcript() {
     let mut inputs = Vec::new();
     for (at, _) in production.match_indices(MARKER) {
         let tail = &production[at + MARKER.len()..];
-        let end = tail.find(')').expect("a closing paren");
+        let end = tail.find('}').expect("a closing brace");
         inputs.push(&tail[..end]);
     }
     assert!(!inputs.is_empty(), "the resume path should still exist");
@@ -1148,7 +1148,7 @@ fn no_engine_path_hands_a_model_an_unassembled_transcript() {
     // for injection). A new path added without one moves these two apart.
     let paths = production.matches("TurnInput::Content {").count()
         + production.matches("TurnInput::Goal {").count()
-        + production.matches("TurnInput::Resume(").count();
+        + production.matches("TurnInput::Resume {").count();
     let assemblies = production.matches(".assembled_prior(").count()
         + production.matches(".bounded_session_history(").count();
     assert!(
