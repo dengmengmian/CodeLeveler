@@ -222,6 +222,7 @@ async fn harness_with(
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     Harness {
         engine,
@@ -1708,6 +1709,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let spec2 = TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
@@ -2315,6 +2317,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
         },
         approver: Arc::new(AutoApprove),
         clarifier: Arc::new(AutoClarify),
+        task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let s = TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
