@@ -27,7 +27,9 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_memory::{SemanticCandidate, SemanticError, parse_semantic_candidates};
-use leveler_model::{Message, ModelRef, ModelRequest, ModelRuntime, Role, TransportPolicy};
+use leveler_model::{
+    Message, ModelRef, ModelRequest, ModelRuntime, ReasoningEffort, Role, TransportPolicy,
+};
 
 /// Upper bound on the user text handed to the extractor. A turn's memory is
 /// decided by the user's own sentence, and a sentence is short; pasting a
@@ -111,22 +113,19 @@ impl ModelSemanticExtractor {
         self.max_output_tokens = max_output_tokens;
         self
     }
-}
 
-#[async_trait]
-impl SemanticExtractor for ModelSemanticExtractor {
-    async fn extract(
-        &self,
-        user_message: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<Vec<SemanticCandidate>, ExtractionError> {
+    /// The exact request this extractor sends, or `None` for an empty message.
+    ///
+    /// Public so a probe (and the request-shape test) can measure the real
+    /// prompt and token usage without re-deriving either. Extraction is a
+    /// small, bounded, non-streaming task: fixed instructions, one user
+    /// message, deterministic temperature, a low reasoning budget — it must
+    /// not inherit the coding turn's max-effort reasoning.
+    pub fn build_request(&self, user_message: &str) -> Option<ModelRequest> {
         let message = clip(user_message, MAX_EXTRACTOR_INPUT_CHARS);
         if message.trim().is_empty() {
-            return Ok(Vec::new());
+            return None;
         }
-        // The child token means a cancelled turn stops the extraction too, but
-        // the timeout is this call's own bound and never the turn's.
-        let call_token = cancellation.child_token();
         let mut request = ModelRequest::new(
             self.model.clone(),
             vec![
@@ -136,9 +135,26 @@ impl SemanticExtractor for ModelSemanticExtractor {
         );
         request.temperature = Some(0.0);
         request.max_output_tokens = Some(self.max_output_tokens);
+        request.reasoning_effort = Some(ReasoningEffort::Low);
         request.transport = TransportPolicy::LongThinkingNonStreaming;
         request.deadline = Some(std::time::Instant::now() + self.timeout);
+        Some(request)
+    }
+}
 
+#[async_trait]
+impl SemanticExtractor for ModelSemanticExtractor {
+    async fn extract(
+        &self,
+        user_message: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<SemanticCandidate>, ExtractionError> {
+        let Some(request) = self.build_request(user_message) else {
+            return Ok(Vec::new());
+        };
+        // The child token means a cancelled turn stops the extraction too, but
+        // the timeout is this call's own bound and never the turn's.
+        let call_token = cancellation.child_token();
         let call = self.runtime.generate(request, call_token);
         let response = match tokio::time::timeout(self.timeout, call).await {
             Err(_) => return Err(ExtractionError::Timeout),
@@ -325,6 +341,11 @@ mod tests {
             "这个项目后面模型就 Pro 吧"
         );
         assert_eq!(request.temperature, Some(0.0));
+        assert_eq!(
+            request.reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "extraction must not inherit the coding turn's max-effort reasoning"
+        );
         assert!(
             request.tools.is_empty(),
             "no tools: the extractor cannot act"
