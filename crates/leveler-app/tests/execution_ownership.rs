@@ -81,7 +81,14 @@ impl Gate {
                     drain_request(&mut stream).await;
                     let fail = failing.load(std::sync::atomic::Ordering::SeqCst);
                     if !fail {
-                        held.acquire().await.unwrap().forget();
+                        // A cancelled model request drops its connection. Do
+                        // not let that abandoned handler consume the next
+                        // permit and strand the following execution.
+                        let permit = tokio::select! {
+                            permit = held.acquire() => permit.unwrap(),
+                            _ = stream.read_u8() => return,
+                        };
+                        permit.forget();
                     }
                     let response = if fail {
                         let body = r#"{"error":{"message":"boom"}}"#;
@@ -127,6 +134,14 @@ impl Gate {
 
     fn open_one(&self) {
         self.permits.add_permits(1);
+    }
+
+    fn open_after_cancel(&self) {
+        // Reqwest may keep the cancelled request's socket alive for reuse, so
+        // its server handler can remain queued even though the runtime turn is
+        // already interrupted. Release that abandoned handler and the one live
+        // request that follows it.
+        self.permits.add_permits(2);
     }
 
     fn ask_for_approval(&self) {
@@ -372,7 +387,7 @@ async fn an_interrupted_execution_releases_the_session() {
         .await
         .expect("B runs after A's interruption");
     assert_eq!(w.owner().await.boot, Some(w.b.boot()));
-    w.gate.open_one();
+    w.gate.open_after_cancel();
     w.settled(2).await;
 }
 

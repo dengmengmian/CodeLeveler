@@ -5,8 +5,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use leveler_agent::{
-    BatchSourceTurn, MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS, MAX_EXTRACTOR_INPUT_CHARS,
-    ModelSemanticExtractor, SemanticExtractor, validate_batch_candidates,
+    BatchSourceTurn, DEFAULT_EXTRACTION_TIMEOUT, MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS,
+    MAX_EXTRACTOR_INPUT_CHARS, ModelSemanticExtractor, SemanticExtractor,
+    validate_batch_candidates,
 };
 use leveler_core::{BootId, BootLiveness};
 use leveler_memory::{AppliedOperation, MemoryCandidate, MemoryStore};
@@ -65,6 +66,7 @@ pub struct MemoryConsolidator {
     state_dir: PathBuf,
     memory_dir: PathBuf,
     runtime: Arc<dyn ModelRuntime>,
+    extraction_timeout: Duration,
     notify: Notify,
     cancel: CancellationToken,
     event_sink: MemoryEventSink,
@@ -85,10 +87,19 @@ impl MemoryConsolidator {
             state_dir,
             memory_dir,
             runtime,
+            extraction_timeout: DEFAULT_EXTRACTION_TIMEOUT,
             notify: Notify::new(),
             cancel: CancellationToken::new(),
             event_sink,
         })
+    }
+
+    #[cfg(test)]
+    fn with_extraction_timeout(mut self: Arc<Self>, timeout: Duration) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("a fresh consolidator has no other owners")
+            .extraction_timeout = timeout;
+        self
     }
 
     /// Wake the worker after a turn reaches a terminal state. This never waits
@@ -251,7 +262,8 @@ impl MemoryConsolidator {
             .ok_or_else(|| format!("invalid persisted model reference `{}`", items[0].model));
         let result = match model {
             Ok(model) => {
-                let extractor = ModelSemanticExtractor::new(self.runtime.clone(), model);
+                let extractor = ModelSemanticExtractor::new(self.runtime.clone(), model)
+                    .with_timeout(self.extraction_timeout);
                 self.process_claimed(&items, &extractor).await
             }
             Err(error) => Err(error),
@@ -1064,7 +1076,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_turns(&db, 1).await;
-        tokio::time::pause();
         let worker = MemoryConsolidator::new(
             db.clone(),
             BootId::generate(),
@@ -1072,10 +1083,10 @@ mod tests {
             temp.path().join("memory"),
             Arc::new(HangingRuntime),
             Arc::new(|_| {}),
-        );
+        )
+        .with_extraction_timeout(Duration::from_millis(1));
 
         let error = worker.run_once().await.unwrap_err();
-        tokio::time::resume();
         let counts = MemoryInboxRepository::new(&db).counts().await.unwrap();
 
         assert!(error.contains("timed out"));

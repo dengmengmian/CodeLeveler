@@ -146,6 +146,17 @@ fn interrupted_work() -> Vec<MockResponse> {
         ]),
         sse(vec![
             tool_call_frame(
+                "c-final-plan",
+                "update_plan",
+                serde_json::json!({"plan": [
+                    {"step": "implement the inventory core", "status": "completed"},
+                    {"step": "run the tests", "status": "pending"}
+                ]}),
+            ),
+            finish_frame("tool_calls"),
+        ]),
+        sse(vec![
+            tool_call_frame(
                 "c-goal",
                 "update_goal",
                 serde_json::json!({"status": "complete", "summary": "continued to the end"}),
