@@ -837,6 +837,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_escape_is_rejected_and_target_survives() {
         let tmp = tempfile::tempdir().unwrap();
@@ -847,19 +848,14 @@ mod tests {
         fs::write(outside.join("keep.txt"), b"do not delete").unwrap();
         let link = home.cache_dir().join("escape");
         fs::create_dir_all(home.cache_dir()).unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
-        #[cfg(unix)]
-        {
-            let err =
-                safe_remove(&link, std::slice::from_ref(&home.root().to_path_buf())).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-            assert!(
-                outside.join("keep.txt").is_file(),
-                "the symlink target must survive"
-            );
-        }
+        let err = safe_remove(&link, std::slice::from_ref(&home.root().to_path_buf())).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            outside.join("keep.txt").is_file(),
+            "the symlink target must survive"
+        );
     }
 
     #[test]
