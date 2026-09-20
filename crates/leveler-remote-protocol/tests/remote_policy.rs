@@ -75,6 +75,16 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
+            // Same authority as submit_message: it continues the session's own
+            // interrupted task or falls back to an ordinary message.
+            "resume_task",
+            ClientCommand::ResumeTask {
+                session_id: session(),
+                content: "继续".to_string(),
+            },
+            true,
+        ),
+        (
             "add_attachment",
             ClientCommand::AddAttachment {
                 session_id: session(),
@@ -109,6 +119,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
         (
             "force_cancel_current_turn",
             ClientCommand::ForceCancelCurrentTurn {
+                session_id: session(),
+            },
+            true,
+        ),
+        (
+            // A strictly stronger stop than cancelling the turn.
+            "cancel_task",
+            ClientCommand::CancelTask {
                 session_id: session(),
             },
             true,
@@ -368,6 +386,16 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             ClientCommand::CancelUserShell {
                 session_id: session(),
                 execution_id: leveler_client_protocol::UserShellId::new("ush-1"),
+            },
+            false,
+        ),
+        (
+            // A background task outlives the turn, and remote gets no user
+            // shell at all.
+            "cancel_background_task",
+            ClientCommand::CancelBackgroundTask {
+                session_id: session(),
+                task_id: "t1".to_string(),
             },
             false,
         ),
