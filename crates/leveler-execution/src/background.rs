@@ -54,6 +54,16 @@ const MAX_LOG_BYTES: usize = 256 * 1024;
 /// above this bound before the next spawn.
 const MAX_RETAINED_TERMINAL_TASKS: usize = 64;
 
+/// How often the post-reap watcher probes whether the task's process group is
+/// gone. Low frequency on purpose: an owned dev server can run for hours, and
+/// this is a single `signal(0)` probe, not a process scan.
+const GROUP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long the reaper lets the output pumps flush after the process group is
+/// confirmed gone, before it finishes the task anyway. Bounded on purpose: an
+/// fd inherited by a process outside the group must not extend the task.
+const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundTaskStatus {
     Running,
@@ -83,6 +93,10 @@ pub struct BackgroundTaskSnapshot {
     pub exit_code: Option<i32>,
     pub log: String,
     pub duration_ms: u64,
+    /// The session that owns this task, when known. Session-owned tasks can be
+    /// stopped by their owner through the runtime; daemon-scoped tasks have no
+    /// owner and are not addressable by a client session.
+    pub owner_scope: Option<String>,
 }
 
 /// Registry-owned lifecycle facts for UI/runtime projections.
@@ -160,6 +174,10 @@ struct TaskInner {
     done: Arc<Notify>,
     process_done: bool,
     log_pumps_remaining: u8,
+    /// The process group this task owns has been confirmed gone, so any log
+    /// pump still open is an fd held outside our tree and must not keep the
+    /// task Running. Set by the post-reap group watcher.
+    group_reaped: bool,
     /// Consumed by the reaper when the process exits, so the diff and any
     /// restore run exactly once and without waiting for a tool call.
     mutation_baseline: Option<MutationBaseline>,
@@ -398,6 +416,7 @@ impl BackgroundTaskRegistry {
                 done: done.clone(),
                 process_done: false,
                 log_pumps_remaining,
+                group_reaped: false,
                 mutation_baseline,
                 settlement: None,
                 sandbox_scratch,
@@ -427,7 +446,12 @@ impl BackgroundTaskRegistry {
 
         let lifecycle_events = self.lifecycle_events.clone();
         tokio::spawn(async move {
-            let code = {
+            // Capture the owned process-group identity BEFORE waiting. The
+            // direct child's exit is not the task's exit: descendants that
+            // share its process group are still this task's workload, and
+            // dropping the identity here is what used to make them
+            // unstoppable (and the task immortal).
+            let (code, identity) = {
                 let mut st = reg.lock().await;
                 let Some(task) = st.tasks.get_mut(&tid) else {
                     return;
@@ -435,11 +459,13 @@ impl BackgroundTaskRegistry {
                 let Some(mut child) = task.child.take() else {
                     return;
                 };
+                let identity = task.identity;
                 drop(st);
-                match child.wait().await {
+                let code = match child.wait().await {
                     Ok(s) => s.code(),
                     Err(_) => None,
-                }
+                };
+                (code, identity)
             };
             // Settle before publishing the terminal state, so a waiter woken
             // by `finalize_if_drained` never observes a task that is finished
@@ -454,13 +480,85 @@ impl BackgroundTaskRegistry {
                 Some(baseline) => Some(settle(&baseline).await),
                 None => None,
             };
-            let mut st = reg.lock().await;
-            if let Some(task) = st.tasks.get_mut(&tid) {
-                task.process_done = true;
-                task.exit_code = code;
-                task.identity = None;
-                task.settlement = settlement;
-                if finalize_if_drained(task) {
+            let finalized_at_reap = {
+                let mut st = reg.lock().await;
+                match st.tasks.get_mut(&tid) {
+                    Some(task) => {
+                        task.process_done = true;
+                        task.exit_code = code;
+                        task.settlement = settlement;
+                        // `identity` is deliberately NOT cleared here: only a
+                        // terminal task releases ownership of its group.
+                        if finalize_if_drained(task) {
+                            let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
+                                owner_scope: task.owner_scope.clone(),
+                                task: snapshot(task),
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => true,
+                }
+            };
+
+            // The direct child is reaped, but the task is not finished until
+            // the process group it owns is gone: descendants that share the
+            // group are still its workload, whether or not they keep the log
+            // pipes open. Watch the group; polling is deliberately
+            // low-frequency (an owned dev server can run for hours) and only
+            // probes membership, it never signals the process.
+            if !finalized_at_reap && let Some(identity) = identity {
+                loop {
+                    if identity.group_gone().await {
+                        break;
+                    }
+                    let terminal = {
+                        let st = reg.lock().await;
+                        st.tasks
+                            .get(&tid)
+                            .is_none_or(|task| task.status.is_terminal())
+                    };
+                    if terminal {
+                        break;
+                    }
+                    tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
+                }
+                // Record the group's end first: a log pump that reaches EOF
+                // from here on may finish the task on its own.
+                {
+                    let mut st = reg.lock().await;
+                    if let Some(task) = st.tasks.get_mut(&tid) {
+                        task.group_reaped = true;
+                    }
+                }
+                // Bounded final drain. The group is gone, so every writer it
+                // had is gone and the pumps should EOF imminently; give them
+                // a short window to flush before finishing even if an fd was
+                // inherited by a process outside the group.
+                let drain_deadline = Instant::now() + LOG_DRAIN_GRACE;
+                loop {
+                    let done = {
+                        let st = reg.lock().await;
+                        match st.tasks.get(&tid) {
+                            Some(task) => {
+                                task.status.is_terminal()
+                                    || task.log_pumps_remaining == 0
+                                    || Instant::now() >= drain_deadline
+                            }
+                            None => true,
+                        }
+                    };
+                    if done {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let mut st = reg.lock().await;
+                if let Some(task) = st.tasks.get_mut(&tid)
+                    && finalize_if_drained(task)
+                {
                     let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
                         owner_scope: task.owner_scope.clone(),
                         task: snapshot(task),
@@ -564,6 +662,21 @@ impl BackgroundTaskRegistry {
             .values()
             .filter(|t| t.status.is_active())
             .count()
+    }
+
+    /// Every active task across all scopes, oldest first.
+    ///
+    /// This is the read-only blocker list a retiring runtime reports: it is
+    /// the SAME `is_active` predicate `alive_count` counts, so a client can
+    /// never be shown a task the drain does not also wait on. It carries no
+    /// authority — stopping a task still goes through the session-scoped
+    /// runtime command.
+    pub async fn active_snapshots(&self) -> Vec<BackgroundTaskSnapshot> {
+        let st = self.inner.lock().await;
+        let mut active: Vec<&TaskInner> =
+            st.tasks.values().filter(|t| t.status.is_active()).collect();
+        active.sort_by_key(|t| t.started);
+        active.into_iter().map(snapshot).collect()
     }
 
     pub async fn kill_all(&self) -> usize {
@@ -829,7 +942,12 @@ fn path_allows(allowed: &str, modified: &str) -> bool {
 }
 
 fn finalize_if_drained(task: &mut TaskInner) -> bool {
-    if !task.process_done || task.log_pumps_remaining != 0 {
+    // The task owns its process group: the direct child is not the task. A
+    // workload is over only when the child has been reaped AND the group it
+    // owned is confirmed gone. The output pumps are a delivery channel, not
+    // liveness — a pipe still held outside the group must not keep the task
+    // Running, and an EOF before the group ends must not finish it either.
+    if !task.process_done || !task.group_reaped {
         return false;
     }
     if task.status.is_terminal() {
@@ -841,8 +959,12 @@ fn finalize_if_drained(task: &mut TaskInner) -> bool {
         terminal => terminal,
     };
     task.finished = Some(Instant::now());
-    // The process and both output pumps are done, so no child can use TMPDIR.
-    // Release potentially large temp files independently of history retention.
+    // Ownership ends with the terminal state: a later signal must never reach
+    // a process group id the kernel may have recycled.
+    task.identity = None;
+    // The process and any still-open output pumps are done, so no child can
+    // use TMPDIR. Release potentially large temp files independently of
+    // history retention.
     task.sandbox_scratch.take();
     task.done.notify_waiters();
     true
@@ -895,6 +1017,7 @@ fn snapshot(task: &TaskInner) -> BackgroundTaskSnapshot {
         exit_code: task.exit_code,
         log: task.log.clone(),
         duration_ms,
+        owner_scope: task.owner_scope.clone(),
     }
 }
 
@@ -1154,6 +1277,7 @@ mod tests {
                     done: Arc::new(Notify::new()),
                     process_done: true,
                     log_pumps_remaining: 0,
+                    group_reaped: false,
                     mutation_baseline: None,
                     settlement: None,
                     sandbox_scratch: None,
@@ -1182,6 +1306,7 @@ mod tests {
                     done: Arc::new(Notify::new()),
                     process_done: false,
                     log_pumps_remaining: 0,
+                    group_reaped: false,
                     mutation_baseline: None,
                     settlement: None,
                     sandbox_scratch: None,
@@ -1225,6 +1350,7 @@ mod tests {
             done: Arc::new(Notify::new()),
             process_done: true,
             log_pumps_remaining: 0,
+            group_reaped: true,
             mutation_baseline: None,
             settlement: None,
             sandbox_scratch: Some(crate::command::SandboxScratch::unleased(scratch)),
@@ -1769,6 +1895,217 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// CASE A + CASE C: a task whose direct child exits while a descendant
+    /// keeps the log pipes open is still the owner of that descendant's
+    /// process group. It must stay non-terminal, stay stoppable after the
+    /// `Child` handle is gone, and a kill must terminate the whole group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_descendant_outliving_the_direct_child_keeps_the_task_stoppable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child_pid_file = dir.path().join("child.pid");
+        let desc_pid_file = dir.path().join("desc.pid");
+        let reg = host_registry();
+        // `sh` exits at once; the backgrounded `sleep` inherits the child's
+        // stdout/stderr (so the pumps never see EOF) and its process group.
+        let req = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                format!(
+                    "echo $$ > '{}'; sleep 30 & echo $! > '{}'",
+                    child_pid_file.display(),
+                    desc_pid_file.display()
+                ),
+            ],
+            dir.path().to_path_buf(),
+        );
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let child = wait_for_pid_file(&child_pid_file, Duration::from_secs(5))
+            .await
+            .expect("direct child pid");
+        let descendant = wait_for_pid_file(&desc_pid_file, Duration::from_secs(5))
+            .await
+            .expect("descendant pid");
+
+        wait_until_child_taken(&reg, &id, Duration::from_secs(5))
+            .await
+            .expect("reaper must hold the Child handle");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(child) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!process_alive(child), "the direct child must have exited");
+        assert!(
+            process_alive(descendant),
+            "the descendant must still be running"
+        );
+
+        let snap = reg.get(&id).await.expect("retained");
+        assert!(
+            snap.status.is_active(),
+            "the task still owns the live descendant: {:?}",
+            snap.status
+        );
+        assert_eq!(reg.alive_count().await, 1);
+
+        // This is the defect: with the identity dropped at child reap, kill
+        // failed with "no process identity to signal".
+        reg.kill(&id)
+            .await
+            .expect("kill must reach the retained process group");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reg.get(&id).await.is_some_and(|s| s.status.is_active()) && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let final_snap = reg.get(&id).await.expect("retained");
+        assert_eq!(final_snap.status, BackgroundTaskStatus::Killed);
+        assert!(
+            !process_alive(descendant),
+            "kill must terminate the descendant too"
+        );
+        assert_eq!(
+            reg.alive_count().await,
+            0,
+            "no ghost Running task may remain"
+        );
+    }
+
+    /// CASE B + CASE E (group gone first): a descendant that ends on its own
+    /// terminates the task without a kill — even when it redirected its own
+    /// output, so no pipe EOF ever signalled its end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_descendant_that_exits_naturally_finishes_the_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let desc_pid_file = dir.path().join("desc.pid");
+        let reg = host_registry();
+        // The descendant redirects its own stdio, so the task's pipes EOF as
+        // soon as `sh` exits; only the process group still proves it lives.
+        let req = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                format!(
+                    "sleep 1 >/dev/null 2>&1 & echo $! > '{}'",
+                    desc_pid_file.display()
+                ),
+            ],
+            dir.path().to_path_buf(),
+        );
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let descendant = wait_for_pid_file(&desc_pid_file, Duration::from_secs(5))
+            .await
+            .expect("descendant pid");
+
+        // The direct child is reaped and the pipes EOF well before `sleep 1`
+        // ends; EOF must not be read as task liveness.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mid = reg.get(&id).await.expect("retained");
+        assert!(
+            mid.status.is_active(),
+            "pipe EOF alone must not finish a task whose group is alive: {:?}",
+            mid.status
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reg.get(&id).await.is_some_and(|s| s.status.is_active()) && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let final_snap = reg.get(&id).await.expect("retained");
+        assert_eq!(final_snap.status, BackgroundTaskStatus::Exited);
+        assert!(
+            !process_alive(descendant),
+            "the descendant exited on its own"
+        );
+        assert_eq!(reg.alive_count().await, 0);
+    }
+
+    /// CASE D: an ordinary short command still finishes promptly and keeps its
+    /// captured output — the group watcher and bounded final drain add no
+    /// visible stall.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_short_command_finishes_promptly_with_its_output() {
+        let reg = host_registry();
+        let req = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "echo done-marker".into()],
+            std::env::temp_dir(),
+        );
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let started = Instant::now();
+        let snap = reg
+            .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .expect("wait");
+        assert_eq!(snap.status, BackgroundTaskStatus::Exited);
+        assert!(snap.log.contains("done-marker"), "log: {}", snap.log);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a short task must not stall on the group/drain step: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(reg.alive_count().await, 0);
+    }
+
+    /// CASE F: a kill racing natural completion settles the task exactly once,
+    /// with no panic and no ghost `Running` record.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_racing_natural_exit_is_idempotent() {
+        for _ in 0..20 {
+            let reg = host_registry();
+            let id = reg
+                .spawn(
+                    ProcessRequest::new("true", Vec::new(), std::env::temp_dir()),
+                    None,
+                )
+                .await
+                .expect("spawn");
+            // The kill may land before or after the reaper finalizes; both
+            // must be safe and produce exactly one terminal.
+            let _ = reg.kill(&id).await;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while reg.get(&id).await.is_some_and(|s| s.status.is_active())
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let snap = reg.get(&id).await.expect("retained");
+            assert!(
+                snap.status.is_terminal(),
+                "a raced kill must settle once: {:?}",
+                snap.status
+            );
+            assert_eq!(reg.alive_count().await, 0);
+        }
+    }
+
+    /// The read-only blocker list a retiring runtime reports is the SAME set
+    /// `alive_count` counts, and it names the command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_snapshots_name_every_live_blocker() {
+        let reg = host_registry();
+        let id = reg
+            .spawn(
+                ProcessRequest::new("sleep", vec!["30".into()], std::env::temp_dir()),
+                None,
+            )
+            .await
+            .expect("spawn");
+        let blockers = reg.active_snapshots().await;
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert_eq!(blockers[0].id, id);
+        assert_eq!(blockers[0].program, "sleep");
+        assert_eq!(reg.alive_count().await, blockers.len());
+        let _ = reg.kill(&id).await;
     }
 
     #[cfg(unix)]

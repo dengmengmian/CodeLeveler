@@ -27,7 +27,7 @@ use leveler_client_protocol::{
     NotificationLevel, ProtocolEnvelope, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
 
-use crate::action::{Action, Effect, EffectCompletion, UrlOpener, WebLauncher};
+use crate::action::{Action, CleanHost, Effect, EffectCompletion, UrlOpener, WebLauncher};
 use crate::reducer::reduce;
 use crate::render::render;
 use crate::screen::Screen;
@@ -83,6 +83,10 @@ const HISTORY_CAP: usize = 100;
 /// daemons are not this case — they carry a launcher. Do not call them remote.
 const WEB_LAUNCHER_UNAVAILABLE: &str = "当前 TUI 没有可用的 Web UI 启动器";
 
+/// `/clean` needs a host-provided scanner; without it the page cannot run.
+/// Only the standalone TUI tests hit this — the CLI always injects one.
+const CLEAN_UNAVAILABLE: &str = "storage cleanup host unavailable";
+
 /// Errors running the terminal UI.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
@@ -107,6 +111,7 @@ pub async fn run(
     web_launcher: Option<WebLauncher>,
     url_opener: Option<UrlOpener>,
     remote_launcher: Option<crate::action::RemoteLauncher>,
+    clean_host: Option<CleanHost>,
     boot: Boot,
 ) -> Result<TuiExit, TuiError> {
     let (mut guard, mut stdout) = TerminalGuard::enter()?;
@@ -349,6 +354,7 @@ pub async fn run(
             &web_launcher,
             &url_opener,
             &remote_launcher,
+            &clean_host,
             &mut alt,
             &mut stdout,
         );
@@ -605,6 +611,7 @@ fn dispatch_effects(
     web_launcher: &Option<WebLauncher>,
     url_opener: &Option<UrlOpener>,
     remote_launcher: &Option<crate::action::RemoteLauncher>,
+    clean_host: &Option<CleanHost>,
     // `$EDITOR` takes the terminal over, so it needs the alternate-screen
     // handle (dropped for the duration) and stdout to restore modes on.
     alt: &mut Option<Terminal<CrosstermBackend<Stdout>>>,
@@ -771,6 +778,40 @@ fn dispatch_effects(
                 });
             }
             Effect::Quit => state.running = false,
+            Effect::StartCleanScan => {
+                let tx = completion_tx.clone();
+                match clean_host.clone() {
+                    Some(host) => {
+                        tokio::spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || (host.scan)())
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = tx.send(Action::CleanScanned(result));
+                        });
+                    }
+                    None => {
+                        let _ = completion_tx
+                            .send(Action::CleanScanned(Err(CLEAN_UNAVAILABLE.to_string())));
+                    }
+                }
+            }
+            Effect::RunCleanSafe => {
+                let tx = completion_tx.clone();
+                match clean_host.clone() {
+                    Some(host) => {
+                        tokio::spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || (host.run_safe)())
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = tx.send(Action::CleanRan(result));
+                        });
+                    }
+                    None => {
+                        let _ = completion_tx
+                            .send(Action::CleanRan(Err(CLEAN_UNAVAILABLE.to_string())));
+                    }
+                }
+            }
         }
     }
 }

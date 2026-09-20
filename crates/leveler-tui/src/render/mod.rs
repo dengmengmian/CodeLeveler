@@ -833,6 +833,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Help => render_help_screen(frame, area, state),
         Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
         Screen::Context => crate::context::render_context_screen(frame, area, state),
+        Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
     }
     if let Some(overlay) = &state.overlay {
         crate::overlay::render_overlay(frame, area, overlay, &state.theme, state.locale);

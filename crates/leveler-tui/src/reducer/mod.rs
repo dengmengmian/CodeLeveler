@@ -107,6 +107,20 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             state.file_candidates = files;
             Vec::new()
         }
+        Action::CleanScanned(result) => {
+            match result {
+                Ok(plan) => state.clean.plan_ready(plan),
+                Err(message) => state.clean.failed(message),
+            }
+            Vec::new()
+        }
+        Action::CleanRan(result) => {
+            match result {
+                Ok(report) => state.clean.finished(report),
+                Err(message) => state.clean.failed(message),
+            }
+            Vec::new()
+        }
         Action::EffectCompleted(completion) => {
             apply_effect_completion(state, completion);
             Vec::new()

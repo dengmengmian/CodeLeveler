@@ -1068,6 +1068,26 @@ impl ProcessIdentity {
             self.kill_tree();
         }
     }
+
+    /// Whether the owned process group is gone, as a single non-blocking probe.
+    ///
+    /// Unix: a signal-0 probe answers `ESRCH` only when the group has no
+    /// members left. Windows: the Job Object owns the tree, so once the direct
+    /// child is reaped and its handle dropped nothing in the job survives.
+    ///
+    /// Used by the background reaper after the direct child exits: the task
+    /// owns its group until this is true, and releases the identity at the
+    /// terminal so a recycled group id is never signalled later.
+    pub async fn group_gone(self) -> bool {
+        #[cfg(unix)]
+        {
+            process_group_gone(self.pgid, std::time::Duration::ZERO).await
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
 }
 
 /// One spawned, policy-confined process from [`CommandRunner::spawn`].

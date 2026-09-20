@@ -30,6 +30,9 @@ pub enum Screen {
     Trace,
     /// Context Inspector (`/context`): what the next model request is made of.
     Context,
+    /// `/clean`: reclaim CodeLeveler-owned local storage. A page over the host's
+    /// cleanup plan; scan and cleanup run off-thread.
+    Clean,
 }
 
 /// Help / popup grouping for slash commands.
@@ -309,6 +312,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
+    // Reclaim CodeLeveler's own local storage. Safe while a turn runs: the scan
+    // and cleanup happen off-thread, and only provably-safe items are removed.
+    slash(
+        "/clean",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // Self-update. `IdleOnly`: replacing the running binary under an active
     // task would strand it, so the busy gate refuses first.
     slash(
@@ -409,6 +421,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/theme" => s.theme,
         "/new" => s.new,
         "/help" => s.help,
+        "/clean" => s.clean,
         "/update" | "/upgrade" => s.update,
         _ => "",
     }
@@ -682,6 +695,7 @@ mod surface_tests {
                 "/remote",
                 "/remote-loc",
                 "/help",
+                "/clean",
                 "/update",
             ]
         );
@@ -1185,6 +1199,7 @@ mod reachability_tests {
             Screen::ActivityList => Some("Enter on the footer background summary — reducer/mod.rs"),
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
+            Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Context => Some("`/context` — screen_nav::open_context"),
         }
     }

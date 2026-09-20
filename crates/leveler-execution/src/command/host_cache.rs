@@ -40,6 +40,40 @@ pub(crate) struct SandboxPaths {
     /// (including on crash, where the reaper reclaims the orphan). Kept last so
     /// it drops after `scratch`.
     _lease: SandboxLeaseGuard,
+    /// Shared advisory lease on this workspace's tool cache, held for the whole
+    /// command. The storage-hygiene GC takes the exclusive lock before removing
+    /// an entry, so a cache a live command is using is never reclaimed.
+    _tool_cache_lease: ToolCacheLeaseGuard,
+}
+
+/// Shared advisory lock on a workspace's tool-cache entry.
+///
+/// Shared rather than exclusive: several commands in the same workspace may
+/// reuse the cache concurrently, and their shared locks must not conflict. The
+/// GC's exclusive lock is what they block.
+struct ToolCacheLeaseGuard {
+    _lock: std::fs::File,
+}
+
+fn acquire_tool_cache_lease(tool_cache_dir: &Path) -> std::io::Result<ToolCacheLeaseGuard> {
+    let lock_path = tool_cache_dir.join(leveler_core::TOOL_CACHE_LOCK_FILE);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    fs2::FileExt::lock_shared(&lock)?;
+    Ok(ToolCacheLeaseGuard { _lock: lock })
+}
+
+/// Record that this workspace's cache was just used. The marker's mtime is the
+/// last-used signal the GC orders by; best-effort, never fatal.
+fn touch_tool_cache_last_used(tool_cache_dir: &Path) {
+    let _ = std::fs::write(
+        tool_cache_dir.join(leveler_core::TOOL_CACHE_LAST_USED_FILE),
+        b"",
+    );
 }
 
 /// RAII guard tying a per-command scratch dir to an exclusive advisory lock on
@@ -425,6 +459,11 @@ pub(crate) fn prepare_sandbox_paths(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     }
+    // Mark this entry used and hold a shared lease for the whole command. The GC
+    // reads the marker to order candidates and takes the exclusive form of the
+    // lease to prove nobody is using an entry before reclaiming it.
+    touch_tool_cache_last_used(&tool_cache);
+    let tool_cache_lease = acquire_tool_cache_lease(&tool_cache)?;
 
     std::fs::create_dir(scratch.path().join("tmp"))?;
     // The confined child's CodeLeveler runtime root, created here so
@@ -488,6 +527,7 @@ pub(crate) fn prepare_sandbox_paths(
         npm_cache,
         cache_write_roots,
         _lease: lease,
+        _tool_cache_lease: tool_cache_lease,
     })
 }
 

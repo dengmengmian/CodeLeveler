@@ -100,8 +100,8 @@ pub use progress::{
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, UiActiveBackgroundTask, UiActiveToolCall,
-    UiCheckpoint, UiMessage, UiMessageKind, UiReasoningState, UiRole, UiSessionSnapshot,
-    UiSessionSummary, UiUserShell,
+    UiBackgroundTaskBlocker, UiCheckpoint, UiMessage, UiMessageKind, UiReasoningState, UiRole,
+    UiSessionSnapshot, UiSessionSummary, UiUserShell,
 };
 pub use version::{PROTOCOL_VERSION, ProtocolEnvelope, ProtocolError, ProtocolVersion};
 pub use wire_types::{ApprovalDecision, ApprovalPolicy, PermissionProfile};

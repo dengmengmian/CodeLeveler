@@ -48,12 +48,7 @@ impl Layout {
         // roots) share one state namespace — otherwise sessions list/resume
         // miss the DB written under the other spelling.
         let repo_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
-        // `config_dir` (the dev providers/models bundle) is orthogonal to the
-        // home namespace — it keeps its own LEVELER_CONFIG_DIR / <repo>/configs
-        // resolution and is NOT a LevelerHome path.
-        let config_dir = config_dir_override
-            .or_else(|| environment.var_os("LEVELER_CONFIG_DIR").map(PathBuf::from))
-            .unwrap_or_else(|| repo_root.join("configs"));
+        let config_dir = Self::resolve_config_dir(&repo_root, config_dir_override, environment);
         let home = LevelerHome::resolve(environment);
         let state_dir = home.project_state_dir(&encode_repo_path(&repo_root));
         write_owner_marker_if_directory_exists(&state_dir, &repo_root);
@@ -63,6 +58,63 @@ impl Layout {
             state_dir,
             home,
         }
+    }
+
+    /// Like [`Self::resolve`], but the runtime state, sockets, locks, browser
+    /// profile and cache for this run live under `home_root` instead of the
+    /// process-wide `LEVELER_HOME`.
+    ///
+    /// This is the automation seam: an eval, a dogfood run or a throwaway
+    /// fixture gets its OWN disposable home, so it never writes per-project
+    /// state into the user's persistent environment. The global `config.toml`
+    /// is intentionally NOT relocated — it is still read from the process
+    /// environment, so provider/model credentials and user config keep
+    /// working, and no secret is copied into the ephemeral root.
+    pub fn ephemeral(
+        repo_root: PathBuf,
+        config_dir_override: Option<PathBuf>,
+        home_root: &Path,
+    ) -> Self {
+        Self::ephemeral_with_environment(
+            repo_root,
+            config_dir_override,
+            home_root,
+            leveler_core::environment(),
+        )
+    }
+
+    /// [`Self::ephemeral`] with an explicit environment snapshot (tests).
+    pub fn ephemeral_with_environment(
+        repo_root: PathBuf,
+        config_dir_override: Option<PathBuf>,
+        home_root: &Path,
+        environment: &leveler_core::EnvSnapshot,
+    ) -> Self {
+        let repo_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+        let config_dir = Self::resolve_config_dir(&repo_root, config_dir_override, environment);
+        let home = LevelerHome::from_root(home_root.to_path_buf());
+        let state_dir = home.project_state_dir(&encode_repo_path(&repo_root));
+        write_owner_marker_if_directory_exists(&state_dir, &repo_root);
+        Self {
+            repo_root,
+            config_dir,
+            state_dir,
+            home,
+        }
+    }
+
+    /// The dev providers/models bundle directory: an explicit override, else
+    /// `LEVELER_CONFIG_DIR`, else `<repo>/configs`. Orthogonal to the home
+    /// namespace, and shared by every constructor so ephemeral and persistent
+    /// layouts resolve config identically.
+    fn resolve_config_dir(
+        repo_root: &Path,
+        config_dir_override: Option<PathBuf>,
+        environment: &leveler_core::EnvSnapshot,
+    ) -> PathBuf {
+        config_dir_override
+            .or_else(|| environment.var_os("LEVELER_CONFIG_DIR").map(PathBuf::from))
+            .unwrap_or_else(|| repo_root.join("configs"))
     }
 
     pub fn providers_dir(&self) -> PathBuf {
@@ -140,6 +192,75 @@ impl Layout {
     /// never the repo.
     pub fn browser_screenshots_dir(&self) -> PathBuf {
         self.state_dir.join("browser").join("screenshots")
+    }
+}
+
+/// A unique, disposable CodeLeveler home for one automation run.
+///
+/// Owns a fresh directory under the system temp dir and removes it on drop, so
+/// an eval / dogfood / fixture run never leaves per-project state, sockets or a
+/// browser profile in the user's persistent home. Process-local and unique per
+/// instance, so concurrent runs cannot collide.
+///
+/// Use [`Self::layout`] to build the run's [`Layout`]s and drop this when the
+/// run ends — `Drop` runs on success, failure and panic alike.
+#[derive(Debug)]
+pub struct EphemeralHome {
+    root: PathBuf,
+}
+
+impl EphemeralHome {
+    /// Create a new home root under `<temp>/codeleveler/<label>/<unique>`.
+    pub fn create(label: &str) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let unique = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            nanos,
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        // Keep the label a single, inert path segment.
+        let label: String = label
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let root = std::env::temp_dir()
+            .join("codeleveler")
+            .join(label)
+            .join(unique);
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    /// The ephemeral home root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// A [`Layout`] whose runtime state/sockets/browser/cache live under this
+    /// disposable home. Config still resolves from the real environment, so
+    /// provider/model credentials keep working without being copied here.
+    pub fn layout(&self, repo_root: impl Into<PathBuf>, config_dir: Option<PathBuf>) -> Layout {
+        Layout::ephemeral(repo_root.into(), config_dir, &self.root)
+    }
+}
+
+impl Drop for EphemeralHome {
+    fn drop(&mut self) {
+        // Best-effort: automation that starts a daemon must stop it before this
+        // drops, or a socket may keep a file alive. Never panics.
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -430,5 +551,62 @@ mod tests {
         let repos = known_repositories(&home);
         assert_eq!(repos, vec![PathBuf::from("/work/foo")]);
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn ephemeral_layout_scopes_state_sockets_and_browser_to_the_run_home() {
+        let base = std::env::temp_dir().join(format!(
+            "leveler-ephemeral-layout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home_root = base.join("home");
+        fs::create_dir_all(&home_root).unwrap();
+        let layout = Layout::ephemeral_with_environment(
+            PathBuf::from("/repo"),
+            Some(PathBuf::from("/bundle")),
+            &home_root,
+            &env_home("/real/.leveler"),
+        );
+        assert_eq!(layout.home().root(), home_root);
+        assert_eq!(layout.config_dir, PathBuf::from("/bundle"));
+        assert!(
+            layout.state_dir.starts_with(&home_root),
+            "{:?}",
+            layout.state_dir
+        );
+        assert!(
+            layout.socket_path().starts_with(&home_root),
+            "{:?}",
+            layout.socket_path()
+        );
+        assert!(
+            layout.browser_profile_dir().starts_with(&home_root),
+            "{:?}",
+            layout.browser_profile_dir()
+        );
+        assert!(
+            !layout.state_dir.starts_with("/real/.leveler"),
+            "ephemeral state must not land in the real home: {:?}",
+            layout.state_dir
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn ephemeral_home_is_unique_and_removed_on_drop() {
+        let a = EphemeralHome::create("unit-test").unwrap();
+        let b = EphemeralHome::create("unit-test").unwrap();
+        assert_ne!(a.root(), b.root(), "each run gets its own home");
+        let a_root = a.root().to_path_buf();
+        let b_root = b.root().to_path_buf();
+        assert!(a_root.is_dir() && b_root.is_dir());
+        drop(a);
+        assert!(!a_root.exists(), "dropping the run home removes it");
+        assert!(b_root.is_dir(), "another run's home is untouched");
+        drop(b);
     }
 }

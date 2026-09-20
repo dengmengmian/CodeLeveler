@@ -15,13 +15,16 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
 use leveler_local_transport::{
     CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient,
 };
+// Test-owned daemons run in their own process group and are reclaimed on drop,
+// so a panic or a fired deadline cannot leave an orphan `leveler serve` behind.
+use leveler_test_support::ManagedChild;
 
 struct TestEnv {
     _tmp: tempfile::TempDir,
@@ -80,8 +83,9 @@ compatibility:
     }
 }
 
-fn spawn_serve(env: &TestEnv, ready: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_leveler"))
+fn spawn_serve(env: &TestEnv, ready: &Path) -> ManagedChild {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
+    command
         .arg("--repo")
         .arg(&env.repo)
         .arg("serve")
@@ -91,9 +95,8 @@ fn spawn_serve(env: &TestEnv, ready: &Path) -> Child {
         .env("LEVELER_CONFIG_DIR", &env.config_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn leveler serve")
+        .stderr(Stdio::null());
+    ManagedChild::spawn(&mut command).expect("spawn leveler serve")
 }
 
 #[cfg(feature = "test-crash-barrier")]
@@ -101,7 +104,7 @@ fn spawn_serve_with_after_turn_started_barrier(
     env: &TestEnv,
     ready: &Path,
     barrier: &Path,
-) -> Child {
+) -> ManagedChild {
     spawn_serve_with_barrier(
         env,
         ready,
@@ -116,8 +119,9 @@ fn spawn_serve_with_barrier(
     ready: &Path,
     barrier_var: &str,
     barrier: &Path,
-) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_leveler"))
+) -> ManagedChild {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
+    command
         .arg("--repo")
         .arg(&env.repo)
         .arg("serve")
@@ -128,14 +132,13 @@ fn spawn_serve_with_barrier(
         .env(barrier_var, barrier)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn leveler serve with crash barrier")
+        .stderr(Stdio::null());
+    ManagedChild::spawn(&mut command).expect("spawn leveler serve with crash barrier")
 }
 
 /// Wait for the daemon's ready file; panics with the child's status on
 /// premature exit so a startup failure is diagnosable.
-fn wait_ready(ready: &Path, child: &mut Child, timeout: Duration) -> serde_json::Value {
+fn wait_ready(ready: &Path, child: &mut ManagedChild, timeout: Duration) -> serde_json::Value {
     let deadline = Instant::now() + timeout;
     loop {
         if ready.is_file()
@@ -155,7 +158,7 @@ fn wait_ready(ready: &Path, child: &mut Child, timeout: Duration) -> serde_json:
     }
 }
 
-fn stop_daemon(child: &mut Child) {
+fn stop_daemon(child: &mut ManagedChild) {
     // SIGINT = the daemon's documented Ctrl+C shutdown path.
     unsafe {
         libc_kill(child.id() as i32, 2);
@@ -248,8 +251,16 @@ fn runtime_id_survives_a_daemon_restart() {
 
 /// Scenario D: two daemons racing one repository — exactly one survives, and
 /// the socket answers with exactly that identity.
-#[tokio::test]
-async fn concurrent_daemon_starts_elect_exactly_one_runtime() {
+#[test]
+fn concurrent_daemon_starts_elect_exactly_one_runtime() {
+    leveler_test_support::bounded_test(
+        "concurrent_daemon_starts_elect_exactly_one_runtime",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        concurrent_daemon_starts_elect_exactly_one_runtime_body,
+    );
+}
+
+async fn concurrent_daemon_starts_elect_exactly_one_runtime_body() {
     let env = test_env("http://127.0.0.1:9");
     let ready_a = env.home.join("ready-a.json");
     let ready_b = env.home.join("ready-b.json");
@@ -328,8 +339,16 @@ async fn hold_open_model_endpoint() -> (String, tokio::task::JoinHandle<()>) {
 /// session snapshot is still served. Side-effect replay conservatism itself
 /// is locked by `leveler-engine/tests/crash_recovery_test.rs`; this proves
 /// the process-level path into those semantics.
-#[tokio::test]
-async fn sigkill_during_a_task_recovers_on_restart_without_duplication() {
+#[test]
+fn sigkill_during_a_task_recovers_on_restart_without_duplication() {
+    leveler_test_support::bounded_test(
+        "sigkill_during_a_task_recovers_on_restart_without_duplication",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        sigkill_during_a_task_recovers_on_restart_without_duplication_body,
+    );
+}
+
+async fn sigkill_during_a_task_recovers_on_restart_without_duplication_body() {
     let (base_url, _model) = hold_open_model_endpoint().await;
     let env = test_env(&base_url);
     let ready1 = env.home.join("ready1.json");
@@ -462,8 +481,16 @@ async fn task_owner(
 /// `leveler run` process starts beside it and must not interrupt or fence it.
 /// Then the daemon is SIGKILLed: the next daemon reaps the dead daemon's turn
 /// — and leaves the still-live `leveler run` turn alone.
-#[tokio::test]
-async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped() {
+#[test]
+fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped() {
+    leveler_test_support::bounded_test(
+        "live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped_body,
+    );
+}
+
+async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped_body() {
     let (base_url, _model) = hold_open_model_endpoint().await;
     let env = test_env(&base_url);
     let ready1 = env.home.join("ready1.json");
@@ -508,7 +535,8 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped()
 
     // A second host on the same repository: `leveler run` creates a session
     // (with its startup recovery) and starts its own turn.
-    let mut sibling = Command::new(env!("CARGO_BIN_EXE_leveler"))
+    let mut sibling_command = Command::new(env!("CARGO_BIN_EXE_leveler"));
+    sibling_command
         .arg("--repo")
         .arg(&env.repo)
         .arg("run")
@@ -517,9 +545,8 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped()
         .env("LEVELER_CONFIG_DIR", &env.config_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn leveler run");
+        .stderr(Stdio::null());
+    let mut sibling = ManagedChild::spawn(&mut sibling_command).expect("spawn leveler run");
     let deadline = Instant::now() + Duration::from_secs(30);
     let sibling_turn = loop {
         if let Some(turn) = running_turns(&db)
@@ -591,8 +618,16 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped()
 /// process is another boot on the same state, probing liveness through the
 /// real boot leases. While the shell runs the session is the daemon's; once it
 /// exits the daemon stays up and the session passes to the other boot.
-#[tokio::test]
-async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs() {
+#[test]
+fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs() {
+    leveler_test_support::bounded_test(
+        "a_live_daemons_user_shell_holds_the_session_only_while_it_runs",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_live_daemons_user_shell_holds_the_session_only_while_it_runs_body,
+    );
+}
+
+async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs_body() {
     let (base_url, _model) = hold_open_model_endpoint().await;
     let env = test_env(&base_url);
     let ready = env.home.join("ready-shell.json");
@@ -681,8 +716,17 @@ async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs() {
 /// exact test barrier. SIGKILL there must reconstruct one user message; a
 /// second restart must remain a no-op.
 #[cfg(feature = "test-crash-barrier")]
-#[tokio::test]
-async fn sigkill_after_durable_ack_before_transcript_append_recovers_once() {
+#[test]
+fn sigkill_after_durable_ack_before_transcript_append_recovers_once() {
+    leveler_test_support::bounded_test(
+        "sigkill_after_durable_ack_before_transcript_append_recovers_once",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        sigkill_after_durable_ack_before_transcript_append_recovers_once_body,
+    );
+}
+
+#[cfg(feature = "test-crash-barrier")]
+async fn sigkill_after_durable_ack_before_transcript_append_recovers_once_body() {
     let (base_url, _model) = hold_open_model_endpoint().await;
     let env = test_env(&base_url);
     let ready1 = env.home.join("ready-barrier-1.json");
@@ -815,8 +859,17 @@ async fn sigkill_after_durable_ack_before_transcript_append_recovers_once() {
 /// command id — over the socket — as unresolvable, every time, and never run it
 /// a second time.
 #[cfg(feature = "test-crash-barrier")]
-#[tokio::test]
-async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart() {
+#[test]
+fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart() {
+    leveler_test_support::bounded_test(
+        "sigkill_before_the_receipt_settles_is_unresolvable_after_restart",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        sigkill_before_the_receipt_settles_is_unresolvable_after_restart_body,
+    );
+}
+
+#[cfg(feature = "test-crash-barrier")]
+async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart_body() {
     let (base_url, _model) = hold_open_model_endpoint().await;
     let env = test_env(&base_url);
     let ready1 = env.home.join("ready-receipt-1.json");
@@ -917,8 +970,16 @@ async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart() {
 
 /// Gate Scenario A: a running daemon reports identity + admission health
 /// over the socket, and the numbers reflect reality (no active work yet).
-#[tokio::test]
-async fn health_reports_identity_and_admission() {
+#[test]
+fn health_reports_identity_and_admission() {
+    leveler_test_support::bounded_test(
+        "health_reports_identity_and_admission",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        health_reports_identity_and_admission_body,
+    );
+}
+
+async fn health_reports_identity_and_admission_body() {
     let env = test_env("http://127.0.0.1:9");
     let ready = env.home.join("ready.json");
     let mut daemon = spawn_serve(&env, &ready);
@@ -951,8 +1012,16 @@ async fn health_reports_identity_and_admission() {
 /// mid-task; after a restart the SAME client object reaches the SAME
 /// RuntimeId, the session snapshot is served again, the orphan turn was
 /// recovered, and the ownership epoch advanced (old tokens powerless).
-#[tokio::test]
-async fn connected_client_recovers_after_daemon_sigkill() {
+#[test]
+fn connected_client_recovers_after_daemon_sigkill() {
+    leveler_test_support::bounded_test(
+        "connected_client_recovers_after_daemon_sigkill",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        connected_client_recovers_after_daemon_sigkill_body,
+    );
+}
+
+async fn connected_client_recovers_after_daemon_sigkill_body() {
     let (base_url, _model) = hold_open_model_endpoint().await;
     let env = test_env(&base_url);
     let ready1 = env.home.join("ready1.json");

@@ -313,6 +313,29 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 scroll_screen_key(state, &key, true);
             }
         },
+        Screen::Clean => match key.code {
+            // Esc leaves the page. It never cancels foreground Agent work, and
+            // a cleanup already running keeps running: the page owns no work
+            // lifecycle, only a view over the host's plan.
+            KeyCode::Esc => close_screen(state),
+            KeyCode::Up | KeyCode::Char('k') => state.clean.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => state.clean.move_selection(1),
+            KeyCode::Enter => match state.clean.selected_action() {
+                Some(crate::clean::CleanAction::CleanSafe) => {
+                    state.clean.begin_clean();
+                    return vec![Effect::RunCleanSafe];
+                }
+                Some(crate::clean::CleanAction::Details) => {
+                    state.clean.details = !state.clean.details;
+                    state.clean.selected = 0;
+                }
+                Some(crate::clean::CleanAction::Close) => close_screen(state),
+                None => {}
+            },
+            _ => {
+                scroll_screen_key(state, &key, true);
+            }
+        },
         Screen::Conversation => {}
     }
     Vec::new()
@@ -376,6 +399,15 @@ pub(super) fn open_context(state: &mut AppState) -> Vec<Effect> {
     state.screen_scroll = 0;
     state.context.selected = 0;
     vec![Effect::Send(crate::context::issue_query(state))]
+}
+
+/// Open `/clean` and start a fresh scan. The scan runs off-thread in the event
+/// loop; this only enters the page and asks for it.
+pub(super) fn open_clean(state: &mut AppState) -> Vec<Effect> {
+    state.active_screen = Screen::Clean;
+    state.screen_scroll = 0;
+    state.clean.begin_scan();
+    vec![Effect::StartCleanScan]
 }
 
 /// Open the Sessions screen and refresh the list (spec §52).

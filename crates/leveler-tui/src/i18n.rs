@@ -626,6 +626,8 @@ pub struct UiText {
     pub slash: SlashText,
     /// One-line palette labels for the `/` popup — not help copy.
     pub slash_brief: SlashText,
+    /// `/clean` page copy.
+    pub clean: CleanText,
     /// Ghost argument placeholders drawn after the caret (not in the buffer).
     pub slash_ghost: SlashGhost,
 
@@ -976,12 +978,46 @@ pub struct SlashText {
     pub theme: &'static str,
     pub new: &'static str,
     pub help: &'static str,
+    /// `/clean` — reclaim local storage.
+    pub clean: &'static str,
     /// `/update` — install the latest stable release.
     pub update: &'static str,
     /// `/remote`
     pub remote: &'static str,
     /// `/remote-loc`
     pub remote_loc: &'static str,
+}
+
+/// `/clean` page copy. Kept in its own struct so the page's words live beside
+/// every other user-visible string, in both languages.
+#[derive(Debug)]
+pub struct CleanText {
+    pub title: &'static str,
+    pub footer_hint: &'static str,
+    pub reclaimable: &'static str,
+    pub safe_total: &'static str,
+    pub needs_confirmation: &'static str,
+    pub analyzing: &'static str,
+    pub analyzing_note: &'static str,
+    pub cleaning: &'static str,
+    pub reclaimed: &'static str,
+    pub failed: &'static str,
+    pub partial_failure: &'static str,
+    pub details_safe: &'static str,
+    pub details_needs: &'static str,
+    pub action_clean_safe: &'static str,
+    pub action_details: &'static str,
+    pub action_back: &'static str,
+    pub action_close: &'static str,
+    pub kind_tool_cache: &'static str,
+    pub kind_expired_ephemeral: &'static str,
+    pub kind_dead_socket: &'static str,
+    pub kind_orphan_lock: &'static str,
+    pub kind_historical_automation: &'static str,
+    pub kind_deleted_project_data: &'static str,
+    pub kind_browser_state: &'static str,
+    pub note_deleted_project: &'static str,
+    pub note_browser_state: &'static str,
 }
 
 /// Argument ghosts for commands that require free-text params.
@@ -1413,6 +1449,7 @@ static ZH: UiText = UiText {
         theme: "选择配色主题（auto / dark / light / high-contrast）",
         new: "开始新对话（当前这段保留在 /sessions）",
         help: "查看帮助",
+        clean: "清理本地状态缓存",
         update: "升级到最新的稳定版本（会自动重启）",
     },
     slash_brief: SlashText {
@@ -1443,7 +1480,36 @@ static ZH: UiText = UiText {
         theme: "切换主题",
         new: "新对话",
         help: "查看帮助",
+        clean: "清理本地状态缓存",
         update: "检查更新",
+    },
+    clean: CleanText {
+        title: "清理本地状态",
+        footer_hint: "↑↓ 选择 · Enter 确认 · Esc 返回",
+        reclaimable: "可释放空间",
+        safe_total: "安全可清理总计",
+        needs_confirmation: "需要确认",
+        analyzing: "正在分析可释放空间…",
+        analyzing_note: "后台扫描中，界面保持响应。Esc 返回。",
+        cleaning: "正在清理…",
+        reclaimed: "已释放",
+        failed: "清理失败",
+        partial_failure: "部分数据未能清理",
+        details_safe: "安全清理",
+        details_needs: "需要确认",
+        action_clean_safe: "安全清理",
+        action_details: "查看详情",
+        action_back: "返回",
+        action_close: "关闭",
+        kind_tool_cache: "工具缓存",
+        kind_expired_ephemeral: "过期临时运行",
+        kind_dead_socket: "无主 socket",
+        kind_orphan_lock: "无主 lock",
+        kind_historical_automation: "历史自动化状态",
+        kind_deleted_project_data: "已删除项目数据",
+        kind_browser_state: "浏览器状态",
+        note_deleted_project: "可能包含会话或用户数据",
+        note_browser_state: "可能包含登录状态",
     },
     slash_ghost: SlashGhost {
         btw: "<问题>",
@@ -2094,6 +2160,7 @@ static EN: UiText = UiText {
         theme: "choose theme (auto / dark / light / high-contrast)",
         new: "start a new conversation (this one stays in /sessions)",
         help: "show help",
+        clean: "reclaim local storage",
         update: "install the latest stable release (restarts automatically)",
     },
     slash_brief: SlashText {
@@ -2124,7 +2191,36 @@ static EN: UiText = UiText {
         theme: "switch theme",
         new: "new chat",
         help: "View help",
+        clean: "clean local storage",
         update: "check for updates",
+    },
+    clean: CleanText {
+        title: "Local storage",
+        footer_hint: "↑↓ Select · Enter Confirm · Esc Back",
+        reclaimable: "Reclaimable storage",
+        safe_total: "Safe to reclaim",
+        needs_confirmation: "Needs confirmation",
+        analyzing: "Analyzing reclaimable storage…",
+        analyzing_note: "Scanning in the background; the UI stays responsive. Esc Back.",
+        cleaning: "Cleaning…",
+        reclaimed: "Reclaimed",
+        failed: "Cleanup failed",
+        partial_failure: "Some items could not be cleaned",
+        details_safe: "Safe to clean",
+        details_needs: "Needs confirmation",
+        action_clean_safe: "Clean safe items",
+        action_details: "View details",
+        action_back: "Back",
+        action_close: "Close",
+        kind_tool_cache: "Tool cache",
+        kind_expired_ephemeral: "Expired temporary",
+        kind_dead_socket: "Unowned socket",
+        kind_orphan_lock: "Unowned lock",
+        kind_historical_automation: "Historical automation",
+        kind_deleted_project_data: "Deleted-project data",
+        kind_browser_state: "Browser state",
+        note_deleted_project: "May contain sessions or user data",
+        note_browser_state: "May contain login state",
     },
     slash_ghost: SlashGhost {
         btw: "<question>",

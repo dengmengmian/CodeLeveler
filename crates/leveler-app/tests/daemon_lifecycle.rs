@@ -524,6 +524,142 @@ async fn a_live_background_task_holds_the_handover_open() {
         .expect("once nothing is left running, the runtime retires");
 }
 
+/// The real handoff blocker: a background task whose direct child EXITED while
+/// a descendant keeps the inherited log pipes open. The runtime must name it
+/// (not just count it), the session-scoped `CancelBackgroundTask` must stop its
+/// whole process group, and the drain must then complete — no permanent
+/// "finishing existing work".
+#[tokio::test]
+async fn a_child_that_exited_still_leaves_a_named_stoppable_blocker() {
+    let (base_url, _model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let token = CancellationToken::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new(
+            app.clone(),
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+        .with_process_shutdown(token.clone()),
+    );
+    let session_id = runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "handoff blocker".into(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .expect("create session")
+        .session
+        .id;
+
+    // The direct child exits at once; the backgrounded `sleep` inherits the
+    // child's stdout/stderr (so the log pumps never EOF) and its process group.
+    let workdir = tmp.path().join("bg");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let pid_file = workdir.join("descendant.pid");
+    let task_id = app
+        .background_tasks()
+        .spawn_owned(
+            leveler_execution::ProcessRequest::new(
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    format!("sleep 30 & echo $! > '{}'", pid_file.display()),
+                ],
+                workdir.clone(),
+            ),
+            None,
+            Some(session_id.as_str()),
+        )
+        .await
+        .expect("background task starts");
+    let descendant = wait_for_pid(&pid_file, std::time::Duration::from_secs(5))
+        .await
+        .expect("descendant pid");
+
+    runtime
+        .send(ClientCommand::ShutdownWhenIdle {
+            reason: leveler_client_protocol::RestartReason::BuildMismatch,
+        })
+        .await
+        .unwrap();
+
+    let health = runtime.runtime_info().await.unwrap().health;
+    assert_eq!(health.active_turns, 0);
+    assert_eq!(health.active_background_tasks, 1);
+    assert!(!health.quiescent());
+    let blocker = health
+        .blockers
+        .iter()
+        .find(|blocker| blocker.task_id == task_id)
+        .expect("the handoff must name the real blocker, not just a count");
+    assert_eq!(blocker.program, "sh");
+    assert_eq!(blocker.session_id.as_ref(), Some(&session_id));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), token.cancelled())
+            .await
+            .is_err(),
+        "the drain waits while the named blocker lives"
+    );
+
+    // Stop it through the runtime domain command — never a raw signal.
+    runtime
+        .send(ClientCommand::CancelBackgroundTask {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+        })
+        .await
+        .expect("cancel command accepted");
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), token.cancelled())
+        .await
+        .expect("the handover completes once the blocker has settled");
+    assert_eq!(app.background_tasks().alive_count().await, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_alive(descendant) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !process_alive(descendant),
+        "stopping the task must terminate its whole process group"
+    );
+}
+
+async fn wait_for_pid(path: &std::path::Path, timeout: std::time::Duration) -> Option<u32> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            return Some(pid);
+        }
+        if start.elapsed() > timeout {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// The client's idea of "idle" and the drain's are the SAME reading.
 ///
 /// The defect this pins: `RuntimeHealth` used to expose only `active_turns`,

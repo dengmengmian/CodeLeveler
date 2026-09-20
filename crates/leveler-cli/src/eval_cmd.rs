@@ -743,6 +743,10 @@ fn seal_eval_answer_keys() {
     let home = leveler_core::LevelerHome::resolve(leveler_core::environment());
     roots.push(home.projects_dir());
     roots.push(home.config_file());
+    // The per-case state of an ephemeral eval run lives under this base; seal
+    // it too, or an agent could read its own transcript back out of the temp
+    // home the persistent-home seal above no longer covers.
+    roots.push(std::env::temp_dir().join("codeleveler").join("eval"));
     leveler_execution::seal_read_denials(roots);
 }
 
@@ -1210,8 +1214,22 @@ async fn run_eval_case(
         let _ = git(&["commit", "-qm", "eval baseline"]);
     }
 
-    // Run the agent (direct tool loop) in the case workspace.
-    let layout = Layout::resolve(dir.clone(), Some(config_dir.to_path_buf()));
+    // Run the agent (direct tool loop) in the case workspace, with runtime
+    // state in a DISPOSABLE home: an eval run must never write per-case state,
+    // sockets, a browser profile or a session DB into the user's persistent
+    // `~/.leveler`. The home is dropped (and removed) when this case returns,
+    // on success and failure alike. Config still comes from the real
+    // environment, so provider/model credentials keep working.
+    let ephemeral = match leveler_project::EphemeralHome::create("eval") {
+        Ok(home) => home,
+        Err(e) => {
+            return fail(
+                format!("could not create ephemeral eval home: {e}"),
+                leveler_eval::FailureCategory::Environment,
+            );
+        }
+    };
+    let layout = ephemeral.layout(dir.clone(), Some(config_dir.to_path_buf()));
     let app = match Application::assemble(layout) {
         Ok(a) => a,
         Err(e) => {

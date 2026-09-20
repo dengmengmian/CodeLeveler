@@ -1830,6 +1830,7 @@ mod tests {
                     turn_capacity: Some(4),
                     shutting_down: false,
                     retiring_reason: None,
+                    blockers: Vec::new(),
                 },
             })
         }
@@ -1916,6 +1917,51 @@ mod tests {
         let info = LocalRuntimeService::runtime_info(&client).await.unwrap();
         assert_eq!(info.runtime_id.as_str(), "rt-test");
         shutdown.cancel();
+    }
+
+    /// ONE_PROJECT_ONE_RUNTIME: three interactive clients share a single local
+    /// runtime, and the runtime counts them. Closing one decrements the count
+    /// without disturbing the others. This is the transport fact behind "three
+    /// TUIs on the same repo share one daemon".
+    #[tokio::test]
+    async fn three_clients_share_one_runtime_and_are_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.sock");
+        let runtime: Arc<dyn LocalRuntimeService> = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+
+        let c1 = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let c2 = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let c3 = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        assert_eq!(
+            c3.local_waiter_count().await.unwrap(),
+            3,
+            "three interactive clients must be counted"
+        );
+
+        drop(c1);
+        for _ in 0..100 {
+            if c3.local_waiter_count().await.unwrap() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(c3.local_waiter_count().await.unwrap(), 2);
+
+        drop(c2);
+        for _ in 0..100 {
+            if c3.local_waiter_count().await.unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(c3.local_waiter_count().await.unwrap(), 1);
+
+        drop(c3);
+        shutdown.cancel();
+        let _ = task.await;
     }
 
     /// A reviver that performs a REAL ensure: binds a fresh LocalSocketServer

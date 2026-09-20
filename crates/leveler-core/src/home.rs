@@ -182,6 +182,22 @@ impl LevelerHome {
     }
 }
 
+/// Marker file inside a tool-cache entry whose mtime is its last-used time.
+///
+/// Written by the execution layer whenever a workspace's cache is prepared, and
+/// read by GC. Kept as one named constant so the writer and the GC cannot drift
+/// apart on the spelling.
+pub const TOOL_CACHE_LAST_USED_FILE: &str = ".leveler-last-used";
+
+/// Advisory lock file inside a tool-cache entry.
+///
+/// A command preparing the cache takes a **shared** lock for the lifetime of the
+/// command; a garbage collector takes an **exclusive** lock before removing the
+/// entry, so a cache in use is never deleted. Shared (not exclusive) on the
+/// command side because several commands may legitimately reuse one workspace's
+/// cache at the same time.
+pub const TOOL_CACHE_LOCK_FILE: &str = ".leveler-cache.lock";
+
 #[cfg(test)]
 mod tests {
     use super::*;

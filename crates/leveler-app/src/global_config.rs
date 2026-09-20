@@ -97,15 +97,37 @@ pub struct GlobalConfig {
     /// Self-update preferences.
     #[serde(default)]
     update: GlobalUpdate,
+    /// Local storage lifecycle preferences (cache budget, ephemeral TTL).
+    #[serde(default)]
+    storage: GlobalStorage,
+}
+
+/// `[storage]`. Bounds on what CodeLeveler may reclaim from its own home.
+/// Absent fields fall back to the built-in policy in `leveler-project::hygiene`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalStorage {
+    /// Maximum bytes for `cache/tools` before the GC reclaims oldest-first.
+    #[serde(default)]
+    tool_cache_max_bytes: Option<u64>,
+    /// Hours a crash-orphaned ephemeral run must sit before it is reclaimed.
+    #[serde(default)]
+    ephemeral_ttl_hours: Option<u64>,
 }
 
 /// `[update]`. Whether CodeLeveler keeps itself current, and how often it
 /// checks. Two fields, no channel: only the stable GitHub release is tracked.
+///
+/// `auto_update` is **off by default**: the startup path is local and
+/// network-free, and the one operation that must run before the terminal is
+/// taken over is the self-update. A user who wants start-up auto-update opts in
+/// explicitly with `[update] auto_update = true`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalUpdate {
-    /// Check for (and install) a newer stable release at start-up.
-    #[serde(default = "default_true")]
+    /// Check for (and install) a newer stable release at start-up. Off by
+    /// default so startup never depends on the network.
+    #[serde(default)]
     auto_update: bool,
     /// Hours between successful checks (clamped to at least one).
     #[serde(default = "default_check_interval_hours")]
@@ -115,7 +137,7 @@ struct GlobalUpdate {
 impl Default for GlobalUpdate {
     fn default() -> Self {
         Self {
-            auto_update: true,
+            auto_update: false,
             check_interval_hours: 1,
         }
     }
@@ -526,6 +548,16 @@ impl GlobalConfig {
     pub fn update_check_interval_hours(&self) -> u64 {
         self.update.check_interval_hours.max(1)
     }
+
+    /// `[storage].tool_cache_max_bytes` — the tool-cache size budget, when set.
+    pub fn tool_cache_max_bytes(&self) -> Option<u64> {
+        self.storage.tool_cache_max_bytes
+    }
+
+    /// `[storage].ephemeral_ttl_hours` — the crash-residue TTL, when set.
+    pub fn ephemeral_ttl_hours(&self) -> Option<u64> {
+        self.storage.ephemeral_ttl_hours
+    }
 }
 
 /// Render the starter config `leveler init` writes. Lives next to the parser
@@ -768,6 +800,30 @@ fn parse_protocol(s: &str) -> ProtocolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup path must be network-free by default: auto-update is opt-in.
+    #[test]
+    fn startup_auto_update_is_off_unless_explicitly_enabled() {
+        let cfg: GlobalConfig = toml::from_str("default_model = \"mock/m\"\n").unwrap();
+        assert!(!cfg.update_auto(), "startup auto-update must default off");
+
+        let cfg: GlobalConfig = toml::from_str("[update]\nauto_update = true\n").unwrap();
+        assert!(cfg.update_auto(), "an explicit opt-in is honoured");
+    }
+
+    /// The `[storage]` budget and TTL are readable, and default to unset.
+    #[test]
+    fn storage_budget_is_optional_and_readable() {
+        let cfg: GlobalConfig = toml::from_str("default_model = \"mock/m\"\n").unwrap();
+        assert_eq!(cfg.tool_cache_max_bytes(), None);
+        assert_eq!(cfg.ephemeral_ttl_hours(), None);
+
+        let cfg: GlobalConfig =
+            toml::from_str("[storage]\ntool_cache_max_bytes = 123\nephemeral_ttl_hours = 6\n")
+                .unwrap();
+        assert_eq!(cfg.tool_cache_max_bytes(), Some(123));
+        assert_eq!(cfg.ephemeral_ttl_hours(), Some(6));
+    }
 
     /// Reopening a session through the daemon leaves the client without a
     /// model registry, and the snapshot names the model but not its limits —
@@ -1184,10 +1240,14 @@ completion_judge_timeout_seconds = 180
     }
 
     #[test]
-    fn the_update_section_defaults_to_auto_hourly_and_is_configurable() {
+    fn the_update_section_is_off_by_default_and_configurable() {
+        // Startup is network-free unless the user explicitly opts in.
         let default = GlobalConfig::from_toml_str("").unwrap();
-        assert!(default.update_auto());
+        assert!(!default.update_auto());
         assert_eq!(default.update_check_interval_hours(), 1);
+
+        let on = GlobalConfig::from_toml_str("[update]\nauto_update = true\n").unwrap();
+        assert!(on.update_auto());
 
         let off = GlobalConfig::from_toml_str("[update]\nauto_update = false\n").unwrap();
         assert!(!off.update_auto());

@@ -196,7 +196,7 @@ fn socket_intent(
 }
 
 #[cfg(unix)]
-async fn connect_default_runtime(
+pub(crate) async fn connect_default_runtime(
     path: &Path,
 ) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
     match tokio::time::timeout(
@@ -222,7 +222,7 @@ async fn connect_default_runtime(
 }
 
 #[cfg(not(unix))]
-async fn connect_default_runtime(
+pub(crate) async fn connect_default_runtime(
     _path: &Path,
 ) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
     Ok(None)
@@ -397,30 +397,144 @@ async fn runtime_is_current(
 #[cfg(unix)]
 const HANDOVER_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Human wording for a handover reason.
+/// The lifecycle line a retiring runtime reports: exactly the two things the
+/// drain waits for, so a user can see WHY it has not exited yet.
+///
+/// When the drain is blocked by live background work, the real tasks are named
+/// (id, command, age) instead of a bare count — a bare count tells the user
+/// nothing about what to do next. The list comes from the runtime's own
+/// `BackgroundTaskRegistry` via `RuntimeInfo.health.blockers`, so it is the
+/// same set `alive_count` counts, never a `ps` guess.
 #[cfg(unix)]
-fn restart_reason_label(reason: leveler_client_protocol::RestartReason) -> &'static str {
-    use leveler_client_protocol::RestartReason;
-    match reason {
-        RestartReason::BuildMismatch => "build mismatch",
-        RestartReason::ConfigChanged => "configuration changed",
-        RestartReason::UpdateReady => "a newer build is installed",
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandoffLang {
+    Zh,
+    En,
+}
+
+#[cfg(unix)]
+impl HandoffLang {
+    /// The UI language, resolved the same way every other surface resolves it.
+    fn current() -> Self {
+        match leveler_tui::Locale::resolve(None) {
+            leveler_tui::Locale::En => Self::En,
+            leveler_tui::Locale::Zh => Self::Zh,
+        }
+    }
+
+    fn pick(self, zh: &'static str, en: &'static str) -> &'static str {
+        match self {
+            Self::Zh => zh,
+            Self::En => en,
+        }
     }
 }
 
-/// The lifecycle line a retiring runtime reports: exactly the two things the
-/// drain waits for, so a user can see WHY it has not exited yet.
 #[cfg(unix)]
 fn retiring_status(health: &leveler_client_protocol::RuntimeHealth) -> String {
+    retiring_status_lang(health, HandoffLang::current())
+}
+
+/// The lifecycle line a retiring runtime reports, in the user's language.
+///
+/// The user thinks in *versions*, never in "runtimes": this text says "the
+/// previous CodeLeveler version" and never exposes `quiescent`, a fingerprint
+/// or a pgid. The counts are the runtime's own.
+#[cfg(unix)]
+fn retiring_status_lang(
+    health: &leveler_client_protocol::RuntimeHealth,
+    lang: HandoffLang,
+) -> String {
     let phase = if health.quiescent() {
-        "quiescent, exiting"
+        lang.pick("正在退出", "exiting")
     } else {
-        "finishing existing work"
+        lang.pick("正在完成现有工作", "finishing existing work")
     };
+    let mut text = format!(
+        "{} {} · {} {} · {phase}",
+        lang.pick("当前轮次", "turns"),
+        health.active_turns,
+        lang.pick("后台任务", "background tasks"),
+        health.active_background_tasks,
+    );
+    if health.quiescent() || health.blockers.is_empty() {
+        return text;
+    }
+    text.push_str(&format!(
+        "\n\n  {}",
+        lang.pick(
+            "旧版本 CodeLeveler 仍有任务正在执行：",
+            "The previous CodeLeveler version still has running tasks:",
+        )
+    ));
+    for blocker in &health.blockers {
+        text.push_str(&format!(
+            "\n    {}  {}  {}",
+            blocker.task_id,
+            blocker_command_line(&blocker.program, &blocker.args),
+            format_task_age(blocker.elapsed_ms),
+        ));
+    }
+    text.push_str(&format!(
+        "\n\n  {} leveler background logs <task_id>",
+        lang.pick("查看：", "Inspect:")
+    ));
+    text.push_str(&format!(
+        "\n  {}    leveler background stop <task_id>",
+        lang.pick("停止：", "Stop:   ")
+    ));
+    text
+}
+
+/// A stable identity for the handoff state, used only to decide whether to
+/// restate it. Deliberately excludes anything that changes every poll (a
+/// task's age), so a long wait prints once, not every interval.
+#[cfg(unix)]
+fn handoff_key(health: &leveler_client_protocol::RuntimeHealth) -> String {
     format!(
-        "turns {} · background tasks {} · {phase}",
-        health.active_turns, health.active_background_tasks
+        "{}|{}|{}|{}",
+        health.active_turns,
+        health.active_background_tasks,
+        health.quiescent(),
+        health
+            .blockers
+            .iter()
+            .map(|blocker| blocker.task_id.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     )
+}
+
+/// `program args…` as one line, so a blocker reads as the command it is.
+#[cfg(unix)]
+pub(crate) fn blocker_command_line(program: &str, args: &[String]) -> String {
+    let mut line = program.to_string();
+    for arg in args {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    line
+}
+
+/// A compact age for the blocker line (`1d 01h`, `18m`, `4s`).
+#[cfg(unix)]
+pub(crate) fn format_task_age(elapsed_ms: u64) -> String {
+    let secs = elapsed_ms / 1000;
+    let (days, hours, minutes, seconds) = (
+        secs / 86_400,
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60,
+    );
+    if days > 0 {
+        format!("{days}d {hours:02}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// Observe a retiring runtime until it is gone and replaced (or simply gone).
@@ -442,13 +556,14 @@ fn retiring_status(health: &leveler_client_protocol::RuntimeHealth) -> String {
 async fn observe_retiring_runtime(
     client: &LocalSocketRuntimeClient,
     socket_path: &Path,
-    reason: leveler_client_protocol::RestartReason,
+    _reason: leveler_client_protocol::RestartReason,
     observed_pid: Option<u32>,
     interval: Duration,
 ) {
     let mut last = String::new();
     loop {
-        let status = match leveler_local_transport::LocalRuntimeService::runtime_info(client).await
+        let (key, status) = match leveler_local_transport::LocalRuntimeService::runtime_info(client)
+            .await
         {
             Ok(info) => {
                 if observed_pid.is_some_and(|pid| info.pid != pid) {
@@ -456,7 +571,11 @@ async fn observe_retiring_runtime(
                     // the old generation is gone and the handover is done.
                     return;
                 }
-                retiring_status(&info.health)
+                // Dedupe on what actually changed — counts, phase, and the
+                // blocker identity — never on the rendered age: a running
+                // task's age grows every poll, and reprinting the whole block
+                // every few seconds is noise, not news.
+                (handoff_key(&info.health), retiring_status(&info.health))
             }
             Err(_) => {
                 if tokio::net::UnixStream::connect(socket_path).await.is_err() {
@@ -467,17 +586,27 @@ async fn observe_retiring_runtime(
                 // Still alive but not answering the handshake (an older
                 // generation): say so once, then keep waiting rather than
                 // failing the startup on a runtime we cannot read.
-                "state unobservable (the old runtime does not answer the handshake)".to_string()
+                let lang = HandoffLang::current();
+                let status = lang
+                    .pick(
+                        "旧版本 CodeLeveler 未响应握手，暂时无法读取其状态。",
+                        "The previous CodeLeveler version does not answer the handshake; its state cannot be read yet.",
+                    )
+                    .to_string();
+                (status.clone(), status)
             }
         };
-        if status != last {
+        if key != last {
+            let lang = HandoffLang::current();
             eprintln!(
-                "Runtime update pending: the previous local runtime is retiring ({}).\n  \
-                 {status}\n  \
-                 Existing work will not be interrupted.",
-                restart_reason_label(reason),
+                "{}\n  {status}\n  {}",
+                lang.pick("版本更新等待中", "Version update pending"),
+                lang.pick(
+                    "现有任务不会被自动中断，完成后将自动切换到当前版本。",
+                    "Existing work will not be interrupted; the current version will take over automatically.",
+                ),
             );
-            last = status;
+            last = key;
         }
         tokio::time::sleep(interval).await;
     }
@@ -536,9 +665,21 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
             // might be busy. Leave it alone and say so — replacing a runtime
             // we cannot reason about is how active work gets destroyed.
             RuntimeConsistency::Unknown => {
+                let lang = HandoffLang::current();
                 anyhow::bail!(
-                    "the local runtime is from an unknown build and cannot be verified; \
-                     stop it and start CodeLeveler again"
+                    "{}\n  {}\n{}",
+                    lang.pick(
+                        "发现旧版本 CodeLeveler",
+                        "Previous CodeLeveler version detected",
+                    ),
+                    lang.pick(
+                        "当前项目仍连接到不支持自动版本切换的早期版本。",
+                        "This project is still connected to an earlier version that cannot complete an automatic version switch.",
+                    ),
+                    lang.pick(
+                        "该版本无法自动完成版本切换；请退出后重新启动 CodeLeveler 以切换到当前版本。",
+                        "This version cannot complete an automatic version switch. Exit and start CodeLeveler again to switch to the current version.",
+                    ),
                 );
             }
             RuntimeConsistency::Outdated { runtime, expected } => {
@@ -744,9 +885,11 @@ pub(crate) async fn cmd_tui(
     session: Option<String>,
     config_overridden: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    // Best-effort start-up self-update, before the terminal is taken over. A
-    // successful install replaces this process in place (preserving argv); any
-    // failure is logged and the current version starts normally.
+    // Start-up self-update is OPT-IN and, when enabled, must run before the
+    // terminal is taken over: a successful install replaces this process in
+    // place, which is only safe outside the alternate screen. It is off by
+    // default ([update].auto_update = false) so the default start-up path is
+    // local and makes no network request; a user who wants it opts in.
     crate::upgrade_cmd::run_startup_update().await;
     if in_process && socket.is_some() {
         anyhow::bail!("--socket cannot be combined with --in-process");
@@ -931,6 +1074,7 @@ pub(crate) async fn cmd_tui(
             Some(web_launcher),
             Some(make_url_opener()),
             Some(remote_launcher),
+            Some(crate::clean_cmd::clean_host()),
             boot,
         )
         .await?;
@@ -1055,6 +1199,7 @@ pub(crate) async fn cmd_tui(
         Some(web_launcher),
         Some(make_url_opener()),
         Some(remote_launcher),
+        Some(crate::clean_cmd::clean_host()),
         boot,
     )
     .await?;
@@ -2382,6 +2527,68 @@ mod daemon_bind_tests {
         let _ = daemon_task.await;
     }
 
+    /// Healthy attach must be a local operation with no noticeable latency:
+    /// probe the socket, connect, and read one `RuntimeInfo`. No scan, no GC,
+    /// no network. Twenty warm samples so the numbers mean something.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn healthy_attach_probe_is_local_and_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let mut bound = bind_daemon_transports(
+            &sock,
+            None,
+            None,
+            test_service(),
+            leveler_local_transport::LocalWaiters::new(),
+        )
+        .await
+        .expect("server binds");
+        let unix = bound.unix.take().expect("unix listener");
+        let server_shutdown = tokio_util::sync::CancellationToken::new();
+        let server_task = tokio::spawn(unix.serve(server_shutdown.clone()));
+
+        // Warm up: the first connect creates the transport.
+        let warm = connect_default_runtime(&sock).await.unwrap();
+        assert!(warm.is_some(), "the bound socket must answer");
+        drop(warm);
+
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let client = connect_default_runtime(&sock)
+                .await
+                .expect("probe")
+                .expect("connected");
+            // The real healthy path then reads one RuntimeInfo. Bounded so a
+            // non-answering test service can never hang this measurement.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                leveler_local_transport::LocalRuntimeService::runtime_info(&client),
+            )
+            .await;
+            samples.push(start.elapsed());
+            drop(client);
+        }
+        samples.sort();
+        let median = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        let max = *samples.last().unwrap();
+        eprintln!(
+            "healthy attach probe: median={median:?} p95={p95:?} max={max:?} (20 warm samples, local socket only)"
+        );
+        assert!(
+            median < Duration::from_millis(100),
+            "healthy attach median {median:?} exceeds 100ms"
+        );
+        assert!(
+            p95 < Duration::from_millis(200),
+            "healthy attach p95 {p95:?} exceeds 200ms"
+        );
+
+        server_shutdown.cancel();
+        let _ = server_task.await;
+    }
+
     #[tokio::test]
     async fn second_daemon_on_the_same_socket_fails_fast() {
         let dir = tempfile::tempdir().unwrap();
@@ -2738,5 +2945,160 @@ mod parent_reasoning_tests {
     #[test]
     fn an_unknown_level_is_refused() {
         assert!(parent_reasoning_override(Some("hihg".into())).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod handoff_status_tests {
+    use super::*;
+    use leveler_client_protocol::{RuntimeHealth, UiBackgroundTaskBlocker};
+
+    fn blocker(
+        task_id: &str,
+        program: &str,
+        args: &[&str],
+        elapsed_ms: u64,
+    ) -> UiBackgroundTaskBlocker {
+        UiBackgroundTaskBlocker {
+            task_id: task_id.to_string(),
+            program: program.to_string(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            elapsed_ms,
+            session_id: None,
+            log_tail: String::new(),
+        }
+    }
+
+    /// PV1/PV2 — the version-handover copy is bilingual product text, and the
+    /// user never sees the internal word "runtime".
+    #[test]
+    fn the_handover_copy_is_bilingual_and_never_says_runtime() {
+        let health = RuntimeHealth {
+            active_background_tasks: 1,
+            blockers: vec![blocker("bg-1", "make", &["up"], 1_080_000)],
+            ..Default::default()
+        };
+        let zh = retiring_status_lang(&health, HandoffLang::Zh);
+        assert!(zh.contains("旧版本 CodeLeveler"), "{zh}");
+        assert!(zh.contains("后台任务"), "{zh}");
+        assert!(!zh.contains("旧运行时"), "{zh}");
+
+        let en = retiring_status_lang(&health, HandoffLang::En);
+        assert!(en.contains("previous CodeLeveler version"), "{en}");
+        assert!(!en.contains("previous runtime"), "{en}");
+        assert!(!en.contains("quiescent"), "{en}");
+    }
+
+    /// PV3/PV4 — a known handover reason must not leak a raw build hash, and an
+    /// unknown version must not invent one. The status line carries counts and
+    /// user wording only.
+    #[test]
+    fn the_handover_status_has_no_raw_build_hash() {
+        let health = RuntimeHealth {
+            quiescent: true,
+            ..Default::default()
+        };
+        let en = retiring_status_lang(&health, HandoffLang::En);
+        assert!(!en.contains("fingerprint"), "{en}");
+        assert!(!en.contains("pgid"), "{en}");
+    }
+
+    #[test]
+    fn an_idle_runtime_shows_no_blocker_list() {
+        let health = RuntimeHealth {
+            quiescent: true,
+            ..Default::default()
+        };
+        let text = retiring_status_lang(&health, HandoffLang::En);
+        assert!(text.contains("exiting"), "{text}");
+        assert!(!text.contains("running tasks"), "{text}");
+    }
+
+    #[test]
+    fn a_blocked_handover_names_the_command_age_and_stop_path() {
+        let health = RuntimeHealth {
+            active_background_tasks: 1,
+            blockers: vec![blocker("bg-1", "make", &["up"], 90_061_000)],
+            ..Default::default()
+        };
+        let text = retiring_status_lang(&health, HandoffLang::En);
+        assert!(text.contains("finishing existing work"), "{text}");
+        assert!(
+            text.contains("previous CodeLeveler version still has running tasks"),
+            "{text}"
+        );
+        assert!(text.contains("bg-1"), "{text}");
+        assert!(text.contains("make up"), "{text}");
+        assert!(text.contains("1d 01h"), "{text}");
+        assert!(text.contains("leveler background stop"), "{text}");
+    }
+
+    #[test]
+    fn every_live_blocker_is_listed_oldest_first() {
+        let health = RuntimeHealth {
+            active_background_tasks: 3,
+            blockers: vec![
+                blocker("bg-1", "make", &["up"], 90_061_000),
+                blocker("bg-4", "pnpm", &["dev"], 1_080_000),
+                blocker("bg-7", "cargo", &["watch"], 4_000),
+            ],
+            ..Default::default()
+        };
+        let text = retiring_status_lang(&health, HandoffLang::En);
+        let first = text.find("bg-1").expect("bg-1 named");
+        let second = text.find("bg-4").expect("bg-4 named");
+        let third = text.find("bg-7").expect("bg-7 named");
+        assert!(first < second && second < third, "{text}");
+    }
+
+    #[test]
+    fn task_ages_render_compactly() {
+        assert_eq!(format_task_age(90_061_000), "1d 01h");
+        assert_eq!(format_task_age(1_080_000), "18m 00s");
+        assert_eq!(format_task_age(4_000), "4s");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod handoff_key_tests {
+    use super::*;
+    use leveler_client_protocol::{RuntimeHealth, UiBackgroundTaskBlocker};
+
+    fn blocker(task_id: &str, elapsed_ms: u64) -> UiBackgroundTaskBlocker {
+        UiBackgroundTaskBlocker {
+            task_id: task_id.to_string(),
+            program: "make".to_string(),
+            args: vec!["up".to_string()],
+            elapsed_ms,
+            session_id: None,
+            log_tail: String::new(),
+        }
+    }
+
+    /// A stable blocker's growing age must not restate the handoff block.
+    #[test]
+    fn a_growing_age_does_not_change_the_key() {
+        let a = RuntimeHealth {
+            active_background_tasks: 1,
+            blockers: vec![blocker("bg-1", 1_000)],
+            ..Default::default()
+        };
+        let b = RuntimeHealth {
+            active_background_tasks: 1,
+            blockers: vec![blocker("bg-1", 90_000)],
+            ..Default::default()
+        };
+        assert_eq!(handoff_key(&a), handoff_key(&b));
+    }
+
+    #[test]
+    fn a_changed_blocker_set_changes_the_key() {
+        let a = RuntimeHealth {
+            active_background_tasks: 1,
+            blockers: vec![blocker("bg-1", 1_000)],
+            ..Default::default()
+        };
+        let none = RuntimeHealth::default();
+        assert_ne!(handoff_key(&a), handoff_key(&none));
     }
 }

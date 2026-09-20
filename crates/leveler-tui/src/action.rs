@@ -112,6 +112,24 @@ pub enum Action {
     UpdateStep(leveler_update::UpdateStep),
     /// `/update` ended: installed, already current, or failed with a reason.
     UpdateFinished(Result<leveler_update::UpdateOutcome, String>),
+    /// A local storage scan finished: the plan, or why it could not be built.
+    CleanScanned(Result<crate::clean::CleanPlanView, String>),
+    /// A safe cleanup finished: what it reclaimed, or why it could not run.
+    CleanRan(Result<crate::clean::CleanResultView, String>),
+}
+
+/// Injected at startup by the CLI: local storage cleanup for `/clean`.
+///
+/// Both calls are **blocking** (they walk the filesystem); the event loop runs
+/// them on a blocking thread so the UI never freezes. Opaque so `leveler-tui`
+/// need not depend on the storage engine.
+#[derive(Clone)]
+pub struct CleanHost {
+    /// Build a fresh plan (scan). Also captures the frozen plan the host will
+    /// execute, so the run operates on exactly what the user was shown.
+    pub scan: std::sync::Arc<dyn Fn() -> crate::clean::CleanPlanView + Send + Sync>,
+    /// Execute the safe subset of the plan the last scan produced.
+    pub run_safe: std::sync::Arc<dyn Fn() -> crate::clean::CleanResultView + Send + Sync>,
 }
 
 /// A side effect for the event loop to carry out.
@@ -159,6 +177,13 @@ pub enum Effect {
     /// The reducer only emits this while idle, so it cannot replace the binary
     /// under a running task.
     StartUpdate,
+    /// Scan CodeLeveler-owned storage for reclaimable items (`/clean`). The
+    /// event loop runs it on a blocking thread and folds the plan back as
+    /// [`Action::CleanScanned`]; the UI stays responsive.
+    StartCleanScan,
+    /// Run the safe cleanup over the plan the scan produced. Blocking; folded
+    /// back as [`Action::CleanRan`]. Only `Safety::Safe` items are removed.
+    RunCleanSafe,
     /// Tear down the UI and exit.
     Quit,
 }

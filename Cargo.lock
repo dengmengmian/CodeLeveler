@@ -2102,6 +2102,7 @@ dependencies = [
 name = "leveler-project"
 version = "1.0.1"
 dependencies = [
+ "fs2",
  "leveler-core",
  "serde",
  "serde_yaml_ng",
@@ -2232,6 +2233,8 @@ name = "leveler-test-support"
 version = "1.0.1"
 dependencies = [
  "leveler-core",
+ "nix 0.29.0",
+ "tempfile",
  "tokio",
 ]
 

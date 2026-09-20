@@ -11,3 +11,9 @@ description = "Test utilities: a scriptable mock OpenAI-compatible provider serv
 [dependencies]
 leveler-core = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }

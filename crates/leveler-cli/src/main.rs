@@ -7,6 +7,8 @@
 
 mod agents_cmds;
 mod approver;
+mod background_cmd;
+mod clean_cmd;
 mod cli;
 mod common;
 mod completions_cmd;
@@ -292,6 +294,27 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             ModelSubcommand::Probe { model } => cmd_model_probe(layout, &model).await,
         },
         Command::Sessions(sc) => cmd_sessions(layout, sc).await,
+        Command::Background(bc) => background_cmd::cmd_background(layout, bc).await,
+        Command::Clean {
+            safe,
+            cache,
+            ephemeral,
+            stale_state,
+            needs_confirmation,
+            json,
+            manifest,
+        } => clean_cmd::cmd_clean(
+            layout,
+            clean_cmd::CleanArgs {
+                safe,
+                cache,
+                ephemeral,
+                stale_state,
+                needs_confirmation,
+                json,
+                manifest,
+            },
+        ),
         Command::Trace {
             session,
             seq,

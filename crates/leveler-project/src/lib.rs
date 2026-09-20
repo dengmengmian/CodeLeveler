@@ -7,8 +7,9 @@
 
 pub mod config;
 pub mod detect;
+pub mod hygiene;
 pub mod layout;
 
 pub use config::{CommandSpec, IndependentReview, ProjectConfig, RunLimitsConfig, VerifySpec};
 pub use detect::{Language, detect_languages};
-pub use layout::Layout;
+pub use layout::{EphemeralHome, Layout};

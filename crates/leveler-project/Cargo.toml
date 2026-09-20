@@ -10,6 +10,7 @@ description = "Project/language detection and CodeLeveler filesystem layout."
 
 [dependencies]
 leveler-core = { workspace = true }
+fs2 = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }

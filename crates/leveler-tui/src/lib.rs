@@ -19,6 +19,7 @@ mod activity_stream;
 pub mod agents_view;
 mod brand;
 pub mod btw;
+pub mod clean;
 mod code_block;
 pub mod composer;
 pub mod context;
@@ -63,8 +64,8 @@ mod workbench;
 mod run;
 
 pub use action::{
-    PairingRequest, RemoteInvite, RemoteLauncher, RemoteOutcome, RemoteRequest, UrlOpener,
-    WebLauncher,
+    CleanHost, PairingRequest, RemoteInvite, RemoteLauncher, RemoteOutcome, RemoteRequest,
+    UrlOpener, WebLauncher,
 };
 pub use i18n::Locale;
 pub use run::{TuiError, TuiExit, run};

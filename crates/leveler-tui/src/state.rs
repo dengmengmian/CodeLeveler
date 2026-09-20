@@ -271,6 +271,9 @@ pub struct AppState {
     /// `/context` inspector state: the latest runtime accounting snapshot and
     /// presentation-only disclosure/selection.
     pub context: crate::context::ContextView,
+    /// `/clean` page state: scan/cleanup stage, the plan, and the result.
+    /// Presentation-only; the CLI host owns the scan and the deletion.
+    pub clean: crate::clean::CleanState,
 
     /// Active plan from the current run, if any. Terminal plans move into the
     /// transcript and never remain in this slot.
@@ -538,6 +541,7 @@ impl AppState {
             tools_screen: ToolsScreenState::default(),
             trace: crate::observability::TraceView::default(),
             context: crate::context::ContextView::default(),
+            clean: crate::clean::CleanState::default(),
             plan: None,
             project_rule_sources: Vec::new(),
             verification: None,

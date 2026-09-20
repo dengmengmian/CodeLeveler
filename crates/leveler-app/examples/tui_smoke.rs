@@ -31,7 +31,6 @@ use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEvent};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
-use leveler_project::Layout;
 
 #[derive(Debug, Clone)]
 struct Scenario {
@@ -69,7 +68,13 @@ async fn main() -> anyhow::Result<()> {
     };
     let model = ModelRef::parse(&model_arg).expect("provider/model");
 
-    let layout = Layout::resolve(std::env::current_dir()?, None);
+    let repo = std::env::current_dir()?;
+    // Automated dogfood: runtime state, sockets and the browser profile live in
+    // a disposable home, so a smoke run never writes per-project state into the
+    // user's persistent `~/.leveler`. Config still resolves from the real
+    // environment. The home is removed when `main` returns.
+    let home = leveler_project::EphemeralHome::create("tui-smoke")?;
+    let layout = home.layout(repo, None);
     let repo = layout.repo_root.display().to_string();
     let app = Arc::new(Application::assemble(layout)?);
     let session_id = app

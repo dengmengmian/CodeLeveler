@@ -294,6 +294,11 @@ pub struct RuntimeHealth {
     /// `Quit` and for a runtime that is still serving.
     #[serde(default)]
     pub retiring_reason: Option<crate::RestartReason>,
+    /// The live tasks behind `active_background_tasks`, oldest first. Empty on
+    /// an idle runtime and on every runtime older than this field; additive so
+    /// an old client still decodes. Read-only: see [`UiBackgroundTaskBlocker`].
+    #[serde(default)]
+    pub blockers: Vec<UiBackgroundTaskBlocker>,
 }
 
 impl RuntimeHealth {
@@ -405,6 +410,30 @@ pub struct UiActiveBackgroundTask {
     pub args: Vec<String>,
     /// Runtime-observed age at snapshot time.
     pub elapsed_ms: u64,
+}
+
+/// One live background task that is keeping a runtime from becoming idle.
+///
+/// Read-only status detail: a publishing runtime names the real blocker
+/// instead of a bare count, so a client waiting on a handover can show what is
+/// owed. It carries no authority — stopping the task still goes through the
+/// session-scoped `CancelBackgroundTask` command, never a raw signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiBackgroundTaskBlocker {
+    pub task_id: String,
+    pub program: String,
+    pub args: Vec<String>,
+    /// Runtime-observed age at answer time.
+    pub elapsed_ms: u64,
+    /// The session that owns the task, when known. `CancelBackgroundTask` is
+    /// session-scoped, so this is what makes the blocker stoppable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Bounded tail of the task's combined output, for a read-only view that
+    /// does not need the interactive UI.
+    #[serde(default)]
+    pub log_tail: String,
 }
 
 /// Everything a client needs to render a session's header and transcript.

@@ -4383,6 +4383,24 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         // The SAME reading the drain waits on: a client's view of "idle" is
         // never a second accounting.
         let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await;
+        // Name the tasks behind the count, from the same registry the drain
+        // waits on. Read-only: stopping one still goes through
+        // `CancelBackgroundTask`.
+        let blockers = self
+            .app
+            .background_tasks()
+            .active_snapshots()
+            .await
+            .into_iter()
+            .map(|task| leveler_client_protocol::UiBackgroundTaskBlocker {
+                task_id: task.id,
+                program: task.program,
+                args: task.args,
+                elapsed_ms: task.duration_ms,
+                session_id: task.owner_scope.map(leveler_core::SessionId::new),
+                log_tail: background_log_tail(&task.log),
+            })
+            .collect();
         Ok(leveler_client_protocol::RuntimeInfo {
             runtime_id,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -4401,9 +4419,27 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 turn_capacity: Some(capacity as u32),
                 shutting_down,
                 retiring_reason,
+                blockers,
             },
         })
     }
+}
+
+/// Largest tail of a background task's output carried in a runtime-health
+/// answer. The full log stays in the registry; this is only enough for a
+/// read-only glance from a client that is not attached to the task stream.
+const BACKGROUND_LOG_TAIL_BYTES: usize = 2_000;
+
+/// The last [`BACKGROUND_LOG_TAIL_BYTES`] of `log`, cut on a char boundary.
+fn background_log_tail(log: &str) -> String {
+    if log.len() <= BACKGROUND_LOG_TAIL_BYTES {
+        return log.to_string();
+    }
+    let start = log.len() - BACKGROUND_LOG_TAIL_BYTES;
+    let start = (start..log.len())
+        .find(|index| log.is_char_boundary(*index))
+        .unwrap_or(log.len());
+    log[start..].to_string()
 }
 
 fn mime_from_name(name: &str) -> String {

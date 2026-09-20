@@ -10,7 +10,7 @@ use super::overlay_keys::{
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{
-    open_context, open_diff_screen, open_sessions_screen, open_trace, toggle_screen,
+    open_clean, open_context, open_diff_screen, open_sessions_screen, open_trace, toggle_screen,
 };
 
 /// "The composer text just changed" hook: re-arm the slash popup and drop any
@@ -511,6 +511,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             open_trace(state, id)
         }
         "context" => open_context(state),
+        "clean" => open_clean(state),
         "work-mode" => set_work_mode(state, command),
         "collab" => set_collab_cmd(state, command),
         "memory" => memory_slash(state, command),

@@ -168,6 +168,47 @@ pub enum Command {
     #[command(subcommand)]
     Sessions(SessionsCommand),
 
+    /// Inspect and stop background tasks on this repository's local runtime.
+    ///
+    /// A background task (a dev server, a watcher) outlives the turn that
+    /// started it, and a retiring runtime waits for it instead of interrupting
+    /// it. `list` names the tasks a handover is waiting on, `logs` reads one,
+    /// and `stop` asks the runtime to end one — the runtime, not this CLI,
+    /// signals the process.
+    #[command(subcommand)]
+    Background(BackgroundCommand),
+
+    /// Analyze and reclaim CodeLeveler's own local storage.
+    ///
+    /// With no action flag this is a dry run: it reports what could be
+    /// reclaimed and deletes nothing. `--safe` reclaims only provably-safe
+    /// items — rebuildable caches, expired run residue, dead socket/lock
+    /// metadata, historical automation state. Durable sessions and artifacts
+    /// are never removed by `--safe`.
+    Clean {
+        /// Reclaim only provably-safe items.
+        #[arg(long)]
+        safe: bool,
+        /// Reclaim rebuildable tool caches over the size budget.
+        #[arg(long)]
+        cache: bool,
+        /// Reclaim expired ephemeral run residue.
+        #[arg(long)]
+        ephemeral: bool,
+        /// Reclaim dead sockets and orphan lock metadata.
+        #[arg(long)]
+        stale_state: bool,
+        /// Include items that require explicit confirmation.
+        #[arg(long)]
+        needs_confirmation: bool,
+        /// Print the plan as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Write the frozen cleanup plan here before deleting anything.
+        #[arg(long, value_name = "PATH")]
+        manifest: Option<PathBuf>,
+    },
+
     /// Inspect durable runtime observation (EventLog + model requests).
     Trace {
         /// Session id (defaults to the most recently updated session).
@@ -815,6 +856,20 @@ pub enum SessionsCommand {
     Delete { id: String },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum BackgroundCommand {
+    /// List live background tasks on the local runtime.
+    List {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a live background task's recent output.
+    Logs { task_id: String },
+    /// Ask the runtime to stop one background task and its process group.
+    Stop { task_id: String },
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -1366,6 +1421,22 @@ mod tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn background_parses_list_logs_and_stop() {
+        assert!(matches!(
+            parse(&["leveler", "background", "list"]).command,
+            Some(Command::Background(BackgroundCommand::List { .. }))
+        ));
+        assert!(matches!(
+            parse(&["leveler", "background", "logs", "bg-1"]).command,
+            Some(Command::Background(BackgroundCommand::Logs { task_id })) if task_id == "bg-1"
+        ));
+        assert!(matches!(
+            parse(&["leveler", "background", "stop", "bg-1"]).command,
+            Some(Command::Background(BackgroundCommand::Stop { task_id })) if task_id == "bg-1"
+        ));
     }
 
     #[test]

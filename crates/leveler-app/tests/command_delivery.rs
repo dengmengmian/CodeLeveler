@@ -108,8 +108,16 @@ async fn build_client() -> (
     (tmp, app, client, session_id)
 }
 
-#[tokio::test]
-async fn duplicate_command_id_dispatches_once() {
+#[test]
+fn duplicate_command_id_dispatches_once() {
+    leveler_test_support::bounded_test(
+        "duplicate_command_id_dispatches_once",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        duplicate_command_id_dispatches_once_body,
+    );
+}
+
+async fn duplicate_command_id_dispatches_once_body() {
     let (_tmp, app, client, session_id) = build_client().await;
     let mut rx = client.subscribe();
     let envelope = CommandEnvelope {
@@ -139,8 +147,16 @@ async fn duplicate_command_id_dispatches_once() {
     settle_background_turns(&app, &client, &[&session_id]).await;
 }
 
-#[tokio::test]
-async fn stale_expected_version_is_rejected() {
+#[test]
+fn stale_expected_version_is_rejected() {
+    leveler_test_support::bounded_test(
+        "stale_expected_version_is_rejected",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        stale_expected_version_is_rejected_body,
+    );
+}
+
+async fn stale_expected_version_is_rejected_body() {
     let (_tmp, _app, client, session_id) = build_client().await;
     // The fresh session's log is at 0; a command expecting version 999 was
     // issued against a stale view and must be rejected (resync required).
@@ -160,8 +176,16 @@ async fn stale_expected_version_is_rejected() {
     );
 }
 
-#[tokio::test]
-async fn envelope_command_session_mismatch_is_rejected() {
+#[test]
+fn envelope_command_session_mismatch_is_rejected() {
+    leveler_test_support::bounded_test(
+        "envelope_command_session_mismatch_is_rejected",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        envelope_command_session_mismatch_is_rejected_body,
+    );
+}
+
+async fn envelope_command_session_mismatch_is_rejected_body() {
     let (_tmp, _app, client, session_id) = build_client().await;
     // The envelope targets the real session, but the command payload targets a
     // different one — version/receipt checks would key off A while B is acted on.
@@ -181,8 +205,16 @@ async fn envelope_command_session_mismatch_is_rejected() {
     );
 }
 
-#[tokio::test]
-async fn reused_command_id_with_different_payload_is_rejected() {
+#[test]
+fn reused_command_id_with_different_payload_is_rejected() {
+    leveler_test_support::bounded_test(
+        "reused_command_id_with_different_payload_is_rejected",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        reused_command_id_with_different_payload_is_rejected_body,
+    );
+}
+
+async fn reused_command_id_with_different_payload_is_rejected_body() {
     let (_tmp, _app, client, session_id) = build_client().await;
     let first = CommandEnvelope {
         command_id: CommandId::new("cmd-payload-conflict"),
@@ -223,8 +255,16 @@ fn submission(command_id: &str, session_id: &SessionId, content: &str) -> Comman
 /// envelope. After the runtime that admitted it is gone and a new one reads the
 /// same state, that retry must be answered from the durable receipt — delivered —
 /// and must not start a second turn.
-#[tokio::test]
-async fn a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn() {
+#[test]
+fn a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn() {
+    leveler_test_support::bounded_test(
+        "a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn_body,
+    );
+}
+
+async fn a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn_body() {
     let (tmp, app, client, session_id) = build_client().await;
     let envelope = submission("cmd-restart", &session_id, "survive a restart");
     client.deliver(envelope.clone()).await.unwrap();
@@ -322,8 +362,16 @@ async fn turns(app: &Application, session_id: &SessionId) -> usize {
 
 /// Another boot admitted the command and still holds its lease: it may yet
 /// settle the receipt. A retry learns nothing new — no answer, and no rerun.
-#[tokio::test]
-async fn a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun() {
+#[test]
+fn a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun() {
+    leveler_test_support::bounded_test(
+        "a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun_body,
+    );
+}
+
+async fn a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun_body() {
     let (_tmp, app, client, session_id) = build_client().await;
     let other_boot = RuntimeBootLease::acquire(&app.layout.state_dir).unwrap();
     let envelope = submission("cmd-live-elsewhere", &session_id, "still running there");
@@ -348,8 +396,16 @@ async fn a_dispatching_receipt_of_a_live_boot_stays_unknown_and_is_not_rerun() {
 /// does for a killed process — and the receipt is still `dispatching`. Nothing
 /// can settle it any more: an authoritative unresolvable answer, the same on
 /// every later delivery, and the command never runs again.
-#[tokio::test]
-async fn a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun() {
+#[test]
+fn a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun() {
+    leveler_test_support::bounded_test(
+        "a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun_body,
+    );
+}
+
+async fn a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun_body() {
     let (_tmp, app, client, session_id) = build_client().await;
     let crashed_boot = RuntimeBootLease::acquire(&app.layout.state_dir).unwrap();
     let envelope = submission("cmd-orphaned", &session_id, "died mid-dispatch");
@@ -375,8 +431,16 @@ async fn a_dispatching_receipt_of_an_ended_boot_is_unresolvable_and_not_rerun() 
 /// application's boot admitted — the boot its turns are owned by — is judged
 /// as this boot's own: not in flight here means abandoned, with no probe that
 /// would find the application's own lease held and answer "still alive".
-#[tokio::test]
-async fn a_receipt_of_the_applications_boot_is_judged_as_this_boots_own() {
+#[test]
+fn a_receipt_of_the_applications_boot_is_judged_as_this_boots_own() {
+    leveler_test_support::bounded_test(
+        "a_receipt_of_the_applications_boot_is_judged_as_this_boots_own",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_receipt_of_the_applications_boot_is_judged_as_this_boots_own_body,
+    );
+}
+
+async fn a_receipt_of_the_applications_boot_is_judged_as_this_boots_own_body() {
     let (_tmp, app, client, session_id) = build_client().await;
     let envelope = submission("cmd-own-boot", &session_id, "admitted by this boot");
     leave_dispatching(&app, &envelope, &app.boot_id().unwrap()).await;
@@ -394,8 +458,16 @@ async fn a_receipt_of_the_applications_boot_is_judged_as_this_boots_own() {
 /// ended without settling the receipt (its dispatch returned an error, which
 /// cannot prove nothing happened). A later delivery of the same id — the
 /// client never saw that answer — is unresolvable, not a second dispatch.
-#[tokio::test]
-async fn a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelivery() {
+#[test]
+fn a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelivery() {
+    leveler_test_support::bounded_test(
+        "a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelivery",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelivery_body,
+    );
+}
+
+async fn a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelivery_body() {
     let (_tmp, _app, client, session_id) = build_client().await;
     let envelope = CommandEnvelope {
         command_id: CommandId::new("cmd-ended-here"),
@@ -418,8 +490,16 @@ async fn a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelive
 /// Model selection is a session action. A repository-local model may not exist
 /// anywhere else, so selecting it must never rewrite the user's global default
 /// and make another repository unable to start.
-#[tokio::test]
-async fn selecting_a_model_does_not_rewrite_the_global_default() {
+#[test]
+fn selecting_a_model_does_not_rewrite_the_global_default() {
+    leveler_test_support::bounded_test(
+        "selecting_a_model_does_not_rewrite_the_global_default",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        selecting_a_model_does_not_rewrite_the_global_default_body,
+    );
+}
+
+async fn selecting_a_model_does_not_rewrite_the_global_default_body() {
     let (_tmp, _app, client, session_id) = build_client().await;
     let path = leveler_app::GlobalConfig::path().expect("isolated global config path");
     let original = "default_model = \"global/keep\"\n";
@@ -437,8 +517,16 @@ async fn selecting_a_model_does_not_rewrite_the_global_default() {
     std::fs::remove_file(path).unwrap();
 }
 
-#[tokio::test]
-async fn runtime_reports_the_config_generation_loaded_at_boot() {
+#[test]
+fn runtime_reports_the_config_generation_loaded_at_boot() {
+    leveler_test_support::bounded_test(
+        "runtime_reports_the_config_generation_loaded_at_boot",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        runtime_reports_the_config_generation_loaded_at_boot_body,
+    );
+}
+
+async fn runtime_reports_the_config_generation_loaded_at_boot_body() {
     let (tmp, app, client, _session_id) = build_client().await;
     let before = client
         .runtime_info()
@@ -467,8 +555,16 @@ async fn runtime_reports_the_config_generation_loaded_at_boot() {
 /// is still admitting or dispatching the command must never be judged
 /// orphaned. Delivered concurrently many times, the answers are only
 /// "delivered" or "no answer yet", and each command makes one turn.
-#[tokio::test]
-async fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable() {
+#[test]
+fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable() {
+    leveler_test_support::bounded_test(
+        "concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable_body,
+    );
+}
+
+async fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable_body() {
     let (_tmp, app, _client, _session) = build_client().await;
     let client = Arc::new(
         InProcessRuntimeClient::new_with_options(
@@ -513,8 +609,16 @@ async fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable() {
 /// M-3 — a trusted-local AutoApprove session keeps its policy per-session, and a
 /// session known only from the DB (a restore) is fail-closed to Interactive: an
 /// AutoApprove policy is never persisted and re-granted on restore.
-#[tokio::test]
-async fn auto_approve_is_per_session_and_restore_is_fail_closed() {
+#[test]
+fn auto_approve_is_per_session_and_restore_is_fail_closed() {
+    leveler_test_support::bounded_test(
+        "auto_approve_is_per_session_and_restore_is_fail_closed",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        auto_approve_is_per_session_and_restore_is_fail_closed_body,
+    );
+}
+
+async fn auto_approve_is_per_session_and_restore_is_fail_closed_body() {
     use leveler_client_protocol::ApprovalPolicy;
     let (_tmp, _app, client, restored_session) = build_client().await;
 
@@ -550,8 +654,16 @@ async fn auto_approve_is_per_session_and_restore_is_fail_closed() {
     );
 }
 
-#[tokio::test]
-async fn daemon_session_runtime_options_are_isolated_per_session() {
+#[test]
+fn daemon_session_runtime_options_are_isolated_per_session() {
+    leveler_test_support::bounded_test(
+        "daemon_session_runtime_options_are_isolated_per_session",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        daemon_session_runtime_options_are_isolated_per_session_body,
+    );
+}
+
+async fn daemon_session_runtime_options_are_isolated_per_session_body() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
@@ -602,8 +714,16 @@ async fn daemon_session_runtime_options_are_isolated_per_session() {
     );
 }
 
-#[tokio::test]
-async fn creating_a_daemon_session_does_not_reap_another_live_turn() {
+#[test]
+fn creating_a_daemon_session_does_not_reap_another_live_turn() {
+    leveler_test_support::bounded_test(
+        "creating_a_daemon_session_does_not_reap_another_live_turn",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        creating_a_daemon_session_does_not_reap_another_live_turn_body,
+    );
+}
+
+async fn creating_a_daemon_session_does_not_reap_another_live_turn_body() {
     let (_tmp, app, client, live_session) = build_client().await;
     let db = app.open_database().await.unwrap();
     TurnRepository::new(&db)
@@ -629,8 +749,16 @@ async fn creating_a_daemon_session_does_not_reap_another_live_turn() {
     );
 }
 
-#[tokio::test]
-async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
+#[test]
+fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
+    leveler_test_support::bounded_test(
+        "daemon_snapshots_keep_checkpoints_scoped_to_their_session",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        daemon_snapshots_keep_checkpoints_scoped_to_their_session_body,
+    );
+}
+
+async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session_body() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
@@ -678,8 +806,16 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session() {
     settle_background_turns(&app, &client, &[&first.session.id, &second.session.id]).await;
 }
 
-#[tokio::test]
-async fn daemon_event_subscriptions_are_isolated_per_session() {
+#[test]
+fn daemon_event_subscriptions_are_isolated_per_session() {
+    leveler_test_support::bounded_test(
+        "daemon_event_subscriptions_are_isolated_per_session",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        daemon_event_subscriptions_are_isolated_per_session_body,
+    );
+}
+
+async fn daemon_event_subscriptions_are_isolated_per_session_body() {
     let (_tmp, _app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
@@ -721,8 +857,17 @@ async fn daemon_event_subscriptions_are_isolated_per_session() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn socket_clients_receive_only_their_session_events() {
+#[test]
+fn socket_clients_receive_only_their_session_events() {
+    leveler_test_support::bounded_test(
+        "socket_clients_receive_only_their_session_events",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        socket_clients_receive_only_their_session_events_body,
+    );
+}
+
+#[cfg(unix)]
+async fn socket_clients_receive_only_their_session_events_body() {
     let (tmp, _app, runtime, _existing_session) = build_client().await;
     let path = tmp.path().join("runtime.sock");
     let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
@@ -889,8 +1034,16 @@ async fn wait_for_notification(
 /// as "do not overwrite an already-retitled placeholder", so a second
 /// session with a real goal covers it. Cancel the spawned wait-for-network
 /// loops at the end so the Tokio runtime is not torn down under them.
-#[tokio::test]
-async fn first_message_retitles_a_placeholder_session() {
+#[test]
+fn first_message_retitles_a_placeholder_session() {
+    leveler_test_support::bounded_test(
+        "first_message_retitles_a_placeholder_session",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        first_message_retitles_a_placeholder_session_body,
+    );
+}
+
+async fn first_message_retitles_a_placeholder_session_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let bootstrap = client
         .create_session(CreateSessionRequest {
@@ -958,8 +1111,16 @@ async fn first_message_retitles_a_placeholder_session() {
 /// The session-menu commands: rename overwrites the title, archive hides the
 /// session from the default list (transcript intact), fork clones record +
 /// transcript into a fresh session leaving the original untouched.
-#[tokio::test]
-async fn session_menu_rename_archive_fork_roundtrip() {
+#[test]
+fn session_menu_rename_archive_fork_roundtrip() {
+    leveler_test_support::bounded_test(
+        "session_menu_rename_archive_fork_roundtrip",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        session_menu_rename_archive_fork_roundtrip_body,
+    );
+}
+
+async fn session_menu_rename_archive_fork_roundtrip_body() {
     let (_tmp, app, client, session_id) = build_client().await;
     let db = app.open_database().await.unwrap();
     let sessions = leveler_storage::SessionRepository::new(&db);
@@ -1042,8 +1203,16 @@ async fn session_menu_rename_archive_fork_roundtrip() {
 
 /// `/clear` must be a fresh start, not a wipe: the previous session keeps its
 /// transcript and stays listed, so the move is reversible by reopening it.
-#[tokio::test]
-async fn a_new_session_leaves_the_previous_one_intact() {
+#[test]
+fn a_new_session_leaves_the_previous_one_intact() {
+    leveler_test_support::bounded_test(
+        "a_new_session_leaves_the_previous_one_intact",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_new_session_leaves_the_previous_one_intact_body,
+    );
+}
+
+async fn a_new_session_leaves_the_previous_one_intact_body() {
     let (_tmp, app, client, session_id) = build_client().await;
     client
         .send(ClientCommand::SubmitMessage {
@@ -1115,8 +1284,16 @@ async fn a_new_session_leaves_the_previous_one_intact() {
 /// conversations mid-click. The routing that prevents it is the requester's
 /// own event channel — this pins that, since the client-side rule has no
 /// correlation of its own to fall back on.
-#[tokio::test]
-async fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
+#[test]
+fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
+    leveler_test_support::bounded_test(
+        "a_new_session_reaches_only_the_tab_that_asked_for_it",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_new_session_reaches_only_the_tab_that_asked_for_it_body,
+    );
+}
+
+async fn a_new_session_reaches_only_the_tab_that_asked_for_it_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let onlooker = client
         .create_session(CreateSessionRequest {
@@ -1179,8 +1356,16 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it() {
 /// that originally held it in memory died between windows), while:
 /// restore stays fail-closed, other sessions never leak the policy, and a
 /// resume WITHOUT the flag upgrades nothing.
-#[tokio::test]
-async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime() {
+#[test]
+fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime() {
+    leveler_test_support::bounded_test(
+        "resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime_body,
+    );
+}
+
+async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime_body() {
     use leveler_client_protocol::ApprovalPolicy;
     use leveler_local_transport::LocalRuntimeService as _;
     let (_tmp, _app, client, resumed_session) = build_client().await;
@@ -1239,8 +1424,16 @@ async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime() 
 /// then said nothing at all: the screen went blank, and every way the user
 /// could learn what happened — which checkpoint, whether files moved — was a
 /// notification that only existed on the failure paths.
-#[tokio::test]
-async fn a_restored_checkpoint_says_where_it_landed() {
+#[test]
+fn a_restored_checkpoint_says_where_it_landed() {
+    leveler_test_support::bounded_test(
+        "a_restored_checkpoint_says_where_it_landed",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_restored_checkpoint_says_where_it_landed_body,
+    );
+}
+
+async fn a_restored_checkpoint_says_where_it_landed_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let opened = client
         .create_session(CreateSessionRequest {
@@ -1291,8 +1484,16 @@ async fn a_restored_checkpoint_says_where_it_landed() {
 /// the compatibility stream that carries every session, which no session-scoped
 /// client subscribes to. The failure path used the session's own stream, so a
 /// fork that worked was silent and only a fork that broke was visible.
-#[tokio::test]
-async fn a_forked_session_tells_the_session_it_was_forked_from() {
+#[test]
+fn a_forked_session_tells_the_session_it_was_forked_from() {
+    leveler_test_support::bounded_test(
+        "a_forked_session_tells_the_session_it_was_forked_from",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        a_forked_session_tells_the_session_it_was_forked_from_body,
+    );
+}
+
+async fn a_forked_session_tells_the_session_it_was_forked_from_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let opened = client
         .create_session(CreateSessionRequest {
