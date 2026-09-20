@@ -752,6 +752,7 @@ impl Application {
         develop: bool,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
+        self.ensure_memory_consolidator(&db)?;
         let repo = SessionRepository::new(&db);
         // Product axes SoT is the session row (SetProductAxes / create defaults).
         let (work_profile, read_only) = self.turn_axes(&repo, session_id).await?;
@@ -784,6 +785,7 @@ impl Application {
         } else {
             engine.run(session_id, &spec, observer, cancellation).await
         };
+        self.notify_memory_consolidator();
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),
@@ -811,6 +813,7 @@ impl Application {
         cancellation: CancellationToken,
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
+        self.ensure_memory_consolidator(&db)?;
         let repo = SessionRepository::new(&db);
         let (work_profile, read_only) = self.turn_axes(&repo, session_id).await?;
         let engine = self
@@ -835,6 +838,7 @@ impl Application {
         let result = engine
             .chat(session_id, &spec, content, observer, cancellation)
             .await;
+        self.notify_memory_consolidator();
         match result {
             Ok(report) => report_to_result(report),
             Err(error) => Err(app_error_from_engine(error)),

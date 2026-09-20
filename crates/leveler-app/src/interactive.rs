@@ -436,7 +436,7 @@ pub struct InProcessRuntimeClient {
     /// Compatibility stream containing events from every session.
     events: broadcast::Sender<RuntimeEvent>,
     /// Session-scoped streams used by daemon/socket clients.
-    session_events: Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>,
+    session_events: Arc<Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>>,
     pending: PendingApprovals,
     pending_clarify: PendingClarifications,
     /// User shell executions (`!command`): active + bounded history.
@@ -722,6 +722,40 @@ impl InProcessRuntimeClient {
         auto_approve: bool,
     ) -> Self {
         let (events, _) = broadcast::channel(2048);
+        let session_events: Arc<Mutex<HashMap<SessionId, broadcast::Sender<RuntimeEvent>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mut memory_events = app.subscribe_memory_events();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let all_events = events.clone();
+            let scoped_events = session_events.clone();
+            handle.spawn(async move {
+                loop {
+                    let event = match memory_events.recv().await {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "memory event bridge lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
+                    let runtime_event = RuntimeEvent::MemoryChanged {
+                        operation: event.operation,
+                        id: event.id,
+                        title: event.title,
+                        authority: Some(event.authority),
+                    };
+                    let _ = all_events.send(runtime_event.clone());
+                    if let Some(sender) = scoped_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&SessionId::new(event.session_id))
+                        .cloned()
+                    {
+                        let _ = sender.send(runtime_event);
+                    }
+                }
+            });
+        }
         let media_root = app.layout.state_dir.join("media");
         let in_flight = app.in_flight_commands();
         // One flag, shared: the runtime reports it and admission enforces it.
@@ -743,7 +777,7 @@ impl InProcessRuntimeClient {
             auto_approve,
             media_root,
             events,
-            session_events: Mutex::new(HashMap::new()),
+            session_events,
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_clarify: Arc::new(Mutex::new(HashMap::new())),
             steering: Arc::new(Mutex::new(HashMap::new())),

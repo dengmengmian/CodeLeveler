@@ -15,6 +15,7 @@ mod event_repo;
 mod event_store;
 mod goal_checkpoint_store;
 mod goal_store;
+mod memory_inbox_repo;
 mod message_repo;
 mod message_store;
 mod model_request_repo;
@@ -38,6 +39,9 @@ pub use goal_checkpoint_store::{
     GoalCheckpointRecord, GoalCheckpointStore, MemoryGoalCheckpointStore, NewGoalCheckpoint,
 };
 pub use goal_store::{GoalRecord, GoalState, GoalStore, MemoryGoalStore};
+pub use memory_inbox_repo::{
+    MemoryInboxCounts, MemoryInboxItem, MemoryInboxReadyState, MemoryInboxRepository,
+};
 pub use message_repo::{MessageRepository, TimedMessage};
 pub use message_store::{
     MemoryMessageStore, MemoryModelRequestStore, MessageStore, ModelRequestStore,

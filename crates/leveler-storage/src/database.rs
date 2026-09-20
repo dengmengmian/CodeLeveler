@@ -331,6 +331,52 @@ mod tests {
         );
     }
 
+    /// Creating the inbox must not reinterpret historical turns as newly
+    /// accepted work. Only inserts made after the admission trigger exists
+    /// belong in the queue.
+    #[tokio::test]
+    async fn migration_0027_does_not_backfill_historical_turns() {
+        use sqlx::ConnectOptions;
+        use sqlx::migrate::Migrate;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .connect()
+                .await
+                .unwrap();
+            conn.ensure_migrations_table().await.unwrap();
+            for migration in MIGRATOR.migrations.iter().filter(|m| m.version < 27) {
+                conn.apply(migration).await.unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO sessions (id, repository, goal, status, model, state, \
+                 created_at, updated_at) VALUES \
+                 ('s','/r','g','completed','provider/model','complete','t','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO turns (id, session_id, ordinal, kind, payload, status, created_at) \
+                 VALUES ('historical','s',1,'user','{}','completed','t')",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+
+        let db = Database::connect(&path).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     #[tokio::test]
     async fn peek_repository_reads_latest_row_without_migrating() {
         let dir = std::env::temp_dir().join(format!(

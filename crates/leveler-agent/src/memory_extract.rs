@@ -1,32 +1,36 @@
 //! Semantic memory-candidate extraction: the async half.
 //!
 //! [`SemanticExtractor`] answers one question — "what durable project facts did
-//! the user just state?" — and nothing else. Its result is a list of
-//! [`SemanticCandidate`]s that still has to pass the deterministic gate in
-//! `leveler_memory::validate_semantic_candidates` before the lifecycle sees it.
+//! these user turns state?" — and nothing else. Batch results wrap the existing
+//! [`SemanticCandidate`] schema with a source-turn id, then pass a deterministic
+//! source-bound evidence gate before the lifecycle sees them.
 //!
 //! The extractor is a separate, bounded model call rather than a side effect of
 //! the main coding turn. The unified model layer (`ModelRequest`/`ModelResponse`)
 //! carries no structured-output channel and the only structured channel is tool
 //! calling, which a coding model cannot be relied on to use for a secondary
 //! task. A dedicated call reuses the existing provider abstraction, so the same
-//! code serves every provider, and it is safe to run *concurrently* with the
-//! coding turn: it is bounded by a deadline, low-token, and — because the
-//! caller treats any failure as "no candidates" — it can never fail or delay
-//! the coding turn.
+//! code serves every provider. The production batch API is intended for the
+//! persistent background consolidator: it is bounded by a deadline and token
+//! ceiling, while failures remain retryable inbox work rather than affecting a
+//! coding turn.
 //!
-//! What this call is given matters for safety. It is handed ONLY the current
-//! user message: no assistant text, no recalled memories, no tool output. A
-//! recalled memory therefore cannot be re-proposed as a fresh ExplicitUser
-//! fact, because the extractor never sees it.
+//! What this call is given matters for safety. It is handed ONLY selected user
+//! messages and opaque turn ids: no assistant text, no recalled memories, no
+//! tool output. A recalled memory therefore cannot be re-proposed as a fresh
+//! ExplicitUser fact, because the extractor never sees it.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use leveler_memory::{SemanticCandidate, SemanticError, parse_semantic_candidates};
+use leveler_memory::{
+    CandidateRejection, MemoryCandidate, SemanticCandidate, SemanticError,
+    parse_semantic_candidates, validate_semantic_candidate,
+};
 use leveler_model::{
     Message, ModelRef, ModelRequest, ModelRuntime, ReasoningEffort, Role, TransportPolicy,
 };
@@ -35,6 +39,15 @@ use leveler_model::{
 /// decided by the user's own sentence, and a sentence is short; pasting a
 /// pasted file or a giant log cannot smuggle in a fact.
 pub const MAX_EXTRACTOR_INPUT_CHARS: usize = 4_000;
+/// Maximum number of source turns represented by one provider request.
+pub const MAX_BATCH_TURNS: usize = 8;
+/// Maximum total user-authored characters represented by one batch request.
+/// The limit counts only source text, not JSON/prompt framing.
+pub const MAX_BATCH_INPUT_CHARS: usize = 16_000;
+/// Maximum number of candidate envelopes accepted from one model response.
+pub const MAX_CANDIDATES: usize = 32;
+/// Hard output ceiling for a batch request.
+pub const MAX_OUTPUT_TOKENS: u32 = 4_096;
 /// Default deadline for the extraction call. Short enough that even a
 /// sequential caller is not hurt, long enough for a small model response.
 pub const DEFAULT_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -52,6 +65,12 @@ pub enum ExtractionError {
     Model(String),
     /// The response was not the expected JSON.
     Parse(SemanticError),
+    /// A caller tried to submit a batch outside the documented request bounds.
+    BatchTooLarge { turns: usize, input_chars: usize },
+    /// The model exceeded the candidate-count contract.
+    TooManyCandidates { count: usize, max: usize },
+    /// A batch cannot be represented safely (for example duplicate turn ids).
+    InvalidBatch(String),
     /// The caller's turn was cancelled; extraction stops with it.
     Cancelled,
 }
@@ -62,9 +81,83 @@ impl std::fmt::Display for ExtractionError {
             Self::Timeout => write!(f, "extraction timed out"),
             Self::Model(message) => write!(f, "extraction model call failed: {message}"),
             Self::Parse(error) => write!(f, "extraction output was not usable: {error}"),
+            Self::BatchTooLarge { turns, input_chars } => write!(
+                f,
+                "extraction batch exceeded its bounds: {turns} turns, {input_chars} input chars"
+            ),
+            Self::TooManyCandidates { count, max } => {
+                write!(f, "extractor returned {count} candidates; maximum is {max}")
+            }
+            Self::InvalidBatch(message) => write!(f, "invalid extraction batch: {message}"),
             Self::Cancelled => write!(f, "extraction cancelled"),
         }
     }
+}
+
+/// One durable inbox turn supplied to batch extraction.
+///
+/// Deliberately contains no assistant response, recalled memory, tool output,
+/// or conversation history: the user-authored text remains the sole evidence
+/// source for an `explicit_user` candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchSourceTurn {
+    pub source_turn_id: String,
+    pub user_text: String,
+}
+
+/// Source binding around the existing semantic schema.
+///
+/// `SemanticCandidate` stays the provider-neutral memory contract. The batch
+/// protocol adds provenance outside it so the deterministic gate can select
+/// exactly one source turn before validating `evidence_span`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchSemanticCandidate {
+    pub source_turn_id: String,
+    pub candidate: SemanticCandidate,
+}
+
+/// A batch candidate whose deterministic validation has either succeeded or
+/// produced an inspectable rejection. Candidate rejection is not a batch
+/// transport failure and therefore does not require retrying the whole batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchCandidateValidation {
+    pub source_turn_id: String,
+    pub candidate: SemanticCandidate,
+    pub result: Result<MemoryCandidate, BatchCandidateRejection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchCandidateRejection {
+    UnknownSourceTurn,
+    Candidate(CandidateRejection),
+}
+
+/// Validate every candidate only against the user text named by its envelope.
+///
+/// This lookup is the batch trust boundary: evidence present in a different
+/// turn in the same model request cannot authorize the candidate.
+pub fn validate_batch_candidates(
+    candidates: Vec<BatchSemanticCandidate>,
+    source_turns: &[BatchSourceTurn],
+) -> Vec<BatchCandidateValidation> {
+    candidates
+        .into_iter()
+        .map(|batch_candidate| {
+            let result = source_turns
+                .iter()
+                .find(|turn| turn.source_turn_id == batch_candidate.source_turn_id)
+                .ok_or(BatchCandidateRejection::UnknownSourceTurn)
+                .and_then(|turn| {
+                    validate_semantic_candidate(&batch_candidate.candidate, &turn.user_text)
+                        .map_err(BatchCandidateRejection::Candidate)
+                });
+            BatchCandidateValidation {
+                source_turn_id: batch_candidate.source_turn_id,
+                candidate: batch_candidate.candidate,
+                result,
+            }
+        })
+        .collect()
 }
 
 /// Extract durable project facts from the user's own sentence.
@@ -78,6 +171,31 @@ pub trait SemanticExtractor: Send + Sync {
         user_message: &str,
         cancellation: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, ExtractionError>;
+
+    /// Extract source-bound candidates from several turns.
+    ///
+    /// The default adapter preserves existing test/custom extractors. The
+    /// production model extractor overrides this with one provider request;
+    /// new implementations used by a consolidator should do the same.
+    async fn extract_batch(
+        &self,
+        source_turns: &[BatchSourceTurn],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<BatchSemanticCandidate>, ExtractionError> {
+        let mut batch = Vec::new();
+        for turn in source_turns {
+            let candidates = self.extract(&turn.user_text, cancellation).await?;
+            batch.extend(
+                candidates
+                    .into_iter()
+                    .map(|candidate| BatchSemanticCandidate {
+                        source_turn_id: turn.source_turn_id.clone(),
+                        candidate,
+                    }),
+            );
+        }
+        Ok(batch)
+    }
 }
 
 /// A [`SemanticExtractor`] backed by the shared [`ModelRuntime`].
@@ -90,6 +208,7 @@ pub struct ModelSemanticExtractor {
     model: ModelRef,
     timeout: Duration,
     max_output_tokens: u32,
+    batch_max_output_tokens: u32,
 }
 
 impl ModelSemanticExtractor {
@@ -99,6 +218,7 @@ impl ModelSemanticExtractor {
             model,
             timeout: DEFAULT_EXTRACTION_TIMEOUT,
             max_output_tokens: DEFAULT_EXTRACTION_MAX_TOKENS,
+            batch_max_output_tokens: MAX_OUTPUT_TOKENS,
         }
     }
 
@@ -111,6 +231,7 @@ impl ModelSemanticExtractor {
     /// Override the output ceiling.
     pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
         self.max_output_tokens = max_output_tokens;
+        self.batch_max_output_tokens = max_output_tokens.min(MAX_OUTPUT_TOKENS);
         self
     }
 
@@ -140,6 +261,70 @@ impl ModelSemanticExtractor {
         request.deadline = Some(std::time::Instant::now() + self.timeout);
         Some(request)
     }
+
+    /// Build one bounded batch request.
+    ///
+    /// Oversized input is rejected rather than truncated: silently omitting a
+    /// claimed turn would let the caller mark work processed that the model
+    /// never saw.
+    pub fn build_batch_request(
+        &self,
+        source_turns: &[BatchSourceTurn],
+    ) -> Result<Option<ModelRequest>, ExtractionError> {
+        if source_turns.is_empty() {
+            return Ok(None);
+        }
+        let input_chars = source_turns
+            .iter()
+            .map(|turn| turn.user_text.chars().count())
+            .sum::<usize>();
+        if source_turns.len() > MAX_BATCH_TURNS || input_chars > MAX_BATCH_INPUT_CHARS {
+            return Err(ExtractionError::BatchTooLarge {
+                turns: source_turns.len(),
+                input_chars,
+            });
+        }
+        let mut ids = std::collections::HashSet::with_capacity(source_turns.len());
+        for turn in source_turns {
+            if turn.source_turn_id.trim().is_empty() {
+                return Err(ExtractionError::InvalidBatch(
+                    "source_turn_id must not be empty".to_string(),
+                ));
+            }
+            if turn.user_text.trim().is_empty() {
+                return Err(ExtractionError::InvalidBatch(format!(
+                    "turn {} has empty user text",
+                    turn.source_turn_id
+                )));
+            }
+            if turn.user_text.chars().count() > MAX_EXTRACTOR_INPUT_CHARS {
+                return Err(ExtractionError::BatchTooLarge {
+                    turns: source_turns.len(),
+                    input_chars,
+                });
+            }
+            if !ids.insert(turn.source_turn_id.as_str()) {
+                return Err(ExtractionError::InvalidBatch(format!(
+                    "duplicate source_turn_id {}",
+                    turn.source_turn_id
+                )));
+            }
+        }
+        let payload = serde_json::json!({ "turns": source_turns }).to_string();
+        let mut request = ModelRequest::new(
+            self.model.clone(),
+            vec![
+                Message::text(Role::System, batch_extraction_system_prompt()),
+                Message::text(Role::User, payload),
+            ],
+        );
+        request.temperature = Some(0.0);
+        request.max_output_tokens = Some(self.batch_max_output_tokens);
+        request.reasoning_effort = Some(ReasoningEffort::Low);
+        request.transport = TransportPolicy::LongThinkingNonStreaming;
+        request.deadline = Some(std::time::Instant::now() + self.timeout);
+        Ok(Some(request))
+    }
 }
 
 #[async_trait]
@@ -164,10 +349,164 @@ impl SemanticExtractor for ModelSemanticExtractor {
         let text = response.message.text_content();
         parse_semantic_candidates(&text).map_err(ExtractionError::Parse)
     }
+
+    async fn extract_batch(
+        &self,
+        source_turns: &[BatchSourceTurn],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<BatchSemanticCandidate>, ExtractionError> {
+        let Some(request) = self.build_batch_request(source_turns)? else {
+            return Ok(Vec::new());
+        };
+        let call = self.runtime.generate(request, cancellation.child_token());
+        let response = match tokio::time::timeout(self.timeout, call).await {
+            Err(_) => return Err(ExtractionError::Timeout),
+            Ok(Err(error)) => return Err(ExtractionError::Model(error.to_string())),
+            Ok(Ok(response)) => response,
+        };
+        parse_batch_semantic_candidates(&response.message.text_content())
+    }
 }
 
 fn clip(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
+}
+
+fn parse_batch_semantic_candidates(
+    raw: &str,
+) -> Result<Vec<BatchSemanticCandidate>, ExtractionError> {
+    let cleaned = strip_batch_code_fence(raw.trim());
+    let Some(json) = extract_batch_json(cleaned) else {
+        return Err(ExtractionError::Parse(SemanticError::NoJson));
+    };
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| ExtractionError::Parse(SemanticError::Malformed(error.to_string())))?;
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut map) => match map.remove("candidates") {
+            Some(serde_json::Value::Array(items)) => items,
+            Some(_) => {
+                return Err(ExtractionError::Parse(SemanticError::Schema(
+                    "`candidates` was not an array".to_string(),
+                )));
+            }
+            None => {
+                return Err(ExtractionError::Parse(SemanticError::Schema(
+                    "expected an array or {\"candidates\": [...]}".to_string(),
+                )));
+            }
+        },
+        _ => {
+            return Err(ExtractionError::Parse(SemanticError::Schema(
+                "expected an array or {\"candidates\": [...]}".to_string(),
+            )));
+        }
+    };
+    if items.len() > MAX_CANDIDATES {
+        return Err(ExtractionError::TooManyCandidates {
+            count: items.len(),
+            max: MAX_CANDIDATES,
+        });
+    }
+    items
+        .into_iter()
+        .map(|item| {
+            serde_json::from_value(item)
+                .map_err(|error| ExtractionError::Parse(SemanticError::Schema(error.to_string())))
+        })
+        .collect()
+}
+
+fn strip_batch_code_fence(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let rest = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
+    let rest = rest.trim_end();
+    rest.strip_suffix("```").map(str::trim_end).unwrap_or(rest)
+}
+
+fn extract_batch_json(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|byte| *byte == b'{' || *byte == b'[')?;
+    let open = bytes[start];
+    let close = if open == b'{' { b'}' } else { b']' };
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            byte if byte == open => depth += 1,
+            byte if byte == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..start + offset + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Batch-specific extension of the established semantic extraction contract.
+pub fn batch_extraction_system_prompt() -> String {
+    format!(
+        r#"You extract long-term project facts that users themselves stated.
+
+You are NOT the coding assistant. You do not answer users and do not use tools.
+The user message is JSON with exactly `turns`, an array of objects containing
+only `source_turn_id` and that turn's user-authored `user_text`.
+
+Return ONLY a JSON object: {{"candidates": [ ... ]}}. No prose or code fence.
+Return {{"candidates": []}} when no turn states a durable project fact.
+Return at most {MAX_CANDIDATES} candidate envelopes.
+
+Each candidate envelope is exactly:
+{{
+  "source_turn_id": the exact id of the ONE source turn,
+  "candidate": {{
+    "fact": one short clause, in the conversation's language,
+    "subject": a stable lowercase dotted identity,
+    "value": the assigned value when present (optional),
+    "scope": "project" | "session" | "task" | "user",
+    "durability": "durable" | "temporary" | "unknown",
+    "authority": "explicit_user",
+    "operation_hint": "create" | "update" | "reaffirm" | "negate" | "temporary" | "unknown",
+    "evidence_span": words copied exactly from that source turn's user_text,
+    "confidence": a number 0..1 (optional)
+  }}
+}}
+
+Rules:
+- Every envelope MUST name exactly one supplied source_turn_id.
+- evidence_span MUST occur verbatim in that same source turn. Never borrow
+  evidence from another turn, combine turns, translate, infer, or paraphrase.
+- The ONLY authority is explicit_user. One atomic fact per candidate.
+- Emit candidates only for a new or changed concrete value. Questions,
+  references to an earlier decision, guesses, and confirmations without a new
+  value produce no candidate.
+- Durable means lasting wording or a concrete project-level setting/change
+  without a temporary marker. "today", "this time", "暂时", "先试试" and
+  equivalent wording is temporary/unknown for that candidate only.
+- Runtime state such as a PID, current branch, port, or today's status is not
+  durable. Prefer a stable dotted subject across turns for the same subject.
+"#
+    )
 }
 
 /// The extraction contract. Kept as one function so every provider and every
@@ -337,6 +676,30 @@ mod tests {
         "evidence_span":"模型就 Pro"
     }]}"#;
 
+    fn source_turn(id: &str, user_text: &str) -> BatchSourceTurn {
+        BatchSourceTurn {
+            source_turn_id: id.to_string(),
+            user_text: user_text.to_string(),
+        }
+    }
+
+    fn batch_candidate_json(source_turn_id: &str, evidence: &str) -> String {
+        format!(
+            r#"{{"candidates":[{{
+                "source_turn_id":"{source_turn_id}",
+                "candidate":{{
+                    "fact":"默认模型是 Pro",
+                    "subject":"project.default_model",
+                    "scope":"project",
+                    "durability":"durable",
+                    "authority":"explicit_user",
+                    "operation_hint":"create",
+                    "evidence_span":"{evidence}"
+                }}
+            }}]}}"#
+        )
+    }
+
     #[tokio::test]
     async fn a_well_formed_response_yields_candidates() {
         let runtime = Arc::new(FakeRuntime::answering(VALID_JSON));
@@ -413,5 +776,134 @@ mod tests {
             runtime.requests().is_empty(),
             "nothing to extract, nothing to pay for"
         );
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_one_call_with_only_turn_ids_and_user_text() {
+        let runtime = Arc::new(FakeRuntime::answering(&batch_candidate_json(
+            "turn-1",
+            "模型就 Pro",
+        )));
+        let turns = vec![
+            source_turn("turn-1", "这个项目后面模型就 Pro 吧"),
+            source_turn("turn-2", "Windows 也不能丢"),
+        ];
+
+        let candidates = extractor(runtime.clone())
+            .extract_batch(&turns, &CancellationToken::new())
+            .await
+            .expect("batch extraction succeeds");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_turn_id, "turn-1");
+        assert_eq!(runtime.requests().len(), 1, "one batch is one model call");
+        let request = &runtime.requests()[0];
+        assert_eq!(request.messages.len(), 2, "system + batch payload only");
+        let payload = request.messages[1].text_content();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "turns": [
+                    {"source_turn_id": "turn-1", "user_text": "这个项目后面模型就 Pro 吧"},
+                    {"source_turn_id": "turn-2", "user_text": "Windows 也不能丢"}
+                ]
+            }),
+            "the extractor must not receive assistant, tool, memory, or history content"
+        );
+    }
+
+    #[test]
+    fn batch_request_rejects_turn_and_input_limits_instead_of_silently_dropping_work() {
+        let runtime = Arc::new(FakeRuntime::answering(r#"{"candidates":[]}"#));
+        let extractor = extractor(runtime);
+        let too_many = (0..=MAX_BATCH_TURNS)
+            .map(|index| source_turn(&format!("turn-{index}"), "x"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            extractor.build_batch_request(&too_many),
+            Err(ExtractionError::BatchTooLarge { .. })
+        ));
+
+        let too_large = vec![source_turn(
+            "turn-large",
+            &"界".repeat(MAX_BATCH_INPUT_CHARS + 1),
+        )];
+        assert!(matches!(
+            extractor.build_batch_request(&too_large),
+            Err(ExtractionError::BatchTooLarge { .. })
+        ));
+
+        let oversized_turn = vec![source_turn(
+            "turn-oversized",
+            &"x".repeat(MAX_EXTRACTOR_INPUT_CHARS + 1),
+        )];
+        assert!(matches!(
+            extractor.build_batch_request(&oversized_turn),
+            Err(ExtractionError::BatchTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_output_over_candidate_limit_is_a_parse_failure() {
+        let one = serde_json::json!({
+            "source_turn_id": "turn-1",
+            "candidate": {
+                "fact": "默认模型是 Pro",
+                "subject": "project.default_model",
+                "scope": "project",
+                "durability": "durable",
+                "authority": "explicit_user",
+                "operation_hint": "create",
+                "evidence_span": "模型就 Pro"
+            }
+        });
+        let response = serde_json::json!({
+            "candidates": vec![one; MAX_CANDIDATES + 1]
+        });
+        let runtime = Arc::new(FakeRuntime::answering(&response.to_string()));
+        let error = extractor(runtime)
+            .extract_batch(
+                &[source_turn("turn-1", "模型就 Pro")],
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExtractionError::TooManyCandidates { .. }));
+    }
+
+    #[test]
+    fn evidence_is_checked_only_against_the_declared_source_turn() {
+        let turns = vec![
+            source_turn("turn-a", "登录有个 bug"),
+            source_turn("turn-b", "模型就 Pro"),
+        ];
+        let candidates = vec![BatchSemanticCandidate {
+            source_turn_id: "turn-a".to_string(),
+            candidate: parse_semantic_candidates(VALID_JSON).unwrap().remove(0),
+        }];
+
+        let outcomes = validate_batch_candidates(candidates, &turns);
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            outcomes[0].result,
+            Err(BatchCandidateRejection::Candidate(
+                leveler_memory::CandidateRejection::EvidenceNotFound
+            ))
+        ));
+    }
+
+    #[test]
+    fn unknown_source_turn_is_rejected() {
+        let candidates = vec![BatchSemanticCandidate {
+            source_turn_id: "invented-turn".to_string(),
+            candidate: parse_semantic_candidates(VALID_JSON).unwrap().remove(0),
+        }];
+        let outcomes =
+            validate_batch_candidates(candidates, &[source_turn("turn-real", "模型就 Pro")]);
+        assert!(matches!(
+            outcomes[0].result,
+            Err(BatchCandidateRejection::UnknownSourceTurn)
+        ));
     }
 }

@@ -22,6 +22,7 @@ mod goal_recap;
 mod interactive;
 mod live_view;
 pub mod mcp_config;
+pub mod memory_consolidator;
 pub mod observability;
 mod parallel;
 mod prompt_bridge;
@@ -278,6 +279,10 @@ pub struct Application {
     mcp_tools: Arc<tokio::sync::Mutex<Option<Vec<Arc<dyn leveler_tools::tool::Tool>>>>>,
     /// The session database pool, opened once per process.
     database: Arc<tokio::sync::Mutex<Option<Database>>>,
+    /// One project-scoped durable memory worker. Runtime composition roots
+    /// start it explicitly; every client of this application then shares it.
+    memory_consolidator: OnceLock<Arc<memory_consolidator::MemoryConsolidator>>,
+    memory_events: tokio::sync::broadcast::Sender<memory_consolidator::MemoryConsolidationEvent>,
     /// When set, overrides the resolved execution policy on every execution
     /// path (single-knob ablation runs). `None` = resolver defaults.
     execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
@@ -322,6 +327,14 @@ pub struct Application {
     permission_profiles: std::sync::Mutex<
         std::collections::HashMap<String, leveler_execution::SharedPermissionProfile>,
     >,
+}
+
+impl Drop for Application {
+    fn drop(&mut self) {
+        if let Some(worker) = self.memory_consolidator.get() {
+            worker.cancel();
+        }
+    }
 }
 
 impl Application {
@@ -508,6 +521,7 @@ impl Application {
             layout.browser_profile_dir(),
             config.browser_default,
         ));
+        let (memory_events, _) = tokio::sync::broadcast::channel(128);
         Ok(Self {
             layout,
             config,
@@ -515,6 +529,8 @@ impl Application {
             config_fingerprint,
             mcp_tools: Arc::new(tokio::sync::Mutex::new(None)),
             database: Arc::new(tokio::sync::Mutex::new(None)),
+            memory_consolidator: OnceLock::new(),
+            memory_events,
             execution_overrides: None,
             work_profile: WorkProfile::Balanced,
             collaboration: CollaborationMode::Chat,
@@ -652,7 +668,52 @@ impl Application {
         })?;
         let db = Database::connect(&self.layout.database_path()).await?;
         let mut guard = self.database.lock().await;
-        Ok(guard.get_or_insert_with(|| db).clone())
+        let db = guard.get_or_insert_with(|| db).clone();
+        Ok(db)
+    }
+
+    /// Start this runtime's project memory worker explicitly. Database-only
+    /// commands must not acquire provider-side effects merely by opening the
+    /// store; runtime composition roots call this after startup recovery.
+    pub async fn start_memory_consolidator(&self) -> Result<(), AppError> {
+        let db = self.open_database().await?;
+        self.ensure_memory_consolidator(&db)
+    }
+
+    fn ensure_memory_consolidator(&self, db: &Database) -> Result<(), AppError> {
+        if self.memory_consolidator.get().is_some() {
+            return Ok(());
+        }
+        let events = self.memory_events.clone();
+        let worker = memory_consolidator::MemoryConsolidator::new(
+            db.clone(),
+            self.boot_id()?,
+            self.layout.state_dir.clone(),
+            self.layout.memory_dir(),
+            self.registry.clone(),
+            Arc::new(move |event| {
+                let _ = events.send(event);
+            }),
+        );
+        if self.memory_consolidator.set(worker.clone()).is_ok() {
+            drop(worker.spawn());
+        }
+        Ok(())
+    }
+
+    /// Signal that a terminal turn may have admitted new memory work. The
+    /// signal is non-durable and lossy by design; startup/max-age polling and
+    /// the SQLite inbox are the durable truth.
+    pub fn notify_memory_consolidator(&self) {
+        if let Some(worker) = self.memory_consolidator.get() {
+            worker.notify_turn_terminal();
+        }
+    }
+
+    pub fn subscribe_memory_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<memory_consolidator::MemoryConsolidationEvent> {
+        self.memory_events.subscribe()
     }
 
     /// All configured model references.

@@ -198,6 +198,11 @@ impl MemoryStore {
 
     /// Write or replace an active entry (caller handles approval).
     pub fn remember(&self, entry: MemoryEntry) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        self.remember_unlocked(entry)
+    }
+
+    pub(crate) fn remember_unlocked(&self, entry: MemoryEntry) -> Result<MemoryEntry, MemoryError> {
         validate_entry(&entry)?;
         let path = self.active_path(&entry.id);
         let json = serde_json::to_string_pretty(&entry)?;
@@ -213,7 +218,12 @@ impl MemoryStore {
     /// never both claim the same id, and readers never observe a partial JSON
     /// file. An unreadable existing entry is an error, not evidence that the id
     /// is available.
-    pub fn remember_deduplicated(
+    pub fn remember_deduplicated(&self, entry: MemoryEntry) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        self.remember_deduplicated_unlocked(entry)
+    }
+
+    pub(crate) fn remember_deduplicated_unlocked(
         &self,
         mut entry: MemoryEntry,
     ) -> Result<MemoryEntry, MemoryError> {
@@ -226,6 +236,18 @@ impl MemoryStore {
             } else {
                 format!("{base}-{suffix}")
             };
+            // History is durable data, not a pool of reusable identifiers.
+            // Reusing an archived id would make the successful active write
+            // below delete that history copy and can also create cycles in a
+            // supersession chain. Explicit `remember` remains the deliberate
+            // upsert/reactivation API; the deduplicating create path always
+            // advances to a fresh id.
+            if self.archive_path(&entry.id).exists() {
+                suffix = suffix.checked_add(1).ok_or_else(|| {
+                    MemoryError::Invalid("too many colliding memory ids".to_string())
+                })?;
+                continue;
+            }
             let path = self.active_path(&entry.id);
             let json = serde_json::to_string_pretty(&entry)?;
             let mut temp = tempfile::Builder::new()
@@ -236,7 +258,6 @@ impl MemoryStore {
 
             match fs::hard_link(temp.path(), &path) {
                 Ok(()) => {
-                    let _ = fs::remove_file(self.archive_path(&entry.id));
                     return Ok(entry);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -272,6 +293,11 @@ impl MemoryStore {
 
     /// Archive (forget) an active entry. Idempotent if already archived.
     pub fn forget(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        self.forget_unlocked(id)
+    }
+
+    pub(crate) fn forget_unlocked(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
         let active = self.active_path(id);
         let archive = self.archive_path(id);
         if active.exists() {
@@ -358,6 +384,7 @@ impl MemoryStore {
         kind: MemoryKind,
         tags: Vec<String>,
     ) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         let mut entry = new_entry(title, body, tags);
         entry.kind = Some(kind.as_str().to_string());
         // Every caller of `activate` is a person's own command or a proposal
@@ -374,7 +401,7 @@ impl MemoryStore {
         // reservation so concurrent writers cannot claim one id, an identical
         // title+body returning what is there, and a `-N` suffix otherwise.
         // `validate_entry` inside it is where a credential is refused.
-        let saved = self.remember_deduplicated(entry)?;
+        let saved = self.remember_deduplicated_unlocked(entry)?;
         // Best effort, deliberately after the active copy is durable: a
         // candidate left behind would ask the user to approve what is already
         // stored, but failing to remove it is not a reason to lose the write.

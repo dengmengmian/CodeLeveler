@@ -1817,6 +1817,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "chrono",
  "fs2",
  "futures",
  "leveler-agent",
@@ -2077,6 +2078,7 @@ name = "leveler-memory"
 version = "1.0.1"
 dependencies = [
  "chrono",
+ "fs2",
  "serde",
  "serde_json",
  "tempfile",

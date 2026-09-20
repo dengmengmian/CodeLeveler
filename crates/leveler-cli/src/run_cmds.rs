@@ -1361,6 +1361,10 @@ pub(crate) async fn cmd_serve(
             "reaped zombie turns before daemon startup"
         );
     }
+    // Start durable memory recovery only after dead turns have been reaped.
+    // Opening the database remains side-effect free for read-only commands;
+    // the daemon composition root explicitly owns this background service.
+    app.start_memory_consolidator().await?;
 
     if let Some(path) = &ready_json {
         // Machine-readable readiness for the supervising process (spawned by
@@ -1513,6 +1517,7 @@ pub(crate) async fn cmd_web(
                     "reaped zombie turns before WebUI startup"
                 );
             }
+            app.start_memory_consolidator().await?;
             let router = leveler_web::RouterService::new(service, app.layout.repo_root.clone());
             let manager = leveler_web::ProjectManager::new(
                 router.clone(),

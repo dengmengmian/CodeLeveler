@@ -18,7 +18,8 @@
 //! their K36 human-approval gate; the autonomous path here is reserved for a
 //! statement the user made themselves in this turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 
 use serde::{Deserialize, Serialize};
 
@@ -478,6 +479,17 @@ pub fn decide(
 }
 
 impl MemoryStore {
+    pub(crate) fn acquire_lifecycle_lock(&self) -> Result<std::fs::File, MemoryError> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.root().join(".lifecycle.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        Ok(lock)
+    }
+
     /// Decide and apply. The autonomous path: caller has already established
     /// that the candidate is the user's own statement (or otherwise authorized).
     ///
@@ -489,7 +501,19 @@ impl MemoryStore {
         &self,
         candidate: &MemoryCandidate,
     ) -> Result<CommitOutcome, MemoryError> {
+        // Decision and apply are one store transaction. The data itself stays
+        // file-backed, but the advisory lock serializes every autonomous
+        // writer using this project root, including writers in other
+        // processes. Keeping the file handle alive holds the lock until the
+        // outcome has been fully applied.
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+
         let now = now_rfc3339();
+        // New-first replacement guarantees no gap in current truth, so a
+        // crash can leave two physical active files. Heal that durable residue
+        // before deriving a fresh decision; an at-least-once retry then sees
+        // the already-written replacement and becomes an idempotent skip.
+        self.reconcile_active_truths(&now)?;
         let decision = decide(self, candidate, &now)?;
         match decision.operation {
             MemoryOperation::Skip { reason } => Ok(CommitOutcome {
@@ -516,7 +540,7 @@ impl MemoryStore {
             MemoryOperation::Supersede { existing_id } => {
                 let old = self.read_active(&existing_id)?;
                 let new = self.write_candidate(candidate, Some(&old))?;
-                let archived = self.mark_superseded(&old, &new.id, &now)?;
+                let archived = self.mark_superseded_unlocked(&old, &new.id, &now)?;
                 Ok(CommitOutcome {
                     operation: AppliedOperation::Superseded,
                     entry: Some(new),
@@ -527,7 +551,7 @@ impl MemoryStore {
             MemoryOperation::Merge { existing_id } => {
                 let old = self.read_active(&existing_id)?;
                 let new = self.write_candidate(candidate, Some(&old))?;
-                let archived = self.mark_superseded(&old, &new.id, &now)?;
+                let archived = self.mark_superseded_unlocked(&old, &new.id, &now)?;
                 Ok(CommitOutcome {
                     operation: AppliedOperation::Merged,
                     entry: Some(new),
@@ -536,6 +560,55 @@ impl MemoryStore {
                 })
             }
         }
+    }
+
+    /// Restore the physical invariant of at most one current entry per
+    /// semantic identity.
+    ///
+    /// This is apply recovery, not a second decision engine. Multiple active
+    /// files with one key can only be residue from the new-first supersede
+    /// protocol (including an older concurrent writer). The successor link is
+    /// authoritative when present; authority and durable timestamps provide a
+    /// deterministic fallback for forked legacy residue.
+    fn reconcile_active_truths(&self, now: &str) -> Result<(), MemoryError> {
+        let mut by_key: HashMap<String, Vec<MemoryEntry>> = HashMap::new();
+        for entry in self.list_active()? {
+            if entry.effective_status() != MemoryStatus::Active || entry.is_expired_at(now) {
+                continue;
+            }
+            if let Some(key) = entry.key.clone() {
+                by_key.entry(key).or_default().push(entry);
+            }
+        }
+
+        for entries in by_key.into_values().filter(|entries| entries.len() > 1) {
+            let superseded_ids: HashSet<&str> = entries
+                .iter()
+                .filter_map(|entry| entry.supersedes.as_deref())
+                .collect();
+            // A terminal entry is not named as the predecessor of another
+            // active entry. This follows a whole A -> B -> C chain rather than
+            // relying on pairwise comparisons, which are not transitive.
+            let terminal: Vec<&MemoryEntry> = entries
+                .iter()
+                .filter(|entry| !superseded_ids.contains(entry.id.as_str()))
+                .collect();
+            let candidates: Vec<&MemoryEntry> = if terminal.is_empty() {
+                // Defensive fallback for malformed cyclic residue.
+                entries.iter().collect()
+            } else {
+                terminal
+            };
+            let winner = candidates
+                .into_iter()
+                .max_by(|left, right| compare_current_truth(left, right))
+                .expect("group has at least two entries")
+                .clone();
+            for old in entries.into_iter().filter(|entry| entry.id != winner.id) {
+                self.mark_superseded_unlocked(&old, &winner.id, now)?;
+            }
+        }
+        Ok(())
     }
 
     /// Promote a candidate to an active entry, carrying provenance forward.
@@ -555,12 +628,22 @@ impl MemoryStore {
         if let Some(old) = superseding {
             entry.supersedes = Some(old.id.clone());
         }
-        self.remember_deduplicated(entry)
+        self.remember_deduplicated_unlocked(entry)
     }
 
     /// Move one active entry to history as superseded. Idempotent-safe: it
     /// writes the archive copy before removing the active one.
     pub fn mark_superseded(
+        &self,
+        old: &MemoryEntry,
+        new_id: &str,
+        now: &str,
+    ) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
+        self.mark_superseded_unlocked(old, new_id, now)
+    }
+
+    fn mark_superseded_unlocked(
         &self,
         old: &MemoryEntry,
         new_id: &str,
@@ -573,7 +656,11 @@ impl MemoryStore {
         archived.archived_at = Some(now.to_string());
         let json = serde_json::to_string_pretty(&archived)?;
         crate::write_atomically_pub(&self.archive_path(&archived.id), json.as_bytes())?;
-        let _ = std::fs::remove_file(self.active_path(&archived.id));
+        match std::fs::remove_file(self.active_path(&archived.id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(MemoryError::Io(error)),
+        }
         Ok(archived)
     }
 
@@ -583,6 +670,7 @@ impl MemoryStore {
     /// filters expired entries regardless, so the store staying slightly stale
     /// never leaks an expired fact into context.
     pub fn expire_due(&self) -> Result<Vec<MemoryEntry>, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         let now = now_rfc3339();
         let mut out = Vec::new();
         for entry in self.list_active()? {
@@ -643,6 +731,15 @@ fn is_better(candidate: &MemoryEntry, current: &MemoryEntry) -> bool {
     candidate.authority().rank() > current.authority().rank()
         || (candidate.authority().rank() == current.authority().rank()
             && candidate.updated_at > current.updated_at)
+}
+
+fn compare_current_truth(left: &MemoryEntry, right: &MemoryEntry) -> std::cmp::Ordering {
+    left.authority()
+        .rank()
+        .cmp(&right.authority().rank())
+        .then_with(|| left.updated_at.cmp(&right.updated_at))
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 #[cfg(test)]
@@ -727,6 +824,91 @@ mod tests {
         let again = store.commit_candidate(&fact).unwrap();
         assert_eq!(again.operation, AppliedOperation::Skipped);
         assert_eq!(store.effective_active().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_reconciles_crash_after_new_truth_became_durable() {
+        let (_dir, store) = store();
+        let first = parse_durable_fact("以后这个项目的发布探针代号固定为 ORANGE-7319").unwrap();
+        let old = store
+            .commit_candidate(&first)
+            .unwrap()
+            .entry
+            .expect("created entry");
+        let second = parse_durable_fact("以后发布探针代号改成 BLUE-4821").unwrap();
+
+        // Fault injection: this is the exact durable state left by a process
+        // dying after the replacement write and before the old entry is moved
+        // to history.
+        let replacement = store.write_candidate(&second, Some(&old)).unwrap();
+        assert_eq!(store.list_active().unwrap().len(), 2, "injected residue");
+
+        let retry = store.commit_candidate(&second).unwrap();
+        assert_eq!(retry.operation, AppliedOperation::Skipped);
+        let physical = store.list_active().unwrap();
+        assert_eq!(physical.len(), 1, "retry must heal physical active state");
+        assert_eq!(physical[0].id, replacement.id);
+        let archived = store.list_archived().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, old.id);
+        assert_eq!(
+            archived[0].superseded_by.as_deref(),
+            Some(replacement.id.as_str())
+        );
+    }
+
+    #[test]
+    fn concurrent_commits_leave_one_physical_current_truth() {
+        use std::sync::{Arc, Barrier};
+
+        let (_dir, store) = store();
+        let key = semantic_key_of("并发写入模型");
+        let mut initial = MemoryCandidate::new(
+            "初始模型",
+            "并发写入模型：initial",
+            CandidateKind::Free,
+            Some(key.clone()),
+            CandidateSource::UserExplicit,
+            vec![],
+        )
+        .unwrap();
+        initial.authority = MemoryAuthority::ExplicitUser;
+        store.commit_candidate(&initial).unwrap();
+
+        let writers = 12;
+        let barrier = Arc::new(Barrier::new(writers));
+        let mut threads = Vec::new();
+        for index in 0..writers {
+            let store = store.clone();
+            let key = key.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let mut candidate = MemoryCandidate::new(
+                    format!("并发模型 {index}"),
+                    format!("并发写入模型：value-{index}"),
+                    CandidateKind::Free,
+                    Some(key),
+                    CandidateSource::UserExplicit,
+                    vec![],
+                )
+                .unwrap();
+                candidate.authority = MemoryAuthority::ExplicitUser;
+                barrier.wait();
+                store.commit_candidate(&candidate).unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let active = store.list_active().unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "only one physical current truth may remain"
+        );
+        assert_eq!(store.effective_active().unwrap(), active);
+        assert_eq!(store.list_archived().unwrap().len(), writers);
     }
 
     #[test]

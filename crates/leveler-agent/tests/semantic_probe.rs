@@ -14,25 +14,26 @@
 //!   cargo test -p leveler-agent --test semantic_probe -- --ignored --nocapture
 //! ```
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::{AgentEvent, Executor, ModelSemanticExtractor, NoopSink};
-use leveler_execution::{AutoApprove, PermissionProfile, Workspace};
+use async_trait::async_trait;
+
+use leveler_agent::{
+    BatchSourceTurn, MAX_BATCH_TURNS, ModelSemanticExtractor, SemanticExtractor,
+    validate_batch_candidates,
+};
 use leveler_memory::{
     MemoryCandidate, MemoryStore, parse_semantic_candidates, validate_semantic_candidates,
 };
 use leveler_model::{
-    ContentPart, ModelCapabilities, ModelError, ModelEventStream, ModelLimits, ModelPricing,
-    ModelProfile, ModelRef, ModelRequest, ModelResponse, ModelRuntime, ProtocolKind,
-    ReasoningConfig, ReasoningEffort, ReasoningStyle,
+    ModelCapabilities, ModelError, ModelEventStream, ModelLimits, ModelPricing, ModelProfile,
+    ModelRef, ModelRequest, ModelResponse, ModelRuntime, ProtocolKind, ReasoningConfig,
+    ReasoningEffort, ReasoningStyle, TokenUsage,
 };
 use leveler_provider::{ModelConfigFile, ProviderConfig, ProviderRegistry, RegistryInputs};
-use leveler_tools::ToolContext;
 
 /// The probe sentences, in order. Each is a natural paraphrase, deliberately
 /// avoiding the deterministic fast path's templates.
@@ -254,15 +255,9 @@ fn commit(store: &MemoryStore, memory: &MemoryCandidate) -> String {
     }
 }
 
-// ── end-to-end: the real executor, the real extractor, the real store ───────
-
-/// Delegates to the real registry and records every request, so "what did the
-/// provider actually see" is evidence from a real run.
 struct RecordingRuntime {
     inner: Arc<dyn ModelRuntime>,
-    requests: Mutex<Vec<ModelRequest>>,
-    /// Raw text of every extraction (non-streaming) response, in order.
-    extractions: Mutex<Vec<String>>,
+    usages: Mutex<Vec<TokenUsage>>,
 }
 
 #[async_trait]
@@ -272,7 +267,6 @@ impl ModelRuntime for RecordingRuntime {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
-        self.requests.lock().unwrap().push(request.clone());
         self.inner.stream(request, cancellation).await
     }
 
@@ -282,10 +276,7 @@ impl ModelRuntime for RecordingRuntime {
         cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
         let response = self.inner.generate(request, cancellation).await?;
-        self.extractions
-            .lock()
-            .unwrap()
-            .push(response.message.text_content());
+        self.usages.lock().unwrap().push(response.usage);
         Ok(response)
     }
 
@@ -322,170 +313,113 @@ fn real_registry() -> Option<(Arc<RecordingRuntime>, ModelRef)> {
         }],
     })
     .ok()?;
-    let runtime: Arc<dyn ModelRuntime> = Arc::new(registry);
-    let recording = Arc::new(RecordingRuntime {
-        inner: runtime,
-        requests: Mutex::new(Vec::new()),
-        extractions: Mutex::new(Vec::new()),
-    });
-    Some((recording, ModelRef::new("probe", &model_id)))
+    Some((
+        Arc::new(RecordingRuntime {
+            inner: Arc::new(registry),
+            usages: Mutex::new(Vec::new()),
+        }),
+        ModelRef::new("probe", &model_id),
+    ))
 }
 
-fn real_executor(
-    runtime: Arc<RecordingRuntime>,
-    model: &ModelRef,
-    dir: &std::path::Path,
-    mem: &std::path::Path,
-) -> Executor {
-    let workspace = Workspace::new(dir).unwrap();
-    let tool_context = ToolContext::with_environment(
-        workspace,
-        PermissionProfile::Assisted,
-        Arc::new(leveler_core::EnvSnapshot::new(
-            std::env::vars_os(),
-            std::env::current_dir().unwrap_or_default(),
-            std::env::temp_dir(),
-        )),
-    );
-    // An EMPTY tool registry: this probe exercises the memory path, not the
-    // coding tools, and it must never let a real model touch the machine.
-    let extractor: Arc<dyn leveler_agent::SemanticExtractor> = Arc::new(
-        ModelSemanticExtractor::new(runtime.clone(), model.clone())
-            .with_timeout(Duration::from_secs(60)),
-    );
-    Executor::new(
-        runtime,
-        Arc::new(leveler_tools::ToolRegistry::new()),
-        tool_context,
-        model.clone(),
-        2,
-    )
-    .with_memory_expose(true)
-    .with_memory_root(Some(mem.to_path_buf()))
-    .with_semantic_extractor(Some(extractor))
-    .with_approver(Arc::new(AutoApprove))
-}
-
-async fn real_turn(executor: &Executor, request: &str, events: &mut Vec<AgentEvent>) {
-    executor
-        .run(
-            request,
-            &mut |event| events.push(event),
-            &mut NoopSink,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("real turn completes");
-}
-
-/// SMCE-12 against a real model: create → recall → update → recall, driven by
-/// the real executor over the real store. Ignored by default.
+/// Real batch dogfood: six turns are consolidated in one provider call, and
+/// source-bound validation plus the real lifecycle store leave one current
+/// truth for the project model preference.
 #[tokio::test]
 #[ignore = "real provider; requires SEMANTIC_PROBE_* / provider API key"]
-async fn real_model_cross_session_create_recall_update_recall() {
+async fn real_model_batch_consolidation_probe() {
     let Some((runtime, model)) = real_registry() else {
         eprintln!("SKIP: no probe API key");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let mem = dir.path().join("memory");
-
-    // Session A — create from a natural paraphrase, no templates.
-    let executor_a = real_executor(runtime.clone(), &model, dir.path(), &mem);
-    let mut _events_a = Vec::new();
-    real_turn(
-        &executor_a,
-        "这个项目后面模型就 Pro 吧，别再来回切了",
-        &mut _events_a,
-    )
-    .await;
-    let store = MemoryStore::open(&mem).unwrap();
-    let created = store.effective_active().unwrap();
-    assert_eq!(created.len(), 1, "session A created exactly one memory");
-    let created_body = created[0].body.clone();
-    println!("session A created: {created_body:?}");
-    println!(
-        "session A raw extraction: {:?}",
-        runtime.extractions.lock().unwrap().last()
-    );
-
-    // Session B — recall into a real provider request.
-    let before_b = runtime.requests.lock().unwrap().len();
-    let executor_b = real_executor(runtime.clone(), &model, dir.path(), &mem);
-    let mut _events_b = Vec::new();
-    real_turn(&executor_b, "模型这块按之前定的来", &mut _events_b).await;
-    let saw_created_in_b = requests_since(&runtime, before_b, &created_body);
-    println!("session B: recall saw created body = {saw_created_in_b}");
-
-    // Session C — paraphrase update.
-    let executor_c = real_executor(runtime.clone(), &model, dir.path(), &mem);
-    let mut _events_c = Vec::new();
-    real_turn(
-        &executor_c,
-        "模型还是换回 Flash 吧，Pro 先不用了",
-        &mut _events_c,
-    )
-    .await;
-    let current = store.effective_active().unwrap();
-    assert_eq!(current.len(), 1, "session C left one current truth");
-    let current_body = current[0].body.clone();
-    let old_bodies: Vec<String> = store
-        .list_archived()
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.body)
-        .collect();
-    println!(
-        "session C raw extraction: {:?}",
-        runtime.extractions.lock().unwrap().last()
-    );
-    println!("session C current: {current_body:?}, history: {old_bodies:?}");
-
-    // Session D — the new truth is recalled, the old one is not, and a
-    // recall/defer statement creates nothing.
-    let before_d = runtime.requests.lock().unwrap().len();
-    let executor_d = real_executor(runtime.clone(), &model, dir.path(), &mem);
-    let mut _events_d = Vec::new();
-    real_turn(&executor_d, "模型按之前最终定的那个走", &mut _events_d).await;
-    println!(
-        "session D raw extraction: {:?}",
-        runtime.extractions.lock().unwrap().last()
-    );
-    let saw_current_in_d = requests_since(&runtime, before_d, &current_body);
-    let saw_old_in_d = old_bodies
+    let store = MemoryStore::open(dir.path().join("memory")).unwrap();
+    let extractor =
+        ModelSemanticExtractor::new(runtime.clone(), model).with_timeout(Duration::from_secs(60));
+    let turns = PROBE
         .iter()
-        .any(|body| requests_since(&runtime, before_d, body));
-    println!("session D: recall saw current = {saw_current_in_d}, saw superseded = {saw_old_in_d}");
-
-    let final_active = store.effective_active().unwrap();
-    for entry in &final_active {
-        println!("final active: key={:?} body={:?}", entry.key, entry.body);
-    }
-    for entry in store.list_archived().unwrap() {
-        println!("final history: {:?} {:?}", entry.body, entry.status);
-    }
-    assert!(saw_created_in_b, "session B must recall the created truth");
-    assert!(saw_current_in_d, "session D must recall the updated truth");
-    assert!(
-        !saw_old_in_d,
-        "session D must not recall the superseded truth"
-    );
-    assert_eq!(final_active.len(), 1);
-    assert_eq!(
-        final_active[0].body, current_body,
-        "a recall/defer sentence must not rewrite memory"
-    );
-}
-
-fn requests_since(runtime: &Arc<RecordingRuntime>, from: usize, needle: &str) -> bool {
-    runtime.requests.lock().unwrap()[from..]
-        .iter()
-        .any(|request| {
-            request.messages.iter().any(|message| {
-                message
-                    .content
-                    .iter()
-                    .any(|part| matches!(part, ContentPart::Text { text } if text.contains(needle)))
-            })
+        .enumerate()
+        .map(|(index, (_, text))| BatchSourceTurn {
+            source_turn_id: format!("turn-{index}"),
+            user_text: (*text).to_string(),
         })
+        .collect::<Vec<_>>();
+
+    let started = Instant::now();
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    let mut calls = 0usize;
+    for batch in turns.chunks(MAX_BATCH_TURNS) {
+        calls += 1;
+        let proposed = extractor
+            .extract_batch(batch, &CancellationToken::new())
+            .await
+            .expect("real batch extraction succeeds");
+        for validated in validate_batch_candidates(proposed, batch) {
+            match validated.result {
+                Ok(memory) => {
+                    accepted += 1;
+                    store.commit_candidate(&memory).expect("candidate commits");
+                }
+                Err(error) => {
+                    rejected += 1;
+                    println!(
+                        "rejected source={} error={error:?}",
+                        validated.source_turn_id
+                    );
+                }
+            }
+        }
+    }
+
+    let active = store.effective_active().unwrap();
+    let archived = store.list_archived().unwrap();
+    let usages = runtime.usages.lock().unwrap().clone();
+    let input_tokens: u64 = usages.iter().map(|usage| usage.input_tokens).sum();
+    let output_tokens: u64 = usages.iter().map(|usage| usage.output_tokens).sum();
+    let cost_usd =
+        input_tokens as f64 / 1_000_000.0 * 0.1389 + output_tokens as f64 / 1_000_000.0 * 0.2778;
+    println!(
+        "batch_calls={calls} turns={} request_rate={:.3} accepted={accepted} rejected={rejected} elapsed_ms={} input_tokens={input_tokens} output_tokens={output_tokens} cost_per_100_turns_usd={:.6} active={:?}",
+        turns.len(),
+        calls as f64 / turns.len() as f64,
+        started.elapsed().as_millis(),
+        cost_usd / turns.len() as f64 * 100.0,
+        active
+            .iter()
+            .map(|entry| (&entry.key, &entry.body))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(usages.len(), 1);
+    assert!(
+        accepted > 0,
+        "real model should find at least one durable fact"
+    );
+    let active_text = active
+        .iter()
+        .map(|entry| entry.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let archived_text = archived
+        .iter()
+        .map(|entry| entry.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(active_text.contains("Windows"));
+    assert!(active_text.contains("保护分支"));
+    assert!(active_text.contains("Rust"));
+    assert!(active_text.contains("Flash"));
+    assert!(
+        !active_text.contains("full test"),
+        "temporary rule must not persist"
+    );
+    assert!(
+        !active_text.contains("Pro"),
+        "the updated model must supersede Pro"
+    );
+    assert!(
+        archived_text.contains("Pro"),
+        "superseded Pro must remain in history"
+    );
 }

@@ -75,14 +75,6 @@ const RECALL_BLOCK_MAX_BYTES: usize = 2048;
 /// they are paid for on EVERY turn, relevant or not.
 const STANDING_PREFERENCE_MAX_ENTRIES: usize = 8;
 
-/// How long the turn waits for an already-running semantic extraction after
-/// the coding turn itself is done. The extraction runs concurrently with the
-/// turn, so this is a true tail bound, not the call's budget: a coding turn
-/// almost always outlives a small extraction, and only a genuinely slow
-/// extractor ever reaches this. Past it the extraction is abandoned for this
-/// turn — memory never delays the answer.
-const EXTRACTION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// What recall decided for one turn, and what it cost.
 ///
 /// Built so the decision can be inspected instead of inferred from a string:
@@ -259,24 +251,6 @@ fn applied_event(outcome: &leveler_memory::CommitOutcome) -> Option<AgentEvent> 
         leveler_memory::AppliedOperation::Skipped => return None,
     };
     Some(memory_change_event(operation, entry))
-}
-
-/// The result of this turn's deterministic memory maintenance: the events a
-/// client should see, and whether the fast path handled the sentence itself.
-struct MemoryMaintenance {
-    events: Vec<AgentEvent>,
-    fast_path_handled: bool,
-}
-
-impl MemoryMaintenance {
-    /// Memory could not run at all; nothing to show and nothing for the
-    /// semantic path to add.
-    fn handled() -> Self {
-        Self {
-            events: Vec::new(),
-            fast_path_handled: true,
-        }
-    }
 }
 
 /// Events emitted as the loop progresses, for the CLI to render.
@@ -1154,7 +1128,6 @@ pub struct Executor {
     /// deterministic gate and the memory commit decision before anything is
     /// written. It is held here because only the runtime may decide when a
     /// durable fact is allowed to exist.
-    semantic_extractor: Option<Arc<dyn crate::memory_extract::SemanticExtractor>>,
     /// Hard per-run limits on commands / modified files / wall-clock time,
     /// checked before each tool call (spec §27).
     step_limits: StepLimits,
@@ -1269,7 +1242,6 @@ impl Executor {
             memory_catalog: String::new(),
             memory_expose: false,
             memory_root: None,
-            semantic_extractor: None,
             step_limits: StepLimits::default(),
             permission_rules: std::sync::RwLock::new(
                 leveler_execution::PermissionRuleSet::default(),
@@ -1394,14 +1366,6 @@ impl Executor {
     /// deterministic gate and committed through the same memory commit
     /// decision as every other producer; a failure yields no candidates and
     /// never affects the coding turn.
-    pub fn with_semantic_extractor(
-        mut self,
-        extractor: Option<Arc<dyn crate::memory_extract::SemanticExtractor>>,
-    ) -> Self {
-        self.semantic_extractor = extractor;
-        self
-    }
-
     /// Set hard per-run limits on commands, modified files, and duration.
     pub fn with_step_limits(mut self, limits: StepLimits) -> Self {
         self.step_limits = limits;
@@ -1681,7 +1645,6 @@ impl Executor {
             memory_expose: self.memory_expose,
             // A child's "user message" is a delegation brief, not the user's
             // own durable statement: a child never creates project memory.
-            semantic_extractor: None,
             // A child inherits the parent's memory location: recall and
             // parking mean the same thing at any depth.
             memory_root: self.memory_root.clone(),
@@ -2045,16 +2008,9 @@ impl Executor {
         if let Some(catalog) = self.agent_catalog_injection() {
             seed.push(Message::text(Role::System, catalog));
         }
-        let maintenance = self.maintain_memory(&request);
-        let fast_path_handled = maintenance.fast_path_handled;
-        for event in maintenance.events {
+        for event in self.maintain_memory(&request) {
             observer(event);
         }
-        let extraction = if fast_path_handled {
-            None
-        } else {
-            self.spawn_semantic_extraction(&request, &cancellation)
-        };
         let injection = self.relevant_memory_injection(&request);
         if !injection.recalled.is_empty() {
             observer(AgentEvent::MemoryRecalled {
@@ -2071,14 +2027,8 @@ impl Executor {
         });
         sink.append(&seed).await.map_err(AgentError::from)?;
         let mut facts = AbortedFacts::default();
-        let outcome = self
-            .drive(seed, objective, observer, sink, cancellation, &mut facts)
-            .await;
-        if let Some(handle) = extraction {
-            self.finish_semantic_extraction(handle, &request, observer)
-                .await;
-        }
-        outcome
+        self.drive(seed, objective, observer, sink, cancellation, &mut facts)
+            .await
     }
 
     /// The per-turn catalog of agents the top-level agent may delegate to.
@@ -2199,22 +2149,22 @@ impl Executor {
     /// Failure is never fatal to the coding turn: a memory store that cannot be
     /// written is reported at debug level and the turn proceeds.
     ///
-    /// The returned flag says whether the deterministic fast path already
-    /// handled this turn. When it did, the semantic extractor is not run: the
-    /// fast path is the zero-cost route for a statement it fully understands,
-    /// and the two producers must not both emit a candidate for one sentence.
-    fn maintain_memory(&self, request: &str) -> MemoryMaintenance {
+    /// Semantic extraction is deliberately absent here. Fresh user turns are
+    /// admitted durably at the turn-write boundary and processed by the
+    /// runtime-owned batch consolidator. The main turn performs only this
+    /// deterministic, zero-model-call fast path.
+    fn maintain_memory(&self, request: &str) -> Vec<AgentEvent> {
         if !self.memory_expose {
-            return MemoryMaintenance::handled();
+            return Vec::new();
         }
         let Some(root) = self.memory_root.as_ref() else {
-            return MemoryMaintenance::handled();
+            return Vec::new();
         };
         let store = match MemoryStore::open(root) {
             Ok(store) => store,
             Err(error) => {
                 tracing::debug!(error = %error, "memory maintenance skipped: store unavailable");
-                return MemoryMaintenance::handled();
+                return Vec::new();
             }
         };
         let mut events = Vec::new();
@@ -2230,10 +2180,7 @@ impl Executor {
             Err(error) => tracing::debug!(error = %error, "memory expiry sweep failed"),
         }
         let Some(candidate) = leveler_memory::parse_durable_fact(request) else {
-            return MemoryMaintenance {
-                events,
-                fast_path_handled: false,
-            };
+            return events;
         };
         match store.commit_candidate(&candidate) {
             Ok(outcome) => {
@@ -2243,143 +2190,7 @@ impl Executor {
             }
             Err(error) => tracing::debug!(error = %error, "memory commit failed"),
         }
-        MemoryMaintenance {
-            events,
-            fast_path_handled: true,
-        }
-    }
-
-    /// Start the semantic extraction for this turn, when one is configured and
-    /// the deterministic fast path did not already answer it.
-    ///
-    /// The work is spawned rather than awaited so it overlaps the coding turn:
-    /// on a real turn the coding work dwarfs a small extraction, so the
-    /// extraction's own latency is not added to the turn. It is bounded by the
-    /// extractor's deadline and cancelled with the turn.
-    fn spawn_semantic_extraction(
-        &self,
-        request: &str,
-        cancellation: &CancellationToken,
-    ) -> Option<
-        tokio::task::JoinHandle<
-            Result<Vec<leveler_memory::SemanticCandidate>, crate::memory_extract::ExtractionError>,
-        >,
-    > {
-        if !self.memory_expose || self.memory_root.is_none() {
-            return None;
-        }
-        let extractor = Arc::clone(self.semantic_extractor.as_ref()?);
-        let message = request.to_string();
-        let token = cancellation.child_token();
-        // Input minimization is a SAFETY property, not an optimization: the
-        // extractor receives the user's sentence and the schema, never the
-        // assistant's answer, never a recalled memory, never tool output. A
-        // fact it proposes therefore cannot be a recalled memory echoing
-        // itself back — it literally never saw one.
-        tracing::debug!(
-            input_chars = message.chars().count(),
-            "semantic memory extraction started"
-        );
-        Some(tokio::spawn(async move {
-            extractor.extract(&message, &token).await
-        }))
-    }
-
-    /// Validate and commit the accepted subset of one semantic extraction.
-    ///
-    /// The extractor's list is untrusted input: every candidate is checked by
-    /// [`leveler_memory::validate_semantic_candidates`] against the user's own
-    /// message before the commit decision sees it. Refusals are debug-logged,
-    /// never surfaced, and any store failure leaves the coding turn intact.
-    fn commit_semantic_batch(
-        &self,
-        candidates: &[leveler_memory::SemanticCandidate],
-        request: &str,
-    ) -> Vec<AgentEvent> {
-        let validated = leveler_memory::validate_semantic_candidates(candidates, request);
-        for (index, rejection) in &validated.rejected {
-            tracing::debug!(
-                candidate_index = index,
-                code = rejection.code(),
-                reason = %rejection.reason(),
-                "semantic memory candidate rejected"
-            );
-        }
-        if validated.accepted.is_empty() {
-            return Vec::new();
-        }
-        let Some(root) = self.memory_root.as_ref() else {
-            return Vec::new();
-        };
-        let store = match MemoryStore::open(root) {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::debug!(error = %error, "semantic memory commit skipped: store unavailable");
-                return Vec::new();
-            }
-        };
-        let mut events = Vec::new();
-        for candidate in &validated.accepted {
-            match store.commit_candidate(candidate) {
-                Ok(outcome) => {
-                    if let Some(event) = applied_event(&outcome) {
-                        events.push(event);
-                    }
-                }
-                Err(error) => tracing::debug!(error = %error, "semantic memory commit failed"),
-            }
-        }
         events
-    }
-
-    /// Join a spawned extraction and commit what it proposed. Never fails the
-    /// turn: a timed-out, malformed or cancelled extraction is a debug log.
-    /// Join a spawned extraction and commit what it proposed.
-    ///
-    /// The wait after the coding turn is BOUNDED by [`EXTRACTION_GRACE`]: when
-    /// the extraction finished during the turn (the common case) the commit is
-    /// immediate; when it is still running it gets a short grace period and is
-    /// then abandoned for this turn. Memory is an auxiliary capability and a
-    /// slow extractor must never become the turn's tail latency. An abandoned
-    /// extraction is not an error: the next turn's conversation context still
-    /// carries the thread, and a repeated durable statement is re-extracted
-    /// then. Failure of any kind is a debug log.
-    async fn finish_semantic_extraction(
-        &self,
-        mut handle: tokio::task::JoinHandle<
-            Result<Vec<leveler_memory::SemanticCandidate>, crate::memory_extract::ExtractionError>,
-        >,
-        request: &str,
-        observer: &mut (dyn FnMut(AgentEvent) + Send),
-    ) {
-        let candidates = match tokio::time::timeout(EXTRACTION_GRACE, &mut handle).await {
-            Err(_) => {
-                handle.abort();
-                tracing::debug!(
-                    grace_ms = EXTRACTION_GRACE.as_millis() as u64,
-                    "semantic memory extraction exceeded grace; skipped this turn"
-                );
-                return;
-            }
-            Ok(Ok(Ok(candidates))) => candidates,
-            Ok(Ok(Err(error))) => {
-                tracing::debug!(error = %error, "semantic memory extraction degraded");
-                return;
-            }
-            Ok(Err(error)) => {
-                tracing::debug!(error = %error, "semantic memory extraction task failed");
-                return;
-            }
-        };
-        let accepted = self.commit_semantic_batch(&candidates, request);
-        tracing::debug!(
-            extracted = candidates.len(),
-            committed = accepted.len(),
-            "semantic memory extraction committed"
-        );
-        for event in accepted {
-            observer(event);
-        }
     }
 
     /// Continue a conversation: seed the model with the prior transcript plus a
@@ -2437,16 +2248,9 @@ impl Executor {
         if let Some(catalog) = self.agent_catalog_injection() {
             seed.push(Message::text(Role::System, catalog));
         }
-        let maintenance = self.maintain_memory(&request);
-        let fast_path_handled = maintenance.fast_path_handled;
-        for event in maintenance.events {
+        for event in self.maintain_memory(&request) {
             observer(event);
         }
-        let extraction = if fast_path_handled {
-            None
-        } else {
-            self.spawn_semantic_extraction(&request, &cancellation)
-        };
         let injection = self.relevant_memory_injection(&request);
         if !injection.recalled.is_empty() {
             observer(AgentEvent::MemoryRecalled {
@@ -2459,14 +2263,8 @@ impl Executor {
         }
         seed.push(user);
         let mut facts = AbortedFacts::default();
-        let outcome = self
-            .drive(seed, objective, observer, sink, cancellation, &mut facts)
-            .await;
-        if let Some(handle) = extraction {
-            self.finish_semantic_extraction(handle, &request, observer)
-                .await;
-        }
-        outcome
+        self.drive(seed, objective, observer, sink, cancellation, &mut facts)
+            .await
     }
 
     /// Resume from a previously-persisted transcript, continuing the loop.

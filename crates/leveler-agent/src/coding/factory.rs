@@ -186,18 +186,7 @@ impl ExecutorFactory {
         executor = executor
             .with_memory_catalog(self.memory_catalog.clone())
             .with_memory_expose(self.memory_expose)
-            .with_memory_root(self.memory_root.clone())
-            // Semantic extraction rides the SAME runtime and model the turn
-            // already uses, so it is provider-neutral and needs no extra
-            // configuration. With no memory root there is nothing to write and
-            // no extractor is built — the deterministic fast path is then the
-            // only producer, exactly as before.
-            .with_semantic_extractor(self.memory_root.as_ref().map(|_| {
-                Arc::new(crate::memory_extract::ModelSemanticExtractor::new(
-                    self.runtime.clone(),
-                    self.model.clone(),
-                )) as Arc<dyn crate::memory_extract::SemanticExtractor>
-            }));
+            .with_memory_root(self.memory_root.clone());
 
         executor = if profile_enables_goal_mode(&profile) {
             executor.with_goal_mode(true)

@@ -86,6 +86,14 @@ impl TurnInitiationPayload {
     }
 }
 
+/// Decode the authoritative initiating user message stored in `turns.payload`.
+///
+/// Consumers such as the asynchronous memory consolidator must use this
+/// boundary instead of duplicating the versioned wire format.
+pub fn decode_turn_initiating_message(payload: &str) -> Result<Message, EngineError> {
+    TurnInitiationPayload::decode(payload)
+}
+
 /// Everything the engine offers the harness for one turn.
 ///
 /// This is the whole seam. The engine hands over durable ports and the state

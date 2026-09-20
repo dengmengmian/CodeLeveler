@@ -44,7 +44,7 @@ pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
 pub use turn::{
     MAX_CHILD_RESUMES, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner,
-    TurnSink, TurnStart, storage_model_request,
+    TurnSink, TurnStart, decode_turn_initiating_message, storage_model_request,
 };
 
 /// Engine-level errors. Persistence and replay failures are hard errors —

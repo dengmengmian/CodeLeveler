@@ -153,16 +153,17 @@ impl MemoryStore {
     /// This is the explicit accept path (CLI / UI). It is **not** safe to call
     /// from auto-approved agent loops without a separate human decision.
     pub fn accept(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
         let candidate = self.read_pending(id)?;
         let entry = entry_from_candidate(&candidate);
         let saved = if let Some(key) = &entry.key {
             // Upsert by structured key: replace existing active with same key.
             if let Some(old) = self.find_active_by_key(key)? {
-                let _ = self.forget(&old.id);
+                let _ = self.forget_unlocked(&old.id);
             }
-            self.remember(entry)?
+            self.remember_unlocked(entry)?
         } else {
-            self.remember_deduplicated(entry)?
+            self.remember_deduplicated_unlocked(entry)?
         };
         let _ = fs::remove_file(self.pending_path(id));
         // Accepting clears suppress for this fingerprint so a later genuine

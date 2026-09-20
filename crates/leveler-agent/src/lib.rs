@@ -53,8 +53,11 @@ pub use leveler_lifecycle::{
     WorkProfile,
 };
 pub use memory_extract::{
+    BatchCandidateRejection, BatchCandidateValidation, BatchSemanticCandidate, BatchSourceTurn,
     DEFAULT_EXTRACTION_MAX_TOKENS, DEFAULT_EXTRACTION_TIMEOUT, ExtractionError,
-    MAX_EXTRACTOR_INPUT_CHARS, ModelSemanticExtractor, SemanticExtractor, extraction_system_prompt,
+    MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS, MAX_CANDIDATES, MAX_EXTRACTOR_INPUT_CHARS,
+    MAX_OUTPUT_TOKENS, ModelSemanticExtractor, SemanticExtractor, batch_extraction_system_prompt,
+    extraction_system_prompt, validate_batch_candidates,
 };
 pub use sub_agent::{ChildResult, ChildStatus, RUNTIME_NOTICE_HEADERS, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};
