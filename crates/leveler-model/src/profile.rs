@@ -325,15 +325,12 @@ pub struct CompatibilityConfig {
     /// the forced ToolChoice contract instead of downgrading it.
     #[serde(default = "default_true")]
     pub thinking_supports_forced_tool_choice: bool,
-    /// Whether the provider requires `reasoning_content` echoed back on
-    /// assistant tool-call messages. DeepSeek's thinking mode validates the
-    /// tool-call *id*: an id it does not recognize as one of its own
-    /// thinking-mode generations (a foreign id, or an id generated while
-    /// thinking was explicitly disabled) is rejected with HTTP 400 ("The
-    /// `reasoning_content` in the thinking mode must be passed back to the
-    /// API") unless the message carries a `reasoning_content` key — the
-    /// captured reasoning, or the empty string when the round produced none.
-    /// Measured 2026-08-07. Default false: the field is never sent.
+    /// Whether tool-enabled requests must echo `reasoning_content` on every
+    /// historical assistant message. DeepSeek's thinking mode validates the
+    /// complete assistant history when tools are available; the value is the
+    /// captured reasoning, or the empty string when a round produced none.
+    /// Requests without tools never send this provider-specific field.
+    /// Default false: the field is never sent.
     #[serde(default)]
     pub passback_reasoning_content: bool,
 }

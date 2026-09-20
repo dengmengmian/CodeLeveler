@@ -39,14 +39,24 @@ pub struct ProviderPreset {
 /// Presets offered during setup, in the order they are listed.
 pub const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
+        id: "bigmodel",
+        label: "智谱 BigModel",
+        base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
+        protocol: ProtocolKind::OpenAiChat,
+        key_env: "BIGMODEL_API_KEY",
+        console_url: "https://bigmodel.cn/coding-plan/personal/overview",
+        suggested_model: "glm-5.3",
+        suggested_context: 1_048_576,
+    },
+    ProviderPreset {
         id: "deepseek",
         label: "DeepSeek",
         base_url: "https://api.deepseek.com",
         protocol: ProtocolKind::OpenAiChat,
         key_env: "DEEPSEEK_API_KEY",
         console_url: "https://platform.deepseek.com/api_keys",
-        suggested_model: "deepseek-chat",
-        suggested_context: 131_072,
+        suggested_model: "deepseek-flash",
+        suggested_context: 1_048_576,
     },
     ProviderPreset {
         id: "moonshot",
@@ -149,5 +159,22 @@ mod tests {
     fn lookup_finds_presets_by_id() {
         assert_eq!(preset("deepseek").map(|p| p.label), Some("DeepSeek"));
         assert!(preset("nope").is_none());
+    }
+
+    #[test]
+    fn bigmodel_coding_plan_preset_matches_the_official_openai_endpoint() {
+        let p = preset("bigmodel").expect("BigModel must be a first-class login preset");
+        assert_eq!(p.base_url, "https://open.bigmodel.cn/api/coding/paas/v4");
+        assert_eq!(p.protocol, ProtocolKind::OpenAiChat);
+        assert_eq!(p.key_env, "BIGMODEL_API_KEY");
+        assert_eq!(p.suggested_model, "glm-5.3");
+        assert_eq!(p.suggested_context, 1_048_576);
+    }
+
+    #[test]
+    fn deepseek_preset_uses_the_current_flash_model_contract() {
+        let p = preset("deepseek").expect("DeepSeek must be a first-class login preset");
+        assert_eq!(p.suggested_model, "deepseek-flash");
+        assert_eq!(p.suggested_context, 1_048_576);
     }
 }

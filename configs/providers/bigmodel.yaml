@@ -1,0 +1,17 @@
+# Zhipu BigModel GLM Coding Plan OpenAI-compatible endpoint.
+# Docs: https://docs.bigmodel.cn/cn/coding-plan/quick-start
+# Key via env only — never commit secrets.
+id: bigmodel
+protocol: openai_chat
+base_url: ${BIGMODEL_BASE_URL:-https://open.bigmodel.cn/api/coding/paas/v4}
+api_key_env: BIGMODEL_API_KEY
+headers:
+  user-agent: CodeLeveler/0.1.0
+timeouts:
+  connect_seconds: 20
+  request_seconds: 600
+  idle_stream_seconds: 180
+retry:
+  max_attempts: 3
+  initial_backoff_ms: 500
+  max_backoff_ms: 10000

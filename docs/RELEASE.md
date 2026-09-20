@@ -1,18 +1,28 @@
-# CodeLeveler 1.0.1
+# CodeLeveler 1.0.2
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-A bug-fix release on top of 1.0.0. Installed 1.0.0 builds pick it up automatically, or run `leveler update` / `/update`.
+A feature and compatibility release on top of 1.0.1. Installed stable builds pick it up automatically, or run `leveler update` / `/update`.
+
+## Added
+
+- First-class Zhipu BigModel Coding Plan setup for `glm-5.3` and `glm-5.3-flash`, including reasoning, vision and 1M-context model profiles
+- Current DeepSeek profiles for `deepseek-flash` and `deepseek-v4-pro`, with vision and parallel-tool capabilities where supported
+- A unified skills registry, skill inspection and guarded skill-authoring workflow
+- Background activity, detail and plan views in the TUI
+- Durable semantic memory extraction with bounded reasoning, asynchronous batching and lifecycle recovery
+
+## Changed
+
+- Session continuation, cancel and resume now share one explicit runtime protocol across the CLI, TUI, host and remote-control surfaces
+- `leveler login` and the default `leveler init` path write complete built-in model capabilities instead of generic placeholders
+- The retired `deepseek-v4-flash` configuration is replaced by `deepseek-flash`
 
 ## Fixed
 
-- Starting the TUI while an older local runtime is still busy no longer fails after 10 seconds: the client waits for the old runtime to finish and hands over to the new one
-- A handover no longer hangs when another client has already started the replacement runtime
-- A development build is recognised by the runtime it started, so it no longer restarts an identical runtime on every launch
-- An idle background runtime shuts itself down once no client is attached and no work is running
-- Every visible tool row in the TUI names what ran
-- A message typed while a turn runs is sent automatically as the next turn once the runtime is ready, in order and only into the session it was written for; waiting no longer shows as "status unknown"
-- Option lists in questions, pickers and approvals are numbered, and labels stay aligned when moving the cursor or past 9 → 10
+- DeepSeek thinking-mode conversations now return `reasoning_content` for every historical assistant message when tools are present, preventing multi-turn tool requests from being rejected
+- DeepSeek forced tool choices disable thinking without silently dropping an explicitly supplied temperature
+- Dynamic DeepSeek peak/off-peak and cache pricing is no longer represented as an inaccurate static USD price
 
 ## Known limits
 

@@ -333,6 +333,10 @@ struct GlobalModel {
     /// false there. Defaults to true.
     #[serde(default = "default_true")]
     supports_temperature: bool,
+    #[serde(default)]
+    synthesize_tool_call_ids: bool,
+    #[serde(default)]
+    drop_unsupported_fields: bool,
     /// Whether the provider accepts a forced `tool_choice` (`required` /
     /// named function) while thinking mode is active. DeepSeek rejects that
     /// combination (HTTP 400 "Thinking mode does not support this
@@ -596,6 +600,80 @@ pub fn render_init_config(
     )
 }
 
+/// Render a starter config from an authoritative model profile.
+///
+/// Provider presets use this when the model YAML is bundled into the binary;
+/// arbitrary `leveler init` input continues to use [`render_init_config`].
+pub fn render_init_config_with_profile(
+    provider_id: &str,
+    base_url: &str,
+    api_key_env: &str,
+    profile: &ModelProfile,
+) -> String {
+    let text = render_init_config(
+        provider_id,
+        base_url,
+        api_key_env,
+        &profile.id,
+        u64::from(profile.limits.context_window),
+    );
+    let mut doc: DocumentMut = text.parse().expect("render_init_config returns valid TOML");
+    let model = &mut doc["models"][&profile.id];
+    model["model_id"] = value(profile.model_id.clone());
+    model["protocol"] = value(protocol_name(profile.protocol));
+    model["streaming"] = value(profile.capabilities.streaming);
+    model["tool_calling"] = value(profile.capabilities.tool_calling);
+    model["parallel_tool_calls"] = value(profile.capabilities.parallel_tool_calls);
+    model["structured_output"] = value(profile.capabilities.structured_output);
+    model["vision"] = value(profile.capabilities.vision);
+    model["reasoning"] = value(profile.capabilities.reasoning);
+    model["reasoning_style"] = value(reasoning_style_name(profile.reasoning.style));
+    let mut efforts = toml_edit::Array::new();
+    for effort in &profile.reasoning.supported_efforts {
+        efforts.push(effort.as_wire());
+    }
+    model["supported_efforts"] = value(efforts);
+    if let Some(effort) = profile.reasoning.default_effort {
+        model["reasoning_effort"] = value(effort.as_wire());
+    }
+    model["context_window"] = value(i64::from(profile.limits.context_window));
+    model["reliable_context"] = value(i64::from(profile.limits.reliable_context));
+    model["max_output_tokens"] = value(i64::from(profile.limits.max_output_tokens));
+    model["max_tool_schema_bytes"] = value(profile.limits.max_tool_schema_bytes as i64);
+    model["max_parallel_tool_calls"] = value(profile.limits.max_parallel_tool_calls as i64);
+    if let Some(limit) = profile.limits.max_tool_output_bytes {
+        model["max_tool_output_bytes"] = value(limit as i64);
+    }
+    model["synthesize_tool_call_ids"] = value(profile.compatibility.synthesize_tool_call_ids);
+    model["drop_unsupported_fields"] = value(profile.compatibility.drop_unsupported_fields);
+    model["supports_temperature"] = value(profile.compatibility.supports_temperature);
+    model["thinking_supports_forced_tool_choice"] =
+        value(profile.compatibility.thinking_supports_forced_tool_choice);
+    model["passback_reasoning_content"] = value(profile.compatibility.passback_reasoning_content);
+    format!(
+        "# CodeLeveler global config — created by `leveler login`.\n\
+         # Reference: https://github.com/dengmengmian/CodeLeveler#configuration\n\
+         {doc}"
+    )
+}
+
+fn protocol_name(protocol: ProtocolKind) -> &'static str {
+    match protocol {
+        ProtocolKind::OpenAiChat => "openai_chat",
+        ProtocolKind::OpenAiResponses => "openai_responses",
+        ProtocolKind::AnthropicMessages => "anthropic_messages",
+        ProtocolKind::GeminiGenerateContent => "gemini_generate_content",
+    }
+}
+
+fn reasoning_style_name(style: ReasoningStyle) -> &'static str {
+    match style {
+        ReasoningStyle::None => "none",
+        ReasoningStyle::OpenAiEffort => "open_ai_effort",
+        ReasoningStyle::ThinkingFlag => "thinking_flag",
+    }
+}
+
 impl GlobalConfig {
     /// Expand into provider/model/policy configs with sensible defaults filled.
     pub fn into_bundle(self) -> GlobalBundle {
@@ -662,6 +740,8 @@ impl GlobalConfig {
                         context_quality: None,
                         reasoning,
                         compatibility: CompatibilityConfig {
+                            synthesize_tool_call_ids: m.synthesize_tool_call_ids,
+                            drop_unsupported_fields: m.drop_unsupported_fields,
                             supports_temperature: m.supports_temperature,
                             thinking_supports_forced_tool_choice: m
                                 .thinking_supports_forced_tool_choice,
@@ -871,6 +951,28 @@ mod tests {
         assert_eq!(bundle.models.len(), 1, "one model: {text}");
         assert_eq!(bundle.models[0].profile.id, "deepseek-chat");
         assert_eq!(bundle.models[0].profile.limits.context_window, 131_072);
+    }
+
+    #[test]
+    fn profile_rendering_preserves_builtin_glm_facts() {
+        for model in ["glm-5.3", "glm-5.3-flash"] {
+            let expected = leveler_provider::builtin_model_profile("bigmodel", model)
+                .unwrap()
+                .unwrap();
+            let text = render_init_config_with_profile(
+                "bigmodel",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "BIGMODEL_API_KEY",
+                &expected,
+            );
+            let bundle = GlobalConfig::from_toml_str(&text).unwrap().into_bundle();
+            let actual = &bundle.models[0].profile;
+            assert_eq!(actual.model_id, expected.model_id);
+            assert_eq!(actual.capabilities, expected.capabilities);
+            assert_eq!(actual.reasoning, expected.reasoning);
+            assert_eq!(actual.limits, expected.limits);
+            assert_eq!(actual.compatibility, expected.compatibility);
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ leveler run "find the failing tests and fix them"
 
 - Produces repository changes you can inspect instead of treating an agent's completion claim as proof.
 - Persists sessions so you can close the UI and continue with `leveler resume`.
-- Supports DeepSeek, Moonshot/Kimi, OpenAI, Anthropic, and other OpenAI-compatible endpoints.
+- Supports Zhipu BigModel (GLM Coding Plan), DeepSeek, Moonshot/Kimi, OpenAI, Anthropic, and other OpenAI-compatible endpoints.
 - Provides an explicit `/develop` workflow for Analyze → Coding → Verify → Review.
 - Offers optional browser automation, web search, custom agents, and parallel candidate worktrees.
 
@@ -98,7 +98,7 @@ Manual update:
 ```sh
 leveler update            # install the latest stable release
 leveler update --check    # exit 2 when an update exists
-leveler update --version v1.0.1
+leveler update --version v1.0.2
 ```
 
 Inside the TUI:
@@ -128,7 +128,9 @@ cd your-project
 leveler
 ```
 
-`leveler login` supports DeepSeek, Moonshot/Kimi, OpenAI, and Anthropic. When the provider supports model discovery, it lists the models exposed to the supplied key. The command writes `~/.leveler/config.toml`; on Unix it restricts that file to mode `0600`. Skip the menu with `leveler login deepseek` or `leveler login moonshot`.
+`leveler login` supports Zhipu BigModel (GLM Coding Plan), DeepSeek, Moonshot/Kimi, OpenAI, and Anthropic. When the provider supports model discovery, it lists the models exposed to the supplied key. The command writes `~/.leveler/config.toml`; on Unix it restricts that file to mode `0600`. Skip the menu with `leveler login bigmodel`, `leveler login deepseek`, or `leveler login moonshot`.
+
+DeepSeek Flash is configured as `deepseek/deepseek-flash`. Replace the retired pre-release reference `deepseek/deepseek-v4-flash` in existing configs.
 
 For another OpenAI-compatible endpoint, run `leveler init` and edit `~/.leveler/config.toml`. [configs/example.yaml](configs/example.yaml) is an annotated schema reference only; that YAML file is not loaded as configuration.
 

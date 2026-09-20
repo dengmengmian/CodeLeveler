@@ -28,7 +28,7 @@ leveler run "找出失败的测试并修好"
 
 - 需要修改代码时，在仓库里产生可检查的改动，而不是把智能体的一句“已完成”当成证据。
 - 持久化会话；关闭界面后，可以用 `leveler resume` 继续。
-- 支持 DeepSeek、Moonshot/Kimi、OpenAI、Anthropic，以及其他 OpenAI 兼容接口。
+- 支持智谱 BigModel（GLM Coding Plan）、DeepSeek、Moonshot/Kimi、OpenAI、Anthropic，以及其他 OpenAI 兼容接口。
 - 提供显式的 `/develop` 工作流：分析 → 编码 → 验证 → 评审。
 - 可选支持浏览器自动化、网页搜索、自定义 Agent 和并行候选 worktree。
 
@@ -98,7 +98,7 @@ CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时�
 ```sh
 leveler update            # 安装最新稳定版
 leveler update --check    # 有更新时退出码为 2
-leveler update --version v1.0.1
+leveler update --version v1.0.2
 ```
 
 在 TUI 中：
@@ -128,7 +128,9 @@ cd your-project
 leveler
 ```
 
-`leveler login` 支持 DeepSeek、Moonshot/Kimi、OpenAI 和 Anthropic。服务商支持模型发现时，它会列出该 key 可见的模型。配置写入 `~/.leveler/config.toml`；在 Unix 上，该文件会被限制为 `0600`。可以用 `leveler login deepseek` 或 `leveler login moonshot` 跳过菜单。
+`leveler login` 支持智谱 BigModel（GLM Coding Plan）、DeepSeek、Moonshot/Kimi、OpenAI 和 Anthropic。服务商支持模型发现时，它会列出该 key 可见的模型。配置写入 `~/.leveler/config.toml`；在 Unix 上，该文件会被限制为 `0600`。可以用 `leveler login bigmodel`、`leveler login deepseek` 或 `leveler login moonshot` 跳过菜单。
+
+DeepSeek Flash 的模型引用是 `deepseek/deepseek-flash`。已有配置中的预发布名称 `deepseek/deepseek-v4-flash` 需要替换为该名称。
 
 接入其他 OpenAI 兼容接口时，先运行 `leveler init`，再修改 `~/.leveler/config.toml`。[configs/example.yaml](configs/example.yaml) 只是带注释的配置结构参考；这个 YAML 文件本身不会被加载。
 

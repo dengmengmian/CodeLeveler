@@ -40,9 +40,16 @@ fn load_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigErr
 /// user believe a binding is in effect.
 pub fn load_model_config(path: &Path) -> Result<ModelConfigFile, ConfigError> {
     let cfg: ModelConfigFile = load_yaml(path)?;
+    validate_model_config(cfg, &path.display().to_string())
+}
+
+fn validate_model_config(
+    cfg: ModelConfigFile,
+    source: &str,
+) -> Result<ModelConfigFile, ConfigError> {
     if let Some(policy) = &cfg.policy {
         return Err(ConfigError::RetiredKey {
-            path: path.display().to_string(),
+            path: source.to_string(),
             key: "policy".to_string(),
             reason: format!(
                 "model policy tiers are retired, `policy: {policy}` has no effect — \
@@ -56,11 +63,47 @@ pub fn load_model_config(path: &Path) -> Result<ModelConfigFile, ConfigError> {
         &cfg.profile.reasoning,
     ) {
         return Err(ConfigError::InvalidReasoning {
-            path: path.display().to_string(),
+            path: source.to_string(),
             reason,
         });
     }
     Ok(cfg)
+}
+
+/// Return a model profile bundled into the binary for first-run configuration.
+///
+/// The embedded source is the same YAML loaded by repo-local configuration, so
+/// `leveler login` cannot drift to a second copy of model facts.
+pub fn builtin_model_profile(
+    provider: &str,
+    model_id: &str,
+) -> Result<Option<ModelProfile>, ConfigError> {
+    let (source, raw) = match model_id {
+        "glm-5.3" => (
+            "configs/models/glm-5.3.yaml",
+            include_str!("../../../configs/models/glm-5.3.yaml"),
+        ),
+        "glm-5.3-flash" => (
+            "configs/models/glm-5.3-flash.yaml",
+            include_str!("../../../configs/models/glm-5.3-flash.yaml"),
+        ),
+        "deepseek-flash" => (
+            "configs/models/deepseek-flash.yaml",
+            include_str!("../../../configs/models/deepseek-flash.yaml"),
+        ),
+        "deepseek-v4-pro" => (
+            "configs/models/deepseek-v4-pro.yaml",
+            include_str!("../../../configs/models/deepseek-v4-pro.yaml"),
+        ),
+        _ => return Ok(None),
+    };
+    let cfg: ModelConfigFile =
+        serde_yaml::from_str(raw).map_err(|source_error| ConfigError::Parse {
+            path: source.to_string(),
+            source: source_error,
+        })?;
+    let cfg = validate_model_config(cfg, source)?;
+    Ok((cfg.profile.provider == provider).then_some(cfg.profile))
 }
 
 #[cfg(test)]
@@ -282,5 +325,72 @@ limits:
             reasoning > 0,
             "expected at least one reasoning-capable builtin"
         );
+    }
+
+    #[test]
+    fn builtin_glm_5_3_profiles_match_the_published_contract() {
+        use leveler_model::{ReasoningEffort, ReasoningStyle};
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/models");
+        for (file, expects_vision) in [("glm-5.3.yaml", false), ("glm-5.3-flash.yaml", true)] {
+            let profile = load_model_config(&dir.join(file)).unwrap().profile;
+            assert_eq!(profile.provider, "bigmodel");
+            assert_eq!(profile.protocol, ProtocolKind::OpenAiChat);
+            assert_eq!(profile.limits.context_window, 1_048_576);
+            assert_eq!(profile.limits.max_output_tokens, 131_072);
+            assert_eq!(profile.capabilities.vision, expects_vision);
+            assert_eq!(profile.reasoning.style, ReasoningStyle::ThinkingFlag);
+            assert_eq!(
+                profile.reasoning.supported_efforts,
+                vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max
+                ]
+            );
+            assert_eq!(profile.reasoning.default_effort, Some(ReasoningEffort::Max));
+        }
+    }
+
+    #[test]
+    fn builtin_deepseek_profiles_match_the_published_contract() {
+        use leveler_model::{ReasoningEffort, ReasoningStyle};
+
+        let flash = builtin_model_profile("deepseek", "deepseek-flash")
+            .unwrap()
+            .expect("deepseek-flash must be embedded for login");
+        assert_eq!(flash.model_id, "deepseek-flash");
+        assert!(flash.capabilities.vision);
+        assert!(flash.capabilities.parallel_tool_calls);
+        assert_eq!(flash.limits.context_window, 1_048_576);
+        assert_eq!(flash.limits.max_output_tokens, 393_216);
+        assert_eq!(flash.reasoning.style, ReasoningStyle::ThinkingFlag);
+        assert_eq!(
+            flash.reasoning.supported_efforts,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+        assert_eq!(flash.reasoning.default_effort, Some(ReasoningEffort::Max));
+        assert!(flash.compatibility.supports_temperature);
+        assert_eq!(flash.limits.max_parallel_tool_calls, 0);
+        assert!(!flash.compatibility.thinking_supports_forced_tool_choice);
+        assert!(flash.compatibility.passback_reasoning_content);
+        assert!(
+            flash.pricing.is_none(),
+            "dynamic peak/off-peak pricing must not be guessed"
+        );
+
+        let pro = builtin_model_profile("deepseek", "deepseek-v4-pro")
+            .unwrap()
+            .expect("deepseek-v4-pro must stay embedded for login compatibility");
+        assert!(
+            pro.pricing.is_none(),
+            "dynamic peak/off-peak pricing must not be guessed"
+        );
+        assert!(pro.compatibility.supports_temperature);
+        assert_eq!(pro.limits.max_parallel_tool_calls, 0);
     }
 }

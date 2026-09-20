@@ -326,6 +326,23 @@ retry:
         assert_eq!(cfg.timeouts.connect_seconds, 5);
         assert_eq!(cfg.retry.max_attempts, 2);
     }
+
+    #[test]
+    fn repo_bigmodel_provider_uses_the_coding_plan_endpoint() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs/providers/bigmodel.yaml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let expanded = expand_env_with(&raw, |_| None).unwrap();
+        let cfg = parse_provider_config(&expanded, &path.display().to_string()).unwrap();
+        assert_eq!(cfg.id, "bigmodel");
+        assert_eq!(cfg.protocol, ProtocolKind::OpenAiChat);
+        assert_eq!(cfg.base_url, "https://open.bigmodel.cn/api/coding/paas/v4");
+        assert_eq!(cfg.api_key_env, "BIGMODEL_API_KEY");
+        assert!(
+            cfg.api_key.is_none(),
+            "repo config must never contain a key"
+        );
+    }
 }
 
 #[cfg(test)]

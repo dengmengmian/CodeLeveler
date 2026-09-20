@@ -106,7 +106,7 @@ protocol: openai_chat
 capabilities:
   streaming: true
   tool_calling: true
-  parallel_tool_calls: false
+  parallel_tool_calls: true
   structured_output: true
   reasoning: true            # model CAN reason; see `reasoning:` below for how to ask
   vision: false
@@ -127,12 +127,9 @@ limits:
   reliable_context: 786432   # auto-compaction threshold
   max_output_tokens: 393216  # official max output 384K; keep input+output ≤ window
   max_tool_schema_bytes: 32768
-  max_parallel_tool_calls: 1
-# Optional cost accounting (USD/MTok). Official list is CNY; converted ~7.2.
-# input uses cache-miss list price (pro: 3 元, flash: 1 元).
-pricing:
-  input_usd_per_mtok: 0.4167
-  output_usd_per_mtok: 0.8333
+  max_parallel_tool_calls: 0  # provider supports parallel calls; no published hard cap
+# Pricing is omitted because DeepSeek peak/off-peak and cache rates are
+# dynamic; a static USD/MTok value would produce false cost accounting.
 compatibility:
   synthesize_tool_call_ids: true   # provider omits tool-call ids → synthesize them
   drop_unsupported_fields: true

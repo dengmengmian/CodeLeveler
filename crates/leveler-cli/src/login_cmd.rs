@@ -209,19 +209,7 @@ async fn first_run_setup(
     // gateways with no /models endpoint.
     let model = choose_model(chosen, &key).await?;
 
-    let template = leveler_app::global_config::render_init_config(
-        chosen.id,
-        chosen.base_url,
-        chosen.key_env,
-        &model,
-        chosen.suggested_context,
-    );
-    let with_proto = set_provider_field(
-        &template,
-        chosen.id,
-        "protocol",
-        protocol_key(chosen.protocol),
-    )?;
+    let with_proto = starter_config(chosen, &model)?;
     let with_key = upsert_api_key(&with_proto, chosen.id, &key)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -236,6 +224,33 @@ async fn first_run_setup(
     println!("  leveler            # interactive UI");
     println!("  leveler doctor     # verify the setup");
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn starter_config(
+    preset: &leveler_provider::presets::ProviderPreset,
+    model_id: &str,
+) -> anyhow::Result<String> {
+    let template = match leveler_provider::builtin_model_profile(preset.id, model_id)? {
+        Some(profile) => leveler_app::global_config::render_init_config_with_profile(
+            preset.id,
+            preset.base_url,
+            preset.key_env,
+            &profile,
+        ),
+        None => leveler_app::global_config::render_init_config(
+            preset.id,
+            preset.base_url,
+            preset.key_env,
+            model_id,
+            preset.suggested_context,
+        ),
+    };
+    set_provider_field(
+        &template,
+        preset.id,
+        "protocol",
+        protocol_key(preset.protocol),
+    )
 }
 
 /// Offer the models this key can actually reach; fall back to the preset's
@@ -491,6 +506,52 @@ context_window = 131072
                 "{} must be selectable straight away",
                 p.id
             );
+        }
+    }
+
+    #[test]
+    fn bigmodel_login_writes_complete_glm_model_facts() {
+        use leveler_provider::presets::preset;
+
+        for (model, vision) in [("glm-5.3", false), ("glm-5.3-flash", true)] {
+            let text = starter_config(preset("bigmodel").unwrap(), model).unwrap();
+            let doc: DocumentMut = text.parse().unwrap();
+            let facts = &doc["models"][model];
+            assert_eq!(facts["model_id"].as_str(), Some(model));
+            assert_eq!(facts["vision"].as_bool(), Some(vision));
+            assert_eq!(facts["reasoning"].as_bool(), Some(true));
+            assert_eq!(facts["reasoning_style"].as_str(), Some("thinking_flag"));
+            let efforts = facts["supported_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(efforts, vec!["low", "high", "max"]);
+            assert_eq!(facts["reasoning_effort"].as_str(), Some("max"));
+            assert_eq!(facts["context_window"].as_integer(), Some(1_048_576));
+            assert_eq!(facts["reliable_context"].as_integer(), Some(786_432));
+            assert_eq!(facts["max_output_tokens"].as_integer(), Some(131_072));
+        }
+    }
+
+    #[test]
+    fn deepseek_login_writes_complete_builtin_model_facts() {
+        use leveler_provider::presets::preset;
+
+        for (model, vision) in [("deepseek-flash", true), ("deepseek-v4-pro", false)] {
+            let text = starter_config(preset("deepseek").unwrap(), model).unwrap();
+            let doc: DocumentMut = text.parse().unwrap();
+            let facts = &doc["models"][model];
+            assert_eq!(facts["model_id"].as_str(), Some(model));
+            assert_eq!(facts["vision"].as_bool(), Some(vision));
+            assert_eq!(facts["reasoning"].as_bool(), Some(true));
+            assert_eq!(facts["parallel_tool_calls"].as_bool(), Some(true));
+            assert_eq!(facts["context_window"].as_integer(), Some(1_048_576));
+            assert_eq!(facts["max_output_tokens"].as_integer(), Some(393_216));
+            assert_eq!(facts["supports_temperature"].as_bool(), Some(true));
+            assert_eq!(facts["max_parallel_tool_calls"].as_integer(), Some(0));
+            assert_eq!(facts["passback_reasoning_content"].as_bool(), Some(true));
         }
     }
 

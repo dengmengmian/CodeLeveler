@@ -14,8 +14,8 @@ use crate::output::Line;
 /// Defaults offered at each prompt (empty answer accepts them).
 const DEFAULT_PROVIDER: &str = "deepseek";
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_MODEL: &str = "deepseek-chat";
-const DEFAULT_CONTEXT_WINDOW: u64 = 131_072;
+const DEFAULT_MODEL: &str = "deepseek-flash";
+const DEFAULT_CONTEXT_WINDOW: u64 = 1_048_576;
 
 pub(crate) fn cmd_init() -> anyhow::Result<std::process::ExitCode> {
     let path = leveler_app::GlobalConfig::path()
@@ -36,13 +36,13 @@ pub(crate) fn cmd_init() -> anyhow::Result<std::process::ExitCode> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         print!(
             "{}",
-            leveler_app::global_config::render_init_config(
+            render_config(
                 DEFAULT_PROVIDER,
                 DEFAULT_BASE_URL,
                 &default_key_env(DEFAULT_PROVIDER),
                 DEFAULT_MODEL,
                 DEFAULT_CONTEXT_WINDOW,
-            )
+            )?
         );
         eprintln!("# non-interactive: template printed, nothing written.");
         eprintln!("# save it to: {}", path.display());
@@ -65,13 +65,7 @@ pub(crate) fn cmd_init() -> anyhow::Result<std::process::ExitCode> {
         .parse()
         .with_context(|| format!("context window must be a number, got `{window_raw}`"))?;
 
-    let text = leveler_app::global_config::render_init_config(
-        &provider,
-        &base_url,
-        &key_env,
-        &model,
-        context_window,
-    );
+    let text = render_config(&provider, &base_url, &key_env, &model, context_window)?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -85,6 +79,31 @@ pub(crate) fn cmd_init() -> anyhow::Result<std::process::ExitCode> {
     println!("  leveler doctor            # verify the setup");
     println!("  leveler run \"…\"           # or `leveler tui`");
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn render_config(
+    provider: &str,
+    base_url: &str,
+    key_env: &str,
+    model: &str,
+    context_window: u64,
+) -> anyhow::Result<String> {
+    Ok(
+        match leveler_provider::builtin_model_profile(provider, model)? {
+            Some(profile) if u64::from(profile.limits.context_window) == context_window => {
+                leveler_app::global_config::render_init_config_with_profile(
+                    provider, base_url, key_env, &profile,
+                )
+            }
+            _ => leveler_app::global_config::render_init_config(
+                provider,
+                base_url,
+                key_env,
+                model,
+                context_window,
+            ),
+        },
+    )
 }
 
 /// `PROVIDER_API_KEY`, uppercased, non-alphanumerics folded to `_`.
@@ -122,12 +141,55 @@ fn prompt(label: &str, default: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_key_env;
+    use super::{
+        DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL, default_key_env, render_config,
+    };
+    use toml_edit::DocumentMut;
 
     #[test]
     fn key_env_is_derived_from_the_provider_id() {
         assert_eq!(default_key_env("deepseek"), "DEEPSEEK_API_KEY");
         assert_eq!(default_key_env("my-provider"), "MY_PROVIDER_API_KEY");
         assert_eq!(default_key_env(""), "PROVIDER_API_KEY");
+    }
+
+    #[test]
+    fn default_deepseek_template_uses_the_complete_flash_profile() {
+        let text = render_config(
+            "deepseek",
+            DEFAULT_BASE_URL,
+            "DEEPSEEK_API_KEY",
+            DEFAULT_MODEL,
+            DEFAULT_CONTEXT_WINDOW,
+        )
+        .unwrap();
+        let doc: DocumentMut = text.parse().unwrap();
+        let profile = &doc["models"]["deepseek-flash"];
+        assert_eq!(profile["model_id"].as_str(), Some("deepseek-flash"));
+        assert_eq!(profile["context_window"].as_integer(), Some(1_048_576));
+        assert_eq!(profile["max_output_tokens"].as_integer(), Some(393_216));
+        assert_eq!(profile["reasoning"].as_bool(), Some(true));
+        assert_eq!(profile["vision"].as_bool(), Some(true));
+        assert_eq!(profile["parallel_tool_calls"].as_bool(), Some(true));
+        assert_eq!(profile["supports_temperature"].as_bool(), Some(true));
+        assert_eq!(profile["max_parallel_tool_calls"].as_integer(), Some(0));
+        assert_eq!(profile["passback_reasoning_content"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn explicit_nondefault_context_window_is_preserved() {
+        let text = render_config(
+            "deepseek",
+            DEFAULT_BASE_URL,
+            "DEEPSEEK_API_KEY",
+            DEFAULT_MODEL,
+            262_144,
+        )
+        .unwrap();
+        let doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(
+            doc["models"]["deepseek-flash"]["context_window"].as_integer(),
+            Some(262_144)
+        );
     }
 }

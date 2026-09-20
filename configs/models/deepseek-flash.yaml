@@ -1,14 +1,14 @@
-# DeepSeek-V4-Pro — https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+# DeepSeek Flash — https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+# Replaces the pre-release `deepseek-v4-flash` config. Existing user config
+# should migrate to `deepseek/deepseek-flash`; the provider wire id is now
+# `deepseek-flash`.
 # Context 1M, max output 384K.
-# Reasoning (https://api-docs.deepseek.com/guides/thinking_mode/ 2026-08-18):
-#   native wire: low | high | max
-#   provider default: high (thinking on)
-#   CodeLeveler default: max
+# Reasoning: native wire low | high | max; CodeLeveler default max.
 # Pricing is intentionally omitted: DeepSeek's peak/off-peak and cache rates
 # are time-dependent and cannot be represented by the static pricing schema.
-id: deepseek-v4-pro
+id: deepseek-flash
 provider: deepseek
-model_id: deepseek-v4-pro
+model_id: deepseek-flash
 protocol: openai_chat
 capabilities:
   streaming: true
@@ -16,7 +16,7 @@ capabilities:
   parallel_tool_calls: true
   structured_output: true
   reasoning: true
-  vision: false
+  vision: true
 reasoning:
   style: thinking_flag
   supported_efforts: [low, high, max]
@@ -30,10 +30,5 @@ limits:
 compatibility:
   synthesize_tool_call_ids: true
   drop_unsupported_fields: true
-  # DeepSeek rejects a forced tool_choice while thinking (HTTP 400), and
-  # thinking is its server-side default — the adapter must explicitly disable
-  # thinking on forced-choice requests. Measured 2026-08-07.
   thinking_supports_forced_tool_choice: false
-  # Tool-enabled requests must echo `reasoning_content` on every historical
-  # assistant message (captured text, or "" when none).
   passback_reasoning_content: true

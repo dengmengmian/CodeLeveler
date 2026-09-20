@@ -44,7 +44,11 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         context: &ProtocolContext,
         stream: bool,
     ) -> Result<EncodedRequest, ProtocolError> {
-        let messages = convert_messages(&request.messages, context.passback_reasoning_content);
+        let messages = convert_messages(
+            &request.messages,
+            context.passback_reasoning_content,
+            !request.tools.is_empty(),
+        );
 
         let tools = request
             .tools
@@ -285,7 +289,11 @@ impl ProtocolAdapter for OpenAiChatAdapter {
 }
 
 /// Convert unified messages to OpenAI chat messages.
-fn convert_messages(messages: &[Message], passback_reasoning: bool) -> Vec<ChatMessage> {
+fn convert_messages(
+    messages: &[Message],
+    passback_reasoning: bool,
+    request_has_tools: bool,
+) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     for msg in messages {
         // Tool-result messages map to one `role: tool` message per result.
@@ -327,14 +335,14 @@ fn convert_messages(messages: &[Message], passback_reasoning: bool) -> Vec<ChatM
             }
         }
 
-        // Providers with the pass-back contract (DeepSeek thinking mode)
-        // validate that assistant tool-call messages carry a
-        // `reasoning_content` key: the captured reasoning, or the empty
-        // string when the round produced none (e.g. it ran with thinking
-        // explicitly disabled). Everyone else keeps the legacy wire — the
-        // key is never sent.
+        // DeepSeek's thinking-mode contract applies to the complete assistant
+        // history whenever the current request exposes tools, not only to
+        // rounds that happened to produce a tool call. Echo every historical
+        // assistant round's captured reasoning (or the empty string) in that
+        // case. Requests without tools retain the legacy wire and never expose
+        // the provider-specific field.
         let reasoning_content =
-            (passback_reasoning && msg.role == Role::Assistant && !tool_calls.is_empty())
+            (passback_reasoning && request_has_tools && msg.role == Role::Assistant)
                 .then_some(reasoning);
 
         // Use the multimodal array form only when images are present.
@@ -610,6 +618,35 @@ mod tests {
     }
 
     #[test]
+    fn forced_choice_keeps_temperature_when_disabling_deepseek_thinking() {
+        let context = ProtocolContext {
+            thinking_supports_forced_tool_choice: false,
+            supports_temperature: true,
+            ..ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::Max))
+        };
+        let mut req = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-flash"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        req.temperature = Some(0.2);
+        req.tools = vec![ToolDefinition {
+            name: "update_plan".into(),
+            description: "plan".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        req.tool_choice = ToolChoice::Required;
+
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&req, &context, true)
+            .unwrap()
+            .body;
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["tool_choice"], "required");
+        let temperature = body["temperature"].as_f64().unwrap();
+        assert!((temperature - 0.2).abs() < 1e-6, "{body}");
+    }
+
+    #[test]
     fn incompatible_provider_disables_thinking_on_named_tool_choice() {
         // Style None still gets the explicit disable: absence of the thinking
         // field means "provider default", which for these providers is ON.
@@ -637,7 +674,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         });
-        let req = ModelRequest::new(
+        let mut req = ModelRequest::new(
             ModelRef::new("deepseek", "deepseek-chat"),
             vec![
                 Message::text(Role::User, "hi"),
@@ -657,6 +694,11 @@ mod tests {
                 },
             ],
         );
+        req.tools = vec![ToolDefinition {
+            name: "get_time".into(),
+            description: "read the clock".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
         OpenAiChatAdapter::new()
             .encode_request(&req, context, true)
             .unwrap()
@@ -700,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn passback_does_not_touch_plain_assistant_text_messages() {
+    fn passback_does_not_touch_plain_assistant_text_messages_without_tools() {
         let context = ProtocolContext {
             passback_reasoning_content: true,
             ..ctx()
@@ -719,8 +761,80 @@ mod tests {
             .body;
         assert!(
             body["messages"][1].get("reasoning_content").is_none(),
-            "only tool-call messages carry the echo: {body}"
+            "requests without tools must keep the legacy wire: {body}"
         );
+    }
+
+    #[test]
+    fn passback_echoes_reasoning_from_plain_assistant_rounds_when_tools_are_available() {
+        let context = ProtocolContext {
+            passback_reasoning_content: true,
+            ..ctx()
+        };
+        let mut request = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-flash"),
+            vec![
+                Message::text(Role::User, "first"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentPart::Reasoning {
+                            text: "consider the next step".into(),
+                        },
+                        ContentPart::Text {
+                            text: "done".into(),
+                        },
+                    ],
+                },
+                Message::text(Role::User, "continue with tools"),
+            ],
+        );
+        request.tools = vec![ToolDefinition {
+            name: "grep".into(),
+            description: "search".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&request, &context, true)
+            .unwrap()
+            .body;
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            "consider the next step"
+        );
+    }
+
+    #[test]
+    fn passback_omits_plain_round_reasoning_when_current_request_has_no_tools() {
+        let context = ProtocolContext {
+            passback_reasoning_content: true,
+            ..ctx()
+        };
+        let request = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-flash"),
+            vec![
+                Message::text(Role::User, "first"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentPart::Reasoning {
+                            text: "private chain".into(),
+                        },
+                        ContentPart::Text {
+                            text: "done".into(),
+                        },
+                    ],
+                },
+                Message::text(Role::User, "continue without tools"),
+            ],
+        );
+
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&request, &context, true)
+            .unwrap()
+            .body;
+        assert!(body["messages"][1].get("reasoning_content").is_none());
     }
 
     #[test]
@@ -897,7 +1011,7 @@ mod tests {
                 },
             }],
         }];
-        let converted = convert_messages(&msgs, false);
+        let converted = convert_messages(&msgs, false, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("c1"));
@@ -924,7 +1038,7 @@ mod tests {
                 },
             ],
         }];
-        let converted = convert_messages(&msgs, false);
+        let converted = convert_messages(&msgs, false, false);
         let json = serde_json::to_value(&converted[0]).unwrap();
         assert_eq!(json["content"][0]["type"], "text");
         assert_eq!(json["content"][1]["type"], "image_url");

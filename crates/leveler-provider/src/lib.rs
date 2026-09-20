@@ -13,7 +13,7 @@ pub mod probe;
 pub mod registry;
 mod transport;
 
-pub use catalog::{ModelConfigFile, load_model_config};
+pub use catalog::{ModelConfigFile, builtin_model_profile, load_model_config};
 pub use config::{
     ConfigError, ProviderConfig, RetryConfig, Timeouts, expand_env, expand_env_with,
     load_provider_config, resolve_api_key,
