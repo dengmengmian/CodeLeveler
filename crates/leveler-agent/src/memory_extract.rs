@@ -202,14 +202,30 @@ Rules:
   translate or paraphrase it. A fact without a verbatim span is not a fact.
 - Be atomic: one fact per candidate. If the message states three separate
   durable facts, return three candidates. Never return one multi-fact blob.
-- "durable" means the user framed it as lasting ("以后", "from now on", "must").
-  Words like "今天", "currently", "this time", "先试试", "maybe" make a fact
-  "temporary" or "unknown" — report that honestly, do not upgrade it.
+- ONLY a statement that introduces a NEW or CHANGED value is a candidate. If
+  the message recalls, asks about, confirms, or defers to something already
+  decided, return {"candidates": []}. Examples that are NOT candidates:
+  "按之前定的来" / "模型按最终那个走" / "go with what we agreed" /
+  "我们之前怎么定的?" — these name no new value.
+- The "fact" must contain the concrete value being asserted (e.g. "默认模型
+  改为 Flash", "Windows 必须支持"), never a reference to a value
+  ("按之前那个", "最终定的那个"). A reference to a value is not a value.
+- "durable" means the user framed it as lasting ("以后", "from now on", "must")
+  OR changed/decided a project-level setting without a temporary marker
+  ("默认改回 Flash", "换成 X", "别再用 Y"). "temporary" or "unknown" needs
+  an explicit marker: "今天", "这次", "先试试", "暂时", "currently",
+  "this time", "maybe". A bare change ("改回 Flash 吧") is durable — do not
+  report it as "unknown" just because it carries no time word.
+- Durability is judged PER candidate, from the clause that states it. A
+  temporary word in one clause does not make a different clause's decision
+  temporary: in "模型换回 Flash，Pro 先不用了" the Flash change is durable and
+  only the "Pro 先不用" part is temporary.
 - Speculation, guesses and questions are NOT durable facts.
 - Report current runtime state (a PID, a branch, a port, today's status) as
   "temporary" or "unknown", never "durable".
-- Use "reaffirm" when the user restates an existing decision; "update" or
-  "negate" when they change or reverse one.
+- Use "reaffirm" when the user restates an existing decision with the SAME
+  value (still no new value, so no candidate is owed); "update" or "negate"
+  when they change or reverse an existing decision by naming a different value.
 - Prefer a canonical dotted "subject" and reuse the same subject string for the
   same subject across messages, so a later statement updates rather than
   duplicates.
