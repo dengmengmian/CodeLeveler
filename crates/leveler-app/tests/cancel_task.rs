@@ -168,12 +168,25 @@ fn blocking_work() -> Vec<MockResponse> {
 async fn last_outcome(db: &leveler_storage::Database, session: &leveler_core::SessionId) -> String {
     use leveler_engine::EngineEvent;
     let stores = EngineStores::from_database(db);
-    let row = stores
-        .events
-        .load_last_by_type(session, "task_finished", None)
-        .await
-        .unwrap()
-        .expect("a terminal exists");
+    // The terminal event is written as the task settles, which trails the turn
+    // row's status change — markedly so on Windows, where stopping the child
+    // process is not instantaneous. Wait for it rather than reading once.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let row = loop {
+        if let Some(row) = stores
+            .events
+            .load_last_by_type(session, "task_finished", None)
+            .await
+            .unwrap()
+        {
+            break row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no terminal task_finished event was recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     match EngineEvent::from_payload(&row.payload).unwrap() {
         EngineEvent::TaskFinished { outcome, .. } => outcome.as_str().to_string(),
         other => panic!("unexpected event: {other:?}"),
