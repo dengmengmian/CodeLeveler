@@ -14,17 +14,55 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use leveler_test_support::{
-    TestProcessScope, bounded_test, live_children, sleep_command, sleep_shell_line,
-};
+#[cfg(unix)]
+use leveler_test_support::sleep_shell_line;
+use leveler_test_support::{TestProcessScope, bounded_test, live_children, sleep_command};
 
 /// A short deadline for these self-tests; the real default is far larger.
 const SELF_TEST_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[cfg(unix)]
+const TREE_TEST_TIMEOUT: Duration = SELF_TEST_TIMEOUT;
+#[cfg(windows)]
+const TREE_TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn spawn_sleeper(scope: &mut TestProcessScope, seconds: u32) -> u32 {
     let (program, args) = sleep_command(seconds);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     scope.spawn_program(program, &args).expect("spawn sleeper")
+}
+
+#[cfg(unix)]
+fn spawn_descendant_tree(scope: &mut TestProcessScope, pid_file: &std::path::Path) {
+    // The shell exits after spawning the descendant. The process group must
+    // remain reclaimable even after its leader has gone.
+    let line = format!(
+        "{} & echo $! > '{}'",
+        sleep_shell_line(300),
+        pid_file.display()
+    );
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", &line]);
+    scope.spawn(&mut command).expect("spawn descendant shell");
+}
+
+#[cfg(windows)]
+fn spawn_descendant_tree(scope: &mut TestProcessScope, pid_file: &std::path::Path) {
+    // `taskkill /T` discovers descendants through the live parent tree. Keep
+    // the PowerShell parent alive after it records the child PID, then the
+    // scope's timeout cleanup must terminate both processes.
+    let path = pid_file.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$child = Start-Process -FilePath powershell -ArgumentList \
+         @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 300') \
+         -PassThru; Set-Content -LiteralPath '{path}' -Value $child.Id; \
+         Start-Sleep -Seconds 300"
+    );
+    let mut command = std::process::Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    scope
+        .spawn(&mut command)
+        .expect("spawn descendant PowerShell tree");
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -110,21 +148,12 @@ fn case_b_c_timeout_reclaims_child_and_descendants() {
     let error = run_catching(|| {
         let pid_file = pid_file.clone();
         let observed_direct = observed_direct.clone();
-        bounded_test("case_bc_children", SELF_TEST_TIMEOUT, move || async move {
+        bounded_test("case_bc_children", TREE_TEST_TIMEOUT, move || async move {
             let mut scope = TestProcessScope::new("case_bc");
             let direct = spawn_sleeper(&mut scope, 300);
             observed_direct.store(direct, Ordering::SeqCst);
 
-            // A shell that starts a descendant in the same process group and
-            // then exits, so only the descendant keeps the group alive.
-            let line = format!(
-                "{} & echo $! > '{}'",
-                sleep_shell_line(300),
-                pid_file.display()
-            );
-            let mut command = std::process::Command::new("/bin/sh");
-            command.args(["-c", &line]);
-            scope.spawn(&mut command).expect("spawn descendant shell");
+            spawn_descendant_tree(&mut scope, &pid_file);
 
             std::future::pending::<()>().await;
         });

@@ -11,6 +11,10 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_leveler"))
 }
 
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
 struct Sandbox {
     _tmp: tempfile::TempDir,
     home: PathBuf,
@@ -145,7 +149,7 @@ fn gc_over_budget_reclaims_oldest_entry() {
     set_old_mtime(&marker);
     sandbox.write_budget(8 * 1024 * 1024);
 
-    let out = sandbox.run(&["--cache", "--manifest", "/dev/null"], "en");
+    let out = sandbox.run(&["--cache", "--manifest", null_device()], "en");
     assert!(
         out.status.success(),
         "{}",
