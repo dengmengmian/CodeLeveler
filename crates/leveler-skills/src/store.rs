@@ -311,7 +311,7 @@ fn validate_bundled_path(path: &str) -> Result<PathBuf, SkillStoreError> {
         return fail("a bundled file path is empty");
     }
     let candidate = PathBuf::from(&normalized);
-    if candidate.is_absolute() {
+    if candidate.is_absolute() || candidate.has_root() {
         return fail(format!("bundled path `{path}` must be relative"));
     }
     let mut out = PathBuf::new();

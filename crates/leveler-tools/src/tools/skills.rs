@@ -539,7 +539,12 @@ mod tests {
             description.contains("references/checklist.md"),
             "{description}"
         );
-        assert!(description.contains(".leveler/skills"), "{description}");
+        // The location is host-native (backslashes on Windows); compare on a
+        // separator-normalized copy so the assertion tests the path, not the OS.
+        assert!(
+            description.replace('\\', "/").contains(".leveler/skills"),
+            "{description}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
