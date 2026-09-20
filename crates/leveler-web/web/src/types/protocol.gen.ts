@@ -357,6 +357,10 @@ export type RuntimeEvent =
   | { type: 'background_tasks_reconciled'; tasks: UiActiveBackgroundTask[] }
   /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
   | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[] }
+  /** The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies. */
+  | { type: 'memory_recalled'; count: number; ids: string[] }
+  /** A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body. */
+  | { type: 'memory_changed'; authority?: string | null; id: string; operation: string; title: string }
   /** Side-question (`/btw`) started; not persisted to session history. */
   | { type: 'btw_started'; question: string }
   /** Side-question answer chunk (often one full answer in MVP). */
