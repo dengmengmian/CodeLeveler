@@ -746,7 +746,6 @@ impl GlobalConfig {
                             thinking_supports_forced_tool_choice: m
                                 .thinking_supports_forced_tool_choice,
                             passback_reasoning_content: m.passback_reasoning_content,
-                            ..CompatibilityConfig::default()
                         },
                         // Global models use the default prompt; a per-model prompt
                         // is a repo-config concern (configs/models/*.yaml).
