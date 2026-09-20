@@ -211,6 +211,32 @@ fn trace_ids(ids: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The outcome of one turn's recall: the block to inject (if anything was
+/// selected) and the ids that made it, so the caller can emit an event without
+/// re-deriving the selection.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct MemoryInjection {
+    pub block: Option<String>,
+    pub recalled: Vec<String>,
+}
+
+/// Build the client-facing change event for one lifecycle operation. Carries a
+/// bounded title, never a body.
+fn memory_change_event(
+    operation: leveler_memory::MemoryLifecycleOp,
+    entry: &leveler_memory::MemoryEntry,
+) -> AgentEvent {
+    AgentEvent::MemoryChanged {
+        operation: operation.as_str().to_string(),
+        id: entry.id.clone(),
+        title: entry.title.chars().take(80).collect(),
+        authority: entry
+            .provenance
+            .as_ref()
+            .map(|p| p.authority.as_str().to_string()),
+    }
+}
+
 /// Events emitted as the loop progresses, for the CLI to render.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -420,6 +446,20 @@ pub enum AgentEvent {
     FinalizationPhaseStarted { phase: String },
     /// A generic finalization phase settled.
     FinalizationPhaseFinished { phase: String, elapsed_ms: u64 },
+    /// The per-turn memory recall selected memories and injected them into the
+    /// model context. Emitted ONLY when at least one memory was selected — a
+    /// search that found nothing is not a recall. Carries ids/counts, never
+    /// bodies, so it is safe on every surface.
+    MemoryRecalled { ids: Vec<String>, count: usize },
+    /// A durable memory was created, superseded or expired by the runtime
+    /// lifecycle. `operation` is one of `created` / `superseded` / `expired` /
+    /// `merged`. Carries the short title, not the body.
+    MemoryChanged {
+        operation: String,
+        id: String,
+        title: String,
+        authority: Option<String>,
+    },
     /// The loop finished with a final answer.
     Finished(String),
 }
@@ -1935,7 +1975,17 @@ impl Executor {
         if let Some(catalog) = self.agent_catalog_injection() {
             seed.push(Message::text(Role::System, catalog));
         }
-        if let Some(recall) = self.relevant_memory_injection(&request) {
+        for event in self.maintain_memory(&request) {
+            observer(event);
+        }
+        let injection = self.relevant_memory_injection(&request);
+        if !injection.recalled.is_empty() {
+            observer(AgentEvent::MemoryRecalled {
+                count: injection.recalled.len(),
+                ids: injection.recalled.clone(),
+            });
+        }
+        if let Some(recall) = injection.block {
             seed.push(Message::text(Role::System, recall));
         }
         seed.push(Message {
@@ -1995,19 +2045,21 @@ impl Executor {
     /// and the trace. Callers push the result as a `Role::System` message
     /// immediately before the user message, so the cached prefix survives and
     /// the block is stripped next turn.
-    fn relevant_memory_injection(&self, request: &str) -> Option<String> {
+    fn relevant_memory_injection(&self, request: &str) -> MemoryInjection {
         if !self.memory_expose {
             tracing::debug!(memory_exposed = false, "memory recall skipped");
-            return None;
+            return MemoryInjection::default();
         }
-        let root = self.memory_root.as_ref()?;
+        let Some(root) = self.memory_root.as_ref() else {
+            return MemoryInjection::default();
+        };
         let store = match MemoryStore::open(root) {
             Ok(store) => store,
             Err(error) => {
                 // Never silently swallowed: a store that cannot be opened is
                 // the difference between "no memories" and "memory broken".
                 tracing::debug!(error = %error, "memory store unavailable for recall");
-                return None;
+                return MemoryInjection::default();
             }
         };
         let standing = store
@@ -2045,7 +2097,75 @@ impl Executor {
             selected_ids = ?trace_ids(&plan.selected),
             "memory recall"
         );
-        block
+        MemoryInjection {
+            block,
+            recalled: plan.selected,
+        }
+    }
+
+    /// Run the durable-memory lifecycle for this turn's user request, returning
+    /// the structured change events a client should see.
+    ///
+    /// This is the AUTONOMOUS path. It never touches the model-facing `remember`
+    /// tool and never asks a second time for a rule the user just stated: a
+    /// candidate is only produced when the user's own sentence is an explicit
+    /// directive, and that sentence is the authorization. Everything weaker
+    /// (model inference, vague observation) is refused by the decision layer and
+    /// stays out of active memory.
+    ///
+    /// Failure is never fatal to the coding turn: a memory store that cannot be
+    /// written is reported at debug level and the turn proceeds.
+    fn maintain_memory(&self, request: &str) -> Vec<AgentEvent> {
+        if !self.memory_expose {
+            return Vec::new();
+        }
+        let Some(root) = self.memory_root.as_ref() else {
+            return Vec::new();
+        };
+        let store = match MemoryStore::open(root) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::debug!(error = %error, "memory maintenance skipped: store unavailable");
+                return Vec::new();
+            }
+        };
+        let mut events = Vec::new();
+        match store.expire_due() {
+            Ok(expired) => {
+                for entry in expired {
+                    events.push(memory_change_event(
+                        leveler_memory::MemoryLifecycleOp::Expired,
+                        &entry,
+                    ));
+                }
+            }
+            Err(error) => tracing::debug!(error = %error, "memory expiry sweep failed"),
+        }
+        if let Some(candidate) = leveler_memory::parse_durable_fact(request) {
+            match store.commit_candidate(&candidate) {
+                Ok(outcome) => {
+                    if let Some(entry) = &outcome.entry {
+                        let op = match outcome.operation {
+                            leveler_memory::AppliedOperation::Created => {
+                                leveler_memory::MemoryLifecycleOp::Created
+                            }
+                            leveler_memory::AppliedOperation::Superseded => {
+                                leveler_memory::MemoryLifecycleOp::Superseded
+                            }
+                            leveler_memory::AppliedOperation::Merged => {
+                                leveler_memory::MemoryLifecycleOp::Merged
+                            }
+                            leveler_memory::AppliedOperation::Skipped => {
+                                return events;
+                            }
+                        };
+                        events.push(memory_change_event(op, entry));
+                    }
+                }
+                Err(error) => tracing::debug!(error = %error, "memory commit failed"),
+            }
+        }
+        events
     }
 
     /// Continue a conversation: seed the model with the prior transcript plus a
@@ -2103,7 +2223,17 @@ impl Executor {
         if let Some(catalog) = self.agent_catalog_injection() {
             seed.push(Message::text(Role::System, catalog));
         }
-        if let Some(recall) = self.relevant_memory_injection(&request) {
+        for event in self.maintain_memory(&request) {
+            observer(event);
+        }
+        let injection = self.relevant_memory_injection(&request);
+        if !injection.recalled.is_empty() {
+            observer(AgentEvent::MemoryRecalled {
+                count: injection.recalled.len(),
+                ids: injection.recalled.clone(),
+            });
+        }
+        if let Some(recall) = injection.block {
             seed.push(Message::text(Role::System, recall));
         }
         seed.push(user);
@@ -2298,6 +2428,13 @@ mod recall_tests {
             archived_at: None,
             key: None,
             kind: None,
+            status: leveler_memory::MemoryStatus::Active,
+            scope: leveler_memory::MemoryScope::Project,
+            provenance: None,
+            supersedes: None,
+            superseded_by: None,
+            superseded_at: None,
+            expires_at: None,
         }
     }
 

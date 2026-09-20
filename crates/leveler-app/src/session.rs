@@ -166,6 +166,21 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             max_attempts,
             delay_ms,
         },
+        EngineEvent::MemoryRecalled { count, ids } => AgentEvent::MemoryRecalled {
+            count: count as usize,
+            ids,
+        },
+        EngineEvent::MemoryChanged {
+            operation,
+            id,
+            title,
+            authority,
+        } => AgentEvent::MemoryChanged {
+            operation,
+            id,
+            title,
+            authority,
+        },
         EngineEvent::PlanUpdated { steps } => AgentEvent::PlanUpdated { steps },
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }

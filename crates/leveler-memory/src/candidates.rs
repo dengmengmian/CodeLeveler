@@ -8,16 +8,18 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::{CandidateOperation, MemoryAuthority};
 use crate::{MemoryError, now_rfc3339, slugify};
 
 /// How a candidate was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateSource {
-    /// LEGACY. Before direct writes existed, an explicit "记住：…" became a
-    /// candidate; today that goes straight to active, so nothing new carries
-    /// this. Kept so old `pending/` files still deserialize, and shown as
-    /// legacy rather than reinterpreted.
+    /// An explicit user statement of a durable rule ("以后默认模型固定为 X").
+    /// It is the user's own words in this turn, so it is the authorization for
+    /// an autonomous lifecycle write — no second consent prompt is owed.
+    /// (Historically also the label on a "记住：…" candidate; kept so old
+    /// `pending/` files still deserialize.)
     UserExplicit,
     /// LEGACY spelling of [`Self::SystemInferred`], kept for the same reason.
     SystemPropose,
@@ -62,6 +64,23 @@ pub struct MemoryCandidate {
     pub fingerprint: String,
     pub source: CandidateSource,
     pub created_at: String,
+    /// Semantic identity of the fact this candidate states (a normalized
+    /// subject). Two statements about the same subject share it, so a later
+    /// one can supersede an earlier one instead of accumulating beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_key: Option<String>,
+    /// How much weight this candidate carries when it conflicts with an
+    /// existing memory. Defaults to the weakest class for old `pending/` files.
+    #[serde(default)]
+    pub authority: MemoryAuthority,
+    /// Whether the candidate states a new fact or corrects an existing one.
+    /// A hint for the commit decision; the decision re-derives it from the store.
+    #[serde(default)]
+    pub operation: CandidateOperation,
+    /// Optional expiry (RFC 3339). Present means the fact is time-bound and
+    /// must not survive past it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 impl MemoryCandidate {
@@ -98,10 +117,14 @@ impl MemoryCandidate {
             body,
             tags,
             kind,
+            semantic_key: key.clone(),
             key,
             fingerprint,
             source,
             created_at: now_rfc3339(),
+            authority: MemoryAuthority::ModelInference,
+            operation: CandidateOperation::Create,
+            expires_at: None,
         })
     }
 }

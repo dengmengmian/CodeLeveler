@@ -3838,6 +3838,78 @@ fn memory_list_event_pushes_multiline_transcript_note() {
 }
 
 #[test]
+fn memory_recalled_event_pushes_a_note_and_a_short_toast() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryRecalled {
+            count: 2,
+            ids: vec!["a".into(), "b".into()],
+        }),
+    );
+    let note = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            TranscriptItem::Note(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("MemoryRecalled must push a note");
+    // Structured: the count is rendered, not a parsed log line.
+    assert!(note.contains('2'), "{note}");
+    assert!(note.contains("Memory"), "{note}");
+    let toast = s.notification.as_ref().expect("short toast");
+    assert!(toast.message.contains('2'), "{}", toast.message);
+}
+
+#[test]
+fn memory_recalled_zero_is_silent() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryRecalled {
+            count: 0,
+            ids: vec![],
+        }),
+    );
+    assert!(
+        !s.transcript.items().iter().any(|i| matches!(
+            i,
+            TranscriptItem::Note(t) if t.contains("Memory")
+        )),
+        "a 0-hit search must not render as a recall"
+    );
+}
+
+#[test]
+fn memory_changed_event_renders_the_structured_operation() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryChanged {
+            operation: "superseded".into(),
+            id: "k-probe".into(),
+            title: "发布探针代号：BLUE-4821".into(),
+            authority: Some("explicit_user".into()),
+        }),
+    );
+    let note = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            TranscriptItem::Note(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("MemoryChanged must push a note");
+    assert!(note.contains("k-probe"), "{note}");
+    assert!(note.contains("BLUE-4821"), "{note}");
+    assert!(note.contains("explicit_user"), "{note}");
+    assert!(!note.contains("updated · updated"), "{note}");
+}
+
+#[test]
 fn slash_work_mode_sends_product_axes() {
     let mut s = opened();
     // Default collaboration is chat; /work-mode only changes the work profile.

@@ -383,6 +383,23 @@ pub enum EngineEvent {
     PlanUpdated {
         steps: Vec<leveler_lifecycle::PlanStep>,
     },
+    /// The runtime recalled durable project memory into this turn's model
+    /// context. Emitted only when at least one memory was selected; carries
+    /// ids/count, never bodies.
+    MemoryRecalled {
+        count: u32,
+        ids: Vec<String>,
+    },
+    /// A durable memory lifecycle change (created / superseded / expired /
+    /// merged). `operation` is an opaque stable key chosen by the memory
+    /// capability so the engine stays free of its types.
+    MemoryChanged {
+        operation: String,
+        id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authority: Option<String>,
+    },
     /// Host refused update_goal(complete) (process gate). Persisted for UI/resume.
     GoalIntercepted {
         kind: String,
@@ -729,6 +746,7 @@ impl EngineEvent {
                 | EngineEvent::SubAgentActivity { .. }
                 | EngineEvent::RunFinished { .. }
                 | EngineEvent::ModelRetrying { .. }
+                | EngineEvent::MemoryRecalled { .. }
         )
     }
 
@@ -831,6 +849,10 @@ impl EngineEvent {
             | EngineEvent::AdvisoryStarted { .. }
             | EngineEvent::CommandProgress { .. }
             | EngineEvent::ModelRetrying { .. }
+            // A memory id/operation is a project fact; a recalled set is
+            // per-turn UI data. Neither belongs on a remote projection.
+            | EngineEvent::MemoryRecalled { .. }
+            | EngineEvent::MemoryChanged { .. }
             // User shell facts carry the raw command line and its output —
             // local-sensitive by construction.
             | EngineEvent::UserShellStarted { .. }
@@ -1008,6 +1030,8 @@ impl EngineEvent {
             | EngineEvent::ToolCallOutput { .. }
             | EngineEvent::ModelRetrying { .. }
             | EngineEvent::CommandProgress { .. }
+            | EngineEvent::MemoryRecalled { .. }
+            | EngineEvent::MemoryChanged { .. }
             | EngineEvent::ContextUsage { .. } => return None,
         })
     }

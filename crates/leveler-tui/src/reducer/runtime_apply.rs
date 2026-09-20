@@ -959,6 +959,41 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BackgroundTasksReconciled { tasks } => {
             replace_active_background_tasks(state, &tasks);
         }
+        RuntimeEvent::MemoryRecalled { count, .. } => {
+            // The runtime emits this only for a real recall, so a search that
+            // found nothing never reaches here. One collapsed line, no bodies.
+            if count == 0 {
+                return;
+            }
+            let label = state.t().memory_recalled.replace("{}", &count.to_string());
+            state.transcript.push_note(label.clone());
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: label,
+            });
+        }
+        RuntimeEvent::MemoryChanged {
+            operation,
+            id,
+            title,
+            authority,
+        } => {
+            let t = state.t();
+            let verb = match operation.as_str() {
+                "created" => t.memory_created,
+                "superseded" | "updated" => t.memory_updated,
+                "expired" => t.memory_expired,
+                "merged" => t.memory_merged,
+                _ => t.memory_created,
+            };
+            let suffix = authority.map(|a| format!(" ({a})")).unwrap_or_default();
+            let line = format!("{verb} · [{id}] {title}{suffix}");
+            state.transcript.push_note(line.clone());
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: line,
+            });
+        }
     }
 }
 

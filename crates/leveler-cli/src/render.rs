@@ -255,6 +255,20 @@ fn render_event_text(event: AgentEvent) {
             println!("  {} finalizing: {phase}", console::style("⋯").yellow());
         }
         AgentEvent::FinalizationPhaseFinished { .. } => {}
+        AgentEvent::MemoryRecalled { count, .. } => {
+            println!("{} memory recalled {count}", console::style("●").cyan());
+        }
+        AgentEvent::MemoryChanged {
+            operation,
+            id,
+            title,
+            ..
+        } => {
+            println!(
+                "{} memory {operation} [{id}] {title}",
+                console::style("●").cyan()
+            );
+        }
         AgentEvent::Finished(_) => {}
     }
 }
@@ -482,6 +496,18 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         }),
         AgentEvent::FinalizationPhaseFinished { phase, elapsed_ms } => serde_json::json!({
             "type": "finalization_phase_finished", "phase": phase, "elapsed_ms": elapsed_ms,
+        }),
+        AgentEvent::MemoryRecalled { ids, count } => serde_json::json!({
+            "type": "memory_recalled", "count": count, "ids": ids,
+        }),
+        AgentEvent::MemoryChanged {
+            operation,
+            id,
+            title,
+            authority,
+        } => serde_json::json!({
+            "type": "memory_changed", "operation": operation, "id": id,
+            "title": title, "authority": authority,
         }),
     }
 }

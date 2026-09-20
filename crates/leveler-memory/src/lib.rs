@@ -9,12 +9,17 @@
 #![forbid(unsafe_code)]
 
 mod candidates;
+mod lifecycle;
 mod pipeline;
 
 pub use candidates::{
     CandidateKind, CandidateSource, MemoryCandidate, fingerprint_of, looks_like_secret,
     package_manager_from_root, parse_direct_memory_command, parse_inferred_preference,
     title_from_body,
+};
+pub use lifecycle::{
+    AppliedOperation, CandidateOperation, CommitOutcome, MemoryAuthority, MemoryDecision,
+    MemoryLifecycleOp, MemoryOperation, Provenance, decide, parse_durable_fact, semantic_key_of,
 };
 pub use pipeline::{ProposeOutcome, SuppressRecord, collect_turn_candidates};
 
@@ -24,6 +29,32 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// How far a memory's relevance reaches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScope {
+    /// Durable project knowledge; survives sessions and restarts.
+    #[default]
+    Project,
+    /// Time-bound runtime state. Must carry an expiry and never becomes a
+    /// lasting fact.
+    Ephemeral,
+}
+
+/// Lifecycle state. `Active` is current truth; the other two are history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatus {
+    #[default]
+    Active,
+    /// Replaced by a newer memory; kept for history, never recalled as current.
+    Superseded,
+    /// Reached its `expires_at`.
+    Expired,
+    /// Forgotten (archived) by the user.
+    Archived,
+}
 
 /// A durable memory entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,11 +69,61 @@ pub struct MemoryEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
     /// Optional structured key (e.g. `package_manager`) for upserts / soft-hints.
+    /// Doubles as the semantic identity for lifecycle conflict resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     /// Free-form kind label (`preference`, `package_manager`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Lifecycle state. Old files omit it and read as `Active`.
+    #[serde(default)]
+    pub status: MemoryStatus,
+    /// Relevance scope. Old files omit it and read as `Project`.
+    #[serde(default)]
+    pub scope: MemoryScope,
+    /// Where the fact came from and how much weight it carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+    /// The id this entry replaced, when it is a correction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// The id that replaced this entry, when it is historical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// When this entry stopped being current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_at: Option<String>,
+    /// When this entry stops being recallable. RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+impl MemoryEntry {
+    /// The state after reconciling the legacy `archived_at` marker with the
+    /// explicit `status` field: an old archived file (no status) reads as
+    /// `Archived`, never as current truth.
+    pub fn effective_status(&self) -> MemoryStatus {
+        match self.status {
+            MemoryStatus::Active if self.archived_at.is_some() => MemoryStatus::Archived,
+            other => other,
+        }
+    }
+
+    /// Whether this entry's window has closed. RFC 3339 UTC timestamps order
+    /// lexicographically, so a string compare is exact here.
+    pub fn is_expired_at(&self, now: &str) -> bool {
+        self.expires_at.as_deref().is_some_and(|at| at <= now)
+    }
+
+    /// The authority this entry carries. An entry written before provenance
+    /// existed is treated as the weakest class, so a new explicit statement may
+    /// correct it.
+    pub fn authority(&self) -> MemoryAuthority {
+        self.provenance
+            .as_ref()
+            .map(|p| p.authority)
+            .unwrap_or(MemoryAuthority::ModelInference)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +271,7 @@ impl MemoryStore {
         if active.exists() {
             let mut entry: MemoryEntry = serde_json::from_str(&fs::read_to_string(&active)?)?;
             entry.archived_at = Some(now_rfc3339());
+            entry.status = MemoryStatus::Archived;
             fs::write(&archive, serde_json::to_string_pretty(&entry)?)?;
             fs::remove_file(active)?;
             return Ok(entry);
@@ -272,6 +354,16 @@ impl MemoryStore {
     ) -> Result<MemoryEntry, MemoryError> {
         let mut entry = new_entry(title, body, tags);
         entry.kind = Some(kind.as_str().to_string());
+        // Every caller of `activate` is a person's own command or a proposal
+        // they approved, so the entry records explicit-user authority. Without
+        // it an entry written before this field existed and one written now
+        // would look alike, and a lower-authority observation could silently
+        // replace a fact the user chose.
+        entry.provenance = Some(Provenance {
+            authority: MemoryAuthority::ExplicitUser,
+            source: "user_direct".to_string(),
+            evidence: None,
+        });
         // `remember_deduplicated` already owns the hard parts: a hard-link
         // reservation so concurrent writers cannot claim one id, an identical
         // title+body returning what is there, and a `-N` suffix otherwise.
@@ -308,7 +400,7 @@ impl MemoryStore {
     /// because they must never reach the model this way.
     pub fn catalog_lines(&self, max_entries: usize) -> Result<String, MemoryError> {
         let mut entries: Vec<MemoryEntry> = self
-            .list_active()?
+            .effective_active()?
             .into_iter()
             .filter(|e| {
                 !is_sensitive(e)
@@ -350,7 +442,7 @@ impl MemoryStore {
     /// `id` so the block is deterministic across runs.
     pub fn standing_preferences(&self, limit: usize) -> Result<Vec<MemoryEntry>, MemoryError> {
         let mut out: Vec<MemoryEntry> = self
-            .list_active()?
+            .effective_active()?
             .into_iter()
             .filter(|e| is_standing_preference(e) && !is_sensitive(e))
             .collect();
@@ -392,7 +484,7 @@ impl MemoryStore {
         if q.is_empty() {
             return Ok(Vec::new());
         }
-        let entries = self.list_active()?;
+        let entries = self.effective_active()?;
         let docs: Vec<Vec<String>> = entries
             .iter()
             .map(|e| tokenize(&format!("{} {} {}", e.title, e.body, e.tags.join(" "))))
@@ -488,6 +580,13 @@ pub fn new_entry(title: &str, body: &str, tags: Vec<String>) -> MemoryEntry {
         archived_at: None,
         key: None,
         kind: None,
+        status: MemoryStatus::Active,
+        scope: MemoryScope::Project,
+        provenance: None,
+        supersedes: None,
+        superseded_by: None,
+        superseded_at: None,
+        expires_at: None,
     }
 }
 
@@ -507,6 +606,18 @@ pub fn entry_from_candidate(candidate: &MemoryCandidate) -> MemoryEntry {
         }
         .to_string(),
     );
+    entry.provenance = Some(Provenance {
+        authority: candidate.authority,
+        source: match candidate.source {
+            crate::CandidateSource::UserExplicit => "explicit_user",
+            crate::CandidateSource::SystemPropose => "system_propose",
+            crate::CandidateSource::SystemInferred => "system_inferred",
+            crate::CandidateSource::AgentProposed => "agent_remember_tool",
+        }
+        .to_string(),
+        evidence: None,
+    });
+    entry.expires_at = candidate.expires_at.clone();
     entry
 }
 
@@ -638,7 +749,7 @@ fn s_for_hash(title: &str) -> String {
 
 /// Short stable hex hash (FNV-1a 64), the same family `fingerprint_of` uses.
 /// Not cryptographic — it only has to be stable and collision-shy for titles.
-fn short_hash(raw: &str) -> String {
+pub(crate) fn short_hash(raw: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in raw.bytes() {
         h ^= u64::from(b);
@@ -1244,7 +1355,7 @@ impl MemoryStore {
         limit: usize,
     ) -> Result<Vec<(MemoryEntry, f64)>, MemoryError> {
         let q = local_embed(query);
-        let entries = self.list_active()?;
+        let entries = self.effective_active()?;
         let mut scored: Vec<(MemoryEntry, f64)> = entries
             .into_iter()
             .map(|e| {

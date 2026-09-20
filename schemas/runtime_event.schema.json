@@ -1694,6 +1694,67 @@
       }
     },
     {
+      "description": "The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies.",
+      "type": "object",
+      "required": [
+        "count",
+        "ids",
+        "type"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory_recalled"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body.",
+      "type": "object",
+      "required": [
+        "id",
+        "operation",
+        "title",
+        "type"
+      ],
+      "properties": {
+        "authority": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "memory_changed"
+          ]
+        }
+      }
+    },
+    {
       "description": "Side-question (`/btw`) started; not persisted to session history.",
       "type": "object",
       "required": [
@@ -4343,6 +4404,67 @@
               "type": "string",
               "enum": [
                 "memory_list"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies.",
+          "type": "object",
+          "required": [
+            "count",
+            "ids",
+            "type"
+          ],
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "memory_recalled"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body.",
+          "type": "object",
+          "required": [
+            "id",
+            "operation",
+            "title",
+            "type"
+          ],
+          "properties": {
+            "authority": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "memory_changed"
               ]
             }
           }

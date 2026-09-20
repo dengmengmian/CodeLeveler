@@ -771,6 +771,25 @@ impl EventBridge {
                 let plan = ui_plan(steps);
                 let _ = self.events.send(RuntimeEvent::PlanUpdated { plan });
             }
+            EngineEvent::MemoryRecalled { count, ids } => {
+                // Structured, so no client parses the injected system block.
+                let _ = self
+                    .events
+                    .send(RuntimeEvent::MemoryRecalled { count, ids });
+            }
+            EngineEvent::MemoryChanged {
+                operation,
+                id,
+                title,
+                authority,
+            } => {
+                let _ = self.events.send(RuntimeEvent::MemoryChanged {
+                    operation,
+                    id,
+                    title,
+                    authority,
+                });
+            }
             EngineEvent::GoalIntercepted { kind, detail } => {
                 // Surface as activity label; full tool error remains the model path.
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
@@ -2119,6 +2138,26 @@ mod projection_equivalence {
             } => format!("progress:{phase}:closing={closing}:streak={no_progress_streak}"),
             other => format!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn memory_events_project_to_structured_runtime_events() {
+        let shapes = project(vec![
+            EngineEvent::MemoryRecalled {
+                count: 1,
+                ids: vec!["k-probe".into()],
+            },
+            EngineEvent::MemoryChanged {
+                operation: "created".into(),
+                id: "k-probe".into(),
+                title: "发布探针代号：ORANGE-7319".into(),
+                authority: Some("explicit_user".into()),
+            },
+        ]);
+        assert!(shapes[0].contains("MemoryRecalled"), "{shapes:?}");
+        assert!(shapes[0].contains("k-probe"), "{shapes:?}");
+        assert!(shapes[1].contains("MemoryChanged"), "{shapes:?}");
+        assert!(shapes[1].contains("created"), "{shapes:?}");
     }
 
     fn tool_started(id: &str, name: &str, agent: Option<&str>) -> EngineEvent {

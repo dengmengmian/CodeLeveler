@@ -610,6 +610,20 @@ pub enum RuntimeEvent {
         #[serde(default)]
         pending: Vec<UiMemoryCandidate>,
     },
+    /// The runtime recalled durable project memory into this turn's model
+    /// context. Emitted ONLY when at least one memory was selected — a search
+    /// that found nothing is not a recall. Ids/count only, never bodies.
+    MemoryRecalled { count: u32, ids: Vec<String> },
+    /// A durable memory lifecycle change (created / superseded / expired /
+    /// merged). `operation` is an opaque stable key; `title` is a bounded
+    /// summary, never the body.
+    MemoryChanged {
+        operation: String,
+        id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authority: Option<String>,
+    },
     /// Side-question (`/btw`) started; not persisted to session history.
     BtwStarted { question: String },
     /// Side-question answer chunk (often one full answer in MVP).
