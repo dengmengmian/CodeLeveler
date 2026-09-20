@@ -17,6 +17,7 @@ mod child_profile;
 pub mod coding;
 pub mod executor;
 mod injected_tools;
+mod memory_extract;
 mod nudges;
 pub mod ownership;
 mod prompt;
@@ -50,6 +51,10 @@ pub use leveler_lifecycle::{
     ChildLimit, ChildStop, CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource,
     PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase,
     WorkProfile,
+};
+pub use memory_extract::{
+    DEFAULT_EXTRACTION_MAX_TOKENS, DEFAULT_EXTRACTION_TIMEOUT, ExtractionError,
+    MAX_EXTRACTOR_INPUT_CHARS, ModelSemanticExtractor, SemanticExtractor, extraction_system_prompt,
 };
 pub use sub_agent::{ChildResult, ChildStatus, RUNTIME_NOTICE_HEADERS, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};

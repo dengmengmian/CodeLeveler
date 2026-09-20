@@ -11,6 +11,7 @@
 mod candidates;
 mod lifecycle;
 mod pipeline;
+mod semantic;
 
 pub use candidates::{
     CandidateKind, CandidateSource, MemoryCandidate, fingerprint_of, looks_like_secret,
@@ -22,6 +23,11 @@ pub use lifecycle::{
     MemoryLifecycleOp, MemoryOperation, Provenance, decide, parse_durable_fact, semantic_key_of,
 };
 pub use pipeline::{ProposeOutcome, SuppressRecord, collect_turn_candidates};
+pub use semantic::{
+    CandidateDurability, CandidateRejection, CandidateScope, OperationHint, SemanticCandidate,
+    SemanticError, ValidatedCandidates, canonical_subject, evidence_matches,
+    parse_semantic_candidates, validate_semantic_candidate, validate_semantic_candidates,
+};
 
 use std::collections::HashMap;
 use std::fs;

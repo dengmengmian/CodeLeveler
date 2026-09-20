@@ -81,6 +81,12 @@ pub struct MemoryCandidate {
     /// must not survive past it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// The user's own words this candidate was drawn from. Present for the
+    /// semantic path, absent for older candidates. Carried into provenance so
+    /// an autonomous write can always be traced back to the sentence that
+    /// authorized it. Never a secret (checked at construction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 impl MemoryCandidate {
@@ -125,6 +131,7 @@ impl MemoryCandidate {
             authority: MemoryAuthority::ModelInference,
             operation: CandidateOperation::Create,
             expires_at: None,
+            evidence: None,
         })
     }
 }

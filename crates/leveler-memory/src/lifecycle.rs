@@ -548,7 +548,7 @@ impl MemoryStore {
         entry.provenance = Some(Provenance {
             authority: candidate.authority,
             source: source_label(candidate.source).to_string(),
-            evidence: None,
+            evidence: candidate.evidence.clone(),
         });
         entry.expires_at = candidate.expires_at.clone();
         entry.status = MemoryStatus::Active;
