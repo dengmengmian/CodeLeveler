@@ -13,6 +13,7 @@ A focused TUI usability release on top of 1.0.2. Installed stable builds pick it
 
 - Failed background task waits remain visible with their task details instead of being hidden with successful scheduling polls
 - Replayed sessions use the same background polling visibility rules as live sessions without dropping durable tool-call history
+- Self-update now validates both legacy and current `--version` output formats, rejects failed version probes, and lets older installations accept the rebuilt v1.0.3 binary
 
 ## Known limits
 

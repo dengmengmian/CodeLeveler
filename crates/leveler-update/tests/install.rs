@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use leveler_update::install::install_from_archive;
+use leveler_update::install::{install_from_archive, validate_binary};
 use leveler_update::version::parse_version;
 
 fn host_triple() -> &'static str {
@@ -52,6 +52,66 @@ fn installed_script(dir: &Path, body: &str) {
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
+}
+
+#[test]
+fn validation_accepts_the_release_binary_version_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join("leveler");
+    std::fs::write(&binary, "#!/bin/sh\necho 'leveler 1.0.2 (1c86d6b9d402)'\n").unwrap();
+
+    let expected = parse_version("1.0.2").unwrap();
+    validate_binary(&binary, &expected).unwrap();
+}
+
+#[test]
+fn validation_accepts_the_release_binary_version_output_on_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join("leveler");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\necho 'leveler 1.0.2 (1c86d6b9d402)' >&2\n",
+    )
+    .unwrap();
+
+    let expected = parse_version("1.0.2").unwrap();
+    validate_binary(&binary, &expected).unwrap();
+}
+
+#[test]
+fn validation_rejects_a_failed_version_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join("leveler");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\necho 'leveler 1.0.2 (1c86d6b9d402)'\nexit 1\n",
+    )
+    .unwrap();
+
+    let expected = parse_version("1.0.2").unwrap();
+    let err = validate_binary(&binary, &expected).unwrap_err();
+    assert!(
+        matches!(err, leveler_update::UpdateError::Validation(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn validation_rejects_a_version_found_only_in_noise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join("leveler");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\necho 'warning: target 1.0.2 unavailable'\n",
+    )
+    .unwrap();
+
+    let expected = parse_version("1.0.2").unwrap();
+    let err = validate_binary(&binary, &expected).unwrap_err();
+    assert!(
+        matches!(err, leveler_update::UpdateError::Validation(_)),
+        "{err}"
+    );
 }
 
 #[test]

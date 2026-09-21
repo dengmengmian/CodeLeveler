@@ -170,16 +170,31 @@ pub fn validate_binary(path: &Path, expected: &Version) -> Result<(), UpdateErro
             path.display()
         ))
     })?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let text = if stdout.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(UpdateError::Validation(format!(
+            "downloaded binary --version exited with {} (output: {text})",
+            output.status
+        )));
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let text = if text.trim().is_empty() {
         String::from_utf8_lossy(&output.stderr)
     } else {
         text
     };
-    let reported = text
-        .split_whitespace()
-        .next()
-        .and_then(crate::version::parse_version);
+    let mut tokens = text.split_whitespace();
+    let reported = match tokens.next() {
+        Some("leveler") => tokens.next().and_then(crate::version::parse_version),
+        Some(version) => crate::version::parse_version(version),
+        None => None,
+    };
     match reported {
         Some(v) if v == *expected => Ok(()),
         Some(v) => Err(UpdateError::Validation(format!(

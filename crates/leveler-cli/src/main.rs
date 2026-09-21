@@ -66,8 +66,11 @@ async fn main() -> std::process::ExitCode {
     // Record panics before anything else can install a hook — the TUI's
     // terminal-restore hook chains to this one.
     crash::install(env!("CARGO_PKG_VERSION"));
-    // `--version` is clap's (see the `version = build_provenance()` on `Cli`).
     let args = Cli::parse();
+    if args.version {
+        println!("{}", build_provenance());
+        return std::process::ExitCode::SUCCESS;
+    }
     // No subcommand or `tui` takes over the terminal (ratatui alternate
     // screen). Logs written to stderr there paint straight over the UI and
     // corrupt it, so TUI mode logs to a file instead.
@@ -408,15 +411,8 @@ fn build_provenance() -> String {
     format_provenance(&id.version, &id.revision, id.dirty)
 }
 
-/// The same line, borrowed for the process lifetime. `clap`'s `version` takes
-/// a `&'static str`, and the string is built once from compile-time constants.
-pub(crate) fn build_provenance_static() -> &'static str {
-    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    LINE.get_or_init(build_provenance).as_str()
-}
-
-/// The version *string* only — clap prints the command name in front of it, so
-/// naming `leveler` here too would render `leveler leveler 0.2.0-beta.1`.
+/// The version comes first so an older updater can validate this binary before
+/// installing it; the provenance suffix keeps official builds traceable.
 fn format_provenance(version: &str, commit: &str, dirty: bool) -> String {
     let short = commit.get(..12).unwrap_or(commit);
     if dirty {
@@ -433,33 +429,17 @@ mod provenance_tests {
     use super::format_provenance;
     use crate::cli::{Cli, Command};
 
-    /// A top-level `--version` prints the provenance string, not clap's plain
-    /// `CARGO_PKG_VERSION`. Asserted through the real parser: clap reports it
-    /// as a `DisplayVersion` "error" whose message is what the user sees.
+    /// Top-level version flags are data from clap; `main` owns rendering so the
+    /// SemVer can be the first token for older updater binaries.
     #[test]
-    fn a_top_level_version_flag_prints_provenance() {
+    fn top_level_version_flags_are_parsed_without_clap_rendering() {
         for argv in [
             vec!["leveler", "--version"],
             vec!["leveler", "-V"],
-            // A global flag that takes a value may precede it. Scanning the
-            // raw argument list got this one wrong; clap does not.
             vec!["leveler", "--repo", "/tmp/x", "--version"],
         ] {
-            let err = Cli::try_parse_from(&argv).expect_err("--version exits via clap");
-            assert_eq!(
-                err.kind(),
-                clap::error::ErrorKind::DisplayVersion,
-                "{argv:?} must be a version query"
-            );
-            assert!(
-                err.to_string().contains(
-                    leveler_core::BuildIdentity::current()
-                        .revision
-                        .get(..12)
-                        .unwrap_or("")
-                ),
-                "the version output must name the commit: {err}"
-            );
+            let cli = Cli::try_parse_from(&argv).expect("top-level version flag must parse");
+            assert!(cli.version, "{argv:?} must be a version query");
         }
     }
 
@@ -500,8 +480,7 @@ mod provenance_tests {
         assert!(line.contains("0.1.4"), "{line}");
         assert!(line.contains("c3bf11ba01c3"), "{line}");
         assert!(!line.contains("UNTRUSTED"), "{line}");
-        // clap prints the command name itself; carrying one here rendered
-        // `leveler leveler 0.2.0-beta.1`.
+        // The version must remain the first token for updater compatibility.
         assert!(!line.contains("leveler"), "{line}");
     }
 
