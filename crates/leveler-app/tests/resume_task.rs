@@ -171,12 +171,20 @@ async fn settled(app: &Application, session: &leveler_core::SessionId, min_turns
     loop {
         let db = app.open_database().await.unwrap();
         let turns = TurnRepository::new(&db).list(session).await.unwrap();
-        if turns.len() >= min_turns && turns.iter().all(|turn| turn.status != "running") {
+        let stores = EngineStores::from_database(&db);
+        let goals = match stores.tasks.task_for_session(session).await.unwrap() {
+            Some(task) => stores.goals.for_task(&task).await.unwrap(),
+            None => Vec::new(),
+        };
+        if turns.len() >= min_turns
+            && turns.iter().all(|turn| turn.status != "running")
+            && goals.iter().all(|goal| goal.state == GoalState::Settled)
+        {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the turn did not settle in time: {turns:?}"
+            "the turn and its goals did not settle in time: turns={turns:?} goals={goals:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
