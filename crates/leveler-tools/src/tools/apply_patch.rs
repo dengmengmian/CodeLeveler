@@ -992,8 +992,14 @@ mod tests {
 
         // Hold the second target's cooperative lock so the patch commits its
         // first delete and then pauses before comparing/removing the second.
-        let lock_path =
-            leveler_project::layout::target_lock_path(&context.execution.environment, &second);
+        // The commit path resolves against the canonical workspace root. Use
+        // that exact path here as well so macOS `/var` -> `/private/var`
+        // canonicalization cannot make this test lock a different file.
+        let second_resolved = context.execution.workspace.root().join("src/second.rs");
+        let lock_path = leveler_project::layout::target_lock_path(
+            &context.execution.environment,
+            &second_resolved,
+        );
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let lock = std::fs::OpenOptions::new()
             .read(true)

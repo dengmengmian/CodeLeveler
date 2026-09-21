@@ -828,6 +828,17 @@ mod tests {
         // once the listener is dropped.
         let listener = std::os::unix::net::UnixListener::bind(&dead).unwrap();
         drop(listener);
+        // On macOS the kernel can briefly keep accepting connects after the
+        // final listener handle is dropped. Establish the test precondition
+        // instead of racing that teardown.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::os::unix::net::UnixStream::connect(&dead).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the closed listener should become unreachable"
+            );
+            std::thread::yield_now();
+        }
         let plan = plan_cleanup(&home, &tmp.path().join("nope"), &options(SystemTime::now()));
         assert!(
             plan.entries
