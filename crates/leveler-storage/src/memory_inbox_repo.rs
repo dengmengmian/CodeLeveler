@@ -89,18 +89,31 @@ impl<'a> MemoryInboxRepository<'a> {
     /// due-time and project-singleton gate as [`Self::claim_batch`].
     pub async fn ready_state(&self, now: Timestamp) -> Result<MemoryInboxReadyState, StorageError> {
         let (count, oldest): (i64, Option<String>) = sqlx::query_as(
-            "SELECT COUNT(*), MIN(created_at) FROM memory_inbox \
-             WHERE status IN ('pending', 'failed_retryable') \
-               AND (next_attempt_at IS NULL OR next_attempt_at <= ?1) \
-               AND EXISTS ( \
-                   SELECT 1 FROM turns \
-                   WHERE turns.id = memory_inbox.turn_id \
-                     AND turns.status != 'running' AND turns.finished_at IS NOT NULL \
-               ) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM memory_inbox AS active \
-                   WHERE active.status = 'processing' \
-               )",
+            "WITH ordered AS ( \
+                 SELECT memory_inbox.id, memory_inbox.created_at, \
+                        CASE WHEN (memory_inbox.next_attempt_at IS NULL \
+                                        OR memory_inbox.next_attempt_at <= ?1) \
+                                  AND turns.status != 'running' \
+                                  AND turns.finished_at IS NOT NULL \
+                             THEN 1 ELSE 0 END AS ready, \
+                        ROW_NUMBER() OVER (ORDER BY memory_inbox.id) AS position \
+                 FROM memory_inbox \
+                 JOIN turns ON turns.id = memory_inbox.turn_id \
+                 WHERE memory_inbox.status IN ('pending', 'failed_retryable') \
+             ), ready_prefix AS ( \
+                 SELECT current.id, current.created_at \
+                 FROM ordered AS current \
+                 WHERE current.ready = 1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM ordered AS prior \
+                       WHERE prior.position < current.position AND prior.ready = 0 \
+                   ) \
+             ) \
+             SELECT COUNT(*), MIN(created_at) FROM ready_prefix \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM memory_inbox AS active \
+                 WHERE active.status = 'processing' \
+             )",
         )
         .bind(now.to_rfc3339())
         .fetch_one(self.db.pool())
@@ -134,35 +147,53 @@ impl<'a> MemoryInboxRepository<'a> {
             return Ok(Vec::new());
         }
         let now = now.to_rfc3339();
-        // The oldest ready row selects both model and staging phase. This
-        // avoids mixed-model requests and keeps exact-replay rows separate
-        // from fresh rows that still require extraction.
+        // Only the ready prefix of the durable queue is claimable. A failed
+        // older turn therefore cannot retry after a newer correction and
+        // restore stale memory. Within that prefix, the oldest row selects the
+        // model and staging phase so batches remain homogeneous.
         let mut rows = sqlx::query_as::<_, MemoryInboxItem>(
-            "WITH oldest_work AS ( \
-                 SELECT memory_inbox.model AS model, \
-                        memory_inbox.result_json IS NULL AS needs_extraction \
+            "WITH ordered AS ( \
+                 SELECT memory_inbox.id, memory_inbox.model, \
+                        memory_inbox.result_json IS NULL AS needs_extraction, \
+                        CASE WHEN (memory_inbox.next_attempt_at IS NULL \
+                                        OR memory_inbox.next_attempt_at <= ?2) \
+                                  AND turns.status != 'running' \
+                                  AND turns.finished_at IS NOT NULL \
+                             THEN 1 ELSE 0 END AS ready, \
+                        ROW_NUMBER() OVER (ORDER BY memory_inbox.id) AS position \
                  FROM memory_inbox \
                  JOIN turns ON turns.id = memory_inbox.turn_id \
                  WHERE memory_inbox.status IN ('pending', 'failed_retryable') \
-                   AND (memory_inbox.next_attempt_at IS NULL OR memory_inbox.next_attempt_at <= ?2) \
-                   AND turns.status != 'running' AND turns.finished_at IS NOT NULL \
+             ), ready_prefix AS ( \
+                 SELECT current.id, current.model, current.needs_extraction, current.position \
+                 FROM ordered AS current \
+                 WHERE current.ready = 1 \
                    AND NOT EXISTS ( \
-                       SELECT 1 FROM memory_inbox AS active \
-                       WHERE active.status = 'processing' \
+                       SELECT 1 FROM ordered AS prior \
+                       WHERE prior.position < current.position AND prior.ready = 0 \
                    ) \
-                 ORDER BY memory_inbox.id \
+             ), oldest_work AS ( \
+                 SELECT model, needs_extraction \
+                 FROM ready_prefix \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM memory_inbox AS active \
+                     WHERE active.status = 'processing' \
+                 ) \
+                 ORDER BY position \
                  LIMIT 1 \
              ), eligible AS ( \
-                 SELECT memory_inbox.id \
-                 FROM memory_inbox \
-                 JOIN turns ON turns.id = memory_inbox.turn_id \
-                 WHERE memory_inbox.status IN ('pending', 'failed_retryable') \
-                   AND (memory_inbox.next_attempt_at IS NULL OR memory_inbox.next_attempt_at <= ?2) \
-                   AND turns.status != 'running' AND turns.finished_at IS NOT NULL \
-                   AND memory_inbox.model = (SELECT model FROM oldest_work) \
-                   AND (memory_inbox.result_json IS NULL) = \
-                       (SELECT needs_extraction FROM oldest_work) \
-                 ORDER BY memory_inbox.id \
+                 SELECT current.id \
+                 FROM ready_prefix AS current \
+                 WHERE current.model = (SELECT model FROM oldest_work) \
+                   AND current.needs_extraction = (SELECT needs_extraction FROM oldest_work) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM ready_prefix AS prior \
+                       WHERE prior.position < current.position \
+                         AND (prior.model != (SELECT model FROM oldest_work) \
+                              OR prior.needs_extraction != \
+                                 (SELECT needs_extraction FROM oldest_work)) \
+                   ) \
+                 ORDER BY current.position \
                  LIMIT ?3 \
              ) \
              UPDATE memory_inbox \
@@ -412,6 +443,14 @@ mod tests {
         .unwrap();
     }
 
+    fn fresh_payload(message: &str) -> String {
+        serde_json::json!({
+            "version": 1,
+            "initiating_message": { "role": "user", "content": message }
+        })
+        .to_string()
+    }
+
     #[tokio::test]
     async fn turn_insert_atomically_admits_only_fresh_user_or_chat_payloads() {
         let (db, session) = fixture().await;
@@ -436,6 +475,17 @@ mod tests {
             .await
             .unwrap();
         turns.start(&session, "user", None, now).await.unwrap();
+        turns
+            .start(
+                &session,
+                "chat",
+                Some(
+                    r#"{"version":2,"objective":{"text":"resume","version":1,"source":"this_turn_user"},"continuation_root_turn_id":"root"}"#,
+                ),
+                now,
+            )
+            .await
+            .unwrap();
         turns
             .start(&session, "node", Some(r#"{"node_id":"n"}"#), now)
             .await
@@ -483,14 +533,14 @@ mod tests {
         let turns = TurnRepository::new(&db);
         let now = leveler_core::now();
         let first = turns
-            .start(&session, "user", Some(r#"{"message":"one"}"#), now)
+            .start(&session, "user", Some(&fresh_payload("one")), now)
             .await
             .unwrap();
         turns
             .start(
                 &session,
                 "chat",
-                Some(r#"{"message":"two"}"#),
+                Some(&fresh_payload("two")),
                 now + Duration::seconds(1),
             )
             .await
@@ -505,28 +555,28 @@ mod tests {
         assert_eq!(claimed[0].turn_id, first.id);
         assert_eq!(claimed[0].session_id, session.as_str());
         assert_eq!(claimed[0].turn_ordinal, 1);
-        assert_eq!(claimed[0].turn_payload, r#"{"message":"one"}"#);
+        assert_eq!(claimed[0].turn_payload, fresh_payload("one"));
         assert_eq!(claimed[0].model, "provider/model");
         assert_eq!(claimed[0].attempt, 1);
     }
 
     #[tokio::test]
-    async fn claim_uses_oldest_due_model_without_occupying_other_models() {
+    async fn claim_keeps_model_batches_contiguous_without_skipping_queue_order() {
         let (db, first_session) = fixture().await;
         let other = SessionRecord::new("/repo", "goal", "other/model", leveler_core::now());
         let other_session = SessionId::new(other.id.clone());
         SessionRepository::new(&db).create(&other).await.unwrap();
         let now = leveler_core::now();
-        TurnRepository::new(&db)
-            .start(&first_session, "user", Some(r#"{"message":"a"}"#), now)
+        let first = TurnRepository::new(&db)
+            .start(&first_session, "user", Some(&fresh_payload("a")), now)
             .await
             .unwrap();
-        TurnRepository::new(&db)
-            .start(&other_session, "user", Some(r#"{"message":"b"}"#), now)
+        let second = TurnRepository::new(&db)
+            .start(&other_session, "user", Some(&fresh_payload("b")), now)
             .await
             .unwrap();
-        TurnRepository::new(&db)
-            .start(&first_session, "chat", Some(r#"{"message":"c"}"#), now)
+        let third = TurnRepository::new(&db)
+            .start(&first_session, "chat", Some(&fresh_payload("c")), now)
             .await
             .unwrap();
         finish_all_turns(&db, now).await;
@@ -536,14 +586,34 @@ mod tests {
             .claim_batch(&BootId::new("boot-a"), now, 10)
             .await
             .unwrap();
-        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].turn_id, first.id);
         assert!(claimed.iter().all(|item| item.model == "provider/model"));
         let pending: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM memory_inbox WHERE status = 'pending'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(pending, 1);
+        assert_eq!(pending, 2);
+
+        repo.mark_processed(&BootId::new("boot-a"), &[claimed[0].inbox_id], now)
+            .await
+            .unwrap();
+        let next = repo
+            .claim_batch(&BootId::new("boot-b"), now, 10)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].turn_id, second.id);
+        repo.mark_processed(&BootId::new("boot-b"), &[next[0].inbox_id], now)
+            .await
+            .unwrap();
+        let last = repo
+            .claim_batch(&BootId::new("boot-c"), now, 10)
+            .await
+            .unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].turn_id, third.id);
     }
 
     #[tokio::test]
@@ -551,7 +621,7 @@ mod tests {
         let (db, session) = fixture().await;
         let now = leveler_core::now();
         TurnRepository::new(&db)
-            .start(&session, "user", Some(r#"{"message":"a"}"#), now)
+            .start(&session, "user", Some(&fresh_payload("a")), now)
             .await
             .unwrap();
         finish_all_turns(&db, now).await;
@@ -574,7 +644,7 @@ mod tests {
         let (db, session) = fixture().await;
         let now = leveler_core::now();
         TurnRepository::new(&db)
-            .start(&session, "user", Some(r#"{"message":"a"}"#), now)
+            .start(&session, "user", Some(&fresh_payload("a")), now)
             .await
             .unwrap();
         finish_all_turns(&db, now).await;
@@ -618,7 +688,7 @@ mod tests {
         let (db, session) = fixture().await;
         let now = leveler_core::now();
         TurnRepository::new(&db)
-            .start(&session, "user", Some(r#"{"message":"a"}"#), now)
+            .start(&session, "user", Some(&fresh_payload("a")), now)
             .await
             .unwrap();
         finish_all_turns(&db, now).await;
@@ -650,7 +720,7 @@ mod tests {
         let (db, session) = fixture().await;
         let now = leveler_core::now();
         TurnRepository::new(&db)
-            .start(&session, "user", Some(r#"{"message":"a"}"#), now)
+            .start(&session, "user", Some(&fresh_payload("a")), now)
             .await
             .unwrap();
         finish_all_turns(&db, now).await;
@@ -682,12 +752,7 @@ mod tests {
         let turns = TurnRepository::new(&db);
         for text in ["first", "second"] {
             turns
-                .start(
-                    &session,
-                    "user",
-                    Some(&format!(r#"{{"message":"{text}"}}"#)),
-                    now,
-                )
+                .start(&session, "user", Some(&fresh_payload(text)), now)
                 .await
                 .unwrap();
         }
@@ -721,12 +786,7 @@ mod tests {
         let turns = TurnRepository::new(&db);
         for message in ["a", "b"] {
             turns
-                .start(
-                    &session,
-                    "user",
-                    Some(&format!(r#"{{"message":"{message}"}}"#)),
-                    now,
-                )
+                .start(&session, "user", Some(&fresh_payload(message)), now)
                 .await
                 .unwrap();
         }
@@ -762,12 +822,7 @@ mod tests {
         let turns = TurnRepository::new(&db);
         for message in ["a", "b"] {
             turns
-                .start(
-                    &session,
-                    "user",
-                    Some(&format!(r#"{{"message":"{message}"}}"#)),
-                    now,
-                )
+                .start(&session, "user", Some(&fresh_payload(message)), now)
                 .await
                 .unwrap();
         }
@@ -793,17 +848,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_state_counts_only_due_work_and_is_hidden_by_a_processing_batch() {
+    async fn a_future_retry_blocks_newer_memory_until_order_can_be_preserved() {
         let (db, session) = fixture().await;
         let now = leveler_core::now();
         let old = now - Duration::minutes(2);
         let turns = TurnRepository::new(&db);
-        turns
-            .start(&session, "user", Some(r#"{"message":"old"}"#), old)
+        let old_turn = turns
+            .start(&session, "user", Some(&fresh_payload("old")), old)
             .await
             .unwrap();
-        turns
-            .start(&session, "chat", Some(r#"{"message":"new"}"#), now)
+        let new_turn = turns
+            .start(&session, "chat", Some(&fresh_payload("new")), now)
             .await
             .unwrap();
         finish_all_turns(&db, now).await;
@@ -826,14 +881,27 @@ mod tests {
         .unwrap();
 
         let state = repo.ready_state(now).await.unwrap();
-        assert_eq!(state.count, 1, "future retries are not ready");
-        assert_eq!(state.oldest_created_at, Some(now));
-        assert_eq!(
-            repo.ready_state(now + Duration::minutes(5))
+        assert_eq!(state.count, 0, "newer work must not pass an older retry");
+        assert_eq!(state.oldest_created_at, None);
+        assert!(
+            repo.claim_batch(&BootId::new("boot-b"), now, 10)
                 .await
                 .unwrap()
-                .count,
-            2
+                .is_empty()
+        );
+
+        let due = now + Duration::minutes(5);
+        assert_eq!(repo.ready_state(due).await.unwrap().count, 2);
+        let claimed = repo
+            .claim_batch(&BootId::new("boot-b"), due, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|item| item.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![old_turn.id.as_str(), new_turn.id.as_str()]
         );
     }
 
@@ -842,7 +910,7 @@ mod tests {
         let (db, session) = fixture().await;
         let now = leveler_core::now();
         let turn = TurnRepository::new(&db)
-            .start(&session, "user", Some(r#"{"message":"a"}"#), now)
+            .start(&session, "user", Some(&fresh_payload("a")), now)
             .await
             .unwrap();
         let repo = MemoryInboxRepository::new(&db);
@@ -895,7 +963,7 @@ mod tests {
                     .start(
                         &session,
                         "user",
-                        Some(&format!(r#"{{"message":"turn {index}"}}"#)),
+                        Some(&fresh_payload(&format!("turn {index}"))),
                         leveler_core::now(),
                     )
                     .await

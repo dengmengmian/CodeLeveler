@@ -17,7 +17,7 @@ use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEvent, ModelEventStream, ModelProfile,
     ModelRef, ModelRequest, ModelResponse, ModelRuntime, Role, TokenUsage, ToolCall,
 };
-use leveler_storage::{Database, MessageRepository, SessionRepository};
+use leveler_storage::{Database, MessageRepository, SessionRepository, TurnRepository};
 use leveler_tools::ToolContext;
 use leveler_verifier::VerificationPlan;
 
@@ -326,6 +326,110 @@ async fn explicit_resume_reactivates_the_persisted_unfinished_plan() {
     let activated = activated.expect("explicit resume must reactivate the persisted plan");
     assert_eq!(activated[0].status, "completed");
     assert_eq!(activated[1].status, "pending");
+}
+
+#[tokio::test]
+async fn resume_after_chat_provider_failure_keeps_chat_objective_not_old_running_goal() {
+    let h = harness(vec![partial_plan("old_ci_plan")]).await;
+    let mut s = spec(&h, "OLD_CI_GOAL_MARKER: clear failed CI runs");
+    s.runtime.continuation = ContinuationPolicy::bounded(1);
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    let first = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("old goal window");
+    assert_ne!(first.outcome, TaskOutcome::Completed);
+
+    SessionRepository::new(&h.db)
+        .set_outcome(&session, TaskOutcome::Interrupted, leveler_core::now())
+        .await
+        .unwrap();
+    let failed_chat = h
+        .engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "ARK_CHAT_OBJECTIVE_MARKER: configure Ark image support".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        failed_chat.is_err(),
+        "the empty script must model provider failure"
+    );
+
+    h.responses
+        .lock()
+        .unwrap()
+        .push_back(text("continuing the Ark configuration"));
+    let before_resume = h.requests.lock().unwrap().len();
+    let mut resumed_events = Vec::new();
+    h.engine
+        .resume_with_instruction(
+            &session,
+            &s,
+            Message::text(Role::User, "继续"),
+            &mut |event| resumed_events.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat continuation");
+    assert!(
+        !resumed_events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::PlanUpdated { .. })),
+        "Ark Chat continuation must not seed the old CI plan"
+    );
+
+    {
+        let requests = h.requests.lock().unwrap();
+        let resumed = requests
+            .get(before_resume)
+            .expect("resume must issue a model request");
+        let blob = request_blob(resumed);
+        assert!(
+            blob.contains("ARK_CHAT_OBJECTIVE_MARKER"),
+            "resume must stay anchored to the interrupted chat: {blob}"
+        );
+        let objective_pin = resumed
+            .messages
+            .iter()
+            .find(|message| {
+                message
+                    .text_content()
+                    .contains(leveler_context::ACTIVE_OBJECTIVE_MARKER)
+            })
+            .expect("resume request must carry an explicit host-pinned objective");
+        assert!(
+            objective_pin
+                .text_content()
+                .contains("ARK_CHAT_OBJECTIVE_MARKER: configure Ark image support"),
+            "host objective pin must be Ark: {}",
+            objective_pin.text_content()
+        );
+        assert!(
+            !objective_pin.text_content().contains("OLD_CI_GOAL_MARKER"),
+            "old CI may remain history but cannot be the active objective pin"
+        );
+        assert!(
+            !resumed.tools.iter().any(|tool| tool.name == "update_goal"),
+            "a resumed chat must keep chat profile instead of being promoted to goal mode"
+        );
+    }
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    let continuation =
+        leveler_engine::decode_turn_continuation(turns.last().unwrap().payload.as_deref().unwrap())
+            .unwrap();
+    assert_eq!(
+        continuation.objective.text(),
+        "ARK_CHAT_OBJECTIVE_MARKER: configure Ark image support",
+        "the host-pinned active objective must come from the interrupted Chat turn"
+    );
 }
 
 async fn seed_oversized_login_history(db: &Database, session: &leveler_core::SessionId) {

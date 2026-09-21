@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::candidates::{CandidateKind, MemoryCandidate, parse_inferred_preference};
 use crate::{
-    MemoryEntry, MemoryError, MemoryStore, entry_from_candidate, now_rfc3339, write_atomically_pub,
+    CommitOutcome, MemoryAuthority, MemoryEntry, MemoryError, MemoryStore, now_rfc3339,
+    write_atomically_pub,
 };
 
 /// Result of attempting to enqueue a candidate.
@@ -27,6 +28,14 @@ pub enum ProposeOutcome {
     AlreadyPending(MemoryCandidate),
 }
 
+/// Runtime admission keeps new topics behind consent while allowing a user's
+/// explicit correction of an already-known fact to take effect immediately.
+#[derive(Debug, Clone)]
+pub enum AdmitOutcome {
+    Proposed(ProposeOutcome),
+    Corrected(CommitOutcome),
+}
+
 /// Recorded when the user rejects a candidate (suppress re-prompt).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuppressRecord {
@@ -39,6 +48,26 @@ pub struct SuppressRecord {
 }
 
 impl MemoryStore {
+    /// Admit a validated runtime candidate.
+    ///
+    /// A new identity is only proposed. A different value for an existing
+    /// identity may update immediately only when the candidate is backed by
+    /// explicit user authority; weaker observations still require consent.
+    pub fn admit_candidate(&self, candidate: MemoryCandidate) -> Result<AdmitOutcome, MemoryError> {
+        if candidate.authority == MemoryAuthority::ExplicitUser
+            && candidate.key.is_some()
+            && let Some(existing) = self.find_active_for_candidate(&candidate)?
+            && existing.body.trim() != candidate.body.trim()
+        {
+            let outcome = self.commit_candidate(&candidate)?;
+            // Heal an equivalent proposal that an interactive admission path
+            // may have queued before the executor observed the correction.
+            let _ = self.list_pending();
+            return Ok(AdmitOutcome::Corrected(outcome));
+        }
+        self.propose(candidate).map(AdmitOutcome::Proposed)
+    }
+
     /// Enqueue a candidate for user consent. Never writes `active/`.
     pub fn propose(&self, candidate: MemoryCandidate) -> Result<ProposeOutcome, MemoryError> {
         if self.is_suppressed(&candidate.fingerprint)? {
@@ -52,24 +81,40 @@ impl MemoryStore {
                     fingerprint: candidate.fingerprint.clone(),
                 });
             }
-            if let Some(existing) = self.find_active_by_key(key)? {
+            if let Some(existing) = self.find_active_by_key(key)?
+                && existing.body.trim() == candidate.body.trim()
+            {
                 return Ok(ProposeOutcome::AlreadyActive { id: existing.id });
             }
+            // Same identity, different value: this is an update proposal.
+            // It must wait for consent, but must not be discarded merely
+            // because an older value is currently active.
         }
         // Same fingerprint already pending?
+        let mut replaces_pending = None;
         for pending in self.list_pending()? {
             if pending.fingerprint == candidate.fingerprint {
                 return Ok(ProposeOutcome::AlreadyPending(pending));
             }
             if candidate.key.is_some() && pending.key == candidate.key {
-                return Ok(ProposeOutcome::AlreadyPending(pending));
+                if pending.body.trim() == candidate.body.trim() {
+                    return Ok(ProposeOutcome::AlreadyPending(pending));
+                }
+                // A later correction for the same identity replaces the stale
+                // unapproved proposal. Pending state is not history; keeping
+                // both would let the user accidentally accept the old value.
+                replaces_pending = Some(pending.id);
+                break;
             }
         }
 
         let path = self.pending_path(&candidate.id);
         // Avoid clobbering a different pending id collision: suffix if needed.
         let mut candidate = candidate;
-        if path.exists() {
+        let replaces_same_path = replaces_pending
+            .as_deref()
+            .is_some_and(|id| self.pending_path(id) == path);
+        if path.exists() && !replaces_same_path {
             let mut n = 2u32;
             loop {
                 let alt_id = format!("{}-{n}", candidate.id);
@@ -85,6 +130,11 @@ impl MemoryStore {
         }
         let json = serde_json::to_string_pretty(&candidate)?;
         write_atomically_pub(&self.pending_path(&candidate.id), json.as_bytes())?;
+        if let Some(old_id) = replaces_pending
+            && old_id != candidate.id
+        {
+            let _ = fs::remove_file(self.pending_path(&old_id));
+        }
         Ok(ProposeOutcome::Pending(candidate))
     }
 
@@ -153,17 +203,35 @@ impl MemoryStore {
     /// This is the explicit accept path (CLI / UI). It is **not** safe to call
     /// from auto-approved agent loops without a separate human decision.
     pub fn accept(&self, id: &str) -> Result<MemoryEntry, MemoryError> {
-        let _lifecycle_lock = self.acquire_lifecycle_lock()?;
-        let candidate = self.read_pending(id)?;
-        let entry = entry_from_candidate(&candidate);
-        let saved = if let Some(key) = &entry.key {
-            // Upsert by structured key: replace existing active with same key.
-            if let Some(old) = self.find_active_by_key(key)? {
-                let _ = self.forget_unlocked(&old.id);
+        let mut candidate = self.read_pending(id)?;
+        // Accepting is the user's authority. Route it through the same
+        // lifecycle transaction as runtime corrections so a changed semantic
+        // identity preserves the old value as superseded history instead of
+        // reusing its id and deleting that history.
+        candidate.authority = crate::lifecycle::MemoryAuthority::ExplicitUser;
+        candidate.source = crate::candidates::CandidateSource::UserExplicit;
+        let outcome = self.commit_candidate(&candidate)?;
+        let saved = match outcome.entry {
+            Some(entry) => entry,
+            None => {
+                // An identical candidate is an idempotent accept. Return the
+                // current truth rather than manufacturing another entry.
+                if let Some(key) = candidate.key.as_deref()
+                    && let Some(active) = self.find_active_by_key(key)?
+                {
+                    active
+                } else if let Some(active) = self
+                    .list_active()?
+                    .into_iter()
+                    .find(|entry| entry.body.trim() == candidate.body.trim())
+                {
+                    active
+                } else {
+                    return Err(MemoryError::Invalid(outcome.skipped_reason.unwrap_or_else(
+                        || "accepted candidate produced no active memory".into(),
+                    )));
+                }
             }
-            self.remember_unlocked(entry)?
-        } else {
-            self.remember_deduplicated_unlocked(entry)?
         };
         let _ = fs::remove_file(self.pending_path(id));
         // Accepting clears suppress for this fingerprint so a later genuine
@@ -215,7 +283,37 @@ impl MemoryStore {
         Ok(self
             .list_active()?
             .into_iter()
-            .find(|e| e.key.as_deref() == Some(key)))
+            .find(|entry| crate::lifecycle::durable_entry_key(entry).as_deref() == Some(key)))
+    }
+
+    fn find_active_for_candidate(
+        &self,
+        candidate: &MemoryCandidate,
+    ) -> Result<Option<MemoryEntry>, MemoryError> {
+        Ok(self
+            .list_active()?
+            .into_iter()
+            .find(|entry| crate::lifecycle::entry_matches_candidate(entry, candidate)))
+    }
+
+    /// Once an explicit write establishes the current truth, every older
+    /// unapproved proposal for that identity is stale. Removing all of them
+    /// prevents a later accept from reverting the correction.
+    pub(crate) fn clear_pending_for_key(&self, key: &str) -> Result<(), MemoryError> {
+        for candidate in self.list_pending_raw()? {
+            let candidate_key = candidate
+                .semantic_key
+                .as_deref()
+                .or(candidate.key.as_deref());
+            if candidate_key == Some(key) {
+                match fs::remove_file(self.pending_path(&candidate.id)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(MemoryError::Io(error)),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -236,7 +334,9 @@ pub fn collect_turn_candidates(
     // fact — they read it fresh instead of remembering it.
     let _ = repo_root;
     let mut out = Vec::new();
-    if let Some(o) = store.propose_from_user_text(user_text)? {
+    if let Some(candidate) = crate::parse_durable_fact(user_text) {
+        out.push(store.propose(candidate)?);
+    } else if let Some(o) = store.propose_from_user_text(user_text)? {
         out.push(o);
     }
     Ok(out)
@@ -293,6 +393,17 @@ mod pipeline_tests {
             1,
             "only the user's own intent: {outcomes:?}"
         );
+        assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_strong_durable_fact_is_not_duplicated_by_the_soft_fallback() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+
+        let outcomes = collect_turn_candidates(&store, "以后最好默认使用 pnpm", None).unwrap();
+
+        assert_eq!(outcomes.len(), 1);
         assert_eq!(store.list_pending().unwrap().len(), 1);
     }
 
@@ -397,6 +508,175 @@ mod pipeline_tests {
             "propose must not create active entries"
         );
         assert_eq!(store.list_pending().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn changed_value_for_active_key_waits_then_supersedes_on_accept() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let old = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old_id = store.commit_candidate(&old).unwrap().entry.unwrap().id;
+        let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+
+        let pending = match store.propose(changed).unwrap() {
+            ProposeOutcome::Pending(candidate) => candidate,
+            other => panic!("changed value must wait for consent: {other:?}"),
+        };
+        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert!(store.effective_active().unwrap()[0].body.contains("Pro"));
+
+        let saved = store.accept(&pending.id).unwrap();
+        assert!(saved.body.contains("Flash"));
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Flash"));
+        let history = store.list_archived().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, old_id);
+        assert!(
+            store
+                .search("Pro", 10)
+                .unwrap()
+                .into_iter()
+                .all(|(entry, _)| entry.id != old_id),
+            "superseded history must not be recalled"
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_correction_supersedes_without_a_second_candidate() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let old = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let old_id = store.commit_candidate(&old).unwrap().entry.unwrap().id;
+        let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+
+        let outcome = match store.admit_candidate(changed).unwrap() {
+            AdmitOutcome::Corrected(outcome) => outcome,
+            AdmitOutcome::Proposed(other) => panic!("correction stayed pending: {other:?}"),
+        };
+        assert_eq!(outcome.operation, crate::AppliedOperation::Superseded);
+        assert!(store.list_pending().unwrap().is_empty());
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Flash"));
+        assert_eq!(store.list_archived().unwrap()[0].id, old_id);
+        assert!(
+            store
+                .search("Pro", 10)
+                .unwrap()
+                .into_iter()
+                .all(|(entry, _)| entry.id != old_id)
+        );
+    }
+
+    #[test]
+    fn explicit_correction_removes_every_stale_pending_value_for_the_key() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let old = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        store.commit_candidate(&old).unwrap();
+        let pending = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        assert!(matches!(
+            store.propose(pending).unwrap(),
+            ProposeOutcome::Pending(_)
+        ));
+
+        let newest = crate::parse_durable_fact("以后本项目默认模型改为 Ultra").unwrap();
+        assert!(matches!(
+            store.admit_candidate(newest).unwrap(),
+            AdmitOutcome::Corrected(_)
+        ));
+
+        assert!(store.list_pending().unwrap().is_empty());
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Ultra"));
+    }
+
+    #[test]
+    fn a_legacy_keyless_direct_write_is_found_and_superseded() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let old = store
+            .activate(
+                "旧默认模型",
+                "以后本项目默认模型固定为 Pro",
+                crate::MemoryKind::Preference,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(
+            old.key.is_none(),
+            "fixture represents a legacy direct write"
+        );
+
+        let changed = crate::parse_durable_fact("以后本项目默认模型改为 Flash").unwrap();
+        assert!(matches!(
+            store.admit_candidate(changed).unwrap(),
+            AdmitOutcome::Corrected(_)
+        ));
+
+        let active = store.effective_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].body.contains("Flash"));
+        assert_eq!(store.list_archived().unwrap()[0].id, old.id);
+    }
+
+    #[test]
+    fn a_subject_mention_in_a_note_or_broader_preference_is_not_superseded() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        store
+            .activate(
+                "后台启动排查",
+                "后台启动服务故障排查文档在 docs/runbook.md",
+                crate::MemoryKind::Note,
+                Vec::new(),
+            )
+            .unwrap();
+        store
+            .activate(
+                "日志保留",
+                "以后后台启动服务的日志保留 7 天",
+                crate::MemoryKind::Preference,
+                Vec::new(),
+            )
+            .unwrap();
+        let semantic = crate::SemanticCandidate {
+            fact: "以后不要后台启动服务".into(),
+            subject: "service.background_start".into(),
+            value: Some("disabled".into()),
+            scope: crate::CandidateScope::Project,
+            durability: crate::CandidateDurability::Durable,
+            authority: crate::MemoryAuthority::ExplicitUser,
+            operation_hint: crate::OperationHint::Update,
+            evidence_span: "以后不要后台启动服务了".into(),
+            confidence: Some(1.0),
+        };
+        let candidate =
+            crate::validate_semantic_candidate(&semantic, "以后不要后台启动服务了").unwrap();
+
+        assert!(matches!(
+            store.admit_candidate(candidate).unwrap(),
+            AdmitOutcome::Proposed(ProposeOutcome::Pending(_))
+        ));
+        assert_eq!(store.effective_active().unwrap().len(), 2);
+        assert!(store.list_archived().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unchanged_value_for_active_key_is_already_active() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        let fact = crate::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
+        let active_id = store.commit_candidate(&fact).unwrap().entry.unwrap().id;
+
+        assert_eq!(
+            store.propose(fact).unwrap(),
+            ProposeOutcome::AlreadyActive { id: active_id }
+        );
+        assert!(store.list_pending().unwrap().is_empty());
     }
 
     #[test]

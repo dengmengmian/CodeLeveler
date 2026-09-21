@@ -193,6 +193,46 @@ fn pending_entries(
         .collect()
 }
 
+fn project_memory_consolidation_event(
+    event: crate::memory_consolidator::MemoryConsolidationEvent,
+) -> RuntimeEvent {
+    if event.operation == "proposed" {
+        RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Info,
+            message: format!(
+                "发现可能值得记住的内容，等待确认：[{}] {}。用 /memory 查看并采纳或忽略。",
+                event.id, event.title
+            ),
+        }
+    } else {
+        RuntimeEvent::MemoryChanged {
+            operation: event.operation,
+            id: event.id,
+            title: event.title,
+            authority: Some(event.authority),
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn proposed_memory_projects_to_truthful_pending_notification() {
+    let event = crate::memory_consolidator::MemoryConsolidationEvent {
+        session_id: "session".to_string(),
+        operation: "proposed".to_string(),
+        id: "cand-output".to_string(),
+        title: "输出保持紧凑".to_string(),
+        authority: "explicit_user".to_string(),
+    };
+    match project_memory_consolidation_event(event) {
+        RuntimeEvent::Notification { message, .. } => {
+            assert!(message.contains("等待确认"));
+            assert!(message.contains("cand-output"));
+        }
+        other => panic!("pending candidate became a durable change: {other:?}"),
+    }
+}
+
 /// One active/archived row, carrying what a client must render differently:
 /// the kind, and whether it is withheld from the model as sensitive.
 fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::UiMemoryEntry {
@@ -738,17 +778,13 @@ impl InProcessRuntimeClient {
                         }
                         Err(broadcast::error::RecvError::Closed) => return,
                     };
-                    let runtime_event = RuntimeEvent::MemoryChanged {
-                        operation: event.operation,
-                        id: event.id,
-                        title: event.title,
-                        authority: Some(event.authority),
-                    };
+                    let session_id = event.session_id.clone();
+                    let runtime_event = project_memory_consolidation_event(event);
                     let _ = all_events.send(runtime_event.clone());
                     if let Some(sender) = scoped_events
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&SessionId::new(event.session_id))
+                        .get(&SessionId::new(session_id))
                         .cloned()
                     {
                         let _ = sender.send(runtime_event);
@@ -2250,24 +2286,23 @@ impl InProcessRuntimeClient {
                     let db = app.open_database().await.map_err(|e| e.to_string())?;
                     let stores = leveler_storage::EngineStores::from_database(&db);
                     let engine = app.task_engine(&db).map_err(|e| e.to_string())?;
-                    // A session without any goal has nothing to recap —
-                    // answer truthfully before spending a model call.
-                    let has_goal = match stores.tasks.task_for_session(&session_id).await {
-                        Ok(Some(task)) => !stores
-                            .goals
-                            .for_task(&task)
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .is_empty(),
-                        _ => false,
-                    };
-                    if !has_goal {
+                    // Recap only the exact Goal lineage named by the latest
+                    // durable turn. A latest Chat or legacy ambiguous row must
+                    // not fall back to an older goal in the session.
+                    let Some(scope) = leveler_agent::coding::latest_session_goal_checkpoint_scope(
+                        &stores,
+                        &session_id,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
+                    else {
                         return Ok(None);
-                    }
+                    };
                     let semantic = Self::recap_semantic(&app, &session_id, model.clone()).await;
                     let record = leveler_agent::coding::create_goal_checkpoint(
                         &engine,
                         &session_id,
+                        &scope,
                         leveler_lifecycle::CheckpointReason::Manual,
                         Some(&leveler_agent::coding::GitWorkspace::new(
                             &app.layout.repo_root,

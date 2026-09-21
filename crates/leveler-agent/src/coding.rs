@@ -21,8 +21,9 @@ pub mod turn;
 pub mod workspace;
 
 pub use checkpoint::{
-    ProjectedCheckpoint, SemanticRecap, WorkspaceFacts, checkpoint_created_event,
-    create_goal_checkpoint, project_goal_checkpoint, resume_prior_from_checkpoint,
+    GoalCheckpointScope, ProjectedCheckpoint, SemanticRecap, WorkspaceFacts,
+    checkpoint_created_event, create_goal_checkpoint, latest_goal_checkpoint_scope,
+    latest_session_goal_checkpoint_scope, project_goal_checkpoint, resume_prior_from_checkpoint,
 };
 pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
 pub use policy::{

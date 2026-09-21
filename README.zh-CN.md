@@ -98,7 +98,7 @@ CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时�
 ```sh
 leveler update            # 安装最新稳定版
 leveler update --check    # 有更新时退出码为 2
-leveler update --version v1.0.3
+leveler update --version v1.0.4
 ```
 
 在 TUI 中：

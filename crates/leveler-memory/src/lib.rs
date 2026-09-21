@@ -22,7 +22,7 @@ pub use lifecycle::{
     AppliedOperation, CandidateOperation, CommitOutcome, MemoryAuthority, MemoryDecision,
     MemoryLifecycleOp, MemoryOperation, Provenance, decide, parse_durable_fact, semantic_key_of,
 };
-pub use pipeline::{ProposeOutcome, SuppressRecord, collect_turn_candidates};
+pub use pipeline::{AdmitOutcome, ProposeOutcome, SuppressRecord, collect_turn_candidates};
 pub use semantic::{
     CandidateDurability, CandidateRejection, CandidateScope, OperationHint, SemanticCandidate,
     SemanticError, ValidatedCandidates, canonical_subject, evidence_matches,
@@ -1134,6 +1134,46 @@ mod tests {
             "never query-recalled"
         );
         assert!(!store.catalog_lines(16).unwrap().contains("deploy token"));
+    }
+
+    /// Old stores can contain credentials that predate (or slipped past) the
+    /// write boundary. They remain user-owned files, but no automatic model path
+    /// may expose them.
+    #[test]
+    fn legacy_api_keys_are_withheld_from_recall_and_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path()).unwrap();
+        for (id, title, body) in [
+            (
+                "legacy-api-key",
+                "API key",
+                "API key is demo-provider-value-1234567890",
+            ),
+            (
+                "legacy-deploy-key",
+                "部署密钥",
+                "部署密钥是 demo-provider-value-1234567890",
+            ),
+        ] {
+            let mut entry = new_entry(title, body, vec!["preference".into()]);
+            entry.id = id.to_string();
+            entry.kind = Some("preference".into());
+            std::fs::write(
+                dir.path().join("active").join(format!("{id}.json")),
+                serde_json::to_string_pretty(&entry).unwrap(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(store.list_active().unwrap().len(), 2, "files are preserved");
+        assert!(
+            store.list_active().unwrap().iter().all(is_sensitive),
+            "every legacy credential must be classified as sensitive"
+        );
+        assert!(store.standing_preferences(8).unwrap().is_empty());
+        assert!(store.recall("API key", 4).unwrap().is_empty());
+        assert!(store.recall("部署密钥", 4).unwrap().is_empty());
+        assert!(store.catalog_lines(16).unwrap().is_empty());
     }
 
     /// Only entries that declare themselves preferences are injected

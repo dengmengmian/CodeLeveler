@@ -34,6 +34,13 @@ pub trait TurnStore: Send + Sync {
         session_id: Option<&SessionId>,
     ) -> Result<Vec<TurnRecord>, StorageError>;
 
+    /// All turns for one session in ordinal order. Resume uses the durable
+    /// turn payload to recover the exact work lineage that failed.
+    async fn list_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<TurnRecord>, StorageError>;
+
     /// Fenced start: like `start`, but atomically guarded on `token` being
     /// the session's task's current ownership (single guarded statement in
     /// SQLite). A stale runtime cannot open new execution turns.
@@ -67,6 +74,13 @@ impl TurnStore for Database {
         session_id: Option<&SessionId>,
     ) -> Result<Vec<TurnRecord>, StorageError> {
         TurnRepository::new(self).list_running(session_id).await
+    }
+
+    async fn list_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<TurnRecord>, StorageError> {
+        TurnRepository::new(self).list(session_id).await
     }
 
     async fn start_owned(
@@ -205,6 +219,22 @@ impl TurnStore for MemoryTurnStore {
                 .then(a.ordinal.cmp(&b.ordinal))
         });
         Ok(out)
+    }
+
+    async fn list_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<TurnRecord>, StorageError> {
+        let mut rows: Vec<_> = self
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.session_id == session_id.as_str())
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.ordinal);
+        Ok(rows)
     }
 
     async fn start_owned(

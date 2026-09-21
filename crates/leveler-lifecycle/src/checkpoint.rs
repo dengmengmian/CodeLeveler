@@ -195,6 +195,14 @@ impl CheckpointPlan {
 pub struct GoalCheckpoint {
     /// What the user asked, verbatim (from the goal row).
     pub objective: String,
+    /// Identity of the continuation lineage this projection belongs to.
+    ///
+    /// A goal may have several unrelated execution lineages over its lifetime.
+    /// Resume may consume this checkpoint only when this root exactly matches
+    /// the lineage it is restoring. `None` is a legacy checkpoint: readable
+    /// for presentation, but not authoritative for lineage-scoped resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_root_turn_id: Option<String>,
     /// Persisted transcript messages `[0..ordinal)` are represented by this
     /// checkpoint; resume context is the checkpoint plus messages from this
     /// ordinal on. `None` = not captured (no context-continuity claim).

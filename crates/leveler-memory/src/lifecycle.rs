@@ -15,8 +15,9 @@
 //! ```
 //!
 //! A model never writes the store directly. `remember`/`forget` tools keep
-//! their K36 human-approval gate; the autonomous path here is reserved for a
-//! statement the user made themselves in this turn.
+//! their K36 human-approval gate, and ordinary durable-looking user statements
+//! remain pending candidates. Only an explicit direct memory command, or an
+//! accepted candidate, authorizes an active-memory write.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -25,7 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::candidates::{CandidateKind, CandidateSource, MemoryCandidate, looks_like_secret};
 use crate::{
-    MemoryEntry, MemoryError, MemoryStatus, MemoryStore, entry_from_candidate, now_rfc3339, slugify,
+    MemoryEntry, MemoryError, MemoryKind, MemoryStatus, MemoryStore, entry_from_candidate,
+    now_rfc3339, slugify,
 };
 
 /// Where a fact came from, and therefore how much weight it carries.
@@ -188,6 +190,16 @@ pub fn semantic_key_of(subject: &str) -> String {
     }
 }
 
+/// Semantic identity for both current entries and legacy direct writes that
+/// predate the `key` field. The latter can be upgraded from their own durable
+/// assignment text without guessing from unrelated prose.
+pub(crate) fn durable_entry_key(entry: &MemoryEntry) -> Option<String> {
+    entry.key.clone().or_else(|| {
+        parse_durable_fact(&entry.body)
+            .and_then(|candidate| candidate.semantic_key.or(candidate.key))
+    })
+}
+
 // ── explicit durable-fact parsing ──────────────────────────────────────────
 
 const DURABLE_PREFIXES: [&str; 7] = [
@@ -268,7 +280,11 @@ pub fn parse_durable_fact(text: &str) -> Option<MemoryCandidate> {
         CandidateKind::Free,
         Some(key.clone()),
         CandidateSource::UserExplicit,
-        vec!["explicit".to_string(), "decision".to_string()],
+        vec![
+            "explicit".to_string(),
+            "decision".to_string(),
+            format!("subject:{subject}"),
+        ],
     )
     .ok()?;
     candidate.semantic_key = Some(key);
@@ -355,6 +371,66 @@ fn first_line(value: &str) -> String {
     line.chars().take(48).collect()
 }
 
+pub(crate) fn candidate_subject(candidate: &MemoryCandidate) -> Option<&str> {
+    candidate
+        .tags
+        .iter()
+        .find_map(|tag| tag.strip_prefix("subject:"))
+        .filter(|subject| !subject.is_empty())
+}
+
+pub(crate) fn entry_matches_candidate(entry: &MemoryEntry, candidate: &MemoryCandidate) -> bool {
+    let identity = candidate
+        .semantic_key
+        .as_deref()
+        .or(candidate.key.as_deref());
+    if identity.is_some() && durable_entry_key(entry).as_deref() == identity {
+        return true;
+    }
+    if entry.key.is_some() {
+        return false;
+    }
+    if MemoryKind::of(entry) != MemoryKind::Preference
+        || entry.provenance.as_ref().map(|value| value.source.as_str()) != Some("user_direct")
+    {
+        return false;
+    }
+    let Some(subject) = candidate_subject(candidate) else {
+        return false;
+    };
+    let normalized_subject: String = subject
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect();
+    if normalized_subject.chars().count() < 4 {
+        return false;
+    }
+    let mut body = entry.body.trim();
+    for prefix in ["从现在起", "以后", "今后"] {
+        if let Some(rest) = body.strip_prefix(prefix) {
+            body = rest.trim_start();
+            break;
+        }
+    }
+    for prefix in ["不要", "不再", "别"] {
+        if let Some(rest) = body.strip_prefix(prefix) {
+            body = rest.trim_start();
+            break;
+        }
+    }
+    let body = body
+        .trim_end_matches(['。', '.', '！', '!', '；', ';'])
+        .trim_end_matches('了')
+        .trim();
+    let normalized_body: String = body
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect();
+    normalized_body == normalized_subject
+}
+
 // ── decision ───────────────────────────────────────────────────────────────
 
 fn source_label(source: CandidateSource) -> &'static str {
@@ -395,10 +471,10 @@ pub fn decide(
         .semantic_key
         .as_deref()
         .or(candidate.key.as_deref());
-    if let Some(key) = identity {
+    if identity.is_some() {
         let mut related: Vec<MemoryEntry> = active
             .into_iter()
-            .filter(|e| e.key.as_deref() == Some(key))
+            .filter(|entry| entry_matches_candidate(entry, candidate))
             .collect();
         related.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         if let Some(existing) = related.first() {
@@ -515,7 +591,7 @@ impl MemoryStore {
         // the already-written replacement and becomes an idempotent skip.
         self.reconcile_active_truths(&now)?;
         let decision = decide(self, candidate, &now)?;
-        match decision.operation {
+        let outcome: Result<CommitOutcome, MemoryError> = match decision.operation {
             MemoryOperation::Skip { reason } => Ok(CommitOutcome {
                 operation: AppliedOperation::Skipped,
                 entry: None,
@@ -559,7 +635,19 @@ impl MemoryStore {
                     skipped_reason: None,
                 })
             }
+        };
+        let outcome = outcome?;
+        if matches!(
+            outcome.operation,
+            AppliedOperation::Created | AppliedOperation::Superseded | AppliedOperation::Merged
+        ) && let Some(key) = candidate
+            .semantic_key
+            .as_deref()
+            .or(candidate.key.as_deref())
+        {
+            self.clear_pending_for_key(key)?;
         }
+        Ok(outcome)
     }
 
     /// Restore the physical invariant of at most one current entry per
@@ -576,7 +664,7 @@ impl MemoryStore {
             if entry.effective_status() != MemoryStatus::Active || entry.is_expired_at(now) {
                 continue;
             }
-            if let Some(key) = entry.key.clone() {
+            if let Some(key) = durable_entry_key(&entry) {
                 by_key.entry(key).or_default().push(entry);
             }
         }
@@ -702,7 +790,7 @@ impl MemoryStore {
             if entry.effective_status() != MemoryStatus::Active || entry.is_expired_at(&now) {
                 continue;
             }
-            match entry.key.clone() {
+            match durable_entry_key(&entry) {
                 Some(key) => match by_key.get(&key).copied() {
                     Some(index) if !is_better(&entry, &out[index]) => {}
                     Some(index) => out[index] = entry,

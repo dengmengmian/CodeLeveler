@@ -353,6 +353,7 @@ pub fn validate_semantic_candidate(
             "explicit".to_string(),
             "decision".to_string(),
             "semantic".to_string(),
+            format!("subject:{subject}"),
         ],
     )
     .map_err(|_| CandidateRejection::Sensitive)?;
@@ -483,6 +484,11 @@ const SUBJECT_ALIASES: &[(&str, &str)] = &[
     ("windows支持", "windows支持"),
     ("平台支持", "windows支持"),
     ("platform.windows.support", "windows支持"),
+    ("service_background_start", "后台启动服务"),
+    ("servicebackgroundstart", "后台启动服务"),
+    ("background_start", "后台启动服务"),
+    ("backgroundstart", "后台启动服务"),
+    ("后台启动服务", "后台启动服务"),
     ("protected_branch_push", "保护分支推送"),
     ("protectedbranchpush", "保护分支推送"),
     ("保护分支推送", "保护分支推送"),
@@ -687,6 +693,10 @@ mod tests {
                 "{subject}"
             );
         }
+        assert_eq!(
+            canonical_subject("service.background_start"),
+            "后台启动服务"
+        );
     }
 
     #[test]

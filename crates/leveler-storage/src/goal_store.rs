@@ -110,6 +110,11 @@ pub trait GoalStore: Send + Sync {
         now: Timestamp,
     ) -> Result<(), OwnershipError>;
 
+    /// Reopen this exact settled goal for an explicit continuation. This does
+    /// not create or select a goal by objective text; ownership and task
+    /// identity are checked atomically with the state transition.
+    async fn reopen(&self, token: &OwnershipToken, goal_id: &GoalId) -> Result<(), OwnershipError>;
+
     /// One goal by id, or `None` when it does not exist.
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError>;
 
@@ -208,6 +213,27 @@ impl GoalStore for Database {
             return Ok(());
         }
         goal_write_miss(self, token, goal_id, true).await
+    }
+
+    async fn reopen(&self, token: &OwnershipToken, goal_id: &GoalId) -> Result<(), OwnershipError> {
+        let updated = sqlx::query(
+            "UPDATE goals SET state = 'running', settled_at = NULL \
+             WHERE id = ?1 AND task_id = ?2 AND state IN ('settled', 'running') AND EXISTS (\
+                 SELECT 1 FROM tasks WHERE id = ?2 \
+                 AND owner_runtime_id = ?3 AND owner_epoch = ?4\
+             )",
+        )
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if updated.rows_affected() == 1 {
+            return Ok(());
+        }
+        goal_write_miss(self, token, goal_id, false).await
     }
 
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError> {
@@ -425,6 +451,31 @@ impl GoalStore for MemoryGoalStore {
             .map_err(OwnershipError::Storage)
     }
 
+    async fn reopen(&self, token: &OwnershipToken, goal_id: &GoalId) -> Result<(), OwnershipError> {
+        let Some(ownership) = self.ownership.get() else {
+            return Err(OwnershipError::Storage(StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".to_string(),
+            )));
+        };
+        ownership
+            .with_current(token, || {
+                let mut rows = self.rows.lock().unwrap();
+                let goal = rows
+                    .iter_mut()
+                    .find(|goal| &goal.id == goal_id && goal.task_id == token.task_id)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "goal {goal_id} not found for task {}",
+                            token.task_id
+                        ))
+                    })?;
+                goal.state = GoalState::Running;
+                goal.settled_at = None;
+                Ok::<_, StorageError>(())
+            })?
+            .map_err(OwnershipError::Storage)
+    }
+
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError> {
         Ok(self
             .rows
@@ -516,6 +567,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.get(&goal).await.unwrap().unwrap().settled_at, first);
+
+        store.reopen(token, &goal).await.unwrap();
+        let reopened = store.get(&goal).await.unwrap().unwrap();
+        assert_eq!(reopened.id, goal, "resume preserves exact goal identity");
+        assert_eq!(reopened.state, GoalState::Running);
+        assert_eq!(reopened.settled_at, None);
+        // Retrying the same explicit reopen is idempotent.
+        store.reopen(token, &goal).await.unwrap();
 
         assert_eq!(store.get(&GoalId::new("missing")).await.unwrap(), None);
     }

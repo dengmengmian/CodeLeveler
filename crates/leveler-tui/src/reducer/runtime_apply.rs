@@ -973,16 +973,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::MemoryRecalled { count, .. } => {
             // The runtime emits this only for a real recall, so a search that
-            // found nothing never reaches here. One collapsed line, no bodies.
+            // found nothing never reaches here. Keep one auditable transcript
+            // line, but do not duplicate routine recall as a transient toast.
             if count == 0 {
                 return;
             }
             let label = state.t().memory_recalled.replace("{}", &count.to_string());
-            state.transcript.push_note(label.clone());
-            state.notification = Some(Notification {
-                level: NotificationLevel::Info,
-                message: label,
-            });
+            state.transcript.push_note(label);
         }
         RuntimeEvent::MemoryChanged {
             operation, title, ..
@@ -990,7 +987,8 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let t = state.t();
             let verb = match operation.as_str() {
                 "created" => t.memory_created,
-                "superseded" | "updated" => t.memory_updated,
+                "superseded" => t.memory_superseded,
+                "updated" => t.memory_updated,
                 "expired" => t.memory_expired,
                 "merged" => t.memory_merged,
                 _ => t.memory_created,

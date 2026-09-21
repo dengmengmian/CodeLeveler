@@ -154,7 +154,7 @@ async fn ordinary_main_turn_makes_zero_semantic_model_calls() {
 }
 
 #[tokio::test]
-async fn deterministic_fast_path_still_commits_without_semantic_call() {
+async fn deterministic_fast_path_still_proposes_without_semantic_call() {
     let dir = tempfile::tempdir().unwrap();
     let memory = dir.path().join("memory");
     let runtime = Arc::new(CaptureRuntime::new(vec![assistant_text("好")]));
@@ -163,18 +163,15 @@ async fn deterministic_fast_path_still_commits_without_semantic_call() {
     let events = run_turn(&executor, "以后本项目默认模型固定为 flash").await;
 
     assert_eq!(runtime.generate_calls(), 0);
-    assert_eq!(
-        MemoryStore::open(&memory)
-            .unwrap()
-            .effective_active()
-            .unwrap()
-            .len(),
-        1
+    let store = MemoryStore::open(&memory).unwrap();
+    assert!(store.effective_active().unwrap().is_empty());
+    assert_eq!(store.list_pending().unwrap().len(), 1);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::MemoryChanged { .. })),
+        "a pending candidate is not presented as durable memory"
     );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::MemoryChanged { operation, .. } if operation == "created"
-    )));
 }
 
 #[tokio::test]

@@ -16,8 +16,10 @@ use crate::{MemoryError, now_rfc3339, slugify};
 #[serde(rename_all = "snake_case")]
 pub enum CandidateSource {
     /// An explicit user statement of a durable rule ("以后默认模型固定为 X").
-    /// It is the user's own words in this turn, so it is the authorization for
-    /// an autonomous lifecycle write — no second consent prompt is owed.
+    /// This records that the fact came from the user's own words and therefore
+    /// carries explicit-user authority; it does NOT mean the user consented to
+    /// persist it. Except for an explicit direct-memory command, it must still
+    /// remain pending until the user accepts it.
     /// (Historically also the label on a "记住：…" candidate; kept so old
     /// `pending/` files still deserialize.)
     UserExplicit,
@@ -164,8 +166,15 @@ pub fn looks_like_secret(text: &str) -> bool {
     const MARKERS: &[&str] = &[
         "api_key",
         "apikey",
+        "api key",
+        "access_key",
+        "access key",
         "secret_key",
+        "secret key",
         "private_key",
+        "private key",
+        "client_secret",
+        "client secret",
         "-----begin",
         "sk-",
         "ghp_",
@@ -177,13 +186,86 @@ pub fn looks_like_secret(text: &str) -> bool {
     if MARKERS.iter().any(|m| lower.contains(m)) {
         return true;
     }
-    // Long base64-ish blob.
-    let alnum: String = text.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    alnum.len() >= 40
-        && text.contains('=')
-        && alnum
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    if contains_credential_assignment(text) || contains_provider_token(text) {
+        return true;
+    }
+    // A contiguous padded base64 blob, rather than 40 unrelated alphanumeric
+    // characters elsewhere in a sentence that also happens to contain `=`.
+    text.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'))
+        .any(|part| {
+            part.len() >= 40
+                && part.contains('=')
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+        })
+}
+
+/// Credential names are often more stable than their values. Recognise a
+/// conventional assignment without treating ordinary prose about tokens or
+/// keys as secret material.
+fn contains_credential_assignment(text: &str) -> bool {
+    for separator in ['=', ':', '：', '是', '为'] {
+        for (left, right) in text.match_indices(separator).map(|(index, _)| {
+            let after = index + separator.len_utf8();
+            (&text[..index], &text[after..])
+        }) {
+            let value = right.trim();
+            if value.chars().count() < 8 {
+                continue;
+            }
+            let label = left
+                .split_whitespace()
+                .next_back()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .to_ascii_lowercase();
+            const LABEL_SUFFIXES: &[&str] = &[
+                "api_key",
+                "apikey",
+                "access_key",
+                "secret_key",
+                "private_key",
+                "client_secret",
+                "token",
+                "password",
+                "passwd",
+                "credential",
+                "密钥",
+                "令牌",
+                "密码",
+                "凭证",
+            ];
+            if LABEL_SUFFIXES.iter().any(|suffix| label.ends_with(suffix)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Well-known token prefixes whose payloads are opaque bearer credentials.
+/// A minimum length keeps documentation that merely names a prefix recallable.
+fn contains_provider_token(text: &str) -> bool {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '`' | '=' | ':' | '：' | ',' | '，' | ';' | '；'
+            )
+    })
+    .any(|token| {
+        let lower = token.to_ascii_lowercase();
+        (token.len() >= 16
+            && (token.starts_with("AKIA")
+                || token.starts_with("AKLT")
+                || token.starts_with("AIza")))
+            || (token.len() >= 20
+                && ["hf_", "glpat-", "github_pat_", "npm_", "pypi-"]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix)))
+            || (token.len() >= 40 && token.starts_with("eyJ") && token.matches('.').count() == 2)
+    })
 }
 
 /// The body of a message that is ONLY a memory command, or `None`.
@@ -562,6 +644,57 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Credentials are not limited to OpenAI/GitHub prefixes. Natural-language
+    /// labels, conventional secret assignments and common provider token shapes
+    /// must all stop at the single memory write boundary.
+    #[test]
+    fn common_credential_forms_are_sensitive() {
+        for text in [
+            "API key is demo-provider-value-1234567890",
+            "部署密钥是 demo-provider-value-1234567890",
+            "SERVICE_TOKEN=opaque-provider-value-1234567890",
+            "DATABASE_PASSWORD: correct-horse-battery-staple",
+            "AKIAIOSFODNN7EXAMPLE",
+            "AKLTDEMO1234567890EXAMPLE",
+            "AIzaSyD-demoGoogleApiKeyValue1234567890",
+            "hf_demoModelTokenValue1234567890",
+            "glpat-demoGitLabTokenValue1234567890",
+            "github_pat_demoGitHubTokenValue1234567890",
+            "npm_demoRegistryTokenValue1234567890",
+            "pypi-AgEIdemoPackageTokenValue1234567890",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vIn0.signature",
+        ] {
+            assert!(
+                looks_like_secret(text),
+                "credential was not detected: {text}"
+            );
+            assert!(
+                MemoryCandidate::new(
+                    "project credential",
+                    text,
+                    CandidateKind::Free,
+                    None,
+                    CandidateSource::UserExplicit,
+                    vec![],
+                )
+                .is_err(),
+                "credential reached the memory write boundary: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_key_and_token_discussion_is_not_a_credential() {
+        for text in [
+            "token budget = 1000",
+            "monkey=value",
+            "部署密钥保管人：Zephyr-Q7",
+            "document the hf_ prefix used in examples",
+        ] {
+            assert!(!looks_like_secret(text), "ordinary text was hidden: {text}");
+        }
     }
 
     #[test]

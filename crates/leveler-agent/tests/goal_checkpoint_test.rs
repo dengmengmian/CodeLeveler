@@ -2,7 +2,9 @@
 //! idempotent triggers, corrupt-checkpoint fail-closed, and the interruption
 //! trigger — all against real SQLite (in-memory), never mocked stores.
 
-use leveler_agent::coding::{create_goal_checkpoint, resume_prior_from_checkpoint};
+use leveler_agent::coding::{
+    GoalCheckpointScope, create_goal_checkpoint, resume_prior_from_checkpoint,
+};
 use leveler_core::{OwnerEpoch, RuntimeId, SessionId};
 use leveler_engine::{EngineEvent, ReapScope, reap_after_restart};
 use leveler_lifecycle::CheckpointReason;
@@ -18,6 +20,7 @@ struct Fixture {
     engine: leveler_engine::TaskEngine,
     session: SessionId,
     goal: leveler_core::GoalId,
+    scope: GoalCheckpointScope,
 }
 
 async fn fixture() -> Fixture {
@@ -41,6 +44,29 @@ async fn fixture() -> Fixture {
     let goal = GoalStore::open(&db, &token, "port the parser", leveler_core::now())
         .await
         .unwrap();
+    let root_payload = serde_json::json!({
+        "version": 2,
+        "objective": leveler_lifecycle::ObjectiveAnchor::from_session_goal("port the parser"),
+        "goal_id": goal,
+    })
+    .to_string();
+    let root = TurnRepository::new(&db)
+        .start(&session, "user", Some(&root_payload), leveler_core::now())
+        .await
+        .unwrap();
+    TurnRepository::new(&db)
+        .finish(
+            &leveler_core::TurnId::new(root.id.clone()),
+            "completed",
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    let scope = GoalCheckpointScope::new(
+        goal.clone(),
+        leveler_core::TurnId::new(&root.id),
+        vec![leveler_core::TurnId::new(root.id)],
+    );
     let stores = EngineStores::from_database(&db);
     let engine = leveler_engine::TaskEngine {
         stores: stores.clone(),
@@ -56,6 +82,7 @@ async fn fixture() -> Fixture {
         engine,
         session,
         goal,
+        scope,
     }
 }
 
@@ -64,7 +91,7 @@ async fn append_event(fx: &Fixture, event: EngineEvent) -> i64 {
     leveler_storage::EventStore::append(
         &fx.db,
         &fx.session,
-        None,
+        Some(&fx.scope.root_turn_id),
         &event_type,
         &payload,
         leveler_core::now(),
@@ -86,6 +113,7 @@ async fn checkpoint_reaped(fx: &Fixture, outcome: &leveler_engine::ReapOutcome) 
         let Some(record) = create_goal_checkpoint(
             &fx.engine,
             &reaped.session_id,
+            &fx.scope,
             CheckpointReason::Interrupted,
             None,
             None,
@@ -146,6 +174,7 @@ async fn resume_receives_checkpoint_plus_exact_delta() {
     let record = create_goal_checkpoint(
         &fx.engine,
         &fx.session,
+        &fx.scope,
         CheckpointReason::Manual,
         None,
         None,
@@ -170,7 +199,7 @@ async fn resume_receives_checkpoint_plus_exact_delta() {
     )
     .await
     .unwrap();
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &fx.scope, &transcript)
         .await
         .unwrap()
         .expect("a valid checkpoint must be consumed");
@@ -201,6 +230,7 @@ async fn repeated_trigger_at_same_boundary_is_one_checkpoint() {
     let first = create_goal_checkpoint(
         &fx.engine,
         &fx.session,
+        &fx.scope,
         CheckpointReason::Manual,
         None,
         None,
@@ -211,6 +241,7 @@ async fn repeated_trigger_at_same_boundary_is_one_checkpoint() {
     let repeat = create_goal_checkpoint(
         &fx.engine,
         &fx.session,
+        &fx.scope,
         CheckpointReason::Manual,
         None,
         None,
@@ -227,6 +258,7 @@ async fn repeated_trigger_at_same_boundary_is_one_checkpoint() {
     let advanced = create_goal_checkpoint(
         &fx.engine,
         &fx.session,
+        &fx.scope,
         CheckpointReason::Manual,
         None,
         None,
@@ -250,10 +282,101 @@ async fn no_checkpoint_yields_no_prior() {
     )
     .await
     .unwrap();
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &fx.scope, &transcript)
         .await
         .unwrap();
     assert!(prior.is_none());
+}
+
+#[tokio::test]
+async fn latest_scope_is_resolved_from_v2_turn_identity() {
+    let fx = fixture().await;
+    let resolved =
+        leveler_agent::coding::latest_goal_checkpoint_scope(&fx.stores, &fx.session, &fx.goal)
+            .await
+            .unwrap()
+            .expect("v2 goal turn has an exact scope");
+
+    assert_eq!(resolved.goal_id, fx.goal);
+    assert_eq!(resolved.root_turn_id, fx.scope.root_turn_id);
+    assert_eq!(resolved.turn_ids, fx.scope.turn_ids);
+}
+
+#[tokio::test]
+async fn latest_session_scope_does_not_fall_back_past_a_chat() {
+    let fx = fixture().await;
+    let chat_payload = serde_json::json!({
+        "version": 2,
+        "objective": leveler_lifecycle::ObjectiveAnchor::from_user_message("configure Ark"),
+    })
+    .to_string();
+    TurnRepository::new(&fx.db)
+        .start(
+            &fx.session,
+            "chat",
+            Some(&chat_payload),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        leveler_agent::coding::latest_session_goal_checkpoint_scope(&fx.stores, &fx.session)
+            .await
+            .unwrap()
+            .is_none(),
+        "a current Chat must not install or create the older Goal's checkpoint"
+    );
+}
+
+/// Checkpoint identity includes the continuation root, not only the goal.
+/// A later, unrelated lineage of the same goal must take the full-history
+/// path instead of installing stale plan/evidence context.
+#[tokio::test]
+async fn a_checkpoint_is_not_consumed_by_another_lineage_of_the_same_goal() {
+    let fx = fixture().await;
+    append_event(&fx, marker_event("old lineage work")).await;
+    create_goal_checkpoint(
+        &fx.engine,
+        &fx.session,
+        &fx.scope,
+        CheckpointReason::Manual,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("checkpoint");
+
+    let other_scope = GoalCheckpointScope::new(
+        fx.goal.clone(),
+        leveler_core::TurnId::new("other-root"),
+        vec![leveler_core::TurnId::new("other-root")],
+    );
+    let transcript = leveler_engine::RawTranscript::load_strict(
+        fx.stores.messages.as_ref(),
+        &fx.session,
+        "test transcript",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        leveler_agent::coding::checkpoint::checkpoint_transcript_ordinal(
+            &fx.stores,
+            &fx.session,
+            &other_scope,
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    assert!(
+        resume_prior_from_checkpoint(&fx.stores, &fx.session, &other_scope, &transcript)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// §38: a checkpoint whose cursor points beyond the durable log is never
@@ -276,6 +399,7 @@ async fn a_cursor_beyond_the_log_fails_closed() {
                 event_cursor: 9_999,
                 payload: leveler_lifecycle::GoalCheckpoint {
                     objective: "x".into(),
+                    lineage_root_turn_id: Some(fx.scope.root_turn_id.as_str().to_string()),
                     transcript_ordinal: Some(0),
                     ..Default::default()
                 },
@@ -292,7 +416,7 @@ async fn a_cursor_beyond_the_log_fails_closed() {
     )
     .await
     .unwrap();
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &fx.scope, &transcript)
         .await
         .unwrap();
     assert!(
@@ -359,6 +483,7 @@ async fn a_pre_compact_checkpoint_is_never_consumed_after_the_cut() {
     let old = create_goal_checkpoint(
         &fx.engine,
         &fx.session,
+        &fx.scope,
         CheckpointReason::Manual,
         None,
         None,
@@ -401,7 +526,7 @@ async fn a_pre_compact_checkpoint_is_never_consumed_after_the_cut() {
         "grown past the old watermark"
     );
 
-    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &transcript)
+    let prior = resume_prior_from_checkpoint(&fx.stores, &fx.session, &fx.scope, &transcript)
         .await
         .unwrap();
     assert!(

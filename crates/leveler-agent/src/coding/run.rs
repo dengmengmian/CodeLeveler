@@ -27,7 +27,7 @@ use leveler_verifier::{Verdict, VerificationPlan, VerificationReport, Verifier};
 
 use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::coding::policy::IndependentReviewPolicy;
-use crate::coding::turn::{TurnInput, drive_turn};
+use crate::coding::turn::{TurnInput, content_objective_text, drive_turn};
 use crate::coding::workspace::GitWorkspace;
 use crate::{ContinuationPolicy, StepLimits};
 
@@ -135,6 +135,40 @@ pub struct CodingRuntime {
     /// terminal time so a cooperative stop is recorded as `cancelled` rather
     /// than resumable `interrupted`.
     pub task_cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum ResumeTurnKind {
+    Chat,
+    Goal,
+}
+
+struct ResumeLineage {
+    kind: ResumeTurnKind,
+    objective: leveler_lifecycle::ObjectiveAnchor,
+    root_turn_id: TurnId,
+    turn_ids: Vec<TurnId>,
+    goal_id: Option<leveler_core::GoalId>,
+}
+
+fn continuation_root_is_valid(
+    turns: &[leveler_storage::TurnRecord],
+    continuation: &leveler_storage::TurnRecord,
+    root: &TurnId,
+) -> bool {
+    turns.iter().any(|candidate| {
+        candidate.id == root.as_str()
+            && candidate.session_id == continuation.session_id
+            && candidate.ordinal < continuation.ordinal
+            && candidate.kind == continuation.kind
+    })
+}
+
+fn is_bare_legacy_continuation(message: &Message) -> bool {
+    let text = message.text_content();
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed == "继续" || lower == "continue" || lower == "resume"
 }
 
 /// The domain-neutral half of a task: what to do and how long the runtime
@@ -542,6 +576,204 @@ pub(crate) fn bound_goal_history(
     messages[start..].to_vec()
 }
 impl CodingRuntime {
+    async fn resume_lineage(
+        &self,
+        session_id: &SessionId,
+        fallback_objective: &str,
+    ) -> Result<ResumeLineage, EngineError> {
+        let turns = self
+            .engine
+            .stores
+            .turns
+            .list_for_session(session_id)
+            .await?;
+        let mut resolved = None;
+        let mut legacy_continuation_ids = Vec::new();
+        for turn in turns.iter().rev() {
+            if turn.kind != "user" && turn.kind != "chat" {
+                continue;
+            }
+            let Some(payload) = turn.payload.as_deref() else {
+                // With no WAL payload there is no evidence tying this turn to
+                // an older objective. Downgrade explicitly to THIS real row;
+                // a legacy user turn can use the persisted session goal, while
+                // a Chat cannot be reconstructed without inventing intent.
+                if turn.kind == "chat" {
+                    return Err(EngineError::Corrupt(format!(
+                        "legacy chat turn {} has no initiating payload",
+                        turn.id
+                    )));
+                }
+                resolved = Some(ResumeLineage {
+                    kind: ResumeTurnKind::Goal,
+                    objective: leveler_lifecycle::ObjectiveAnchor::from_session_goal(
+                        fallback_objective,
+                    ),
+                    root_turn_id: TurnId::new(turn.id.clone()),
+                    turn_ids: Vec::new(),
+                    goal_id: None,
+                });
+                break;
+            };
+            let payload_version = serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|value| value.get("version")?.as_u64());
+            if payload_version == Some(2) {
+                let lineage = leveler_engine::decode_turn_continuation(payload)?;
+                if let Some(root) = lineage.root_turn_id.as_ref() {
+                    let valid_root = continuation_root_is_valid(&turns, turn, root);
+                    if !valid_root {
+                        return Err(EngineError::Corrupt(format!(
+                            "turn {} has invalid continuation root {}",
+                            turn.id,
+                            root.as_str()
+                        )));
+                    }
+                    let root_turn = turns
+                        .iter()
+                        .find(|candidate| candidate.id == root.as_str())
+                        .expect("validated root exists");
+                    if let Some(root_payload) = root_turn.payload.as_deref() {
+                        let root_version = serde_json::from_str::<serde_json::Value>(root_payload)
+                            .ok()
+                            .and_then(|value| value.get("version")?.as_u64());
+                        if root_version == Some(2) {
+                            let root_lineage =
+                                leveler_engine::decode_turn_continuation(root_payload)?;
+                            if root_lineage.root_turn_id.is_some()
+                                || root_lineage.goal_id != lineage.goal_id
+                            {
+                                return Err(EngineError::Corrupt(format!(
+                                    "turn {} names root {} from a different lineage",
+                                    turn.id,
+                                    root.as_str()
+                                )));
+                            }
+                        }
+                    }
+                }
+                resolved = Some(ResumeLineage {
+                    kind: if turn.kind == "chat" {
+                        ResumeTurnKind::Chat
+                    } else {
+                        ResumeTurnKind::Goal
+                    },
+                    objective: lineage.objective,
+                    root_turn_id: lineage
+                        .root_turn_id
+                        .unwrap_or_else(|| TurnId::new(turn.id.clone())),
+                    turn_ids: Vec::new(),
+                    goal_id: lineage.goal_id,
+                });
+                break;
+            }
+            // V1 compatibility: its initiating message is authoritative for
+            // that fresh turn even though it did not yet persist an explicit
+            // objective/root. Never fall back to the transcript's first user.
+            if let Ok(message) = leveler_engine::decode_turn_initiating_message(payload) {
+                if is_bare_legacy_continuation(&message) {
+                    legacy_continuation_ids.push(TurnId::new(turn.id.clone()));
+                    continue;
+                }
+                let text = message.text_content();
+                let kind = if turn.kind == "chat" {
+                    ResumeTurnKind::Chat
+                } else {
+                    ResumeTurnKind::Goal
+                };
+                let objective = match kind {
+                    ResumeTurnKind::Chat => {
+                        leveler_lifecycle::ObjectiveAnchor::from_user_message(text)
+                    }
+                    ResumeTurnKind::Goal => {
+                        leveler_lifecycle::ObjectiveAnchor::from_session_goal(text)
+                    }
+                };
+                resolved = Some(ResumeLineage {
+                    kind,
+                    objective,
+                    root_turn_id: TurnId::new(turn.id.clone()),
+                    turn_ids: Vec::new(),
+                    goal_id: None,
+                });
+                break;
+            }
+        }
+        if let Some(mut lineage) = resolved {
+            let root_turn_id = lineage.root_turn_id.clone();
+            let goal_id = lineage.goal_id.clone();
+            lineage.turn_ids = turns
+                .iter()
+                .filter_map(|turn| {
+                    if turn.id == root_turn_id.as_str() {
+                        return Some(TurnId::new(turn.id.clone()));
+                    }
+                    let payload = turn.payload.as_deref()?;
+                    let decoded = leveler_engine::decode_turn_continuation(payload).ok()?;
+                    (decoded.root_turn_id.as_ref() == Some(&root_turn_id)
+                        && decoded.goal_id == goal_id)
+                        .then(|| TurnId::new(turn.id.clone()))
+                })
+                .collect();
+            legacy_continuation_ids.reverse();
+            for turn_id in legacy_continuation_ids {
+                if !lineage.turn_ids.contains(&turn_id) {
+                    lineage.turn_ids.push(turn_id);
+                }
+            }
+            if matches!(lineage.kind, ResumeTurnKind::Goal) && lineage.goal_id.is_none() {
+                lineage.goal_id = self.unique_legacy_running_goal(session_id).await?;
+            }
+            return Ok(lineage);
+        }
+        // Pre-WAL sessions have no initiating payload at all. Bind their
+        // explicit downgrade to a REAL persisted turn so a second resume can
+        // validate the root and seed the first resume's events.
+        let root = turns
+            .iter()
+            .rev()
+            .find(|turn| turn.kind == "user" || turn.kind == "chat")
+            .ok_or_else(|| EngineError::Corrupt("session has no resumable turn".into()))?;
+        let goal_id = self.unique_legacy_running_goal(session_id).await?;
+        Ok(ResumeLineage {
+            kind: ResumeTurnKind::Goal,
+            objective: leveler_lifecycle::ObjectiveAnchor::from_session_goal(fallback_objective),
+            root_turn_id: TurnId::new(root.id.clone()),
+            turn_ids: vec![TurnId::new(root.id.clone())],
+            goal_id,
+        })
+    }
+
+    async fn unique_legacy_running_goal(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<leveler_core::GoalId>, EngineError> {
+        let task_id = self
+            .engine
+            .stores
+            .tasks
+            .task_for_session(session_id)
+            .await?
+            .ok_or_else(|| EngineError::Corrupt("legacy session has no task".into()))?;
+        let mut running = self
+            .engine
+            .stores
+            .goals
+            .for_task(&task_id)
+            .await?
+            .into_iter()
+            .filter(|goal| goal.state == leveler_storage::GoalState::Running);
+        let Some(goal) = running.next() else {
+            return Ok(None);
+        };
+        if running.next().is_some() {
+            return Err(EngineError::Corrupt(
+                "legacy goal continuation is ambiguous across multiple running goals".into(),
+            ));
+        }
+        Ok(Some(goal.id))
+    }
+
     async fn open_or_reuse_goal(
         &self,
         token: &leveler_core::OwnershipToken,
@@ -563,45 +795,52 @@ impl CodingRuntime {
         self.engine.open_goal(token, objective).await
     }
 
-    /// Rebind a resume to the task's own running goal.
+    /// Rebind a resume to the exact running goal persisted by its lineage.
     ///
     /// The logical task is the TASK, and the goal it owns is the one that was
-    /// running when the turn was interrupted. Matching by objective text is not
-    /// enough: a continuation phrased differently (`继续`) must not open a
-    /// second goal, and a session whose goal column was never populated must
-    /// not create an empty one. `fallback_objective` is used only when the task
-    /// has no running goal at all (a goal-less chat task).
+    /// running when the turn was interrupted. Matching by objective text (or
+    /// merely taking the newest running goal) is not identity and can attach a
+    /// continuation to unrelated work.
     async fn resume_goal(
         &self,
         token: &leveler_core::OwnershipToken,
-        fallback_objective: &str,
+        goal_id: &leveler_core::GoalId,
     ) -> Result<leveler_core::GoalId, EngineError> {
-        // `for_task` returns newest-opened first; the newest running goal is
-        // the one being continued.
-        if let Some(goal) = self
+        let goal = self
             .engine
             .stores
             .goals
-            .for_task(&token.task_id)
+            .get(goal_id)
             .await?
-            .into_iter()
-            .find(|goal| goal.state == leveler_storage::GoalState::Running)
-        {
-            return Ok(goal.id);
+            .ok_or_else(|| EngineError::Corrupt(format!("lineage goal {goal_id} not found")))?;
+        if goal.task_id != token.task_id {
+            return Err(EngineError::Corrupt(format!(
+                "lineage goal {goal_id} does not belong to task {}",
+                token.task_id
+            )));
         }
-        self.engine.open_goal(token, fallback_objective).await
+        if goal.state == leveler_storage::GoalState::Settled {
+            self.engine.stores.goals.reopen(token, goal_id).await?;
+        }
+        Ok(goal.id)
     }
 
     async fn load_request_transcript(
         &self,
         session_id: &SessionId,
         strict: Option<&str>,
+        checkpoint_scope: Option<&crate::coding::checkpoint::GoalCheckpointScope>,
     ) -> Result<leveler_engine::RawTranscript, EngineError> {
-        let checkpoint_ordinal = crate::coding::checkpoint::checkpoint_transcript_ordinal(
-            &self.engine.stores,
-            session_id,
-        )
-        .await?;
+        let checkpoint_ordinal = if let Some(scope) = checkpoint_scope {
+            crate::coding::checkpoint::checkpoint_transcript_ordinal(
+                &self.engine.stores,
+                session_id,
+                scope,
+            )
+            .await?
+        } else {
+            None
+        };
         self.engine
             .load_request_transcript(session_id, checkpoint_ordinal, strict)
             .await
@@ -613,24 +852,33 @@ impl CodingRuntime {
         session_id: &SessionId,
         raw: leveler_engine::RawTranscript,
         objective: Option<&str>,
+        checkpoint_scope: Option<&crate::coding::checkpoint::GoalCheckpointScope>,
         workspace: Option<&dyn crate::coding::checkpoint::WorkspaceFacts>,
         summarizer: &dyn leveler_engine::ContextSummarizer,
         cancellation: &CancellationToken,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
-        if let Some(prior) = self
-            .checkpointed_prior(
-                log,
-                session_id,
-                &raw,
-                workspace,
-                summarizer,
-                cancellation,
-                observer,
-            )
-            .await?
+        if let Some(scope) = checkpoint_scope
+            && let Some(prior) = self
+                .checkpointed_prior(
+                    log,
+                    session_id,
+                    &raw,
+                    workspace,
+                    summarizer,
+                    cancellation,
+                    observer,
+                    scope,
+                )
+                .await?
         {
-            return Ok(prior);
+            return Ok(leveler_context::compact_messages(
+                &prior,
+                usize::MAX,
+                u64::MAX,
+                None,
+                objective,
+            ));
         }
         let context = raw
             .assemble(
@@ -643,7 +891,13 @@ impl CodingRuntime {
         if context.compacted {
             log.append(None, context.snapshot_event(), observer).await?;
         }
-        Ok(context.prior)
+        Ok(leveler_context::compact_messages(
+            &context.prior,
+            usize::MAX,
+            u64::MAX,
+            None,
+            objective,
+        ))
     }
 
     async fn checkpointed_prior(
@@ -655,11 +909,9 @@ impl CodingRuntime {
         summarizer: &dyn leveler_engine::ContextSummarizer,
         _cancellation: &CancellationToken,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
+        scope: &crate::coding::checkpoint::GoalCheckpointScope,
     ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
         let threshold = leveler_context::PRE_REQUEST_COMPACT_THRESHOLD;
-        if leveler_context::estimate_tokens(&raw.messages) <= threshold {
-            return Ok(None);
-        }
         let Some(task) = self
             .engine
             .stores
@@ -675,6 +927,7 @@ impl CodingRuntime {
         if let Some(prior) = crate::coding::checkpoint::resume_prior_from_checkpoint(
             &self.engine.stores,
             session_id,
+            scope,
             raw,
         )
         .await?
@@ -682,10 +935,14 @@ impl CodingRuntime {
         {
             return Ok(Some(prior));
         }
+        if leveler_context::estimate_tokens(&raw.messages) <= threshold {
+            return Ok(None);
+        }
         let summary = summarizer.summarize(&raw.messages).await;
         match crate::coding::checkpoint::create_goal_checkpoint(
             &self.engine,
             session_id,
+            scope,
             leveler_lifecycle::CheckpointReason::ContextCompaction,
             workspace,
             crate::coding::checkpoint::SemanticRecap::briefing(summary.as_deref()),
@@ -914,16 +1171,32 @@ impl CodingRuntime {
             let checkpoint_phase =
                 begin_finalization_phase(&log, FINALIZATION_CONTINUATION_CHECKPOINT, observer)
                     .await;
-            let checkpoint = crate::coding::checkpoint::create_goal_checkpoint(
-                &self.engine,
-                session_id,
-                leveler_lifecycle::CheckpointReason::Milestone,
-                repo.map(GitWorkspace::new)
-                    .as_ref()
-                    .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
-                None,
-            )
-            .await;
+            let checkpoint = match goal {
+                Some(goal_id) => match crate::coding::checkpoint::latest_goal_checkpoint_scope(
+                    &self.engine.stores,
+                    session_id,
+                    goal_id,
+                )
+                .await
+                {
+                    Ok(Some(scope)) => {
+                        crate::coding::checkpoint::create_goal_checkpoint(
+                            &self.engine,
+                            session_id,
+                            &scope,
+                            leveler_lifecycle::CheckpointReason::Milestone,
+                            repo.map(GitWorkspace::new)
+                                .as_ref()
+                                .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
+                            None,
+                        )
+                        .await
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                },
+                None => Ok(None),
+            };
             match checkpoint {
                 Ok(Some(record)) => {
                     let event = crate::coding::checkpoint::checkpoint_created_event(&record);
@@ -1178,11 +1451,11 @@ impl CodingRuntime {
         let terminal_cancellation = cancellation.clone();
         let result = match (develop, spec.runtime.kind) {
             (true, _) => {
-                self.run_develop_loop(&log, &runner, spec, observer, cancellation)
+                self.run_develop_loop(&log, &runner, spec, &goal, observer, cancellation)
                     .await
             }
             (false, ExecutionKind::Direct) => {
-                self.run_direct(&log, &runner, spec, observer, cancellation)
+                self.run_direct(&log, &runner, spec, &goal, observer, cancellation)
                     .await
             }
             (false, ExecutionKind::Parallel) => Err(EngineError::Config(
@@ -1250,7 +1523,7 @@ impl CodingRuntime {
         };
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
-        let raw = self.load_request_transcript(session_id, None).await?;
+        let raw = self.load_request_transcript(session_id, None, None).await?;
         let token = self
             .engine
             .start_task(
@@ -1292,6 +1565,7 @@ impl CodingRuntime {
                 session_id,
                 raw,
                 objective_hint,
+                None,
                 Some(&GitWorkspace::new(&spec.coding.repository)),
                 &self.context_summarizer(&cancellation),
                 &cancellation,
@@ -1317,7 +1591,13 @@ impl CodingRuntime {
             let recorded = runner
                 .run_turn(
                     TurnKind::Chat,
-                    leveler_engine::TurnStart::Fresh(initiating_message),
+                    leveler_engine::TurnStart::Anchored {
+                        message: initiating_message,
+                        objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(
+                            content_objective_text(&content),
+                        ),
+                        goal_id: None,
+                    },
                     observer,
                     cancellation.clone(),
                     |ports| {
@@ -1438,45 +1718,129 @@ impl CodingRuntime {
                 outcome.map(|o| o.as_str()).unwrap_or_default()
             )));
         }
-        let raw = self
-            .load_request_transcript(session_id, Some("transcript"))
-            .await?;
-        if raw.is_empty() {
-            return Err(EngineError::Config(format!(
-                "session {session_id} has no transcript to resume; \
-                 for interactive chat reopen with: leveler tui --session {session_id}"
-            )));
+        let mut lineage = self.resume_lineage(session_id, &spec.runtime.goal).await?;
+        if let Some(message) = instruction.as_ref() {
+            let image_count = message
+                .content
+                .iter()
+                .filter(|part| matches!(part, leveler_model::ContentPart::Image { .. }))
+                .count();
+            let mut amendment = if is_bare_legacy_continuation(message) {
+                String::new()
+            } else {
+                message.text_content()
+            };
+            if image_count > 0 {
+                if !amendment.is_empty() {
+                    amendment.push('\n');
+                }
+                amendment.push_str(&format!("[{image_count} image attachment(s)]"));
+            }
+            lineage.objective.amend(amendment);
         }
         let token = self
             .engine
             .mark_running(session_id, AgentState::Execute)
             .await?;
-        // Resume rebinds the goal by IDENTITY: the task's running goal is the
-        // logical task being continued, regardless of how the continuation
-        // message is phrased. `spec.runtime.goal` is only the fallback for a
-        // session that lost its goal row.
-        let goal = match self.resume_goal(&token, &spec.runtime.goal).await {
-            Ok(goal) => goal,
-            Err(error) => {
-                let result = Err(error);
-                self.finish_from_result(
-                    &token,
-                    session_id,
-                    &result,
-                    None,
-                    Some(&spec.coding.repository),
-                    observer,
-                    &cancellation,
-                )
-                .await?;
-                return result;
+        if matches!(lineage.kind, ResumeTurnKind::Goal) && lineage.goal_id.is_none() {
+            lineage.goal_id = match self
+                .open_or_reuse_goal(&token, lineage.objective.text())
+                .await
+            {
+                Ok(goal_id) => Some(goal_id),
+                Err(error) => {
+                    let result = Err(error);
+                    self.finish_from_result(
+                        &token,
+                        session_id,
+                        &result,
+                        None,
+                        Some(&spec.coding.repository),
+                        observer,
+                        &cancellation,
+                    )
+                    .await?;
+                    return result;
+                }
+            };
+        }
+        let checkpoint_scope = match (&lineage.kind, lineage.goal_id.as_ref()) {
+            (ResumeTurnKind::Goal, Some(goal_id)) => {
+                Some(crate::coding::checkpoint::GoalCheckpointScope::new(
+                    goal_id.clone(),
+                    lineage.root_turn_id.clone(),
+                    lineage.turn_ids.clone(),
+                ))
             }
+            _ => None,
         };
         let log = EventLog::new_owned(
             self.engine.stores.events.as_ref(),
             session_id.clone(),
             token.clone(),
         );
+        // Recover a crash after the turn WAL was inserted but before its
+        // initiating message reached the transcript. This must happen before
+        // the transcript is loaded for the resumed model request.
+        for event in leveler_engine::reap_running_turns_owned(
+            self.engine.stores.turns.as_ref(),
+            self.engine.stores.messages.as_ref(),
+            self.engine.stores.terminal.as_ref(),
+            &token,
+            Some(session_id),
+        )
+        .await?
+        {
+            observer(event);
+        }
+        let raw = self
+            .load_request_transcript(session_id, Some("transcript"), checkpoint_scope.as_ref())
+            .await?;
+        if raw.is_empty() {
+            let result = Err(EngineError::Config(format!(
+                "session {session_id} has no transcript to resume; \
+                 for interactive chat reopen with: leveler tui --session {session_id}"
+            )));
+            self.finish_from_result(
+                &token,
+                session_id,
+                &result,
+                None,
+                Some(&spec.coding.repository),
+                observer,
+                &cancellation,
+            )
+            .await?;
+            return result;
+        }
+        // Resume rebinds the goal by IDENTITY: the task's running goal is the
+        // logical task being continued, regardless of how the continuation
+        // message is phrased. `spec.runtime.goal` is only the fallback for a
+        // session that lost its goal row.
+        let goal = if matches!(lineage.kind, ResumeTurnKind::Goal) {
+            let lineage_goal = lineage.goal_id.as_ref().ok_or_else(|| {
+                EngineError::Corrupt("goal continuation has no durable goal id".into())
+            })?;
+            match self.resume_goal(&token, lineage_goal).await {
+                Ok(goal) => Some(goal),
+                Err(error) => {
+                    let result = Err(error);
+                    self.finish_from_result(
+                        &token,
+                        session_id,
+                        &result,
+                        None,
+                        Some(&spec.coding.repository),
+                        observer,
+                        &cancellation,
+                    )
+                    .await?;
+                    return result;
+                }
+            }
+        } else {
+            None
+        };
         // Long-goal P3: a valid durable checkpoint replaces the replayed old
         // context — resume receives the checkpoint block plus exactly the
         // transcript after its watermark. No usable checkpoint (none written,
@@ -1489,7 +1853,8 @@ impl CodingRuntime {
                 &log,
                 session_id,
                 raw,
-                Some(spec.runtime.goal.as_str()),
+                Some(lineage.objective.text()),
+                checkpoint_scope.as_ref(),
                 Some(&GitWorkspace::new(&spec.coding.repository)),
                 &self.context_summarizer(&cancellation),
                 &cancellation,
@@ -1520,6 +1885,7 @@ impl CodingRuntime {
                 spec,
                 prior,
                 instruction,
+                lineage,
                 observer,
                 cancellation,
             )
@@ -1533,7 +1899,7 @@ impl CodingRuntime {
             &token,
             session_id,
             &result,
-            Some(&goal),
+            goal.as_ref(),
             Some(&spec.coding.repository),
             observer,
             &terminal_cancellation,
@@ -1687,25 +2053,40 @@ impl CodingRuntime {
         spec: &TaskSpec,
         prior: Vec<leveler_model::Message>,
         instruction: Option<leveler_model::Message>,
+        lineage: ResumeLineage,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         // A continuation message is this turn's persisted user input; without
         // one (headless resume) the turn carries no new initiating message and
         // the engine records it as a pure resume.
-        let (kind, start) = match &instruction {
-            Some(message) => (
-                TurnKind::User,
-                leveler_engine::TurnStart::Fresh(message.clone()),
-            ),
-            None => (TurnKind::User, leveler_engine::TurnStart::Resume),
+        let kind = match lineage.kind {
+            ResumeTurnKind::Chat => TurnKind::Chat,
+            ResumeTurnKind::Goal => TurnKind::User,
+        };
+        let start = leveler_engine::TurnStart::Continue {
+            message: instruction.clone(),
+            objective: lineage.objective.clone(),
+            root_turn_id: lineage.root_turn_id.clone(),
+            goal_id: lineage.goal_id.clone(),
+        };
+        let profile = match lineage.kind {
+            ResumeTurnKind::Chat => chat_profile(spec),
+            ResumeTurnKind::Goal => goal_profile(spec),
         };
         let recorded = runner
             .run_turn(kind, start, observer, cancellation.clone(), |ports| {
                 drive_turn(
                     &self.factory,
-                    goal_profile(spec),
-                    TurnInput::Resume { prior, instruction },
+                    profile,
+                    TurnInput::Resume {
+                        prior,
+                        instruction,
+                        objective: lineage.objective,
+                        lineage_turn_ids: lineage.turn_ids,
+                        root_turn_id: lineage.root_turn_id,
+                        goal_id: lineage.goal_id,
+                    },
                     true,
                     runner.session_id.clone(),
                     self.engine.stores.events.clone(),
@@ -1744,6 +2125,7 @@ impl CodingRuntime {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
+        goal_id: &leveler_core::GoalId,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -1788,6 +2170,7 @@ impl CodingRuntime {
                     log,
                     runner,
                     spec,
+                    goal_id,
                     coding_task(&goal, &work_order),
                     // Develop owns its own Review stage; the closure reviewer
                     // would read the same diff a second time on the same bill.
@@ -1951,6 +2334,7 @@ impl CodingRuntime {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
+        goal_id: &leveler_core::GoalId,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -1958,6 +2342,7 @@ impl CodingRuntime {
             log,
             runner,
             spec,
+            goal_id,
             spec.runtime.goal.clone(),
             self.factory.independent_review,
             observer,
@@ -1978,6 +2363,7 @@ impl CodingRuntime {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
+        goal_id: &leveler_core::GoalId,
         task: String,
         review_policy: IndependentReviewPolicy,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
@@ -1989,6 +2375,7 @@ impl CodingRuntime {
             .bounded_session_history(
                 log,
                 &runner.session_id,
+                goal_id,
                 &task,
                 Some(&spec.coding.repository),
                 &cancellation,
@@ -1999,14 +2386,22 @@ impl CodingRuntime {
         let recorded = runner
             .run_turn(
                 TurnKind::User,
-                leveler_engine::TurnStart::Fresh(Message::text(Role::User, task.clone())),
+                leveler_engine::TurnStart::Anchored {
+                    message: Message::text(Role::User, task.clone()),
+                    objective: leveler_lifecycle::ObjectiveAnchor::from_session_goal(task.clone()),
+                    goal_id: Some(goal_id.clone()),
+                },
                 observer,
                 cancellation.clone(),
                 |ports| {
                     drive_turn(
                         &self.factory,
                         goal_profile(spec),
-                        TurnInput::Goal { goal: task, prior },
+                        TurnInput::Goal {
+                            goal: task,
+                            prior,
+                            goal_id: goal_id.clone(),
+                        },
                         prior_epoch_open,
                         runner.session_id.clone(),
                         self.engine.stores.events.clone(),
@@ -2041,13 +2436,22 @@ impl CodingRuntime {
         &self,
         log: &EventLog<'_>,
         session_id: &SessionId,
+        goal_id: &leveler_core::GoalId,
         goal: &str,
         repo: Option<&std::path::Path>,
         cancellation: &CancellationToken,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
         const GOAL_HISTORY_MAX: usize = 24;
-        let raw = self.load_request_transcript(session_id, None).await?;
+        let scope = crate::coding::checkpoint::latest_goal_checkpoint_scope(
+            &self.engine.stores,
+            session_id,
+            goal_id,
+        )
+        .await?;
+        let raw = self
+            .load_request_transcript(session_id, Some("transcript"), scope.as_ref())
+            .await?;
         if raw.is_empty() {
             return Ok(Vec::new());
         }
@@ -2055,19 +2459,21 @@ impl CodingRuntime {
         // session's history actually grows — over the fold threshold it
         // continues from a durable checkpoint (fresh or cut here) instead of
         // a blunt last-N tail of replayed history.
-        if let Some(prior) = self
-            .checkpointed_prior(
-                log,
-                session_id,
-                &raw,
-                repo.map(GitWorkspace::new)
-                    .as_ref()
-                    .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
-                &self.context_summarizer(cancellation),
-                cancellation,
-                observer,
-            )
-            .await?
+        if let Some(scope) = scope.as_ref()
+            && let Some(prior) = self
+                .checkpointed_prior(
+                    log,
+                    session_id,
+                    &raw,
+                    repo.map(GitWorkspace::new)
+                        .as_ref()
+                        .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
+                    &self.context_summarizer(cancellation),
+                    cancellation,
+                    observer,
+                    scope,
+                )
+                .await?
         {
             return Ok(prior);
         }
@@ -3468,5 +3874,80 @@ mod seed_tests {
 
         report.modified_files.clear();
         assert_eq!(task_terminal_stop(&report), StopReason::Answered);
+    }
+}
+
+#[cfg(test)]
+mod continuation_lineage_tests {
+    use super::*;
+
+    fn turn(id: &str, session: &str, ordinal: i64, kind: &str) -> leveler_storage::TurnRecord {
+        leveler_storage::TurnRecord {
+            id: id.into(),
+            session_id: session.into(),
+            ordinal,
+            kind: kind.into(),
+            payload: None,
+            status: "failed".into(),
+            created_at: leveler_core::now().to_rfc3339(),
+            finished_at: None,
+            owner_boot_id: None,
+        }
+    }
+
+    #[test]
+    fn continuation_root_must_be_same_session_earlier_and_same_kind() {
+        let root = turn("root", "session-a", 1, "chat");
+        let continuation = turn("next", "session-a", 2, "chat");
+        assert!(continuation_root_is_valid(
+            std::slice::from_ref(&root),
+            &continuation,
+            &TurnId::new("root")
+        ));
+
+        let cross_session = turn("root", "session-b", 1, "chat");
+        assert!(!continuation_root_is_valid(
+            &[cross_session],
+            &continuation,
+            &TurnId::new("root")
+        ));
+        let wrong_kind = turn("root", "session-a", 1, "user");
+        assert!(!continuation_root_is_valid(
+            &[wrong_kind],
+            &continuation,
+            &TurnId::new("root")
+        ));
+        let future = turn("root", "session-a", 3, "chat");
+        assert!(!continuation_root_is_valid(
+            &[future],
+            &continuation,
+            &TurnId::new("root")
+        ));
+        let self_root = turn("next", "session-a", 2, "chat");
+        assert!(!continuation_root_is_valid(
+            &[self_root],
+            &continuation,
+            &TurnId::new("next")
+        ));
+    }
+
+    #[test]
+    fn only_bare_legacy_continue_commands_backtrack() {
+        assert!(is_bare_legacy_continuation(&Message::text(
+            Role::User,
+            "继续"
+        )));
+        assert!(is_bare_legacy_continuation(&Message::text(
+            Role::User,
+            "continue"
+        )));
+        assert!(!is_bare_legacy_continuation(&Message::text(
+            Role::User,
+            "继续开发新功能"
+        )));
+        assert!(!is_bare_legacy_continuation(&Message::text(
+            Role::User,
+            "Continue implementing feature X"
+        )));
     }
 }

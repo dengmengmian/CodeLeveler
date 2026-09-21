@@ -1,19 +1,24 @@
-# CodeLeveler 1.0.3
+# CodeLeveler 1.0.4
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-A focused TUI usability release on top of 1.0.2. Installed stable builds pick it up automatically, or run `leveler update` / `/update`.
+A correctness-focused patch release for task continuation and durable memory. Installed stable builds pick it up automatically, or run `leveler update` / `/update`.
 
 ## Changed
 
-- Successful `wait_task` and `get_task` polling no longer adds repeated rows to Conversation; the background task remains represented once by its command row, footer and detail view
-- Background command status now reads “running in background” / “后台运行” to describe the live state directly
+- Resumed work now keeps an explicit objective anchor, root turn and goal identity, so later instructions amend the same lineage instead of being mistaken for unrelated work
+- Durable-looking memory candidates wait for confirmation, while explicit `remember` commands still save immediately
+- A later explicit preference that conflicts with the same remembered subject supersedes the old value and reports that the stale memory was updated
+- Routine memory recall is shown once in Conversation instead of being duplicated as both a transcript note and a toast
 
 ## Fixed
 
-- Failed background task waits remain visible with their task details instead of being hidden with successful scheduling polls
-- Replayed sessions use the same background polling visibility rules as live sessions without dropping durable tool-call history
-- Self-update now validates both legacy and current `--version` output formats, rejects failed version probes, and lets older installations accept the rebuilt v1.0.3 binary
+- Goal checkpoints are scoped to their exact continuation lineage and cannot be consumed by unrelated chats or goals
+- Restart recovery and explicit continuation preserve the authoritative goal identity, including reopening the exact settled goal when needed
+- Repeated pending candidates for the same memory subject keep only the latest value; corrections also supersede compatible keyless direct memories from older builds, and retries cannot restore stale preferences out of order
+- API keys, tokens, passwords and other credential-shaped values are rejected at the memory write boundary
+- Sensitive entries left by older versions are hidden from automatic recall and from every model-facing memory action, including list, read, lexical search and vector search
+- Memory consolidation only considers fresh user-authored turns, avoiding replay or internal-turn candidates
 
 ## Known limits
 

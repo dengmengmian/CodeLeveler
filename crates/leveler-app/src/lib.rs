@@ -1040,6 +1040,16 @@ impl Application {
         let Ok(store) = leveler_memory::MemoryStore::open(&memory_dir) else {
             return Vec::new();
         };
+        // A deterministic correction of an existing identity is applied by
+        // the executor and reported as `MemoryChanged::superseded`. Do not
+        // first tell the user it is waiting for confirmation.
+        if let Some(candidate) = leveler_memory::parse_durable_fact(user_text)
+            && let Some(key) = candidate.key.as_deref()
+            && let Ok(Some(active)) = store.find_active_by_key(key)
+            && active.body.trim() != candidate.body.trim()
+        {
+            return Vec::new();
+        }
         match leveler_memory::collect_turn_candidates(
             &store,
             user_text,

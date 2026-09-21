@@ -43,8 +43,9 @@ pub use reaper::{
 pub use recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 pub use session_context::{ContextSummarizer, RawTranscript, SessionContext};
 pub use turn::{
-    MAX_CHILD_RESUMES, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome, TurnRunner,
-    TurnSink, TurnStart, decode_turn_initiating_message, storage_model_request,
+    MAX_CHILD_RESUMES, TurnContinuation, TurnFacts, TurnFailure, TurnPorts, TurnRecordedOutcome,
+    TurnRunner, TurnSink, TurnStart, decode_turn_continuation, decode_turn_initiating_message,
+    storage_model_request,
 };
 
 /// Engine-level errors. Persistence and replay failures are hard errors —

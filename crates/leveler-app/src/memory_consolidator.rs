@@ -10,7 +10,9 @@ use leveler_agent::{
     validate_batch_candidates,
 };
 use leveler_core::{BootId, BootLiveness};
-use leveler_memory::{AppliedOperation, MemoryCandidate, MemoryStore};
+use leveler_memory::{
+    AdmitOutcome, AppliedOperation, MemoryCandidate, MemoryStore, ProposeOutcome,
+};
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_storage::{Database, MemoryInboxItem, MemoryInboxReadyState, MemoryInboxRepository};
 use tokio::sync::{Notify, Semaphore};
@@ -385,9 +387,9 @@ impl MemoryConsolidator {
                 .chars()
                 .take(MAX_EXTRACTOR_INPUT_CHARS)
                 .collect();
-            // The main turn may already have committed this exact deterministic
-            // candidate. Stage the same value for idempotent replay; if the
-            // process crashed before the fast path ran, the worker completes it.
+            // Deterministic durable wording avoids a model call, but is still
+            // only a candidate. Only an explicit memory command may write
+            // active memory without a separate accept decision.
             if let Some(candidate) = leveler_memory::parse_durable_fact(&user_text) {
                 staged[index].accepted.push(candidate);
                 continue;
@@ -491,7 +493,7 @@ impl MemoryConsolidator {
                 let candidate = result.accepted[result.applied].clone();
                 let authority = candidate.authority.as_str().to_string();
                 let outcome = store
-                    .commit_candidate(&candidate)
+                    .admit_candidate(candidate)
                     .map_err(|e| e.to_string())?;
                 result.applied += 1;
                 let result_json = serde_json::to_string(result).map_err(|e| e.to_string())?;
@@ -503,18 +505,27 @@ impl MemoryConsolidator {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                if let Some(entry) = outcome.entry {
-                    let operation = match outcome.operation {
-                        AppliedOperation::Created => "created",
-                        AppliedOperation::Superseded => "superseded",
-                        AppliedOperation::Merged => "merged",
-                        AppliedOperation::Skipped => continue,
-                    };
+                let event = match outcome {
+                    AdmitOutcome::Proposed(ProposeOutcome::Pending(entry)) => {
+                        Some(("proposed", entry.id, entry.title))
+                    }
+                    AdmitOutcome::Corrected(outcome) => outcome.entry.and_then(|entry| {
+                        let operation = match outcome.operation {
+                            AppliedOperation::Created => "created",
+                            AppliedOperation::Superseded => "superseded",
+                            AppliedOperation::Merged => "merged",
+                            AppliedOperation::Skipped => return None,
+                        };
+                        Some((operation, entry.id, entry.title))
+                    }),
+                    AdmitOutcome::Proposed(_) => None,
+                };
+                if let Some((operation, id, title)) = event {
                     (self.event_sink)(MemoryConsolidationEvent {
                         session_id: item.session_id.clone(),
                         operation: operation.to_string(),
-                        id: entry.id,
-                        title: entry.title,
+                        id,
+                        title,
                         authority: authority.clone(),
                     });
                 }
@@ -627,6 +638,8 @@ mod tests {
 
     struct OneCandidateExtractor;
 
+    struct BackgroundCorrectionExtractor;
+
     struct ScriptedRuntime {
         calls: AtomicUsize,
         replies: Mutex<VecDeque<Result<String, ModelError>>>,
@@ -737,6 +750,38 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SemanticExtractor for BackgroundCorrectionExtractor {
+        async fn extract(
+            &self,
+            _: &str,
+            _: &CancellationToken,
+        ) -> Result<Vec<SemanticCandidate>, ExtractionError> {
+            unreachable!()
+        }
+
+        async fn extract_batch(
+            &self,
+            turns: &[BatchSourceTurn],
+            _: &CancellationToken,
+        ) -> Result<Vec<BatchSemanticCandidate>, ExtractionError> {
+            Ok(vec![BatchSemanticCandidate {
+                source_turn_id: turns[0].source_turn_id.clone(),
+                candidate: SemanticCandidate {
+                    fact: "以后不要后台启动服务".to_string(),
+                    subject: "service.background_start".to_string(),
+                    value: Some("disabled".to_string()),
+                    scope: CandidateScope::Project,
+                    durability: CandidateDurability::Durable,
+                    authority: MemoryAuthority::ExplicitUser,
+                    operation_hint: OperationHint::Update,
+                    evidence_span: "以后不要后台启动服务了".to_string(),
+                    confidence: Some(1.0),
+                },
+            }])
+        }
+    }
+
     fn envelope(
         turn: &BatchSourceTurn,
         fact: &str,
@@ -802,7 +847,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_output_is_committed_in_durable_inbox_order() {
+    async fn model_output_is_proposed_in_durable_inbox_order() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_messages(
@@ -833,12 +878,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.accepted, 2);
-        let active = MemoryStore::open(temp.path().join("memory"))
-            .unwrap()
-            .list_active()
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        assert!(store.list_active().unwrap().is_empty());
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "项目默认模型是 Flash");
+    }
+
+    #[tokio::test]
+    async fn semantic_correction_supersedes_a_keyless_direct_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(&db, ["以后不要后台启动服务了".to_string()]).await;
+        let boot = BootId::generate();
+        let items = MemoryInboxRepository::new(&db)
+            .claim_batch(&boot, leveler_core::now(), 1)
+            .await
             .unwrap();
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        let old_id = store
+            .activate(
+                "以后后台启动服务",
+                "以后后台启动服务",
+                leveler_memory::MemoryKind::Preference,
+                Vec::new(),
+            )
+            .unwrap()
+            .id;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let worker = MemoryConsolidator::new(
+            db,
+            boot,
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            Arc::new(UnusedRuntime),
+            Arc::new(move |event| captured.lock().unwrap().push(event)),
+        );
+
+        worker
+            .process_claimed(&items, &BackgroundCorrectionExtractor)
+            .await
+            .unwrap();
+
+        assert!(store.list_pending().unwrap().is_empty());
+        let active = store.effective_active().unwrap();
         assert_eq!(active.len(), 1);
-        assert_eq!(active[0].body, "项目默认模型是 Flash");
+        assert_eq!(active[0].body, "以后不要后台启动服务");
+        let history = store.list_archived().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, old_id);
+        assert!(
+            store
+                .search("后台启动服务", 10)
+                .unwrap()
+                .into_iter()
+                .all(|(entry, _)| entry.id != old_id)
+        );
+        assert!(events.lock().unwrap().iter().any(|event| {
+            event.operation == "superseded" && event.title.contains("不要后台启动")
+        }));
     }
 
     #[test]
@@ -1001,14 +1100,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_path_fact_replayed_by_background_is_skipped_without_duplicate_event() {
+    async fn deterministic_fact_is_proposed_without_a_model_call() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         let statement = "以后本项目默认模型固定为 Pro";
         let turn_ids = admitted_messages(&db, [statement.to_string()]).await;
         let store = MemoryStore::open(temp.path().join("memory")).unwrap();
-        let fast_path = leveler_memory::parse_durable_fact(statement).unwrap();
-        store.commit_candidate(&fast_path).unwrap();
         let raw = serde_json::json!({"candidates": [{
             "source_turn_id": turn_ids[0].0.clone(),
             "candidate": {
@@ -1038,11 +1135,18 @@ mod tests {
 
         worker.run_once().await.unwrap();
 
-        assert_eq!(store.effective_active().unwrap().len(), 1);
+        assert!(store.effective_active().unwrap().is_empty());
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].body.contains("Pro"));
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
         assert!(
-            events.lock().unwrap().is_empty(),
-            "Skip emits no second change event"
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.operation == "proposed"),
+            "the bridge needs a distinct pending-candidate signal"
         );
     }
 
@@ -1188,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_after_commit_replays_without_duplicate_active_memory() {
+    async fn crash_after_propose_replays_without_duplicate_pending_memory() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_turns(&db, 1).await;
@@ -1240,16 +1344,15 @@ mod tests {
         second.run_once().await.unwrap();
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
 
-        let active = MemoryStore::open(temp.path().join("memory"))
-            .unwrap()
-            .list_active()
-            .unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].body, "turn 0");
+        let store = MemoryStore::open(temp.path().join("memory")).unwrap();
+        assert!(store.list_active().unwrap().is_empty());
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "turn 0");
     }
 
     #[tokio::test]
-    async fn staged_apply_cursor_resumes_same_key_updates_without_rolling_back() {
+    async fn staged_apply_cursor_resumes_same_key_updates_as_latest_pending() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::connect_in_memory().await.unwrap();
         admitted_turns(&db, 1).await;
@@ -1261,7 +1364,7 @@ mod tests {
         let pro = leveler_memory::parse_durable_fact("以后本项目默认模型固定为 Pro").unwrap();
         let flash = leveler_memory::parse_durable_fact("以后本项目默认模型改成 Flash").unwrap();
         let store = MemoryStore::open(temp.path().join("memory")).unwrap();
-        store.commit_candidate(&pro).unwrap();
+        store.propose(pro.clone()).unwrap();
         let staged = StagedTurnResult {
             accepted: vec![pro, flash],
             rejected: 0,
@@ -1296,9 +1399,10 @@ mod tests {
         worker.run_once().await.unwrap();
 
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
-        let active = store.effective_active().unwrap();
-        assert_eq!(active.len(), 1);
-        assert!(active[0].body.contains("Flash"));
-        assert_eq!(store.list_archived().unwrap().len(), 1);
+        assert!(store.effective_active().unwrap().is_empty());
+        let pending = store.list_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].body.contains("Flash"));
+        assert!(store.list_archived().unwrap().is_empty());
     }
 }

@@ -237,9 +237,6 @@ fn memory_change_event(
     }
 }
 
-/// The change event for a commit that actually changed current truth. A commit
-/// that created nothing (identical, merge-covered, or refused) emits nothing:
-/// the UI shows what happened, and nothing is not an event.
 fn applied_event(outcome: &leveler_memory::CommitOutcome) -> Option<AgentEvent> {
     let entry = outcome.entry.as_ref()?;
     let operation = match outcome.operation {
@@ -2139,12 +2136,10 @@ impl Executor {
     /// Run the durable-memory lifecycle for this turn's user request, returning
     /// the structured change events a client should see.
     ///
-    /// This is the AUTONOMOUS path. It never touches the model-facing `remember`
-    /// tool and never asks a second time for a rule the user just stated: a
-    /// candidate is only produced when the user's own sentence is an explicit
-    /// directive, and that sentence is the authorization. Everything weaker
-    /// (model inference, vague observation) is refused by the decision layer and
-    /// stays out of active memory.
+    /// Only a narrow `记住：…` / `remember: …` command writes directly: the
+    /// command itself is consent. A sentence that merely looks durable (for
+    /// example, "以后本项目默认用 X") is parked as a pending candidate and
+    /// cannot enter active memory until the user accepts it.
     ///
     /// Failure is never fatal to the coding turn: a memory store that cannot be
     /// written is reported at debug level and the turn proceeds.
@@ -2179,16 +2174,41 @@ impl Executor {
             }
             Err(error) => tracing::debug!(error = %error, "memory expiry sweep failed"),
         }
-        let Some(candidate) = leveler_memory::parse_durable_fact(request) else {
-            return events;
-        };
-        match store.commit_candidate(&candidate) {
-            Ok(outcome) => {
-                if let Some(event) = applied_event(&outcome) {
-                    events.push(event);
+        if let Some(body) = leveler_memory::parse_direct_memory_command(request) {
+            if let Some(candidate) = leveler_memory::parse_durable_fact(&body) {
+                match store.commit_candidate(&candidate) {
+                    Ok(outcome) => {
+                        if let Some(event) = applied_event(&outcome) {
+                            events.push(event);
+                        }
+                    }
+                    Err(error) => tracing::debug!(error = %error, "direct memory write failed"),
+                }
+            } else {
+                let title = leveler_memory::title_from_body(&body);
+                match store.activate(
+                    &title,
+                    &body,
+                    leveler_memory::MemoryKind::Preference,
+                    Vec::new(),
+                ) {
+                    Ok(entry) => events.push(memory_change_event(
+                        leveler_memory::MemoryLifecycleOp::Created,
+                        &entry,
+                    )),
+                    Err(error) => tracing::debug!(error = %error, "direct memory write failed"),
                 }
             }
-            Err(error) => tracing::debug!(error = %error, "memory commit failed"),
+        } else if let Some(candidate) = leveler_memory::parse_durable_fact(request) {
+            match store.admit_candidate(candidate) {
+                Ok(leveler_memory::AdmitOutcome::Corrected(outcome)) => {
+                    if let Some(event) = applied_event(&outcome) {
+                        events.push(event);
+                    }
+                }
+                Ok(leveler_memory::AdmitOutcome::Proposed(_)) => {}
+                Err(error) => tracing::debug!(error = %error, "memory admission failed"),
+            }
         }
         events
     }

@@ -442,7 +442,8 @@ mod tests {
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "leveler-skills-{tag}-{}",
+            "leveler-skills-{tag}-{}-{}",
+            std::process::id(),
             super::super::test_ordinal()
         ));
         std::fs::create_dir_all(&dir).unwrap();

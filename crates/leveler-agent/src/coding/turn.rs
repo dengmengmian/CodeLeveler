@@ -14,7 +14,7 @@ use leveler_engine::{
     EngineError, EngineEvent, LostChild, LostChildNote, LostChildVoice, TranscriptSink, TurnFacts,
     TurnFailure, TurnPorts,
 };
-use leveler_lifecycle::{EvidenceLedger, PlanState, ProgressLedger};
+use leveler_lifecycle::{EvidenceLedger, ObjectiveAnchor, PlanState, ProgressLedger};
 use leveler_model::{ContentPart, Message, Role};
 use leveler_storage::EventStore;
 
@@ -27,7 +27,11 @@ use crate::{AgentError, AgentEvent, AgentOutcome, DriveAborted, Executor};
 pub enum TurnInput {
     /// A fresh goal (seeds system + user messages). Optional `prior` is the
     /// bounded session history so multi-turn Goal can refer to earlier turns.
-    Goal { goal: String, prior: Vec<Message> },
+    Goal {
+        goal: String,
+        prior: Vec<Message>,
+        goal_id: leveler_core::GoalId,
+    },
     /// A resumed transcript (drive continues mid-conversation).
     ///
     /// `instruction` is the continuation message the user just sent (a bare
@@ -38,6 +42,14 @@ pub enum TurnInput {
     Resume {
         prior: Vec<Message>,
         instruction: Option<Message>,
+        /// Host-resolved from the interrupted turn payload. Context assembly
+        /// and the executor consume this same value.
+        objective: ObjectiveAnchor,
+        /// Root plus every persisted continuation turn in this lineage. State
+        /// seeds must never escape this set into an older session epoch.
+        lineage_turn_ids: Vec<leveler_core::TurnId>,
+        root_turn_id: leveler_core::TurnId,
+        goal_id: Option<leveler_core::GoalId>,
     },
     /// A conversational turn: prior transcript + new content parts.
     Content {
@@ -57,6 +69,22 @@ pub(crate) fn content_text(content: &[ContentPart]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Durable objective text for multimodal user input. Images are represented
+/// without persisting base64 bytes or remote URLs into prompt-facing text.
+pub(crate) fn content_objective_text(content: &[ContentPart]) -> String {
+    let text = content_text(content);
+    let images = content
+        .iter()
+        .filter(|part| matches!(part, ContentPart::Image { .. }))
+        .count();
+    match (text.trim().is_empty(), images) {
+        (false, 0) => text,
+        (false, count) => format!("{text}\n[{count} image attachment(s)]"),
+        (true, count) if count > 0 => format!("[{count} image attachment(s)]"),
+        _ => "[non-text user request]".to_string(),
+    }
 }
 
 /// Build the turn's executor, run it, and report the facts the engine records.
@@ -79,6 +107,12 @@ pub async fn drive_turn(
     // progress and running children, but a terminal historical Plan must not
     // become active merely because its final declaration retained open rows.
     let resumes_task_epoch = matches!(&input, TurnInput::Resume { .. });
+    let seed_scope = match &input {
+        TurnInput::Resume {
+            lineage_turn_ids, ..
+        } => Some(lineage_turn_ids.as_slice()),
+        _ => None,
+    };
     let TurnPorts {
         turn_id,
         emitter,
@@ -91,10 +125,33 @@ pub async fn drive_turn(
         approver,
         clarifier,
     } = ports;
-    let _ = turn_id;
+    let checkpoint_scope = match &input {
+        TurnInput::Goal { goal_id, .. } => {
+            Some(crate::coding::checkpoint::GoalCheckpointScope::new(
+                goal_id.clone(),
+                turn_id.clone(),
+                vec![turn_id.clone()],
+            ))
+        }
+        TurnInput::Resume {
+            root_turn_id,
+            lineage_turn_ids,
+            goal_id: Some(goal_id),
+            ..
+        } => {
+            let mut turn_ids = lineage_turn_ids.clone();
+            turn_ids.push(turn_id.clone());
+            Some(crate::coding::checkpoint::GoalCheckpointScope::new(
+                goal_id.clone(),
+                root_turn_id.clone(),
+                turn_ids,
+            ))
+        }
+        _ => None,
+    };
     let seeds = if seed_task_state {
         Some(
-            load_coding_seeds(events.as_ref(), &session_id)
+            load_coding_seeds(events.as_ref(), &session_id, seed_scope)
                 .await
                 .map_err(seed_failure)?,
         )
@@ -134,10 +191,11 @@ pub async fn drive_turn(
         // child executors.
         .with_execution_fence(fence);
 
-    if let Some(context) = checkpoint_context {
+    if let (Some(context), Some(scope)) = (checkpoint_context, checkpoint_scope) {
         executor = executor.with_compaction_checkpoint(Arc::new(CodingCompactionCheckpoint::new(
             context.engine,
             session_id.clone(),
+            scope,
             context.workspace,
             emitter.clone(),
         )));
@@ -211,7 +269,11 @@ pub async fn drive_turn(
         emitter.emit(event);
     };
     let result = match input {
-        TurnInput::Goal { goal, prior } => {
+        TurnInput::Goal {
+            goal,
+            prior,
+            goal_id: _,
+        } => {
             let objective = leveler_lifecycle::ObjectiveAnchor::from_session_goal(goal.as_str());
             if prior.is_empty() {
                 executor
@@ -236,6 +298,10 @@ pub async fn drive_turn(
         TurnInput::Resume {
             mut prior,
             instruction,
+            objective,
+            lineage_turn_ids: _,
+            root_turn_id: _,
+            goal_id: _,
         } => {
             // Persist the continuation message before running: it is this
             // turn's user input, and the transcript must match what the user
@@ -263,11 +329,12 @@ pub async fn drive_turn(
                 ));
             }
             executor
+                .with_objective(objective)
                 .resume_tracked(prior, &mut forward, &mut sink, cancellation.clone())
                 .await
         }
         TurnInput::Content { prior, content } => {
-            let text = content_text(&content);
+            let text = content_objective_text(&content);
             let objective = if is_goal_profile {
                 leveler_lifecycle::ObjectiveAnchor::from_session_goal(text)
             } else {
@@ -308,11 +375,12 @@ struct CodingTurnSeeds {
 async fn load_coding_seeds(
     events: &dyn EventStore,
     session_id: &SessionId,
+    turn_ids: Option<&[leveler_core::TurnId]>,
 ) -> Result<CodingTurnSeeds, EngineError> {
     Ok(CodingTurnSeeds {
-        plan: last_persisted_plan(events, session_id).await?,
-        ledger: last_persisted_ledger(events, session_id).await?,
-        progress: last_persisted_progress(events, session_id).await?,
+        plan: persisted_plan(events, session_id, turn_ids).await?,
+        ledger: persisted_ledger(events, session_id, turn_ids).await?,
+        progress: persisted_progress(events, session_id, turn_ids).await?,
     })
 }
 
@@ -334,11 +402,30 @@ async fn last_event_of_type(
     events: &dyn EventStore,
     session_id: &SessionId,
     event_type: &str,
+    turn_ids: Option<&[leveler_core::TurnId]>,
 ) -> Result<Option<EngineEvent>, EngineError> {
-    match events
-        .load_last_by_type(session_id, event_type, None)
-        .await?
-    {
+    let row = if let Some(turn_ids) = turn_ids {
+        let mut newest = None;
+        for turn_id in turn_ids {
+            if let Some(candidate) = events
+                .load_last_by_type(session_id, event_type, Some(turn_id))
+                .await?
+                && newest
+                    .as_ref()
+                    .is_none_or(|row: &leveler_storage::EventRecord| {
+                        candidate.sequence > row.sequence
+                    })
+            {
+                newest = Some(candidate);
+            }
+        }
+        newest
+    } else {
+        events
+            .load_last_by_type(session_id, event_type, None)
+            .await?
+    };
+    match row {
         Some(row) => Ok(Some(EngineEvent::from_payload(&row.payload)?)),
         None => Ok(None),
     }
@@ -349,7 +436,20 @@ pub(crate) async fn last_persisted_plan(
     session_id: &SessionId,
 ) -> Result<Option<PlanState>, EngineError> {
     Ok(
-        match last_event_of_type(events, session_id, "plan_updated").await? {
+        match last_event_of_type(events, session_id, "plan_updated", None).await? {
+            Some(EngineEvent::PlanUpdated { steps }) => Some(PlanState { steps }),
+            _ => None,
+        },
+    )
+}
+
+async fn persisted_plan(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    turn_ids: Option<&[leveler_core::TurnId]>,
+) -> Result<Option<PlanState>, EngineError> {
+    Ok(
+        match last_event_of_type(events, session_id, "plan_updated", turn_ids).await? {
             Some(EngineEvent::PlanUpdated { steps }) => Some(PlanState { steps }),
             _ => None,
         },
@@ -361,7 +461,20 @@ pub(crate) async fn last_persisted_ledger(
     session_id: &SessionId,
 ) -> Result<Option<EvidenceLedger>, EngineError> {
     Ok(
-        match last_event_of_type(events, session_id, "evidence_ledger_updated").await? {
+        match last_event_of_type(events, session_id, "evidence_ledger_updated", None).await? {
+            Some(EngineEvent::EvidenceLedgerUpdated { ledger }) => Some(ledger),
+            _ => None,
+        },
+    )
+}
+
+async fn persisted_ledger(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    turn_ids: Option<&[leveler_core::TurnId]>,
+) -> Result<Option<EvidenceLedger>, EngineError> {
+    Ok(
+        match last_event_of_type(events, session_id, "evidence_ledger_updated", turn_ids).await? {
             Some(EngineEvent::EvidenceLedgerUpdated { ledger }) => Some(ledger),
             _ => None,
         },
@@ -373,7 +486,20 @@ pub(crate) async fn last_persisted_progress(
     session_id: &SessionId,
 ) -> Result<Option<ProgressLedger>, EngineError> {
     Ok(
-        match last_event_of_type(events, session_id, "progress_updated").await? {
+        match last_event_of_type(events, session_id, "progress_updated", None).await? {
+            Some(EngineEvent::ProgressUpdated { ledger }) => Some(ledger),
+            _ => None,
+        },
+    )
+}
+
+async fn persisted_progress(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    turn_ids: Option<&[leveler_core::TurnId]>,
+) -> Result<Option<ProgressLedger>, EngineError> {
+    Ok(
+        match last_event_of_type(events, session_id, "progress_updated", turn_ids).await? {
             Some(EngineEvent::ProgressUpdated { ledger }) => Some(ledger),
             _ => None,
         },

@@ -3943,7 +3943,7 @@ fn memory_list_event_pushes_multiline_transcript_note() {
 }
 
 #[test]
-fn memory_recalled_event_pushes_a_note_and_a_short_toast() {
+fn memory_recalled_event_pushes_an_auditable_note_without_a_toast() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -3964,8 +3964,10 @@ fn memory_recalled_event_pushes_a_note_and_a_short_toast() {
     // Structured: the count is rendered, not a parsed log line.
     assert!(note.contains('2'), "{note}");
     assert!(note.contains("Memory"), "{note}");
-    let toast = s.notification.as_ref().expect("short toast");
-    assert!(toast.message.contains('2'), "{}", toast.message);
+    assert!(
+        s.notification.is_none(),
+        "routine recall must not duplicate the transcript note as a toast"
+    );
 }
 
 #[test]
@@ -3988,7 +3990,7 @@ fn memory_recalled_zero_is_silent() {
 }
 
 #[test]
-fn memory_changed_event_renders_the_structured_operation() {
+fn memory_superseded_event_explains_the_conflict_and_update() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -4008,7 +4010,10 @@ fn memory_changed_event_renders_the_structured_operation() {
             _ => None,
         })
         .expect("MemoryChanged must push a note");
-    assert_eq!(note, "● Memory · 已更新 · 发布探针代号：BLUE-4821");
+    assert_eq!(
+        note,
+        "● Memory · 与已有记忆冲突，已更新 · 发布探针代号：BLUE-4821"
+    );
     assert!(note.contains("BLUE-4821"), "{note}");
     assert!(
         !note.contains("k-probe"),
@@ -4019,6 +4024,68 @@ fn memory_changed_event_renders_the_structured_operation() {
         "internal authority stays in memory management: {note}"
     );
     assert!(!note.contains("updated · updated"), "{note}");
+    let toast = s
+        .notification
+        .as_ref()
+        .expect("persistent memory changes must remain visible as a toast");
+    assert_eq!(toast.message, note);
+}
+
+#[test]
+fn memory_superseded_event_explains_the_conflict_in_english() {
+    let mut s = opened();
+    s.locale = leveler_tui::Locale::En;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryChanged {
+            operation: "superseded".into(),
+            id: "k-probe".into(),
+            title: "Release probe code: BLUE-4821".into(),
+            authority: Some("explicit_user".into()),
+        }),
+    );
+    let note = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            TranscriptItem::Note(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("MemoryChanged must push a note");
+    assert_eq!(
+        note,
+        "● Memory · conflicted with existing memory, updated · Release probe code: BLUE-4821"
+    );
+    let toast = s
+        .notification
+        .as_ref()
+        .expect("persistent memory changes must remain visible as a toast");
+    assert_eq!(toast.message, note);
+}
+
+#[test]
+fn memory_updated_event_keeps_the_plain_updated_label() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryChanged {
+            operation: "updated".into(),
+            id: "k-probe".into(),
+            title: "发布探针代号：BLUE-4821".into(),
+            authority: Some("explicit_user".into()),
+        }),
+    );
+    let note = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            TranscriptItem::Note(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("MemoryChanged must push a note");
+    assert_eq!(note, "● Memory · 已更新 · 发布探针代号：BLUE-4821");
 }
 
 #[test]

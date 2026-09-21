@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::RiskLevel;
-use leveler_memory::MemoryStore;
+use leveler_memory::{MemoryStore, is_sensitive};
 
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
@@ -99,7 +99,10 @@ impl Tool for MemoryTool {
             "list" => {
                 let entries = store
                     .list_active()
-                    .map_err(|e| ToolError::Io(e.to_string()))?;
+                    .map_err(|e| ToolError::Io(e.to_string()))?
+                    .into_iter()
+                    .filter(|entry| !is_sensitive(entry))
+                    .collect::<Vec<_>>();
                 if entries.is_empty() {
                     return Ok(ToolOutput::ok("No active memories.".to_string()));
                 }
@@ -120,6 +123,9 @@ impl Tool for MemoryTool {
                 let e = store
                     .read_active(&id)
                     .map_err(|err| ToolError::Io(err.to_string()))?;
+                if is_sensitive(&e) {
+                    return Ok(ToolOutput::error("memory not found"));
+                }
                 Ok(ToolOutput::ok(format!(
                     "# {}\n\n{}\n\n(tags: {})",
                     e.title,
@@ -129,15 +135,25 @@ impl Tool for MemoryTool {
             }
             "search" | "vector_search" => {
                 let q = args.query.unwrap_or_default();
-                let hits = if args.action == "vector_search" {
+                // Search the full active set before filtering. Asking the
+                // store for only the user's limit could let sensitive hits
+                // occupy that window and hide safe matches behind them.
+                let active_count = store
+                    .list_active()
+                    .map_err(|e| ToolError::Io(e.to_string()))?
+                    .len();
+                let search_limit = active_count.max(args.limit.max(1));
+                let mut hits = if args.action == "vector_search" {
                     store
-                        .vector_search(&q, args.limit.max(1))
+                        .vector_search(&q, search_limit)
                         .map_err(|e| ToolError::Io(e.to_string()))?
                 } else {
                     store
-                        .search(&q, args.limit.max(1))
+                        .search(&q, search_limit)
                         .map_err(|e| ToolError::Io(e.to_string()))?
                 };
+                hits.retain(|(entry, _)| !is_sensitive(entry));
+                hits.truncate(args.limit.max(1));
                 if hits.is_empty() {
                     return Ok(ToolOutput::ok("No matching memories.".to_string()));
                 }
@@ -464,5 +480,59 @@ mod tests {
             out.content
         );
         assert!(out.content.contains("score"), "{}", out.content);
+    }
+
+    /// Stores created before credential validation may already contain a key.
+    /// The model-facing tool must not expose it through any read action, even
+    /// though the file remains available for the user's own cleanup/audit.
+    #[tokio::test]
+    async fn historical_sensitive_memory_is_hidden_from_every_read_action() {
+        let dir = tempdir().unwrap();
+        let mem = dir.path().join("memory");
+        let root = MemoryRoot::new(Some(mem.clone()));
+        let ctx = ctx_in(dir.path());
+        let store = MemoryStore::open(&mem).unwrap();
+        let safe = leveler_memory::new_entry(
+            "Deploy preference",
+            "Use foreground service startup.",
+            vec![],
+        );
+        store.remember(safe).unwrap();
+
+        let secret = leveler_memory::new_entry(
+            "Legacy API key",
+            "API_KEY=demo-provider-value-1234567890",
+            vec![],
+        );
+        let secret_id = secret.id.clone();
+        std::fs::write(
+            mem.join("active").join(format!("{secret_id}.json")),
+            serde_json::to_vec_pretty(&secret).unwrap(),
+        )
+        .unwrap();
+
+        for input in [
+            serde_json::json!({"action": "list"}),
+            serde_json::json!({"action": "search", "query": "API key provider", "limit": 10}),
+            serde_json::json!({"action": "vector_search", "query": "API key provider", "limit": 10}),
+        ] {
+            let out = MemoryTool::new(root.clone())
+                .execute(input, ctx.clone(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(!out.content.contains(&secret_id), "{}", out.content);
+            assert!(!out.content.contains("demo-provider"), "{}", out.content);
+        }
+
+        let read = MemoryTool::new(root)
+            .execute(
+                serde_json::json!({"action": "read", "id": secret_id}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(read.is_error, "sensitive direct read must be refused");
+        assert!(!read.content.contains("demo-provider"), "{}", read.content);
     }
 }

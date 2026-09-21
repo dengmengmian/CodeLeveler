@@ -403,9 +403,27 @@ pub(crate) async fn checkpoint_reaped_sessions(
 ) {
     let stores = &engine.stores;
     for reaped in reaped_sessions {
+        let scope = match leveler_agent::coding::latest_session_goal_checkpoint_scope(
+            stores,
+            &reaped.session_id,
+        )
+        .await
+        {
+            Ok(Some(scope)) => scope,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session = %reaped.session_id,
+                    "could not resolve exact lineage for interrupted checkpoint"
+                );
+                continue;
+            }
+        };
         match leveler_agent::coding::create_goal_checkpoint(
             engine,
             &reaped.session_id,
+            &scope,
             leveler_lifecycle::CheckpointReason::Interrupted,
             None,
             None,

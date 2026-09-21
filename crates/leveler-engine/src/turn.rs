@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_core::{SessionId, TurnId};
+use leveler_core::{GoalId, SessionId, TurnId};
 use leveler_execution::{Approver, Clarifier};
-use leveler_lifecycle::StopReason;
+use leveler_lifecycle::{ObjectiveAnchor, StopReason};
 use leveler_model::{Message, Role};
 use leveler_storage::{EngineStores, MessageStore, ModelRequestStore};
 
@@ -40,7 +40,29 @@ pub enum TurnStart {
     Resume,
     /// A fresh user turn carries the request accepted into the write-ahead log.
     Fresh(Message),
-    /// A node or repair turn carries only its mechanical kind payload.
+    /// A fresh domain turn with its host-resolved objective. This is the
+    /// durable continuation anchor; the model never reconstructs it.
+    Anchored {
+        message: Message,
+        objective: ObjectiveAnchor,
+        goal_id: Option<GoalId>,
+    },
+    /// Continue one exact turn lineage. `root_turn_id` remains stable across
+    /// repeated provider failures/model switches.
+    Continue {
+        message: Option<Message>,
+        objective: ObjectiveAnchor,
+        root_turn_id: TurnId,
+        goal_id: Option<GoalId>,
+    },
+    /// Internal work performed inside an existing lineage/epoch.
+    InternalLineage {
+        objective: ObjectiveAnchor,
+        root_turn_id: TurnId,
+        goal_id: Option<GoalId>,
+    },
+    /// Legacy unscoped internal start. New node/repair turns reject this: an
+    /// internal turn must name the lineage whose state it may consume.
     Internal,
 }
 
@@ -52,6 +74,27 @@ pub enum TurnStart {
 pub(crate) struct TurnInitiationPayload {
     version: u8,
     initiating_message: Message,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TurnInitiationPayloadV2 {
+    version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initiating_message: Option<Message>,
+    objective: ObjectiveAnchor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation_root_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal_id: Option<GoalId>,
+}
+
+/// Host-owned facts needed to continue an exact work lineage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnContinuation {
+    pub initiating_message: Option<Message>,
+    pub objective: ObjectiveAnchor,
+    pub root_turn_id: Option<TurnId>,
+    pub goal_id: Option<GoalId>,
 }
 
 impl TurnInitiationPayload {
@@ -70,6 +113,17 @@ impl TurnInitiationPayload {
     }
 
     pub(crate) fn decode(payload: &str) -> Result<Message, EngineError> {
+        let version = serde_json::from_str::<serde_json::Value>(payload)?
+            .get("version")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| EngineError::Corrupt("turn initiation payload has no version".into()))?;
+        if version == 2 {
+            return decode_turn_continuation(payload)?
+                .initiating_message
+                .ok_or_else(|| {
+                    EngineError::Corrupt("continuation turn has no initiating message".into())
+                });
+        }
         let decoded: Self = serde_json::from_str(payload)?;
         if decoded.version != Self::VERSION {
             return Err(EngineError::Corrupt(format!(
@@ -84,6 +138,80 @@ impl TurnInitiationPayload {
         }
         Ok(decoded.initiating_message)
     }
+}
+
+fn encode_anchored(
+    message: Option<Message>,
+    objective: ObjectiveAnchor,
+    root_turn_id: Option<TurnId>,
+    goal_id: Option<GoalId>,
+) -> Result<String, EngineError> {
+    if message
+        .as_ref()
+        .is_some_and(|message| message.role != Role::User)
+    {
+        return Err(EngineError::Config(
+            "a turn initiating message must have the user role".to_string(),
+        ));
+    }
+    Ok(serde_json::to_string(&TurnInitiationPayloadV2 {
+        version: 2,
+        initiating_message: message,
+        objective,
+        continuation_root_turn_id: root_turn_id,
+        goal_id,
+    })?)
+}
+
+fn encode_internal_lineage(
+    kind: &TurnKind,
+    objective: ObjectiveAnchor,
+    root_turn_id: TurnId,
+    goal_id: Option<GoalId>,
+) -> Result<String, EngineError> {
+    let encoded = encode_anchored(None, objective, Some(root_turn_id), goal_id)?;
+    let mut value: serde_json::Value = serde_json::from_str(&encoded)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| EngineError::Corrupt("turn lineage payload is not an object".into()))?;
+    match kind {
+        TurnKind::Node { node_id } => {
+            object.insert("node_id".into(), serde_json::Value::String(node_id.clone()));
+        }
+        TurnKind::Repair { attempt } => {
+            object.insert("attempt".into(), serde_json::Value::from(*attempt));
+        }
+        TurnKind::User | TurnKind::Chat => {}
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
+/// Decode a v2 continuation anchor. V1 rows remain readable by
+/// [`decode_turn_initiating_message`] and are upgraded by the harness from
+/// their initiating message and persisted turn kind.
+pub fn decode_turn_continuation(payload: &str) -> Result<TurnContinuation, EngineError> {
+    let decoded: TurnInitiationPayloadV2 = serde_json::from_str(payload)?;
+    if decoded.version != 2 {
+        return Err(EngineError::Corrupt(format!(
+            "turn payload version {} has no continuation lineage",
+            decoded.version
+        )));
+    }
+    if decoded
+        .initiating_message
+        .as_ref()
+        .is_some_and(|message| message.role != Role::User)
+    {
+        return Err(EngineError::Corrupt(
+            "turn initiation payload is not a user message".to_string(),
+        ));
+    }
+    Ok(TurnContinuation {
+        initiating_message: decoded.initiating_message,
+        objective: decoded.objective,
+        root_turn_id: decoded.continuation_root_turn_id,
+        goal_id: decoded.goal_id,
+    })
 }
 
 /// Decode the authoritative initiating user message stored in `turns.payload`.
@@ -339,18 +467,57 @@ impl TurnRunner<'_> {
             (TurnKind::User | TurnKind::Chat, TurnStart::Fresh(message)) => {
                 Some(TurnInitiationPayload::encode(message)?)
             }
+            (
+                TurnKind::User | TurnKind::Chat,
+                TurnStart::Anchored {
+                    message,
+                    objective,
+                    goal_id,
+                },
+            ) => Some(encode_anchored(Some(message), objective, None, goal_id)?),
+            (
+                TurnKind::User | TurnKind::Chat,
+                TurnStart::Continue {
+                    message,
+                    objective,
+                    root_turn_id,
+                    goal_id,
+                },
+            ) => Some(encode_anchored(
+                message,
+                objective,
+                Some(root_turn_id),
+                goal_id,
+            )?),
             (TurnKind::User | TurnKind::Chat, TurnStart::Resume) => None,
             (TurnKind::User | TurnKind::Chat, TurnStart::Internal) => {
                 return Err(EngineError::Config(
                     "a user turn requires a fresh message or resume start".to_string(),
                 ));
             }
-            (TurnKind::Node { node_id }, TurnStart::Internal) => {
-                Some(format!(r#"{{"node_id":"{node_id}"}}"#))
+            (TurnKind::User | TurnKind::Chat, TurnStart::InternalLineage { .. }) => {
+                return Err(EngineError::Config(
+                    "a user turn cannot use an internal lineage start".to_string(),
+                ));
             }
-            (TurnKind::Repair { attempt }, TurnStart::Internal) => {
-                Some(format!(r#"{{"attempt":{attempt}}}"#))
+            (TurnKind::Node { .. } | TurnKind::Repair { .. }, TurnStart::Internal) => {
+                return Err(EngineError::Config(
+                    "internal turns require an explicit continuation lineage".to_string(),
+                ));
             }
+            (
+                internal_kind @ (TurnKind::Node { .. } | TurnKind::Repair { .. }),
+                TurnStart::InternalLineage {
+                    objective,
+                    root_turn_id,
+                    goal_id,
+                },
+            ) => Some(encode_internal_lineage(
+                internal_kind,
+                objective,
+                root_turn_id,
+                goal_id,
+            )?),
             (TurnKind::Node { .. } | TurnKind::Repair { .. }, _) => {
                 return Err(EngineError::Config(
                     "internal turns require an internal start".to_string(),
@@ -828,5 +995,69 @@ impl TurnRunner<'_> {
             self.log.append(Some(attribute_to), event, observer).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+    use leveler_lifecycle::ObjectiveSource;
+
+    #[test]
+    fn v1_initiating_payload_remains_readable() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "initiating_message": Message::text(Role::User, "legacy chat")
+        })
+        .to_string();
+        assert_eq!(
+            decode_turn_initiating_message(&payload)
+                .unwrap()
+                .text_content(),
+            "legacy chat"
+        );
+    }
+
+    #[test]
+    fn v2_payload_round_trips_objective_and_root() {
+        let root = TurnId::new("turn-root");
+        let goal = GoalId::new("goal-ark");
+        let payload = encode_anchored(
+            Some(Message::text(Role::User, "继续")),
+            ObjectiveAnchor::from_user_message("configure Ark"),
+            Some(root.clone()),
+            Some(goal.clone()),
+        )
+        .unwrap();
+        let decoded = decode_turn_continuation(&payload).unwrap();
+        assert_eq!(decoded.objective.text(), "configure Ark");
+        assert_eq!(decoded.objective.source, ObjectiveSource::ThisTurnUser);
+        assert_eq!(decoded.root_turn_id, Some(root));
+        assert_eq!(decoded.goal_id, Some(goal));
+        assert_eq!(
+            decode_turn_initiating_message(&payload)
+                .unwrap()
+                .text_content(),
+            "继续"
+        );
+    }
+
+    #[test]
+    fn internal_turn_payload_keeps_mechanical_identity_and_lineage() {
+        let root = TurnId::new("turn-root");
+        let goal = GoalId::new("goal-ark");
+        let payload = encode_internal_lineage(
+            &TurnKind::Repair { attempt: 3 },
+            ObjectiveAnchor::from_session_goal("configure Ark"),
+            root.clone(),
+            Some(goal.clone()),
+        )
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["attempt"], 3);
+        let decoded = decode_turn_continuation(&payload).unwrap();
+        assert_eq!(decoded.root_turn_id, Some(root));
+        assert_eq!(decoded.goal_id, Some(goal));
     }
 }
