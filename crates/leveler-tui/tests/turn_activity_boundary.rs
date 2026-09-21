@@ -487,8 +487,8 @@ fn the_current_turns_child_is_live_activity() {
 }
 
 /// What the user sees: the activity strip is the current execution area. It
-/// shows the child in the turn that owns it and drops it in the next, while the
-/// transcript keeps rendering the history.
+/// offers details while the child is running, collapses once the team settles,
+/// and leaves the durable history in the transcript for the next turn.
 #[test]
 fn the_activity_strip_shows_the_child_in_its_turn_and_not_in_the_next() {
     let mut s = opened();
@@ -504,14 +504,24 @@ fn the_activity_strip_shows_the_child_in_its_turn_and_not_in_the_next() {
             None,
         )),
     );
+    let running = rendered(&mut s, 120, 40);
+    assert!(
+        strip_has_activity_row(&running, "Euclid"),
+        "the strip offers child details while it is running:\n{running}"
+    );
+
     reduce(
         &mut s,
         Action::Runtime(child_update("c1", "Euclid", true, true, "完成", None)),
     );
-    let turn1 = rendered(&mut s, 120, 40);
+    let settled = rendered(&mut s, 120, 40);
     assert!(
-        strip_has_activity_row(&turn1, "Euclid"),
-        "the strip shows the child while its own turn is live:\n{turn1}"
+        settled.replace(' ', "").contains("1个Agent已完成"),
+        "a settled team collapses to one terminal line:\n{settled}"
+    );
+    assert!(
+        !strip_has_activity_row(&settled, "Euclid"),
+        "settled children no longer advertise a live detail action:\n{settled}"
     );
 
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));

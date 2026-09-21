@@ -84,6 +84,10 @@ impl GoalPhase {
 #[derive(Debug, Clone)]
 pub struct ActiveGoal {
     title: String,
+    /// Full objective shown on the Goal detail page. The header always uses
+    /// `title`; keeping the source text here avoids reconstructing it from a
+    /// mutable transcript later.
+    objective: String,
     phase: GoalPhase,
     /// Active execution time banked from windows that already ended.
     accumulated: Duration,
@@ -98,8 +102,13 @@ impl ActiveGoal {
     /// A fresh running goal (a turn this client submitted, or one already live
     /// when the client reconnected).
     pub fn running(title: String, now: Instant) -> Self {
+        Self::running_with_objective(title.clone(), title, now)
+    }
+
+    pub fn running_with_objective(title: String, objective: String, now: Instant) -> Self {
         Self {
             title,
+            objective,
             phase: GoalPhase::Running,
             accumulated: Duration::ZERO,
             window_started: Some(now),
@@ -113,6 +122,10 @@ impl ActiveGoal {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    pub fn objective(&self) -> &str {
+        &self.objective
     }
 
     /// Bank the live window (idempotent) so the clock stops advancing.
@@ -142,7 +155,12 @@ impl ActiveGoal {
 
     /// Replace this goal with a new one. Elapsed restarts at zero.
     pub fn replace(&mut self, title: String, now: Instant) {
+        self.replace_with_objective(title.clone(), title, now);
+    }
+
+    pub fn replace_with_objective(&mut self, title: String, objective: String, now: Instant) {
         self.title = title;
+        self.objective = objective;
         self.phase = GoalPhase::Running;
         self.accumulated = Duration::ZERO;
         self.window_started = Some(now);
@@ -209,6 +227,7 @@ pub fn short_title(content: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedGoal {
     pub title: Option<String>,
+    pub objective: Option<String>,
     pub continuation: bool,
 }
 
@@ -222,11 +241,19 @@ pub fn begin(state: &mut AppState, staged: Option<StagedGoal>, now: Instant) {
     let fallback = state.goal.clone();
     let staged = staged.unwrap_or(StagedGoal {
         title: None,
+        objective: None,
         continuation: false,
     });
     let Some(goal) = state.active_goal.as_mut() else {
-        let title = staged.title.filter(|t| !t.is_empty()).unwrap_or(fallback);
-        let mut goal = ActiveGoal::running(title, now);
+        let title = staged
+            .title
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| fallback.clone());
+        let objective = staged
+            .objective
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(fallback);
+        let mut goal = ActiveGoal::running_with_objective(title, objective, now);
         if staged.continuation {
             goal.phase = GoalPhase::Resuming;
         }
@@ -241,8 +268,15 @@ pub fn begin(state: &mut AppState, staged: Option<StagedGoal>, now: Instant) {
     if same_goal {
         goal.resume(now);
     } else {
-        let title = staged.title.filter(|t| !t.is_empty()).unwrap_or(fallback);
-        goal.replace(title, now);
+        let title = staged
+            .title
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| fallback.clone());
+        let objective = staged
+            .objective
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(fallback);
+        goal.replace_with_objective(title, objective, now);
     }
 }
 
@@ -268,11 +302,18 @@ pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
     spans(phase, goal.title(), &elapsed, &state.theme, max)
 }
 
+pub fn has_visible_goal(state: &AppState) -> bool {
+    state
+        .active_goal
+        .as_ref()
+        .is_some_and(|goal| goal.is_visible(Instant::now()))
+}
+
 /// Build the indicator, degrading with the available width.
 ///
-/// Priority when space runs out is glyph + elapsed first, title last: the
-/// clock is the fact the user cannot recover elsewhere, while the title can be
-/// truncated to an ellipsis and still identify the task.
+/// Priority when space runs out is glyph + elapsed + detail affordance first,
+/// title last: the full objective is always reachable even when its summary is
+/// truncated away.
 pub fn spans(
     phase: GoalPhase,
     title: &str,
@@ -283,8 +324,8 @@ pub fn spans(
     let ink = Style::default().fg(phase.ink(theme));
     let glyph = phase.glyph();
     let elapsed_w = UnicodeWidthStr::width(elapsed);
-    // `glyph`, a separating space, the elapsed clock.
-    let minimum = 1 + 1 + elapsed_w;
+    // `glyph`, a separating space, the elapsed clock, and " ↗".
+    let minimum = 1 + 1 + elapsed_w + 2;
     if minimum > max {
         // Not even the clock fits; the identity header keeps the row.
         return Vec::new();
@@ -293,14 +334,15 @@ pub fn spans(
         vec![
             Span::styled(format!("{glyph} "), ink),
             Span::styled(elapsed.to_string(), ink),
+            Span::styled(" ↗", Style::default().fg(theme.accent.primary)),
         ]
     };
     let title = title.trim();
     if title.is_empty() {
         return clock();
     }
-    // `glyph`, space, title, " · ", elapsed.
-    let fixed = 1 + 1 + 3 + elapsed_w;
+    // `glyph`, space, title, " · ", elapsed, " ↗".
+    let fixed = 1 + 1 + 3 + elapsed_w + 2;
     let title_room = max.saturating_sub(fixed);
     if title_room < MIN_TITLE_COLS {
         return clock();
@@ -311,6 +353,7 @@ pub fn spans(
         Span::styled(shown, Style::default().fg(theme.text.primary)),
         Span::styled(" · ", Style::default().fg(theme.text.muted)),
         Span::styled(elapsed.to_string(), ink),
+        Span::styled(" ↗", Style::default().fg(theme.accent.primary)),
     ]
 }
 
@@ -425,7 +468,7 @@ mod tests {
             &theme,
             120,
         );
-        assert_eq!(plain(&spans), "◆ 修复断线后任务续接 · 6m 42s");
+        assert_eq!(plain(&spans), "◆ 修复断线后任务续接 · 6m 42s ↗");
         // Only the glyph and clock are tinted; the title keeps normal ink.
         assert_eq!(spans[1].style.fg, Some(theme.text.primary));
         assert_eq!(spans[0].style.fg, Some(theme.status.running));
@@ -460,7 +503,7 @@ mod tests {
         );
         let text = plain(&spans);
         assert!(text.contains('…'), "title should be truncated: {text}");
-        assert!(text.ends_with("6m 42s"), "clock must survive: {text}");
+        assert!(text.ends_with("6m 42s ↗"), "clock must survive: {text}");
         assert!(
             width(&spans) <= 20,
             "must not exceed its budget: {}",
@@ -486,8 +529,8 @@ mod tests {
     fn a_very_narrow_row_keeps_only_the_glyph_and_clock() {
         let theme = Theme::dark();
         let spans = spans(GoalPhase::Paused, "some goal", "9m 47s", &theme, 10);
-        assert_eq!(plain(&spans), "◐ 9m 47s");
-        assert_eq!(width(&spans), 8);
+        assert_eq!(plain(&spans), "◐ 9m 47s ↗");
+        assert_eq!(width(&spans), 10);
     }
 
     #[test]
@@ -497,7 +540,7 @@ mod tests {
         // Empty title still degrades to the clock when the clock fits.
         assert_eq!(
             plain(&spans(GoalPhase::Running, "", "6s", &theme, 8)),
-            "◆ 6s"
+            "◆ 6s ↗"
         );
     }
 

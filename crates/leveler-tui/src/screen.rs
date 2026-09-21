@@ -25,6 +25,10 @@ pub enum Screen {
     /// Enter on the input footer's background summary; Enter on a row opens its
     /// [`Screen::Activity`] detail, `x` stops the selected running task.
     ActivityList,
+    /// Full active plan, opened from the workbench's one-line plan summary.
+    Plan,
+    /// Full active objective, opened from the bounded header summary.
+    Goal,
     Help,
     /// Durable runtime observatory (`/trace`).
     Trace,
@@ -1197,6 +1201,8 @@ mod reachability_tests {
             Screen::Shell => Some("`!command` — reducer/submit.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
             Screen::ActivityList => Some("Enter on the footer background summary — reducer/mod.rs"),
+            Screen::Plan => Some("Enter or click on the plan summary — reducer/mod.rs"),
+            Screen::Goal => Some("Enter or click on the header goal — reducer/mod.rs"),
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
@@ -1215,6 +1221,8 @@ mod reachability_tests {
             Screen::Shell,
             Screen::Activity,
             Screen::ActivityList,
+            Screen::Plan,
+            Screen::Goal,
             Screen::Help,
             Screen::Trace,
             Screen::Context,

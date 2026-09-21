@@ -233,6 +233,9 @@ pub struct SubAgentBlock {
     pub agent_name: Option<String>,
     pub role: String,
     pub status: ToolStatus,
+    /// The task fixed at spawn. Kept after settlement so the conversation can
+    /// retain what the delegated step did without replaying the live roster.
+    pub task: String,
     /// The task while running; a short result summary once done.
     pub detail: String,
     pub progress: SubAgentProgress,
@@ -242,6 +245,9 @@ pub struct SubAgentBlock {
     /// show each agent's own running time (`now_elapsed - started`). `0` when the
     /// start time is unknown (finish-without-start fallback).
     pub started_elapsed_secs: u64,
+    /// Turn elapsed when the child settled. Preserves the collaboration
+    /// duration after the live team panel disappears.
+    pub settled_elapsed_secs: Option<u64>,
     /// What the parent did with what this child produced, projected from
     /// the runtime's `contribution`. `Pending` until the child finishes;
     /// `NotMeasured` when the runtime produced no projection — which is not
@@ -1119,10 +1125,12 @@ impl TranscriptState {
             nickname,
             role,
             status: ToolStatus::Running,
+            task: task.clone(),
             detail: task,
             progress: SubAgentProgress::default(),
             recent_step: None,
             started_elapsed_secs,
+            settled_elapsed_secs: None,
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             limit: None,
@@ -1147,6 +1155,7 @@ impl TranscriptState {
         contribution: crate::multi_agent::Contribution,
         stop: Option<leveler_client_protocol::ChildStop>,
         limit: Option<leveler_client_protocol::ChildLimit>,
+        settled_elapsed_secs: u64,
     ) {
         let status = if ok {
             ToolStatus::Ok
@@ -1159,6 +1168,7 @@ impl TranscriptState {
             block.contribution = contribution.clone();
             block.stop = stop;
             block.limit = limit;
+            block.settled_elapsed_secs = Some(settled_elapsed_secs);
             block.interrupted = false;
             block.unreported = false;
             return;
@@ -1170,10 +1180,12 @@ impl TranscriptState {
             nickname: nickname.to_string(),
             role: String::new(),
             status,
+            task: String::new(),
             detail: summary,
             progress: SubAgentProgress::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            settled_elapsed_secs: Some(settled_elapsed_secs),
             contribution,
             stop,
             limit,
@@ -1197,6 +1209,7 @@ impl TranscriptState {
             block.status = status;
             block.detail = summary;
             block.progress.active = false;
+            block.settled_elapsed_secs = None;
             block.contribution = contribution.clone();
             return;
         }
@@ -1208,10 +1221,12 @@ impl TranscriptState {
             nickname: nickname.to_string(),
             role: String::new(),
             status,
+            task: String::new(),
             detail: summary,
             progress: SubAgentProgress::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            settled_elapsed_secs: None,
             contribution,
             stop: None,
             limit: None,
@@ -1846,6 +1861,36 @@ mod tests {
         assert_eq!(block.status, ToolStatus::Ok);
     }
 
+    #[test]
+    fn completing_a_sub_agent_keeps_its_task_and_settled_clock_for_history() {
+        let mut ts = TranscriptState::default();
+        ts.push_sub_agent_started(
+            "agent-1".into(),
+            "Euclid".into(),
+            "explorer".into(),
+            "摸清前台手工发单全链路".into(),
+            3,
+        );
+        ts.complete_sub_agent_with_contribution(
+            "agent-1",
+            "Euclid",
+            true,
+            "完成".into(),
+            crate::multi_agent::Contribution::NotMeasured,
+            Some(leveler_client_protocol::ChildStop::Completed),
+            None,
+            106,
+        );
+
+        let block = ts.items().iter().find_map(|item| match item {
+            TranscriptItem::SubAgent(block) => Some(block),
+            _ => None,
+        });
+        let block = block.expect("sub-agent history");
+        assert_eq!(block.task, "摸清前台手工发单全链路");
+        assert_eq!(block.settled_elapsed_secs, Some(106));
+    }
+
     /// The typed bound travels with the typed stop onto the block. It used to
     /// be dropped at exactly this boundary, which is why the transcript could
     /// not tell a wall-clock timeout from a spent token budget.
@@ -1869,6 +1914,7 @@ mod tests {
             crate::multi_agent::Contribution::NotMeasured,
             Some(ChildStop::Budget),
             Some(ChildLimit::ModelTokens),
+            5,
         );
         let block = match ts.items.last() {
             Some(TranscriptItem::SubAgent(b)) => b,
@@ -1887,6 +1933,7 @@ mod tests {
             crate::multi_agent::Contribution::NotMeasured,
             Some(ChildStop::Budget),
             None,
+            5,
         );
         let block = match ts.items.last() {
             Some(TranscriptItem::SubAgent(b)) => b,

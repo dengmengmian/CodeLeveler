@@ -651,6 +651,17 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
     {
         // The footer summary is focused: Enter opens the background-jobs list.
         format!("Enter {}", t.background_list_title)
+    } else if state.workbench_focus == crate::state::WorkbenchFocus::Goal
+        && crate::active_goal::has_visible_goal(state)
+    {
+        t.goal_focus_hint.to_string()
+    } else if state.workbench_focus == crate::state::WorkbenchFocus::Plan
+        && state
+            .plan
+            .as_ref()
+            .is_some_and(crate::workbench::plan_panel_should_show)
+    {
+        t.plan_focus_hint.to_string()
     } else if state.is_busy() {
         format!("Esc {} · Ctrl+C {}", t.hint_interrupt, t.hint_cancel)
     } else if state.composer.text().starts_with('!') {

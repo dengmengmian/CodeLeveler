@@ -62,7 +62,8 @@ fn spawned(s: &mut AppState, id: &str, nickname: &str, agent: Option<&str>) {
     );
 }
 
-/// Dogfood: the tree read `├─ Euclid` while the roster said `rust-reviewer`.
+/// The durable conversation summary no longer duplicates live identities;
+/// the activity projection remains the identity source for detail navigation.
 #[test]
 fn a_declared_agent_child_carries_its_agent_name_in_the_tree_and_the_activity_lane() {
     let mut s = state();
@@ -76,13 +77,13 @@ fn a_declared_agent_child_carries_its_agent_name_in_the_tree_and_the_activity_la
         .map(crate::selection::line_to_plain)
         .collect();
     assert!(
-        text.iter().any(|l| l.contains("Euclid · rust-reviewer")),
+        text.iter().any(|l| l.contains("2 个 agents 正在运行")),
         "{text:#?}"
     );
     assert!(
         text.iter()
-            .any(|l| l.contains("Newton") && !l.contains("Newton ·")),
-        "a built-in child keeps its nickname alone: {text:#?}"
+            .all(|l| !l.contains("Euclid") && !l.contains("Newton")),
+        "live identities do not duplicate into the conversation: {text:#?}"
     );
 
     let rows = crate::activity::summaries(&s);

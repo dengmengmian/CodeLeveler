@@ -3696,6 +3696,111 @@ fn plan_and_verification_events_update_state() {
 }
 
 #[test]
+fn plan_summary_opens_a_full_plan_page_with_keyboard_and_returns_with_esc() {
+    use leveler_client_protocol::PlanStepStatus;
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    s.plan = Some(UiPlan {
+        steps: vec![
+            UiPlanStep {
+                index: 0,
+                description: "摸清现有报价模型".into(),
+                status: PlanStepStatus::Done,
+            },
+            UiPlanStep {
+                index: 1,
+                description: "设计完整语义模型".into(),
+                status: PlanStepStatus::Running,
+            },
+            UiPlanStep {
+                index: 2,
+                description: "写成正式设计文档".into(),
+                status: PlanStepStatus::Pending,
+            },
+        ],
+    });
+
+    let workbench = rendered(&mut s, 100, 30);
+    let plan_rows: Vec<&str> = workbench
+        .lines()
+        .filter(|line| line.contains("计划") || line.contains("语义模型"))
+        .collect();
+    assert_eq!(
+        plan_rows.len(),
+        1,
+        "the workbench owns one plan summary row:\n{workbench}"
+    );
+    assert!(
+        plan_rows[0].contains('↗'),
+        "detail affordance: {plan_rows:?}"
+    );
+    assert!(
+        !workbench.contains("写成正式设计文档"),
+        "pending steps belong to the detail page:\n{workbench}"
+    );
+
+    reduce(&mut s, key(KeyCode::Tab));
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(format!("{:?}", s.workbench_focus), "Plan");
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(format!("{:?}", s.active_screen), "Plan");
+
+    let detail = rendered(&mut s, 100, 30);
+    assert!(detail.contains("← 计划"), "{detail}");
+    assert!(detail.contains("摸清现有报价模型"), "{detail}");
+    assert!(detail.contains("设计完整语义模型"), "{detail}");
+    assert!(detail.contains("写成正式设计文档"), "{detail}");
+
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+}
+
+#[test]
+fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use leveler_client_protocol::PlanStepStatus;
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    s.plan = Some(UiPlan {
+        steps: (0..20)
+            .map(|index| UiPlanStep {
+                index,
+                description: format!("完整计划步骤 {}", index + 1),
+                status: if index == 0 {
+                    PlanStepStatus::Running
+                } else {
+                    PlanStepStatus::Pending
+                },
+            })
+            .collect(),
+    });
+
+    let workbench = rendered(&mut s, 100, 24);
+    let row = workbench
+        .lines()
+        .position(|line| line.contains("计划 ·"))
+        .unwrap_or_else(|| panic!("plan summary missing:\n{workbench}")) as u16;
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert_eq!(format!("{:?}", s.active_screen), "Plan");
+
+    let first = rendered(&mut s, 70, 10);
+    assert!(first.contains("完整计划步骤 1"), "{first}");
+    reduce(&mut s, key(KeyCode::PageDown));
+    assert!(s.screen_scroll > 0);
+    let later = rendered(&mut s, 70, 10);
+    assert!(!later.contains("● 1. 完整计划步骤 1"), "{later}");
+    assert!(later.contains("完整计划步骤 20"), "{later}");
+}
+
+#[test]
 fn ctrl_d_opens_diff_and_requests_it() {
     let mut s = opened();
     let effects = reduce(&mut s, ctrl('d'));
@@ -3903,9 +4008,16 @@ fn memory_changed_event_renders_the_structured_operation() {
             _ => None,
         })
         .expect("MemoryChanged must push a note");
-    assert!(note.contains("k-probe"), "{note}");
+    assert_eq!(note, "● Memory · 已更新 · 发布探针代号：BLUE-4821");
     assert!(note.contains("BLUE-4821"), "{note}");
-    assert!(note.contains("explicit_user"), "{note}");
+    assert!(
+        !note.contains("k-probe"),
+        "internal id stays in memory management: {note}"
+    );
+    assert!(
+        !note.contains("explicit_user"),
+        "internal authority stays in memory management: {note}"
+    );
     assert!(!note.contains("updated · updated"), "{note}");
 }
 
@@ -5455,7 +5567,10 @@ fn tab_toggles_workbench_focus_and_arrows_diverge() {
     );
     assert!(!s.conv.auto_scroll);
 
-    // Tab back → Input: ↑ recalls history.
+    // The live header goal is now its own focus stop; the next Tab returns to
+    // Input when there is no plan, command, or activity row.
+    reduce(&mut s, key(KeyCode::Tab));
+    assert_eq!(s.workbench_focus, WorkbenchFocus::Goal);
     reduce(&mut s, key(KeyCode::Tab));
     assert_eq!(s.workbench_focus, WorkbenchFocus::Input);
     reduce(&mut s, key(KeyCode::Up));
@@ -8669,7 +8784,7 @@ fn a_child_spawned_from_an_agent_is_shown_under_its_agent_name() {
         }),
     );
     let t = s.t();
-    let rows = leveler_tui::multi_agent::roster_rows(&s.team, None, 0, t);
+    let rows = leveler_tui::multi_agent::roster_rows(&s.team, 0, t);
     assert!(
         rows.iter().any(|r| r.label.contains("security-reviewer")),
         "{rows:?}"

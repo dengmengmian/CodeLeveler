@@ -39,9 +39,13 @@ pub(crate) fn plan_done_total(plan: &UiPlan) -> (usize, usize) {
     let k = plan
         .steps
         .iter()
-        .filter(|s| crate::plan_viewport::is_plan_step_settled(s.status))
+        .filter(|s| is_plan_step_settled(s.status))
         .count();
     (k, n)
+}
+
+fn is_plan_step_settled(status: PlanStepStatus) -> bool {
+    matches!(status, PlanStepStatus::Done | PlanStepStatus::Skipped)
 }
 
 /// Whether the sticky plan chrome should stay on screen.
@@ -54,21 +58,14 @@ pub(crate) fn plan_panel_should_show(plan: &UiPlan) -> bool {
     if plan.steps.is_empty() {
         return false;
     }
-    let all_success = plan
-        .steps
-        .iter()
-        .all(|s| crate::plan_viewport::is_plan_step_settled(s.status));
+    let all_success = plan.steps.iter().all(|s| is_plan_step_settled(s.status));
     !all_success
 }
 
 /// Summary after `计划`/`plan`. The plan is the agent's declared progress, so
-/// the summary says how much it declared done — never a "当前 6/9" cursor that
-/// reads as the runtime tracking execution. While a turn runs and the step
-/// list is collapsed, it also names the step declared in progress (expanded,
-/// the list shows it). Outside a running turn the plan is the last record of
-/// what was declared, and nothing in it is presented as under way. Never
-/// claims item #1 is in progress just because nothing is done yet.
-pub(crate) fn plan_summary_label(plan: &UiPlan, collapsed: bool, live: bool, t: &UiText) -> String {
+/// the summary says how much it declared done and, when available, the current
+/// running or failed step. It never invents a "next" step when none is active.
+pub(crate) fn plan_summary_label(plan: &UiPlan, live: bool, t: &UiText) -> String {
     let (done, total) = plan_done_total(plan);
     if total == 0 {
         return t.active_plan.to_string();
@@ -82,27 +79,66 @@ pub(crate) fn plan_summary_label(plan: &UiPlan, collapsed: bool, live: bool, t: 
         return fill(t.plan_last_recorded);
     }
     let progress = fill(t.plan_n_done);
-    match plan
+    if let Some(step) = plan
+        .steps
+        .iter()
+        .find(|s| s.status == PlanStepStatus::Failed)
+    {
+        return format!(
+            "{progress} · {}",
+            t.plan_failed_item
+                .replace("{step}", &(step.index + 1).to_string())
+                .replace("{description}", &step.description)
+        );
+    }
+    if let Some(step) = plan
         .steps
         .iter()
         .find(|s| s.status == PlanStepStatus::Running)
-        .filter(|_| collapsed)
     {
-        Some(step) => format!(
+        return format!(
             "{progress} · {}",
             t.plan_running_item.replace("{step}", &step.description)
-        ),
-        None => progress,
+        );
+    }
+    let pending = plan
+        .steps
+        .iter()
+        .filter(|s| s.status == PlanStepStatus::Pending)
+        .count();
+    if pending > 0 {
+        format!(
+            "{progress} · {}",
+            t.plan_pending_count.replace("{n}", &pending.to_string())
+        )
+    } else {
+        progress
     }
 }
 
-/// One-line plan chrome title: `▼ 计划 · 已完成 5/9`.
-pub(crate) fn plan_chrome_title(plan: &UiPlan, collapsed: bool, live: bool, t: &UiText) -> String {
-    let disclosure = if collapsed { "▶" } else { "▼" };
+/// One-line plan summary. The arrow opens the full Plan page; there is no
+/// second inline expansion mode.
+pub(crate) fn plan_chrome_title(plan: &UiPlan, live: bool, t: &UiText) -> String {
+    let glyph = if plan
+        .steps
+        .iter()
+        .any(|step| step.status == PlanStepStatus::Failed)
+    {
+        "!"
+    } else if live
+        && plan
+            .steps
+            .iter()
+            .any(|step| step.status == PlanStepStatus::Running)
+    {
+        "●"
+    } else {
+        "○"
+    };
     format!(
-        "{disclosure} {} · {}",
+        "{glyph} {} · {} ↗",
         t.active_plan,
-        plan_summary_label(plan, collapsed, live, t)
+        plan_summary_label(plan, live, t)
     )
 }
 
@@ -247,25 +283,13 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     render_notice(frame, notice_slot, state);
     if status_rows > 0 {
         frame.render_widget(Paragraph::new(status_block.clone()), status_slot);
-        let activity_rows =
-            crate::activity::status_activity_lines(state, status_slot.width as usize, state.t());
-        let headline = status_block
-            .len()
-            .saturating_sub(activity_rows.len())
-            .min(status_rows as usize);
-        state.activity_hits = activity_rows
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| headline + i < status_rows as usize)
-            .filter_map(|(i, row)| {
-                row.id
-                    .clone()
-                    .map(|id| (chunks[4].y + (headline + i) as u16, id))
-            })
-            .collect();
-    } else {
-        state.activity_hits.clear();
     }
+    let plan_area = crate::layout::horizontal_inset(chunks[5], crate::layout::WORKSPACE_GUTTER_X);
+    state.plan_hit = (plan_rows > 0 && plan_area.width > 0).then_some((
+        plan_area.y,
+        plan_area.x,
+        plan_area.x.saturating_add(plan_area.width),
+    ));
     render_plan_panel(frame, chunks[5], state);
     render_attachments(frame, attach_slot, state);
     crate::pending_inputs::render(frame, pending_slot, state, area.height);
@@ -278,7 +302,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     }
     render_footer(frame, footer_slot, state);
     // chunks[11] = breathing row; the roster docks under the footer.
-    render_team_panel(frame, chunks[12], state);
+    state.activity_hits = render_team_panel(frame, chunks[12], state);
 
     // /btw is its own surface (see `crate::btw`), not an overlay here.
 
@@ -289,7 +313,7 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
 
 // ── Header (single-line environment strip + rule — no model / tokens) ───────
 
-fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_header(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Leading blank row keeps the brand strip off the terminal's top edge.
     let [_gap, status, rule_area] = Layout::vertical([
         Constraint::Length(1),
@@ -304,10 +328,15 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
         width: status.width.saturating_sub(1),
         ..status
     };
-    frame.render_widget(
-        Paragraph::new(header_line(state, text_area.width as usize)),
-        text_area,
-    );
+    let (line, goal_range) = header_line_parts(state, text_area.width as usize);
+    state.goal_hit = goal_range.map(|(start, end)| {
+        (
+            status.y,
+            text_area.x.saturating_add(start as u16),
+            text_area.x.saturating_add(end as u16),
+        )
+    });
+    frame.render_widget(Paragraph::new(line), text_area);
     frame.render_widget(
         Paragraph::new(header_rule_line(area.width as usize, state)),
         rule_area,
@@ -318,18 +347,27 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 /// flushed right.
 ///
 /// The goal never starves the identity: it is offered only the columns left
-/// after `CodeLeveler`, and as the row narrows it drops its title first and
-/// then itself. The identity strip is the row's floor.
-fn header_line(state: &AppState, width: usize) -> Line<'static> {
+/// after `CodeLeveler`, up to a fixed ceiling, and as the row narrows it drops
+/// its title first and then itself. The identity strip is the row's floor.
+fn header_line_parts(state: &AppState, width: usize) -> (Line<'static>, Option<(usize, usize)>) {
     if width == 0 {
-        return Line::from("");
+        return (Line::from(""), None);
     }
     // "CodeLeveler" plus a gap is the minimum the identity strip keeps.
     const MIN_IDENTITY: usize = 10;
     const GAP: usize = 2;
-    let goal = crate::active_goal::header(state, width.saturating_sub(MIN_IDENTITY + GAP));
+    // The goal is useful context, but it must not turn the header into a copy
+    // of the prompt or erase the repository identity on wide terminals.
+    const MAX_GOAL_COLS: usize = 48;
+    let goal_budget = width.saturating_sub(MIN_IDENTITY + GAP).min(MAX_GOAL_COLS);
+    let mut goal = crate::active_goal::header(state, goal_budget);
     if goal.is_empty() {
-        return header_status_line(state, width);
+        return (header_status_line(state, width), None);
+    }
+    if state.workbench_focus == crate::state::WorkbenchFocus::Goal {
+        for span in &mut goal {
+            span.style = span.style.add_modifier(Modifier::REVERSED);
+        }
     }
     let goal_w: usize = goal
         .iter()
@@ -346,7 +384,8 @@ fn header_line(state: &AppState, width: usize) -> Line<'static> {
     let mut spans = left.spans;
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(goal);
-    Line::from(spans)
+    let start = width.saturating_sub(goal_w);
+    (Line::from(spans), Some((start, width)))
 }
 
 /// The header underline: always a static hairline. The status spinner above
@@ -460,19 +499,7 @@ fn repo_basename(repo: &str) -> String {
 /// steps remain, so a long plan no longer claims a row per completed step.
 fn plan_panel_height(state: &AppState, budget: u16) -> u16 {
     match &state.plan {
-        Some(p) if plan_panel_should_show(p) => {
-            if state.plan_collapsed {
-                1
-            } else {
-                // The header always survives, exactly like a collapsed dock;
-                // the body gets whatever rows are left. The window already
-                // knows it must fit that body, so a twenty-step plan with three
-                // open steps asks for four rows, not twenty-one.
-                let body = budget.saturating_sub(1) as usize;
-                let window = crate::plan_viewport::plan_summary_window(p, body);
-                (1 + window.desired_rows() as u16).min(budget.max(1))
-            }
-        }
+        Some(p) if plan_panel_should_show(p) && budget > 0 => 1,
         _ => 0,
     }
 }
@@ -494,13 +521,13 @@ fn team_panel_height(state: &AppState) -> u16 {
     // cannot expire the terminal row afterwards — and it shouldn't: once the
     // turn settles, 任务已完成 is the single completion owner (§16) and the
     // collaboration surface yields immediately.
-    if !state.is_busy() {
+    if !state.is_busy() && state.team.active().next().is_none() {
         return 0;
     }
     if state.collaboration_collapsed || state.team.surface_is_terminal(state.elapsed_secs) {
         return 1;
     }
-    // Roster shape: Main row + up to 4 child rows + an overflow row. Capped
+    // Roster shape: aggregate row + up to 4 child rows + an overflow row. Capped
     // so the runtime surface stays a caption on the task, never most of the
     // viewport.
     let children = state.team.children.len();
@@ -509,9 +536,13 @@ fn team_panel_height(state: &AppState) -> u16 {
     (1 + shown + overflow).min(7) as u16
 }
 
-fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+fn render_team_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+) -> Vec<(u16, crate::activity::ActivityId)> {
     if area.height == 0 {
-        return;
+        return Vec::new();
     }
     let theme = &state.theme;
     let t = state.t();
@@ -520,7 +551,7 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     // plan — not chrome hanging off the terminal's left edge.
     let area = crate::layout::horizontal_inset(area, crate::layout::WORKSPACE_GUTTER_X);
     if area.width == 0 {
-        return;
+        return Vec::new();
     }
     const MEMBER_INDENT: &str = "  ";
     let terminal = state.team.surface_is_terminal(state.elapsed_secs);
@@ -552,64 +583,65 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             ))),
             area,
         );
-        return;
+        return Vec::new();
     }
-    // Active agent runtime roster: WHO is working, WHAT each is doing, for
-    // HOW LONG, at what accumulated usage. A process-list shape — no boxes,
-    // no cards. Main leads as the coordinator/root row (it is not a spawned
-    // child); the existing structured activity label is its source, with a
-    // truthful "正在工作" fallback rather than invented detail.
-    let mut lines: Vec<Line> = Vec::new();
-    let rows = crate::multi_agent::roster_rows(
-        &state.team,
-        state.activity.as_deref(),
-        state.elapsed_secs,
-        t,
-    );
+    // One aggregate summary, then one clickable line per child. The summary
+    // replaces the old Main row; the conversation keeps the durable record.
+    let summary =
+        crate::multi_agent::collaboration_runtime_line(&state.team, state.elapsed_secs, t);
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled("● ", Style::default().fg(theme.accent.primary)),
+        Span::styled(
+            summary,
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    let rows = crate::multi_agent::roster_rows(&state.team, state.elapsed_secs, t);
     let budget = (area.height as usize).saturating_sub(lines.len());
-    // Main always leads; children take what remains. If they do not all
-    // fit, one line is reserved for the "还有 N 个 Agent…" overflow note.
-    let child_rows = rows.len() - 1;
-    let avail = budget.saturating_sub(1);
+    let child_rows = rows.len();
+    let avail = budget;
     let shown_children = if child_rows <= avail {
         child_rows
     } else {
         avail.saturating_sub(1)
     };
     let width = area.width as usize;
-    // Narrow terminals drop the meta column rather than squeezing the
-    // activity into unreadability.
-    let narrow = width < 48;
-    // The roster is a compact process list, not a full-width table: on wide
-    // terminals the `elapsed · tokens` column aligns to the roster's own
+    // Narrow terminals truncate the task before dropping elapsed time or the
+    // detail affordance. The roster is a compact process list, not a full-width
+    // table: on wide terminals the elapsed column aligns to the roster's own
     // content inside a bounded readable width — never to the terminal's
     // right edge, which turns each row into two disconnected islands.
     const ROSTER_MAX_WIDTH: usize = 96;
     const META_GAP: usize = 4;
     let bound = width.min(ROSTER_MAX_WIDTH);
     let visible: Vec<&crate::multi_agent::AgentRosterRow> =
-        rows.iter().take(1 + shown_children).collect();
+        rows.iter().take(shown_children).collect();
     // Shared column width: the widest meta among the rows that carry one.
-    let meta_col = if narrow {
-        0
-    } else {
-        visible
-            .iter()
-            .filter_map(|row| row.meta.as_deref())
-            .map(UnicodeWidthStr::width)
-            .max()
-            .unwrap_or(0)
-    };
+    let meta_col = visible
+        .iter()
+        .filter_map(|row| row.meta.as_deref())
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
     // Every row's activity respects the shared meta reservation so the
     // column stays vertically aligned; the column position itself is
     // content-driven (widest head+activity plus breathing room).
     let mut prepared: Vec<(String, usize, String, usize)> = Vec::new();
     let mut content_w = 0usize;
-    for row in &visible {
-        let head = format!("{} {}  ", row.glyph, row.label);
+    for (index, row) in visible.iter().enumerate() {
+        let branch = if index + 1 == shown_children && shown_children == child_rows {
+            "└─"
+        } else {
+            "├─"
+        };
+        let head = format!("  {branch} {} · ", row.label);
         let head_w = UnicodeWidthStr::width(head.as_str());
         let cap = if meta_col > 0 {
-            bound.saturating_sub(meta_col + META_GAP + head_w).max(4)
+            bound
+                .saturating_sub(meta_col + META_GAP + UnicodeWidthStr::width(" ·  ↗") + head_w)
+                .max(4)
         } else {
             width.saturating_sub(head_w).max(4)
         };
@@ -619,9 +651,11 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         prepared.push((head, head_w, activity, activity_w));
     }
     let meta_x = content_w + META_GAP;
-    for (row, (head, head_w, activity, activity_w)) in visible.iter().zip(prepared) {
+    let mut hits = Vec::new();
+    for (index, (row, (head, head_w, activity, activity_w))) in
+        visible.iter().zip(prepared).enumerate()
+    {
         let color = match row.tone {
-            crate::multi_agent::RosterTone::Main => theme.accent.primary,
             crate::multi_agent::RosterTone::Active => theme.accent.primary,
             crate::multi_agent::RosterTone::Done => theme.status.success,
             crate::multi_agent::RosterTone::Failed => theme.status.error,
@@ -630,17 +664,20 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(head, Style::default().fg(color)),
             Span::styled(activity, Style::default().fg(theme.text.secondary)),
         ];
-        if let Some(meta) = row.meta.as_deref()
-            && !narrow
-        {
-            let pad = meta_x.saturating_sub(head_w + activity_w);
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(
-                meta.to_string(),
-                Style::default().fg(theme.text.secondary),
+        let meta = row.meta.as_deref().unwrap_or("");
+        let pad = meta_x.saturating_sub(head_w + activity_w);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(
+            format!(" · {meta} ↗"),
+            Style::default().fg(theme.text.secondary),
+        ));
+        lines.push(Line::from(spans));
+        if let Some(child) = state.team.children.get(index) {
+            hits.push((
+                area.y + 1 + index as u16,
+                crate::activity::ActivityId::Child(child.id.clone()),
             ));
         }
-        lines.push(Line::from(spans));
     }
     let hidden = child_rows - shown_children;
     if hidden > 0 {
@@ -654,6 +691,7 @@ fn render_team_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+    hits
 }
 
 fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -675,74 +713,24 @@ fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     if area.width == 0 {
         return;
     }
-    const STEP_INDENT: &str = "  ";
-    let title = truncate(
-        plan_chrome_title(plan, state.plan_collapsed, live, t),
-        area.width as usize,
-    );
-
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        title,
+    let width = area.width as usize;
+    let raw = plan_chrome_title(plan, live, t);
+    let title = if width > 2 {
+        let without_arrow = raw.strip_suffix(" ↗").unwrap_or(&raw);
+        format!("{} ↗", truncate(without_arrow, width - 2))
+    } else {
+        truncate(raw, width)
+    };
+    let style = if state.workbench_focus == crate::state::WorkbenchFocus::Plan {
         Style::default()
             .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD),
-    ))];
-
-    if !state.plan_collapsed {
-        let body_width = area.width.saturating_sub(3 + STEP_INDENT.len() as u16) as usize;
-        let window = crate::plan_viewport::plan_summary_window(plan, area.height as usize - 1);
-        for step in window.visible {
-            // Only unfinished steps reach the summary, so a settled glyph never
-            // appears here; the running step is the one that earns emphasis.
-            let glyph_color = match step.status {
-                PlanStepStatus::Running if live => theme.accent.primary,
-                PlanStepStatus::Failed => theme.status.error,
-                _ => theme.text.secondary,
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{STEP_INDENT}{} ",
-                        crate::plan_cell::plan_glyph(step.status)
-                    ),
-                    Style::default().fg(glyph_color),
-                ),
-                Span::styled(
-                    truncate(
-                        format!("{}. {}", step.index + 1, step.description),
-                        body_width,
-                    ),
-                    Style::default().fg(if live && step.status == PlanStepStatus::Running {
-                        theme.text.primary
-                    } else {
-                        theme.text.secondary
-                    }),
-                ),
-            ]));
-        }
-        // The count row is a caption, not a step: no glyph, no number, and one
-        // text level dimmer than a pending step.
-        if window.show_hidden_line {
-            lines.push(overflow_line(
-                &t.plan_hidden_active
-                    .replace("{}", &window.hidden_active.to_string()),
-                theme,
-                area.width as usize,
-            ));
-        }
-    }
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// One quiet count row under the plan dock's step indent: `⋯ 另有 N 项待办`.
-/// It is a caption, not a step — no glyph, no step number, and one text level
-/// dimmer than a pending step.
-fn overflow_line(text: &str, theme: &crate::theme::Theme, width: usize) -> Line<'static> {
-    Line::from(Span::styled(
-        truncate(format!("  {text}"), width),
-        Style::default().fg(theme.text.muted),
-    ))
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default()
+            .fg(theme.accent.primary)
+            .add_modifier(Modifier::BOLD)
+    };
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(title, style))), area);
 }
 
 // ── Notice Surface (global user-action feedback) ────────────────────────────
@@ -1131,7 +1119,7 @@ mod tests {
         let plan_row = row_of(&lines, "edit module");
         let input_row = row_of(&lines, "Type a message");
         let footer_row = row_of(&lines, "Context");
-        let roster_row = row_of(&lines, "● Main");
+        let roster_row = row_of(&lines, "agents running");
         assert!(plan_row < input_row, "plan must stay above the composer");
         assert!(input_row < footer_row, "composer above the Context footer");
         assert!(
@@ -1198,7 +1186,7 @@ mod tests {
         let pending_row = row_of(&lines, "Not sent · 9");
         let input_row = row_of(&lines, "Type a message");
         let footer_row = row_of(&lines, "Context");
-        let roster_row = row_of(&lines, "● Main");
+        let roster_row = row_of(&lines, "agents running");
         assert!(pending_row < input_row, "{lines:#?}");
         assert!(
             input_row < footer_row && footer_row < roster_row,
@@ -1264,7 +1252,7 @@ mod tests {
             .collect();
         let body_row = row_of(&lines, "git push");
         let footer_row = row_of(&lines, "Context");
-        let roster_row = row_of(&lines, "● Main");
+        let roster_row = row_of(&lines, "agents running");
         assert!(
             body_row < footer_row,
             "approval body renders above the footer"
@@ -1276,7 +1264,7 @@ mod tests {
         assert!(
             lines[body_row..footer_row]
                 .iter()
-                .all(|l| !l.contains("● Main")),
+                .all(|l| !l.contains("agents running")),
             "no roster row between the approval body and the footer"
         );
     }
@@ -1303,7 +1291,7 @@ mod tests {
         );
     }
 
-    /// Density closure: on a wide terminal the `elapsed · tokens` column
+    /// Density closure: on a wide terminal the elapsed column
     /// aligns to the roster's own bounded content width, NOT the terminal's
     /// right edge — and stays one aligned column across rows of very
     /// different activity lengths.
@@ -1328,10 +1316,10 @@ mod tests {
         );
         let meta_cols: Vec<usize> = lines
             .iter()
-            .filter(|l| l.contains("55s ·"))
-            .map(|l| col_of(l, "55s ·").unwrap())
+            .filter(|l| l.contains("55s ↗"))
+            .map(|l| col_of(l, "55s ↗").unwrap())
             .collect();
-        assert_eq!(meta_cols.len(), 3, "all three children carry usage metas");
+        assert_eq!(meta_cols.len(), 3, "all three children carry elapsed metas");
         assert!(
             meta_cols.iter().all(|c| *c == meta_cols[0]),
             "meta is one shared column: {meta_cols:?}"
@@ -1341,12 +1329,9 @@ mod tests {
             "meta aligns to the roster content, not the 180-column right edge: {}",
             meta_cols[0]
         );
-        for l in lines.iter().filter(|l| l.contains("55s ·")) {
-            let col = l.find("55s ·").unwrap();
-            assert!(
-                l[..col].ends_with("    "),
-                "at least four columns of breathing room before the meta: {l:?}"
-            );
+        for l in lines.iter().filter(|l| l.contains("55s ↗")) {
+            let col = l.find("55s ↗").unwrap();
+            assert!(l[..col].ends_with(" · "), "metadata separator: {l:?}");
             let end = l.trim_end().len();
             assert!(end < 130, "the roster keeps a bounded visual width: {end}");
         }
@@ -1355,14 +1340,11 @@ mod tests {
     /// The agent ROSTER row for `activity`.
     ///
     /// The Activity strip above the roster mentions the same tool with the
-    /// child's nickname (`● Newton · read_file 55s ↗`), so "the line that
-    /// contains read_file" stopped identifying one row the moment that strip
-    /// existed. The roster is the surface these layout rules belong to, and it
-    /// names agents by role.
+    /// child nickname and task on the same clickable line.
     fn roster_row<'a>(lines: &'a [String], activity: &str) -> &'a String {
         lines
             .iter()
-            .find(|l| l.contains(activity) && l.contains("agent"))
+            .find(|l| l.contains(activity) && l.contains('↗'))
             .unwrap_or_else(|| panic!("no roster row for {activity}: {lines:#?}"))
     }
 
@@ -1380,10 +1362,7 @@ mod tests {
         );
         let row = roster_row(&lines, "read_file");
         assert!(row.contains("55s"), "elapsed still shown: {row:?}");
-        assert!(
-            !row.contains('·'),
-            "no `· tokens` half for a zero-usage child: {row:?}"
-        );
+        assert!(!row.contains("tokens"), "no fake token value: {row:?}");
 
         // Control: real usage still renders, so the rule above is "do not
         // invent a number", not "never show one".
@@ -1397,8 +1376,12 @@ mod tests {
         );
         let row = roster_row(&reported, "read_file");
         assert!(
-            row.contains("55s ·"),
-            "a child with usage keeps its `elapsed · tokens` meta: {row:?}"
+            row.contains("55s ↗"),
+            "elapsed and detail affordance stay: {row:?}"
+        );
+        assert!(
+            reported.iter().any(|line| line.contains("362k tokens")),
+            "aggregate usage moves to the summary: {reported:#?}"
         );
     }
 
@@ -1419,8 +1402,8 @@ mod tests {
         );
         let meta_cols: Vec<usize> = lines
             .iter()
-            .filter(|l| l.contains("55s ·"))
-            .map(|l| col_of(l, "55s ·").unwrap())
+            .filter(|l| l.contains("55s ↗"))
+            .map(|l| col_of(l, "55s ↗").unwrap())
             .collect();
         assert_eq!(meta_cols.len(), 2);
         assert_eq!(
@@ -1429,10 +1412,9 @@ mod tests {
         );
     }
 
-    /// Narrow terminals keep identity/activity and drop the meta entirely —
-    /// unchanged by the placement move.
+    /// Narrow terminals truncate the task but preserve time and detail access.
     #[test]
-    fn narrow_terminal_still_drops_the_meta_column() {
+    fn narrow_terminal_preserves_elapsed_and_detail_affordance() {
         let lines = render_workbench(
             46,
             30,
@@ -1442,7 +1424,10 @@ mod tests {
             false,
         );
         let row = roster_row(&lines, "read_file");
-        assert!(!row.contains("55s"), "narrow width drops the meta: {row:?}");
+        assert!(
+            row.contains("55s ↗"),
+            "narrow width preserves the detail affordance: {row:?}"
+        );
 
         // The other side of the rule: given room, the same row shows the same
         // meta. The exact cut is content-dependent — the meta is dropped when
@@ -1501,16 +1486,89 @@ mod tests {
     }
 
     #[test]
+    fn team_panel_is_one_summary_plus_one_line_per_clickable_agent() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.elapsed_secs = 106;
+        let specs = [
+            ("c1", "Euclid", "摸清前台手工发单全链路", 13_000),
+            ("c2", "Newton", "摸清后台目录规格编辑链路", 16_979),
+        ];
+        for (id, nickname, task, tokens) in specs {
+            state.team.apply_update(crate::multi_agent::ChildUpdate {
+                id: id.into(),
+                nickname: nickname.into(),
+                role: "explorer".into(),
+                done: false,
+                ok: false,
+                detail: task.into(),
+                title: Some(task.into()),
+                profile_id: None,
+                agent_name: None,
+                read_only: true,
+                contribution: None,
+                stop: None,
+                limit: None,
+                started_elapsed_secs: 0,
+            });
+            state.team.apply_progress(id, true, tokens, 0);
+        }
+
+        let rows = panel_rows(&state, 3);
+        let text = rows.join("\n");
+        assert!(
+            squash(&rows[0]).contains("2个agents正在运行·29.9ktokens·1m46s"),
+            "summary: {text}"
+        );
+        assert!(
+            squash(&rows[1]).contains("Euclid·摸清前台手工发单全链路·1m46s↗"),
+            "first child stays on one line: {text}"
+        );
+        assert!(
+            squash(&rows[2]).contains("Newton·摸清后台目录规格编辑链路·1m46s↗"),
+            "second child stays on one line: {text}"
+        );
+        assert!(
+            !text.contains("主 Agent"),
+            "no duplicate coordinator row: {text}"
+        );
+    }
+
+    #[test]
+    fn rendered_team_rows_keep_both_detail_targets() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.team = team_with(&[
+            ("c1", "explorer", "摸清前台手工发单全链路"),
+            ("c2", "explorer", "摸清后台目录规格编辑链路"),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+
+        let ids: Vec<&str> = state
+            .activity_hits
+            .iter()
+            .map(|(_, id)| id.as_key())
+            .collect();
+        assert_eq!(ids, vec!["c1", "c2"], "both ↗ rows open their own detail");
+    }
+
+    #[test]
     fn no_team_no_panel_and_no_stolen_rows() {
         let empty = render_with_team(crate::multi_agent::TaskTeamView::default());
         let staffed = render_with_team(team_with(&[
             ("a1", "explorer", "look"),
             ("w1", "worker", "implement"),
         ]));
-        // Roster shape: no standing title — presence is the Main row itself.
+        // Roster shape: the team summary is the standing title.
         assert!(!empty.contains("● Main"), "{empty}");
-        assert!(staffed.contains("● Main"), "{staffed}");
-        assert!(staffed.contains("Explorer"), "{staffed}");
+        assert!(staffed.contains("2 agents running"), "{staffed}");
+        assert!(!staffed.contains("● Main"), "{staffed}");
     }
 
     /// The layout indices shift when a panel is inserted; a footer that moved
@@ -2178,13 +2236,13 @@ mod tests {
     #[test]
     fn a_live_plan_title_reports_declared_progress_without_a_cursor() {
         let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&sample_plan(), false, true, t);
-        assert!(title.starts_with('▼'), "{title}");
+        let title = plan_chrome_title(&sample_plan(), true, t);
+        assert!(title.starts_with('●'), "{title}");
         assert!(title.contains("已完成 1/3"), "{title}");
         assert!(!title.contains("当前"), "no runtime cursor: {title}");
         assert!(
-            !title.contains("edit module"),
-            "the numbered list under the header already carries the description: {title}"
+            title.contains("进行中：edit module"),
+            "the one-line summary names the running step: {title}"
         );
         assert!(
             !title.contains("2."),
@@ -2273,33 +2331,33 @@ mod tests {
         state.team = active_team();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         let rows = panel_rows(&state, 4);
-        // Roster shape: every row (Main + children) sits on the shared task
-        // baseline — a process list, not a header with indented members.
+        // Aggregate sits on the task baseline; children form one indented tree.
         let main = rows
             .iter()
             .find(|r| r.contains('●'))
-            .unwrap_or_else(|| panic!("main row rendered:\n{}", rows.join("\n")));
+            .unwrap_or_else(|| panic!("summary row rendered:\n{}", rows.join("\n")));
         let main_col = main.len() - main.trim_start().len();
         assert_eq!(
             main_col,
             crate::layout::WORKSPACE_GUTTER_X as usize,
-            "main row on the content baseline: {main:?}"
+            "summary row on the content baseline: {main:?}"
         );
         let member = rows
             .iter()
-            .find(|r| r.contains('○'))
+            .find(|r| r.contains("├─") || r.contains("└─"))
             .unwrap_or_else(|| panic!("member row rendered:\n{}", rows.join("\n")));
         let member_col = member.len() - member.trim_start().len();
         assert_eq!(
-            member_col, main_col,
-            "children share the same baseline: {main:?} / {member:?}"
+            member_col,
+            main_col + 2,
+            "children are one level inside the summary: {main:?} / {member:?}"
         );
     }
 
-    /// Matrix D/M: Main leads with its structured activity label; an active
-    /// child shows activity plus right-aligned elapsed · usage.
+    /// Matrix D/M: the aggregate leads; an active child shows its task,
+    /// elapsed and detail affordance.
     #[test]
-    fn roster_shows_main_activity_and_child_meta() {
+    fn roster_shows_aggregate_usage_and_child_elapsed() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.activity = Some("正在汇总审计结果".into());
@@ -2328,10 +2386,10 @@ mod tests {
         // space-stripped for CJK anchors.
         let squashed = rows.replace(' ', "");
         assert!(rows.contains('●'), "{rows}");
-        assert!(squashed.contains("正在汇总审计结果"), "{rows}");
+        assert!(squashed.contains("1个agents正在运行"), "{rows}");
         assert!(squashed.contains("审计生命周期与身份"), "{rows}");
         assert!(squashed.contains("4m09s"), "elapsed: {rows}");
-        assert!(rows.contains("168k"), "usage: {rows}");
+        assert!(rows.contains("168k tokens"), "aggregate usage: {rows}");
     }
 
     /// Matrix L: no usage reported yet → elapsed only, never a fake 0.
@@ -2347,9 +2405,9 @@ mod tests {
     }
 
     /// Matrix F/E (§15/§16): an incomplete child renders truthfully with !,
-    /// never as ✓; completed siblings keep ✓ while Main keeps working.
+    /// never as ✓; active siblings keep the roster expanded.
     #[test]
-    fn roster_failure_truth_and_integrating_main() {
+    fn roster_failure_truth_with_active_sibling() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.activity = Some("正在整合结果".into());
@@ -2407,15 +2465,9 @@ mod tests {
         state.team = team;
         let rows = panel_rows(&state, 5).join("\n");
         let squashed = rows.replace(' ', "");
-        assert!(rows.contains('✓'), "{rows}");
-        assert!(rows.contains('!'), "{rows}");
-        assert!(rows.contains('○'), "{rows}");
-        assert!(
-            !squashed.contains("✓执行"),
-            "an incomplete worker must never wear the success glyph: {rows}"
-        );
+        assert!(squashed.contains("1个agents正在运行"), "{rows}");
         assert!(squashed.contains("工作未完成"), "{rows}");
-        assert!(squashed.contains("正在整合结果"), "{rows}");
+        assert!(squashed.contains("auditc"), "{rows}");
     }
 
     /// §14: when EVERY child settles, the surface collapses to one truthful
@@ -2457,9 +2509,10 @@ mod tests {
         );
     }
 
-    /// Matrix J: narrow terminals drop the meta column, keep identity+activity.
+    /// Matrix J: narrow terminals truncate the task but preserve elapsed time
+    /// and the detail affordance.
     #[test]
-    fn roster_narrow_width_drops_meta_keeps_activity() {
+    fn roster_narrow_width_preserves_elapsed_and_detail_affordance() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.elapsed_secs = 100;
@@ -2490,8 +2543,11 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rows.contains('○'), "{rows}");
-        assert!(!rows.contains("1m 40s"), "meta dropped when narrow: {rows}");
+        assert!(rows.contains('↗'), "{rows}");
+        assert!(
+            rows.contains("1m 40s"),
+            "elapsed remains reachable when narrow: {rows}"
+        );
     }
 
     /// Matrix §18: more children than rows → an overflow note, never a
@@ -2563,12 +2619,10 @@ mod tests {
         assert!(squash(&rows[0]).contains("未完成"), "{rows:?}");
     }
 
-    /// The plan is a sibling of the conversation, not a footnote to the
-    /// status line: its header starts at the content baseline and its steps
-    /// sit one level inside it. Real frames showed both at column 0, which
-    /// gave the dock no hierarchy at all.
+    /// The one-line plan is a sibling of the conversation and starts at the
+    /// same content baseline.
     #[test]
-    fn plan_dock_header_and_steps_form_one_indent_level() {
+    fn plan_summary_uses_the_workspace_content_baseline() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut state = test_state();
@@ -2594,50 +2648,45 @@ mod tests {
             })
             .collect();
         let header = &rows[0];
-        let step = rows
-            .iter()
-            .find(|r| r.trim_start().starts_with('→') || r.trim_start().starts_with('○'))
-            .unwrap_or_else(|| panic!("no plan step rendered:\n{}", rows.join("\n")));
         let header_col = header.len() - header.trim_start().len();
-        let step_col = step.len() - step.trim_start().len();
         assert_eq!(
             header_col,
             crate::layout::WORKSPACE_GUTTER_X as usize,
             "header sits on the content baseline: {header:?}"
         );
+        assert!(header.contains('↗'), "{header:?}");
         assert!(
-            step_col > header_col,
-            "steps indent one level inside the header: {header:?} / {step:?}"
+            rows.iter().skip(1).all(|row| row.trim().is_empty()),
+            "{rows:?}"
         );
     }
 
-    /// Collapsed, the step list is gone, so the header names the step the
-    /// agent declared in progress.
+    /// The summary names the running step because the full list lives on its
+    /// own page.
     #[test]
-    fn plan_chrome_title_keeps_progress_when_collapsed() {
+    fn plan_chrome_title_keeps_progress_and_detail_affordance() {
         let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&sample_plan(), true, true, t);
-        assert!(title.starts_with('▶'), "{title}");
+        let title = plan_chrome_title(&sample_plan(), true, t);
+        assert!(title.starts_with('●'), "{title}");
         assert!(
             title.contains("已完成 1/3 · 进行中：edit module"),
             "{title}"
         );
+        assert!(title.ends_with('↗'), "{title}");
     }
 
     /// Outside a running turn the plan is the last record of what the agent
     /// declared, not work under way: no "进行中" anywhere in the header.
     #[test]
     fn a_plan_outside_a_running_turn_reads_as_the_last_record() {
-        for collapsed in [false, true] {
-            let t = crate::i18n::Locale::Zh.text();
-            let title = plan_chrome_title(&sample_plan(), collapsed, false, t);
-            assert!(title.contains("最后记录 1/3"), "{title}");
-            assert!(!title.contains("进行中"), "{title}");
-            let t = crate::i18n::Locale::En.text();
-            let title = plan_chrome_title(&sample_plan(), collapsed, false, t);
-            assert!(title.contains("last recorded 1/3"), "{title}");
-            assert!(!title.contains("in progress"), "{title}");
-        }
+        let t = crate::i18n::Locale::Zh.text();
+        let title = plan_chrome_title(&sample_plan(), false, t);
+        assert!(title.contains("最后记录 1/3"), "{title}");
+        assert!(!title.contains("进行中"), "{title}");
+        let t = crate::i18n::Locale::En.text();
+        let title = plan_chrome_title(&sample_plan(), false, t);
+        assert!(title.contains("last recorded 1/3"), "{title}");
+        assert!(!title.contains("in progress"), "{title}");
     }
 
     #[test]
@@ -2667,8 +2716,9 @@ mod tests {
                 },
             ],
         };
-        let title = plan_chrome_title(&plan, true, true, t);
+        let title = plan_chrome_title(&plan, true, t);
         assert!(title.contains("已完成 0/4"), "{title}");
+        assert!(title.contains("4 项待办"), "{title}");
         assert!(
             !title.contains("进行中"),
             "pending is not in-progress: {title}"
@@ -2692,7 +2742,7 @@ mod tests {
                 },
             ],
         };
-        let title = plan_chrome_title(&plan, true, true, t);
+        let title = plan_chrome_title(&plan, true, t);
         assert!(title.contains("1/2 completed"), "{title}");
         assert!(
             !title.contains("in progress"),
@@ -2731,11 +2781,7 @@ mod tests {
         assert_eq!(plan_panel_height(&state, 40), 0);
 
         state.plan = Some(sample_plan());
-        state.plan_collapsed = true;
         assert_eq!(plan_panel_height(&state, 40), 1);
-
-        state.plan_collapsed = false;
-        assert_eq!(plan_panel_height(&state, 40), 3); // title + 2 open steps
     }
 
     #[test]
@@ -2813,8 +2859,11 @@ mod tests {
         let lines = crate::conversation::build::build_conversation_lines(&s, 100);
         let text = lines.iter().map(rule_plain).collect::<Vec<_>>().join("\n");
         assert!(text.contains("2 个 agents 正在运行"), "{text}");
-        assert!(text.contains("├─ Euclid"), "{text}");
-        assert!(text.contains("└─ Newton"), "{text}");
+        assert!(text.contains("task A、task B"), "{text}");
+        assert!(
+            !text.contains("├─ Euclid") && !text.contains("└─ Newton"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2848,7 +2897,7 @@ mod tests {
         );
     }
 
-    // ── Plan viewport (adaptive height, no silent truncation) ───────────────
+    // ── One-line Plan summary ───────────────────────────────────────────────
 
     fn plan_panel_rows(state: &AppState, height: u16) -> Vec<String> {
         use ratatui::Terminal;
@@ -2895,111 +2944,32 @@ mod tests {
         }
     }
 
-    /// The default summary keeps open work and drops finished history: a
-    /// nine-step plan with step 6 running shows 6..9, not 1..9.
+    /// The workbench always reserves exactly one row for an active plan. The
+    /// complete list belongs to the Plan page.
     #[test]
-    fn a_deep_plan_hides_finished_steps_and_shows_open_work() {
+    fn plan_summary_is_always_one_row() {
         let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.plan = Some(running_plan(9, 5));
         let rows = plan_panel_rows(&state, 10);
-        let flat = squash(&rows.join("\n"));
-        for i in 6..=9 {
-            assert!(
-                flat.contains(&format!("{i}.步骤{i}")),
-                "open step {i} must be on screen:\n{}",
-                rows.join("\n")
-            );
-        }
-        for i in 1..=5 {
-            assert!(
-                !flat.contains(&format!("{i}.步骤{i}")),
-                "finished step {i} must not occupy a row:\n{}",
-                rows.join("\n")
-            );
-        }
-        assert!(!flat.contains('⋯'), "nothing is hidden: {flat}");
+        let visible: Vec<&String> = rows.iter().filter(|row| !row.trim().is_empty()).collect();
+        assert_eq!(visible.len(), 1, "{rows:?}");
+        let line = squash(visible[0]);
+        assert!(line.contains("已完成5/9"), "{line}");
+        assert!(line.contains("进行中：步骤6"), "{line}");
+        assert!(line.ends_with('↗'), "{line}");
     }
 
-    /// A dock too short for every open step keeps the running step and says how
-    /// many open steps it left off — a count, not a fabricated step.
-    #[test]
-    fn a_short_plan_dock_keeps_the_running_step_and_counts_the_hidden_open_work() {
-        let mut state = test_state();
-        state.plan = Some(running_plan(9, 1));
-        let rows = plan_panel_rows(&state, 6);
-        let body = rows.join("\n");
-        let flat = squash(&body);
-        assert!(flat.contains("2.步骤2"), "the running step stays: {body}");
-        assert!(
-            flat.contains("⋯另有4项待办"),
-            "the exact open-step remainder rides on its own row: {body}"
-        );
-        assert!(
-            !flat.contains("1.步骤1"),
-            "the finished step stays hidden: {body}"
-        );
-        let count_row = rows
-            .iter()
-            .find(|r| r.contains('⋯'))
-            .unwrap_or_else(|| panic!("no hidden-count row: {rows:?}"));
-        assert!(
-            count_row.trim_start().starts_with('⋯'),
-            "the count row is a caption, not a step: {count_row:?}"
-        );
-    }
-
-    /// A deep plan windows the open steps: five rows and a count of the rest.
-    #[test]
-    fn a_deep_plan_shows_five_open_steps_and_counts_the_rest() {
-        let mut state = test_state();
-        state.plan = Some(running_plan(30, 17));
-        let rows = plan_panel_rows(&state, 7);
-        let body = rows.join("\n");
-        let flat = squash(&body);
-        assert!(flat.contains("18.步骤18"), "{body}");
-        assert!(!flat.contains("1.步骤1"), "{body}");
-        assert!(flat.contains("⋯另有8项待办"), "{body}");
-        let shown = rows
-            .iter()
-            .filter(|r| {
-                let s = squash(r);
-                s.contains("步骤") && !s.contains('⋯')
-            })
-            .count();
-        assert_eq!(shown, 5, "at most five open steps: {body}");
-    }
-
-    /// P6: a plan whose open steps fit shows no hidden-count row.
-    #[test]
-    fn a_plan_that_fits_shows_no_hidden_count_row() {
-        let mut state = test_state();
-        state.plan = Some(running_plan(4, 1));
-        let rows = plan_panel_rows(&state, 8);
-        let body = rows.join("\n");
-        assert!(!body.contains('⋯'), "{body}");
-    }
-
-    /// P7: a one-row body must not panic and must spend that row on the
-    /// current step rather than on step 1.
-    #[test]
-    fn a_single_body_row_shows_the_current_step() {
-        let mut state = test_state();
-        state.plan = Some(running_plan(30, 17));
-        let rows = plan_panel_rows(&state, 2);
-        assert!(squash(&rows[1]).contains("18.步骤18"), "{rows:?}");
-    }
-
-    /// P8: the header carries how much is declared done — "6/9" alone hid that
-    /// five steps were already done — and the expanded list shows which step
-    /// is in progress.
+    /// The summary carries declared progress and never mistakes the running
+    /// ordinal for the done count.
     #[test]
     fn the_plan_header_carries_declared_progress() {
         let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&running_plan(9, 5), false, true, t);
+        let title = plan_chrome_title(&running_plan(9, 5), true, t);
         assert!(title.contains("已完成 5/9"), "{title}");
         assert!(!title.contains("6/9"), "{title}");
         let t = crate::i18n::Locale::En.text();
-        let title = plan_chrome_title(&running_plan(9, 5), false, true, t);
+        let title = plan_chrome_title(&running_plan(9, 5), true, t);
         assert!(title.contains("5/9 completed"), "{title}");
         assert!(!title.contains("6/9"), "{title}");
     }
@@ -3009,6 +2979,7 @@ mod tests {
     #[test]
     fn both_plan_surfaces_use_the_same_running_glyph() {
         let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.plan = Some(running_plan(3, 1));
         let rows = plan_panel_rows(&state, 5);
         assert!(
@@ -3021,7 +2992,7 @@ mod tests {
         );
     }
 
-    /// P10: a fully finished plan still leaves the dock entirely.
+    /// A fully finished plan still leaves the workbench entirely.
     #[test]
     fn a_finished_plan_takes_no_rows_even_with_an_adaptive_viewport() {
         let mut state = test_state();
@@ -3037,65 +3008,29 @@ mod tests {
         assert_eq!(plan_panel_height(&state, 40), 0);
     }
 
-    /// The dock asks only for its open steps — plus one count row when needed
-    /// — and never more rows than the layout can spare.
+    /// An active plan never takes more than one row, and no row is painted when
+    /// the layout has no room.
     #[test]
-    fn plan_dock_height_follows_the_open_work_and_the_layout_budget() {
+    fn plan_summary_height_is_fixed() {
         let mut state = test_state();
         state.plan = Some(running_plan(9, 5));
-        assert_eq!(plan_panel_height(&state, 40), 5, "header + four open steps");
-        assert_eq!(plan_panel_height(&state, 6), 5, "all four open steps fit");
-        assert_eq!(
-            plan_panel_height(&state, 4),
-            4,
-            "capped by the budget, so the window shrinks"
-        );
-        assert_eq!(plan_panel_height(&state, 0), 1, "the header survives");
-        state.plan_collapsed = true;
         assert_eq!(plan_panel_height(&state, 40), 1);
+        assert_eq!(plan_panel_height(&state, 1), 1);
+        assert_eq!(plan_panel_height(&state, 0), 0);
     }
 
-    /// Acceptance: a 6/10 plan shows the four open steps and no settled
-    /// history, while the header keeps the global 6/10.
+    /// A failed step owns the one-line status and stays visibly actionable.
     #[test]
-    fn six_of_ten_shows_the_four_open_steps_and_keeps_the_global_count() {
+    fn failed_plan_summary_names_the_failed_step() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
-        state.plan = Some(running_plan(10, 6));
-        let rows = plan_panel_rows(&state, 12);
-        let body = rows.join("\n");
-        let flat = squash(&body);
-        assert!(
-            flat.contains("计划") && flat.contains("已完成6/10"),
-            "{body}"
-        );
-        for i in 7..=10 {
-            assert!(flat.contains(&format!("{i}.步骤{i}")), "{body}");
-        }
-        for i in 1..=6 {
-            assert!(!flat.contains(&format!("{i}.步骤{i}")), "{body}");
-        }
-        assert!(!body.contains('⋯'), "{body}");
-    }
-
-    /// Acceptance: a 3/20 plan shows five open steps and counts the other 12.
-    #[test]
-    fn three_of_twenty_shows_five_open_steps_and_twelve_hidden() {
-        let mut state = test_state();
-        state.status = leveler_client_protocol::RuntimeStatus::Busy;
-        state.plan = Some(running_plan(20, 3));
-        let rows = plan_panel_rows(&state, 12);
-        let body = rows.join("\n");
-        let flat = squash(&body);
-        assert!(flat.contains("已完成3/20"), "{body}");
-        assert!(flat.contains("⋯另有12项待办"), "{body}");
-        let shown = (1..=20)
-            .filter(|i| flat.contains(&format!("{i}.步骤{i}")))
-            .count();
-        assert_eq!(shown, 5, "{body}");
-        for i in 1..=3 {
-            assert!(!flat.contains(&format!("{i}.步骤{i}")), "{body}");
-        }
+        let mut plan = running_plan(4, 2);
+        plan.steps[2].status = PlanStepStatus::Failed;
+        state.plan = Some(plan);
+        let line = squash(&plan_panel_rows(&state, 4).join("\n"));
+        assert!(line.starts_with("!计划"), "{line}");
+        assert!(line.contains("第3步失败：步骤3"), "{line}");
+        assert!(line.ends_with('↗'), "{line}");
     }
 
     // ── Notice Surface ─────────────────────────────────────────────────────

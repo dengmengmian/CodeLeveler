@@ -279,6 +279,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // This is the runtime's latest declaration for the active turn.
             // Rendering may hide a fully-done plan, but the reducer keeps the
             // exact value until the terminal transition archives it.
+            if !crate::workbench::plan_panel_should_show(&plan)
+                && state.workbench_focus == crate::state::WorkbenchFocus::Plan
+            {
+                state.workbench_focus = crate::state::WorkbenchFocus::Input;
+            }
             state.plan = Some(plan);
         }
         RuntimeEvent::VerificationUpdated { verification } => {
@@ -537,7 +542,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                     .map(|c| c.contribution.clone())
                     .unwrap_or(crate::multi_agent::Contribution::NotMeasured);
                 state.transcript.complete_sub_agent_with_contribution(
-                    &id, &nickname, ok, detail, projected, stop, limit,
+                    &id,
+                    &nickname,
+                    ok,
+                    detail,
+                    projected,
+                    stop,
+                    limit,
+                    state.elapsed_secs,
                 );
             } else {
                 state.transcript.push_sub_agent_started(
@@ -973,10 +985,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             });
         }
         RuntimeEvent::MemoryChanged {
-            operation,
-            id,
-            title,
-            authority,
+            operation, title, ..
         } => {
             let t = state.t();
             let verb = match operation.as_str() {
@@ -986,8 +995,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 "merged" => t.memory_merged,
                 _ => t.memory_created,
             };
-            let suffix = authority.map(|a| format!(" ({a})")).unwrap_or_default();
-            let line = format!("{verb} · [{id}] {title}{suffix}");
+            let line = format!("{verb} · {title}");
             state.transcript.push_note(line.clone());
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
@@ -1426,6 +1434,9 @@ fn replace_active_background_tasks(
 fn archive_active_plan(state: &mut AppState) {
     if let Some(plan) = state.plan.take() {
         state.transcript.push_plan(plan);
+    }
+    if state.workbench_focus == crate::state::WorkbenchFocus::Plan {
+        state.workbench_focus = crate::state::WorkbenchFocus::Input;
     }
 }
 

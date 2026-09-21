@@ -149,6 +149,7 @@ pub(super) fn send_message(state: &mut AppState) -> Vec<Effect> {
         attachments.is_empty() && leveler_client_protocol::parse_continuation(&content).is_some();
     state.staged_goal = Some(crate::active_goal::StagedGoal {
         title: crate::active_goal::short_title(&content),
+        objective: Some(content.clone()),
         continuation,
     });
     // Go Busy immediately (not on the first runtime event): closes the
@@ -219,6 +220,7 @@ pub(super) fn send_pending_input(state: &mut AppState, index: usize) -> Vec<Effe
         let continuation = leveler_client_protocol::parse_continuation(&content).is_some();
         state.staged_goal = Some(crate::active_goal::StagedGoal {
             title: crate::active_goal::short_title(&content),
+            objective: Some(content.clone()),
             continuation,
         });
         start_turn(state);
@@ -1055,6 +1057,7 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
             state.transcript.push_user_if_new(rest.clone());
             state.staged_goal = Some(crate::active_goal::StagedGoal {
                 title: crate::active_goal::short_title(&rest),
+                objective: Some(rest.clone()),
                 continuation: false,
             });
             start_turn(state);
@@ -1099,6 +1102,7 @@ fn run_develop(state: &mut AppState, command: &str) -> Vec<Effect> {
     state.transcript.push_user_if_new(goal.clone());
     state.staged_goal = Some(crate::active_goal::StagedGoal {
         title: crate::active_goal::short_title(&goal),
+        objective: Some(goal.clone()),
         continuation: false,
     });
     start_turn(state);

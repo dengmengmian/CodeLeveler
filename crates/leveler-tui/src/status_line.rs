@@ -386,20 +386,17 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
     match state.status {
         RuntimeStatus::Busy => busy_status_lines(state, width),
         RuntimeStatus::Error | RuntimeStatus::Idle => {
-            let mut lines = if let Some(label) = &state.activity {
+            if state.team.active().next().is_some() {
+                return Vec::new();
+            }
+            if let Some(label) = &state.activity {
                 vec![Line::from(Span::styled(
                     format!("… {label}"),
                     Style::default().fg(theme.text.secondary),
                 ))]
             } else {
                 vec![Line::from("")]
-            };
-            // A background process outlives the turn that started it. Its
-            // activity row — and a finished one kept for reopening — must stay
-            // visible while Main is idle, or the only way back to its detail
-            // would be a still-running turn.
-            append_activity_rows(&mut lines, state, width, theme);
-            lines
+            }
         }
     }
 }
@@ -432,6 +429,16 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let theme = &state.theme;
     let t = state.t();
     let wait = crate::wait_status::project(state);
+    if state.team.active().next().is_some()
+        && wait.as_ref().is_none_or(|view| {
+            matches!(
+                view.kind,
+                crate::wait_status::WaitKind::Model | crate::wait_status::WaitKind::ChildAgent
+            )
+        })
+    {
+        return Vec::new();
+    }
     if let Some(view) = wait.as_ref()
         && !matches!(
             view.kind,
@@ -534,7 +541,7 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     }
     let text = fit_status(&parts, width);
     let rest = text.strip_prefix(frame).unwrap_or(&text);
-    let mut lines = vec![Line::from(vec![
+    vec![Line::from(vec![
         Span::styled(
             frame.to_string(),
             Style::default()
@@ -542,9 +549,7 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
-    ])];
-    append_activity_rows(&mut lines, state, width, theme);
-    lines
+    ])]
 }
 
 fn blocked_wait_lines(
@@ -562,33 +567,13 @@ fn blocked_wait_lines(
     let headline = crate::wait_status::headline(view, t);
     let text = truncate_to_width(&format!("{WAIT_MARKER} {turn_mode}{headline}"), width);
     let rest = text.strip_prefix(WAIT_MARKER).unwrap_or(&text);
-    let mut lines = vec![Line::from(vec![
+    vec![Line::from(vec![
         Span::styled(
             WAIT_MARKER.to_string(),
             Style::default().fg(theme.accent.primary),
         ),
         Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
-    ])];
-    append_activity_rows(&mut lines, state, width, theme);
-    lines
-}
-
-fn append_activity_rows(
-    lines: &mut Vec<Line<'static>>,
-    state: &AppState,
-    width: usize,
-    theme: &crate::theme::Theme,
-) {
-    for row in crate::activity::status_activity_lines(state, width, state.t()) {
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&row.text, width),
-            Style::default().fg(if row.selected {
-                theme.text.primary
-            } else {
-                theme.text.muted
-            }),
-        )));
-    }
+    ])]
 }
 
 /// Sparse top chrome: `⑂ branch · ~/path` only. Trust signals sit by the
@@ -1220,6 +1205,39 @@ mod tests {
             "a running background task never occupies a strip row: {text}"
         );
         assert!(!text.contains("等待后台任务"), "{text}");
+    }
+
+    #[test]
+    fn active_child_team_owns_live_status_instead_of_repeating_above_the_composer() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        for (id, name, task) in [
+            ("c1", "Euclid", "摸清前台手工发单全链路"),
+            ("c2", "Newton", "摸清后台目录规格编辑链路"),
+        ] {
+            state.team.apply_update(crate::multi_agent::ChildUpdate {
+                id: id.into(),
+                nickname: name.into(),
+                role: "explorer".into(),
+                done: false,
+                ok: false,
+                detail: task.into(),
+                title: Some(task.into()),
+                profile_id: None,
+                agent_name: None,
+                read_only: true,
+                contribution: None,
+                stop: None,
+                limit: None,
+                started_elapsed_secs: 0,
+            });
+        }
+
+        let text = status_text(&state);
+        assert!(
+            text.trim().is_empty(),
+            "team panel is the only live owner: {text}"
+        );
     }
 
     /// A background process outlives its turn. It stays reachable while Main is

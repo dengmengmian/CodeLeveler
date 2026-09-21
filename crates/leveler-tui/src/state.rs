@@ -86,6 +86,8 @@ pub struct Notification {
 ///
 /// - [`Input`](WorkbenchFocus::Input): history browse, typing
 /// - [`Conversation`](WorkbenchFocus::Conversation): viewport scroll
+/// - [`Goal`](WorkbenchFocus::Goal): header goal summary (Enter opens detail)
+/// - [`Plan`](WorkbenchFocus::Plan): one-line plan summary (Enter opens detail)
 /// - [`Activity`](WorkbenchFocus::Activity): compact activity rows (Enter opens detail)
 /// - [`Background`](WorkbenchFocus::Background): the footer's aggregated
 ///   background summary (Enter opens the background-jobs list)
@@ -96,6 +98,8 @@ pub enum WorkbenchFocus {
     #[default]
     Input,
     Conversation,
+    Goal,
+    Plan,
     Activity,
     /// The 待发送 list above the composer.
     Pending,
@@ -415,13 +419,15 @@ pub struct AppState {
     pub background_failures_seen: std::collections::HashSet<String>,
     /// Last-painted footer background-summary hit (row, x_start, x_end).
     pub background_footer_hit: Option<(u16, u16, u16)>,
+    /// Last-painted one-line plan summary hit (row, x_start, x_end).
+    pub plan_hit: Option<(u16, u16, u16)>,
+    /// Last-painted header goal hit (row, x_start, x_end).
+    pub goal_hit: Option<(u16, u16, u16)>,
     /// The running command row under the Command workbench focus, by the
     /// execution's authoritative [`ToolCallId`]. Presentation only: the stop
     /// path re-checks it against the live transcript before acting, so a
     /// finished or replayed row can never be stopped by a stale reference.
     pub command_selected: Option<leveler_client_protocol::ToolCallId>,
-    /// Plan panel collapsed to a single title row.
-    pub plan_collapsed: bool,
     /// Collapse the collaboration surface to its one-line compact row.
     /// View preference only — visibility itself is derived from team activity.
     pub collaboration_collapsed: bool,
@@ -598,8 +604,9 @@ impl AppState {
             background_list_selected: None,
             background_failures_seen: std::collections::HashSet::new(),
             background_footer_hit: None,
+            plan_hit: None,
+            goal_hit: None,
             command_selected: None,
-            plan_collapsed: false,
             collaboration_collapsed: false,
             tools_expanded: false,
             turn_nav: None,

@@ -289,7 +289,7 @@ fn a_narrow_terminal_keeps_the_glyph_and_clock_and_never_overlaps() {
     assert_eq!(header.width(), 20, "fills the row once: {header:?}");
     assert!(header.starts_with(" CodeLeveler"), "{header:?}");
     assert!(
-        header.trim_end().ends_with('s'),
+        header.trim_end().ends_with("s ↗"),
         "clock survives: {header:?}"
     );
     assert!(
@@ -298,6 +298,91 @@ fn a_narrow_terminal_keeps_the_glyph_and_clock_and_never_overlaps() {
     );
     // Row count never changes with the goal present.
     assert_eq!(medium.lines().count(), wide.lines().count());
+}
+
+#[test]
+fn a_wide_header_caps_the_goal_instead_of_sacrificing_repository_context() {
+    let mut state = state();
+    state.repository = "/workspace/CodeLeveler".into();
+    state.branch = Some("main".into());
+    submit(
+        &mut state,
+        "不要参考之前的文档了。我感觉之前的文档不对。我们要重新提出一模型。看要怎么做。",
+    );
+
+    let screen = rendered(&mut state, 120, 12);
+    let header = screen.lines().nth(1).unwrap();
+    assert!(
+        header.contains("/workspace/CodeLeveler"),
+        "a long goal must leave the repository context readable: {header:?}"
+    );
+    let goal = header.split('◆').nth(1).expect("running goal in header");
+    assert!(
+        UnicodeWidthStr::width(goal.trim()) <= 48,
+        "goal chrome must have a fixed display-width ceiling: {header:?}"
+    );
+    assert!(
+        header.contains('…'),
+        "the capped goal should be explicit: {header:?}"
+    );
+}
+
+#[test]
+fn the_header_goal_opens_its_full_multiline_objective_with_keyboard() {
+    let mut state = state();
+    let objective = format!(
+        "重新设计报价模型\n{}",
+        (1..=20)
+            .map(|index| format!("完整目标详情第{index}行：保留全部约束和验收条件"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    submit(&mut state, &objective);
+
+    reduce(&mut state, key(KeyCode::Tab));
+    reduce(&mut state, key(KeyCode::Tab));
+    reduce(&mut state, key(KeyCode::Enter));
+
+    let detail = rendered(&mut state, 80, 16);
+    assert!(detail.contains("当前目标"), "{detail}");
+    assert!(detail.contains("重新设计报价模型"), "{detail}");
+    assert!(
+        detail.contains("完整目标详情第1行：保留全部约束和验收条件"),
+        "the detail page must retain the unabridged objective: {detail}"
+    );
+    reduce(&mut state, key(KeyCode::PageDown));
+    let later = rendered(&mut state, 80, 16);
+    assert!(later.contains("完整目标详情第20行"), "{later}");
+    reduce(&mut state, key(KeyCode::Esc));
+    let workbench = rendered(&mut state, 80, 16);
+    assert!(workbench.contains("CodeLeveler"), "{workbench}");
+    assert!(!workbench.contains("← 当前目标"), "{workbench}");
+}
+
+#[test]
+fn clicking_the_header_goal_opens_the_same_detail_page() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let mut state = state();
+    submit(&mut state, "检查完整目标的点击入口");
+    let workbench = rendered(&mut state, 80, 12);
+    let header = workbench.lines().nth(1).expect("header row");
+    let goal_byte = header.find('◆').expect("goal affordance");
+    let goal_column = UnicodeWidthStr::width(&header[..goal_byte]) as u16 + 2;
+
+    reduce(
+        &mut state,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: goal_column,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+
+    let detail = rendered(&mut state, 80, 12);
+    assert!(detail.contains("← 当前目标"), "{detail}");
+    assert!(detail.contains("检查完整目标的点击入口"), "{detail}");
 }
 
 #[test]

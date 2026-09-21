@@ -35,7 +35,6 @@ mod observability;
 pub mod overlay;
 pub mod pending_inputs;
 mod plan_cell;
-mod plan_viewport;
 mod presentation;
 pub mod reducer;
 pub mod render;

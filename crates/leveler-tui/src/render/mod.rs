@@ -830,6 +830,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Shell => render_shell_screen(frame, area, state),
         Screen::Activity => render_activity_screen(frame, area, state),
         Screen::ActivityList => render_background_list_screen(frame, area, state),
+        Screen::Plan => render_plan_screen(frame, area, state),
+        Screen::Goal => render_goal_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
         Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
         Screen::Context => crate::context::render_context_screen(frame, area, state),
@@ -838,6 +840,185 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     if let Some(overlay) = &state.overlay {
         crate::overlay::render_overlay(frame, area, overlay, &state.theme, state.locale);
     }
+}
+
+fn render_goal_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let theme = &state.theme;
+    let t = state.t();
+    let page = crate::secondary::SecondaryPage {
+        title: t.goal_detail_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.goal_detail_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let lines = goal_detail_lines(state.active_goal.as_ref(), body.width as usize, theme, t);
+    render_scrolled(frame, body, state, lines);
+}
+
+fn goal_detail_lines(
+    goal: Option<&crate::active_goal::ActiveGoal>,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let Some(goal) = goal else {
+        return vec![Line::from(Span::styled(
+            t.activity_stale.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))];
+    };
+    let (phase, color) = match goal.phase() {
+        crate::active_goal::GoalPhase::Running => (t.goal_phase_running, theme.status.running),
+        crate::active_goal::GoalPhase::Paused => (t.goal_phase_paused, theme.status.warning),
+        crate::active_goal::GoalPhase::Resuming => (t.goal_phase_resuming, theme.status.info),
+        crate::active_goal::GoalPhase::Completed => (t.goal_phase_completed, theme.status.success),
+        crate::active_goal::GoalPhase::Failed => (t.goal_phase_failed, theme.status.error),
+    };
+    let elapsed =
+        crate::status_line::fmt_elapsed(goal.elapsed_at(std::time::Instant::now()).as_secs());
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} {phase}", goal.phase().glyph()),
+                Style::default().fg(color),
+            ),
+            Span::styled(
+                format!(" · {} {elapsed}", t.background_meta_elapsed),
+                Style::default().fg(theme.text.muted),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    let safe_objective = goal
+        .objective()
+        .split('\n')
+        .map(sanitize_terminal_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    lines.extend(
+        wrap(&safe_objective, width.max(1))
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, Style::default().fg(theme.text.primary)))),
+    );
+    lines
+}
+
+/// Full Plan page opened from the workbench's one-line summary. It reads the
+/// same active plan as the summary; if the turn settles while this page is
+/// open, the exact plan just archived in the transcript remains readable until
+/// the user returns.
+fn render_plan_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let theme = &state.theme;
+    let t = state.t();
+    let page = crate::secondary::SecondaryPage {
+        title: t.active_plan,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.plan_detail_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let plan = state.plan.as_ref().or_else(|| {
+        state
+            .transcript
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                crate::transcript::TranscriptItem::Plan(plan) => Some(plan),
+                _ => None,
+            })
+    });
+    let lines = plan_detail_lines(plan, body.width as usize, theme, t);
+    render_scrolled(frame, body, state, lines);
+}
+
+fn plan_detail_lines(
+    plan: Option<&leveler_client_protocol::UiPlan>,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let Some(plan) = plan else {
+        return vec![Line::from(Span::styled(
+            t.activity_stale.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))];
+    };
+    let (done, total) = crate::workbench::plan_done_total(plan);
+    let summary = t
+        .plan_n_done
+        .replace("{done}", &done.to_string())
+        .replace("{total}", &total.to_string());
+    let mut lines = vec![
+        Line::from(Span::styled(
+            summary,
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for step in &plan.steps {
+        let prefix = format!(
+            "{} {}. ",
+            crate::plan_cell::plan_glyph(step.status),
+            step.index + 1
+        );
+        let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+        let text_width = width.saturating_sub(prefix_width).max(1);
+        let wrapped = wrap(&step.description, text_width);
+        let glyph_style = match step.status {
+            leveler_client_protocol::PlanStepStatus::Running => {
+                Style::default().fg(theme.accent.primary)
+            }
+            leveler_client_protocol::PlanStepStatus::Done => {
+                Style::default().fg(theme.status.success)
+            }
+            leveler_client_protocol::PlanStepStatus::Failed => {
+                Style::default().fg(theme.status.error)
+            }
+            leveler_client_protocol::PlanStepStatus::Pending => {
+                Style::default().fg(theme.text.secondary)
+            }
+            leveler_client_protocol::PlanStepStatus::Skipped => {
+                Style::default().fg(theme.text.muted)
+            }
+        };
+        let text_style = if matches!(
+            step.status,
+            leveler_client_protocol::PlanStepStatus::Running
+                | leveler_client_protocol::PlanStepStatus::Failed
+        ) {
+            Style::default().fg(theme.text.primary)
+        } else {
+            Style::default().fg(theme.text.secondary)
+        };
+        for (index, row) in wrapped.into_iter().enumerate() {
+            if index == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.clone(), glyph_style),
+                    Span::styled(row, text_style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(prefix_width)),
+                    Span::styled(row, text_style),
+                ]));
+            }
+        }
+    }
+    lines
 }
 
 /// The `/remote` invite.
@@ -2133,10 +2314,12 @@ mod tests {
             nickname: "Newton".into(),
             role: String::new(),
             status: ToolStatus::Ok,
+            task: String::new(),
             detail: "done".into(),
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            settled_elapsed_secs: Some(0),
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             limit: None,
@@ -2170,12 +2353,14 @@ mod tests {
             nickname: "Euclid".into(),
             role: "explorer".into(),
             status: ToolStatus::Failed,
+            task: "Explore model providers".into(),
             detail:
                 "Reached the 6-round limit before finishing.\n\nLatest note: inspecting providers"
                     .into(),
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            settled_elapsed_secs: Some(0),
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             limit: None,
@@ -2212,6 +2397,7 @@ mod tests {
             nickname: "Euclid".into(),
             role: "explorer".into(),
             status: ToolStatus::Running,
+            task: "Explore model provider architecture".into(),
             detail: "Explore model provider architecture".into(),
             progress: crate::transcript::SubAgentProgress {
                 active: true,
@@ -2219,6 +2405,7 @@ mod tests {
             },
             recent_step: None,
             started_elapsed_secs: 0,
+            settled_elapsed_secs: None,
             contribution: crate::multi_agent::Contribution::Pending,
             stop: None,
             limit: None,
@@ -2492,13 +2679,16 @@ mod tests {
             );
         }
 
-        // Consecutive sub-agents aggregate into one tree: a parent header plus
-        // one ├─/└─ child per agent (nickname first).
+        // Conversation keeps one durable aggregate plus the delegated tasks;
+        // the bottom runtime panel owns live identities and state.
         let waiting = render_text(&mut state, 100, 28);
         assert!(waiting.contains("2 个 agents 正在运行"), "{waiting}");
-        assert!(waiting.contains("├─ Euclid"), "{waiting}");
-        assert!(waiting.contains("└─ Newton"), "{waiting}");
-        assert!(waiting.contains("等待执行"), "{waiting}");
+        assert!(waiting.contains("检查 provider 架构"), "{waiting}");
+        assert!(waiting.contains("检查协议适配层"), "{waiting}");
+        assert!(
+            waiting.contains("├─ Euclid"),
+            "live identity stays in the bottom panel: {waiting}"
+        );
 
         for (id, input, output, cached) in
             [("agent-1", 1_200, 80, 600), ("agent-2", 2_400, 160, 1_200)]
@@ -2516,10 +2706,11 @@ mod tests {
         }
 
         let active = render_text(&mut state, 100, 28);
-        assert!(active.contains("进行中"), "{active}");
-        assert!(
-            active.contains("↑ 3.6k · ↓ 240"),
-            "parent aggregates reported usage: {active}"
+        assert!(active.contains("3.8k tokens"), "{active}");
+        assert_eq!(
+            active.matches("3.8k tokens").count(),
+            2,
+            "durable conversation summary plus live bottom summary: {active}"
         );
     }
 
@@ -3089,10 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_plan_hides_finished_steps_and_shows_the_open_ones() {
-        // The panel is a summary, not a full checklist: finished steps drop
-        // out, so an eight-step plan with two open steps shows those two
-        // instead of one row per completed step.
+    fn a_long_plan_stays_one_summary_row_on_the_workbench() {
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.plan = Some(leveler_client_protocol::UiPlan {
@@ -3110,20 +3298,19 @@ mod tests {
         });
 
         let text = render_text(&mut s, 100, 40);
-        for index in 7..=8 {
-            assert!(text.contains(&format!("计划步骤{index}")), "{text}");
-        }
+        assert!(text.contains("已完成 6/8"), "{text}");
+        assert!(text.contains("进行中：计划步骤7 ↗"), "{text}");
         for index in 1..=6 {
             assert!(!text.contains(&format!("计划步骤{index}")), "{text}");
         }
         assert!(
-            !text.contains('⋯'),
-            "every open step fits, so no count row: {text}"
+            !text.contains("计划步骤8"),
+            "pending steps belong to the full plan page: {text}"
         );
     }
 
     #[test]
-    fn a_long_plan_in_a_short_terminal_keeps_the_running_step_and_says_what_is_hidden() {
+    fn a_long_plan_in_a_short_terminal_keeps_the_running_summary_and_link() {
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.plan = Some(leveler_client_protocol::UiPlan {
@@ -3146,9 +3333,10 @@ mod tests {
             "the running step survives: {text}"
         );
         assert!(
-            text.contains('⋯'),
-            "the hidden open steps must name their count: {text}"
+            text.contains("↗"),
+            "the full-plan affordance survives: {text}"
         );
+        assert!(text.contains("已完成 6/20"), "{text}");
         for index in 1..=6 {
             assert!(
                 !text.contains(&format!("计划步骤{index:02}")),

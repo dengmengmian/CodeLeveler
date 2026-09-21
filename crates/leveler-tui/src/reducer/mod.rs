@@ -539,6 +539,12 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     let footer_hit = state
         .background_footer_hit
         .is_some_and(|(row, x0, x1)| mouse.row == row && (x0..x1).contains(&mouse.column));
+    let plan_hit = state
+        .plan_hit
+        .is_some_and(|(row, x0, x1)| mouse.row == row && (x0..x1).contains(&mouse.column));
+    let goal_hit = state
+        .goal_hit
+        .is_some_and(|(row, x0, x1)| mouse.row == row && (x0..x1).contains(&mouse.column));
     let over_jump = point_in_rect(mouse.column, mouse.row, state.conv.scroll_bottom_rect);
 
     // 待发送 rows: hover reveals an item's actions; a click sends, deletes, or
@@ -606,6 +612,20 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
                 crate::activity::open_background_list(state);
+                return Vec::new();
+            }
+            if plan_hit {
+                state.workbench_focus = WorkbenchFocus::Plan;
+                interaction::clear_selection_drag(state);
+                state.conv.selection.clear();
+                screen_nav::open_plan_screen(state);
+                return Vec::new();
+            }
+            if goal_hit {
+                state.workbench_focus = WorkbenchFocus::Goal;
+                interaction::clear_selection_drag(state);
+                state.conv.selection.clear();
+                screen_nav::open_goal_screen(state);
                 return Vec::new();
             }
             if over_input {
@@ -974,6 +994,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Activity => {
             return crate::activity::open_selected(state);
         }
+        KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Plan => {
+            screen_nav::open_plan_screen(state);
+            return Vec::new();
+        }
+        KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Goal => {
+            screen_nav::open_goal_screen(state);
+            return Vec::new();
+        }
         // Background focus: Enter opens the aggregated jobs list. The list page
         // is what acknowledges the failures, so the badge clears on return.
         KeyCode::Enter if state.workbench_focus == WorkbenchFocus::Background => {
@@ -1073,6 +1101,36 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 WorkbenchFocus::Input => WorkbenchFocus::Conversation,
                 WorkbenchFocus::Conversation => {
+                    if crate::active_goal::has_visible_goal(state) {
+                        WorkbenchFocus::Goal
+                    } else if state
+                        .plan
+                        .as_ref()
+                        .is_some_and(crate::workbench::plan_panel_should_show)
+                    {
+                        WorkbenchFocus::Plan
+                    } else if !state.stoppable_commands().is_empty() {
+                        ensure_command_selection(state);
+                        WorkbenchFocus::Command
+                    } else {
+                        ensure_activity_focus(state)
+                    }
+                }
+                WorkbenchFocus::Goal => {
+                    if state
+                        .plan
+                        .as_ref()
+                        .is_some_and(crate::workbench::plan_panel_should_show)
+                    {
+                        WorkbenchFocus::Plan
+                    } else if !state.stoppable_commands().is_empty() {
+                        ensure_command_selection(state);
+                        WorkbenchFocus::Command
+                    } else {
+                        ensure_activity_focus(state)
+                    }
+                }
+                WorkbenchFocus::Plan => {
                     if !state.stoppable_commands().is_empty() {
                         ensure_command_selection(state);
                         WorkbenchFocus::Command
@@ -1186,10 +1244,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Down if popup_len == 0 => {
             state.composer.down();
             dismiss_suggestion_on_history_browse(state);
-        }
-        KeyCode::Char('p') if !ctrl && state.composer.is_empty() && !btw => {
-            // Toggle plan panel when not typing.
-            state.plan_collapsed = !state.plan_collapsed;
         }
         KeyCode::Char('a') if !ctrl && state.composer.is_empty() && !btw => {
             // Toggle collaboration surface density when not typing — the

@@ -662,16 +662,11 @@ mod tests {
             });
         }
         let t = crate::i18n::Locale::Zh.text();
-        let labels: Vec<String> = roster_rows(&team, None, 10, t)
+        let labels: Vec<String> = roster_rows(&team, 10, t)
             .into_iter()
-            .skip(1)
             .map(|r| r.label)
             .collect();
-        assert_eq!(
-            labels,
-            vec!["子 Agent · Euclid", "子 Agent · Newton", "子 Agent · Curie"],
-            "{labels:?}"
-        );
+        assert_eq!(labels, vec!["Euclid", "Newton", "Curie"], "{labels:?}");
 
         // One child of a role needs no disambiguation.
         let mut single = TaskTeamView::default();
@@ -691,12 +686,11 @@ mod tests {
             limit: None,
             started_elapsed_secs: 0,
         });
-        let labels: Vec<String> = roster_rows(&single, None, 10, t)
+        let labels: Vec<String> = roster_rows(&single, 10, t)
             .into_iter()
-            .skip(1)
             .map(|r| r.label)
             .collect();
-        assert_eq!(labels, vec![display_role("reviewer", t)], "{labels:?}");
+        assert_eq!(labels, vec!["Euclid"], "{labels:?}");
     }
 
     /// A settled team that lost a child must not wear the success mark.
@@ -1658,8 +1652,6 @@ pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<
 /// colors. Presentation-only — never persisted, never a lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterTone {
-    /// The coordinator/root row.
-    Main,
     /// A child actively working (or queued to work).
     Active,
     /// A child that settled successfully.
@@ -1675,13 +1667,12 @@ pub enum RosterTone {
 /// new state is added before the runtime supports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRosterRow {
-    pub glyph: &'static str,
     /// Localized identity: 主 Agent / 探索 Agent / …
     pub label: String,
     /// Current human-readable activity — structured runtime facts only
     /// (tool/background labels, task text), never reasoning.
     pub activity: String,
-    /// Right-aligned metadata: "4m09s · 168k", "4m09s", or absent.
+    /// Right-aligned elapsed time, or absent.
     pub meta: Option<String>,
     pub tone: RosterTone,
 }
@@ -1701,13 +1692,19 @@ pub fn name_the_workspace(text: &str, repository: &str) -> String {
     text.replace(repo, name)
 }
 
-/// Compact token figure for the roster meta column: `168k`, `9.4k`, `312`.
-/// No fake precision — one decimal only below 10k.
+/// Compact token figure for the team summary: `168k`, `29.9k`, `312`.
+/// No fake precision — one decimal only below 100k.
 pub fn fmt_tokens_compact(n: u32) -> String {
-    if n >= 10_000 {
+    if n >= 100_000 {
         format!("{}k", n / 1000)
     } else if n >= 1000 {
-        format!("{:.1}k", n as f64 / 1000.0)
+        let whole = n / 1000;
+        let frac = (n % 1000) / 100;
+        if frac == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{frac}k")
+        }
     } else {
         n.to_string()
     }
@@ -1719,114 +1716,89 @@ fn child_meta(view: &ChildAgentView, now_elapsed: u64) -> Option<String> {
             .unwrap_or(now_elapsed)
             .saturating_sub(view.started_elapsed_secs),
     );
-    let usage = view.input_tokens.saturating_add(view.output_tokens);
-    Some(if usage > 0 {
-        format!("{elapsed} · {}", fmt_tokens_compact(usage))
-    } else {
-        elapsed
-    })
+    Some(elapsed)
 }
 
-/// The child's current activity, by structured-source priority: the latest
-/// runtime tool/step label, then the task text, then a role-state fallback.
-/// Raw reasoning is not a source and never becomes one.
+/// The child's assigned task. Transient tool/step labels stay in the detail
+/// page so this summary does not jump from the user's intent to implementation
+/// noise such as `list_files`.
 fn child_activity(view: &ChildAgentView, t: &crate::i18n::UiText) -> String {
-    if matches!(view.status, ChildStatus::Running | ChildStatus::Waiting)
-        && let Some(step) = view.recent_step.as_deref().filter(|s| !s.trim().is_empty())
-    {
-        return step.trim().to_string();
-    }
     running_line(view, t)
 }
 
-/// Build the active agent runtime roster: Main first (the coordinator row —
-/// not a spawned child), then every child in spawn order; the renderer owns
-/// the cap. `main_activity` is the existing structured activity label;
-/// absence means the truthful fallback "正在工作", never invented detail.
+/// Build the active child roster. The aggregate header owns the coordinator
+/// state, so rows contain only the clickable children.
 pub fn roster_rows(
     team: &TaskTeamView,
-    main_activity: Option<&str>,
     now_elapsed: u64,
     t: &crate::i18n::UiText,
 ) -> Vec<AgentRosterRow> {
-    let mut rows = Vec::with_capacity(team.children.len() + 1);
-    rows.push(AgentRosterRow {
-        glyph: "●",
-        label: t.main_agent.to_string(),
-        activity: main_activity
-            .map(str::trim)
-            .filter(|a| !a.is_empty())
-            .unwrap_or(t.main_agent_working)
-            .to_string(),
-        meta: None,
-        tone: RosterTone::Main,
-    });
+    let mut rows = Vec::with_capacity(team.children.len());
     for child in &team.children {
-        let (glyph, tone, activity) = match child.status {
+        let (tone, activity) = match child.status {
             ChildStatus::Waiting | ChildStatus::Running => {
-                ("○", RosterTone::Active, child_activity(child, t))
+                (RosterTone::Active, child_activity(child, t))
             }
             ChildStatus::Completed => (
-                "✓",
                 RosterTone::Done,
                 contribution_line(child, t).unwrap_or_else(|| t.sub_agent_completed.to_string()),
             ),
             // Truth over comfort: an incomplete child never renders as ✓.
             ChildStatus::Failed => (
-                "!",
                 RosterTone::Failed,
                 stop_label(child.stop, t)
                     .map(str::to_string)
                     .unwrap_or_else(|| t.sub_agent_ended_incomplete.to_string()),
             ),
-            ChildStatus::Interrupted => {
-                ("⏸", RosterTone::Failed, t.sub_agent_interrupted.to_string())
-            }
-            ChildStatus::Unreported => {
-                ("?", RosterTone::Failed, t.sub_agent_unreported.to_string())
-            }
+            ChildStatus::Interrupted => (RosterTone::Failed, t.sub_agent_interrupted.to_string()),
+            ChildStatus::Unreported => (RosterTone::Failed, t.sub_agent_unreported.to_string()),
         };
         rows.push(AgentRosterRow {
-            glyph,
-            // A declarative agent is named for what it is; a built-in role
-            // spawn keeps its role's name.
-            label: child
-                .agent_name
-                .clone()
-                .unwrap_or_else(|| display_role(&child.role, t)),
+            label: if child.nickname.trim().is_empty() {
+                child
+                    .agent_name
+                    .clone()
+                    .unwrap_or_else(|| display_role(&child.role, t))
+            } else {
+                child_label(child.nickname.trim(), child.agent_name.as_deref())
+            },
             activity,
             meta: child_meta(child, now_elapsed),
             tone,
         });
     }
-    name_apart_rows_that_share_a_label(&mut rows, &team.children);
     rows
 }
 
-/// Add each child's own name to rows a role label alone cannot tell apart.
-///
-/// The roster names agents by role, which reads well until a turn spawns three
-/// children of one role: it printed "子 Agent" three times, one of them with a
-/// failed command, and nothing said whose. Only the ambiguous rows are
-/// extended, so the common shape is unchanged.
-fn name_apart_rows_that_share_a_label(rows: &mut [AgentRosterRow], children: &[ChildAgentView]) {
-    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for row in rows.iter().skip(1) {
-        *seen.entry(row.label.as_str()).or_default() += 1;
+/// Live aggregate shown above the clickable child rows.
+pub fn collaboration_runtime_line(
+    team: &TaskTeamView,
+    now_elapsed: u64,
+    t: &crate::i18n::UiText,
+) -> String {
+    let active = team.active().count();
+    if active == 0 {
+        return collaboration_compact_line(team, t);
     }
-    let repeated: std::collections::HashSet<String> = seen
-        .into_iter()
-        .filter(|(_, n)| *n > 1)
-        .map(|(label, _)| label.to_string())
-        .collect();
-    if repeated.is_empty() {
-        return;
+    let tokens = team.children.iter().fold(0u32, |sum, child| {
+        sum.saturating_add(child.input_tokens.saturating_add(child.output_tokens))
+    });
+    let started = team
+        .active()
+        .map(|child| child.started_elapsed_secs)
+        .min()
+        .unwrap_or(now_elapsed);
+    let mut line = t
+        .agents_running_header
+        .replacen("{}", &active.to_string(), 1);
+    if tokens > 0 {
+        line.push_str(&format!(" · {} tokens", fmt_tokens_compact(tokens)));
     }
-    for (row, child) in rows.iter_mut().skip(1).zip(children) {
-        if repeated.contains(&row.label) && !child.nickname.trim().is_empty() {
-            row.label = format!("{} · {}", row.label, child.nickname.trim());
-        }
-    }
+    line.push_str(&format!(
+        " · {}",
+        crate::status_line::fmt_elapsed(now_elapsed.saturating_sub(started))
+    ));
+    line
 }
 
 /// One line of the Task Team header.

@@ -778,9 +778,9 @@ fn sub_agent_lines(
 
 /// Render a run of consecutive sub-agent blocks as one inline tree: an
 /// aggregate header (◌ running / ✓ all done / ⚠ ended with failures) plus one
-/// `├─/└─` child per agent. A lone agent keeps the classic single-block
-/// rendering. Only data the blocks actually carry is shown (token usage);
-/// per-agent tool counts / wall time are not tracked, so they are not faked.
+/// durable task summary. A lone agent keeps the classic single-block
+/// rendering. Only data the blocks actually carry is shown; details remain on
+/// the live roster and its drill-down page.
 pub fn sub_agent_tree_lines(
     blocks: &[&crate::transcript::SubAgentBlock],
     theme: &Theme,
@@ -792,7 +792,7 @@ pub fn sub_agent_tree_lines(
     match blocks {
         [] => {}
         [single] => sub_agent_lines(single, theme, wrap_width, &mut out, t, now_elapsed_secs),
-        many => sub_agent_tree_group_lines(many, theme, &mut out, t, now_elapsed_secs),
+        many => sub_agent_tree_group_lines(many, theme, wrap_width, &mut out, t, now_elapsed_secs),
     }
     out
 }
@@ -810,6 +810,7 @@ fn sub_agent_elapsed(block: &crate::transcript::SubAgentBlock, now_elapsed_secs:
 fn sub_agent_tree_group_lines(
     blocks: &[&crate::transcript::SubAgentBlock],
     theme: &Theme,
+    wrap_width: usize,
     out: &mut Vec<Line<'static>>,
     t: &crate::i18n::UiText,
     now_elapsed_secs: u64,
@@ -839,7 +840,8 @@ fn sub_agent_tree_group_lines(
         )
     };
 
-    // Aggregate the token usage the runtime actually reports.
+    // Aggregate the token usage the runtime actually reports. The transcript
+    // keeps one durable step summary; the live roster owns per-agent state.
     let sum_in = blocks
         .iter()
         .fold(0u64, |acc, b| acc + u64::from(b.progress.input_tokens));
@@ -848,10 +850,30 @@ fn sub_agent_tree_group_lines(
         .fold(0u64, |acc, b| acc + u64::from(b.progress.output_tokens));
     let mut stats = String::new();
     if sum_in > 0 || sum_out > 0 {
+        let total = sum_in.saturating_add(sum_out);
         stats.push_str(&format!(
-            " · ↑ {} · ↓ {}",
-            crate::status_line::fmt_tokens_compact(u32::try_from(sum_in).unwrap_or(u32::MAX)),
-            crate::status_line::fmt_tokens_compact(u32::try_from(sum_out).unwrap_or(u32::MAX))
+            " · {} tokens",
+            crate::multi_agent::fmt_tokens_compact(u32::try_from(total).unwrap_or(u32::MAX))
+        ));
+    }
+    let started = blocks
+        .iter()
+        .map(|block| block.started_elapsed_secs)
+        .min()
+        .unwrap_or(now_elapsed_secs);
+    let settled = blocks
+        .iter()
+        .filter_map(|block| block.settled_elapsed_secs)
+        .max();
+    let end = if any_running {
+        now_elapsed_secs
+    } else {
+        settled.unwrap_or(now_elapsed_secs)
+    };
+    if end >= started && (any_running || settled.is_some()) {
+        stats.push_str(&format!(
+            " · {}",
+            crate::status_line::fmt_elapsed(end.saturating_sub(started))
         ));
     }
     // A finished-but-not-clean run breaks down how each agent ended.
@@ -886,79 +908,25 @@ fn sub_agent_tree_group_lines(
         Span::styled(stats, Style::default().fg(theme.text.muted)),
     ]));
 
-    // Children: nickname first, then the localized role name. Stats/status in
-    // a right column aligned on the widest name.
-    let names: Vec<String> = blocks
-        .iter()
-        .map(|b| {
-            let base = if b.nickname.trim().is_empty() {
-                sub_agent_display_name(b, t)
-            } else {
-                b.nickname.clone()
-            };
-            crate::multi_agent::child_label(&base, b.agent_name.as_deref())
-        })
-        .collect();
-    let name_w = names
-        .iter()
-        .map(|name| UnicodeWidthStr::width(name.as_str()))
-        .max()
-        .unwrap_or(0);
-    for (i, (block, name)) in blocks.iter().zip(&names).enumerate() {
-        let branch = if i + 1 == blocks.len() {
-            "└─"
-        } else {
-            "├─"
-        };
-        let mut spans = vec![
-            Span::styled(
-                format!("  {branch} "),
-                Style::default().fg(theme.border.normal),
-            ),
-            Span::styled(name.clone(), Style::default().fg(theme.text.primary)),
-        ];
-        // Only an imperfect run spells out each child's outcome; a fully
-        // successful batch shows usage stats instead of repeating "completed".
-        // While running, prefer the real recent tool/step when present.
-        let (right, right_color) = if block.status == ToolStatus::Running {
-            // Running children lead with their own elapsed time so the user can
-            // see each agent is alive and how long it has worked, then the real
-            // recent tool/step (or a plain running status when none yet).
-            let elapsed = sub_agent_elapsed(block, now_elapsed_secs);
-            let detail = block
-                .recent_step
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| sub_agent_tree_child_status(block, theme, t).0);
-            let text = match (elapsed.is_empty(), detail.is_empty()) {
-                (false, false) => format!("{elapsed} · {detail}"),
-                (false, true) => elapsed,
-                (true, false) => detail,
-                (true, true) => String::new(),
-            };
-            (text, theme.accent.primary)
-        } else if all_ok {
-            let usage = sub_agent_tree_child_usage(block);
-            if let Some(findings) = crate::multi_agent::contribution_line_for_block(block, t) {
-                let text = if usage.is_empty() {
-                    findings
-                } else {
-                    format!("{usage} · {findings}")
-                };
-                (text, theme.text.muted)
-            } else {
-                (usage, theme.text.muted)
-            }
-        } else {
-            sub_agent_tree_child_status(block, theme, t)
-        };
-        if !right.is_empty() {
-            let pad = name_w.saturating_sub(UnicodeWidthStr::width(name.as_str())) + 2;
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(right, Style::default().fg(right_color)));
+    let mut tasks: Vec<String> = Vec::new();
+    for block in blocks {
+        let task = block.task.trim();
+        if !task.is_empty() && !tasks.iter().any(|seen| seen == task) {
+            tasks.push(task.to_string());
         }
-        out.push(Line::from(spans));
+    }
+    if !tasks.is_empty() {
+        let separator = if std::ptr::eq(t, crate::i18n::Locale::En.text()) {
+            " · "
+        } else {
+            "、"
+        };
+        for row in wrap(&tasks.join(separator), wrap_width.saturating_sub(2).max(1)) {
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(row, Style::default().fg(theme.text.secondary)),
+            ]));
+        }
     }
 }
 
@@ -969,21 +937,9 @@ fn sub_agent_timed_out(block: &crate::transcript::SubAgentBlock, t: &crate::i18n
     crate::multi_agent::child_stop_label(block.stop, block.limit, t) == Some(t.agent_status_timeout)
 }
 
-/// Compact usage stats for one fully-succeeded tree child (`↑ 87.8k · ↓ 45.8k`).
-fn sub_agent_tree_child_usage(block: &crate::transcript::SubAgentBlock) -> String {
-    let usage = &block.progress;
-    if usage.input_tokens == 0 && usage.output_tokens == 0 {
-        return String::new();
-    }
-    format!(
-        "↑ {} · ↓ {}",
-        crate::status_line::fmt_tokens_compact(usage.input_tokens),
-        crate::status_line::fmt_tokens_compact(usage.output_tokens)
-    )
-}
-
 /// Status word for one tree child in a non-all-success batch. Running agents
 /// keep the waiting/running distinction; finished ones carry a ✓/✗ glyph.
+#[cfg(test)]
 fn sub_agent_tree_child_status(
     block: &crate::transcript::SubAgentBlock,
     theme: &Theme,
@@ -1559,6 +1515,7 @@ mod tests {
             agent_name: None,
             role: "explorer".into(),
             status,
+            task: "task".into(),
             detail: if status == ToolStatus::Failed {
                 "Reached the 6-round limit before finishing.".into()
             } else {
@@ -1567,6 +1524,7 @@ mod tests {
             progress: Default::default(),
             recent_step: None,
             started_elapsed_secs: 0,
+            settled_elapsed_secs: (status != ToolStatus::Running).then_some(0),
             expanded: false,
             contribution: crate::multi_agent::Contribution::Pending,
             // A failed fixture child was stopped by its wall clock — typed, as
@@ -1668,7 +1626,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_agent_tree_shows_recent_tool_step_while_running() {
+    fn sub_agent_tree_keeps_tasks_instead_of_live_tool_steps() {
         let theme = Theme::default();
         let t = Locale::Zh.text();
         let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
@@ -1679,8 +1637,11 @@ mod tests {
         b.recent_step = Some("grep ✓".into());
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("list_files"), "{text}");
-        assert!(text.contains("grep ✓"), "{text}");
+        assert!(text.contains("task"), "{text}");
+        assert!(
+            !text.contains("list_files") && !text.contains("grep ✓"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1697,15 +1658,16 @@ mod tests {
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("◌ 2 个 agents 正在运行"), "{text}");
-        assert!(text.contains("↑ 3.6k · ↓ 240"), "{text}");
-        assert!(text.contains("├─ Euclid"), "{text}");
-        assert!(text.contains("└─ Newton"), "{text}");
-        assert!(text.contains("进行中"), "{text}");
-        assert!(text.contains("等待执行"), "{text}");
+        assert!(text.contains("3.8k tokens"), "{text}");
+        assert!(text.contains("task"), "{text}");
+        assert!(
+            !text.contains("├─ Euclid") && !text.contains("└─ Newton"),
+            "conversation keeps one durable step summary, not the live roster: {text}"
+        );
     }
 
     #[test]
-    fn running_sub_agents_show_their_own_elapsed_time() {
+    fn running_sub_agents_show_the_batch_elapsed_time() {
         let theme = Theme::default();
         let t = Locale::Zh.text();
         let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
@@ -1715,8 +1677,11 @@ mod tests {
         // Turn is now 15s in: Euclid has run 12s, Newton 5s.
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 15);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("12s"), "Euclid elapsed missing: {text}");
-        assert!(text.contains("5s"), "Newton elapsed missing: {text}");
+        assert!(text.contains("12s"), "batch elapsed missing: {text}");
+        assert!(
+            !text.contains("5s"),
+            "per-agent time belongs to the live panel: {text}"
+        );
     }
 
     #[test]
@@ -1729,9 +1694,8 @@ mod tests {
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("✓ 2 个 agents 完成"), "{text}");
-        assert!(text.contains("├─ Euclid"), "{text}");
-        assert!(text.contains("↑ 87k"), "{text}");
-        assert!(!text.contains("└─ Newton  已完成"), "{text}");
+        assert!(text.contains("87.8k tokens"), "{text}");
+        assert!(!text.contains("├─ Euclid"), "{text}");
     }
 
     #[test]
@@ -1744,9 +1708,10 @@ mod tests {
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("⚠ 2 个 agents 结束"), "{text}");
         assert!(text.contains("1 已完成 · 1 超时"), "{text}");
-        assert!(text.contains("├─ Euclid"), "{text}");
-        assert!(text.contains("✓ 已完成"), "{text}");
-        assert!(text.contains("✗ 超时"), "{text}");
+        assert!(
+            !text.contains("├─ Euclid") && !text.contains("✗ 超时"),
+            "{text}"
+        );
     }
 
     /// The termination label is the shared `ChildStop + ChildLimit` mapping,
@@ -1860,7 +1825,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("1 超时"), "{text}");
-        assert!(text.contains("✗ 超时"), "{text}");
+        assert!(
+            !text.contains("✗ 超时"),
+            "per-agent outcome belongs to the live panel: {text}"
+        );
     }
 
     #[test]

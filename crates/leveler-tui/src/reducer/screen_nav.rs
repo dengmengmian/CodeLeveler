@@ -235,6 +235,20 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
             _ => {}
         },
+        Screen::Plan => {
+            if key.code == KeyCode::Esc {
+                close_screen(state);
+            } else {
+                scroll_screen_key(state, &key, true);
+            }
+        }
+        Screen::Goal => {
+            if key.code == KeyCode::Esc {
+                close_screen(state);
+            } else {
+                scroll_screen_key(state, &key, true);
+            }
+        }
         Screen::Help => {
             if key.code == KeyCode::Esc {
                 close_screen(state);
@@ -339,6 +353,24 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         Screen::Conversation => {}
     }
     Vec::new()
+}
+
+pub(super) fn open_plan_screen(state: &mut AppState) {
+    if state
+        .plan
+        .as_ref()
+        .is_some_and(crate::workbench::plan_panel_should_show)
+    {
+        state.active_screen = Screen::Plan;
+        state.screen_scroll = 0;
+    }
+}
+
+pub(super) fn open_goal_screen(state: &mut AppState) {
+    if crate::active_goal::has_visible_goal(state) {
+        state.active_screen = Screen::Goal;
+        state.screen_scroll = 0;
+    }
 }
 
 /// Return to the conversation, dropping the view's scroll offset.

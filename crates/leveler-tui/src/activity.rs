@@ -3,12 +3,16 @@
 //! Presentation only. Lifecycle stays on the runtime events already applied
 //! to [`AppState`]. This module does not schedule, cancel, or persist work.
 
+#[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
 use crate::i18n::UiText;
 use crate::multi_agent::ChildStatus;
+#[cfg(test)]
 use crate::render::truncate_display;
 use crate::state::{AppState, BackgroundTaskChrome};
+#[cfg(test)]
 use crate::status_line::fmt_elapsed;
 
 /// Compact status-strip cap: how many ACTIVITIES are shown. Remaining stay
@@ -174,9 +178,11 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
 
 /// Blank columns before a child row's task line: aligned under the identity,
 /// past `→ ` (2) plus the status glyph and its space (2).
+#[cfg(test)]
 const CHILD_TASK_INDENT: &str = "    ";
 
 /// One physical line of the status-strip activity block.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActivityRow {
     pub text: String,
@@ -193,6 +199,7 @@ pub(crate) struct ActivityRow {
 ///
 /// The duration and `↗` sit directly after the identity; they are part of the
 /// identity group, never right-aligned to the terminal edge.
+#[cfg(test)]
 pub(crate) fn compact_row(summary: &ActivitySummary, selected: bool, width: usize) -> String {
     let glyph = activity_glyph(summary.status);
     let dur = fmt_elapsed(summary.duration_secs);
@@ -218,6 +225,7 @@ pub(crate) fn compact_row(summary: &ActivitySummary, selected: bool, width: usiz
 /// The semantic title is preferred. A child recorded before titles existed
 /// falls back to the first line of its purpose: a plain projection of the
 /// text the runtime recorded, not a semantic title.
+#[cfg(test)]
 fn child_task_line(summary: &ActivitySummary, width: usize) -> Option<String> {
     if summary.kind != ActivityKind::ChildAgent {
         return None;
@@ -472,6 +480,7 @@ pub(crate) fn open_list_selected(state: &mut AppState) -> Vec<crate::action::Eff
 /// page, so a long-lived process never occupies a row in the conversation
 /// body. When the agent is actively waiting on a task, `wait_status` still
 /// names it — that is main execution state, not the background summary.
+#[cfg(test)]
 pub(crate) fn status_activity_lines(
     state: &AppState,
     width: usize,
