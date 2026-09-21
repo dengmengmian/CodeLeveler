@@ -318,7 +318,7 @@ fn a_backgrounded_command_says_it_started_not_that_it_finished() {
     );
     let rows = plain(&s);
     assert!(
-        rows.iter().any(|r| r.contains("已转入后台")),
+        rows.iter().any(|r| r.contains("后台运行")),
         "the row says it started: {rows:?}"
     );
     assert!(

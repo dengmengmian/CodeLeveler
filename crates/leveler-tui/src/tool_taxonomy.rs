@@ -12,7 +12,9 @@ use crate::i18n::Locale;
 /// exploration noise, keep short normal progress, and emphasize writes/runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityVisibility {
-    /// Do not enter Conversation (file scans, path enumeration, existence probes).
+    /// Do not enter Conversation while it succeeds: file scans, path
+    /// enumeration, existence probes, and runtime task scheduling (waiting on
+    /// or polling a background task). A failure is always shown.
     Silent,
     /// Compact per-call progress unit (reads/searches) — one three-line unit each.
     Normal,
@@ -194,13 +196,17 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         read_only_default: true,
         visibility: ActivityVisibility::Normal,
     },
+    // Task management is runtime scheduling of one user-visible entity (the
+    // background task itself, shown in the footer and its detail page). The
+    // poll/wait that manages it is not a separate user activity, so it stays
+    // out of Conversation. A refused/missing task still surfaces as Failed.
     ToolTaxonomyEntry {
         name: "get_task",
         kind: ToolKind::Execute,
         presentation_en: "Get Task",
         presentation_zh: "任务状态",
         read_only_default: true,
-        visibility: ActivityVisibility::Normal,
+        visibility: ActivityVisibility::Silent,
     },
     ToolTaxonomyEntry {
         name: "wait_task",
@@ -208,7 +214,7 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         presentation_en: "Waiting for background task",
         presentation_zh: "等待后台任务",
         read_only_default: true,
-        visibility: ActivityVisibility::Important,
+        visibility: ActivityVisibility::Silent,
     },
     ToolTaxonomyEntry {
         name: "kill_task",
@@ -748,6 +754,24 @@ mod tests {
             "src/a.rs".to_string()
         });
         assert_eq!(edit, "!  编辑文件  src/a.rs");
+    }
+
+    /// Managing a background task is runtime scheduling, not user activity:
+    /// the task itself is the entity (footer + detail). Polling/waiting stays
+    /// out of Conversation, while stopping it (a user action) stays in.
+    #[test]
+    fn background_task_management_is_silent_except_stopping() {
+        for name in ["wait_task", "get_task"] {
+            assert_eq!(
+                activity_visibility(name, r#"{"task_id":"bg-1"}"#),
+                ActivityVisibility::Silent,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            activity_visibility("kill_task", r#"{"task_id":"bg-1"}"#),
+            ActivityVisibility::Important
+        );
     }
 
     #[test]

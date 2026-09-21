@@ -98,7 +98,7 @@ Manual update:
 ```sh
 leveler update            # install the latest stable release
 leveler update --check    # exit 2 when an update exists
-leveler update --version v1.0.2
+leveler update --version v1.0.3
 ```
 
 Inside the TUI:

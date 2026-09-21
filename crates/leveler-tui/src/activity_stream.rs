@@ -4643,23 +4643,102 @@ mod tests {
     }
 
     /// The runtime's preview is capped (it ends in "…" when cut), so its line
-    /// count is only a lower bound. Dogfood: a 130-line wait_task result read
-    /// "91 行".
+    /// count is only a lower bound. Dogfood: a 130-line result read "91 行".
     #[test]
     fn a_truncated_preview_reports_its_size_as_a_lower_bound() {
-        let mut c = call("wait_task", r#"{"task_id":"bg-1"}"#, ToolStatus::Ok);
+        let mut c = call("grep", r#"{"pattern":"soak","path":"."}"#, ToolStatus::Ok);
         let body: Vec<String> = (1..=91).map(|i| format!("soak tick {i}")).collect();
         c.preview = Some(format!("{}…", body.join("\n")));
         let joined = render_group_text(&group(vec![c]), 120, Locale::Zh).join("\n");
         assert!(joined.contains("91+ 行"), "{joined}");
 
-        let mut whole = call("wait_task", r#"{"task_id":"bg-1"}"#, ToolStatus::Ok);
+        let mut whole = call("grep", r#"{"pattern":"soak","path":"."}"#, ToolStatus::Ok);
         whole.preview = Some("a\nb\nc".into());
         let joined = render_group_text(&group(vec![whole]), 120, Locale::Zh).join("\n");
         assert!(
             joined.contains("3 行") && !joined.contains("3+ 行"),
             "{joined}"
         );
+    }
+
+    /// Runtime scheduling of a background task is not a Conversation event:
+    /// `wait_task`/`get_task` manage one user-visible task (footer + detail)
+    /// without claiming a row of their own, however often the runtime polls.
+    #[test]
+    fn background_task_polling_never_claims_a_conversation_row() {
+        let wait = call(
+            "wait_task",
+            r#"{"task_id":"bg-1","timeout_seconds":120}"#,
+            ToolStatus::Ok,
+        );
+        assert!(
+            render_group_text(&group(vec![wait]), 120, Locale::Zh).is_empty(),
+            "a wait that only reports the task is still running is not activity"
+        );
+
+        // Repeated waits against several tasks still add nothing: the
+        // timeline has no per-invocation entity to accumulate.
+        let polls: Vec<ToolCallBlock> = [
+            ("wait_task", "bg-1"),
+            ("wait_task", "bg-1"),
+            ("wait_task", "bg-2"),
+            ("get_task", "bg-1"),
+            ("get_task", "bg-2"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (name, task))| {
+            let mut c = call(
+                name,
+                &format!(r#"{{"task_id":"{task}","timeout_seconds":120}}"#),
+                ToolStatus::Ok,
+            );
+            c.id = ToolCallId::new(format!("p{i}"));
+            c.duration_ms = Some(120_000);
+            c.preview = Some("task_id: bg\nstatus: running".into());
+            c
+        })
+        .collect();
+        assert!(
+            render_group_text(&group(polls), 120, Locale::Zh).is_empty(),
+            "repeated polling of several background tasks adds no rows"
+        );
+    }
+
+    /// The poll is hidden, but the failure it reports is not: a background task
+    /// that exited non-zero must still reach the user.
+    #[test]
+    fn a_failed_background_wait_still_reports_the_task_failure() {
+        let mut wait = call(
+            "wait_task",
+            r#"{"task_id":"bg-1","timeout_seconds":120}"#,
+            ToolStatus::Failed,
+        );
+        wait.preview = Some("task_id: bg-1\nstatus: exited\nexit_code: 1".into());
+        let rows = render_group_text(&group(vec![wait]), 120, Locale::Zh);
+        assert!(!rows.is_empty(), "a failed wait must not vanish: {rows:?}");
+        assert!(rows[0].contains("等待后台任务"), "{rows:?}");
+        assert!(rows[0].contains('\u{2717}'), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("bg-1")),
+            "the task failure detail is still reachable: {rows:?}"
+        );
+    }
+
+    /// The background policy never reaches a foreground tool.
+    #[test]
+    fn foreground_tools_remain_in_the_conversation() {
+        let grep = call("grep", r#"{"pattern":"foo","path":"."}"#, ToolStatus::Ok);
+        assert!(!render_group_text(&group(vec![grep]), 120, Locale::Zh).is_empty());
+
+        let mut run = call(
+            "run_command",
+            r#"{"program":"make","args":["status"]}"#,
+            ToolStatus::Ok,
+        );
+        run.duration_ms = Some(200);
+        let rows = render_group_text(&group(vec![run]), 120, Locale::Zh);
+        assert!(rows.iter().any(|r| r.contains("make status")), "{rows:?}");
     }
 
     #[test]

@@ -391,3 +391,126 @@ fn visual_disclosure_matrix() {
     println!("\n╔══════ V11/V12 running tool + busy 100x24 ══════╗");
     print!("{}", screen_dump(&mut live, 100, 24));
 }
+
+/// Dogfood: a background command's whole lifecycle through the real reducer.
+/// The Conversation shows the task ENTITY once and the footer keeps the live
+/// task, while the runtime's repeated wait/poll of that same task never claims
+/// a Conversation row. Run on demand:
+///   cargo test -p leveler-tui --test visual_dump -- --ignored --nocapture
+#[test]
+#[ignore = "manual visual harness; run with --ignored --nocapture"]
+fn visual_background_timeline() {
+    let mut s = opened();
+    s.transcript
+        .push_user("库已重建为空库。现在重跑 make up。".into());
+
+    // The agent starts `make up` in the background.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("bg"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"make","args":["up"],"background":true}"#.into(),
+            parallel: false,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("bg"),
+            ok: true,
+            preview: "background task started\ntask_id: bg-1\nstatus: running".into(),
+            duration_ms: 18,
+            applied_diff: None,
+            exit_code: Some(0),
+            stop: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "bg-1".into(),
+            program: "make".into(),
+            args: vec!["up".into()],
+        }),
+    );
+
+    // The runtime waits and polls the SAME task three times; it keeps running.
+    for (i, (name, preview)) in [
+        (
+            "wait_task",
+            "task_id: bg-1\nstatus: running\n--- log ---\nbuilding...",
+        ),
+        (
+            "wait_task",
+            "task_id: bg-1\nstatus: running\n--- log ---\nbuilding...\nready",
+        ),
+        ("get_task", "task_id: bg-1\nstatus: running"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = ToolCallId::new(format!("p{i}"));
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: id.clone(),
+                name: (*name).into(),
+                arguments: r#"{"task_id":"bg-1","timeout_seconds":120}"#.into(),
+                parallel: false,
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                id,
+                ok: true,
+                preview: (*preview).into(),
+                duration_ms: 120_000,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            }),
+        );
+    }
+
+    println!("\n╔══════ background timeline (still running) 100x30 ══════╗");
+    let dump = screen_dump(&mut s, 100, 30);
+    print!("{dump}");
+    assert!(
+        dump.contains("后台运行"),
+        "the background task entry is shown once: {dump}"
+    );
+    assert!(
+        !dump.contains("等待后台任务"),
+        "three wait/poll calls claim no Conversation row: {dump}"
+    );
+    assert!(dump.contains("make up"), "the task is named: {dump}");
+
+    // The task finishes: the terminal fact is history, the entry stays
+    // reopenable from the footer/detail.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "bg-1".into(),
+            exit_code: Some(0),
+            duration_ms: 192_000,
+            ok: true,
+            stopped: false,
+            output: "all services up".into(),
+        }),
+    );
+    println!("\n╔══════ background timeline (exited) 100x30 ══════╗");
+    let dump = screen_dump(&mut s, 100, 30);
+    print!("{dump}");
+    assert!(
+        !dump.contains("等待后台任务"),
+        "no wait row appears after exit: {dump}"
+    );
+    assert!(
+        s.background_task_labels
+            .get("bg-1")
+            .is_some_and(|c| !c.is_running() && c.ok == Some(true)),
+        "the terminal task detail is retained for reopening"
+    );
+}

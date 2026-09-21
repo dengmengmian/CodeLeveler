@@ -279,6 +279,112 @@ fn replayed_background_lifecycle_is_history_and_cannot_replace_live_activity() {
     );
 }
 
+/// A reopened session must not resurrect the runtime's wait/poll rows. They
+/// are hidden by the same taxonomy the live view uses: durable history keeps
+/// the wait calls, the conversation does not show them — nor does it lose the
+/// background task entry they manage.
+#[test]
+fn a_replayed_session_hides_background_wait_polls() {
+    let events = vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "重跑 make up"),
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("bg"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"make","args":["up"],"background":true}"#.into(),
+            parallel: false,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("bg"),
+            ok: true,
+            preview: "background task started\ntask_id: t-1\nstatus: running".into(),
+            duration_ms: 12,
+            applied_diff: None,
+            exit_code: Some(0),
+            stop: None,
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("w1"),
+            name: "wait_task".into(),
+            arguments: r#"{"task_id":"t-1","timeout_seconds":120}"#.into(),
+            parallel: false,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("w1"),
+            ok: true,
+            preview: "task_id: t-1\nstatus: running".into(),
+            duration_ms: 120_000,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("w2"),
+            name: "get_task".into(),
+            arguments: r#"{"task_id":"t-1"}"#.into(),
+            parallel: false,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("w2"),
+            ok: true,
+            preview: "task_id: t-1\nstatus: running".into(),
+            duration_ms: 5,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+        RuntimeEvent::TurnAnswered,
+    ];
+
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+
+    let mut replayed = state();
+    let effects = open(&mut replayed, vec![message(UiRole::User, "重跑 make up")]);
+    let entries: Vec<UiHistoryEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    let rows = |s: &AppState| -> Vec<String> {
+        crate::conversation::build::build_conversation_lines(s, 100)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .map(|l| l.trim_end().to_string())
+            .collect()
+    };
+    for (name, s) in [("live", &live), ("replayed", &replayed)] {
+        let lines = rows(s);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("make up") && l.contains("后台运行")),
+            "{name} keeps the background start entry: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("等待后台任务")),
+            "{name} shows no wait/poll rows: {lines:#?}"
+        );
+        // Hidden is presentation only: the durable transcript still has all
+        // three calls, so nothing was dropped from persistence/replay.
+        assert_eq!(s.transcript.tool_calls().len(), 3, "{name}");
+    }
+}
+
 #[test]
 fn a_stale_or_foreign_history_answer_is_ignored() {
     let mut s = state();

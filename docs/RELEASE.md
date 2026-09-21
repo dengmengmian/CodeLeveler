@@ -1,28 +1,18 @@
-# CodeLeveler 1.0.2
+# CodeLeveler 1.0.3
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-A feature and compatibility release on top of 1.0.1. Installed stable builds pick it up automatically, or run `leveler update` / `/update`.
-
-## Added
-
-- First-class Zhipu BigModel Coding Plan setup for `glm-5.3` and `glm-5.3-flash`, including reasoning, vision and 1M-context model profiles
-- Current DeepSeek profiles for `deepseek-flash` and `deepseek-v4-pro`, with vision and parallel-tool capabilities where supported
-- A unified skills registry, skill inspection and guarded skill-authoring workflow
-- Background activity, detail and plan views in the TUI
-- Durable semantic memory extraction with bounded reasoning, asynchronous batching and lifecycle recovery
+A focused TUI usability release on top of 1.0.2. Installed stable builds pick it up automatically, or run `leveler update` / `/update`.
 
 ## Changed
 
-- Session continuation, cancel and resume now share one explicit runtime protocol across the CLI, TUI, host and remote-control surfaces
-- `leveler login` and the default `leveler init` path write complete built-in model capabilities instead of generic placeholders
-- The retired `deepseek-v4-flash` configuration is replaced by `deepseek-flash`
+- Successful `wait_task` and `get_task` polling no longer adds repeated rows to Conversation; the background task remains represented once by its command row, footer and detail view
+- Background command status now reads “running in background” / “后台运行” to describe the live state directly
 
 ## Fixed
 
-- DeepSeek thinking-mode conversations now return `reasoning_content` for every historical assistant message when tools are present, preventing multi-turn tool requests from being rejected
-- DeepSeek forced tool choices disable thinking without silently dropping an explicitly supplied temperature
-- Dynamic DeepSeek peak/off-peak and cache pricing is no longer represented as an inaccurate static USD price
+- Failed background task waits remain visible with their task details instead of being hidden with successful scheduling polls
+- Replayed sessions use the same background polling visibility rules as live sessions without dropping durable tool-call history
 
 ## Known limits
 
