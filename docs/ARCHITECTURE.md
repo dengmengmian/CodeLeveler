@@ -671,6 +671,8 @@ Terminal (TaskFinished)
 
 Once the authoritative result is committed, the Product must publish the user-visible terminal immediately. Only work already detached to an immutable task/run identity may continue afterward; it must not delay terminal visibility or move a client back into a running state. Session-scoped cleanup must snapshot its exact resource ids before publication. A continuation checkpoint belongs to the authoritative window boundary and is committed before `TaskFinished`, because letting it re-read “current session” afterward could absorb the next turn; failure to create that checkpoint fails the window instead of claiming it is safely resumable. A review configured as required is also completion evidence: it runs for each product-mutating turn, and failure to complete it or reported model findings produce completion warnings separate from project verification. Findings remain advisory model conclusions, not mechanical verification verdicts; an advisory review must not block.
 
+A background process chooses its cleanup boundary explicitly when it starts. The default `goal` lifetime is reaped when its creating goal reaches a terminal state. Only an explicit user request for a server or watcher to remain alive after task completion selects the `runtime` lifetime. Both retain the creating session as owner and remain observable and stoppable through the same background-task interface; `runtime` skips only goal-terminal cleanup and is still settled on process exit, explicit stop, or runtime shutdown.
+
 ### 10.5 Verification Observation and Gate Disposition Are Separate Facts
 
 Each verification check records at least:

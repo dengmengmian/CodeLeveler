@@ -18,7 +18,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use leveler_execution::{
-    ArtifactStore, BackgroundTaskRegistry, MutationBaseline, ProcessRequest, WorkspaceSnapshot,
+    ArtifactStore, BackgroundTaskLifetime, BackgroundTaskRegistry, MutationBaseline,
+    ProcessRequest, WorkspaceSnapshot,
 };
 
 use crate::tool::{ToolContext, ToolError, ToolOutput};
@@ -56,6 +57,7 @@ impl CommandExecution {
         program: &str,
         args: Vec<String>,
         cwd_rel: Option<&str>,
+        lifetime: BackgroundTaskLifetime,
         context: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
         let reg = &self.background_tasks;
@@ -116,16 +118,25 @@ impl CommandExecution {
         }
 
         let req = Self::background_process_request(program, args.clone(), cwd, &context);
-        // Session-owned: reaped when this session's goal reaches terminal state
-        // or the daemon shuts down (R004 F7). Daemon-scoped spawning is reserved
-        // for runtime-internal services, not agent tool calls.
+        // Always session-owned so the creator can observe and stop it. Lifetime
+        // decides whether goal terminal cleanup includes it; daemon-scoped
+        // spawning remains reserved for runtime-internal services.
         match reg
-            .spawn_owned(req, mutation_baseline, Some(context.session_scope()))
+            .spawn_owned_with_lifetime(
+                req,
+                mutation_baseline,
+                Some(context.session_scope()),
+                lifetime,
+            )
             .await
         {
             Ok(task_id) => Ok(ToolOutput::ok(format!(
                 "background task started\ntask_id: {task_id}\nprogram: {program}\nargs: {args:?}\n\
-             status: running\nUse get_task/wait_task/kill_task with this task_id."
+             status: running\nlifetime: {}\nUse get_task/wait_task/kill_task with this task_id.",
+                match lifetime {
+                    BackgroundTaskLifetime::Goal => "goal",
+                    BackgroundTaskLifetime::Runtime => "runtime",
+                }
             ))),
             Err(e) => Ok(ToolOutput::error(format!("background spawn failed: {e}"))),
         }

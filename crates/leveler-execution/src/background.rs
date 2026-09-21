@@ -73,6 +73,19 @@ pub enum BackgroundTaskStatus {
     Killed,
 }
 
+/// How long the runtime retains ownership of a background process.
+///
+/// Both variants remain owned and observable by the creating session. The
+/// difference is only whether a successful goal terminal is a cleanup boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundTaskLifetime {
+    /// Default: stop the process when the creating goal reaches a terminal state.
+    Goal,
+    /// Keep the process until it exits, is explicitly stopped, or the runtime
+    /// shuts down. Intended for user-requested dev servers and watchers.
+    Runtime,
+}
+
 impl BackgroundTaskStatus {
     fn is_active(self) -> bool {
         matches!(self, Self::Running | Self::Killing)
@@ -158,9 +171,10 @@ impl Drop for KillOnDrop {
 struct TaskInner {
     id: String,
     /// Which session started this task, when known. Daemon-scoped tasks have
-    /// no owner; session-owned tasks are reaped when their session's goal
-    /// reaches a terminal state or the daemon shuts down (R004 F7).
+    /// no owner. Session-owned task cleanup follows `lifetime`; runtime shutdown
+    /// reaps every remaining task regardless of lifetime (R004 F7).
     owner_scope: Option<String>,
+    lifetime: BackgroundTaskLifetime,
     program: String,
     args: Vec<String>,
     cwd: PathBuf,
@@ -347,6 +361,25 @@ impl BackgroundTaskRegistry {
         mutation_baseline: Option<MutationBaseline>,
         owner_scope: Option<&str>,
     ) -> Result<String, String> {
+        self.spawn_owned_with_lifetime(
+            request,
+            mutation_baseline,
+            owner_scope,
+            BackgroundTaskLifetime::Goal,
+        )
+        .await
+    }
+
+    /// Spawn an owned task with an explicit cleanup boundary. Runtime-lived
+    /// tasks retain their session owner so list/logs/stop keep working after
+    /// the goal that created them has completed.
+    pub async fn spawn_owned_with_lifetime(
+        &self,
+        request: ProcessRequest,
+        mutation_baseline: Option<MutationBaseline>,
+        owner_scope: Option<&str>,
+        lifetime: BackgroundTaskLifetime,
+    ) -> Result<String, String> {
         let (id, mut reservation) = {
             let mut st = self.inner.lock().await;
             prune_terminal_tasks(&mut st);
@@ -403,6 +436,7 @@ impl BackgroundTaskRegistry {
             TaskInner {
                 id: id.clone(),
                 owner_scope: owner_scope.map(str::to_string),
+                lifetime,
                 program: request.program.clone(),
                 args: request.args.clone(),
                 cwd: request.cwd.clone(),
@@ -747,9 +781,21 @@ impl BackgroundTaskRegistry {
     /// to an in-memory snapshot; process signalling happens only when the
     /// caller settles the ticket later.
     pub async fn detach_cleanup(&self, scope: &str) -> BackgroundCleanupTicket {
+        let ids = {
+            let st = self.inner.lock().await;
+            st.tasks
+                .values()
+                .filter(|task| {
+                    task.owner_scope.as_deref() == Some(scope)
+                        && task.lifetime == BackgroundTaskLifetime::Goal
+                        && !task.status.is_terminal()
+                })
+                .map(|task| task.id.clone())
+                .collect()
+        };
         BackgroundCleanupTicket {
             registry: self.clone(),
-            ids: self.active_ids_for_scope(scope).await,
+            ids,
         }
     }
 
@@ -1264,6 +1310,7 @@ mod tests {
                 TaskInner {
                     id,
                     owner_scope: None,
+                    lifetime: BackgroundTaskLifetime::Goal,
                     program: "true".into(),
                     args: Vec::new(),
                     cwd: PathBuf::new(),
@@ -1293,6 +1340,7 @@ mod tests {
                 TaskInner {
                     id: id.into(),
                     owner_scope: None,
+                    lifetime: BackgroundTaskLifetime::Goal,
                     program: "sleep".into(),
                     args: Vec::new(),
                     cwd: PathBuf::new(),
@@ -1337,6 +1385,7 @@ mod tests {
         let mut task = TaskInner {
             id: "done".into(),
             owner_scope: None,
+            lifetime: BackgroundTaskLifetime::Goal,
             program: "true".into(),
             args: Vec::new(),
             cwd: PathBuf::new(),

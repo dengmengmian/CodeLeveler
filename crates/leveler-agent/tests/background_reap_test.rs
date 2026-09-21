@@ -139,6 +139,22 @@ fn spawn_sleep_server() -> ModelResponse {
     )
 }
 
+/// A long-lived process the user explicitly asked the project runtime to keep
+/// after the current goal reaches its terminal state.
+fn spawn_runtime_sleep_server() -> ModelResponse {
+    let (program, args) = leveler_test_support::sleep_command(300);
+    tool_call(
+        "bg-runtime",
+        "run_command",
+        serde_json::json!({
+            "program": program,
+            "args": args,
+            "background": true,
+            "background_lifetime": "runtime"
+        }),
+    )
+}
+
 /// The same long-lived process as a direct [`ProcessRequest`].
 fn sleep_request(cwd: &std::path::Path) -> ProcessRequest {
     let (program, args) = leveler_test_support::sleep_command(300);
@@ -310,6 +326,42 @@ async fn direct_run_terminal_reaps_session_owned_background_tasks() {
 
     assert_terminal_within(&h.registry, "bg-1", "direct path").await;
     assert_eq!(h.registry.kill_scope(SESSION_SCOPE).await, 0);
+}
+
+/// A user can explicitly ask a dev server to outlive the goal that launched
+/// it. It remains session-addressable for list/logs/stop, but terminal cleanup
+/// must not reap it; runtime shutdown still owns the final cleanup.
+#[tokio::test]
+async fn runtime_lifetime_background_task_survives_goal_terminal() {
+    let h = harness(vec![
+        spawn_runtime_sleep_server(),
+        tool_call(
+            "g-runtime",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "server verified"}),
+        ),
+    ])
+    .await;
+    let s = spec(&h, "start the dev server and leave it running");
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    h.engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("direct run should settle");
+
+    let snapshot = h.registry.get("bg-1").await.expect("task stays registered");
+    assert_eq!(
+        snapshot.status,
+        BackgroundTaskStatus::Running,
+        "an explicitly runtime-lived task must survive goal terminal cleanup"
+    );
+    assert_eq!(
+        h.registry.kill_scope(SESSION_SCOPE).await,
+        1,
+        "the retained task remains session-addressable for explicit stop"
+    );
+    assert_terminal_within(&h.registry, "bg-1", "runtime-lived task cleanup").await;
 }
 
 /// The runtime proof for the terminal visibility invariant: the terminal

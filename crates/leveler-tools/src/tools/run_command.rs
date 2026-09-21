@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use leveler_execution::RiskLevel;
+use leveler_execution::{BackgroundTaskLifetime, RiskLevel};
 
 use super::command_execution::CommandExecution;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -60,6 +60,28 @@ struct Input {
     /// runs block the agent until exit or timeout.
     #[serde(default)]
     background: Option<bool>,
+    /// Cleanup boundary for a background process. Defaults to `goal`, which
+    /// stops it when the current goal finishes. Use `runtime` only when the
+    /// user explicitly asks a dev server or watcher to remain running after
+    /// task completion; it then runs until explicitly stopped or runtime exit.
+    #[serde(default)]
+    background_lifetime: Option<BackgroundLifetimeInput>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BackgroundLifetimeInput {
+    Goal,
+    Runtime,
+}
+
+impl From<BackgroundLifetimeInput> for BackgroundTaskLifetime {
+    fn from(value: BackgroundLifetimeInput) -> Self {
+        match value {
+            BackgroundLifetimeInput::Goal => Self::Goal,
+            BackgroundLifetimeInput::Runtime => Self::Runtime,
+        }
+    }
 }
 
 pub struct RunCommandTool {
@@ -96,7 +118,11 @@ impl Tool for RunCommandTool {
          fetch from the network and fail offline (and may rewrite lockfiles). \
          Do not run a dependency install unless the task requires it. \
          Set background=true for long-running processes; then use \
-         get_task/wait_task/kill_task with the returned task_id."
+         get_task/wait_task/kill_task with the returned task_id. Background \
+         processes stop when the goal finishes by default. Only when the user \
+         explicitly asks the process to remain running after task completion, \
+         set background_lifetime=runtime; it remains owned by this runtime and \
+         can still be inspected or stopped."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -180,10 +206,19 @@ impl Tool for RunCommandTool {
             return Ok(ToolOutput::error(reason));
         }
         if input.background.unwrap_or(false) {
+            let lifetime = input
+                .background_lifetime
+                .unwrap_or(BackgroundLifetimeInput::Goal)
+                .into();
             return self
                 .commands
-                .start_background(program, args, input.cwd.as_deref(), context)
+                .start_background(program, args, input.cwd.as_deref(), lifetime, context)
                 .await;
+        }
+        if input.background_lifetime.is_some() {
+            return Ok(ToolOutput::error(
+                "background_lifetime requires background=true\n",
+            ));
         }
         // Close the `sh -c 'python app.py & …'` bypass of shell_command guards.
         if let Some(reason) = super::shell_guard::refuse_run_command_shell_bypass(program, &args) {
