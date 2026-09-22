@@ -322,10 +322,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &mut AppState) {
     ])
     .areas(area);
 
-    // One-column left inset so the brand does not sit flush on the edge.
+    // One-column horizontal inset keeps both the brand and the right-hand
+    // goal affordance off the terminal edge.
     let text_area = Rect {
         x: status.x + 1,
-        width: status.width.saturating_sub(1),
+        width: status.width.saturating_sub(2),
         ..status
     };
     let (line, goal_range) = header_line_parts(state, text_area.width as usize);

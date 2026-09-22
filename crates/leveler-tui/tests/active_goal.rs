@@ -110,6 +110,10 @@ fn a_submitted_turn_shows_a_running_goal_with_its_clock() {
         "identity intact: {header:?}"
     );
     assert!(header.contains("◆ 修复断线后任务续接 · 0s"), "{header:?}");
+    assert!(
+        header.ends_with("↗ "),
+        "the right-hand goal keeps one column off the terminal edge: {header:?}"
+    );
 }
 
 #[test]
