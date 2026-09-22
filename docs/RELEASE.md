@@ -18,6 +18,8 @@ Installed stable builds can pick it up automatically, or run `leveler update`
 - Apple Terminal before macOS 26 now receives a nearest-colour xterm-256
   palette, avoiding broken RGB rendering while preserving dark/light theme
   polarity and contrast calculations
+- The active-goal header now keeps its detail affordance one column away from
+  the terminal's right edge
 
 ## Known limits
 
