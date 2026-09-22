@@ -199,10 +199,14 @@ fn project_memory_consolidation_event(
     if event.operation == "proposed" {
         RuntimeEvent::Notification {
             level: leveler_client_protocol::NotificationLevel::Info,
-            message: format!(
-                "发现可能值得记住的内容，等待确认：[{}] {}。用 /memory 查看并采纳或忽略。",
-                event.id, event.title
-            ),
+            message: if event.count == 1 {
+                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。".to_string()
+            } else {
+                format!(
+                    "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。",
+                    event.count
+                )
+            },
         }
     } else {
         RuntimeEvent::MemoryChanged {
@@ -223,11 +227,14 @@ fn proposed_memory_projects_to_truthful_pending_notification() {
         id: "cand-output".to_string(),
         title: "输出保持紧凑".to_string(),
         authority: "explicit_user".to_string(),
+        count: 1,
     };
     match project_memory_consolidation_event(event) {
         RuntimeEvent::Notification { message, .. } => {
-            assert!(message.contains("等待确认"));
-            assert!(message.contains("cand-output"));
+            assert_eq!(
+                message,
+                "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。"
+            );
         }
         other => panic!("pending candidate became a durable change: {other:?}"),
     }
@@ -307,11 +314,53 @@ fn protocol_mode(value: PermissionProfile) -> leveler_client_protocol::Permissio
 }
 
 use crate::event_bridge::{EventBridge, turn_runtime_event};
+use crate::prompt_assist::{self, AssistKind};
 use crate::prompt_bridge::{
     ChannelApprover, ChannelClarifier, PendingApprovals, PendingClarifications, resolve_approval,
     resolve_clarification, validate_pending_session,
 };
 use crate::workspace_view::{compute_diff, detect_branch_label};
+
+fn spawn_auxiliary_assist(
+    app: Arc<Application>,
+    active: Arc<crate::active_turns::ActiveTurns>,
+    assists: Arc<AuxiliaryAssists>,
+    session_id: SessionId,
+    model: ModelRef,
+    events: broadcast::Sender<RuntimeEvent>,
+    kind: AssistKind,
+) {
+    if active.is_running(&session_id) {
+        return;
+    }
+    let (generation, cancellation) = assists.begin(&session_id);
+    tokio::spawn(async move {
+        let Some(generated) =
+            prompt_assist::generate(&app, &session_id, model, kind, cancellation).await
+        else {
+            assists.finish(&session_id, generation);
+            return;
+        };
+        if !assists.is_current(&session_id, generation)
+            || active.is_running(&session_id)
+            || prompt_assist::transcript_len(&app, &session_id).await
+                != Some(generated.transcript_len)
+        {
+            assists.finish(&session_id, generation);
+            return;
+        }
+        assists.finish(&session_id, generation);
+        let event = match kind {
+            AssistKind::PromptSuggestion => RuntimeEvent::PromptSuggestion {
+                text: generated.text,
+            },
+            AssistKind::AwaySummary => RuntimeEvent::AwaySummary {
+                text: generated.text,
+            },
+        };
+        let _ = events.send(event);
+    });
+}
 
 /// The instruction used to summarize a conversation for compaction (spec §53).
 const COMPACT_PROMPT: &str = "Summarize the conversation so far into a concise \
@@ -525,9 +574,71 @@ pub struct InProcessRuntimeClient {
     /// The cancellation handle of every tool call executing in a session's
     /// turn, by call id, so a user can stop one command without the turn.
     tool_call_cancels: ChildCancels,
+    /// Optional prompt/recap generation, cancelled before a real turn starts.
+    auxiliary_assists: Arc<AuxiliaryAssists>,
 }
 
 type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
+
+/// Per-session ownership of optional model chrome. A real user turn always
+/// preempts this work before it can compete for provider capacity.
+#[derive(Default)]
+struct AuxiliaryAssists {
+    next_generation: std::sync::atomic::AtomicU64,
+    active: Mutex<HashMap<SessionId, (u64, CancellationToken)>>,
+}
+
+impl AuxiliaryAssists {
+    fn begin(&self, session_id: &SessionId) -> (u64, CancellationToken) {
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let cancellation = CancellationToken::new();
+        if let Some((_, previous)) = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), (generation, cancellation.clone()))
+        {
+            previous.cancel();
+        }
+        (generation, cancellation)
+    }
+
+    fn cancel(&self, session_id: &SessionId) {
+        if let Some((_, cancellation)) = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id)
+        {
+            cancellation.cancel();
+        }
+    }
+
+    fn is_current(&self, session_id: &SessionId, generation: u64) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .is_some_and(|(current, token)| *current == generation && !token.is_cancelled())
+    }
+
+    fn finish(&self, session_id: &SessionId, generation: u64) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .get(session_id)
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            active.remove(session_id);
+        }
+    }
+}
+
 /// Command id → number of deliveries of it this boot is handling.
 pub(crate) type InFlightCommands = Arc<Mutex<HashMap<String, usize>>>;
 
@@ -819,6 +930,7 @@ impl InProcessRuntimeClient {
             steering: Arc::new(Mutex::new(HashMap::new())),
             child_cancels: Arc::new(Mutex::new(HashMap::new())),
             tool_call_cancels: Arc::new(Mutex::new(HashMap::new())),
+            auxiliary_assists: Arc::new(AuxiliaryAssists::default()),
             user_shells: Arc::new(crate::user_shell::UserShellStore::default()),
             checkpoints: Arc::new(crate::checkpoints::CheckpointStore::default()),
             live_views: Arc::new(crate::live_view::LiveViews::default()),
@@ -1479,6 +1591,7 @@ impl InProcessRuntimeClient {
         retitle: bool,
         images: usize,
     ) -> Result<crate::active_turns::TurnLease, ClientError> {
+        self.auxiliary_assists.cancel(session_id);
         let admission = self
             .active
             .admit(session_id)
@@ -2622,18 +2735,20 @@ impl InProcessRuntimeClient {
         if waiting.is_empty() {
             return;
         }
-        let titles: Vec<String> = waiting
-            .iter()
-            .map(|(id, title)| format!("[{id}] {title}"))
-            .collect();
-        let _ = self.events_for(session_id).send(RuntimeEvent::Notification {
-            level: leveler_client_protocol::NotificationLevel::Info,
-            message: format!(
-                "发现 {} 条可能值得记住的内容，等待确认：{}。用 /memory 查看，/memory accept <id> 采纳。",
-                waiting.len(),
-                titles.join("、")
-            ),
-        });
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::Notification {
+                level: leveler_client_protocol::NotificationLevel::Info,
+                message: if waiting.len() == 1 {
+                    "我发现一条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。"
+                        .to_string()
+                } else {
+                    format!(
+                        "我发现 {} 条可能值得记住的内容，先放在待确认里了。用 /memory 可以查看。",
+                        waiting.len()
+                    )
+                },
+            });
     }
 
     fn spawn_content_turn(
@@ -2892,6 +3007,30 @@ impl InProcessRuntimeClient {
 impl InteractiveRuntimeClient for InProcessRuntimeClient {
     async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
         match command {
+            ClientCommand::RequestPromptSuggestion { session_id } => {
+                spawn_auxiliary_assist(
+                    self.app.clone(),
+                    self.active.clone(),
+                    self.auxiliary_assists.clone(),
+                    session_id.clone(),
+                    self.session_model(&session_id),
+                    self.events_for(&session_id),
+                    AssistKind::PromptSuggestion,
+                );
+                Ok(())
+            }
+            ClientCommand::RequestAwaySummary { session_id } => {
+                spawn_auxiliary_assist(
+                    self.app.clone(),
+                    self.active.clone(),
+                    self.auxiliary_assists.clone(),
+                    session_id.clone(),
+                    self.session_model(&session_id),
+                    self.events_for(&session_id),
+                    AssistKind::AwaySummary,
+                );
+                Ok(())
+            }
             ClientCommand::SubmitMessage {
                 session_id,
                 content,

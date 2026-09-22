@@ -157,6 +157,15 @@ pub fn item_render(
                 wrap_width,
             );
         }
+        TranscriptItem::AwaySummary(text) => {
+            push_prefixed(
+                &mut out,
+                &format!("※ {}: ", t.recap_label),
+                text,
+                Style::default().fg(theme.text.secondary),
+                wrap_width,
+            );
+        }
         TranscriptItem::TurnEnd(block) => turn_end_lines(block, theme, wrap_width, &mut out, t),
         TranscriptItem::Recap(block) => {
             let text = match &block.summary {

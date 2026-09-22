@@ -36,6 +36,13 @@ pub enum RestartReason {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCommand {
+    /// Ask the runtime for one best-effort prediction of the user's next
+    /// prompt. The request is advisory UI chrome: it starts no task, persists
+    /// no message, and may produce no event when there is insufficient context.
+    RequestPromptSuggestion { session_id: SessionId },
+    /// Generate a one-shot recap after the UI has observed a post-turn idle
+    /// window. The runtime may decline when the conversation is too short.
+    RequestAwaySummary { session_id: SessionId },
     /// Submit a user message; the runtime drives a turn in the given session.
     SubmitMessage {
         session_id: SessionId,
@@ -430,7 +437,9 @@ impl ClientCommand {
     /// `RequestSessionList`/`Quit` are global) return `None`.
     pub fn session_id(&self) -> Option<&SessionId> {
         match self {
-            ClientCommand::SubmitMessage { session_id, .. }
+            ClientCommand::RequestPromptSuggestion { session_id }
+            | ClientCommand::RequestAwaySummary { session_id }
+            | ClientCommand::SubmitMessage { session_id, .. }
             | ClientCommand::SteerCurrentTurn { session_id, .. }
             | ClientCommand::RunGoal { session_id, .. }
             | ClientCommand::ResumeTask { session_id, .. }
@@ -544,6 +553,22 @@ mod tests {
                 attachments: Vec::new(),
             },
             "submit_message",
+        );
+    }
+
+    #[test]
+    fn generated_chrome_requests_roundtrip() {
+        roundtrip(
+            ClientCommand::RequestPromptSuggestion {
+                session_id: SessionId::new("s1"),
+            },
+            "request_prompt_suggestion",
+        );
+        roundtrip(
+            ClientCommand::RequestAwaySummary {
+                session_id: SessionId::new("s1"),
+            },
+            "request_away_summary",
         );
     }
 

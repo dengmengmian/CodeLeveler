@@ -3961,9 +3961,7 @@ fn memory_recalled_event_pushes_an_auditable_note_without_a_toast() {
             _ => None,
         })
         .expect("MemoryRecalled must push a note");
-    // Structured: the count is rendered, not a parsed log line.
-    assert!(note.contains('2'), "{note}");
-    assert!(note.contains("Memory"), "{note}");
+    assert_eq!(note, "我想起了 2 条相关记忆。");
     assert!(
         s.notification.is_none(),
         "routine recall must not duplicate the transcript note as a toast"
@@ -4010,10 +4008,7 @@ fn memory_superseded_event_explains_the_conflict_and_update() {
             _ => None,
         })
         .expect("MemoryChanged must push a note");
-    assert_eq!(
-        note,
-        "● Memory · 与已有记忆冲突，已更新 · 发布探针代号：BLUE-4821"
-    );
+    assert_eq!(note, "我更新了之前记住的内容：发布探针代号：BLUE-4821");
     assert!(note.contains("BLUE-4821"), "{note}");
     assert!(
         !note.contains("k-probe"),
@@ -4055,7 +4050,7 @@ fn memory_superseded_event_explains_the_conflict_in_english() {
         .expect("MemoryChanged must push a note");
     assert_eq!(
         note,
-        "● Memory · conflicted with existing memory, updated · Release probe code: BLUE-4821"
+        "I updated an earlier memory: Release probe code: BLUE-4821"
     );
     let toast = s
         .notification
@@ -4085,7 +4080,7 @@ fn memory_updated_event_keeps_the_plain_updated_label() {
             _ => None,
         })
         .expect("MemoryChanged must push a note");
-    assert_eq!(note, "● Memory · 已更新 · 发布探针代号：BLUE-4821");
+    assert_eq!(note, "我更新了记忆：发布探针代号：BLUE-4821");
 }
 
 #[test]
@@ -7779,6 +7774,48 @@ fn historical_plans(s: &AppState) -> Vec<&UiPlan> {
             _ => None,
         })
         .collect()
+}
+
+/// A fully settled plan is execution chrome, not durable conversation content.
+/// Once the turn ends there must be no 8/8-style checklist left above the
+/// terminal marker.
+#[test]
+fn a_completed_plan_disappears_when_the_turn_ends() {
+    use leveler_client_protocol::PlanStepStatus as P;
+    let mut s = busy_state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PlanUpdated {
+            plan: UiPlan {
+                steps: vec![
+                    UiPlanStep {
+                        index: 0,
+                        description: "实现".into(),
+                        status: P::Done,
+                    },
+                    UiPlanStep {
+                        index: 1,
+                        description: "无需执行".into(),
+                        status: P::Skipped,
+                    },
+                ],
+            },
+        }),
+    );
+    answer(&mut s, "m-final", "完成。");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnCompletedUnverified {
+            reason: "无自动验证".into(),
+        }),
+    );
+
+    assert!(s.plan.is_none(), "terminal work is not active");
+    assert!(
+        historical_plans(&s).is_empty(),
+        "a settled checklist must not remain in conversation history"
+    );
+    assert!(!rendered(&mut s, 100, 30).contains("计划"));
 }
 
 /// D1: a task can finish while the plan the agent declared is still open —

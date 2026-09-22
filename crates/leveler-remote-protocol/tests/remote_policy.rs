@@ -48,6 +48,20 @@ fn agent_draft() -> leveler_client_protocol::UiAgentDraft {
 fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
     vec![
         (
+            "request_prompt_suggestion",
+            ClientCommand::RequestPromptSuggestion {
+                session_id: session(),
+            },
+            false,
+        ),
+        (
+            "request_away_summary",
+            ClientCommand::RequestAwaySummary {
+                session_id: session(),
+            },
+            false,
+        ),
+        (
             "submit_message",
             ClientCommand::SubmitMessage {
                 session_id: session(),

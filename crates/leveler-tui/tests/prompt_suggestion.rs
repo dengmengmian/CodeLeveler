@@ -79,6 +79,38 @@ fn opened() -> AppState {
     s
 }
 
+#[test]
+fn a0_opening_an_idle_session_requests_an_initial_prediction() {
+    let mut s = AppState::new(
+        Theme::no_color(),
+        Boot {
+            session_id: SessionId::new("s1"),
+            user: "麻凡".to_string(),
+            version: "0.1.0".to_string(),
+            show_welcome: false,
+            draft_path: None,
+            history_path: None,
+            context_window: 200_000,
+            locale: leveler_tui::Locale::Zh,
+            untrusted_config: Vec::new(),
+            reasoning_effort: None,
+        },
+    );
+
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Send(ClientCommand::RequestPromptSuggestion { session_id })
+            if session_id.as_str() == "s1"
+    )));
+}
+
 fn key(code: KeyCode) -> Action {
     Action::Key(KeyEvent::new(code, KeyModifiers::empty()))
 }
@@ -207,6 +239,95 @@ fn prose_turn(s: &mut AppState, text: &str) {
     reduce(s, Action::Runtime(RuntimeEvent::TurnCompleted));
 }
 
+#[test]
+fn idle_recap_fires_once_only_after_a_substantial_conversation() {
+    let mut s = opened();
+    s.transcript.push_user("先定位问题".into());
+    s.transcript.push_user("继续修复".into());
+    let now = std::time::Instant::now();
+    leveler_tui::away_summary::arm(&mut s, now);
+
+    assert!(reduce(&mut s, Action::IdleTick(now)).is_empty());
+    let effects = reduce(
+        &mut s,
+        Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY),
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Send(ClientCommand::RequestAwaySummary { session_id })
+            if session_id.as_str() == "s1"
+    )));
+    assert!(
+        reduce(
+            &mut s,
+            Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY)
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn typing_cancels_the_pending_idle_recap() {
+    let mut s = opened();
+    s.transcript.push_user("先定位问题".into());
+    s.transcript.push_user("继续修复".into());
+    let now = std::time::Instant::now();
+    leveler_tui::away_summary::arm(&mut s, now);
+
+    typed(&mut s, "我有新想法");
+
+    assert!(
+        reduce(
+            &mut s,
+            Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY)
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn away_summary_is_rendered_as_muted_recap_chrome() {
+    let mut s = opened();
+    s.away_summary_pending = true;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AwaySummary {
+            text: "已完成配置梳理，下一步修复覆盖顺序。".into(),
+        }),
+    );
+
+    let shown = frame(&mut s, 100, 28);
+    assert!(
+        shown.contains("※ 回顾: 已完成配置梳理，下一步修复覆盖顺序。"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn late_away_summary_does_not_interrupt_new_user_input() {
+    let mut s = opened();
+    s.transcript.push_user("先定位问题".into());
+    s.transcript.push_user("继续修复".into());
+    let now = std::time::Instant::now();
+    leveler_tui::away_summary::arm(&mut s, now);
+    reduce(
+        &mut s,
+        Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY),
+    );
+    typed(&mut s, "先等等");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AwaySummary {
+            text: "这条过期回顾不应出现".into(),
+        }),
+    );
+
+    assert!(!s.transcript.items().iter().any(
+        |item| matches!(item, TranscriptItem::AwaySummary(text) if text.contains("过期回顾"))
+    ));
+}
+
 fn with_suggestion() -> AppState {
     let mut s = opened();
     goal_turn(&mut s, "complete", Some(NEXT_STEP));
@@ -294,6 +415,93 @@ fn a4_normal_completion_without_a_structured_next_step_offers_nothing() {
         "assistant prose is never parsed into a suggestion"
     );
     assert!(!suggestion::is_visible(&s));
+}
+
+#[test]
+fn a4b_runtime_prediction_after_a_normal_answer_offers_a_ghost() {
+    let mut s = opened();
+    prose_turn(&mut s, "我已经定位到配置加载入口。");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PromptSuggestion {
+            text: "检查配置覆盖顺序".into(),
+        }),
+    );
+
+    assert_eq!(s.prompt_suggestion.as_deref(), Some("检查配置覆盖顺序"));
+    assert!(s.composer.is_empty());
+    assert!(suggestion::is_visible(&s));
+}
+
+#[test]
+fn a4ba_normal_answer_requests_one_runtime_prediction() {
+    let mut s = opened();
+    let id = MessageId::new("m-predict");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: id.clone(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "已经定位问题".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: id }),
+    );
+
+    let effects = reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
+
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                Effect::Send(ClientCommand::RequestPromptSuggestion { .. })
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a4c_late_prediction_does_not_reappear_after_the_user_started_typing() {
+    let mut s = opened();
+    prose_turn(&mut s, "我已经定位到配置加载入口。");
+    typed(&mut s, "我有别的问题");
+    for _ in 0.."我有别的问题".chars().count() {
+        reduce(&mut s, key(KeyCode::Backspace));
+    }
+    assert!(s.composer.is_empty());
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PromptSuggestion {
+            text: "检查配置覆盖顺序".into(),
+        }),
+    );
+
+    assert_eq!(s.prompt_suggestion, None);
+}
+
+#[test]
+fn a4d_runtime_prediction_does_not_replace_a_structured_next_step() {
+    let mut s = with_suggestion();
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::PromptSuggestion {
+            text: "模型猜测的下一步".into(),
+        }),
+    );
+
+    assert_eq!(s.prompt_suggestion.as_deref(), Some(NEXT_STEP));
 }
 
 #[test]

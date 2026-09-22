@@ -70,16 +70,50 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             let refresh = state.active_screen == Screen::Trace
                 && crate::observability::should_refresh_trace(&event);
             let opened = matches!(event, RuntimeEvent::SessionOpened { .. });
+            let turn_ended = matches!(
+                event,
+                RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedWithWarnings { .. }
+                    | RuntimeEvent::TurnAnswered
+                    | RuntimeEvent::TurnCompletedUnverified { .. }
+                    | RuntimeEvent::TurnCompletedChecksFailed { .. }
+            );
             apply_runtime(state, event);
+            let mut effects = Vec::new();
             // A reopened conversation shows its text from the snapshot at
             // once; what ran in it comes from the durable history.
             if opened && !state.is_busy() && !state.transcript.is_empty() {
                 let query_id = CommandId::generate();
                 state.history_query = Some(query_id.clone());
-                return vec![Effect::Send(ClientCommand::QuerySessionHistory {
+                effects.push(Effect::Send(ClientCommand::QuerySessionHistory {
                     session_id: state.session_id.clone(),
                     query_id: Some(query_id),
-                })];
+                }));
+            } else if opened && !state.is_busy() {
+                // No conversation exists yet, so the runtime derives a starter
+                // from repository context. It returns as the same transient
+                // ghost used after ordinary turns.
+                effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
+                    session_id: state.session_id.clone(),
+                }));
+            }
+            if turn_ended
+                && state.composer.is_empty()
+                && state.prompt_suggestion.is_none()
+                && state.transcript.last_turn_end().is_some_and(|turn| {
+                    matches!(
+                        turn.status,
+                        crate::transcript::TurnEndStatus::Completed
+                            | crate::transcript::TurnEndStatus::CompletedWithWarnings
+                            | crate::transcript::TurnEndStatus::Answered
+                            | crate::transcript::TurnEndStatus::Unverified
+                            | crate::transcript::TurnEndStatus::ChecksFailed
+                    )
+                })
+            {
+                effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
+                    session_id: state.session_id.clone(),
+                }));
             }
             if refresh {
                 let session_id = state
@@ -88,21 +122,21 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     .as_ref()
                     .map(|l| l.session.session_id.clone())
                     .unwrap_or_else(|| state.session_id.clone());
-                vec![Effect::Send(crate::observability::issue_query(
+                effects.push(Effect::Send(crate::observability::issue_query(
                     &mut state.trace,
                     session_id,
                     None,
                     0,
                     80,
-                ))]
-            } else {
-                Vec::new()
+                )));
             }
+            effects
         }
         Action::Resize(cols, rows) => {
             state.size = (cols, rows);
             Vec::new()
         }
+        Action::IdleTick(now) => crate::away_summary::poll(state, now).into_iter().collect(),
         Action::FileCandidatesLoaded(files) => {
             state.file_candidates = files;
             Vec::new()
@@ -1268,7 +1302,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         // Dismissing the next-step ghost is the narrowest undo on this screen,
         // so it wins while it is showing — and it does nothing else.
         KeyCode::Esc if crate::suggestion::is_visible(state) && !btw => {
-            crate::suggestion::clear(state);
+            crate::suggestion::dismiss(state);
         }
         // Esc is the interrupt every other coding-agent CLI uses. It escalates
         // cancel → force-cancel like Ctrl+C does, but stops there: quitting on
@@ -1550,7 +1584,7 @@ pub(super) fn enter_btw(state: &mut AppState) {
     // A main cancel armed before the user came here must not stay armed across
     // a surface where Ctrl+C means something else.
     state.disarm_ctrlc();
-    crate::suggestion::clear(state);
+    crate::suggestion::dismiss(state);
 }
 
 /// Return to the main surface. Navigation only — never a cancellation.
@@ -1609,7 +1643,7 @@ fn cancel_btw_answer(state: &mut AppState) -> Vec<Effect> {
 pub(super) fn open_external_editor(state: &mut AppState) -> Vec<Effect> {
     // The seed is the REAL buffer. A ghost suggestion is not a draft and must
     // not travel into `$EDITOR`, so it is dropped rather than hidden.
-    crate::suggestion::clear(state);
+    crate::suggestion::dismiss(state);
     vec![Effect::OpenExternalEditor {
         text: state.composer.canonical_text(),
     }]
@@ -1620,7 +1654,7 @@ pub(super) fn open_external_editor(state: &mut AppState) -> Vec<Effect> {
 /// suggestion the user has already scrolled away from must not reappear.
 fn dismiss_suggestion_on_history_browse(state: &mut AppState) {
     if state.composer.is_browsing_history() {
-        crate::suggestion::clear(state);
+        crate::suggestion::dismiss(state);
     }
 }
 

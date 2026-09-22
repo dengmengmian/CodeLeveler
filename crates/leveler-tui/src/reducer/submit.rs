@@ -27,7 +27,8 @@ pub(super) fn touch_slash_filter(state: &mut AppState) {
     }
     state.slash_selected = 0;
     state.slash_popup_dismissed = false;
-    crate::suggestion::clear(state);
+    crate::suggestion::dismiss(state);
+    crate::away_summary::cancel(state);
     if crate::screen::skill_mention_query(state).is_some() {
         refresh_skill_catalog(state);
     }
@@ -38,7 +39,7 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     // submits nothing and must leave the offer standing: the ghost is not
     // input, so that keystroke is a no-op, not a rejection of the suggestion.
     if !state.composer.is_empty() {
-        crate::suggestion::clear(state);
+        crate::suggestion::dismiss(state);
     }
     // User shell escape: the RAW composer's first character is `!` — no
     // leading-whitespace trim, so " !cargo test" stays a normal message and

@@ -649,6 +649,7 @@ mod pipeline_tests {
             value: Some("disabled".into()),
             scope: crate::CandidateScope::Project,
             durability: crate::CandidateDurability::Durable,
+            memory_type: crate::SemanticMemoryType::User,
             authority: crate::MemoryAuthority::ExplicitUser,
             operation_hint: crate::OperationHint::Update,
             evidence_span: "以后不要后台启动服务了".into(),

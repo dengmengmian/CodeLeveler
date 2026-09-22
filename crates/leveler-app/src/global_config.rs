@@ -118,16 +118,14 @@ struct GlobalStorage {
 /// `[update]`. Whether CodeLeveler keeps itself current, and how often it
 /// checks. Two fields, no channel: only the stable GitHub release is tracked.
 ///
-/// `auto_update` is **off by default**: the startup path is local and
-/// network-free, and the one operation that must run before the terminal is
-/// taken over is the self-update. A user who wants start-up auto-update opts in
-/// explicitly with `[update] auto_update = true`.
+/// `auto_update` is on by default. A normal installation keeps itself on the
+/// latest stable release; package-manager users can explicitly opt out with
+/// `[update] auto_update = false`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalUpdate {
-    /// Check for (and install) a newer stable release at start-up. Off by
-    /// default so startup never depends on the network.
-    #[serde(default)]
+    /// Check for (and install) a newer stable release at start-up.
+    #[serde(default = "default_true")]
     auto_update: bool,
     /// Hours between successful checks (clamped to at least one).
     #[serde(default = "default_check_interval_hours")]
@@ -137,7 +135,7 @@ struct GlobalUpdate {
 impl Default for GlobalUpdate {
     fn default() -> Self {
         Self {
-            auto_update: false,
+            auto_update: true,
             check_interval_hours: 1,
         }
     }
@@ -579,6 +577,10 @@ pub fn render_init_config(
     // Explicit `[providers.x]` tables (not inline) — humans edit this file.
     let mut doc = DocumentMut::new();
     doc["default_model"] = value(format!("{provider_id}/{model_id}"));
+    let mut update = toml_edit::Table::new();
+    update["auto_update"] = value(true);
+    update["check_interval_hours"] = value(1);
+    doc["update"] = toml_edit::Item::Table(update);
     let mut provider = toml_edit::Table::new();
     provider["base_url"] = value(base_url);
     provider["api_key_env"] = value(api_key_env);
@@ -593,6 +595,7 @@ pub fn render_init_config(
     models.set_implicit(true);
     models[model_id] = toml_edit::Item::Table(model);
     doc["models"] = toml_edit::Item::Table(models);
+    annotate_generated_config(&mut doc);
     format!(
         "# CodeLeveler global config — created by `leveler init`.\n\
          # Reference: https://github.com/dengmengmian/CodeLeveler#configuration\n\
@@ -650,12 +653,209 @@ pub fn render_init_config_with_profile(
     model["thinking_supports_forced_tool_choice"] =
         value(profile.compatibility.thinking_supports_forced_tool_choice);
     model["passback_reasoning_content"] = value(profile.compatibility.passback_reasoning_content);
+    annotate_generated_config(&mut doc);
     format!(
         "# CodeLeveler global config — created by `leveler login`.\n\
          # Reference: https://github.com/dengmengmian/CodeLeveler#configuration\n\
          {doc}"
     )
 }
+
+/// Add bilingual explanations to every setting emitted by the first-run
+/// generators. These comments are presentation only; the parsed values remain
+/// the single source of truth.
+fn annotate_generated_config(doc: &mut DocumentMut) {
+    annotate_table_field(
+        doc.as_table_mut(),
+        "default_model",
+        "默认使用的模型，格式为 provider/model。",
+        "Default model, in provider/model form.",
+    );
+    if let Some(update) = doc.get_mut("update").and_then(|item| item.as_table_mut()) {
+        annotate_table_field(
+            update,
+            "auto_update",
+            "启动时自动检查并安装最新稳定版；设为 false 可关闭。",
+            "Check for and install the latest stable release at startup; set false to disable.",
+        );
+        annotate_table_field(
+            update,
+            "check_interval_hours",
+            "成功检查更新后的最短检查间隔（小时，最小为 1）。",
+            "Minimum hours between successful update checks (minimum 1).",
+        );
+    }
+
+    if let Some(providers) = doc
+        .get_mut("providers")
+        .and_then(|item| item.as_table_mut())
+    {
+        for (_, provider) in providers.iter_mut() {
+            let Some(provider) = provider.as_table_mut() else {
+                continue;
+            };
+            annotate_table_field(
+                provider,
+                "protocol",
+                "供应商使用的接口协议。",
+                "API protocol used by this provider.",
+            );
+            annotate_table_field(
+                provider,
+                "base_url",
+                "供应商 API 地址。",
+                "Provider API base URL.",
+            );
+            annotate_table_field(
+                provider,
+                "api_key_env",
+                "保存 API Key 的环境变量名。",
+                "Environment variable containing the API key.",
+            );
+            annotate_table_field(
+                provider,
+                "api_key",
+                "本机保存的 API Key，请勿提交到版本库。",
+                "Locally stored API key; never commit this file.",
+            );
+        }
+    }
+
+    if let Some(models) = doc.get_mut("models").and_then(|item| item.as_table_mut()) {
+        for (_, model) in models.iter_mut() {
+            let Some(model) = model.as_table_mut() else {
+                continue;
+            };
+            for (key, zh, en) in MODEL_SETTING_COMMENTS {
+                annotate_table_field(model, key, zh, en);
+            }
+        }
+    }
+}
+
+fn annotate_table_field(table: &mut toml_edit::Table, key: &str, zh: &str, en: &str) {
+    if let Some(mut key) = table.key_mut(key) {
+        key.leaf_decor_mut().set_prefix(format!("# {zh}\n# {en}\n"));
+    }
+}
+
+const MODEL_SETTING_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "provider",
+        "此模型所属的供应商。",
+        "Provider used by this model.",
+    ),
+    (
+        "model_id",
+        "发送给供应商的真实模型 ID。",
+        "Model ID sent to the provider.",
+    ),
+    (
+        "protocol",
+        "此模型使用的接口协议。",
+        "API protocol used by this model.",
+    ),
+    (
+        "streaming",
+        "是否使用流式响应。",
+        "Whether streaming responses are enabled.",
+    ),
+    (
+        "tool_calling",
+        "模型是否支持工具调用。",
+        "Whether the model supports tool calls.",
+    ),
+    (
+        "parallel_tool_calls",
+        "模型是否支持并行工具调用。",
+        "Whether the model supports parallel tool calls.",
+    ),
+    (
+        "structured_output",
+        "模型是否支持结构化输出。",
+        "Whether the model supports structured output.",
+    ),
+    (
+        "vision",
+        "模型是否支持图片输入。",
+        "Whether the model accepts image input.",
+    ),
+    (
+        "reasoning",
+        "模型是否支持推理模式。",
+        "Whether the model supports reasoning mode.",
+    ),
+    (
+        "reasoning_style",
+        "供应商使用的推理参数格式。",
+        "Provider-specific reasoning parameter style.",
+    ),
+    (
+        "supported_efforts",
+        "模型支持的推理强度。",
+        "Reasoning effort levels supported by the model.",
+    ),
+    (
+        "reasoning_effort",
+        "默认推理强度。",
+        "Default reasoning effort.",
+    ),
+    (
+        "context_window",
+        "模型的最大上下文长度（token）。",
+        "Maximum model context window in tokens.",
+    ),
+    (
+        "reliable_context",
+        "触发压缩前可可靠使用的上下文长度。",
+        "Reliable context size before compaction.",
+    ),
+    (
+        "max_output_tokens",
+        "单次响应允许的最大输出 token 数。",
+        "Maximum output tokens per response.",
+    ),
+    (
+        "max_tool_schema_bytes",
+        "发送给模型的工具定义最大字节数。",
+        "Maximum tool-schema bytes sent to the model.",
+    ),
+    (
+        "max_parallel_tool_calls",
+        "单轮允许的并行工具调用上限；0 表示不额外限制。",
+        "Parallel tool-call limit per turn; 0 means no extra limit.",
+    ),
+    (
+        "max_tool_output_bytes",
+        "单个工具结果送回模型的最大字节数。",
+        "Maximum bytes returned to the model for one tool result.",
+    ),
+    (
+        "synthesize_tool_call_ids",
+        "是否为缺少 ID 的工具调用生成 ID。",
+        "Whether to synthesize missing tool-call IDs.",
+    ),
+    (
+        "drop_unsupported_fields",
+        "是否移除供应商不支持的请求字段。",
+        "Whether to remove request fields unsupported by the provider.",
+    ),
+    (
+        "supports_temperature",
+        "供应商是否接受 temperature 参数。",
+        "Whether the provider accepts the temperature parameter.",
+    ),
+    (
+        "thinking_supports_forced_tool_choice",
+        "推理模式是否支持强制选择工具。",
+        "Whether reasoning mode supports forced tool choice.",
+    ),
+    (
+        "passback_reasoning_content",
+        "工具调用后是否回传供应商的推理内容。",
+        "Whether provider reasoning content is passed back after tool calls.",
+    ),
+];
 
 fn protocol_name(protocol: ProtocolKind) -> &'static str {
     match protocol {
@@ -880,14 +1080,14 @@ fn parse_protocol(s: &str) -> ProtocolKind {
 mod tests {
     use super::*;
 
-    /// The startup path must be network-free by default: auto-update is opt-in.
+    /// A fresh install keeps itself current unless the user explicitly opts out.
     #[test]
-    fn startup_auto_update_is_off_unless_explicitly_enabled() {
+    fn startup_auto_update_is_on_unless_explicitly_disabled() {
         let cfg: GlobalConfig = toml::from_str("default_model = \"mock/m\"\n").unwrap();
-        assert!(!cfg.update_auto(), "startup auto-update must default off");
+        assert!(cfg.update_auto(), "startup auto-update must default on");
 
-        let cfg: GlobalConfig = toml::from_str("[update]\nauto_update = true\n").unwrap();
-        assert!(cfg.update_auto(), "an explicit opt-in is honoured");
+        let cfg: GlobalConfig = toml::from_str("[update]\nauto_update = false\n").unwrap();
+        assert!(!cfg.update_auto(), "an explicit opt-out is honoured");
     }
 
     /// The `[storage]` budget and TTL are readable, and default to unset.
@@ -942,6 +1142,11 @@ mod tests {
             parsed.default_model.as_deref(),
             Some("deepseek/deepseek-chat")
         );
+        assert!(parsed.update_auto(), "a first-run config enables updates");
+        assert_eq!(parsed.update_check_interval_hours(), 1);
+        let doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(doc["update"]["auto_update"].as_bool(), Some(true));
+        assert_eq!(doc["update"]["check_interval_hours"].as_integer(), Some(1));
         let bundle = parsed.into_bundle();
         assert_eq!(bundle.providers.len(), 1, "one provider: {text}");
         assert_eq!(bundle.providers[0].id, "deepseek");
@@ -971,6 +1176,38 @@ mod tests {
             assert_eq!(actual.reasoning, expected.reasoning);
             assert_eq!(actual.limits, expected.limits);
             assert_eq!(actual.compatibility, expected.compatibility);
+        }
+    }
+
+    #[test]
+    fn first_run_config_explains_every_setting_in_chinese_and_english() {
+        let profile = leveler_provider::builtin_model_profile("deepseek", "deepseek-flash")
+            .unwrap()
+            .unwrap();
+        let text = render_init_config_with_profile(
+            "deepseek",
+            "https://api.deepseek.com",
+            "DEEPSEEK_API_KEY",
+            &profile,
+        );
+        let lines = text.lines().collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+                continue;
+            }
+            assert!(trimmed.contains('='), "unexpected generated line: {line}");
+            assert!(index >= 2, "setting has no bilingual comment: {line}");
+            let zh = lines[index - 2].trim();
+            let en = lines[index - 1].trim();
+            assert!(
+                zh.starts_with("# ") && !zh.is_ascii(),
+                "missing Chinese comment before: {line}"
+            );
+            assert!(
+                en.starts_with("# ") && en.is_ascii(),
+                "missing English comment before: {line}"
+            );
         }
     }
 
@@ -1341,10 +1578,9 @@ completion_judge_timeout_seconds = 180
     }
 
     #[test]
-    fn the_update_section_is_off_by_default_and_configurable() {
-        // Startup is network-free unless the user explicitly opts in.
+    fn the_update_section_is_on_by_default_and_configurable() {
         let default = GlobalConfig::from_toml_str("").unwrap();
-        assert!(!default.update_auto());
+        assert!(default.update_auto());
         assert_eq!(default.update_check_interval_hours(), 1);
 
         let on = GlobalConfig::from_toml_str("[update]\nauto_update = true\n").unwrap();

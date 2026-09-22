@@ -98,7 +98,7 @@ Manual update:
 ```sh
 leveler update            # install the latest stable release
 leveler update --check    # exit 2 when an update exists
-leveler update --version v1.0.4
+leveler update --version v1.0.5
 ```
 
 Inside the TUI:
@@ -111,6 +111,8 @@ Inside the TUI:
 
 Configuration, in `~/.leveler/config.toml`:
 
+Start-up auto-update is enabled by default. The first-run login guide writes these settings to the config file:
+
 ```toml
 [update]
 auto_update = true           # false disables start-up checks; manual update still works
@@ -122,7 +124,8 @@ Only stable releases are tracked. Pre-releases are installed only when named exp
 ## First run
 
 ```sh
-leveler login
+leveler                    # choose a language, then run the same first-run setup as login
+leveler login              # or run it explicitly
 leveler doctor
 cd your-project
 leveler

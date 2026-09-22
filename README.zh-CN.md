@@ -98,7 +98,7 @@ CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时�
 ```sh
 leveler update            # 安装最新稳定版
 leveler update --check    # 有更新时退出码为 2
-leveler update --version v1.0.4
+leveler update --version v1.0.5
 ```
 
 在 TUI 中：
@@ -111,6 +111,8 @@ leveler update --version v1.0.4
 
 配置（`~/.leveler/config.toml`）：
 
+启动自动更新默认开启。首次启动的登录引导会把以下配置写入配置文件：
+
 ```toml
 [update]
 auto_update = true           # false 关闭启动自动检查；手动更新仍可用
@@ -122,7 +124,8 @@ check_interval_hours = 1     # 成功检查之间的间隔小时数（最小 1�
 ## 第一次使用
 
 ```sh
-leveler login
+leveler                    # 无配置时先选择语言，再进入与 login 相同的首次设置引导
+leveler login              # 也可以显式运行
 leveler doctor
 cd your-project
 leveler

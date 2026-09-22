@@ -598,6 +598,8 @@ impl AgentBridge {
 /// lines must not carry message text.
 fn command_kind(command: &ClientCommand) -> &'static str {
     match command {
+        ClientCommand::RequestPromptSuggestion { .. } => "request_prompt_suggestion",
+        ClientCommand::RequestAwaySummary { .. } => "request_away_summary",
         ClientCommand::SubmitMessage { .. } => "submit_message",
         ClientCommand::RunGoal { .. } => "run_goal",
         ClientCommand::ResumeTask { .. } => "resume_task",

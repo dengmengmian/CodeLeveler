@@ -25,7 +25,7 @@ pub use lifecycle::{
 pub use pipeline::{AdmitOutcome, ProposeOutcome, SuppressRecord, collect_turn_candidates};
 pub use semantic::{
     CandidateDurability, CandidateRejection, CandidateScope, OperationHint, SemanticCandidate,
-    SemanticError, ValidatedCandidates, canonical_subject, evidence_matches,
+    SemanticError, SemanticMemoryType, ValidatedCandidates, canonical_subject, evidence_matches,
     parse_semantic_candidates, validate_semantic_candidate, validate_semantic_candidates,
 };
 

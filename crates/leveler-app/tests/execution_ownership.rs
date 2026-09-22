@@ -369,6 +369,33 @@ async fn ownership_follows_the_running_execution_between_windows() {
     assert_eq!(w.owner().await, Windows::unowned_at(3));
 }
 
+/// Advisory model work is lower priority than the next user turn. Starting a
+/// real turn must cancel an in-flight prompt prediction before the turn sends
+/// its own provider request, otherwise the prediction can consume the only
+/// available request slot and strand execution.
+#[tokio::test]
+async fn a_new_turn_preempts_an_in_flight_prompt_prediction() {
+    let w = two_windows().await;
+
+    w.a.submit(&w.session).await.unwrap();
+    w.gate.open_one();
+    w.settled(1).await;
+
+    w.a.client
+        .send(ClientCommand::RequestPromptSuggestion {
+            session_id: w.session.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    w.a.submit(&w.session)
+        .await
+        .expect("the user turn preempts advisory generation");
+    w.gate.open_one();
+    assert_eq!(w.settled(2).await.len(), 2);
+}
+
 /// A cancelled execution is a terminal one: the window that cancelled it
 /// stays open and a sibling may run next.
 #[tokio::test]

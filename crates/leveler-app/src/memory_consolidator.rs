@@ -1,5 +1,6 @@
 //! Runtime-owned asynchronous consolidation of durable memory inbox turns.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -42,6 +43,9 @@ pub struct MemoryConsolidationEvent {
     pub id: String,
     pub title: String,
     pub authority: String,
+    /// Number of lifecycle changes represented by this event. Candidate
+    /// proposals are batched so the conversation gets one calm summary.
+    pub count: usize,
 }
 
 pub type MemoryEventSink = Arc<dyn Fn(MemoryConsolidationEvent) + Send + Sync>;
@@ -482,6 +486,7 @@ impl MemoryConsolidator {
         let accepted = staged.iter().map(|result| result.accepted.len()).sum();
         let store = MemoryStore::open(&self.memory_dir).map_err(|e| e.to_string())?;
         let repo = MemoryInboxRepository::new(&self.db);
+        let mut proposed_by_session = BTreeMap::<String, BTreeSet<String>>::new();
         for (item, result) in items.iter().zip(&mut staged) {
             if result.applied > result.accepted.len() {
                 return Err(format!(
@@ -507,7 +512,11 @@ impl MemoryConsolidator {
                 .map_err(|e| e.to_string())?;
                 let event = match outcome {
                     AdmitOutcome::Proposed(ProposeOutcome::Pending(entry)) => {
-                        Some(("proposed", entry.id, entry.title))
+                        proposed_by_session
+                            .entry(item.session_id.clone())
+                            .or_default()
+                            .insert(entry.id);
+                        None
                     }
                     AdmitOutcome::Corrected(outcome) => outcome.entry.and_then(|entry| {
                         let operation = match outcome.operation {
@@ -527,9 +536,20 @@ impl MemoryConsolidator {
                         id,
                         title,
                         authority: authority.clone(),
+                        count: 1,
                     });
                 }
             }
+        }
+        for (session_id, candidate_ids) in proposed_by_session {
+            (self.event_sink)(MemoryConsolidationEvent {
+                session_id,
+                operation: "proposed".to_string(),
+                id: String::new(),
+                title: String::new(),
+                authority: "explicit_user".to_string(),
+                count: candidate_ids.len(),
+            });
         }
         Ok(ConsolidationOutcome {
             claimed: items.len(),
@@ -773,6 +793,7 @@ mod tests {
                     value: Some("disabled".to_string()),
                     scope: CandidateScope::Project,
                     durability: CandidateDurability::Durable,
+                    memory_type: leveler_memory::SemanticMemoryType::Feedback,
                     authority: MemoryAuthority::ExplicitUser,
                     operation_hint: OperationHint::Update,
                     evidence_span: "以后不要后台启动服务了".to_string(),
@@ -796,6 +817,7 @@ mod tests {
                 value: Some(value.to_string()),
                 scope: CandidateScope::Project,
                 durability: CandidateDurability::Durable,
+                memory_type: leveler_memory::SemanticMemoryType::Project,
                 authority: MemoryAuthority::ExplicitUser,
                 operation_hint,
                 evidence_span: fact.to_string(),
@@ -863,13 +885,15 @@ mod tests {
             .claim_batch(&boot, leveler_core::now(), 8)
             .await
             .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
         let worker = MemoryConsolidator::new(
             db,
             boot,
             temp.path().to_path_buf(),
             temp.path().join("memory"),
             Arc::new(UnusedRuntime),
-            Arc::new(|_| {}),
+            Arc::new(move |event| captured.lock().unwrap().push(event)),
         );
 
         let outcome = worker
@@ -883,6 +907,16 @@ mod tests {
         let pending = store.list_pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].body, "项目默认模型是 Flash");
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.operation == "proposed")
+                .count(),
+            1,
+            "one consolidation batch should produce one candidate summary"
+        );
+        assert_eq!(events[0].count, 1);
     }
 
     #[tokio::test]
@@ -1114,6 +1148,7 @@ mod tests {
                 "value": "Pro",
                 "scope": "project",
                 "durability": "durable",
+                "memory_type": "project",
                 "authority": "explicit_user",
                 "operation_hint": "reaffirm",
                 "evidence_span": "本项目默认模型固定为 Pro",
@@ -1324,6 +1359,7 @@ mod tests {
                 "value": "Different",
                 "scope": "project",
                 "durability": "durable",
+                "memory_type": "project",
                 "authority": "explicit_user",
                 "operation_hint": "create",
                 "evidence_span": "turn 0",

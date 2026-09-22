@@ -333,6 +333,9 @@ pub enum TranscriptItem {
     /// Multi-line host note (e.g. `/memory` listing). Transcript-visible, not
     /// a 1-row status notification.
     Note(String),
+    /// Transient, model-generated recap shown after a post-turn idle window.
+    /// Display-only: never persisted or replayed into model context.
+    AwaySummary(String),
     TurnEnd(TurnEndBlock),
     Recap(RecapBlock),
     /// Durable goal checkpoint presentation (`✽ 阶段回顾`), click-expandable.
@@ -354,6 +357,16 @@ pub struct TranscriptState {
 }
 
 impl TranscriptState {
+    /// Enough conversational substance to make an idle recap useful rather
+    /// than repeat a single greeting/answer.
+    pub fn has_away_summary_context(&self) -> bool {
+        self.items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::User(text) if !text.trim().is_empty()))
+            .count()
+            >= 2
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -441,6 +454,14 @@ impl TranscriptState {
         self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Note(text));
+    }
+
+    pub fn push_away_summary(&mut self, text: String) {
+        self.bump();
+        self.close_tool_group();
+        if !matches!(self.items.last(), Some(TranscriptItem::AwaySummary(_))) {
+            self.items.push(TranscriptItem::AwaySummary(text));
+        }
     }
 
     pub fn push_completion(&mut self, report: UiCompletionReport) {

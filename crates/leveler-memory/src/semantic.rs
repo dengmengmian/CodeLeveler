@@ -60,6 +60,22 @@ pub enum CandidateDurability {
     Unknown,
 }
 
+/// Claude Code-style auto-memory category.
+///
+/// `Derived` and `TaskState` are rejection buckets. Naming them in the model
+/// contract lets the deterministic boundary refuse repository truth and
+/// transient progress even when extraction over-produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticMemoryType {
+    User,
+    Feedback,
+    Project,
+    Reference,
+    Derived,
+    TaskState,
+}
+
 /// What the model thinks should happen. A hint only: the commit decision
 /// re-derives the operation from the store, so a mislabeled hint cannot mutate
 /// the wrong memory.
@@ -91,6 +107,7 @@ pub struct SemanticCandidate {
     pub value: Option<String>,
     pub scope: CandidateScope,
     pub durability: CandidateDurability,
+    pub memory_type: SemanticMemoryType,
     pub authority: MemoryAuthority,
     pub operation_hint: OperationHint,
     /// The user's own words this fact was drawn from. Mandatory: it is the
@@ -120,6 +137,9 @@ pub enum CandidateRejection {
     NotDurable { durability: CandidateDurability },
     /// Only project scope may auto-commit this round.
     NotProjectScope { scope: CandidateScope },
+    /// Repository-derived truth and task state have authoritative owners
+    /// elsewhere and must not be copied into long-term memory.
+    NotAutoMemory { memory_type: SemanticMemoryType },
     /// The evidence span was empty or not found in the current user message.
     EvidenceNotFound,
     /// The candidate text looked like a credential.
@@ -139,6 +159,7 @@ impl CandidateRejection {
             Self::NotExplicitUser { .. } => "not_explicit_user",
             Self::NotDurable { .. } => "not_durable",
             Self::NotProjectScope { .. } => "not_project_scope",
+            Self::NotAutoMemory { .. } => "not_auto_memory",
             Self::EvidenceNotFound => "evidence_not_found",
             Self::Sensitive => "sensitive",
             Self::LowConfidence { .. } => "low_confidence",
@@ -158,6 +179,9 @@ impl CandidateRejection {
             }
             Self::NotDurable { durability } => format!("durability {durability:?} is not durable"),
             Self::NotProjectScope { scope } => format!("scope {scope:?} is not project"),
+            Self::NotAutoMemory { memory_type } => {
+                format!("{memory_type:?} belongs to an authoritative source, not auto-memory")
+            }
             Self::EvidenceNotFound => {
                 "evidence span was not found in the current user message".to_string()
             }
@@ -319,6 +343,14 @@ pub fn validate_semantic_candidate(
             scope: candidate.scope,
         });
     }
+    if matches!(
+        candidate.memory_type,
+        SemanticMemoryType::Derived | SemanticMemoryType::TaskState
+    ) {
+        return Err(CandidateRejection::NotAutoMemory {
+            memory_type: candidate.memory_type,
+        });
+    }
 
     if let Some(confidence) = candidate.confidence
         && confidence < MIN_CONFIDENCE
@@ -343,16 +375,22 @@ pub fn validate_semantic_candidate(
     }
 
     let key = semantic_key_of(&subject);
+    let kind = match candidate.memory_type {
+        SemanticMemoryType::User | SemanticMemoryType::Feedback => CandidateKind::Preference,
+        SemanticMemoryType::Project | SemanticMemoryType::Reference => CandidateKind::Free,
+        SemanticMemoryType::Derived | SemanticMemoryType::TaskState => unreachable!(),
+    };
     let mut memory = MemoryCandidate::new(
         fact,
         fact,
-        CandidateKind::Free,
+        kind,
         Some(key.clone()),
         CandidateSource::UserExplicit,
         vec![
             "explicit".to_string(),
             "decision".to_string(),
             "semantic".to_string(),
+            format!("memory_type:{:?}", candidate.memory_type).to_ascii_lowercase(),
             format!("subject:{subject}"),
         ],
     )
@@ -517,6 +555,7 @@ mod tests {
             value: None,
             scope: CandidateScope::Project,
             durability: CandidateDurability::Durable,
+            memory_type: SemanticMemoryType::Project,
             authority: MemoryAuthority::ExplicitUser,
             operation_hint: OperationHint::Create,
             evidence_span: evidence.to_string(),
@@ -527,7 +566,7 @@ mod tests {
     #[test]
     fn parses_a_bare_array_and_an_object_wrapper() {
         let json = r#"[{"fact":"默认模型是 Pro","subject":"project.default_model",
-            "scope":"project","durability":"durable","authority":"explicit_user",
+            "scope":"project","durability":"durable","memory_type":"project","authority":"explicit_user",
             "operation_hint":"create","evidence_span":"模型就 Pro"}]"#;
         let items = parse_semantic_candidates(json).unwrap();
         assert_eq!(items.len(), 1);
@@ -570,8 +609,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_memory_type_is_a_schema_error() {
+        let raw = r#"[{"fact":"默认模型是 Pro","subject":"project.default_model",
+            "scope":"project","durability":"durable","authority":"explicit_user",
+            "operation_hint":"create","evidence_span":"模型就 Pro"}]"#;
+        assert!(matches!(
+            parse_semantic_candidates(raw).unwrap_err(),
+            SemanticError::Schema(_)
+        ));
+    }
+
+    #[test]
     fn parses_dotted_subject_inside_braces_in_strings() {
-        let raw = r#"prefix {"candidates":[{"fact":"a } b","subject":"s","scope":"project","durability":"durable","authority":"explicit_user","operation_hint":"create","evidence_span":"x"}]} trailing"#;
+        let raw = r#"prefix {"candidates":[{"fact":"a } b","subject":"s","scope":"project","durability":"durable","memory_type":"project","authority":"explicit_user","operation_hint":"create","evidence_span":"x"}]} trailing"#;
         let items = parse_semantic_candidates(raw).unwrap();
         assert_eq!(items[0].fact, "a } b");
     }
@@ -597,6 +647,33 @@ mod tests {
             Some(semantic_key_of("默认模型").as_str())
         );
         assert_eq!(memory.evidence.as_deref(), Some("模型就 Pro"));
+    }
+
+    #[test]
+    fn repository_facts_and_task_state_are_not_auto_memory() {
+        for (memory_type, message, fact, evidence) in [
+            (
+                "derived",
+                "demoseed 的 RFQ 必须通过 sourcingrepo.Create 创建",
+                "RFQ 必须通过 sourcingrepo.Create 创建",
+                "RFQ 必须通过 sourcingrepo.Create 创建",
+            ),
+            (
+                "task_state",
+                "S12-05 独立验收还剩两个 blocker",
+                "S12-05 还剩两个 blocker",
+                "S12-05 独立验收还剩两个 blocker",
+            ),
+        ] {
+            let raw = format!(
+                r#"{{"candidates":[{{"fact":"{fact}","subject":"project.test","scope":"project","durability":"durable","authority":"explicit_user","operation_hint":"create","evidence_span":"{evidence}","memory_type":"{memory_type}"}}]}}"#
+            );
+            let candidate = parse_semantic_candidates(&raw).unwrap().remove(0);
+            assert!(
+                validate_semantic_candidate(&candidate, message).is_err(),
+                "{memory_type} must stay out of durable memory"
+            );
+        }
     }
 
     #[test]

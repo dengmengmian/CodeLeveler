@@ -878,6 +878,44 @@
       }
     },
     {
+      "description": "Best-effort prediction of the user's next prompt. Transient UI chrome: it is never persisted as user input and never participates in task completion. Clients may discard it when the user has started typing.",
+      "type": "object",
+      "required": [
+        "text",
+        "type"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "prompt_suggestion"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Best-effort, transient post-turn recap requested after an idle window. It is display-only and never becomes model-visible conversation.",
+      "type": "object",
+      "required": [
+        "text",
+        "type"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "away_summary"
+          ]
+        }
+      }
+    },
+    {
       "description": "The current turn finished successfully.",
       "type": "object",
       "required": [
@@ -3588,6 +3626,44 @@
               "type": "string",
               "enum": [
                 "session_completed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Best-effort prediction of the user's next prompt. Transient UI chrome: it is never persisted as user input and never participates in task completion. Clients may discard it when the user has started typing.",
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "prompt_suggestion"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Best-effort, transient post-turn recap requested after an idle window. It is display-only and never becomes model-visible conversation.",
+          "type": "object",
+          "required": [
+            "text",
+            "type"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "away_summary"
               ]
             }
           }

@@ -1,24 +1,28 @@
-# CodeLeveler 1.0.4
+# CodeLeveler 1.0.5
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-A correctness-focused patch release for task continuation and durable memory. Installed stable builds pick it up automatically, or run `leveler update` / `/update`.
+A first-run and idle-experience release on top of 1.0.4. Installed stable builds pick it up automatically, or run `leveler update` / `/update`.
+
+## Added
+
+- Running `leveler` with no configuration now starts the same first-run setup as `leveler login`, beginning with an explicit language choice (English / 中文) that is written to the config as `lang`
+- A fresh install enables start-up auto-update by default; package-manager users opt out with `[update] auto_update = false`
+- The config written by `leveler login` and `leveler init` carries bilingual comments for every setting it emits
+- The TUI predicts the user's next message as a transient ghost after a turn, and on opening an empty session it derives a starter from repository context. Tab accepts, Esc dismisses; nothing is persisted or submitted on its own
+- After three idle minutes in a substantial conversation, the TUI shows one muted recap of where the work reached and what comes next
+- The client protocol adds `RequestPromptSuggestion` / `RequestAwaySummary` and the `PromptSuggestion` / `AwaySummary` events (protocol minor 1.12); the remote surface refuses both commands
 
 ## Changed
 
-- Resumed work now keeps an explicit objective anchor, root turn and goal identity, so later instructions amend the same lineage instead of being mistaken for unrelated work
-- Durable-looking memory candidates wait for confirmation, while explicit `remember` commands still save immediately
-- A later explicit preference that conflicts with the same remembered subject supersedes the old value and reports that the stale memory was updated
-- Routine memory recall is shown once in Conversation instead of being duplicated as both a transcript note and a toast
+- Durable memory follows Claude Code-style boundaries: extraction classifies each candidate as user, feedback, project, reference, derived or task_state, and repository-derived truth and short-lived task state are refused rather than saved
+- Memory confirmations read as one calm sentence per batch instead of listing candidate ids, and the memory-change notes in Conversation are phrased as plain sentences
+- A fully settled plan checklist is no longer kept as conversation history after its turn ends
 
 ## Fixed
 
-- Goal checkpoints are scoped to their exact continuation lineage and cannot be consumed by unrelated chats or goals
-- Restart recovery and explicit continuation preserve the authoritative goal identity, including reopening the exact settled goal when needed
-- Repeated pending candidates for the same memory subject keep only the latest value; corrections also supersede compatible keyless direct memories from older builds, and retries cannot restore stale preferences out of order
-- API keys, tokens, passwords and other credential-shaped values are rejected at the memory write boundary
-- Sensitive entries left by older versions are hidden from automatic recall and from every model-facing memory action, including list, read, lexical search and vector search
-- Memory consolidation only considers fresh user-authored turns, avoiding replay or internal-turn candidates
+- A late model-generated suggestion or recap can no longer appear after the user has started typing or a new turn has begun
+- An idle recap is one-shot: a consumed deadline never fires again, and it is refused while a turn is running or text is staged
 
 ## Known limits
 

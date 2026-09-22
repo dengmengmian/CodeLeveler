@@ -885,11 +885,10 @@ pub(crate) async fn cmd_tui(
     session: Option<String>,
     config_overridden: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    // Start-up self-update is OPT-IN and, when enabled, must run before the
-    // terminal is taken over: a successful install replaces this process in
-    // place, which is only safe outside the alternate screen. It is off by
-    // default ([update].auto_update = false) so the default start-up path is
-    // local and makes no network request; a user who wants it opts in.
+    // Start-up self-update runs before the terminal is taken over: a
+    // successful install replaces this process in place, which is only safe
+    // outside the alternate screen. It is on by default; package-manager users
+    // can opt out with `[update].auto_update = false`.
     crate::upgrade_cmd::run_startup_update().await;
     if in_process && socket.is_some() {
         anyhow::bail!("--socket cannot be combined with --in-process");

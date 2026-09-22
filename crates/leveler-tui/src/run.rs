@@ -336,7 +336,10 @@ pub async fn run(
                     effects = reduce(&mut state, action);
                     paint_now = true;
                 }
-                _ = tick.tick() => { ticked = true; }
+                _ = tick.tick() => {
+                    effects = reduce(&mut state, Action::IdleTick(Instant::now()));
+                    ticked = true;
+                }
                 _ = selection_tick.tick(), if state.conv.selection.dragging => {
                     effects = reduce(&mut state, Action::SelectionTick);
                     if state.conv.selection_edge_dir != 0 {

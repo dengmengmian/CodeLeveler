@@ -219,7 +219,7 @@ fn a_terminal_turn_moves_the_exact_partial_plan_into_history() {
 }
 
 #[test]
-fn a_fully_done_plan_is_kept_until_terminal_then_archived_verbatim() {
+fn a_fully_done_plan_is_kept_until_terminal_then_disappears() {
     let mut s = opened();
     ask(&mut s, "问题 A");
     reduce(
@@ -238,10 +238,17 @@ fn a_fully_done_plan_is_kept_until_terminal_then_archived_verbatim() {
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     assert!(s.plan.is_none());
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Plan(_))),
+        "a completed checklist is not conversation history"
+    );
     let frame = rendered(&mut s, 120, 40);
     assert!(
-        frame.contains("3/3"),
-        "the historical snapshot is exact:\n{frame}"
+        !frame.contains("3/3") && !frame.contains("步骤一"),
+        "the completed checklist leaves the screen:\n{frame}"
     );
 }
 

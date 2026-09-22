@@ -305,6 +305,10 @@ export type RuntimeEvent =
   | { type: 'context_usage'; accounting: ContextAccounting }
   /** An orchestrated run completed; carries the summary report (spec §23). */
   | { type: 'session_completed'; report: UiCompletionReport }
+  /** Best-effort prediction of the user's next prompt. Transient UI chrome: it is never persisted as user input and never participates in task completion. Clients may discard it when the user has started typing. */
+  | { type: 'prompt_suggestion'; text: string }
+  /** Best-effort, transient post-turn recap requested after an idle window. It is display-only and never becomes model-visible conversation. */
+  | { type: 'away_summary'; text: string }
   /** The current turn finished successfully. */
   | { type: 'turn_completed' }
   /** The work completed and project verification retains its own result, but a separate required completion contract produced warnings. */
@@ -1053,6 +1057,10 @@ export type UserShellId = string;
 
 /** A command from a UI client to the runtime. */
 export type ClientCommand =
+  /** Ask the runtime for one best-effort prediction of the user's next prompt. The request is advisory UI chrome: it starts no task, persists no message, and may produce no event when there is insufficient context. */
+  | { type: 'request_prompt_suggestion'; session_id: SessionId }
+  /** Generate a one-shot recap after the UI has observed a post-turn idle window. The runtime may decline when the conversation is too short. */
+  | { type: 'request_away_summary'; session_id: SessionId }
   /** Submit a user message; the runtime drives a turn in the given session. */
   | { type: 'submit_message'; attachments?: AttachmentRef[]; content: string; session_id: SessionId }
   /** Steer the turn that is already running: the text is injected at the top of the next round instead of waiting for the turn to end. Distinct from queuing a follow-up (which `SubmitMessage` does while busy): a correction like "actually use the other module" is worthless once the work is finished. Ignored when no turn is running — the caller should submit normally in that case. */

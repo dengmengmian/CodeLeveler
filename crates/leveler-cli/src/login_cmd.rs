@@ -10,12 +10,103 @@
 //! `api_key_env`, never the key. The file is tightened to `0600` on write:
 //! once it holds a secret, its old world-readable default is wrong.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use anyhow::Context;
 use toml_edit::{DocumentMut, value};
 
 use crate::output::Line;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRunAction {
+    Continue,
+    Guide,
+    RefuseNonInteractive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterFirstRun {
+    ReturnToShell,
+    StartTui,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRunLanguage {
+    En,
+    Zh,
+}
+
+impl FirstRunLanguage {
+    fn pick(self, en: &'static str, zh: &'static str) -> &'static str {
+        match self {
+            Self::En => en,
+            Self::Zh => zh,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        self.pick("en", "zh")
+    }
+}
+
+fn parse_first_run_language(answer: &str) -> Option<FirstRunLanguage> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "en" | "english" => Some(FirstRunLanguage::En),
+        "2" | "zh" | "chinese" | "中文" => Some(FirstRunLanguage::Zh),
+        _ => None,
+    }
+}
+
+fn first_run_action(config_exists: bool, interactive: bool) -> FirstRunAction {
+    if config_exists {
+        FirstRunAction::Continue
+    } else if interactive {
+        FirstRunAction::Guide
+    } else {
+        FirstRunAction::RefuseNonInteractive
+    }
+}
+
+fn choose_first_run_language() -> anyhow::Result<FirstRunLanguage> {
+    println!("Choose your language:");
+    println!("    1) English");
+    println!("    2) 中文");
+    loop {
+        let answer = prompt_line("language [1]")?.unwrap_or_default();
+        if let Some(language) = parse_first_run_language(&answer) {
+            return Ok(language);
+        }
+        println!("  Please choose 1 for English or 2 for Chinese.");
+    }
+}
+
+/// Reuse `leveler login`'s first-run flow before opening the TUI.
+///
+/// `None` means the caller can continue into the TUI. `Some(code)` means setup
+/// was cancelled or cannot run safely and the caller should return that code.
+pub(crate) async fn ensure_first_run_config_for_tui()
+-> anyhow::Result<Option<std::process::ExitCode>> {
+    let path = leveler_app::GlobalConfig::path()
+        .context("cannot resolve a home directory for the global config")?;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    match first_run_action(path.exists(), interactive) {
+        FirstRunAction::Continue => Ok(None),
+        FirstRunAction::RefuseNonInteractive => {
+            eprintln!("No CodeLeveler config found / 未找到 CodeLeveler 配置。");
+            eprintln!("  Run `leveler login` in a terminal to configure a provider and model.");
+            eprintln!("  请在终端运行 `leveler login` 配置供应商和模型。");
+            Ok(Some(std::process::ExitCode::FAILURE))
+        }
+        FirstRunAction::Guide => {
+            let code = first_run_setup(&path, None, AfterFirstRun::StartTui).await?;
+            if code != std::process::ExitCode::SUCCESS {
+                Ok(Some(code))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
 
 /// Insert or replace `providers.<id>.api_key` in a config document.
 ///
@@ -43,7 +134,37 @@ pub(crate) fn set_provider_field(
         table.set_implicit(true);
     }
     let entry = providers[provider_id].or_insert(toml_edit::table());
-    entry[field] = value(field_value);
+    let table = entry
+        .as_table_mut()
+        .context("provider config entry must be a table")?;
+    table[field] = value(field_value);
+    let comment = match field {
+        "api_key" => Some((
+            "本机保存的 API Key，请勿提交到版本库。",
+            "Locally stored API key; never commit this file.",
+        )),
+        "protocol" => Some((
+            "供应商使用的接口协议。",
+            "API protocol used by this provider.",
+        )),
+        _ => None,
+    };
+    if let Some((zh, en)) = comment
+        && let Some(mut key) = table.key_mut(field)
+    {
+        key.leaf_decor_mut().set_prefix(format!("# {zh}\n# {en}\n"));
+    }
+    Ok(doc.to_string())
+}
+
+fn set_config_language(config: &str, language: FirstRunLanguage) -> anyhow::Result<String> {
+    let mut doc: DocumentMut = config.parse().context("global config is not valid TOML")?;
+    doc["lang"] = value(language.code());
+    if let Some(mut key) = doc.as_table_mut().key_mut("lang") {
+        key.leaf_decor_mut().set_prefix(
+            "# 界面语言；环境变量 LEVELER_LANG 的优先级更高。\n# UI language; LEVELER_LANG takes precedence.\n",
+        );
+    }
     Ok(doc.to_string())
 }
 
@@ -102,7 +223,9 @@ pub(crate) async fn cmd_login(provider: Option<String>) -> anyhow::Result<std::p
     // protocol, context window) that nobody can answer before using the tool.
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(_) => return first_run_setup(&path, provider.as_deref()).await,
+        Err(_) => {
+            return first_run_setup(&path, provider.as_deref(), AfterFirstRun::ReturnToShell).await;
+        }
     };
 
     let configured = configured_providers(&existing);
@@ -156,27 +279,55 @@ pub(crate) async fn cmd_login(provider: Option<String>) -> anyhow::Result<std::p
 async fn first_run_setup(
     path: &std::path::Path,
     provider: Option<&str>,
+    after: AfterFirstRun,
 ) -> anyhow::Result<std::process::ExitCode> {
     use leveler_provider::presets::{PRESETS, preset};
+
+    // This is deliberately the first user-facing output. No locale exists yet,
+    // so the language question itself is always in English.
+    let language = choose_first_run_language()?;
 
     let chosen = match provider {
         Some(id) => match preset(id) {
             Some(p) => p,
             None => {
-                println!("{}", Line::warn(&format!("Unknown provider `{id}`.")));
-                println!("  Built-in: {}", preset_ids().join(", "));
-                println!("  For anything else, run `leveler init` and edit the config.");
+                println!(
+                    "{}",
+                    Line::warn(&format!(
+                        "{} `{id}`.",
+                        language.pick("Unknown provider", "未知供应商")
+                    ))
+                );
+                println!(
+                    "  {}: {}",
+                    language.pick("Built-in", "内置供应商"),
+                    preset_ids().join(", ")
+                );
+                println!(
+                    "  {}",
+                    language.pick(
+                        "For anything else, run `leveler init` and edit the config.",
+                        "其他供应商请运行 `leveler init`，然后编辑配置文件。",
+                    )
+                );
                 return Ok(std::process::ExitCode::from(1));
             }
         },
         None => {
             println!("{}", Line::heading("leveler login"));
-            println!("  No config yet — setting one up.\n");
+            println!(
+                "  {}\n",
+                language.pick(
+                    "No config yet — setting one up.",
+                    "尚未找到配置，现在开始设置。"
+                )
+            );
             for (i, p) in PRESETS.iter().enumerate() {
-                println!("    {}) {}", i + 1, p.label);
+                println!("    {}) {}", i + 1, provider_label(p, language));
             }
             println!();
-            let answer = prompt_line("provider [1]")?.unwrap_or_default();
+            let answer =
+                prompt_line(language.pick("provider [1]", "供应商 [1]"))?.unwrap_or_default();
             let index = if answer.is_empty() {
                 0
             } else {
@@ -185,7 +336,13 @@ async fn first_run_setup(
                     _ => match preset(answer.trim()) {
                         Some(p) => PRESETS.iter().position(|x| x.id == p.id).unwrap_or(0),
                         None => {
-                            println!("{}", Line::warn("Not one of the listed choices."));
+                            println!(
+                                "{}",
+                                Line::warn(language.pick(
+                                    "Not one of the listed choices.",
+                                    "输入不在可选列表中。"
+                                ))
+                            );
                             return Ok(std::process::ExitCode::from(1));
                         }
                     },
@@ -196,21 +353,33 @@ async fn first_run_setup(
     };
 
     println!();
-    println!("  {} · {}", chosen.label, chosen.base_url);
-    println!("\n  Get a key at: {}", chosen.console_url);
-    let key = read_secret(&format!("API key for {}", chosen.label))?;
+    let chosen_label = provider_label(chosen, language);
+    println!("  {chosen_label} · {}", chosen.base_url);
+    println!(
+        "\n  {}: {}",
+        language.pick("Get an API key at", "获取 API Key"),
+        chosen.console_url
+    );
+    let key = read_first_run_secret(chosen_label, language)?;
     if key.trim().is_empty() {
-        println!("{}", Line::warn("Empty key — nothing written."));
+        println!(
+            "{}",
+            Line::warn(language.pick(
+                "Empty key — nothing written.",
+                "API Key 为空，未写入任何配置。"
+            ))
+        );
         return Ok(std::process::ExitCode::from(1));
     }
 
     // Ask the provider what this key can actually reach instead of making the
     // user invent a model id. The preset's suggestion is only the fallback for
     // gateways with no /models endpoint.
-    let model = choose_model(chosen, &key).await?;
+    let model = choose_model(chosen, &key, language).await?;
 
     let with_proto = starter_config(chosen, &model)?;
-    let with_key = upsert_api_key(&with_proto, chosen.id, &key)?;
+    let with_language = set_config_language(&with_proto, language)?;
+    let with_key = upsert_api_key(&with_language, chosen.id, &key)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -218,11 +387,46 @@ async fn first_run_setup(
     tighten(path).ok();
 
     println!();
-    println!("{}", Line::ok(&format!("Ready — {}/{}", chosen.id, model)));
-    println!("  {} (owner-only)", path.display());
-    println!("\nTry it:");
-    println!("  leveler            # interactive UI");
-    println!("  leveler doctor     # verify the setup");
+    println!(
+        "{}",
+        Line::ok(&format!(
+            "{} — {}/{}",
+            language.pick("Ready", "配置完成"),
+            chosen.id,
+            model
+        ))
+    );
+    println!(
+        "  {} ({})",
+        path.display(),
+        language.pick("owner-only", "仅当前用户可读写")
+    );
+    match after {
+        AfterFirstRun::ReturnToShell => {
+            println!("\n{}:", language.pick("Try it", "接下来可以运行"));
+            println!(
+                "  leveler            # {}",
+                language.pick("interactive UI", "打开交互界面")
+            );
+            println!(
+                "  leveler doctor     # {}",
+                language.pick("verify the setup", "检查配置")
+            );
+        }
+        AfterFirstRun::StartTui => {
+            println!(
+                "  {}",
+                language.pick(
+                    "Run `leveler doctor` later to verify the setup.",
+                    "稍后可运行 `leveler doctor` 检查配置。"
+                )
+            );
+            println!(
+                "\n{}\n",
+                language.pick("Starting CodeLeveler…", "正在启动 CodeLeveler…")
+            );
+        }
+    }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -258,6 +462,7 @@ fn starter_config(
 async fn choose_model(
     preset: &leveler_provider::presets::ProviderPreset,
     api_key: &str,
+    language: FirstRunLanguage,
 ) -> anyhow::Result<String> {
     let probe = leveler_provider::config::ProviderConfig {
         id: preset.id.to_string(),
@@ -269,12 +474,21 @@ async fn choose_model(
         timeouts: Default::default(),
         retry: Default::default(),
     };
-    println!("\n  正在获取可用模型…");
+    println!(
+        "\n  {}",
+        language.pick("Fetching available models…", "正在获取可用模型…")
+    );
     let available = match leveler_provider::discovery::list_remote_models(&probe).await {
         Ok(models) if !models.is_empty() => models,
         // Neither case is a failure: plenty of gateways do not implement it.
         Ok(_) => {
-            println!("  (这个 key 没有列出可用模型)");
+            println!(
+                "  ({})",
+                language.pick(
+                    "this key did not list any available models",
+                    "这个 Key 没有列出可用模型"
+                )
+            );
             Vec::new()
         }
         Err(e) => {
@@ -283,9 +497,13 @@ async fn choose_model(
         }
     };
     if available.is_empty() {
-        return Ok(prompt_line(&format!("model [{}]", preset.suggested_model))?
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| preset.suggested_model.to_string()));
+        return Ok(prompt_line(&format!(
+            "{} [{}]",
+            language.pick("model", "模型"),
+            preset.suggested_model
+        ))?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| preset.suggested_model.to_string()));
     }
 
     let shown: Vec<&String> = available.iter().take(20).collect();
@@ -293,12 +511,19 @@ async fn choose_model(
         println!("    {}) {m}", i + 1);
     }
     if available.len() > shown.len() {
-        println!(
-            "    … 另有 {} 个未列出（可直接输入名称）",
-            available.len() - shown.len()
-        );
+        let more = match language {
+            FirstRunLanguage::En => format!(
+                "{} more not shown (type a name directly)",
+                available.len() - shown.len()
+            ),
+            FirstRunLanguage::Zh => format!(
+                "另有 {} 个未列出（可直接输入名称）",
+                available.len() - shown.len()
+            ),
+        };
+        println!("    … {more}");
     }
-    let answer = prompt_line("model [1]")?.unwrap_or_default();
+    let answer = prompt_line(language.pick("model [1]", "模型 [1]"))?.unwrap_or_default();
     if answer.is_empty() {
         return Ok(shown[0].to_string());
     }
@@ -309,6 +534,34 @@ async fn choose_model(
     }
     // A typed name is accepted verbatim — the listing may be truncated.
     Ok(answer)
+}
+
+fn provider_label(
+    preset: &leveler_provider::presets::ProviderPreset,
+    language: FirstRunLanguage,
+) -> &'static str {
+    if preset.id == "bigmodel" {
+        language.pick("Zhipu BigModel", "智谱 BigModel")
+    } else {
+        preset.label
+    }
+}
+
+fn read_first_run_secret(provider: &str, language: FirstRunLanguage) -> anyhow::Result<String> {
+    let label = match language {
+        FirstRunLanguage::En => format!("API key for {provider}"),
+        FirstRunLanguage::Zh => format!("{provider} API Key"),
+    };
+    print!(
+        "  {label} ({}): ",
+        language.pick("input hidden", "输入已隐藏")
+    );
+    std::io::stdout().flush().ok();
+    let key = console::Term::stdout()
+        .read_secure_line()
+        .context("read API key")?;
+    println!();
+    Ok(key)
 }
 
 fn preset_ids() -> Vec<&'static str> {
@@ -396,6 +649,41 @@ context_window = 131072
 "#;
 
     #[test]
+    fn first_tui_launch_guides_only_an_interactive_unconfigured_user() {
+        assert_eq!(first_run_action(true, true), FirstRunAction::Continue);
+        assert_eq!(first_run_action(true, false), FirstRunAction::Continue);
+        assert_eq!(first_run_action(false, true), FirstRunAction::Guide);
+        assert_eq!(
+            first_run_action(false, false),
+            FirstRunAction::RefuseNonInteractive
+        );
+    }
+
+    #[test]
+    fn language_is_the_first_explicit_first_run_choice() {
+        assert_eq!(parse_first_run_language(""), Some(FirstRunLanguage::En));
+        assert_eq!(parse_first_run_language("1"), Some(FirstRunLanguage::En));
+        assert_eq!(
+            parse_first_run_language("english"),
+            Some(FirstRunLanguage::En)
+        );
+        assert_eq!(parse_first_run_language("2"), Some(FirstRunLanguage::Zh));
+        assert_eq!(parse_first_run_language("中文"), Some(FirstRunLanguage::Zh));
+        assert_eq!(parse_first_run_language("3"), None);
+    }
+
+    #[test]
+    fn selected_language_is_persisted_with_bilingual_help() {
+        for (language, expected) in [(FirstRunLanguage::En, "en"), (FirstRunLanguage::Zh, "zh")] {
+            let text = set_config_language(SAMPLE, language).unwrap();
+            let doc: DocumentMut = text.parse().unwrap();
+            assert_eq!(doc["lang"].as_str(), Some(expected));
+            assert!(text.contains("界面语言"), "{text}");
+            assert!(text.contains("UI language"), "{text}");
+        }
+    }
+
+    #[test]
     fn the_key_lands_under_the_right_provider() {
         let out = upsert_api_key(SAMPLE, "deepseek", "sk-abc").unwrap();
         let doc: DocumentMut = out.parse().unwrap();
@@ -407,6 +695,8 @@ context_window = 131072
             doc["providers"]["kimi"].get("api_key").is_none(),
             "only the named provider may be touched"
         );
+        assert!(out.contains("本机保存的 API Key"), "{out}");
+        assert!(out.contains("Locally stored API key"), "{out}");
     }
 
     /// This file is hand-maintained; a login must not reformat it or drop the
@@ -500,6 +790,10 @@ context_window = 131072
                 Some(p.base_url)
             );
             assert_eq!(doc["providers"][p.id]["api_key"].as_str(), Some("sk-test"));
+            assert!(out.contains("供应商使用的接口协议"), "{out}");
+            assert!(out.contains("API protocol used by this provider"), "{out}");
+            assert!(out.contains("本机保存的 API Key"), "{out}");
+            assert!(out.contains("Locally stored API key"), "{out}");
             assert_eq!(
                 doc["default_model"].as_str(),
                 Some(format!("{}/{}", p.id, p.suggested_model).as_str()),

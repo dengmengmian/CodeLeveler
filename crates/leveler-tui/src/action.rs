@@ -86,6 +86,8 @@ pub enum Action {
     Mouse(MouseEvent),
     /// Drive edge auto-scroll while a text selection drag is active.
     SelectionTick,
+    /// Poll the one-shot post-turn idle recap deadline.
+    IdleTick(std::time::Instant),
     /// A burst of plain text typed into the composer.
     TextInput(String),
     /// A bracketed-paste payload.

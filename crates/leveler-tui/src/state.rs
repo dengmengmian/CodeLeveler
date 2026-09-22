@@ -264,6 +264,16 @@ pub struct AppState {
     /// composer content, not a draft, not history, and never submitted on its
     /// own. Ephemeral and never persisted.
     pub prompt_suggestion: Option<String>,
+    /// Whether an asynchronously generated suggestion may still land for the
+    /// current idle input window. Any user edit closes the window so a late
+    /// model response cannot reappear after the user dismissed it.
+    pub prompt_suggestion_allowed: bool,
+    /// One-shot deadline for an optional post-turn recap. User input clears
+    /// it; firing it consumes it. Presentation-only, never persisted.
+    pub away_summary_due_at: Option<std::time::Instant>,
+    /// A request has fired and its late response may still be displayed.
+    /// User activity closes this acceptance window.
+    pub away_summary_pending: bool,
     pub theme: Theme,
     /// Terminal size (cols, rows).
     pub size: (u16, u16),
@@ -541,6 +551,9 @@ impl AppState {
             unfinished_goals: Vec::new(),
             composer: Composer::new(),
             prompt_suggestion: None,
+            prompt_suggestion_allowed: true,
+            away_summary_due_at: None,
+            away_summary_pending: false,
             theme,
             size: (80, 24),
             active_screen: Screen::default(),

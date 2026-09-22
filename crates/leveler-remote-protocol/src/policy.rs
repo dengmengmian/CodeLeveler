@@ -315,9 +315,11 @@ impl RemotePolicy {
 
             // A recap projects plan wording, findings, and workspace paths —
             // repository content in prose form, same class as the goal list.
-            ClientCommand::Recap { .. } => RemoteVerdict::Deny {
+            ClientCommand::Recap { .. }
+            | ClientCommand::RequestPromptSuggestion { .. }
+            | ClientCommand::RequestAwaySummary { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,
-                reason: "goal recap is local-only",
+                reason: "generated session chrome is local-only",
             },
 
             // Retiring the runtime is local lifecycle authority. A phone on

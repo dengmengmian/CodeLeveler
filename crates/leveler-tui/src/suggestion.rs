@@ -56,6 +56,27 @@ pub fn clear(state: &mut AppState) {
     state.prompt_suggestion = None;
 }
 
+/// Start a new idle-input window in which one asynchronous prediction may
+/// arrive. Turn/session boundaries call this; ordinary repainting never does.
+pub fn allow_generated(state: &mut AppState) {
+    state.prompt_suggestion_allowed = true;
+}
+
+/// The user acted on the input. Remove the current ghost and reject a late
+/// prediction that was already in flight for this window.
+pub fn dismiss(state: &mut AppState) {
+    state.prompt_suggestion = None;
+    state.prompt_suggestion_allowed = false;
+}
+
+/// Offer a runtime-generated prediction only while its idle-input window is
+/// still untouched. `offer` keeps the composer-empty guard authoritative.
+pub fn offer_generated(state: &mut AppState, text: &str) {
+    if state.prompt_suggestion_allowed && state.prompt_suggestion.is_none() {
+        offer(state, text);
+    }
+}
+
 /// The single definition of "the ghost is on screen".
 ///
 /// Both the reducer (Tab / Esc) and the renderer read this, so there is exactly

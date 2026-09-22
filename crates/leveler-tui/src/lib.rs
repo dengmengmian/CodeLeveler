@@ -17,6 +17,7 @@ pub mod active_goal;
 pub mod activity;
 mod activity_stream;
 pub mod agents_view;
+pub mod away_summary;
 mod brand;
 pub mod btw;
 pub mod clean;

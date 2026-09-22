@@ -391,6 +391,13 @@ pub enum RuntimeEvent {
     },
     /// An orchestrated run completed; carries the summary report (spec §23).
     SessionCompleted { report: UiCompletionReport },
+    /// Best-effort prediction of the user's next prompt. Transient UI chrome:
+    /// it is never persisted as user input and never participates in task
+    /// completion. Clients may discard it when the user has started typing.
+    PromptSuggestion { text: String },
+    /// Best-effort, transient post-turn recap requested after an idle window.
+    /// It is display-only and never becomes model-visible conversation.
+    AwaySummary { text: String },
     /// The current turn finished successfully.
     TurnCompleted,
     /// The work completed and project verification retains its own result,
@@ -1260,6 +1267,22 @@ mod tests {
                 },
             },
             "session_completed",
+        );
+    }
+
+    #[test]
+    fn generated_chrome_events_roundtrip() {
+        roundtrip(
+            RuntimeEvent::PromptSuggestion {
+                text: "继续验证".into(),
+            },
+            "prompt_suggestion",
+        );
+        roundtrip(
+            RuntimeEvent::AwaySummary {
+                text: "已完成定位，下一步修复。".into(),
+            },
+            "away_summary",
         );
     }
 

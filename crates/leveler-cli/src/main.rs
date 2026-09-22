@@ -195,6 +195,16 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
     let config_overridden = args.config_dir.is_some();
     let layout = resolve_layout(args.repo, args.config_dir)?;
+
+    // The ordinary first launch should become a working product, not a TUI
+    // that can only report "no model configured". Reuse `leveler login` as the
+    // single owner of provider discovery, model selection, secret input and
+    // config generation. Other commands remain scriptable and never prompt.
+    if matches!(&args.command, None | Some(Command::Tui { .. }))
+        && let Some(code) = login_cmd::ensure_first_run_config_for_tui().await?
+    {
+        return Ok(code);
+    }
     warn_untrusted_project_config(&layout);
 
     // No subcommand (or explicit `tui`) opens the interactive terminal UI.

@@ -109,7 +109,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // Staging an attachment is the start of a new message, however the
             // user got here (clipboard image, `/image`, `/attach`). The last
             // turn's next step no longer describes what they are composing.
-            crate::suggestion::clear(state);
+            crate::suggestion::dismiss(state);
             // The image goes where the user is writing, as `[图片 #N]`, and
             // takes the place among the staged images that its token has in
             // the sentence — paste one ahead of another and it IS the first.
@@ -299,6 +299,15 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::SessionCompleted { report } => {
             state.transcript.push_completion(report);
+        }
+        RuntimeEvent::PromptSuggestion { text } => {
+            crate::suggestion::offer_generated(state, &text);
+        }
+        RuntimeEvent::AwaySummary { text } => {
+            if state.away_summary_pending && !state.is_busy() && state.composer.is_empty() {
+                state.transcript.push_away_summary(text);
+            }
+            state.away_summary_pending = false;
         }
         RuntimeEvent::CheckpointCreated { checkpoint } => {
             // Dedup by id — a replayed/lagged event must not add a duplicate.
@@ -993,7 +1002,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 "merged" => t.memory_merged,
                 _ => t.memory_created,
             };
-            let line = format!("{verb} · {title}");
+            let line = verb.replace("{}", &title);
             state.transcript.push_note(line.clone());
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
@@ -1034,6 +1043,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     state.goal_mode_active = false;
     state.transcript.finalize_in_flight();
     state.team.mark_unreported_at_turn_end(state.elapsed_secs);
+    crate::suggestion::allow_generated(state);
     // §12: a clean outcome still needs an answer behind it. Only the two
     // outcomes that render as done are rewritten — an Incomplete or Failed turn
     // already says something went wrong.
@@ -1104,6 +1114,18 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         None => crate::suggestion::clear(state),
     }
     seal_analysis_segment(state);
+    if matches!(
+        status,
+        TurnEndStatus::Completed
+            | TurnEndStatus::CompletedWithWarnings
+            | TurnEndStatus::Answered
+            | TurnEndStatus::Unverified
+            | TurnEndStatus::ChecksFailed
+    ) {
+        crate::away_summary::arm(state, std::time::Instant::now());
+    } else {
+        crate::away_summary::cancel(state);
+    }
 }
 
 /// Rough token estimate from transcript text (CJK-aware), used only when the
@@ -1431,7 +1453,12 @@ fn replace_active_background_tasks(
 
 fn archive_active_plan(state: &mut AppState) {
     if let Some(plan) = state.plan.take() {
-        state.transcript.push_plan(plan);
+        // A fully settled checklist has finished its job as execution chrome.
+        // Keep only plans with open or failed work in history; otherwise a
+        // completed turn leaves a redundant N/N block above its result.
+        if crate::workbench::plan_panel_should_show(&plan) {
+            state.transcript.push_plan(plan);
+        }
     }
     if state.workbench_focus == crate::state::WorkbenchFocus::Plan {
         state.workbench_focus = crate::state::WorkbenchFocus::Input;
@@ -1439,6 +1466,7 @@ fn archive_active_plan(state: &mut AppState) {
 }
 
 pub(super) fn start_turn(state: &mut AppState) {
+    crate::away_summary::cancel(state);
     // A new turn owns the current activity view. The previous turn's settled
     // children are history now — the transcript kept them — and must not keep
     // rendering as work in flight. A child still open at the boundary stays:
@@ -1453,7 +1481,7 @@ pub(super) fn start_turn(state: &mut AppState) {
     state.finalization_stage = None;
     state.project_rule_sources.clear();
     // The previous turn's next step is spent — a new turn is under way.
-    crate::suggestion::clear(state);
+    crate::suggestion::dismiss(state);
     seal_analysis_segment(state);
     // The Active Goal indicator begins with the turn: a new task replaces the
     // last goal with a fresh clock, a continuation keeps its identity and its
@@ -1599,6 +1627,8 @@ fn apply_session_with(
     // the transcript this snapshot is about to replace no longer applies.
     state.pending_permission = None;
     crate::suggestion::clear(state);
+    crate::suggestion::allow_generated(state);
+    crate::away_summary::cancel(state);
     state.status = match session.status.as_str() {
         "running" => RuntimeStatus::Busy,
         "failed" => RuntimeStatus::Error,
