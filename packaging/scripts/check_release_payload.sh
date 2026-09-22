@@ -8,6 +8,22 @@ WORKFLOW="$ROOT/.github/workflows/release.yml"
 
 [ -f "$WORKFLOW" ] || { echo "missing $WORKFLOW" >&2; exit 1; }
 
+# `rust-embed` captures the WebUI at Rust compile time. Building the SPA in a
+# separate CI job does not put it in a release binary, so the release job must
+# build `web/dist` before its first `cargo build --release` invocation.
+web_install_line="$(grep -n -m1 'npm --prefix crates/leveler-web/web ci' "$WORKFLOW" | cut -d: -f1 || true)"
+web_build_line="$(grep -n -m1 'npm --prefix crates/leveler-web/web run build' "$WORKFLOW" | cut -d: -f1 || true)"
+rust_build_line="$(grep -n -m1 'cargo build --release --locked -p leveler-cli' "$WORKFLOW" | cut -d: -f1 || true)"
+
+if [ -z "$web_install_line" ] || [ -z "$web_build_line" ] || [ -z "$rust_build_line" ]; then
+  echo "release payload: release.yml must install and build the WebUI before compiling leveler" >&2
+  exit 1
+fi
+if [ "$web_install_line" -ge "$web_build_line" ] || [ "$web_build_line" -ge "$rust_build_line" ]; then
+  echo "release payload: WebUI build must run before the release binary is compiled" >&2
+  exit 1
+fi
+
 # The unix `cp README.md …` line and the windows `Copy-Item README.md,…` line
 # name the same payload in two syntaxes. Check both, so they cannot silently
 # diverge.

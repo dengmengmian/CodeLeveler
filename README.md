@@ -74,12 +74,17 @@ On Windows, extract the `.zip` and keep `leveler.exe` and `leveler-confine.exe` 
 
 ### From source
 
-With Rust 1.90+ and Git:
+With Rust 1.90+, Node.js 22+, npm, and Git:
 
 ```sh
+npm --prefix crates/leveler-web/web ci
+npm --prefix crates/leveler-web/web run build
 cargo install --path crates/leveler-cli --locked
 leveler --version
 ```
+
+The frontend must be built before `cargo install` because its output is
+embedded in the `leveler` binary at Rust compile time.
 
 On Linux, install `bubblewrap` before running agent commands:
 
@@ -98,7 +103,7 @@ Manual update:
 ```sh
 leveler update            # install the latest stable release
 leveler update --check    # exit 2 when an update exists
-leveler update --version v1.0.5
+leveler update --version v1.0.6
 ```
 
 Inside the TUI:

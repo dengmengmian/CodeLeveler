@@ -74,12 +74,17 @@ Windows 请解压 `.zip`，并保持 `leveler.exe` 与 `leveler-confine.exe` 在
 
 ### 从源码
 
-安装 Rust 1.90+ 和 Git 后：
+安装 Rust 1.90+、Node.js 22+、npm 和 Git 后：
 
 ```sh
+npm --prefix crates/leveler-web/web ci
+npm --prefix crates/leveler-web/web run build
 cargo install --path crates/leveler-cli --locked
 leveler --version
 ```
+
+必须先构建前端再执行 `cargo install`，因为 Rust 编译时会把前端产物嵌入
+`leveler` 二进制。
 
 Linux 在运行智能体命令前需要安装 `bubblewrap`：
 
@@ -98,7 +103,7 @@ CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时�
 ```sh
 leveler update            # 安装最新稳定版
 leveler update --check    # 有更新时退出码为 2
-leveler update --version v1.0.5
+leveler update --version v1.0.6
 ```
 
 在 TUI 中：

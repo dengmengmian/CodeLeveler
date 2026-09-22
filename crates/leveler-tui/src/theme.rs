@@ -201,6 +201,143 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
+/// Whether this Apple Terminal host needs the 256-colour compatibility path.
+/// Kept pure so the macOS-version boundary is testable without changing the
+/// process environment.
+fn old_apple_terminal(term_program: Option<&str>, macos_product_version: Option<&str>) -> bool {
+    if term_program != Some("Apple_Terminal") {
+        return false;
+    }
+    macos_product_version
+        .and_then(|version| version.split('.').next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_none_or(|major| major < 26)
+}
+
+/// Replace every RGB token with its nearest xterm-256 colour.
+fn indexed_256_theme(theme: Theme) -> Theme {
+    let indexed = |color| match color {
+        Color::Rgb(r, g, b) => Color::Indexed(nearest_xterm_256(r, g, b)),
+        other => other,
+    };
+    Theme {
+        id: theme.id,
+        monochrome: theme.monochrome,
+        surface: SurfaceColors {
+            canvas: indexed(theme.surface.canvas),
+            panel: indexed(theme.surface.panel),
+            elevated: indexed(theme.surface.elevated),
+            input: indexed(theme.surface.input),
+            selection: indexed(theme.surface.selection),
+        },
+        text: TextColors {
+            primary: indexed(theme.text.primary),
+            secondary: indexed(theme.text.secondary),
+            muted: indexed(theme.text.muted),
+            disabled: indexed(theme.text.disabled),
+            inverse: indexed(theme.text.inverse),
+            active: indexed(theme.text.active),
+            meta: indexed(theme.text.meta),
+            subtle: indexed(theme.text.subtle),
+        },
+        border: BorderColors {
+            subtle: indexed(theme.border.subtle),
+            normal: indexed(theme.border.normal),
+            strong: indexed(theme.border.strong),
+            focus: indexed(theme.border.focus),
+        },
+        accent: AccentColors {
+            primary: indexed(theme.accent.primary),
+            secondary: indexed(theme.accent.secondary),
+            subtle: indexed(theme.accent.subtle),
+        },
+        status: StatusColors {
+            success: indexed(theme.status.success),
+            warning: indexed(theme.status.warning),
+            error: indexed(theme.status.error),
+            info: indexed(theme.status.info),
+            running: indexed(theme.status.running),
+        },
+        diff: DiffColors {
+            added: indexed(theme.diff.added),
+            removed: indexed(theme.diff.removed),
+            modified: indexed(theme.diff.modified),
+            context: indexed(theme.diff.context),
+            added_bg: indexed(theme.diff.added_bg),
+            removed_bg: indexed(theme.diff.removed_bg),
+        },
+        brand: BrandColors {
+            foundation: indexed(theme.brand.foundation),
+            primary: indexed(theme.brand.primary),
+            highlight: indexed(theme.brand.highlight),
+        },
+    }
+}
+
+/// Nearest colour in the stable xterm cube/grayscale range. Indices 0–15 are
+/// deliberately excluded because terminal profiles may remap those colours.
+fn nearest_xterm_256(r: u8, g: u8, b: u8) -> u8 {
+    let mut nearest = 16u8;
+    let mut nearest_distance = u32::MAX;
+    for index in 16u8..=255 {
+        let (cr, cg, cb) = xterm_256_rgb(index);
+        let dr = i32::from(r) - i32::from(cr);
+        let dg = i32::from(g) - i32::from(cg);
+        let db = i32::from(b) - i32::from(cb);
+        let distance = (dr * dr + dg * dg + db * db) as u32;
+        if distance < nearest_distance {
+            nearest = index;
+            nearest_distance = distance;
+        }
+    }
+    nearest
+}
+
+fn xterm_256_rgb(index: u8) -> (u8, u8, u8) {
+    if index >= 232 {
+        let value = 8 + (index - 232) * 10;
+        return (value, value, value);
+    }
+    let cube = index - 16;
+    let channel = |level: u8| if level == 0 { 0 } else { 55 + level * 40 };
+    (
+        channel(cube / 36),
+        channel((cube % 36) / 6),
+        channel(cube % 6),
+    )
+}
+
+fn macos_product_version() -> Option<&'static str> {
+    static VERSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            {
+                let output = std::process::Command::new("/usr/bin/sw_vers")
+                    .arg("-productVersion")
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .env_clear()
+                    .output()
+                    .ok()?;
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        })
+        .as_deref()
+}
+
+fn terminal_needs_indexed_colors() -> bool {
+    let env = leveler_core::environment();
+    old_apple_terminal(env.var("TERM_PROGRAM").as_deref(), macos_product_version())
+}
+
 impl Theme {
     /// Opaque dark palette (coding-agent default look).
     pub fn dark() -> Self {
@@ -474,7 +611,12 @@ impl Theme {
         if no_color {
             Self::monochrome_with_id(id)
         } else {
-            Self::named(id)
+            let theme = Self::named(id);
+            if terminal_needs_indexed_colors() {
+                indexed_256_theme(theme)
+            } else {
+                theme
+            }
         }
     }
 
@@ -548,16 +690,18 @@ pub fn detect_dark_terminal() -> bool {
         .unwrap_or(true)
 }
 
-/// WCAG relative luminance for an RGB color. `Reset` / named ANSI → `None`.
+/// WCAG relative luminance for RGB or the stable xterm-256 cube/grayscale.
+/// `Reset` and profile-defined ANSI indices 0–15 have no reliable luminance.
 pub fn relative_luminance(color: Color) -> Option<f64> {
     let (r, g, b) = match color {
         Color::Rgb(r, g, b) => (r, g, b),
+        Color::Indexed(index @ 16..=255) => xterm_256_rgb(index),
         _ => return None,
     };
     Some(0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b))
 }
 
-/// WCAG contrast ratio between two RGB colors.
+/// WCAG contrast ratio between two colours with known luminance.
 pub fn contrast_ratio(a: Color, b: Color) -> Option<f64> {
     let la = relative_luminance(a)?;
     let lb = relative_luminance(b)?;
@@ -740,6 +884,39 @@ mod tests {
             assert_eq!(t.surface.canvas, Color::Reset);
             assert_eq!(t.id, id, "preference id retained under NO_COLOR");
         }
+    }
+
+    #[test]
+    fn apple_terminal_before_macos_26_requires_indexed_colors() {
+        assert!(old_apple_terminal(Some("Apple_Terminal"), Some("15.7.1")));
+        assert!(old_apple_terminal(Some("Apple_Terminal"), None));
+        assert!(!old_apple_terminal(Some("Apple_Terminal"), Some("26.0")));
+        assert!(!old_apple_terminal(Some("iTerm.app"), Some("15.7.1")));
+    }
+
+    #[test]
+    fn indexed_compatibility_replaces_rgb_tokens_without_becoming_monochrome() {
+        let theme = indexed_256_theme(Theme::dark());
+        assert!(!theme.is_monochrome());
+        for color in [
+            theme.surface.canvas,
+            theme.surface.input,
+            theme.text.primary,
+            theme.text.muted,
+            theme.border.focus,
+            theme.accent.primary,
+            theme.status.error,
+            theme.diff.added_bg,
+            theme.brand.highlight,
+        ] {
+            assert!(matches!(color, Color::Indexed(_)), "{color:?}");
+        }
+    }
+
+    #[test]
+    fn indexed_compatibility_preserves_theme_polarity() {
+        assert!(indexed_256_theme(Theme::dark()).is_dark());
+        assert!(!indexed_256_theme(Theme::light()).is_dark());
     }
 
     #[test]

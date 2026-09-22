@@ -62,6 +62,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The SPA is embedded by rust-embed at Rust compile time. Each matrix
+      # runner must create web/dist locally; the separate CI WebUI job cannot
+      # contribute files to this release build.
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/leveler-web/web/package-lock.json
+
+      - name: Build WebUI
+        run: |
+          npm --prefix crates/leveler-web/web ci
+          npm --prefix crates/leveler-web/web run build
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0
         with:
