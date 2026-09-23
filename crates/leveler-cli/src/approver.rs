@@ -18,13 +18,9 @@ impl Approver for CliApprover {
             request.tool,
             request.risk
         );
-        if let Some(cmd) = &request.command {
-            eprintln!("    {}", style(cmd).bold());
-        }
-        if !request.paths.is_empty() {
-            for p in &request.paths {
-                eprintln!("    path: {}", p.display());
-            }
+        let details = request_details(request);
+        if !details.is_empty() {
+            eprintln!("{details}");
         }
         let persists = request.always_persists();
         eprint!("  Approve? {}: ", choices_prompt(persists));
@@ -41,6 +37,25 @@ impl Approver for CliApprover {
 
         parse_answer(&line, persists)
     }
+}
+
+fn request_details(request: &ApprovalRequest) -> String {
+    let mut lines = Vec::new();
+    // Escalation approvals can carry their scope, operation and reason in the
+    // description with no separate command. Omitting it makes consent blind.
+    if !request.description.trim().is_empty() {
+        lines.push(format!(
+            "    {}",
+            leveler_core::sanitize_terminal_output(&request.description)
+        ));
+    }
+    if let Some(cmd) = &request.command {
+        lines.push(format!("    {}", style(cmd).bold()));
+    }
+    for path in &request.paths {
+        lines.push(format!("    path: {}", path.display()));
+    }
+    lines.join("\n")
 }
 
 /// The answers offered. "Always" only when the runtime would persist a rule
@@ -73,6 +88,41 @@ fn parse_answer(line: &str, always_persists: bool) -> ApprovalDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privileged_approval_displays_scope_command_and_reason_from_description() {
+        let mut request = ApprovalRequest {
+            id: leveler_core::ApprovalId::new("test"),
+            turn_id: None,
+            call_id: "call".into(),
+            agent_id: None,
+            action_fingerprint: "fingerprint".into(),
+            tool: "shell_command".into(),
+            risk: leveler_execution::RiskLevel::Privileged,
+            description: "Unrestricted filesystem · git add taskbox/ · reason: local commit".into(),
+            command: None,
+            paths: Vec::new(),
+        };
+        let details = request_details(&request);
+        assert!(details.contains(&request.description), "{details}");
+        request.command = Some("git add taskbox/".into());
+        request.paths.push("taskbox/".into());
+        let details = request_details(&request);
+        assert!(details.contains(&request.description));
+        assert!(details.contains("path: taskbox/"));
+        assert!(details.contains("git add taskbox/"));
+        assert!(
+            console::strip_ansi_codes(&details)
+                .lines()
+                .any(|line| line.trim() == "git add taskbox/")
+        );
+        request.command = None;
+        request.paths.clear();
+        request.description = "\u{1b}[2Jgit add taskbox/\rreason: local commit".into();
+        let details = request_details(&request);
+        assert!(!details.contains('\u{1b}') && !details.contains('\r'));
+        assert!(details.contains("git add taskbox/") && details.contains("reason: local commit"));
+    }
 
     /// A consent tool cannot become a project rule: the prompt does not offer
     /// "always", and typing `w` anyway is not an approval.
