@@ -15,6 +15,7 @@ use crate::screen::Screen;
 use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
 
 pub mod overlay_keys;
+mod paste_file;
 mod paste_image;
 mod runtime_apply;
 mod screen_nav;
@@ -46,6 +47,23 @@ pub(crate) fn reconcile_images(state: &mut AppState) {
         .into_iter()
         .filter_map(|index| staged.get(index).cloned())
         .collect();
+}
+
+fn insert_file_references(state: &mut AppState, text: &str) -> bool {
+    let files = paste_file::pasted_files(text);
+    if files.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    for file in files {
+        state.composer.insert_str(&text[from..file.range.start]);
+        state
+            .composer
+            .insert_file_reference(&text[file.range.clone()], &file.name);
+        from = file.range.end;
+    }
+    state.composer.insert_str(&text[from..]);
+    true
 }
 
 /// Fold an action into state, returning side effects for the event loop.
@@ -257,7 +275,9 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 ov.insert_text(&text);
                 Vec::new()
             } else {
-                state.composer.insert_paste(&text);
+                if !insert_file_references(state, &text) {
+                    state.composer.insert_paste(&text);
+                }
                 touch_slash_filter(state);
                 request_file_candidates(state)
             }
@@ -285,10 +305,14 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 state.workbench_focus = WorkbenchFocus::Input;
                 // PTY paste without bracketed-paste arrives as a key burst;
                 // still fold large multi-line blobs like Action::Paste.
-                if text.contains('\n') {
-                    state.composer.insert_paste(&text);
-                } else {
-                    state.composer.insert_str(&text);
+                // The terminal may deliver a dropped path as a burst of
+                // ordinary key text instead of a bracketed paste.
+                if !insert_file_references(state, &text) {
+                    if text.contains('\n') {
+                        state.composer.insert_paste(&text);
+                    } else {
+                        state.composer.insert_str(&text);
+                    }
                 }
                 touch_slash_filter(state);
             }
@@ -300,6 +324,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             // to the text, the tokens left in it and the staged images are
             // brought back into agreement before anything is drawn or sent.
             reconcile_images(state);
+            state.composer.reconcile_file_references();
             effects
         }
         Action::Mouse(mouse) => handle_mouse(state, mouse),

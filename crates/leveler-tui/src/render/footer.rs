@@ -777,20 +777,39 @@ pub(crate) fn render_attachments(frame: &mut Frame, area: Rect, state: &AppState
         return;
     }
     let theme = &state.theme;
-    let n = state.pending_attachments.len();
-    let named: Vec<String> = state
+    let attachment_count = state.pending_attachments.len();
+    let files = state.composer.file_reference_summaries();
+    let file_count = files.len();
+    let n = attachment_count + file_count;
+    let mut named: Vec<String> = state
         .pending_attachments
         .iter()
         .enumerate()
         .map(|(i, att)| format!("[{}] {}", i + 1, att.summary()))
         .collect();
+    named.extend(files.into_iter().enumerate().map(|(i, name)| {
+        let kind = std::path::Path::new(&name)
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_uppercase())
+            .filter(|ext| !ext.is_empty())
+            .unwrap_or_else(|| "FILE".to_string());
+        format!("[{}] {name} · {kind}", i + 1)
+    }));
     // This is one unwrapped row: anything past the edge is cut with no mark,
     // and half an entry reads as a whole one. Naming them is only better than
     // counting them while they all fit.
     let fits = UnicodeWidthStr::width(named.join("  ").as_str()) <= area.width as usize;
     let line = if n > 2 || !fits {
+        let hint = match (attachment_count, file_count) {
+            (0, _) => state.t().file_references_hint.replace("{}", &n.to_string()),
+            (_, 0) => state.t().attachments_hint.replace("{}", &n.to_string()),
+            _ => state
+                .t()
+                .mixed_references_hint
+                .replace("{}", &n.to_string()),
+        };
         Line::from(Span::styled(
-            state.t().attachments_hint.replace("{}", &n.to_string()),
+            hint,
             Style::default().fg(theme.accent.secondary),
         ))
     } else {

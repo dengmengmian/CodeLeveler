@@ -28,6 +28,7 @@ fn byte_of_grapheme(s: &str, g: usize) -> usize {
 
 /// The image-token template when none has been set: `[image #1]`.
 const DEFAULT_IMAGE_TOKEN: &str = "[image #{}]";
+const DEFAULT_FILE_TOKEN: &str = "[file #{}]";
 
 /// A multiline text buffer with a grapheme cursor and input history.
 #[derive(Debug, Clone)]
@@ -41,11 +42,15 @@ pub struct Composer {
     /// The live draft, stashed while browsing history so it can be restored.
     stash: Option<String>,
     pending_pastes: Vec<PendingPaste>,
+    file_references: Vec<FileReference>,
     /// How an attached image is written into the sentence, e.g. `[图片 #{}]`.
     /// The token is ordinary text — it is what the user reads AND what the
     /// model receives — but it edits as one unit, and its number is its
     /// position among the tokens, which is the index of the image it names.
     image_token: String,
+    /// Presentation-only names for pasted local files. The full path remains
+    /// in `FileReference::content` and is restored by `canonical_text()`.
+    file_token: String,
 }
 
 impl Default for Composer {
@@ -57,7 +62,9 @@ impl Default for Composer {
             history_index: None,
             stash: None,
             pending_pastes: Vec::new(),
+            file_references: Vec::new(),
             image_token: DEFAULT_IMAGE_TOKEN.to_string(),
+            file_token: DEFAULT_FILE_TOKEN.to_string(),
         }
     }
 }
@@ -103,6 +110,13 @@ fn scan_image_tokens(s: &str, template: &str) -> Vec<(std::ops::Range<usize>, us
 struct PendingPaste {
     placeholder: String,
     content: String,
+}
+
+#[derive(Debug, Clone)]
+struct FileReference {
+    placeholder: String,
+    content: String,
+    name: String,
 }
 
 impl Composer {
@@ -206,6 +220,82 @@ impl Composer {
             content: normalized,
         });
         self.insert_str(&placeholder);
+    }
+
+    /// Insert a compact local-file reference while retaining the exact pasted
+    /// path for submission. This is presentation, not an uploaded attachment.
+    pub fn insert_file_reference(&mut self, content: &str, name: &str) {
+        self.reconcile_file_references();
+        let number = self.file_references.len() + 1;
+        let placeholder = self.file_token.replace("{}", &number.to_string());
+        self.file_references.push(FileReference {
+            placeholder: placeholder.clone(),
+            content: content.to_string(),
+            name: name.to_string(),
+        });
+        self.insert_str(&placeholder);
+    }
+
+    /// Names of file references whose tokens are still present in the draft.
+    pub fn file_reference_summaries(&self) -> Vec<String> {
+        self.file_references
+            .iter()
+            .filter(|reference| self.buffer.contains(&reference.placeholder))
+            .map(|reference| reference.name.clone())
+            .collect()
+    }
+
+    pub fn file_reference_count(&self) -> usize {
+        self.file_reference_summaries().len()
+    }
+
+    /// Drop broken/deleted file tokens and renumber the survivors in visual
+    /// order. Their original path remains paired with the token throughout.
+    pub fn reconcile_file_references(&mut self) {
+        let mut active: Vec<_> = self
+            .file_references
+            .iter()
+            .filter_map(|reference| {
+                self.buffer.find(&reference.placeholder).map(|start| {
+                    (
+                        start..start + reference.placeholder.len(),
+                        reference.clone(),
+                    )
+                })
+            })
+            .collect();
+        active.sort_by_key(|(range, _)| range.start);
+        if active.is_empty() {
+            self.file_references.clear();
+            return;
+        }
+
+        let cursor_byte = byte_of_grapheme(&self.buffer, self.cursor);
+        let mut out = String::with_capacity(self.buffer.len());
+        let mut kept = Vec::with_capacity(active.len());
+        let mut moved = None;
+        let mut last = 0;
+        for (position, (range, mut reference)) in active.into_iter().enumerate() {
+            if moved.is_none() && cursor_byte <= range.start {
+                moved = Some(out.len() + cursor_byte.saturating_sub(last));
+            }
+            out.push_str(&self.buffer[last..range.start]);
+            let placeholder = self.file_token.replace("{}", &(position + 1).to_string());
+            out.push_str(&placeholder);
+            if moved.is_none() && cursor_byte < range.end {
+                moved = Some(out.len());
+            }
+            reference.placeholder = placeholder;
+            kept.push(reference);
+            last = range.end;
+        }
+        let tail = out.len();
+        out.push_str(&self.buffer[last..]);
+        let moved = moved
+            .unwrap_or_else(|| tail + cursor_byte.saturating_sub(last))
+            .min(out.len());
+        self.file_references = kept;
+        self.rewrite(out, moved);
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -490,6 +580,9 @@ impl Composer {
         for paste in &self.pending_pastes {
             text = text.replacen(&paste.placeholder, &paste.content, 1);
         }
+        for reference in &self.file_references {
+            text = text.replacen(&reference.placeholder, &reference.content, 1);
+        }
         text
     }
 
@@ -499,6 +592,7 @@ impl Composer {
         let text = self.canonical_text();
         self.buffer.clear();
         self.pending_pastes.clear();
+        self.file_references.clear();
         self.cursor = 0;
         self.history_index = None;
         self.stash = None;
@@ -571,6 +665,7 @@ impl Composer {
     pub fn replace(&mut self, text: impl Into<String>) {
         self.commit_history_browse();
         self.pending_pastes.clear();
+        self.file_references.clear();
         self.buffer = text.into();
         self.cursor = grapheme_count(&self.buffer);
     }
@@ -581,6 +676,10 @@ impl Composer {
     /// language decides this, so it is set once the locale is known.
     pub fn set_image_token_template(&mut self, template: &str) {
         self.image_token = template.to_string();
+    }
+
+    pub fn set_file_token_template(&mut self, template: &str) {
+        self.file_token = template.to_string();
     }
 
     /// How many images the sentence names.
@@ -746,16 +845,16 @@ impl Composer {
     /// where a caret may rest.
     fn token_interior(&self) -> Option<std::ops::Range<usize>> {
         let at = byte_of_grapheme(&self.buffer, self.cursor);
-        self.image_tokens()
+        self.editable_token_ranges()
             .into_iter()
-            .find_map(|(range, _)| (at > range.start && at < range.end).then_some(range))
+            .find(|range| at > range.start && at < range.end)
     }
 
     /// The token the cursor is inside or at the far edge of, as a byte span.
     /// `before` looks at what a backward step would cross, otherwise forward.
     fn token_across(&self, before: bool) -> Option<std::ops::Range<usize>> {
         let at = byte_of_grapheme(&self.buffer, self.cursor);
-        self.image_tokens().into_iter().find_map(|(range, _)| {
+        self.editable_token_ranges().into_iter().find_map(|range| {
             let crosses = if before {
                 at > range.start && at <= range.end
             } else {
@@ -763,6 +862,21 @@ impl Composer {
             };
             crosses.then_some(range)
         })
+    }
+
+    fn editable_token_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let mut ranges: Vec<_> = self
+            .image_tokens()
+            .into_iter()
+            .map(|(range, _)| range)
+            .collect();
+        for reference in &self.file_references {
+            if let Some(start) = self.buffer.find(&reference.placeholder) {
+                ranges.push(start..start + reference.placeholder.len());
+            }
+        }
+        ranges.sort_by_key(|range| range.start);
+        ranges
     }
 }
 

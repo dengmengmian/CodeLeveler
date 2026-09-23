@@ -9235,6 +9235,53 @@ fn pasting_text_that_only_looks_like_an_image_path_stays_text() {
     }
 }
 
+#[test]
+fn pasted_document_paths_render_as_file_references_but_submit_real_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let sheet = dir.path().join("价逻辑-必填字段.xlsx");
+    let prototype = dir.path().join("接单方-交互原型.html");
+    std::fs::write(&sheet, b"sheet").unwrap();
+    std::fs::write(&prototype, b"<html></html>").unwrap();
+    let pasted = format!(
+        "{} {} 阅读这两个文件。",
+        sheet.to_string_lossy(),
+        prototype.to_string_lossy()
+    );
+
+    let mut s = opened();
+    let effects = reduce(&mut s, Action::Paste(pasted.clone()));
+    assert!(effects.is_empty(), "file references are local presentation");
+    assert_eq!(s.composer.text(), "[文件 #1] [文件 #2] 阅读这两个文件。");
+    assert_eq!(s.composer.canonical_text(), pasted);
+
+    let frame = rendered(&mut s, 120, 40);
+    assert!(frame.contains("价逻辑-必填字段.xlsx"), "{frame}");
+    assert!(frame.contains("接单方-交互原型.html"), "{frame}");
+    assert!(
+        !frame.contains(dir.path().to_string_lossy().as_ref()),
+        "the long directory must stay hidden:\n{frame}"
+    );
+
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(
+        submitted(&effects).0,
+        ClientCommand::SubmitMessage {
+            session_id: SessionId::new("s1"),
+            content: pasted.clone(),
+            attachments: Vec::new(),
+        }
+    );
+
+    let mut burst = opened();
+    reduce(&mut burst, Action::TextInput(pasted.clone()));
+    assert_eq!(
+        burst.composer.text(),
+        "[文件 #1] [文件 #2] 阅读这两个文件。",
+        "non-bracketed terminal paste should get the same compact display"
+    );
+    assert_eq!(burst.composer.canonical_text(), pasted);
+}
+
 /// Two pastes stage two attachments, in order, and the composer shows them as
 /// `[图片 #1] [图片 #2]` — never a filesystem path.
 #[test]

@@ -150,11 +150,12 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     }
     state.theme.paint_canvas(frame, area);
 
-    let attach_rows: u16 = if state.pending_attachments.is_empty() {
-        0
-    } else {
-        1
-    };
+    let attach_rows: u16 =
+        if state.pending_attachments.is_empty() && state.composer.file_reference_count() == 0 {
+            0
+        } else {
+            1
+        };
     let team_rows = team_panel_height(state);
     // 待发送 sits directly above the composer: input the user wrote and has
     // not sent is part of what they can do now, not of the conversation.

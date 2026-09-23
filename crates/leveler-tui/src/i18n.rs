@@ -514,6 +514,9 @@ pub struct UiText {
     /// Composer attachment chrome.
     pub attachment_chip: &'static str,
     pub attachments_hint: &'static str,
+    pub file_reference_chip: &'static str,
+    pub file_references_hint: &'static str,
+    pub mixed_references_hint: &'static str,
     /// `grep` summary: "<pattern>" in <path>.
     pub grep_in: &'static str,
     /// Approval overlay: the four decisions, and its own chrome. A permission
@@ -1370,6 +1373,9 @@ static ZH: UiText = UiText {
     context_no_compaction: "无",
     attachment_chip: "[图片 #{}] ",
     attachments_hint: "{} 个附件 · 删掉句中的 [图片 #N] 即移除",
+    file_reference_chip: "[文件 #{}] ",
+    file_references_hint: "{} 个文件 · 删掉句中的 [文件 #N] 即移除",
+    mixed_references_hint: "{} 项引用 · 删掉句中的标记即移除",
     grep_in: " 于 ",
     approval_once: "仅允许本次",
     approval_session: "本轮对话内允许",
@@ -2094,6 +2100,9 @@ static EN: UiText = UiText {
     context_no_compaction: "none",
     attachment_chip: "[image #{}] ",
     attachments_hint: "{} attachments · delete its [image #N] to drop one",
+    file_reference_chip: "[file #{}] ",
+    file_references_hint: "{} files · delete its [file #N] to drop one",
+    mixed_references_hint: "{} references · delete its token to drop one",
     grep_in: " in ",
     approval_once: "Allow once",
     approval_always: "Always allow (writes a project rule; never ask again)",

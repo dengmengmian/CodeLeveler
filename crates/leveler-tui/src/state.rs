@@ -659,6 +659,9 @@ impl AppState {
         let template = state.image_token_template();
         state.composer.set_image_token_template(&template);
         state.btw.draft.set_image_token_template(&template);
+        let template = state.t().file_reference_chip.trim_end().to_string();
+        state.composer.set_file_token_template(&template);
+        state.btw.draft.set_file_token_template(&template);
         state
     }
 
