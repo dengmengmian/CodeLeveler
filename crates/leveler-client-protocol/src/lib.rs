@@ -15,7 +15,7 @@
 //!
 //! Defines the protocol used by terminal clients
 //! shell (multi-turn text, streaming). Later phases grow the enums (plan, diff,
-//! verification, approvals, attachments, multi-agent) — new variants only, so
+//! approvals, attachments, multi-agent) — new variants only, so
 //! existing clients keep compiling.
 //!
 //! ## Versioning, resync & data classification (M6)
@@ -79,10 +79,9 @@ pub use skills::{
 };
 
 pub use event::{
-    ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel,
-    REASON_NO_AUTOMATIC_VERIFICATION, REASON_NO_CODE_CHANGES, RuntimeEvent, UiChildAgent,
-    UiChildState, UiCommandStop, UiHistoryEntry, UiMemoryCandidate, UiMemoryEntry, UiMemoryKind,
-    parse_runtime_event,
+    ChildContribution, ChildLimit, ChildOutcome, ChildStop, NotificationLevel, RuntimeEvent,
+    UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, UiMemoryCandidate, UiMemoryEntry,
+    UiMemoryKind, parse_runtime_event,
 };
 pub use goals::{UiGoalRecap, UiUnfinishedGoal};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
@@ -94,8 +93,7 @@ pub use observability::{
 };
 pub use origin::ClientOrigin;
 pub use progress::{
-    CheckState, FinalizationStage, PlanStepStatus, UiCheck, UiCompletionReport, UiDiff, UiDiffFile,
-    UiPlan, UiPlanStep, UiVerification, UiVerificationStatus,
+    FinalizationStage, PlanStepStatus, UiCompletionReport, UiDiff, UiDiffFile, UiPlan, UiPlanStep,
 };
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{

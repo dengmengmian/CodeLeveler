@@ -7,10 +7,8 @@
 //! A checkpoint can summarize truth; it cannot manufacture it.
 //!
 //! Truth rules are baked into the types rather than left to call sites:
-//! [`CheckpointVerification`] and [`CheckpointFindings`] default to
-//! `Unmeasured` / `Unknown`, so a fact that was never projected reads as
-//! absent — never as passed, never as zero. The same discipline as
-//! `Verdict::Unverified` and `UiChildContribution.measured`.
+//! [`CheckpointFindings`] defaults to `Unknown`, so a fact that was never
+//! projected reads as absent — never as zero.
 //!
 //! The payload is persisted as versioned JSON (see
 //! [`GOAL_CHECKPOINT_SCHEMA_VERSION`]); every field added later must carry
@@ -71,28 +69,6 @@ impl CheckpointReason {
             _ => None,
         }
     }
-}
-
-/// Verification state at the checkpoint boundary.
-///
-/// `Unmeasured` is the default on purpose: "no verification evidence" must
-/// never decay into "passed".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum CheckpointVerification {
-    /// Authoritative evidence says the gating checks passed.
-    Passed {
-        /// What proved it (command fingerprint / check names). Bounded.
-        evidence: String,
-    },
-    /// Authoritative evidence says verification failed.
-    Failed {
-        /// What failed. Bounded.
-        detail: String,
-    },
-    /// No verification was measured at this boundary. NOT a pass.
-    #[default]
-    Unmeasured,
 }
 
 /// Findings recorded at the checkpoint boundary.
@@ -213,8 +189,6 @@ pub struct GoalCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<CheckpointPlan>,
     #[serde(default)]
-    pub verification: CheckpointVerification,
-    #[serde(default)]
     pub findings: CheckpointFindings,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<CheckpointChild>,
@@ -287,11 +261,6 @@ impl GoalCheckpoint {
         {
             parts.push(format!("{total} 项发现"));
         }
-        match &self.verification {
-            CheckpointVerification::Passed { .. } => parts.push("验证已通过".to_string()),
-            CheckpointVerification::Failed { .. } => parts.push("验证失败".to_string()),
-            CheckpointVerification::Unmeasured => {}
-        }
         if parts.is_empty() {
             parts.push("进度已记录".to_string());
         }
@@ -319,17 +288,6 @@ impl GoalCheckpoint {
                 body.push_str(&format!("; next step: {next}"));
             }
             push_section(&mut out, "Plan", &body);
-        }
-        match &self.verification {
-            CheckpointVerification::Passed { evidence } => {
-                push_section(&mut out, "Verified", evidence);
-            }
-            CheckpointVerification::Failed { detail } => {
-                push_section(&mut out, "Verification FAILED", detail);
-            }
-            CheckpointVerification::Unmeasured => {
-                push_section(&mut out, "Verification", "not measured at this boundary");
-            }
         }
         match &self.findings {
             CheckpointFindings::Known { total, refs } => {
@@ -427,12 +385,11 @@ mod tests {
     }
 
     /// The core truth rule: a payload with nothing measured decodes to
-    /// explicit absence — never to passed, never to zero findings.
+    /// explicit absence — never to zero findings.
     #[test]
     fn absent_facts_decode_as_unknown_not_success() {
         let decoded: GoalCheckpoint =
             serde_json::from_str(r#"{"objective":"do the thing"}"#).unwrap();
-        assert_eq!(decoded.verification, CheckpointVerification::Unmeasured);
         assert_eq!(decoded.findings, CheckpointFindings::Unknown);
         assert_eq!(
             decoded.workspace.dirty, None,
@@ -452,9 +409,6 @@ mod tests {
                 completed_steps: vec!["a".into(), "b".into(), "c".into()],
                 next_step: Some("d".into()),
             }),
-            verification: CheckpointVerification::Passed {
-                evidence: "cargo test: 120 passed".into(),
-            },
             findings: CheckpointFindings::Known {
                 total: 3,
                 refs: vec!["f-1".into(), "f-2".into(), "f-3".into()],

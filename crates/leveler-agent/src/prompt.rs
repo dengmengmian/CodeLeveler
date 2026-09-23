@@ -240,7 +240,7 @@ impl PromptBuilder {
             "\n\nFINAL DELIVERY: Unless the user explicitly asked for it, do not create a \
              git commit or push. An uncommitted working tree is a normal delivery state. Never \
              ask whether the user wants you to commit or push. End after the factual summary of \
-             the result and its verification; do not append an open-ended offer, invitation, or \
+             the result; do not append an open-ended offer, invitation, or \
              conversational follow-up such as \"if you want, I can...\".",
         );
         prompt
@@ -622,45 +622,18 @@ mod tests {
         );
     }
 
-    /// VIF (verification sufficiency): the prompt must keep stating, in one
-    /// coherent section, the three semantics a measured over-verification fix
-    /// depends on — verification is sufficient rather than maximal, it must not
-    /// expand the requested scope, and a final runtime gate exists without
-    /// replacing the model's own targeted verification. A wording regression
-    /// re-opens the post-sufficiency tax VIF-E2 measured.
+    /// Tests, builds, and linters stay available as ordinary tools, but the
+    /// runtime does not turn them into an automatic completion gate.
     #[test]
-    fn base_prompt_states_the_verification_sufficiency_contract() {
+    fn base_prompt_keeps_checks_user_requested_and_non_terminal() {
         let prompt = PromptBuilder::new().build();
-        let section = verification_section(&prompt);
-
-        // A — sufficiency, not maximality.
-        assert!(section.contains("not a score to maximize"), "{section}");
-        assert!(section.contains("stop verifying"), "{section}");
-        // B — scope discipline.
+        assert!(prompt.contains("ordinary tools"), "{prompt}");
+        assert!(prompt.contains("user explicitly asks"), "{prompt}");
         assert!(
-            section.contains("must never become a reason to expand the scope"),
-            "{section}"
+            prompt.contains("does not append an automatic verification plan"),
+            "{prompt}"
         );
-        // C — final-gate awareness, with targeted verification still required.
-        assert!(section.contains("final verification gate"), "{section}");
-        assert!(
-            section.contains("do not re-run the same standard checks"),
-            "{section}"
-        );
-        assert!(
-            section.contains("stay responsible for the targeted verification"),
-            "{section}"
-        );
-    }
-
-    /// The body of the `## Verification` section — the semantics above must live
-    /// together, not be scattered phrases elsewhere in the prompt.
-    fn verification_section(prompt: &str) -> &str {
-        let start = prompt
-            .find("## Verification")
-            .expect("base prompt must carry a Verification section");
-        let rest = &prompt[start + 2..];
-        &prompt[start..start + 2 + rest.find("\n## ").unwrap_or(rest.len())]
+        assert!(!prompt.contains("final verification gate"), "{prompt}");
     }
 
     /// An edit report is sized to the edit, and never pastes the diff the user

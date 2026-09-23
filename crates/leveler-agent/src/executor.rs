@@ -24,14 +24,12 @@ use leveler_execution::{
 };
 use leveler_lifecycle::{
     EvidenceLedger, ObjectiveAnchor, PlanState, PlanStep, ProgressLedger, StopReason,
-    VerificationStatus,
 };
 use leveler_memory::MemoryStore;
 use leveler_model::{
     ContentPart, Message, ModelError, ModelPricing, ModelRef, ModelRuntime, ReasoningEffort, Role,
 };
 use leveler_tools::{ToolContext, ToolRegistry};
-use leveler_verifier::CheckStatus;
 
 use self::dispatch::text_of;
 use crate::nudges::first_user_text;
@@ -331,29 +329,6 @@ pub enum AgentEvent {
     /// Exact message list the next model request will see. Emitted at a round
     /// boundary so crash recovery does not reconstruct a different context.
     ContextSnapshot { messages: Vec<Message> },
-    /// Post-edit verification started.
-    VerificationStarted,
-    /// One post-edit verification check finished.
-    ///
-    /// Carries the verifier's own [`CheckStatus`] rather than a second enum
-    /// with the same meaning: two spellings of one fact is how `toolmissing`
-    /// reached a durable row whose contract said `tool_missing`.
-    VerificationCheck {
-        name: String,
-        status: CheckStatus,
-        evidence: Option<String>,
-    },
-    /// Post-edit verification finished.
-    ///
-    /// `passed` is the completion gate, not a verification result: it is
-    /// `true` for a run that owed no check and therefore proved nothing.
-    /// `verification` is what the checks actually said, and any consumer
-    /// answering "did this pass" must read that. `None` on rows written
-    /// before the split, where only the gate was recorded.
-    VerificationFinished {
-        passed: bool,
-        verification: Option<VerificationStatus>,
-    },
     /// A sub-agent was spawned and began working (concurrent delegation).
     SubAgentStarted {
         id: String,

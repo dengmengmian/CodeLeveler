@@ -1902,24 +1902,6 @@ fn finish(
                             outcome.rounds
                         ))
                     ),
-                    StopReason::CompletedUnverified => println!(
-                        "{}",
-                        Line::warn(&format!(
-                            "Completed in {} round(s); the project's checks did not run.",
-                            outcome.rounds
-                        ))
-                    ),
-                    StopReason::CompletedChecksFailed => println!(
-                        "{}",
-                        Line::warn(&format!(
-                            "Completed in {} round(s), but the project's checks failed: {}",
-                            outcome.rounds,
-                            outcome
-                                .stop_detail
-                                .as_deref()
-                                .unwrap_or("see verification output")
-                        ))
-                    ),
                 }
             } else {
                 emit_jsonl(serde_json::json!({

@@ -1,6 +1,6 @@
 // Session Truth: one projection for Conversation, Changes, and Inspector.
-// Does not invent protocol fields. Sources: lastTurn, verification, diff,
-// completionReport. Diff totals and report file counts stay distinct.
+// Does not invent protocol fields. Sources: lastTurn, diff, completionReport.
+// Diff totals and report file counts stay distinct.
 // facts only list things that happened or that the user must act on;
 // absences (no diff / no verify / nothing pending) stay silent.
 
@@ -58,7 +58,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
 
   const artifacts = sessionArtifacts(s);
   const changesApplied = artifacts.source !== 'none';
-  const verify = verifyState(s);
+  const verify: VerifyState = 'none';
 
   if (s.pendingApprovals.length > 0) {
     return {
@@ -100,7 +100,7 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
       tone: 'success',
       detail: null,
       trust: 'n/a',
-      verify: s.verification?.passed === null && (s.verification?.checks.length ?? 0) > 0 ? 'running' : verify,
+      verify,
       changesApplied,
       artifacts,
       pending: 'none',
@@ -148,26 +148,11 @@ export function completionTruth(s: SessionView | null): CompletionTruth | null {
   };
 }
 
-function verifyState(s: SessionView): VerifyState {
-  const v = s.verification;
-  if (v?.passed === true) return 'passed';
-  if (v?.passed === false) return 'failed';
-  if (v && v.passed == null && v.checks.some((c) => c.status === 'running')) return 'running';
-  const detail = s.lastTurn?.detail ?? '';
-  if (s.lastTurn?.outcome === 'checks_failed') return 'failed';
-  if (s.lastTurn?.outcome === 'incomplete' && detail.startsWith('failed gate(s)')) return 'failed';
-  if (s.lastTurn?.outcome === 'unverified' && detail === 'no_automatic_verification') return 'incomplete';
-  if (s.lastTurn?.outcome === 'unverified' && detail === 'no_code_changes') return 'none';
-  if (v && v.checks.length > 0 && v.passed == null) return 'incomplete';
-  return 'none';
-}
-
 function kindFrom(s: SessionView, tone: TurnTone): CompletionKind {
   const outcome = s.lastTurn?.outcome;
   if (tone === 'error' || outcome === 'failed' || outcome === 'truncated') return 'failure';
   if (tone === 'muted' || outcome === 'cancelled') return 'failure';
   if (tone === 'warn') return 'warning';
-  if (tone === 'calm' && s.lastTurn?.detail === 'no_automatic_verification') return 'warning';
   if (tone === 'calm') return 'success';
   return 'success';
 }
@@ -178,7 +163,7 @@ function trustFrom(s: SessionView, kind: CompletionKind, verify: VerifyState): T
     return 'verified';
   }
   if (verify === 'failed') return 'failed';
-  if (verify === 'incomplete' || s.lastTurn?.outcome === 'unverified') return 'unverified';
+  if (verify === 'incomplete') return 'unverified';
   if (kind === 'failure') return 'failed';
   if (kind === 'success') return 'n/a';
   return 'unverified';

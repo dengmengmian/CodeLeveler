@@ -17,8 +17,8 @@
 
 use leveler_core::{GoalId, SessionId, TurnId};
 use leveler_lifecycle::{
-    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
-    CheckpointWorkspace, EvidenceLedger, GoalCheckpoint,
+    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointWorkspace,
+    EvidenceLedger, GoalCheckpoint,
 };
 use leveler_storage::{
     EventRecord, EventStore, GoalCheckpointRecord, GoalRecord, GoalState, MessageStore,
@@ -317,14 +317,11 @@ pub async fn project_goal_checkpoint(
     let transcript_ordinal = messages.load(session_id).await?.len() as u64;
 
     let ledger = last_ledger(events, session_id, scope).await?;
-    let (findings, verification) = match &ledger {
-        Some(ledger) => (findings_from(ledger), verification_from(ledger)),
+    let findings = match &ledger {
+        Some(ledger) => findings_from(ledger),
         // The ledger could not be read / was never written: explicitly
-        // unknown and unmeasured — never zero, never passed.
-        None => (
-            CheckpointFindings::Unknown,
-            CheckpointVerification::Unmeasured,
-        ),
+        // unknown — never zero.
+        None => CheckpointFindings::Unknown,
     };
     let plan = match &ledger {
         Some(ledger) => CheckpointPlan::from_state(&ledger.plan),
@@ -339,7 +336,6 @@ pub async fn project_goal_checkpoint(
         lineage_root_turn_id: Some(scope.root_turn_id.as_str().to_string()),
         transcript_ordinal: Some(transcript_ordinal),
         plan,
-        verification,
         findings,
         children: settled_children(events, session_id, scope).await?,
         artifact_refs: Vec::new(),
@@ -620,27 +616,6 @@ fn findings_from(ledger: &EvidenceLedger) -> CheckpointFindings {
     }
 }
 
-fn verification_from(ledger: &EvidenceLedger) -> CheckpointVerification {
-    if ledger.has_fresh_successful_verify() {
-        let evidence = ledger
-            .verifications
-            .iter()
-            .rev()
-            .find(|v| v.exit_code == 0)
-            .map(|v| v.command_fingerprint.clone())
-            .unwrap_or_else(|| "fresh successful verification".to_string());
-        return CheckpointVerification::Passed { evidence };
-    }
-    match ledger.verifications.last() {
-        Some(last) if last.exit_code != 0 => CheckpointVerification::Failed {
-            detail: format!("{} (exit {})", last.command_fingerprint, last.exit_code),
-        },
-        // A stale or baseline-green pass proves nothing about the current
-        // state; "not measured" is the truthful reading, not "passed".
-        _ => CheckpointVerification::Unmeasured,
-    }
-}
-
 async fn settled_children(
     events: &dyn EventStore,
     session_id: &SessionId,
@@ -727,8 +702,7 @@ mod tests {
         }
     }
 
-    /// Truth case B/C: with no ledger written, findings are UNKNOWN (not
-    /// zero) and verification is UNMEASURED (not passed).
+    /// With no ledger written, findings are UNKNOWN rather than zero.
     #[tokio::test]
     async fn no_ledger_projects_unknown_not_success() {
         let events = MemoryEventStore::new();
@@ -739,10 +713,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(projected.payload.findings, CheckpointFindings::Unknown);
-        assert_eq!(
-            projected.payload.verification,
-            CheckpointVerification::Unmeasured
-        );
         assert_eq!(projected.event_cursor, 0, "no events → empty boundary");
         assert_eq!(projected.payload.transcript_ordinal, Some(0));
         assert_eq!(projected.payload.workspace.dirty, None, "no repo → unknown");
@@ -804,80 +774,6 @@ mod tests {
                 );
             }
             other => panic!("expected known findings, got {other:?}"),
-        }
-    }
-
-    /// Truth case A vs the stale-pass trap: a fresh successful verify is
-    /// PASSED; a verify that predates the last mutation is NOT.
-    #[tokio::test]
-    async fn verification_truth_requires_fresh_evidence() {
-        let events = MemoryEventStore::new();
-        let messages = MemoryMessageStore::new();
-        let session = SessionId::new("s1");
-
-        let mut fresh = EvidenceLedger::default();
-        fresh.record_mutation("m1", "apply_patch", vec!["src/a.rs".into()]);
-        fresh.record_verify("v1", "cargo test", 0);
-        append(
-            &events,
-            &session,
-            EngineEvent::EvidenceLedgerUpdated { ledger: fresh },
-        )
-        .await;
-        let projected =
-            project_goal_checkpoint(&events, &messages, &goal(), &session, &scope(), None)
-                .await
-                .unwrap();
-        assert!(matches!(
-            projected.payload.verification,
-            CheckpointVerification::Passed { .. }
-        ));
-
-        // Now a later mutation invalidates that pass.
-        let mut stale = EvidenceLedger::default();
-        stale.record_mutation("m1", "apply_patch", vec!["src/a.rs".into()]);
-        stale.record_verify("v1", "cargo test", 0);
-        stale.record_mutation("m2", "apply_patch", vec!["src/b.rs".into()]);
-        append(
-            &events,
-            &session,
-            EngineEvent::EvidenceLedgerUpdated { ledger: stale },
-        )
-        .await;
-        let projected =
-            project_goal_checkpoint(&events, &messages, &goal(), &session, &scope(), None)
-                .await
-                .unwrap();
-        assert_eq!(
-            projected.payload.verification,
-            CheckpointVerification::Unmeasured,
-            "a stale pass is not current-state evidence"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_verification_projects_as_failed() {
-        let events = MemoryEventStore::new();
-        let messages = MemoryMessageStore::new();
-        let session = SessionId::new("s1");
-        let mut ledger = EvidenceLedger::default();
-        ledger.record_mutation("m1", "apply_patch", vec!["src/a.rs".into()]);
-        ledger.record_verify("v1", "cargo test", 1);
-        append(
-            &events,
-            &session,
-            EngineEvent::EvidenceLedgerUpdated { ledger },
-        )
-        .await;
-        let projected =
-            project_goal_checkpoint(&events, &messages, &goal(), &session, &scope(), None)
-                .await
-                .unwrap();
-        match projected.payload.verification {
-            CheckpointVerification::Failed { detail } => {
-                assert!(detail.contains("cargo test"), "got: {detail}");
-            }
-            other => panic!("expected failed, got {other:?}"),
         }
     }
 

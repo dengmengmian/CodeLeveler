@@ -88,45 +88,6 @@ pub enum NodeStatus {
     Skipped,
 }
 
-/// Domain-neutral wire fact for what a verification command observed. The
-/// harness owns the reason vocabulary; the engine persists it without
-/// interpreting coding semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum VerificationObservation {
-    Passed,
-    Failed,
-    NotRun { reason: String },
-}
-
-/// Domain-neutral wire fact for whether an observation participates in the
-/// completion gate. Optional provenance remains typed rather than being hidden
-/// in arbitrary metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum VerificationDisposition {
-    Required,
-    Skipped {
-        reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        revision: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        failed_tests: Vec<String>,
-    },
-}
-
-/// Mechanical identity and result of the exact command invocation. Optional
-/// on legacy rows and when no process was started.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationExecution {
-    pub program: String,
-    pub args: Vec<String>,
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-}
-
 /// What a turn is, matching `turns.kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -137,9 +98,6 @@ pub enum TurnKind {
     Chat,
     /// Legacy plan-graph node turn (no longer produced).
     Node { node_id: String },
-    /// Legacy verification-repair turn (no longer produced; kept so rows
-    /// written by the deleted auto-repair loop still replay).
-    Repair { attempt: u32 },
 }
 
 impl TurnKind {
@@ -148,7 +106,6 @@ impl TurnKind {
             TurnKind::User => "user",
             TurnKind::Chat => "chat",
             TurnKind::Node { .. } => "node",
-            TurnKind::Repair { .. } => "repair",
         }
     }
 }
@@ -184,8 +141,7 @@ pub enum EngineEvent {
         at: leveler_core::Timestamp,
     },
     /// One named finalization phase began. `phase` is an opaque, stable key
-    /// selected by the harness; the engine records lifecycle timing without
-    /// learning domain-specific verification semantics.
+    /// selected by the harness; the engine records lifecycle timing.
     FinalizationPhaseStarted {
         phase: String,
         at: leveler_core::Timestamp,
@@ -217,11 +173,6 @@ pub enum EngineEvent {
     },
     TaskFinished {
         outcome: TaskOutcome,
-        /// What the project's own checks said over the final tree. Absent on
-        /// rows written before the status/verification split (reads as
-        /// `NotRun`).
-        #[serde(default)]
-        verification: leveler_lifecycle::VerificationStatus,
         reason: Option<String>,
         /// Typed executor stop reason for the whole task (raw, not the
         /// product reinterpretation). `None` on legacy rows and on tasks that
@@ -234,7 +185,7 @@ pub enum EngineEvent {
         /// projection strips it from the public (remote) view like `reason`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<leveler_model::ModelError>,
-        /// Completion-contract warnings orthogonal to project verification.
+        /// Completion-contract warnings.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
     },
@@ -599,48 +550,6 @@ pub enum EngineEvent {
         outcome: String,
     },
 
-    // ── kernel: verification ─────────────────────────────────────────────
-    VerificationStarted,
-    VerificationCheck {
-        name: String,
-        /// The verifier's own durable spelling, carried verbatim:
-        /// `passed | failed | skipped | tool_missing | environment_unavailable`.
-        ///
-        /// A `String` on purpose: the engine persists this fact and does not
-        /// interpret it, and must not start depending on the crate that owns
-        /// the statuses in order to do so. Rows written before the vocabulary
-        /// was made explicit also carry `toolmissing` and
-        /// `environmentunavailable`; readers accept both spellings, and
-        /// nothing rewrites a row.
-        status: String,
-        /// Structured observation. `None` on legacy one-dimensional rows.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        observation: Option<VerificationObservation>,
-        /// Structured gate disposition, including grounded baseline
-        /// provenance. `None` on legacy one-dimensional rows.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        disposition: Option<VerificationDisposition>,
-        /// Effective invocation after verifier argument resolution.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        execution: Option<VerificationExecution>,
-        evidence: Option<String>,
-    },
-    VerificationFinished {
-        /// The completion gate: whether the report blocked completion. It is
-        /// `true` for a run that was not verified, because a run that owed no
-        /// check must still complete. A reader answering "did this pass" must
-        /// read `verification`, not this.
-        passed: bool,
-        /// What the project's own checks actually said.
-        ///
-        /// `None` on rows written before the gate and the truth were split:
-        /// those rows carry `passed` alone, and `passed: true` cannot say
-        /// whether the run was `Passed` or `NotRun`. Absent is the honest
-        /// answer, and it is deliberately an `Option` — a default would
-        /// manufacture a verdict nobody recorded.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        verification: Option<leveler_lifecycle::VerificationStatus>,
-    },
     /// One acceptance criterion's command-backed evidence.
     /// `status`: met | unmet | unverifiable.
     /// `reject_reason`: optional machine-readable refuse code
@@ -678,11 +587,6 @@ pub enum EngineEvent {
     NodeFinished {
         node_id: String,
         status: NodeStatus,
-    },
-    /// Legacy: emitted by the deleted verification-repair loop. Kept only so
-    /// persisted rows still replay; never produced.
-    RepairStarted {
-        attempt: u32,
     },
 
     // ── strategy: parallel worktree candidates ───────────────────────────
@@ -799,8 +703,6 @@ impl EngineEvent {
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }
             | EngineEvent::ClarificationAnswered { .. }
-            | EngineEvent::VerificationStarted
-            | EngineEvent::VerificationFinished { .. }
             | EngineEvent::AcceptanceEvidence { .. }
             | EngineEvent::PhaseChanged { .. }
             | EngineEvent::ProgressUpdated { .. }
@@ -808,7 +710,6 @@ impl EngineEvent {
             | EngineEvent::ContextReady { .. }
             | EngineEvent::NodeStarted { .. }
             | EngineEvent::NodeFinished { .. }
-            | EngineEvent::RepairStarted { .. }
             | EngineEvent::CandidateStarted { .. }
             | EngineEvent::CandidateFinished { .. }
             | EngineEvent::ReviewStarted { .. }
@@ -840,7 +741,6 @@ impl EngineEvent {
             | EngineEvent::EvidenceLedgerUpdated { .. }
             // Carries the checkpoint payload (paths, plan wording) — local.
             | EngineEvent::GoalCheckpointCreated { .. }
-            | EngineEvent::VerificationCheck { .. }
             | EngineEvent::RequirementReady { .. }
             | EngineEvent::PlanReady { .. }
             | EngineEvent::ReviewFinding { .. }
@@ -905,13 +805,8 @@ impl EngineEvent {
                 rounds: *rounds,
                 modified_file_count: modified_files.len(),
             },
-            EngineEvent::TaskFinished {
-                outcome,
-                verification,
-                ..
-            } => PublicEvent::TaskFinished {
+            EngineEvent::TaskFinished { outcome, .. } => PublicEvent::TaskFinished {
                 outcome: *outcome,
-                verification: *verification,
             },
             EngineEvent::TokenUsage {
                 input_tokens,
@@ -941,14 +836,6 @@ impl EngineEvent {
             EngineEvent::ClarificationAnswered { id, .. } => {
                 PublicEvent::ClarificationAnswered { id: id.clone() }
             }
-            EngineEvent::VerificationStarted => PublicEvent::VerificationStarted,
-            EngineEvent::VerificationFinished {
-                passed,
-                verification,
-            } => PublicEvent::VerificationFinished {
-                passed: *passed,
-                verification: *verification,
-            },
             EngineEvent::AcceptanceEvidence {
                 required, status, ..
             } => PublicEvent::AcceptanceEvidence {
@@ -973,9 +860,6 @@ impl EngineEvent {
             EngineEvent::NodeStarted { .. } => PublicEvent::NodeStarted,
             EngineEvent::NodeFinished { status, .. } => {
                 PublicEvent::NodeFinished { status: *status }
-            }
-            EngineEvent::RepairStarted { attempt } => {
-                PublicEvent::RepairStarted { attempt: *attempt }
             }
             EngineEvent::CandidateStarted { .. } => PublicEvent::CandidateStarted,
             EngineEvent::CandidateFinished { verified, .. } => PublicEvent::CandidateFinished {
@@ -1017,7 +901,6 @@ impl EngineEvent {
             // deny-by-default is the right answer for it.
             | EngineEvent::WindowStateUpdated { .. }
             | EngineEvent::GoalCheckpointCreated { .. }
-            | EngineEvent::VerificationCheck { .. }
             | EngineEvent::RequirementReady { .. }
             | EngineEvent::PlanReady { .. }
             | EngineEvent::ReviewFinding { .. }
@@ -1070,8 +953,6 @@ pub enum PublicEvent {
     },
     TaskFinished {
         outcome: TaskOutcome,
-        #[serde(default)]
-        verification: leveler_lifecycle::VerificationStatus,
     },
     TokenUsage {
         input_tokens: u32,
@@ -1095,12 +976,6 @@ pub enum PublicEvent {
     ClarificationAnswered {
         id: ClarificationId,
     },
-    VerificationStarted,
-    VerificationFinished {
-        passed: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        verification: Option<leveler_lifecycle::VerificationStatus>,
-    },
     AcceptanceEvidence {
         required: bool,
         status: PublicAcceptanceStatus,
@@ -1122,9 +997,6 @@ pub enum PublicEvent {
     NodeFinished {
         status: NodeStatus,
     },
-    RepairStarted {
-        attempt: u32,
-    },
     CandidateStarted,
     CandidateFinished {
         verified: bool,
@@ -1145,7 +1017,6 @@ pub enum PublicTurnKind {
     User,
     Chat,
     Node,
-    Repair,
 }
 
 impl From<&TurnKind> for PublicTurnKind {
@@ -1154,7 +1025,6 @@ impl From<&TurnKind> for PublicTurnKind {
             TurnKind::User => Self::User,
             TurnKind::Chat => Self::Chat,
             TurnKind::Node { .. } => Self::Node,
-            TurnKind::Repair { .. } => Self::Repair,
         }
     }
 }
@@ -1278,18 +1148,6 @@ mod contract_tests {
             .data_class(),
             DataClass::LocalOnly
         );
-        assert_eq!(
-            EngineEvent::VerificationCheck {
-                name: "test".into(),
-                status: "failed".into(),
-                observation: Some(VerificationObservation::Failed),
-                disposition: Some(VerificationDisposition::Required),
-                execution: None,
-                evidence: Some("stack trace".into()),
-            }
-            .data_class(),
-            DataClass::LocalOnly
-        );
     }
 
     #[test]
@@ -1297,7 +1155,6 @@ mod contract_tests {
         assert_eq!(
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: None,
@@ -1327,14 +1184,6 @@ mod contract_tests {
             .data_class(),
             DataClass::Projectable
         );
-        assert_eq!(
-            EngineEvent::VerificationFinished {
-                passed: true,
-                verification: None,
-            }
-            .data_class(),
-            DataClass::Projectable
-        );
     }
 
     #[test]
@@ -1359,7 +1208,6 @@ mod contract_tests {
             },
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some(secret.into()),
                 failure: None,
                 stop: None,
@@ -1436,7 +1284,6 @@ mod contract_tests {
         assert!(
             !EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: None,

@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 
 use leveler_core::{GoalId, SessionId, Timestamp, TurnId};
-use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, VerificationStatus};
+use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
 
 use crate::{Database, EventRecord, StorageError, TerminalRepository};
 
@@ -26,7 +26,6 @@ pub(crate) fn task_terminal_payload_for_epoch(
     session_id: &SessionId,
     token: &leveler_core::OwnershipToken,
     outcome: TaskOutcome,
-    verification: VerificationStatus,
     status: SessionStatus,
     state: AgentState,
     goal: Option<&GoalTerminalUpdate>,
@@ -54,7 +53,6 @@ pub(crate) fn task_terminal_payload_for_epoch(
         "_terminal_projection".to_string(),
         serde_json::json!({
             "outcome": outcome.as_str(),
-            "verification": verification.as_str(),
             "status": status.as_str(),
             "state": state.as_str(),
             "goal": goal.map(|update| serde_json::json!({
@@ -115,7 +113,7 @@ pub struct GoalTerminalUpdate {
 #[async_trait]
 pub trait TerminalStore: Send + Sync {
     /// Commit the session's terminal event and the whole terminal lifecycle
-    /// (`outcome`, `verification`, `status`, `state`) atomically. Returns the
+    /// (`outcome`, `status`, `state`) atomically. Returns the
     /// appended event.
     ///
     /// # Errors
@@ -129,7 +127,6 @@ pub trait TerminalStore: Send + Sync {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -167,7 +164,6 @@ pub trait TerminalStore: Send + Sync {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
@@ -198,22 +194,12 @@ impl TerminalStore for Database {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         TerminalRepository::new(self)
-            .finish_task(
-                session_id,
-                event_type,
-                payload,
-                outcome,
-                verification,
-                status,
-                state,
-                now,
-            )
+            .finish_task(session_id, event_type, payload, outcome, status, state, now)
             .await
     }
 
@@ -238,7 +224,6 @@ impl TerminalStore for Database {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
@@ -246,16 +231,7 @@ impl TerminalStore for Database {
     ) -> Result<TaskTerminalCommit, crate::OwnershipError> {
         TerminalRepository::new(self)
             .finish_task_owned(
-                token,
-                session_id,
-                event_type,
-                payload,
-                outcome,
-                verification,
-                status,
-                state,
-                goal,
-                now,
+                token, session_id, event_type, payload, outcome, status, state, goal, now,
             )
             .await
     }
@@ -346,7 +322,6 @@ impl MemoryTerminalStore {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
@@ -366,14 +341,7 @@ impl MemoryTerminalStore {
         }
         let payload = match token {
             Some(token) => task_terminal_payload_for_epoch(
-                payload,
-                session_id,
-                token,
-                outcome,
-                verification,
-                status,
-                state,
-                goal,
+                payload, session_id, token, outcome, status, state, goal,
             )?,
             None => payload.to_string(),
         };
@@ -435,7 +403,6 @@ impl MemoryTerminalStore {
             let mut rows = self.sessions.rows.lock().unwrap();
             if let Some(session) = rows.get_mut(session_id.as_str()) {
                 session.outcome = Some(outcome);
-                session.verification = Some(verification);
                 session.status = status;
                 session.state = state;
             }
@@ -516,22 +483,12 @@ impl TerminalStore for MemoryTerminalStore {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
     ) -> Result<EventRecord, StorageError> {
         self.finish_task_sync(
-            None,
-            session_id,
-            event_type,
-            payload,
-            outcome,
-            verification,
-            status,
-            state,
-            None,
-            now,
+            None, session_id, event_type, payload, outcome, status, state, None, now,
         )
         .map(|commit| commit.event)
     }
@@ -555,7 +512,6 @@ impl TerminalStore for MemoryTerminalStore {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
@@ -582,7 +538,6 @@ impl TerminalStore for MemoryTerminalStore {
                     event_type,
                     payload,
                     outcome,
-                    verification,
                     status,
                     state,
                     goal,
@@ -644,7 +599,6 @@ mod tests {
                     "task_finished",
                     "{}",
                     TaskOutcome::Failed,
-                    leveler_lifecycle::VerificationStatus::NotRun,
                     SessionStatus::Failed,
                     AgentState::Failed,
                     leveler_core::now(),
@@ -690,7 +644,6 @@ mod tests {
                 "task_finished",
                 r#"{"outcome":"interrupted"}"#,
                 TaskOutcome::Interrupted,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Interrupted,
                 AgentState::Execute,
                 leveler_core::now(),
@@ -793,7 +746,6 @@ mod tests {
                     "task_finished",
                     "{}",
                     TaskOutcome::Completed,
-                    VerificationStatus::NotRun,
                     SessionStatus::Completed,
                     AgentState::Complete,
                     Some(&update),
@@ -816,7 +768,6 @@ mod tests {
                 "task_finished",
                 "{}",
                 TaskOutcome::Completed,
-                VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 Some(&update),
@@ -831,7 +782,6 @@ mod tests {
                 "task_finished",
                 "{}",
                 TaskOutcome::Completed,
-                VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 Some(&update),
@@ -847,7 +797,6 @@ mod tests {
                     "task_finished",
                     "{}",
                     TaskOutcome::Completed,
-                    VerificationStatus::NotRun,
                     SessionStatus::Failed,
                     AgentState::Failed,
                     Some(&update),
@@ -870,7 +819,6 @@ mod tests {
                     "task_finished",
                     "{}",
                     TaskOutcome::Completed,
-                    VerificationStatus::NotRun,
                     SessionStatus::Completed,
                     AgentState::Complete,
                     Some(&different_goal_update),
@@ -924,7 +872,6 @@ mod tests {
                     "task_finished",
                     "{}",
                     TaskOutcome::Completed,
-                    leveler_lifecycle::VerificationStatus::NotRun,
                     SessionStatus::Completed,
                     AgentState::Complete,
                     leveler_core::now(),
@@ -996,7 +943,6 @@ mod tests {
                 "task_finished",
                 "{}",
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 leveler_core::now(),

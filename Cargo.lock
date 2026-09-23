@@ -1782,7 +1782,6 @@ dependencies = [
  "leveler-storage",
  "leveler-test-support",
  "leveler-tools",
- "leveler-verifier",
  "schemars",
  "serde",
  "serde_json",
@@ -1839,7 +1838,6 @@ dependencies = [
  "leveler-test-support",
  "leveler-tools",
  "leveler-vcs",
- "leveler-verifier",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1905,7 +1903,6 @@ dependencies = [
  "leveler-tools",
  "leveler-tui",
  "leveler-update",
- "leveler-verifier",
  "leveler-web",
  "qrcode",
  "ratatui",
@@ -2333,23 +2330,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "leveler-verifier"
-version = "1.0.6"
-dependencies = [
- "leveler-core",
- "leveler-execution",
- "leveler-lifecycle",
- "leveler-project",
- "leveler-test-support",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

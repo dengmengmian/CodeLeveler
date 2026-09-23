@@ -26,7 +26,6 @@ leveler-execution = { workspace = true }
 leveler-memory = { workspace = true }
 leveler-lifecycle = { workspace = true }
 leveler-agent = { workspace = true }
-leveler-verifier = { workspace = true }
 leveler-engine = { workspace = true }
 leveler-eval = { workspace = true }
 leveler-lsp = { workspace = true }

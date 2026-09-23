@@ -250,7 +250,6 @@ async fn hard_gate_shell_output_never_enters_model_context() {
                 | RuntimeEvent::TurnAnswered
                 | RuntimeEvent::TurnFailed { .. }
                 | RuntimeEvent::TurnIncomplete { .. }
-                | RuntimeEvent::TurnCompletedUnverified { .. }
         ) {
             break;
         }

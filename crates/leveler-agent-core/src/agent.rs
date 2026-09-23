@@ -215,6 +215,7 @@ impl Agent {
             }
 
             let mut request = ModelRequest::new(self.model.clone(), messages.clone());
+            request.messages.extend(harness.request_context(&ctx));
             request.tools = harness.tool_definitions();
             request.tool_choice = ToolChoice::Auto;
             request.max_output_tokens = self.max_output_tokens;
@@ -232,6 +233,8 @@ impl Agent {
                 self.compaction.lock().ok().and_then(|g| *g),
             );
             harness.on_event(AgentEvent::ContextUsage(accounting));
+
+            let estimated_request_tokens = estimate_tokens(&request.messages);
 
             let mut on_event = |event| harness.on_event(event);
             let round = run_model_round(
@@ -267,7 +270,7 @@ impl Agent {
                 )
             });
             round.estimated_tokens = (round.usage.total() == 0).then(|| {
-                estimate_tokens(&messages)
+                estimated_request_tokens
                     .saturating_add(estimate_tokens(std::slice::from_ref(&round.message)))
             });
             ctx.record_spend(round.usage, round.cost_usd_micros, round.estimated_tokens);
@@ -434,6 +437,80 @@ mod tests {
     fn agent(model: Scripted) -> (Agent, Arc<Scripted>) {
         let model = Arc::new(model);
         (Agent::new(model.clone(), ModelRef::new("mock", "m")), model)
+    }
+
+    #[tokio::test]
+    async fn request_observations_are_fresh_and_count_against_unreported_usage() {
+        struct Observed(BasicHarness<Echo>, u64);
+        #[async_trait]
+        impl AgentHarness for Observed {
+            type Stop = crate::stop::LoopStop;
+            type Error = AgentCoreError;
+            fn tool_definitions(&self) -> Vec<ToolDefinition> {
+                self.0.tool_definitions()
+            }
+            fn request_context(&self, ctx: &LoopContext) -> Vec<Message> {
+                vec![Message::text(
+                    Role::System,
+                    format!("observation round={} {}", ctx.round(), "state ".repeat(100)),
+                )]
+            }
+            async fn execute_calls(
+                &mut self,
+                ctx: &mut LoopContext,
+                assistant: Message,
+                calls: Vec<ToolCall>,
+                messages: &mut Vec<Message>,
+            ) -> Result<Flow<Self::Stop>, Self::Error> {
+                self.0.execute_calls(ctx, assistant, calls, messages).await
+            }
+            async fn on_stop(
+                &mut self,
+                ctx: &mut LoopContext,
+                stop: Self::Stop,
+            ) -> Result<Self::Stop, Self::Error> {
+                self.1 = ctx.usage().estimated_model_tokens;
+                self.0.on_stop(ctx, stop).await
+            }
+        }
+        let first = call("echo", serde_json::json!({"text":"a"}));
+        let first_message = first.message.clone();
+        let (agent, model) = agent(Scripted::new(vec![first, text("done")]));
+        let mut harness = Observed(BasicHarness::new(Echo), 0);
+        let stop = agent
+            .run(
+                vec![Message::text(Role::User, "go")],
+                &mut harness,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (i, request) in requests.iter().enumerate() {
+            let observations: Vec<_> = request
+                .messages
+                .iter()
+                .filter(|m| m.text_content().starts_with("observation round="))
+                .collect();
+            assert_eq!(observations.len(), 1);
+            assert!(
+                observations[0]
+                    .text_content()
+                    .starts_with(&format!("observation round={}", i + 1))
+            );
+        }
+        assert!(
+            !stop
+                .messages
+                .iter()
+                .any(|m| m.text_content().starts_with("observation round="))
+        );
+        assert_eq!(
+            harness.1,
+            estimate_tokens(&requests[0].messages) + estimate_tokens(&[first_message]),
+            "missing provider usage must still bill the entire request projection"
+        );
     }
 
     #[tokio::test]

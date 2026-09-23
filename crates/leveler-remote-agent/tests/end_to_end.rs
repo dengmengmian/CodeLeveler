@@ -115,7 +115,6 @@ impl InteractiveRuntimeClient for FakeRuntime {
             active_tools: Vec::new(),
             active_background_tasks: Vec::new(),
             plan: None,
-            verification: None,
             diff: None,
             checkpoints: Vec::new(),
             recaps: Vec::new(),

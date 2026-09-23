@@ -3,12 +3,11 @@
 //! One projection for every delivery path (live `GoalRecapCreated` events and
 //! snapshot reconstruction), so the TUI always presents the same persisted
 //! facts. Truth rules survive the mapping: `CheckpointFindings::Unknown`
-//! stays `None` (never zero), `Unmeasured` verification stays the string
-//! `"unmeasured"` (never a pass), and `display_summary` falls back to the
+//! stays `None` (never zero), and `display_summary` falls back to the
 //! deterministic structured rendering — a durable checkpoint always presents.
 
 use leveler_client_protocol::UiGoalRecap;
-use leveler_lifecycle::{CheckpointFindings, CheckpointVerification, GoalCheckpoint};
+use leveler_lifecycle::{CheckpointFindings, GoalCheckpoint};
 use leveler_storage::GoalCheckpointRecord;
 
 /// Project a persisted checkpoint row.
@@ -30,11 +29,6 @@ pub(crate) fn project_goal_recap_parts(
     created_at: &str,
     payload: &GoalCheckpoint,
 ) -> UiGoalRecap {
-    let (verification, verification_detail) = match &payload.verification {
-        CheckpointVerification::Passed { evidence } => ("passed", Some(evidence.clone())),
-        CheckpointVerification::Failed { detail } => ("failed", Some(detail.clone())),
-        CheckpointVerification::Unmeasured => ("unmeasured", None),
-    };
     let findings_total = match &payload.findings {
         CheckpointFindings::Known { total, .. } => Some(*total),
         // UNKNOWN is None on the wire — a client must never render it as 0.
@@ -58,8 +52,6 @@ pub(crate) fn project_goal_recap_parts(
         plan_completed: payload.plan.as_ref().map(|p| p.completed),
         plan_total: payload.plan.as_ref().map(|p| p.total),
         completed_milestones: payload.completed_milestones.clone(),
-        verification: verification.to_string(),
-        verification_detail,
         findings_total,
         known_limitations: payload.known_limitations.clone(),
         unresolved_work: payload.unresolved_work.clone(),
@@ -82,8 +74,6 @@ mod tests {
         let recap =
             project_goal_recap_parts("c1", "g1", "manual", "2026-08-27T00:00:00Z", &payload);
         assert_eq!(recap.findings_total, None, "unknown findings are not zero");
-        assert_eq!(recap.verification, "unmeasured");
-        assert_eq!(recap.verification_detail, None);
         assert!(
             !recap.display_summary.is_empty(),
             "a structured checkpoint always presents"

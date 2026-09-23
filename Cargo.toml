@@ -14,7 +14,6 @@ members = [
     "crates/leveler-tools",
     "crates/leveler-agent-core",
     "crates/leveler-agent",
-    "crates/leveler-verifier",
     "crates/leveler-context",
     "crates/leveler-vcs",
     "crates/leveler-lsp",
@@ -59,7 +58,6 @@ leveler-win-confine = { version = "1.0.6", path = "crates/leveler-win-confine" }
 leveler-tools = { version = "1.0.6", path = "crates/leveler-tools" }
 leveler-agent-core = { version = "1.0.6", path = "crates/leveler-agent-core" }
 leveler-agent = { version = "1.0.6", path = "crates/leveler-agent" }
-leveler-verifier = { version = "1.0.6", path = "crates/leveler-verifier" }
 leveler-context = { version = "1.0.6", path = "crates/leveler-context" }
 leveler-vcs = { version = "1.0.6", path = "crates/leveler-vcs" }
 leveler-lsp = { version = "1.0.6", path = "crates/leveler-lsp" }

@@ -17,7 +17,6 @@ pub enum ObservationClass {
     Edit,
     Shell,
     Tool,
-    Verify,
     Agent,
     Recovery,
     System,
@@ -33,7 +32,6 @@ impl ObservationClass {
             Self::Edit => "EDIT",
             Self::Shell => "SHELL",
             Self::Tool => "TOOL",
-            Self::Verify => "VERIFY",
             Self::Agent => "AGENT",
             Self::Recovery => "RECOVERY",
             Self::System => "SYSTEM",
@@ -113,11 +111,6 @@ pub struct UiSessionObservation {
     pub request_retries: u32,
     pub tool_started: u32,
     pub tool_finished: u32,
-    pub verification_runs: u32,
-    /// The latest verdict the runtime actually recorded: `passed`, `failed`,
-    /// `not_run` (nothing ever started), or `unavailable` (started and never
-    /// reached a verdict). A count of runs is not a verdict.
-    pub verification: String,
     pub compact_count: u32,
     pub subagent_started: u32,
     /// Wall clock from the session's first to its latest durable timestamp.

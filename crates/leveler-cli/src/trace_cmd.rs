@@ -51,8 +51,8 @@ pub(crate) async fn cmd_trace(
     );
     println!("  cost     {}", opt_cost(s.cost_usd_micros));
     println!(
-        "  tools    started {}  finished {}   verify {}  agents {}",
-        s.tool_started, s.tool_finished, s.verification, s.subagent_started
+        "  tools    started {}  finished {}   agents {}",
+        s.tool_started, s.tool_finished, s.subagent_started
     );
     for lane in &s.lanes {
         // A lane with nothing in it says nothing; skip it rather than print a

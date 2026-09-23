@@ -528,7 +528,6 @@ mod tests {
             None,
             EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: None,
@@ -544,7 +543,6 @@ mod tests {
             replayed,
             vec![EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: None,
@@ -1355,7 +1353,6 @@ mod tests {
             },
             EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some("no gating checks".into()),
                 failure: None,
                 stop: None,
@@ -1377,7 +1374,6 @@ mod tests {
         let session = SessionId::generate();
         let event = EngineEvent::TaskFinished {
             outcome: crate::TaskOutcome::Completed,
-            verification: leveler_lifecycle::VerificationStatus::NotRun,
             reason: None,
             failure: None,
             stop: None,
@@ -1413,7 +1409,6 @@ mod tests {
             None,
             EngineEvent::TaskFinished {
                 outcome: crate::TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: None,

@@ -6,8 +6,8 @@
 //!   cargo test -p leveler-tui --test product_scenarios -- --ignored --nocapture
 
 use leveler_client_protocol::{
-    CheckState, MessageId, PlanStepStatus, RuntimeEvent, SessionId, ToolCallId, UiCheck, UiDiff,
-    UiDiffFile, UiMessage, UiPlan, UiPlanStep, UiRole, UiSessionSnapshot, UiVerification,
+    MessageId, PlanStepStatus, RuntimeEvent, SessionId, ToolCallId, UiDiff, UiDiffFile, UiMessage,
+    UiPlan, UiPlanStep, UiRole, UiSessionSnapshot,
 };
 use leveler_tui::action::Action;
 use leveler_tui::reducer::reduce;
@@ -81,7 +81,6 @@ fn opened(goal: &str) -> AppState {
         active_tools: Vec::new(),
         active_background_tasks: Vec::new(),
         plan: None,
-        verification: None,
         diff: None,
         checkpoints: Vec::new(),
         recaps: Vec::new(),
@@ -258,19 +257,6 @@ fn s01_simple_edit() {
         true,
         "test result: ok. 4 passed",
         1438,
-    );
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::VerificationUpdated {
-            verification: UiVerification {
-                checks: vec![UiCheck {
-                    name: "cargo test".into(),
-                    status: CheckState::Passed,
-                    evidence: None,
-                }],
-                passed: Some(true),
-            },
-        }),
     );
     say(&mut s, "a2", "空切片现在返回 None，测试通过。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
@@ -570,7 +556,7 @@ fn s07_blocked() {
 
 #[test]
 #[ignore = "manual product harness"]
-fn s08_failed_command_and_s09_verification_failure() {
+fn s08_failed_command() {
     let mut s = opened("修 refund 的并发 bug");
     edit(
         &mut s,
@@ -590,34 +576,11 @@ fn s08_failed_command_and_s09_verification_failure() {
     dump(&mut s, "08 failed command / build error");
     reduce(
         &mut s,
-        Action::Runtime(RuntimeEvent::VerificationUpdated {
-            verification: UiVerification {
-                checks: vec![
-                    UiCheck {
-                        name: "go build ./...".into(),
-                        status: CheckState::Failed,
-                        evidence: Some("internal/billing/refund.go:56:2: undefined: mu".into()),
-                    },
-                    UiCheck {
-                        name: "go test ./...".into(),
-                        status: CheckState::Skipped,
-                        evidence: None,
-                    },
-                ],
-                passed: Some(false),
-            },
+        Action::Runtime(RuntimeEvent::TurnIncomplete {
+            reason: "go build ./... 失败，任务未完成".into(),
         }),
     );
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::TurnCompletedChecksFailed {
-            reason: "go build ./... 失败".into(),
-        }),
-    );
-    dump(
-        &mut s,
-        "09 verification failure / TurnCompletedChecksFailed",
-    );
+    dump(&mut s, "08 failed command / TurnIncomplete");
 }
 
 // --- 3. long task + model wait + long command + compaction ---------------
@@ -750,7 +713,6 @@ fn s10_resume() {
             ("落库", Pending),
             ("补测试", Pending),
         ])),
-        verification: None,
         diff: Some(UiDiff {
             files: vec![UiDiffFile {
                 path: "internal/audit/event.go".into(),

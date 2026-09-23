@@ -30,20 +30,6 @@ export interface AttachmentRef {
 /** Identifies a conversation checkpoint (restore point). */
 export type CheckpointId = string;
 
-/** The state of one verification check. This is the check-level fact and not the task-level verdict, so the three ways a check can produce no verdict stay distinct. A check whose program is not installed is not a check that was deliberately skipped, and neither is a check the environment refused: each one is the reason a run ended unverified, and the reader is owed that reason rather than a shrug. */
-export type CheckState =
-  | 'running' | 'passed' | 'failed'
-  /** Deliberately not run. */
-  | 'skipped'
-  /** No pass/fail observation was produced. `UiCheck::evidence` carries the reason projected by the runtime, such as cancellation or an unavailable dependency. */
-  | 'not_run'
-  /** The check's program is not on `PATH`, so it could not run at all. */
-  | 'tool_missing'
-  /** The check ran but the environment refused it (toolchain/MSRV mismatch). */
-  | 'environment_unavailable'
-  /** The row carried a status this build does not know. It is not a pass, and it is not a skip either — naming it one would invent a reason. */
-  | 'unknown';
-
 export interface ChildContribution {
   findings_total: number;
   profile_id?: string | null;
@@ -189,10 +175,6 @@ export type FailureSource =
 export type FinalizationStage =
   /** Wait for work already admitted by the turn to settle. */
   | 'settling_dependencies'
-  /** Run the configured checks over the final tree. */
-  | 'verification'
-  /** Persist verification and other completion evidence. */
-  | 'evidence'
   /** Run a completion review explicitly required by the task contract. */
   | 'review'
   /** Resolve the task outcome from the collected facts. */
@@ -213,7 +195,7 @@ export interface ModelRef {
 export type NotificationLevel = 'info' | 'warning' | 'error';
 
 /** Presentation class for a meaningful durable event. Unknown tools map to [`Self::Tool`]. */
-export type ObservationClass = 'model' | 'read' | 'search' | 'edit' | 'shell' | 'tool' | 'verify' | 'agent' | 'recovery' | 'system' | 'terminal';
+export type ObservationClass = 'model' | 'read' | 'search' | 'edit' | 'shell' | 'tool' | 'agent' | 'recovery' | 'system' | 'terminal';
 
 export type PermissionProfile = 'request_approval' | 'assisted' | 'full_access';
 
@@ -279,8 +261,6 @@ export type RuntimeEvent =
   | { type: 'tool_call_output'; chunk: string; id: ToolCallId; stream: string }
   /** The execution plan was created or a step's status changed (spec §20). */
   | { type: 'plan_updated'; plan: UiPlan }
-  /** Verification progress: a check finished or the run concluded (spec §22). */
-  | { type: 'verification_updated'; verification: UiVerification }
   /** The working-tree diff was (re)computed (spec §21). */
   | { type: 'diff_updated'; diff: UiDiff }
   /** A conversation checkpoint was created (spec §68). */
@@ -319,10 +299,6 @@ export type RuntimeEvent =
   | { type: 'turn_truncated'; error: string }
   /** The executor stopped cleanly but did not reach a successful terminal state (for example, budget exhaustion or an unresolved goal). */
   | { type: 'turn_incomplete'; reason: string }
-  /** The turn finished its work, but the project's checks did not run or could not produce a verdict. Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish). */
-  | { type: 'turn_completed_unverified'; reason: string }
-  /** The turn finished its work and the project's own checks then FAILED over the final tree. Done, checks failed — both facts stand; `reason` names the failing checks. */
-  | { type: 'turn_completed_checks_failed'; reason: string }
   /** The current turn failed. `error` is the legacy display string, kept for compatibility with older clients (CLI, Web). New presentations must prefer `failure` and must never parse `error` to decide a category, a retry, or a delivery truth. */
   | { type: 'turn_failed'; error: string; failure?: UiFailure | null }
   /** The current turn was cancelled (resumable). */
@@ -524,14 +500,6 @@ export interface UiApprovalRequest {
   tool: string;
 }
 
-/** One verification check (spec §22). */
-export interface UiCheck {
-  /** Captured evidence (command output), for failures. */
-  evidence?: string | null;
-  name: string;
-  status: CheckState;
-}
-
 /** A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git. */
 export interface UiCheckpoint {
   id: CheckpointId;
@@ -647,14 +615,10 @@ export type UiCommandStop =
 /** The final completion report (spec §23). */
 export interface UiCompletionReport {
   added: number;
-  checks_passed: number;
-  checks_total: number;
   files_changed: number;
   removed: number;
-  /** Whether the run completed and every gating check passed. Kept for existing clients; `verification` carries the full status. */
+  /** Whether the run completed successfully. */
   success: boolean;
-  /** The project's own checks over the final tree. Absent on reports written before the status/verification split (reads as `not_run`). */
-  verification?: UiVerificationStatus;
 }
 
 /** A summary of working-tree changes. */
@@ -714,7 +678,7 @@ export interface UiFinding {
   symbol?: string | null;
 }
 
-/** One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts. Truth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero. `verification` is `"unmeasured"` when nothing was proven — never a pass. */
+/** One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts. Truth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero. */
 export interface UiGoalRecap {
   /** The persisted `GoalCheckpointId` this Recap presents. */
   checkpoint_id: string;
@@ -737,10 +701,6 @@ export interface UiGoalRecap {
   /** Transcript position the checkpoint represents (messages `[0..n)`), so a reopened session can interleave the Recap where it happened. `None` = unknown; append after existing history. */
   transcript_ordinal?: number | null;
   unresolved_work?: string[];
-  /** `passed` | `failed` | `unmeasured`. */
-  verification: string;
-  /** Evidence for a pass, or the failure detail. Absent when unmeasured. */
-  verification_detail?: string | null;
 }
 
 /** One fact of a past turn, as the live stream carried it. */
@@ -928,9 +888,6 @@ export interface UiSessionObservation {
   tool_finished: number;
   tool_started: number;
   updated_at: string;
-  /** The latest verdict the runtime actually recorded: `passed`, `failed`, `not_run` (nothing ever started), or `unavailable` (started and never reached a verdict). A count of runs is not a verdict. */
-  verification: string;
-  verification_runs: number;
   work_profile: string;
 }
 
@@ -972,7 +929,6 @@ export interface UiSessionSnapshot {
   status: string;
   /** User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block. */
   user_shells?: UiUserShell[];
-  verification?: UiVerification | null;
   /** Whether the current model accepts image input (spec §42). */
   vision?: boolean;
   /** Product work-profile axis (`economy | balanced`; legacy `delivery` reads as `balanced`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes. */
@@ -1042,15 +998,6 @@ export interface UiUserShell {
   /** `running | success | failed | cancelled`. */
   status: string;
 }
-
-/** The verification result. `passed` is `None` while a check is still running, and it is also `None` when nothing was proven. It is never `Some(true)` for a run that was not verified — "not verified" and "failed" are different facts, and clients render them differently (`incomplete` versus `failed`). */
-export interface UiVerification {
-  checks: UiCheck[];
-  passed?: boolean | null;
-}
-
-/** What the project's own checks reported over the final tree. Orthogonal to whether the run completed: `Passed` means the configured commands exited 0, never that the user's request was satisfied. */
-export type UiVerificationStatus = 'passed' | 'failed' | 'not_run' | 'unavailable';
 
 /** Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation. */
 export type UserShellId = string;

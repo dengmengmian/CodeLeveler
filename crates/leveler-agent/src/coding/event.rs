@@ -134,28 +134,6 @@ impl From<AgentEvent> for EngineEvent {
                 // merge via the legacy overlap heuristic on restore.
                 through_ordinal: None,
             },
-            A::VerificationStarted => EngineEvent::VerificationStarted,
-            A::VerificationCheck {
-                name,
-                status,
-                evidence,
-            } => EngineEvent::VerificationCheck {
-                name,
-                // The same durable vocabulary the verifier's own writer uses,
-                // through the same mapper.
-                status: status.as_str().to_string(),
-                observation: None,
-                disposition: None,
-                execution: None,
-                evidence,
-            },
-            A::VerificationFinished {
-                passed,
-                verification,
-            } => EngineEvent::VerificationFinished {
-                passed,
-                verification,
-            },
             A::SubAgentStarted {
                 id,
                 nickname,

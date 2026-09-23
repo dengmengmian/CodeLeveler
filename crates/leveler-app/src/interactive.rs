@@ -4483,7 +4483,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             active_tools: live.active_tools,
             active_background_tasks,
             plan,
-            verification: live.verification,
             diff: live.diff,
             checkpoints,
             recaps,
@@ -4823,8 +4822,8 @@ async fn compact_conversation(
                 messages,
                 // Compact is admitted like a turn, so no turn is running and
                 // no interaction can be pending; checkpoints are about to be
-                // dropped by the caller. The LIVE view (plan/verification/
-                // diff/report) must ride along though — hardcoding it empty
+                // dropped by the caller. The LIVE view (plan/diff/report)
+                // must ride along though — hardcoding it empty
                 // made this snapshot lie relative to `snapshot()`, and a
                 // reconnect would resurrect state this push had cleared.
                 pending_interactions: vec![],
@@ -4834,7 +4833,6 @@ async fn compact_conversation(
                 active_tools: live.active_tools,
                 active_background_tasks,
                 plan: live.plan,
-                verification: live.verification,
                 diff: live.diff,
                 checkpoints: Vec::new(),
                 recaps: Vec::new(),
@@ -5453,7 +5451,6 @@ mod context_ops_tests {
                 },
                 leveler_engine::EngineEvent::TaskFinished {
                     outcome: leveler_lifecycle::TaskOutcome::Completed,
-                    verification: leveler_lifecycle::VerificationStatus::NotRun,
                     reason: None,
                     failure: None,
                     stop: Some(leveler_lifecycle::StopReason::Answered),
@@ -5517,7 +5514,6 @@ mod context_ops_tests {
             leveler_engine::EngineEvent::Compacted { from: 30, to: 1 },
             leveler_engine::EngineEvent::TaskFinished {
                 outcome: leveler_lifecycle::TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: Some(leveler_lifecycle::StopReason::Answered),
@@ -5554,9 +5550,7 @@ mod context_ops_tests {
                     e.event,
                     RuntimeEvent::TurnAnswered
                         | RuntimeEvent::TurnCompleted
-                        | RuntimeEvent::TurnCompletedUnverified { .. }
                         | RuntimeEvent::TurnCompletedWithWarnings { .. }
-                        | RuntimeEvent::TurnCompletedChecksFailed { .. }
                 ))
                 .count(),
             1,

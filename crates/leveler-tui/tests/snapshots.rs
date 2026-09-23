@@ -49,7 +49,6 @@ fn opened_state() -> AppState {
         active_tools: Vec::new(),
         active_background_tasks: Vec::new(),
         plan: None,
-        verification: None,
         diff: None,
         checkpoints: Vec::new(),
         recaps: Vec::new(),
@@ -852,10 +851,7 @@ fn renders_completion_block() {
                 files_changed: 3,
                 added: 86,
                 removed: 31,
-                checks_passed: 4,
-                checks_total: 4,
                 success: true,
-                verification: leveler_client_protocol::UiVerificationStatus::Passed,
             },
         }),
     );
@@ -1397,13 +1393,6 @@ fn sample_recap(unknown_truth: bool) -> leveler_client_protocol::UiGoalRecap {
         plan_completed: Some(3),
         plan_total: Some(5),
         completed_milestones: vec!["ownership / cleanup".to_string()],
-        verification: if unknown_truth {
-            "unmeasured"
-        } else {
-            "passed"
-        }
-        .to_string(),
-        verification_detail: (!unknown_truth).then(|| "cargo test: 2707 passed".to_string()),
         findings_total: if unknown_truth { None } else { Some(3) },
         known_limitations: vec!["delayed popup 未覆盖".to_string()],
         unresolved_work: Vec::new(),
@@ -1636,10 +1625,8 @@ fn trace_state(locale: leveler_tui::Locale, tab: char) -> String {
             request_retries: 0,
             tool_started: 5,
             tool_finished: 5,
-            verification_runs: 1,
             compact_count: 0,
             subagent_started: 0,
-            verification: "not_run".into(),
             duration_ms: None,
             cached_input_tokens: None,
             cost_usd_micros: None,

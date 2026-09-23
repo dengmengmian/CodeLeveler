@@ -28,7 +28,6 @@ use leveler_model::{
 };
 use leveler_storage::{Database, EventRepository, MessageRepository};
 use leveler_tools::ToolContext;
-use leveler_verifier::VerificationPlan;
 
 /// The surface a real coding turn gets: the tool crate's composition plus the
 /// harness controls THIS crate registers (`update_plan`). Production composes
@@ -204,8 +203,6 @@ fn direct_spec(dir: &Path) -> TaskSpec {
             sandbox: false,
             // No gates: the resume turn can at best land CompletedUnverified, which
             // keeps these tests focused on the crash-window reconciliation.
-            verification: VerificationPlan::default(),
-            base_commit: None,
         },
     }
 }

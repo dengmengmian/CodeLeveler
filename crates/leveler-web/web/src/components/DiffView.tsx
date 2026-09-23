@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { CTRL_ICON } from '../lib/icons';
 import { useAppDispatch, useAppState } from '../state/store';
 import { useBridge } from '../state/bridge';
-import { completionTruth, trustLabel } from '../lib/completionTruth';
+import { completionTruth } from '../lib/completionTruth';
 import { groupChangeFiles } from '../lib/changeFiles';
 import {
   nextPath,
@@ -58,7 +58,6 @@ export function DiffView() {
         {truth && (
           <span className={`ch-truth tone-${truth.tone}`}>
             {truth.glyph} {truth.title}
-            <span className="ch-trust">{trustLabel(truth.trust)}</span>
           </span>
         )}
         <span className="dv-nav">

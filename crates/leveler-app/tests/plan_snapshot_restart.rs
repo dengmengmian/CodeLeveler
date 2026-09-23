@@ -12,7 +12,7 @@ use leveler_client_protocol::{InteractiveRuntimeClient, PlanStepStatus};
 use leveler_core::SessionId;
 use leveler_engine::EngineEvent;
 use leveler_execution::PermissionProfile;
-use leveler_lifecycle::{StopReason, TaskOutcome, VerificationStatus};
+use leveler_lifecycle::{StopReason, TaskOutcome};
 use leveler_model::ModelRef;
 use leveler_project::Layout;
 use leveler_storage::EventRepository;
@@ -60,7 +60,6 @@ async fn persist_task_terminal(app: &Application, session_id: &SessionId) {
     let db = app.open_database().await.unwrap();
     let event = EngineEvent::TaskFinished {
         outcome: TaskOutcome::Completed,
-        verification: VerificationStatus::NotRun,
         reason: None,
         stop: Some(StopReason::Completed),
         failure: None,

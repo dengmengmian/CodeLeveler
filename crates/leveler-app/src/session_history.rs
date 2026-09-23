@@ -228,7 +228,7 @@ mod tests {
     use leveler_client_protocol::UiCommandStop;
     use leveler_core::{Timestamp, TurnId, now};
     use leveler_engine::{EngineEvent, TurnKind};
-    use leveler_lifecycle::{StopReason, TaskOutcome, VerificationStatus};
+    use leveler_lifecycle::{StopReason, TaskOutcome};
     use leveler_model::{Message, Role};
     use leveler_storage::{EventStore, MessageRepository, SessionRecord, SessionRepository};
 
@@ -284,7 +284,6 @@ mod tests {
             t0 + ms(1500),
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Completed,
-                verification: VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: Some(StopReason::Answered),
@@ -379,7 +378,6 @@ mod tests {
             t0 + ms(6000),
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Completed,
-                verification: VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: Some(StopReason::Answered),

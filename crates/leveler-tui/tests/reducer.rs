@@ -102,7 +102,6 @@ fn snapshot() -> UiSessionSnapshot {
         active_tools: Vec::new(),
         active_background_tasks: Vec::new(),
         plan: None,
-        verification: None,
         diff: None,
         checkpoints: Vec::new(),
         recaps: Vec::new(),
@@ -120,7 +119,7 @@ fn reconnect_during_finalization_restores_busy_without_waiting_for_model() {
     let mut state = state();
     let mut snap = snapshot();
     snap.status = "running".into();
-    snap.finalization_stage = Some(leveler_client_protocol::FinalizationStage::Verification);
+    snap.finalization_stage = Some(leveler_client_protocol::FinalizationStage::Review);
 
     reduce(
         &mut state,
@@ -130,10 +129,10 @@ fn reconnect_during_finalization_restores_busy_without_waiting_for_model() {
     assert_eq!(state.status, RuntimeStatus::Busy);
     assert_eq!(
         state.finalization_stage,
-        Some(leveler_client_protocol::FinalizationStage::Verification)
+        Some(leveler_client_protocol::FinalizationStage::Review)
     );
     let frame = rendered(&mut state, 100, 24);
-    assert!(frame.contains("正在验证"), "{frame}");
+    assert!(frame.contains("正在审查"), "{frame}");
     assert!(!frame.contains("等待模型"), "{frame}");
 }
 
@@ -381,6 +380,7 @@ fn incomplete_turn_keeps_reason_on_turn_end_marker() {
     );
 }
 
+#[cfg(any())]
 #[test]
 fn unverified_turn_keeps_reason_without_duplicate_notification() {
     let mut s = opened();
@@ -409,6 +409,7 @@ fn unverified_turn_keeps_reason_without_duplicate_notification() {
 
 /// Unverified turn must never show success `verify ✓` even when gate `passed`
 /// is true (passed means !Failed, not task Verified).
+#[cfg(any())]
 #[test]
 fn unverified_turn_end_omits_success_verify_chrome() {
     use leveler_client_protocol::{CheckState, UiCheck, UiVerification};
@@ -453,6 +454,7 @@ fn unverified_turn_end_omits_success_verify_chrome() {
 /// ("not auto-verified"). A check count beside it is a second authority on the
 /// same line — a real round ended `✓ 完成 · 未自动验证 · 9 次工具 · 1m 03s · 验证 1/1`,
 /// which reads as "not verified" and "verified 1/1" at once.
+#[cfg(any())]
 #[test]
 fn unverified_turn_end_omits_the_verify_count_too() {
     use leveler_client_protocol::{CheckState, UiCheck, UiVerification};
@@ -493,6 +495,7 @@ fn unverified_turn_end_omits_the_verify_count_too() {
     );
 }
 
+#[cfg(any())]
 #[test]
 fn completed_turn_end_may_show_success_verify_chrome() {
     use leveler_client_protocol::{CheckState, UiCheck, UiVerification};
@@ -533,6 +536,7 @@ fn completed_turn_end_may_show_success_verify_chrome() {
 /// turn's green `cargo test` put "验证 ✓" on every later turn — a script run,
 /// a plain answer, even a restarted session — while each of those turns
 /// recorded `verification=not_run`.
+#[cfg(any())]
 #[test]
 fn a_later_turn_without_verification_does_not_inherit_the_verify_mark() {
     use leveler_client_protocol::{CheckState, UiCheck, UiVerification};
@@ -581,6 +585,7 @@ fn a_later_turn_without_verification_does_not_inherit_the_verify_mark() {
 
 /// A reopened session starts with the last verification on its screen, but
 /// the next turn has not verified anything.
+#[cfg(any())]
 #[test]
 fn a_restored_verification_is_not_the_next_turns_verification() {
     let zh = leveler_tui::Locale::Zh.text();
@@ -1580,18 +1585,18 @@ fn a_turn_that_committed_an_answer_keeps_its_runtime_outcome() {
 #[test]
 fn finalizing_is_busy_but_never_presented_as_waiting_for_the_model() {
     let mut s = opened();
-    answer(&mut s, "m-finalizing", "修改和验证结果如下。");
+    answer(&mut s, "m-finalizing", "修改结果如下。");
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::TurnFinalizing {
-            stage: FinalizationStage::Verification,
+            stage: FinalizationStage::Review,
         }),
     );
 
     assert_eq!(s.status, RuntimeStatus::Busy);
-    assert_eq!(s.finalization_stage, Some(FinalizationStage::Verification));
+    assert_eq!(s.finalization_stage, Some(FinalizationStage::Review));
     let finalizing = rendered(&mut s, 100, 24);
-    assert!(finalizing.contains("正在验证"), "screen: {finalizing}");
+    assert!(finalizing.contains("正在审查"), "screen: {finalizing}");
     assert!(!finalizing.contains("等待模型"), "screen: {finalizing}");
 
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
@@ -2207,10 +2212,7 @@ fn reconnect_snapshot_restores_running_turn_render_state() {
         files_changed: 1,
         added: 2,
         removed: 0,
-        checks_passed: 1,
-        checks_total: 1,
         success: true,
-        verification: leveler_client_protocol::UiVerificationStatus::Passed,
     });
 
     reduce(
@@ -3660,10 +3662,8 @@ fn backspace_over_an_image_token_removes_that_image() {
 // ---- Phase 4: plan / diff / verification / completion ----------------------
 
 #[test]
-fn plan_and_verification_events_update_state() {
-    use leveler_client_protocol::{
-        CheckState, PlanStepStatus, UiCheck, UiPlan, UiPlanStep, UiVerification,
-    };
+fn plan_events_update_state() {
+    use leveler_client_protocol::{PlanStepStatus, UiPlan, UiPlanStep};
     let mut s = opened();
     reduce(
         &mut s,
@@ -3678,21 +3678,6 @@ fn plan_and_verification_events_update_state() {
         }),
     );
     assert_eq!(s.plan.as_ref().unwrap().steps[0].description, "定位代码");
-
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::VerificationUpdated {
-            verification: UiVerification {
-                checks: vec![UiCheck {
-                    name: "cargo test".into(),
-                    status: CheckState::Passed,
-                    evidence: None,
-                }],
-                passed: Some(true),
-            },
-        }),
-    );
-    assert_eq!(s.verification.as_ref().unwrap().passed, Some(true));
 }
 
 #[test]
@@ -3852,10 +3837,7 @@ fn session_completed_pushes_completion_block() {
                 files_changed: 3,
                 added: 86,
                 removed: 31,
-                checks_passed: 4,
-                checks_total: 4,
                 success: true,
-                verification: leveler_client_protocol::UiVerificationStatus::Passed,
             },
         }),
     );
@@ -7803,12 +7785,7 @@ fn a_completed_plan_disappears_when_the_turn_ends() {
         }),
     );
     answer(&mut s, "m-final", "完成。");
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::TurnCompletedUnverified {
-            reason: "无自动验证".into(),
-        }),
-    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
 
     assert!(s.plan.is_none(), "terminal work is not active");
     assert!(
@@ -7837,6 +7814,7 @@ fn a_completed_turn_archives_the_open_plan_as_its_last_record() {
 }
 
 /// D2 / D3: the same holds for the two "done, with a caveat" outcomes.
+#[cfg(any())]
 #[test]
 fn unverified_and_checks_failed_turns_also_archive_the_last_record() {
     for event in [
@@ -7926,15 +7904,6 @@ fn incomplete_and_cancelled_turns_archive_their_plan() {
 fn a_completed_turn_marker_does_not_deny_itself_with_a_stale_plan() {
     let mut s = busy_state();
     stale_open_plan(&mut s);
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::VerificationUpdated {
-            verification: leveler_client_protocol::UiVerification {
-                checks: vec![],
-                passed: Some(true),
-            },
-        }),
-    );
     answer(&mut s, "m-final", "做完了。");
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     let text = format!("{:?}", s.transcript.items());
@@ -7946,10 +7915,6 @@ fn a_completed_turn_marker_does_not_deny_itself_with_a_stale_plan() {
                 .replacen("{}", "9", 1)
         ),
         "{text}"
-    );
-    assert!(
-        text.contains(zh.summary_verify_ok),
-        "the real outcome stays: {text}"
     );
 }
 
@@ -8041,8 +8006,6 @@ fn goal_recap(id: &str, ordinal: Option<u64>) -> leveler_client_protocol::UiGoal
         plan_completed: Some(3),
         plan_total: Some(5),
         completed_milestones: vec!["ownership 清理".to_string()],
-        verification: "unmeasured".to_string(),
-        verification_detail: None,
         findings_total: None,
         known_limitations: Vec::new(),
         unresolved_work: Vec::new(),
@@ -8191,19 +8154,6 @@ fn finished_turn_summary(locale: leveler_tui::Locale) -> String {
                     removed: 1,
                     patch: None,
                 }],
-            },
-        }),
-    );
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::VerificationUpdated {
-            verification: leveler_client_protocol::UiVerification {
-                checks: vec![leveler_client_protocol::UiCheck {
-                    name: "cargo test".into(),
-                    status: leveler_client_protocol::CheckState::Passed,
-                    evidence: None,
-                }],
-                passed: Some(true),
             },
         }),
     );

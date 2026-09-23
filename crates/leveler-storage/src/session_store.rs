@@ -192,7 +192,6 @@ pub(crate) struct MemorySession {
     pub(crate) sandbox: bool,
     pub(crate) kind: String,
     pub(crate) outcome: Option<TaskOutcome>,
-    pub(crate) verification: Option<leveler_lifecycle::VerificationStatus>,
 }
 
 /// An in-memory [`SessionStore`] honoring the same contract as the SQLite
@@ -246,7 +245,6 @@ impl SessionStore for MemorySessionStore {
                 sandbox: false,
                 kind: "direct".to_string(),
                 outcome: None,
-                verification: None,
             },
         );
         Ok(())

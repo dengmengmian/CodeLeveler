@@ -296,7 +296,10 @@ mod tests {
         emitter.emit(EngineEvent::AssistantDelta {
             text: "first".into(),
         });
-        emitter.emit(EngineEvent::VerificationStarted);
+        emitter.emit(EngineEvent::PhaseChanged {
+            from: leveler_lifecycle::AgentState::Understand,
+            to: leveler_lifecycle::AgentState::Plan,
+        });
         drop(emitter);
 
         assert!(cancel.is_cancelled());
@@ -308,7 +311,7 @@ mod tests {
         assert!(rx.recv().await.is_none());
         assert!(matches!(
             state.take_overflow(),
-            Some(EngineEvent::VerificationStarted)
+            Some(EngineEvent::PhaseChanged { .. })
         ));
     }
 
@@ -410,7 +413,10 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (emitter, _rx, state) = EventEmitter::channel(1, cancel.clone());
         emitter.emit(EngineEvent::AssistantDelta { text: "a".into() });
-        emitter.emit(EngineEvent::VerificationStarted); // overflows: canonical
+        emitter.emit(EngineEvent::PhaseChanged {
+            from: leveler_lifecycle::AgentState::Understand,
+            to: leveler_lifecycle::AgentState::Plan,
+        }); // overflows: canonical
         assert!(state.is_overloaded());
         let err = emitter
             .flush()

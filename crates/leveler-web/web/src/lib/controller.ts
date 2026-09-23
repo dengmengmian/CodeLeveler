@@ -220,9 +220,6 @@ export class RuntimeBridge {
       case 'plan_updated':
         this.dispatch({ type: 'plan', plan: ev.plan });
         break;
-      case 'verification_updated':
-        this.dispatch({ type: 'verification', verification: ev.verification });
-        break;
       case 'diff_updated':
         this.dispatch({ type: 'diff', diff: ev.diff });
         break;

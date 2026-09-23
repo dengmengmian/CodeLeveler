@@ -81,9 +81,7 @@ fn sanitize(text: &str) -> String {
 }
 
 /// The turn-end truth the title obeys: same hierarchy as the transcript
-/// marker, never upgraded. `Unverified` deliberately does NOT get a ✓ — the
-/// title has no room for the in-TUI caveat text, and a bare ✓ would claim
-/// more than Completion Truth does.
+/// marker, never upgraded.
 fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
     match end {
         TurnEndStatus::Completed
@@ -92,8 +90,6 @@ fn terminal_status(end: TurnEndStatus) -> TerminalTaskStatus {
         // A run with no answer committed is not a completion, so the title
         // must not carry the ✓ either.
         TurnEndStatus::NoFinalAnswer
-        | TurnEndStatus::Unverified
-        | TurnEndStatus::ChecksFailed
         | TurnEndStatus::Truncated
         | TurnEndStatus::Incomplete
         | TurnEndStatus::Failed
@@ -166,8 +162,6 @@ fn activity(state: &AppState, status: TerminalTaskStatus) -> Option<String> {
         TerminalTaskStatus::Completed => Some(t.title_completed.to_string()),
         TerminalTaskStatus::Failed => Some(
             match last_turn_end(state) {
-                Some(TurnEndStatus::Unverified) => t.title_unverified,
-                Some(TurnEndStatus::ChecksFailed) => t.title_checks_failed,
                 Some(TurnEndStatus::Cancelled) => t.title_cancelled,
                 Some(TurnEndStatus::Failed) => t.title_failed,
                 _ => t.title_incomplete,
@@ -361,7 +355,6 @@ mod tests {
             TurnEndStatus::Failed,
             TurnEndStatus::Incomplete,
             TurnEndStatus::Truncated,
-            TurnEndStatus::Unverified,
             TurnEndStatus::Cancelled,
         ] {
             let mut state = test_state();

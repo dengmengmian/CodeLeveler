@@ -21,7 +21,7 @@ use leveler_engine::{
     reap_after_restart,
 };
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, AutoClarify};
-use leveler_lifecycle::{AgentState, SessionStatus, StopReason, TaskOutcome, VerificationStatus};
+use leveler_lifecycle::{AgentState, SessionStatus, StopReason, TaskOutcome};
 use leveler_model::{Message, Role};
 use leveler_storage::{Database, EngineStores, SessionRepository, TurnRepository};
 use tokio_util::sync::CancellationToken;
@@ -347,7 +347,6 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
             &session,
             leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Completed,
-                verification: VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: Some(StopReason::Answered),
@@ -366,7 +365,6 @@ async fn an_interrupted_turn_is_visible_after_restart_and_the_next_turn_runs() {
             &session,
             leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Completed,
-                verification: VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: Some(StopReason::Answered),

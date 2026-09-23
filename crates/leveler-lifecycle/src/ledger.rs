@@ -1,7 +1,7 @@
 //! Process evidence ledger. Pure types — no I/O, no shell.
 //!
 //! Event log remains SoT for resume; this is the host in-memory projection
-//! the mechanical readiness gate reads during a drive.
+//! the runtime reads during a drive.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,23 +17,12 @@ pub struct MutationRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifyRecord {
-    pub seq: u64,
-    pub tool_call_id: String,
-    /// Normalized `program + args` fingerprint for acceptance matching.
-    pub command_fingerprint: String,
-    pub exit_code: i32,
-    /// Mutation seq observed when this verify ran (invalidate if later mutations).
-    pub after_mutation_seq: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterceptRecord {
     pub kind: String,
     pub detail: String,
 }
 
-/// What this run mechanically did: mutations, verifications, intercepts and
+/// What this run mechanically did: mutations, intercepts and
 /// multi-agent findings. Facts only — the ledger never says what those facts
 /// prove about the user's intent, and a finding it holds is information the
 /// model produced, never a gate.
@@ -41,7 +30,6 @@ pub struct InterceptRecord {
 pub struct EvidenceLedger {
     pub plan: PlanState,
     pub mutations: Vec<MutationRecord>,
-    pub verifications: Vec<VerifyRecord>,
     pub intercepts: Vec<InterceptRecord>,
     pub next_seq: u64,
     /// Every successful mutating tool call, INCLUDING repeat edits of files
@@ -54,9 +42,8 @@ pub struct EvidenceLedger {
     /// Sequence of the most recent mutating call, whether or not it produced
     /// a `MutationRecord`. `mutations` is keyed on first-touch paths, so a
     /// refinement edit of a file already in the set used to leave
-    /// [`Self::last_mutation_seq`] where it was — and a test that passed
-    /// before that edit kept reading as current. Freshness has to move on
-    /// every change to the tree, not on every new path in it.
+    /// [`Self::last_mutation_seq`] where it was. Freshness has to move on every
+    /// change to the tree, not on every new path in it.
     #[serde(default)]
     pub last_mutation_op_seq: u64,
     /// Durable multi-agent findings (self-reported and adopted from children).
@@ -70,8 +57,7 @@ pub struct EvidenceLedger {
 
 impl EvidenceLedger {
     /// One successful mutating tool call happened (new paths or a re-edit).
-    /// Advances the freshness sequence even when no path is new, so a
-    /// verification recorded before this call is no longer current after it.
+    /// Advances the freshness sequence even when no path is new.
     pub fn note_mutation_op(&mut self) {
         self.total_mutation_ops = self.total_mutation_ops.saturating_add(1);
         self.next_seq = self.next_seq.saturating_add(1);
@@ -101,29 +87,6 @@ impl EvidenceLedger {
             tool: tool.into(),
             paths,
         });
-    }
-
-    pub fn record_verify(
-        &mut self,
-        tool_call_id: impl Into<String>,
-        command_fingerprint: impl Into<String>,
-        exit_code: i32,
-    ) {
-        self.next_seq = self.next_seq.saturating_add(1);
-        self.verifications.push(VerifyRecord {
-            seq: self.next_seq,
-            tool_call_id: tool_call_id.into(),
-            command_fingerprint: command_fingerprint.into(),
-            exit_code,
-            after_mutation_seq: self.last_mutation_seq(),
-        });
-    }
-
-    pub fn has_fresh_successful_verify(&self) -> bool {
-        let last_mut = self.last_mutation_seq();
-        self.verifications
-            .iter()
-            .any(|v| v.exit_code == 0 && v.after_mutation_seq >= last_mut && last_mut > 0)
     }
 
     pub fn record_intercept(&mut self, kind: impl Into<String>, detail: impl Into<String>) {
@@ -172,29 +135,6 @@ impl EvidenceLedger {
     pub fn finding(&self, id: &str) -> Option<&FindingRecord> {
         self.findings.iter().find(|f| f.id == id)
     }
-
-    pub fn normalize_command_fingerprint(program: &str, args: &[String]) -> String {
-        let mut parts = vec![program.trim().to_string()];
-        parts.extend(args.iter().map(|a| a.trim().to_string()));
-        parts.join("\u{1f}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mutation_invalidates_prior_verify() {
-        let mut led = EvidenceLedger::default();
-        led.record_mutation("c1", "apply_patch", vec!["a.rs".into()]);
-        led.record_verify("v1", "cargo\u{1f}test", 0);
-        assert!(led.has_fresh_successful_verify());
-        led.record_mutation("c2", "replace", vec!["a.rs".into()]);
-        assert!(!led.has_fresh_successful_verify());
-        led.record_verify("v2", "cargo\u{1f}test", 0);
-        assert!(led.has_fresh_successful_verify());
-    }
 }
 
 #[cfg(test)]
@@ -238,17 +178,11 @@ mod finding_tests {
     }
 
     /// A finding is information. Nothing in the ledger can turn one into a
-    /// reason to refuse a completion, which is what the deleted `blocking`
-    /// flag and its state machine did.
+    /// reason to refuse a completion.
     #[test]
     fn the_ledger_exposes_no_gate_over_findings() {
         let mut led = EvidenceLedger::default();
         led.record_finding(FindingKind::Correctness, "looks wrong", None, None);
-        led.record_mutation("c1", "apply_patch", vec!["src/lib.rs".into()]);
-        led.record_verify("v1", "cargo\u{1f}test", 0);
-        assert!(
-            led.has_fresh_successful_verify(),
-            "an unjudged finding does not make verification stale"
-        );
+        assert_eq!(led.findings.len(), 1);
     }
 }

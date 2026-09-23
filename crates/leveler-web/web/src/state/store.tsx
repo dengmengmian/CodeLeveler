@@ -35,7 +35,6 @@ import type {
   UiRole,
   UiSessionSnapshot,
   UiSessionSummary,
-  UiVerification,
 } from '../types/protocol';
 
 // ── 视图模型 ────────────────────────────────────────────────────────
@@ -176,7 +175,6 @@ export interface SessionView {
   pendingApprovals: UiApprovalRequest[];
   pendingClarifications: UiClarificationRequest[];
   plan: UiPlan | null;
-  verification: UiVerification | null;
   diff: UiDiff | null;
   checkpoints: UiCheckpoint[];
   completionReport: UiCompletionReport | null;
@@ -348,7 +346,6 @@ export type Action =
   | { type: 'clarification_requested'; request: UiClarificationRequest }
   | { type: 'clarification_resolved'; requestId: string }
   | { type: 'plan'; plan: UiPlan }
-  | { type: 'verification'; verification: UiVerification }
   | { type: 'diff'; diff: UiDiff }
   | { type: 'checkpoint_added'; checkpoint: UiCheckpoint }
   | { type: 'completion'; report: UiCompletionReport }
@@ -433,7 +430,6 @@ function viewFromSnapshot(
     pendingApprovals,
     pendingClarifications,
     plan: snap.plan ?? null,
-    verification: snap.verification ?? null,
     diff: snap.diff ?? null,
     checkpoints: snap.checkpoints ?? [],
     completionReport: snap.completion_report ?? null,
@@ -961,9 +957,6 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'plan':
       if (state.current) state.current.plan = action.plan;
-      return;
-    case 'verification':
-      if (state.current) state.current.verification = action.verification;
       return;
     case 'diff':
       if (state.current) state.current.diff = action.diff;

@@ -39,7 +39,7 @@ fn the_engine_does_not_depend_on_a_harness() {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("the engine manifest is readable");
-    for forbidden in ["leveler-agent", "leveler-tools", "leveler-verifier"] {
+    for forbidden in ["leveler-agent", "leveler-tools"] {
         assert!(
             !manifest.contains(forbidden),
             "leveler-engine must not depend on `{forbidden}`: the engine owns \

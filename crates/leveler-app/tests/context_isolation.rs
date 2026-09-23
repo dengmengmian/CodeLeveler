@@ -104,8 +104,6 @@ async fn wait_for_turn_end(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEven
             Ok(Ok(event)) => match event {
                 RuntimeEvent::TurnCompleted
                 | RuntimeEvent::TurnCompletedWithWarnings { .. }
-                | RuntimeEvent::TurnCompletedUnverified { .. }
-                | RuntimeEvent::TurnCompletedChecksFailed { .. }
                 | RuntimeEvent::TurnAnswered
                 | RuntimeEvent::TurnTruncated { .. }
                 | RuntimeEvent::TurnIncomplete { .. }

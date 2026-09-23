@@ -834,9 +834,14 @@ fn unit_lines(
     let render_action =
         show_action || !has_summary || action != tool_action_label_for(&call.name, locale);
     if render_action {
+        let action_ink = if call.status == ToolStatus::Running && !awaiting_approval {
+            theme.accent.secondary
+        } else {
+            body_ink(call.status, theme)
+        };
         head.push(Span::styled(
             action.clone(),
-            Style::default().fg(body_ink(call.status, theme)),
+            Style::default().fg(action_ink),
         ));
     }
     if has_summary {
@@ -944,7 +949,7 @@ fn push_run(
     // A run is active while any of its calls is; once all are settled the head
     // recedes with them. The children carry the per-call state either way.
     let run_ink = if calls.iter().any(|c| c.status == ToolStatus::Running) {
-        theme.ink(Ink::Active)
+        theme.accent.secondary
     } else {
         theme.ink(Ink::Settled)
     };
@@ -1119,6 +1124,11 @@ const COMMAND_OUTPUT_ROWS: usize = 20;
 
 /// Output rows a RUNNING command shows under its row: enough to see it move.
 pub(crate) const LIVE_TAIL_ROWS: usize = 6;
+
+/// Keep short commands on one stable row. With second-granularity runtime
+/// timestamps, one second is the first evidence that a call is long-lived
+/// enough for its live tail to be useful instead of a one-frame layout jump.
+const LIVE_TAIL_DELAY_SECS: u64 = 1;
 
 /// Diff rows a settled edit keeps on screen before the rest is counted.
 pub(crate) const DIFF_PREVIEW_ROWS: usize = 24;
@@ -1370,6 +1380,7 @@ fn command_unit_lines(
     } else if call.status == ToolStatus::Running
         && crate::tool_taxonomy::result_lifetime(&call.name)
             == crate::tool_taxonomy::ResultLifetime::Transient
+        && call.running_secs(now_elapsed_secs) >= LIVE_TAIL_DELAY_SECS
     {
         // Live: the last few lines it printed, so the user sees it move. The
         // tail is PROCESS — it leaves the moment the call settles (the branch
@@ -2488,6 +2499,29 @@ mod tests {
             Some(theme.ink(Ink::Settled)),
             "finished history recedes: {settled:?}"
         );
+    }
+
+    #[test]
+    fn a_running_tool_accents_only_its_action_not_its_target() {
+        let theme = Theme::dark();
+        let lines = styled_group(
+            vec![call(
+                "read_file",
+                r#"{"path":"target.rs"}"#,
+                ToolStatus::Running,
+            )],
+            &theme,
+        );
+        let action = tool_action_label_for("read_file", Locale::Zh);
+        let action_fg = lines.iter().find_map(|line| {
+            line.spans
+                .iter()
+                .find(|span| span.content == action)
+                .and_then(|span| span.style.fg)
+        });
+
+        assert_eq!(action_fg, Some(theme.accent.secondary));
+        assert_eq!(body_fg(&lines, "target.rs"), Some(theme.ink(Ink::Active)));
     }
 
     /// The hierarchy never buries a failure: a failed call keeps the live ink
@@ -5452,6 +5486,17 @@ mod compact_command_tests {
     fn with_output(mut c: ToolCallBlock, n: usize) -> ToolCallBlock {
         c.output = (1..=n).map(|i| format!("test case_{i} ... ok\n")).collect();
         c
+    }
+
+    /// A command that starts and settles inside the first paint interval must
+    /// not briefly grow the transcript with output rows. That one-frame
+    /// expansion followed by the settled single row makes the bottom-aligned
+    /// conversation visibly jump.
+    #[test]
+    fn a_new_running_command_keeps_one_stable_row() {
+        let c = with_output(cmd(SED, ToolStatus::Running), 2);
+        let rows = text(&lines_at(c, &Theme::no_color(), 100, 0));
+        assert_eq!(rows.len(), 1, "{rows:?}");
     }
 
     /// A command in flight shows what it is printing: the row, then the last

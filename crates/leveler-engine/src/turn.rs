@@ -178,9 +178,6 @@ fn encode_internal_lineage(
         TurnKind::Node { node_id } => {
             object.insert("node_id".into(), serde_json::Value::String(node_id.clone()));
         }
-        TurnKind::Repair { attempt } => {
-            object.insert("attempt".into(), serde_json::Value::from(*attempt));
-        }
         TurnKind::User | TurnKind::Chat => {}
     }
     Ok(serde_json::to_string(&value)?)
@@ -500,13 +497,13 @@ impl TurnRunner<'_> {
                     "a user turn cannot use an internal lineage start".to_string(),
                 ));
             }
-            (TurnKind::Node { .. } | TurnKind::Repair { .. }, TurnStart::Internal) => {
+            (TurnKind::Node { .. }, TurnStart::Internal) => {
                 return Err(EngineError::Config(
                     "internal turns require an explicit continuation lineage".to_string(),
                 ));
             }
             (
-                internal_kind @ (TurnKind::Node { .. } | TurnKind::Repair { .. }),
+                internal_kind @ TurnKind::Node { .. },
                 TurnStart::InternalLineage {
                     objective,
                     root_turn_id,
@@ -518,7 +515,7 @@ impl TurnRunner<'_> {
                 root_turn_id,
                 goal_id,
             )?),
-            (TurnKind::Node { .. } | TurnKind::Repair { .. }, _) => {
+            (TurnKind::Node { .. }, _) => {
                 return Err(EngineError::Config(
                     "internal turns require an internal start".to_string(),
                 ));
@@ -1047,7 +1044,9 @@ mod lineage_tests {
         let root = TurnId::new("turn-root");
         let goal = GoalId::new("goal-ark");
         let payload = encode_internal_lineage(
-            &TurnKind::Repair { attempt: 3 },
+            &TurnKind::Node {
+                node_id: "repair-3".into(),
+            },
             ObjectiveAnchor::from_session_goal("configure Ark"),
             root.clone(),
             Some(goal.clone()),
@@ -1055,7 +1054,7 @@ mod lineage_tests {
         .unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(value["attempt"], 3);
+        assert_eq!(value["node_id"], "repair-3");
         let decoded = decode_turn_continuation(&payload).unwrap();
         assert_eq!(decoded.root_turn_id, Some(root));
         assert_eq!(decoded.goal_id, Some(goal));

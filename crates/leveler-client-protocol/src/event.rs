@@ -11,19 +11,8 @@ use leveler_core::{ApprovalId, ClarificationId, CommandId, ToolCallId};
 
 use super::approval::{UiApprovalRequest, UiClarificationRequest};
 use super::media::AttachmentRef;
-use super::progress::{FinalizationStage, UiCompletionReport, UiDiff, UiPlan, UiVerification};
+use super::progress::{FinalizationStage, UiCompletionReport, UiDiff, UiPlan};
 use super::snapshot::{MessageId, UiCheckpoint, UiMessage, UiSessionSnapshot, UiSessionSummary};
-
-/// Stable `TurnCompletedUnverified.reason` when the turn AUTHORED no source
-/// edits — so clients can show a calm "ended · no source edits" marker
-/// (analysis/Q&A closeout, and repository operations like `pull`/`switch` that
-/// move HEAD without writing anything) instead of an "unverified" delivery
-/// warning. It says what this run wrote, never that the repository stands
-/// where it did.
-pub const REASON_NO_CODE_CHANGES: &str = "no_code_changes";
-/// Stable UI token: work changed files, but the project supplied no applicable
-/// automatic verification command. Clients localize the explanatory detail.
-pub const REASON_NO_AUTOMATIC_VERIFICATION: &str = "no_automatic_verification";
 
 /// Severity for a transient notification .
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,8 +311,6 @@ pub enum RuntimeEvent {
     },
     /// The execution plan was created or a step's status changed (spec §20).
     PlanUpdated { plan: UiPlan },
-    /// Verification progress: a check finished or the run concluded (spec §22).
-    VerificationUpdated { verification: UiVerification },
     /// The working-tree diff was (re)computed (spec §21).
     DiffUpdated { diff: UiDiff },
     /// A conversation checkpoint was created (spec §68).
@@ -411,14 +398,6 @@ pub enum RuntimeEvent {
     /// The executor stopped cleanly but did not reach a successful terminal
     /// state (for example, budget exhaustion or an unresolved goal).
     TurnIncomplete { reason: String },
-    /// The turn finished its work, but the project's checks did not run or
-    /// could not produce a verdict. Done, not verified — distinct from
-    /// `TurnIncomplete` (which means the work did not finish).
-    TurnCompletedUnverified { reason: String },
-    /// The turn finished its work and the project's own checks then FAILED
-    /// over the final tree. Done, checks failed — both facts stand; `reason`
-    /// names the failing checks.
-    TurnCompletedChecksFailed { reason: String },
     /// The current turn failed.
     ///
     /// `error` is the legacy display string, kept for compatibility with older
@@ -754,7 +733,7 @@ pub struct UiMemoryCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::progress::{PlanStepStatus, UiCheck, UiDiff, UiDiffFile, UiPlan, UiPlanStep};
+    use crate::progress::{PlanStepStatus, UiDiff, UiDiffFile, UiPlan, UiPlanStep};
     use crate::snapshot::{
         MessageId, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot, UiSessionSummary,
     };
@@ -789,7 +768,6 @@ mod tests {
             active_tools: Vec::new(),
             active_background_tasks: Vec::new(),
             plan: None,
-            verification: None,
             diff: None,
             checkpoints: Vec::new(),
             recaps: Vec::new(),
@@ -852,10 +830,8 @@ mod tests {
                 request_retries: 0,
                 tool_started: 0,
                 tool_finished: 0,
-                verification_runs: 0,
                 compact_count: 0,
                 subagent_started: 0,
-                verification: "not_run".into(),
                 duration_ms: None,
                 cached_input_tokens: None,
                 cost_usd_micros: None,
@@ -1116,23 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn verification_updated_roundtrips() {
-        roundtrip(
-            RuntimeEvent::VerificationUpdated {
-                verification: crate::progress::UiVerification {
-                    checks: vec![UiCheck {
-                        name: "fmt".to_string(),
-                        status: crate::progress::CheckState::Passed,
-                        evidence: None,
-                    }],
-                    passed: Some(true),
-                },
-            },
-            "verification_updated",
-        );
-    }
-
-    #[test]
     fn diff_updated_roundtrips() {
         roundtrip(
             RuntimeEvent::DiffUpdated {
@@ -1260,9 +1219,6 @@ mod tests {
                     files_changed: 1,
                     added: 2,
                     removed: 3,
-                    checks_passed: 4,
-                    verification: crate::progress::UiVerificationStatus::Passed,
-                    checks_total: 5,
                     success: true,
                 },
             },
@@ -1305,18 +1261,6 @@ mod tests {
                 reason: "round budget".to_string(),
             },
             "turn_incomplete",
-        );
-        roundtrip(
-            RuntimeEvent::TurnCompletedUnverified {
-                reason: "no verification gate".to_string(),
-            },
-            "turn_completed_unverified",
-        );
-        roundtrip(
-            RuntimeEvent::TurnCompletedChecksFailed {
-                reason: "test: 2 failed".to_string(),
-            },
-            "turn_completed_checks_failed",
         );
     }
 

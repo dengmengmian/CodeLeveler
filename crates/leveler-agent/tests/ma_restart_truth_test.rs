@@ -27,7 +27,6 @@ use leveler_model::{
 };
 use leveler_storage::{Database, EventRepository};
 use leveler_tools::ToolContext;
-use leveler_verifier::{CheckKind, VerificationCommand, VerificationPlan};
 
 /// The surface a real coding turn gets: the tool crate's composition plus the
 /// harness controls THIS crate registers (`update_plan`). Production composes
@@ -206,14 +205,6 @@ fn workspace_dir() -> tempfile::TempDir {
 }
 
 fn gated_spec(dir: &Path) -> TaskSpec {
-    let (program, args) = if cfg!(windows) {
-        (
-            "cmd".to_string(),
-            vec!["/c".to_string(), "exit 0".to_string()],
-        )
-    } else {
-        ("true".to_string(), Vec::new())
-    };
     TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
@@ -225,18 +216,6 @@ fn gated_spec(dir: &Path) -> TaskSpec {
             repository: dir.to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: VerificationPlan {
-                commands: vec![VerificationCommand {
-                    name: "ok".into(),
-                    program,
-                    args,
-                    kind: CheckKind::Test,
-                    gating: true,
-                    timeout_seconds: 30,
-                    scope_policy: Default::default(),
-                }],
-            },
-            base_commit: None,
         },
     }
 }
@@ -741,11 +720,8 @@ async fn a_ghost_with_adopted_findings_keeps_them_in_its_terminal() {
 /// reported.
 ///
 /// What it does NOT owe is a verdict on the parent. `TaskOutcome::Completed`
-/// records that the model declared its own goal complete, and
-/// `VerificationStatus` records what the project's checks said; whether a lost
-/// child's work still mattered is the model's reading of its own goal, which
-/// is why the in-memory sibling above pins that a ghost is a fact to report
-/// and never a gate on the close.
+/// records that the model declared its own goal complete; whether a lost
+/// child's work still mattered is the model's reading of its own goal.
 #[tokio::test]
 async fn ghost_reconciliation_survives_a_real_database_reopen() {
     let dir = workspace_dir();

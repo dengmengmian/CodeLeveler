@@ -62,7 +62,6 @@ export type InspectorSection =
   | 'task'
   | 'result'
   | 'plan'
-  | 'verification'
   | 'changes'
   | 'agents'
   | 'runtime'
@@ -80,7 +79,6 @@ export function inspectorVisibleSections(
   if (mode === 'running' || mode === 'idle') sections.push('task');
   if (mode === 'terminal') sections.push('result');
   if (planProgress(s.plan, s.turnActive)) sections.push('plan');
-  if (s.verification && s.verification.checks.length > 0) sections.push('verification');
   if ((s.diff?.files.length ?? 0) > 0) sections.push('changes');
   if (s.agents.length > 0 || extras.delegatedAgents) sections.push('agents');
   if (extras.observation) sections.push('runtime');

@@ -372,26 +372,16 @@ mod mutation_ledger_tests {
     }
 
     /// A second edit of a file already in the modified set arrives here with
-    /// an EMPTY first-touch delta. It is still a change to the tree, and a
-    /// test that passed before it is no longer proof about the tree as it
-    /// stands. Freshness has to move on every mutating call, not only on the
-    /// first touch of each path — or a refinement edit leaves a green run
-    /// looking current when it is not.
+    /// an EMPTY first-touch delta. It is still a change to the tree and must
+    /// advance the mutation operation counter.
     #[test]
-    fn a_re_edit_of_an_already_modified_file_stales_prior_verification() {
+    fn a_re_edit_of_an_already_modified_file_counts_as_a_mutation() {
         let mut ledger = EvidenceLedger::default();
         let plan = PlanState::default();
         ledger.record_mutation("c1", "apply_patch", vec!["a.rs".into()]);
-        ledger.record_verify("v1", "go test ./...", 0);
-        assert!(
-            ledger.has_fresh_successful_verify(),
-            "green right after the first edit"
-        );
+        let before = ledger.total_mutation_ops;
         note_tool_side_effects(&mut ledger, "c2", "apply_patch", vec![], &plan, &mut |_| {});
-        assert!(
-            !ledger.has_fresh_successful_verify(),
-            "a re-edit must invalidate the earlier green run"
-        );
+        assert_eq!(ledger.total_mutation_ops, before + 1);
     }
 
     #[test]

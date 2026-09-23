@@ -546,8 +546,6 @@ describe('query observability', () => {
           request_retries: 0,
           tool_started: 21,
           tool_finished: 21,
-          verification_runs: 1,
-          verification: 'passed',
           compact_count: 0,
           subagent_started: 0,
         },
@@ -634,9 +632,9 @@ describe('event closure', () => {
   it('turn_finalizing replaces generic running chrome without ending the turn', () => {
     const { apply, state } = harness();
     reducer(state, { type: 'turn_active', value: true });
-    apply({ type: 'turn_finalizing', stage: 'verification' });
+    apply({ type: 'turn_finalizing', stage: 'review' });
     expect(state.current?.turnActive).toBe(true);
-    expect(state.current?.activity).toBe('正在验证');
+    expect(state.current?.activity).toBe('正在复核');
     expect(state.current?.lastTurn).toBeNull();
   });
 

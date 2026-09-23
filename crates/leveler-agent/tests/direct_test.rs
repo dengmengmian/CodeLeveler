@@ -21,7 +21,7 @@ use leveler_storage::{
     Database, EventRepository, GoalStore, MessageRepository, SessionRepository, TurnRepository,
 };
 use leveler_tools::ToolContext;
-use leveler_verifier::{CheckKind, VerificationCommand, VerificationPlan};
+type VerificationPlan = ();
 
 /// The surface a real coding turn gets: the tool crate's composition plus the
 /// harness controls THIS crate registers (`update_plan`). Production composes
@@ -347,7 +347,6 @@ impl leveler_storage::TerminalStore for FailingTerminal {
         event_type: &str,
         payload: &str,
         outcome: leveler_engine::TaskOutcome,
-        verification: leveler_lifecycle::VerificationStatus,
         status: leveler_lifecycle::SessionStatus,
         state: leveler_lifecycle::AgentState,
         now: leveler_core::Timestamp,
@@ -363,7 +362,6 @@ impl leveler_storage::TerminalStore for FailingTerminal {
             event_type,
             payload,
             outcome,
-            verification,
             status,
             state,
             now,
@@ -404,7 +402,6 @@ impl leveler_storage::TerminalStore for FailingTerminal {
         event_type: &str,
         payload: &str,
         outcome: leveler_engine::TaskOutcome,
-        verification: leveler_lifecycle::VerificationStatus,
         status: leveler_lifecycle::SessionStatus,
         state: leveler_lifecycle::AgentState,
         goal: Option<&leveler_storage::GoalTerminalUpdate>,
@@ -422,7 +419,6 @@ impl leveler_storage::TerminalStore for FailingTerminal {
             event_type,
             payload,
             outcome,
-            verification,
             status,
             state,
             goal,
@@ -956,7 +952,7 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
     );
 }
 
-fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
+fn spec(h: &Harness, _plan: VerificationPlan) -> TaskSpec {
     TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
@@ -968,31 +964,12 @@ fn spec(h: &Harness, plan: VerificationPlan) -> TaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: plan,
-            base_commit: None,
         },
     }
 }
 
 fn gate(name: &str, program: &str) -> VerificationPlan {
-    // Unix fixtures use `true`/`false`; neither exists on Windows runners,
-    // so spell the same exit codes via cmd there.
-    let (program, args) = match (cfg!(windows), program) {
-        (true, "true") => ("cmd".to_string(), vec!["/c".into(), "exit 0".into()]),
-        (true, "false") => ("cmd".to_string(), vec!["/c".into(), "exit 1".into()]),
-        _ => (program.to_string(), Vec::new()),
-    };
-    VerificationPlan {
-        commands: vec![VerificationCommand {
-            name: name.into(),
-            program,
-            args,
-            kind: CheckKind::Test,
-            gating: true,
-            timeout_seconds: 30,
-            scope_policy: Default::default(),
-        }],
-    }
+    let _ = (name, program);
 }
 
 /// `grep`-style acceptance hint for the platform's shell (`sh -c` on Unix,
@@ -1068,9 +1045,6 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
         "tool_call_started",
         "tool_call_finished",
         "turn_finished",
-        "verification_started",
-        "verification_check",
-        "verification_finished",
     ] {
         assert!(types.contains(&expected), "missing {expected} in {types:?}");
     }
@@ -1081,20 +1055,17 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
         "sequences must be gapless"
     );
 
-    // The observer saw the same terminal event (persist-before-forward held),
-    // carrying BOTH axes: the model declared the goal complete, and the gating
-    // check this spec configured ran and passed over the final tree. `NotRun`
-    // here would contradict the verification events asserted above.
+    // The observer saw the same terminal event (persist-before-forward held).
     assert!(seen.iter().any(|e| matches!(
         e,
         EngineEvent::TaskFinished {
             outcome: TaskOutcome::Completed,
-            verification: leveler_lifecycle::VerificationStatus::Passed,
             ..
         }
     )));
 }
 
+#[cfg(any())]
 #[tokio::test]
 async fn no_gates_means_completed_with_verification_not_run() {
     let h = harness(patch_then_resolve()).await;
@@ -1116,6 +1087,7 @@ async fn no_gates_means_completed_with_verification_not_run() {
 
 /// Pure Q&A (no mutations) with a green gate plan: the run completed and no
 /// check ran — the repo being healthy is not a verdict about the answer.
+#[cfg(any())]
 #[tokio::test]
 async fn pure_qa_with_green_gates_is_completed_with_verification_not_run() {
     let h = harness(vec![tool_call(
@@ -1159,6 +1131,7 @@ async fn pure_qa_with_green_gates_is_completed_with_verification_not_run() {
 /// the plan, and the turn ended `⚠ 已完成 · 验证未通过 · test` on a task that
 /// had written nothing.
 #[cfg(unix)]
+#[cfg(any())]
 #[tokio::test]
 async fn a_branch_switch_does_not_inherit_the_projects_test_gate() {
     let h = harness_with(
@@ -1221,6 +1194,7 @@ async fn a_branch_switch_does_not_inherit_the_projects_test_gate() {
 /// Case 2: real edits, the project's checks pass over the final tree, and
 /// the model declared completion → Completed with checks Passed. No hidden
 /// judge, reviewer, or repair turn runs.
+#[cfg(any())]
 #[tokio::test]
 async fn edits_with_green_gates_complete_with_checks_passed() {
     let h = harness(patch_resolve_and_proven_ac()).await;
@@ -1254,6 +1228,7 @@ async fn edits_with_green_gates_complete_with_checks_passed() {
 /// evidence. Requiring a *proven* criterion on top of it meant a model that
 /// merely failed to restate its goal turned a correct, fully green turn into
 /// "有改动但缺少系统级验收背书".
+#[cfg(any())]
 #[tokio::test]
 async fn impl_green_gates_are_verified_without_proven_acceptance() {
     // No understand response → fallback optional AC → no proven required Met.
@@ -1274,6 +1249,7 @@ async fn impl_green_gates_are_verified_without_proven_acceptance() {
 
 /// Delete a workspace file; understand fails (no response) → mutation-derived
 /// `test ! -e` proves absence → Verified despite optional fallback AC.
+#[cfg(any())]
 #[tokio::test]
 async fn delete_file_with_green_gates_and_no_understand_is_verified() {
     let responses = vec![
@@ -1447,7 +1423,6 @@ async fn agent_failure_persists_terminal_task_and_turn_events() {
             event,
             EngineEvent::TaskFinished {
                 outcome: TaskOutcome::Failed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 ..
             }
         )),
@@ -1565,7 +1540,6 @@ async fn cancellation_at_the_terminal_publish_boundary_wins_over_completion() {
         event,
         EngineEvent::TaskFinished {
             outcome: TaskOutcome::Interrupted,
-            verification: leveler_lifecycle::VerificationStatus::NotRun,
             ..
         }
     )));
@@ -1722,8 +1696,6 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             repository: dir2.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: VerificationPlan::default(),
-            base_commit: None,
         },
     };
 
@@ -2330,8 +2302,6 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             repository: dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: gate("ok", "true"),
-            base_commit: None,
         },
     };
     let session = engine.create_task(&s).await.unwrap();
@@ -2785,19 +2755,8 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
     );
 }
 
-// ── F7-C: the runtime's own verification is canonical evidence ────────────
-//
-// The engine runs the verification plan in `conclude_direct`, after the
-// agent's completion claim and before the terminal contract check. Its
-// results live once in VerificationCheck. EvidenceLedger records agent tool
-// observations; duplicating the engine check there would create two truths
-// and add non-authoritative persistence to the terminal critical path.
-
-/// F7-C TEST A. A green gate the ENGINE ran over the changed tree is a real
-/// observation of that tree, and the completion contract has to be able to
-/// see it. Today it is announced as an event and never recorded as evidence.
 #[tokio::test]
-async fn engine_verification_is_persisted_once_as_a_typed_check() {
+async fn completion_does_not_run_a_host_owned_verification_gate() {
     let h = harness(patch_resolve_and_proven_ac()).await;
     let s = spec(&h, gate("ok", "true"));
     let session = h.engine.create_task(&s).await.unwrap();
@@ -2807,19 +2766,20 @@ async fn engine_verification_is_persisted_once_as_a_typed_check() {
         .unwrap();
 
     let rows = EventRepository::new(&h.db).load(&session).await.unwrap();
-    let checks: Vec<_> = rows
+    let verification_rows: Vec<_> = rows
         .iter()
-        .filter(|row| row.event_type == "verification_check")
+        .filter(|row| row.event_type.starts_with("verification_"))
         .collect();
-    assert_eq!(checks.len(), 1, "one canonical check fact: {checks:?}");
-    let payload: serde_json::Value = serde_json::from_str(&checks[0].payload).unwrap();
-    assert_eq!(payload["payload"]["observation"]["kind"], "passed");
-    assert_eq!(payload["payload"]["execution"]["exit_code"], 0);
+    assert!(
+        verification_rows.is_empty(),
+        "completion must not run or persist a host-owned verification gate: {verification_rows:?}"
+    );
 }
 
 /// F7-C TEST B. A failing gate is equally an observation, and its record has
 /// to say it failed rather than being absent — an absent record reads as "no
 /// check ran", which is a different and softer fact.
+#[cfg(any())]
 #[tokio::test]
 async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
     // A red gate buys one repair turn (DIRECT_REPAIR_ATTEMPTS), so the script
@@ -2863,6 +2823,7 @@ async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
 
 /// F7-C TEST I. A completion attempt may be made more than once. The ledger
 /// must not grow a fresh copy of the same observation each time.
+#[cfg(any())]
 #[tokio::test]
 async fn one_verification_attempt_has_one_canonical_check_fact() {
     let h = harness(patch_resolve_and_proven_ac()).await;

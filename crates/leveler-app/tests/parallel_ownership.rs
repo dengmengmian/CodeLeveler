@@ -111,7 +111,6 @@ async fn parallel_parent_canonical_writes_require_current_owner() {
             &parent,
             leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some("stale parent".into()),
                 failure: None,
                 stop: None,
@@ -208,7 +207,6 @@ async fn parallel_parent_finishes_through_the_engine() {
             &parent,
             leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::Passed,
                 reason: None,
                 failure: None,
                 stop: None,

@@ -1,6 +1,6 @@
 //! Live (non-transcript) session view: what a reconnecting client must see
-//! beyond the message history — running tools, the active plan, verification,
-//! diff, and the completion report.
+//! beyond the message history — running tools, the active plan, diff, and the
+//! completion report.
 //!
 //! One owner for two jobs that must agree: folding the outbound RuntimeEvent
 //! stream into per-session state (`apply`), and answering the reconnect
@@ -12,7 +12,6 @@ use std::sync::Mutex;
 
 use leveler_client_protocol::{
     FinalizationStage, RuntimeEvent, UiActiveToolCall, UiCompletionReport, UiDiff, UiPlan,
-    UiVerification,
 };
 use leveler_core::SessionId;
 
@@ -20,7 +19,6 @@ use leveler_core::SessionId;
 pub(crate) struct LiveSessionView {
     pub active_tools: Vec<UiActiveToolCall>,
     pub plan: Option<UiPlan>,
-    pub verification: Option<UiVerification>,
     pub diff: Option<UiDiff>,
     pub completion_report: Option<UiCompletionReport>,
     pub finalization_stage: Option<FinalizationStage>,
@@ -112,9 +110,6 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         RuntimeEvent::ContextUsage { accounting } => {
             view.context_usage = Some(accounting.clone());
         }
-        RuntimeEvent::VerificationUpdated { verification } => {
-            view.verification = Some(verification.clone());
-        }
         RuntimeEvent::DiffUpdated { diff } => view.diff = Some(diff.clone()),
         RuntimeEvent::SessionCompleted { report } => {
             view.completion_report = Some(report.clone());
@@ -129,8 +124,6 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         | RuntimeEvent::TurnAnswered
         | RuntimeEvent::TurnTruncated { .. }
         | RuntimeEvent::TurnIncomplete { .. }
-        | RuntimeEvent::TurnCompletedUnverified { .. }
-        | RuntimeEvent::TurnCompletedChecksFailed { .. }
         | RuntimeEvent::TurnFailed { .. }
         | RuntimeEvent::TurnCancelled => {
             view.active_tools.clear();
@@ -241,12 +234,12 @@ mod tests {
         views.apply(
             &session_id,
             &RuntimeEvent::TurnFinalizing {
-                stage: FinalizationStage::Verification,
+                stage: FinalizationStage::Review,
             },
         );
         assert_eq!(
             views.view(&session_id).finalization_stage,
-            Some(FinalizationStage::Verification)
+            Some(FinalizationStage::Review)
         );
 
         views.apply(&session_id, &RuntimeEvent::TurnCompleted);
@@ -266,12 +259,6 @@ mod tests {
             },
             RuntimeEvent::TurnIncomplete {
                 reason: "incomplete".to_string(),
-            },
-            RuntimeEvent::TurnCompletedUnverified {
-                reason: "unverified".to_string(),
-            },
-            RuntimeEvent::TurnCompletedChecksFailed {
-                reason: "checks failed".to_string(),
             },
             RuntimeEvent::TurnFailed {
                 error: "failed".to_string(),

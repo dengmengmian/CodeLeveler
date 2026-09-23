@@ -17,13 +17,10 @@ use leveler_engine::{
     TurnKind, TurnRunner,
 };
 use leveler_execution::{Approver, Clarifier, PermissionProfile, RiskLevel};
-use leveler_lifecycle::{
-    AgentState, PlanState, ProgressLedger, SessionStatus, StopReason, VerificationStatus,
-};
+use leveler_lifecycle::{AgentState, PlanState, ProgressLedger, SessionStatus, StopReason};
 use leveler_model::{Message, Role};
 #[cfg(test)]
 use leveler_storage::EventStore;
-use leveler_verifier::{Verdict, VerificationPlan, VerificationReport, Verifier};
 
 use crate::coding::factory::{ExecutorFactory, TurnProfile};
 use crate::coding::policy::IndependentReviewPolicy;
@@ -31,65 +28,10 @@ use crate::coding::turn::{TurnInput, content_objective_text, drive_turn};
 use crate::coding::workspace::GitWorkspace;
 use crate::{ContinuationPolicy, StepLimits};
 
-const FINALIZATION_VERIFICATION: &str = "verification";
 const FINALIZATION_REVIEW: &str = "review";
 const FINALIZATION_RESOLVING_OUTCOME: &str = "resolving_outcome";
 const FINALIZATION_CONTINUATION_CHECKPOINT: &str = "continuation_checkpoint";
 const FINALIZATION_PUBLISHING_TERMINAL: &str = "publishing_terminal";
-
-fn engine_verification_observation(
-    observation: &leveler_verifier::CheckObservation,
-) -> leveler_engine::VerificationObservation {
-    match observation {
-        leveler_verifier::CheckObservation::Passed => {
-            leveler_engine::VerificationObservation::Passed
-        }
-        leveler_verifier::CheckObservation::Failed => {
-            leveler_engine::VerificationObservation::Failed
-        }
-        leveler_verifier::CheckObservation::NotRun(reason) => {
-            leveler_engine::VerificationObservation::NotRun {
-                reason: reason.as_str().to_string(),
-            }
-        }
-    }
-}
-
-fn engine_verification_disposition(
-    disposition: &leveler_verifier::GateDisposition,
-) -> leveler_engine::VerificationDisposition {
-    use leveler_verifier::{BaselineSource, GateDisposition, GateSkipReason};
-    match disposition {
-        GateDisposition::Required => leveler_engine::VerificationDisposition::Required,
-        GateDisposition::Skipped(reason) => {
-            let (reason, revision, source, failed_tests) = match reason {
-                GateSkipReason::ConfirmedBaselineFailure {
-                    revision,
-                    provenance,
-                } => (
-                    "confirmed_baseline_failure".to_string(),
-                    Some(revision.clone()),
-                    Some(match provenance.source {
-                        BaselineSource::DetachedWorktreeRerun => {
-                            "detached_worktree_rerun".to_string()
-                        }
-                    }),
-                    provenance.failed_tests.iter().cloned().collect(),
-                ),
-                GateSkipReason::NotApplicable => {
-                    ("not_applicable".to_string(), None, None, Vec::new())
-                }
-                GateSkipReason::Superseded => ("superseded".to_string(), None, None, Vec::new()),
-            };
-            leveler_engine::VerificationDisposition::Skipped {
-                reason,
-                revision,
-                source,
-                failed_tests,
-            }
-        }
-    }
-}
 
 async fn begin_finalization_phase(
     log: &EventLog<'_>,
@@ -213,13 +155,6 @@ pub struct CodingTaskSpec {
     pub repository: PathBuf,
     pub mode: PermissionProfile,
     pub sandbox: bool,
-    /// The post-edit verification plan (empty = nothing to verify → the task
-    /// can at best finish `CompletedUnverified`).
-    pub verification: VerificationPlan,
-    /// The repo's `HEAD` at task start, used as the baseline for delta
-    /// attribution of gate failures. Callers leave this `None`; the engine
-    /// stamps it (from `git rev-parse HEAD`) before the first turn edits.
-    pub base_commit: Option<String>,
 }
 
 /// Everything needed to create a task: the runtime descriptor plus the Coding
@@ -267,16 +202,13 @@ pub(crate) fn prior_epoch_open(
 
 /// The session's lifecycle columns for a finished task.
 ///
-/// Read off how the run ENDED, never off the verification verdict: a task the
-/// model declared complete is a completed session whether or not the
-/// project's checks passed — the checks are reported beside it as
-/// [`VerificationStatus`], not folded into the status.
+/// Read these directly from how the run ended. User-requested tests, builds,
+/// and linters remain ordinary tool calls and do not create a second terminal
+/// status for the task.
 pub(crate) fn terminal_status_for(report: &TaskReport) -> (SessionStatus, AgentState) {
     use StopReason as S;
     match report.stop_reason {
-        S::Completed | S::Answered | S::CompletedUnverified | S::CompletedChecksFailed => {
-            (SessionStatus::Completed, AgentState::Complete)
-        }
+        S::Completed | S::Answered => (SessionStatus::Completed, AgentState::Complete),
         S::Incomplete | S::BudgetExhausted | S::TurnLimitReached | S::Stalled => {
             (SessionStatus::Incomplete, AgentState::Execute)
         }
@@ -305,12 +237,8 @@ fn chat_profile(spec: &TaskSpec) -> TurnProfile {
 #[derive(Debug)]
 pub struct TaskReport {
     pub outcome: TaskOutcome,
-    /// What the project's own checks said over the final tree. Orthogonal to
-    /// `outcome`.
-    pub verification_status: VerificationStatus,
     pub final_text: String,
     pub modified_files: Vec<String>,
-    pub verification: Option<VerificationReport>,
     /// The executor's stop reason (legacy status mapping needs its nuance).
     pub stop_reason: StopReason,
     /// The executor's concrete reason for a non-success stop, when available.
@@ -329,8 +257,8 @@ pub struct TaskReport {
 }
 
 impl TaskReport {
-    /// A report with the always-present fields set and the orchestration-only
-    /// extras (`verification`/`review`) defaulted to `None`.
+    /// A report with the always-present fields set and orchestration-only
+    /// extras defaulted to `None`.
     /// Sites that produce those set them via `TaskReport { field: Some(..),
     /// ..TaskReport::new(..) }`, so a new optional field defaults in one place.
     pub(crate) fn new(
@@ -342,10 +270,8 @@ impl TaskReport {
     ) -> Self {
         Self {
             outcome,
-            verification_status: VerificationStatus::NotRun,
             final_text,
             modified_files,
-            verification: None,
             stop_reason,
             stop_detail: None,
             rounds,
@@ -409,34 +335,6 @@ fn develop_stop_warning(terminal: &crate::coding::develop::DevelopTerminal) -> S
     }
 }
 
-/// What the project's own checks observed, as text a reviewer can read.
-///
-/// Observation and disposition stay separate, exactly as they are recorded:
-/// collapsing them into one word is what makes a skipped baseline failure look
-/// like a check that passed.
-fn verification_digest(report: &TaskReport) -> String {
-    let Some(verification) = &report.verification else {
-        return format!(
-            "no verification report (status: {:?}). Do not read this as passing.",
-            report.verification_status
-        );
-    };
-    let mut lines = vec![format!("status: {:?}", report.verification_status)];
-    for check in &verification.checks {
-        lines.push(format!(
-            "{}: observed {:?}, disposition {:?}",
-            check.name, check.observation, check.disposition
-        ));
-    }
-    if !verification.scope_violations.is_empty() {
-        lines.push(format!(
-            "scope violations: {}",
-            verification.scope_violations.join(", ")
-        ));
-    }
-    lines.join("\n")
-}
-
 fn report_from_agent_outcome(
     outcome: crate::AgentOutcome,
     task_outcome: TaskOutcome,
@@ -455,49 +353,7 @@ fn report_from_agent_outcome(
 }
 
 fn task_terminal_reason(report: &TaskReport) -> Option<String> {
-    if report.outcome != TaskOutcome::Completed {
-        return report.stop_detail.clone();
-    }
-    if task_terminal_stop(report) != StopReason::Completed {
-        return report.stop_detail.clone();
-    }
-    match report.verification_status {
-        VerificationStatus::Passed => None,
-        VerificationStatus::Failed => Some(match report.verification.as_ref() {
-            Some(verification) if !verification.scope_ok => format!(
-                "modified files outside allowed scope: {}",
-                verification.scope_violations.join(", ")
-            ),
-            Some(verification) => {
-                let failed = verification
-                    .failed_gates()
-                    .into_iter()
-                    .map(failed_gate_label)
-                    .collect::<Vec<_>>();
-                if failed.is_empty() {
-                    "verification did not pass".to_string()
-                } else {
-                    format!("failed gate(s): {}", failed.join(", "))
-                }
-            }
-            None => "verification did not pass".to_string(),
-        }),
-        VerificationStatus::NotRun | VerificationStatus::Unavailable => {
-            if report.modified_files.is_empty() {
-                return Some("no_code_changes".to_string());
-            }
-            Some(match report.verification.as_ref() {
-                Some(verification) if !verification.has_gating_checks() => {
-                    "no_automatic_verification".to_string()
-                }
-                Some(verification) => match verification.verdict() {
-                    Verdict::Unverified(reason) => reason,
-                    _ => "no_automatic_verification".to_string(),
-                },
-                None => "no_automatic_verification".to_string(),
-            })
-        }
-    }
+    report.stop_detail.clone()
 }
 
 fn task_terminal_stop(report: &TaskReport) -> StopReason {
@@ -507,29 +363,10 @@ fn task_terminal_stop(report: &TaskReport) -> StopReason {
     {
         // `Answered` is a truthful executor stop for pure Q&A. Once the Coding
         // Harness has observed a product mutation, the durable task terminal
-        // must enter the completion+verification path; otherwise replay would
-        // discard failed/unavailable verification and review warnings.
+        // records the task as completed.
         StopReason::Completed
     } else {
         report.stop_reason
-    }
-}
-
-fn failed_gate_label(check: &leveler_verifier::CheckOutcome) -> String {
-    if check.failed_tests.is_empty() {
-        return check.name.clone();
-    }
-    let shown = check
-        .failed_tests
-        .iter()
-        .take(2)
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let remaining = check.failed_tests.len() - shown.len();
-    if remaining == 0 {
-        format!("{} ({})", check.name, shown.join(", "))
-    } else {
-        format!("{} ({}, +{} more)", check.name, shown.join(", "), remaining)
     }
 }
 
@@ -1114,7 +951,6 @@ impl CodingRuntime {
                 let (status, state) = terminal_status_for(report);
                 leveler_engine::TaskTerminal {
                     outcome: report.outcome,
-                    verification: report.verification_status,
                     reason: task_terminal_reason(report),
                     failure: None,
                     stop: Some(task_terminal_stop(report)),
@@ -1126,7 +962,6 @@ impl CodingRuntime {
             }
             Err(EngineError::Cancelled) if explicit_task_cancel => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Cancelled,
-                verification: VerificationStatus::NotRun,
                 reason: Some("user_cancelled_task".to_string()),
                 failure: None,
                 stop: None,
@@ -1137,7 +972,6 @@ impl CodingRuntime {
             },
             Err(EngineError::Cancelled) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Interrupted,
-                verification: VerificationStatus::NotRun,
                 reason: None,
                 failure: None,
                 stop: None,
@@ -1148,7 +982,6 @@ impl CodingRuntime {
             },
             Err(error) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
-                verification: VerificationStatus::NotRun,
                 reason: Some(error.to_string()),
                 // The structured provider failure, when that is what ended the
                 // turn. Presentation reads this instead of parsing `reason`.
@@ -1223,7 +1056,6 @@ impl CodingRuntime {
                 // rather than logging a best-effort failure and claiming the
                 // work window closed correctly.
                 terminal.outcome = TaskOutcome::Failed;
-                terminal.verification = VerificationStatus::NotRun;
                 terminal.reason = Some(format!("continuation checkpoint failed: {error}"));
                 // A checkpoint failure is not a provider failure: do not carry
                 // a stale provider error beside a different reason.
@@ -1264,7 +1096,6 @@ impl CodingRuntime {
         // user-declared outcome and keeps its terminal.
         if cancelled_at_commit && !explicit_task_cancel {
             terminal.outcome = TaskOutcome::Interrupted;
-            terminal.verification = VerificationStatus::NotRun;
             terminal.reason = None;
             terminal.stop = None;
             terminal.status = SessionStatus::Interrupted;
@@ -1423,30 +1254,6 @@ impl CodingRuntime {
         )
         .await?;
 
-        // Stamp the pre-change baseline anchor onto the spec, captured before
-        // any turn edits so the post-edit gate can tell this change's failures
-        // from ones the repo already carried (see `baseline`). Carried on the
-        // spec so every path that reaches `verify` — including resume — sees it
-        // without threading. None (left as-is) outside a git work tree.
-        let owned_spec;
-        let spec = if spec.coding.base_commit.is_none() {
-            if let Some(head) = crate::coding::baseline::capture_head(&spec.coding.repository).await
-            {
-                owned_spec = TaskSpec {
-                    coding: CodingTaskSpec {
-                        base_commit: Some(head),
-                        ..spec.coding.clone()
-                    },
-                    runtime: spec.runtime.clone(),
-                };
-                &owned_spec
-            } else {
-                spec
-            }
-        } else {
-            spec
-        };
-
         // Orchestrate execution path removed; legacy kind falls through to direct.
         let terminal_cancellation = cancellation.clone();
         let result = match (develop, spec.runtime.kind) {
@@ -1494,33 +1301,6 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        // Anchor the baseline for THIS turn before it edits anything, exactly as
-        // `run` does. Without it `reconcile_with_baseline` has nothing to compare
-        // against, so failures the repository already carried are charged to this
-        // turn: measured on a repo with one pre-existing red test, a 3-round edit
-        // became a 45-round run in which the repair turn started rewriting
-        // unrelated files trying to make someone else's failure go away.
-        // A dirty worktree cannot use HEAD as a truthful before-change
-        // snapshot, so `capture_head` deliberately returns None there and the
-        // turn remains unattributed rather than inventing baseline authority.
-        let owned_spec;
-        let spec = if spec.coding.base_commit.is_none() {
-            match crate::coding::baseline::capture_head(&spec.coding.repository).await {
-                Some(head) => {
-                    owned_spec = TaskSpec {
-                        coding: CodingTaskSpec {
-                            base_commit: Some(head),
-                            ..spec.coding.clone()
-                        },
-                        runtime: spec.runtime.clone(),
-                    };
-                    &owned_spec
-                }
-                None => spec,
-            }
-        } else {
-            spec
-        };
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
         let raw = self.load_request_transcript(session_id, None, None).await?;
@@ -2111,13 +1891,12 @@ impl CodingRuntime {
         .await
     }
 
-    /// The Develop workflow: `Analyze → Coding → Verify → Review`.
+    /// The Develop workflow: `Analyze → Coding → Review`.
     ///
     /// One task, one goal, one session. Analyze and Review are harness-launched
     /// read-only children — the same child primitive, lifecycle, ownership
     /// fence and spend rollup the closure reviewer already uses — and Coding is
     /// the ordinary Coding turn, unchanged except for a better first message.
-    /// Verification is the project's own, run where it always runs.
     ///
     /// Nothing here is reachable from an ordinary turn.
     async fn run_develop_loop(
@@ -2194,7 +1973,6 @@ impl CodingRuntime {
                 &goal,
                 &work_order,
                 &report.final_text,
-                &verification_digest(&report),
                 &report.modified_files,
                 diff.as_deref(),
             );
@@ -2328,7 +2106,7 @@ impl CodingRuntime {
         }
     }
 
-    /// The direct strategy: one goal turn, then mechanical verification.
+    /// The direct strategy: one goal turn.
     async fn run_direct(
         &self,
         log: &EventLog<'_>,
@@ -2351,7 +2129,7 @@ impl CodingRuntime {
         .await
     }
 
-    /// One Coding turn on `task`, concluded with mechanical verification.
+    /// One Coding turn on `task`.
     ///
     /// `task` is normally the user's goal verbatim. The Develop workflow passes
     /// the goal WITH its work order, which is the whole of what that workflow
@@ -2604,48 +2382,15 @@ impl CodingRuntime {
         // Goal continuation and bounded budget extension already happened in
         // `supervise` — one loop, one decision point (convergence plan phase 4).
         //
-        // What happens here is mechanical bookkeeping, not judgement: the
-        // run's stop reason names the outcome, the project's own checks run
-        // once over the final tree and are reported beside it, and an
-        // explicitly configured reviewer is launched. Nothing here repairs
-        // on the model's behalf, re-reads the goal, or downgrades a completed
-        // run because a heuristic disagreed with the model.
+        // The model owns task execution. The runtime records its outcome but
+        // does not append a host-owned build/test gate after the model has
+        // finished. Tests remain ordinary tools that run only when requested
+        // by the user or chosen by the model during the task.
         let mut task_report =
             if let Some(terminal) = direct_non_success_outcome(outcome.stop_reason) {
                 report_from_agent_outcome(outcome, terminal)
-            } else if outcome.modified_files.is_empty() || !spec.coding.verification.has_gates() {
-                // No mutation, or no checks configured: nothing to run, and the
-                // report says so instead of pretending a verdict.
-                report_from_agent_outcome(outcome, TaskOutcome::Completed)
             } else {
-                let report = self
-                    .verify(
-                        log,
-                        spec,
-                        &[],
-                        &outcome.modified_files,
-                        observer,
-                        &cancellation,
-                    )
-                    .await?;
-                let verification_status = verification_status_of(&report);
-                let mut base = report_from_agent_outcome(outcome, TaskOutcome::Completed);
-                let baseline_failures = report.confirmed_baseline_failures();
-                if !baseline_failures.is_empty() {
-                    base.completion_warnings.push(format!(
-                        "mechanically confirmed baseline failure: {}",
-                        baseline_failures
-                            .iter()
-                            .map(|check| check.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                TaskReport {
-                    verification: Some(report),
-                    verification_status,
-                    ..base
-                }
+                report_from_agent_outcome(outcome, TaskOutcome::Completed)
             };
 
         // A configured required reviewer contributes durable completion
@@ -2690,100 +2435,6 @@ impl CodingRuntime {
         Ok(task_report)
     }
 
-    async fn verify(
-        &self,
-        log: &EventLog<'_>,
-        spec: &TaskSpec,
-        allowed_paths: &[String],
-        modified_files: &[String],
-        observer: &mut (dyn FnMut(EngineEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<VerificationReport, EngineError> {
-        let verification_phase =
-            begin_finalization_phase(log, FINALIZATION_VERIFICATION, observer).await;
-        log.append(None, EngineEvent::VerificationStarted, observer)
-            .await?;
-        let verifier = Verifier::with_environment(
-            &spec.coding.repository,
-            self.factory.tool_context.execution.environment.clone(),
-        );
-        let mut plan = gate_plan(spec);
-        // Blast-radius scoping: a change that touches no compiled input (docs,
-        // scripts, lock files) must not run — and be blamed for — the whole
-        // workspace's pre-existing red. Downgrades those gates to non-gating.
-        plan.scope_gates_to_changes(modified_files);
-        let mut report = verifier
-            .verify(
-                &plan,
-                allowed_paths,
-                modified_files,
-                cancellation,
-                &mut |_| {},
-            )
-            .await;
-
-        // Attribute pre-existing/flaky failures to the baseline so only THIS
-        // change's failures gate completion. No-op when the gate is green or no
-        // baseline is available (`base_commit` captured at task start).
-        if let Some(base_commit) = spec.coding.base_commit.as_deref() {
-            crate::coding::baseline::reconcile_with_baseline(
-                &mut report,
-                &spec.coding.repository,
-                base_commit,
-                &plan,
-                modified_files,
-                self.factory.tool_context.execution.environment.clone(),
-                cancellation,
-            )
-            .await;
-        }
-        for check in &report.checks {
-            log.append(
-                None,
-                EngineEvent::VerificationCheck {
-                    name: check.name.clone(),
-                    // The durable vocabulary, from the owner of the type.
-                    // `format!("{:?}").to_lowercase()` wrote `toolmissing`,
-                    // which this event's own contract spells `tool_missing`.
-                    status: check.legacy_status().as_str().to_string(),
-                    observation: Some(engine_verification_observation(&check.observation)),
-                    disposition: Some(engine_verification_disposition(&check.disposition)),
-                    execution: check.execution.as_ref().map(|execution| {
-                        leveler_engine::VerificationExecution {
-                            program: execution.program.clone(),
-                            args: execution.args.clone(),
-                            exit_code: execution.exit_code,
-                            timed_out: execution.timed_out,
-                        }
-                    }),
-                    evidence: matches!(
-                        &check.observation,
-                        leveler_verifier::CheckObservation::Failed
-                            | leveler_verifier::CheckObservation::NotRun(_)
-                    )
-                    .then(|| check.evidence.clone()),
-                },
-                observer,
-            )
-            .await?;
-        }
-        log.append(
-            None,
-            EngineEvent::VerificationFinished {
-                // The completion gate, which is deliberately true for a run
-                // that owed no check.
-                passed: report.passed(),
-                // The fact, mapped by the one mapper every consumer shares.
-                verification: Some(verification_status_of(&report)),
-            },
-            observer,
-        )
-        .await?;
-        if let Some(started) = verification_phase {
-            finish_finalization_phase(FINALIZATION_VERIFICATION, started);
-        }
-        Ok(report)
-    }
     /// Best-effort model handoff briefing for a pre-request fold: only called
     /// when the raw history exceeds the compact threshold, and any failure
     /// degrades to the bare-breadcrumb fold (never blocks the turn).
@@ -3237,49 +2888,13 @@ fn review_brief(goal: &str, files: &[String], diff: Option<&str>) -> String {
     )
 }
 
-/// The mechanical verdict of the project's own checks, as a status.
-///
-/// THE single `VerificationReport` → `VerificationStatus` mapping. Every
-/// surface reads this one: the `verification_finished` event, the task report,
-/// and through it `task_finished.verification`. Two mappings is how an event
-/// log ends up saying `passed` while the terminal row says `unavailable`.
-///
-/// The rule is the status enum's own definition, not a new one: a gate that
-/// failed is `Failed`; nothing configured to run is `NotRun` ("no checks are
-/// configured"); checks that were configured but could not speak — tool
-/// missing, environment mismatch, skipped — are `Unavailable`.
-fn verification_status_of(report: &VerificationReport) -> VerificationStatus {
-    match report.verdict() {
-        Verdict::Verified => VerificationStatus::Passed,
-        Verdict::Failed => VerificationStatus::Failed,
-        Verdict::Unverified(_) if !report.has_gating_checks() => VerificationStatus::NotRun,
-        Verdict::Unverified(_) => VerificationStatus::Unavailable,
-    }
-}
-/// The plan the post-edit gate actually runs.
-///
-/// A spec's plan is discovered when the turn is created. That is too early for a
-/// turn that BUILDS a project: a repo with no manifest yields an empty plan, so
-/// the agent could `go mod init`, write a full test suite, and still finish
-/// `CompletedUnverified` because the gate had been told there was nothing to
-/// run. When the spec carries no plan, re-read the repository at gate time —
-/// by then the project it created is on disk. An explicit plan is always
-/// honored as given.
-fn gate_plan(spec: &TaskSpec) -> VerificationPlan {
-    if spec.coding.verification.commands.is_empty() {
-        leveler_verifier::discover::plan_for_repo(&spec.coding.repository)
-    } else {
-        spec.coding.verification.clone()
-    }
-}
-
 /// Map non-success agent stops for Direct conclude (shipped path used by
-/// `conclude_direct`). `None` means continue into verification.
+/// `conclude_direct`).
 pub(crate) fn direct_non_success_outcome(stop: crate::StopReason) -> Option<TaskOutcome> {
     use crate::StopReason as S;
     match stop {
-        // A declared end: the project's checks run and are reported beside it.
-        S::Completed | S::Answered | S::CompletedUnverified | S::CompletedChecksFailed => None,
+        // A declared end is complete; the runtime does not add another gate.
+        S::Completed | S::Answered => None,
         // The round ceiling is a resource boundary, not a model failure: a
         // ceiling stop is BudgetLimited — incomplete and resumable — the same
         // class as an exhausted budget.
@@ -3396,161 +3011,32 @@ mod review_brief_tests {
 }
 
 #[cfg(test)]
-mod verification_status_tests {
-    use super::*;
-    use leveler_verifier::{
-        BaselineProvenance, BaselineSource, CheckExecution, CheckKind, CheckObservation,
-        CheckOutcome, CheckStatus, GateDisposition, GateSkipReason, NotRunReason,
-    };
-
-    fn report(status: CheckStatus) -> VerificationReport {
-        let observation = match status {
-            CheckStatus::Passed => CheckObservation::Passed,
-            CheckStatus::Failed => CheckObservation::Failed,
-            CheckStatus::Skipped => CheckObservation::NotRun(NotRunReason::VerificationIncomplete),
-            CheckStatus::ToolMissing => CheckObservation::NotRun(NotRunReason::ToolMissing),
-            CheckStatus::EnvironmentUnavailable => {
-                CheckObservation::NotRun(NotRunReason::EnvironmentUnavailable)
-            }
-        };
-        VerificationReport {
-            checks: vec![CheckOutcome {
-                name: "test".into(),
-                kind: CheckKind::Test,
-                gating: true,
-                observation,
-                disposition: GateDisposition::Required,
-                execution: matches!(status, CheckStatus::Passed | CheckStatus::Failed).then_some(
-                    CheckExecution {
-                        program: "cargo".into(),
-                        args: vec!["test".into()],
-                        exit_code: Some(if status == CheckStatus::Failed { 1 } else { 0 }),
-                        timed_out: false,
-                    },
-                ),
-                evidence: String::new(),
-                failure: None,
-                failed_tests: std::collections::BTreeSet::new(),
-            }],
-            scope_ok: true,
-            scope_violations: vec![],
-        }
-    }
-
-    #[test]
-    fn verification_status_mirrors_the_report_verdict() {
-        assert_eq!(
-            verification_status_of(&report(CheckStatus::Passed)),
-            VerificationStatus::Passed
-        );
-        assert_eq!(
-            verification_status_of(&report(CheckStatus::Failed)),
-            VerificationStatus::Failed
-        );
-        // Configured but unable to speak: the checks exist, so this is
-        // `Unavailable` and not "nothing to verify".
-        assert_eq!(
-            verification_status_of(&report(CheckStatus::ToolMissing)),
-            VerificationStatus::Unavailable
-        );
-        assert_eq!(
-            verification_status_of(&report(CheckStatus::EnvironmentUnavailable)),
-            VerificationStatus::Unavailable
-        );
-    }
-
-    /// A failure the baseline already had does not gate, and this mapper must
-    /// not decide that for itself by reading the check rows: the report
-    /// decides (`verdict()` reports it as unverified, with the reason naming
-    /// the pre-existing failure), and the status follows the report exactly as
-    /// it did before the split.
-    #[test]
-    fn a_baseline_attributed_failure_keeps_the_canonical_status() {
-        let mut pre_existing = report(CheckStatus::Failed);
-        pre_existing.checks[0].disposition =
-            GateDisposition::Skipped(GateSkipReason::ConfirmedBaselineFailure {
-                revision: "base".into(),
-                provenance: BaselineProvenance {
-                    source: BaselineSource::DetachedWorktreeRerun,
-                    failed_tests: std::collections::BTreeSet::new(),
-                },
-            });
-        assert!(matches!(pre_existing.verdict(), Verdict::Unverified(_)));
-        assert_eq!(
-            verification_status_of(&pre_existing),
-            VerificationStatus::Unavailable
-        );
-
-        // The same rows WITHOUT the attribution are a failure. The rows are
-        // identical in both cases, so nothing here can be reading them.
-        assert_eq!(
-            verification_status_of(&report(CheckStatus::Failed)),
-            VerificationStatus::Failed
-        );
-    }
-
-    /// The one case where the gate and the truth must not be read the same
-    /// way: a run with nothing configured to run. Its gate is open, and it
-    /// proved nothing.
-    #[test]
-    fn a_report_with_no_gates_is_not_run_rather_than_unavailable() {
-        let no_gates = VerificationReport {
-            checks: vec![],
-            scope_ok: true,
-            scope_violations: vec![],
-        };
-        assert!(
-            no_gates.passed(),
-            "the gate is open for a run that owes nothing"
-        );
-        assert_eq!(
-            verification_status_of(&no_gates),
-            VerificationStatus::NotRun
-        );
-
-        // A non-gating check is still nothing to verify against.
-        let mut advisory = report(CheckStatus::Passed);
-        advisory.checks[0].gating = false;
-        assert!(advisory.passed());
-        assert_eq!(
-            verification_status_of(&advisory),
-            VerificationStatus::NotRun
-        );
-    }
-}
-
-#[cfg(test)]
 mod terminal_mapping_tests {
     use super::*;
 
-    /// The session status is read off how the run ended, never off the
-    /// verification verdict: a guard-forced Incomplete stop stays Incomplete
-    /// however green the tree, and a completed run with failed checks is a
-    /// completed session that reports `VerificationStatus::Failed` beside it.
+    /// The session status is read off how the run ended.
     #[test]
     fn terminal_status_follows_the_stop_reason_not_the_checks() {
-        let mut report = TaskReport::new(
+        let report = TaskReport::new(
             TaskOutcome::Completed,
             String::new(),
             vec!["a.rs".into()],
             crate::StopReason::Incomplete,
             1,
         );
-        report.verification_status = VerificationStatus::Passed;
         assert_eq!(terminal_status_for(&report).0, SessionStatus::Incomplete);
 
-        let mut clean = TaskReport::new(
+        let clean = TaskReport::new(
             TaskOutcome::Completed,
             String::new(),
             vec!["a.rs".into()],
             crate::StopReason::Completed,
             1,
         );
-        clean.verification_status = VerificationStatus::Failed;
         assert_eq!(
             terminal_status_for(&clean),
             (SessionStatus::Completed, AgentState::Complete),
-            "failed checks are reported, not laundered into an incomplete session"
+            "a completed task remains completed"
         );
 
         let blocked = TaskReport::new(
@@ -3592,83 +3078,12 @@ mod terminal_mapping_tests {
         assert_eq!(
             direct_non_success_outcome(crate::StopReason::Answered),
             None,
-            "Answered continues into verify path"
+            "Answered is already a successful terminal"
         );
         assert_eq!(
             direct_non_success_outcome(crate::StopReason::Completed),
             None
         );
-    }
-}
-
-#[cfg(test)]
-mod gate_plan_tests {
-    use super::*;
-    use leveler_verifier::VerificationCommand;
-
-    fn spec(repository: std::path::PathBuf, verification: VerificationPlan) -> TaskSpec {
-        TaskSpec {
-            runtime: RuntimeTaskSpec {
-                goal: "build it".to_string(),
-                kind: ExecutionKind::Direct,
-                continuation: ContinuationPolicy::UntilTerminal,
-                limits: StepLimits::default(),
-            },
-            coding: CodingTaskSpec {
-                repository,
-                mode: leveler_execution::PermissionProfile::Assisted,
-                sandbox: false,
-                verification,
-                base_commit: None,
-            },
-        }
-    }
-
-    #[test]
-    fn a_project_created_during_the_turn_is_still_verified() {
-        // The turn began in an empty repo (no manifest → empty plan) and ended
-        // having created a Go module. The gate must see the module.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("go.mod"),
-            "module example.com/x\n\ngo 1.21\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("main.go"),
-            "package main\n\nfunc main() {}\n",
-        )
-        .unwrap();
-
-        let plan = gate_plan(&spec(dir.path().to_path_buf(), VerificationPlan::default()));
-
-        assert!(
-            plan.commands.iter().any(|c| c.program == "go"),
-            "an empty spec plan must be re-discovered against the repo as it is at \
-             gate time, got: {:?}",
-            plan.commands.iter().map(|c| &c.name).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn an_explicit_plan_is_honored_as_given() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("go.mod"), "module example.com/x\n").unwrap();
-        let declared = VerificationPlan {
-            commands: vec![VerificationCommand {
-                name: "custom".to_string(),
-                program: "make".to_string(),
-                args: vec!["check".to_string()],
-                kind: leveler_verifier::CheckKind::Test,
-                gating: true,
-                timeout_seconds: 600,
-                scope_policy: Default::default(),
-            }],
-        };
-
-        let plan = gate_plan(&spec(dir.path().to_path_buf(), declared.clone()));
-
-        assert_eq!(plan, declared, "a declared plan must not be second-guessed");
     }
 }
 
@@ -3868,8 +3283,6 @@ mod seed_tests {
             StopReason::Answered,
             1,
         );
-        report.verification_status = VerificationStatus::Unavailable;
-
         assert_eq!(task_terminal_stop(&report), StopReason::Completed);
 
         report.modified_files.clear();

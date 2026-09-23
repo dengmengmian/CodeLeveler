@@ -12,7 +12,7 @@
 //! The crate is split along the runtime-evolution boundary:
 //!
 //! - [`runtime`] — the **generic runtime lifecycle**: [`SessionStatus`],
-//!   [`TaskOutcome`], [`VerificationStatus`], [`TurnOutcome`]. Domain-neutral; a future non-Coding
+//!   [`TaskOutcome`], [`TurnOutcome`]. Domain-neutral; a future non-Coding
 //!   domain depends on this module without pulling Coding semantics.
 //! - [`workflow`] — the **Coding workflow**: [`AgentState`] and, over time,
 //!   the other Coding-phase structures. Refines the runtime lifecycle, never
@@ -26,11 +26,8 @@
 //! Four axes are kept deliberately distinct (see the M1A ADR):
 //! - [`SessionStatus`] — the *operational* position in the lifecycle.
 //! - [`TaskOutcome`] — how the task *ended* (completed / blocked / failed…).
-//! - [`VerificationStatus`] — what the project's own checks said about the
-//!   final tree. Orthogonal to the outcome: the runtime reports both and
-//!   never folds them into one word.
 //! - [`TurnOutcome`] — whether one engine turn completed, failed, or was
-//!   interrupted, independent of the task's later verification verdict.
+//!   interrupted.
 //!
 //! ## Runtime authority boundary
 //!
@@ -49,7 +46,6 @@
 mod axes;
 mod checkpoint;
 mod findings;
-mod impact;
 mod ledger;
 mod objective;
 mod plan;
@@ -59,12 +55,11 @@ pub mod workflow;
 
 pub use axes::{CollaborationMode, WorkProfile};
 pub use checkpoint::{
-    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointVerification,
-    CheckpointWorkspace, GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
+    CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointWorkspace,
+    GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,
 };
 pub use findings::{ChildResultProjection, ChildStatus, FindingKind, FindingRecord};
-pub use impact::{ChangeImpact, is_build_relevant};
-pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord, VerifyRecord};
+pub use ledger::{EvidenceLedger, InterceptRecord, MutationRecord};
 pub use objective::{ObjectiveAnchor, ObjectiveSource};
 pub use plan::{PlanOrigin, PlanState, PlanStep};
 pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
@@ -72,6 +67,6 @@ pub use progress::{ProgressCaps, ProgressLedger, TurnPhase};
 // physical second — no consumer changes required.
 pub use runtime::{
     ChildAgentSnapshot, ChildLimit, ChildSpawnSpec, ChildStop, SessionStatus, StopReason,
-    TaskOutcome, TurnOutcome, UnknownVariant, VerificationStatus,
+    TaskOutcome, TurnOutcome, UnknownVariant,
 };
 pub use workflow::AgentState;

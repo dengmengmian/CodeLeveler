@@ -1,8 +1,6 @@
 //! Event rendering for the CLI: agent events in text or JSONL form.
 
 use leveler_agent::{AdvisoryKind, AgentEvent};
-use leveler_lifecycle::VerificationStatus;
-use leveler_verifier::CheckStatus;
 
 use crate::cli::OutputFormat;
 pub(crate) fn render_event(event: AgentEvent, output: OutputFormat) {
@@ -88,51 +86,6 @@ fn render_event_text(event: AgentEvent) {
                 println!("  {mark} {}", s.step);
             }
         }
-        AgentEvent::VerificationStarted => {
-            println!("{} verification started", console::style("→").blue());
-        }
-        AgentEvent::VerificationCheck {
-            name,
-            status,
-            evidence,
-        } => {
-            let mark = match status {
-                CheckStatus::Passed => console::style("✓").green(),
-                CheckStatus::Failed => console::style("✗").red(),
-                CheckStatus::Skipped => console::style("–").dim(),
-                // The two ways a check produced no verdict show as themselves.
-                // A single "not run" mark for all three is what told a reader
-                // a missing toolchain was a deliberate skip.
-                CheckStatus::ToolMissing => console::style("?").yellow(),
-                CheckStatus::EnvironmentUnavailable => console::style("!").yellow(),
-            };
-            println!("  {mark} verification {name}");
-            if let Some(evidence) = evidence {
-                let trimmed = evidence.trim();
-                if !trimmed.is_empty() {
-                    println!("    {}", console::style(trimmed).dim());
-                }
-            }
-        }
-        AgentEvent::VerificationFinished {
-            passed,
-            verification,
-        } => {
-            // Only `Passed` may be printed as a pass. `passed` is the
-            // completion gate, and it is true for a run that proved nothing.
-            let label = match verification {
-                Some(VerificationStatus::Passed) => "passed",
-                Some(VerificationStatus::Failed) => "failed",
-                Some(VerificationStatus::NotRun) => "not run",
-                Some(VerificationStatus::Unavailable) => "unavailable",
-                // Written before the split: a closed gate that failed is a
-                // failure; a closed gate that passed says nothing about
-                // whether anything was proven.
-                None if !passed => "failed",
-                None => "unverified (legacy row)",
-            };
-            println!("{} verification {label}", console::style("•").cyan());
-        }
         AgentEvent::SubAgentStarted {
             nickname,
             role,
@@ -206,10 +159,9 @@ fn render_event_text(event: AgentEvent) {
         }
         AgentEvent::EvidenceLedgerUpdated { ledger } => {
             println!(
-                "  {} evidence ledger · mut={} verify={} intercepts={}",
+                "  {} evidence ledger · mut={} intercepts={}",
                 console::style("📒").blue(),
                 ledger.mutations.len(),
-                ledger.verifications.len(),
                 ledger.intercepts.len()
             );
         }
@@ -364,40 +316,6 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         AgentEvent::PlanUpdated { steps } => serde_json::json!({
             "type": "plan_updated", "steps": steps,
         }),
-        AgentEvent::VerificationStarted => serde_json::json!({
-            "type": "verification_started",
-        }),
-        AgentEvent::VerificationCheck {
-            name,
-            status,
-            evidence,
-        } => serde_json::json!({
-            "type": "verification_check",
-            "name": name,
-            // The durable vocabulary, from its owner — the CLI writes the same
-            // spelling the runtime did, and never a second one.
-            "status": status.as_str(),
-            "evidence": evidence,
-        }),
-        AgentEvent::VerificationFinished {
-            passed,
-            verification,
-        } => {
-            let mut row = serde_json::json!({
-                "type": "verification_finished",
-                // The completion gate. Kept under this name for readers
-                // written before the split, and it is `true` for a run that
-                // was not verified — so it is not the field to count a pass
-                // from.
-                "passed": passed,
-            });
-            // The fact, when the row carries it. Absent means "not recorded",
-            // and a reader must not turn an absence into a verdict.
-            if let Some(verification) = verification {
-                row["verification"] = serde_json::json!(verification.as_str());
-            }
-            row
-        }
         AgentEvent::SubAgentStarted {
             id,
             nickname,
@@ -474,7 +392,6 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         AgentEvent::EvidenceLedgerUpdated { ledger } => serde_json::json!({
             "type": "evidence_ledger_updated",
             "mutations": ledger.mutations.len(),
-            "verifications": ledger.verifications.len(),
             "intercepts": ledger.intercepts.len(),
         }),
         AgentEvent::ProgressUpdated { ledger } => serde_json::json!({

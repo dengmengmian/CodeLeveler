@@ -398,10 +398,15 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
         match block {
             MdBlock::Heading { level, spans } => {
                 // Render as a styled heading (no literal "#" markers). H1/H2
-                // get a heading-colored bar so the level still reads at a glance.
-                let style = Style::default()
-                    .fg(theme.text.primary)
-                    .add_modifier(Modifier::BOLD);
+                // use the readable accent across the whole heading and get a
+                // leading bar, so long answers remain easy to scan. Minor
+                // headings stay primary text to avoid painting every section.
+                let color = if *level <= 2 {
+                    theme.accent.secondary
+                } else {
+                    theme.text.primary
+                };
+                let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
                 let mut heading = Vec::new();
                 if *level <= 2 {
                     heading.push(MdSpan {
@@ -1182,6 +1187,47 @@ mod tests {
                 .iter()
                 .any(|s| s.style.fg == Some(theme.text.primary)),
             "assistant prose must use the reading-text role, not a muted/dim fg"
+        );
+    }
+
+    #[test]
+    fn primary_headings_use_the_theme_accent_while_body_stays_primary() {
+        let theme = Theme::dark();
+        let lines = MdDoc::parse("## 现在的实现对不对\n\n正文保持原色").to_lines(40, &theme);
+
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.accent.secondary)),
+            "the complete H1/H2 heading should use the readable accent color"
+        );
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.text.primary)),
+            "heading emphasis must not recolor assistant prose"
+        );
+    }
+
+    #[test]
+    fn minor_headings_remain_bold_primary_text() {
+        let theme = Theme::dark();
+        let lines = MdDoc::parse("### 细节").to_lines(40, &theme);
+
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme.text.primary)),
+            "H3-H6 should not make long answers overly colorful"
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
         );
     }
 

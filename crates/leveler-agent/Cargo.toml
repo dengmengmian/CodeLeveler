@@ -18,7 +18,6 @@ leveler-agent-core = { workspace = true }
 leveler-execution = { workspace = true }
 leveler-engine = { workspace = true }
 leveler-storage = { workspace = true }
-leveler-verifier = { workspace = true }
 leveler-context = { workspace = true }
 leveler-skills = { workspace = true }
 serde = { workspace = true }

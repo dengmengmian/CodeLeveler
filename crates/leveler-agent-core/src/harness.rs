@@ -275,6 +275,14 @@ pub trait AgentHarness: Send {
     /// The tool definitions the next request advertises.
     fn tool_definitions(&self) -> Vec<ToolDefinition>;
 
+    /// Fresh host observations for this request only. Unlike transcript
+    /// messages these projections are neither replayed as history nor folded
+    /// into summaries. The host derives them from its authoritative state;
+    /// the kernel accounts for the exact request including this context.
+    fn request_context(&self, _ctx: &LoopContext) -> Vec<Message> {
+        Vec::new()
+    }
+
     /// Round top, before admission. Inject anything that must reach the model
     /// before it is asked (host input, settled background work).
     async fn on_round_start(

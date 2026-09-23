@@ -5,28 +5,6 @@ use leveler_execution::{is_shell_wrapper_program, shell_c_script};
 use leveler_model::ToolCall;
 use sha2::{Digest, Sha256};
 
-/// Whether a program is a verification-class runner (build / test /
-/// typecheck). Heuristic by program basename over the command that ACTUALLY
-/// ran, whatever tool wrapper carried it: the real gate is the verifier — this
-/// decides what counts as a green check and whether the executor nudges the
-/// model to verify before accepting a completion.
-pub(crate) fn is_verification_program(program: &str) -> bool {
-    const VERIFICATION_PROGRAMS: &[&str] = &[
-        "cargo", "rustc", "go", "npm", "pnpm", "yarn", "npx", "bun", "deno", "node", "tsc", "jest",
-        "vitest", "mocha", "pytest", "python", "python3", "tox", "mypy", "ruff", "make", "just",
-        "gradle", "gradlew", "mvn", "mvnw", "dotnet", "ctest", "cmake", "swift", "zig",
-    ];
-    // Parse both separator styles so Windows tool calls are classified the
-    // same way even when replayed or tested on a Unix host.
-    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let base = base.to_ascii_lowercase();
-    let base = [".exe", ".cmd", ".bat", ".com"]
-        .into_iter()
-        .find_map(|suffix| base.strip_suffix(suffix))
-        .unwrap_or(&base);
-    VERIFICATION_PROGRAMS.contains(&base)
-}
-
 pub(crate) fn collect_scoped_paths_from_call(call: &ToolCall, out: &mut Vec<String>) {
     if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
         push_unique_path(out, path);
@@ -501,22 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn verification_class_is_decided_by_the_program_that_ran() {
-        // HC-002 F1: this used to be double-gated on the TOOL NAME, so the
-        // same runner counted through `run_command` and vanished through
-        // `shell_command`. The class is a property of the program; which
-        // command actually ran is the execution layer's report, not a guess
-        // from arguments (a spoofed `program` field on a shell call never
-        // reaches this).
-        assert!(is_verification_program("cargo"));
-        assert!(is_verification_program("go"));
-        assert!(!is_verification_program("git"));
-        assert!(!is_verification_program("echo"));
-        assert!(is_verification_program(r"C:\Rust\bin\cargo.exe"));
-        assert!(is_verification_program(r"C:\Node\npm.CMD"));
-    }
-
-    #[test]
     fn permission_match_line_uses_raw_shell_cmd() {
         let call = tool_call(
             "shell_command",
@@ -527,127 +489,5 @@ mod tests {
         assert_eq!(line.as_deref(), Some("cargo test --workspace"));
         // Must not be the wrapper form used for classification.
         assert!(!line.unwrap().starts_with("sh "));
-    }
-}
-
-/// The execution layer records a verification-class run as completion
-/// evidence only when the command's own exit status is the program's
-/// (HC-002): `jest … 2>&1 | tail -6` exits with `tail`'s status, and
-/// `TEST_ENV=web jest …` ran in an environment the fingerprint does not
-/// name. Those runs are real to the model — it just watched the tests pass —
-/// and invisible to the ledger. Left unsaid, the next completion claim is
-/// refused for "no green check since the last edit" against a check the
-/// model remembers running, and the run ends in a guard fight over evidence
-/// that was never recorded. This names the gap at the moment it opens.
-pub(crate) fn unproven_verification_note(
-    call_name: &str,
-    arguments: &serde_json::Value,
-    executed_commands: &[Vec<String>],
-    is_error: bool,
-) -> Option<String> {
-    if is_error || !executed_commands.is_empty() {
-        return None;
-    }
-    let script = match call_name {
-        "shell_command" => arguments.get("cmd")?.as_str()?.to_string(),
-        "run_command" => {
-            let program = arguments.get("program")?.as_str()?;
-            let args: Vec<&str> = arguments
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-                .unwrap_or_default();
-            let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
-            match (base, args.as_slice()) {
-                ("sh" | "bash" | "zsh" | "dash", [flag, body, ..]) if *flag == "-c" => {
-                    (*body).to_string()
-                }
-                // A plain program is proven by construction; if nothing was
-                // recorded the tool itself said so and there is no shape to explain.
-                _ => return None,
-            }
-        }
-        _ => return None,
-    };
-    let programs = leveler_execution::literal_program_names(&script)?;
-    let program = programs.iter().find(|w| is_verification_program(w))?;
-    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    Some(format!(
-        "[runtime] This run is not recorded as verification evidence: the command's \
-         exit status is not `{base}`'s own (a pipe, redirect, `;`/`||`, environment \
-         prefix or subshell stands between them), so a completion claim cannot cite \
-         it. Run `{base} …` as one plain command for it to count."
-    ))
-}
-
-#[cfg(test)]
-mod unproven_verification_note_tests {
-    use super::*;
-
-    fn shell(cmd: &str) -> serde_json::Value {
-        serde_json::json!({ "cmd": cmd })
-    }
-
-    #[test]
-    fn a_piped_test_run_is_named_as_unrecorded_evidence() {
-        let note = unproven_verification_note(
-            "shell_command",
-            &shell("TEST_ENV=web node_modules/.bin/jest --ci nested 2>&1 | tail -6"),
-            &[],
-            false,
-        )
-        .expect("a verification program ran in a shape that proves nothing");
-        assert!(note.contains("jest"), "names the program: {note}");
-        assert!(
-            note.contains("not recorded"),
-            "says the run did not count: {note}"
-        );
-    }
-
-    #[test]
-    fn a_recorded_run_and_a_non_verification_pipeline_get_no_note() {
-        // Proven and recorded: nothing to say.
-        assert!(
-            unproven_verification_note(
-                "shell_command",
-                &shell("node_modules/.bin/jest --ci nested"),
-                &[vec![
-                    "node_modules/.bin/jest".into(),
-                    "--ci".into(),
-                    "nested".into()
-                ]],
-                false,
-            )
-            .is_none()
-        );
-        // No verification program anywhere in the pipeline: not evidence either way.
-        assert!(
-            unproven_verification_note("shell_command", &shell("ls -la | head -5"), &[], false)
-                .is_none()
-        );
-        // A failed run is not silently-lost evidence; the failure is visible.
-        assert!(
-            unproven_verification_note("shell_command", &shell("jest 2>&1 | tail -6"), &[], true)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn run_command_with_a_shell_wrapper_is_covered_too() {
-        let args = serde_json::json!({ "program": "sh", "args": ["-c", "pytest -q; echo done"] });
-        let note = unproven_verification_note("run_command", &args, &[], false)
-            .expect("pytest behind `;` proves nothing");
-        assert!(note.contains("pytest"));
-        // A plain run_command of the program itself is proven by construction.
-        let plain = serde_json::json!({ "program": "pytest", "args": ["-q"] });
-        assert!(
-            unproven_verification_note(
-                "run_command",
-                &plain,
-                &[vec!["pytest".into(), "-q".into()]],
-                false
-            )
-            .is_none()
-        );
     }
 }

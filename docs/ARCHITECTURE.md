@@ -185,7 +185,7 @@ A Coding Harness may own:
 coding-domain contract
 repository semantics
 coding tool surface
-verification semantics
+test, build, and lint tool semantics
 delegation semantics
 multi-agent write collaboration semantics
 coding completion semantics
@@ -243,6 +243,14 @@ a second permission or ownership system
 ```
 
 ---
+
+### 5.5 Execution Feedback
+
+Each model request receives a read-only projection of authoritative execution state, not a second task ledger. The kernel accepts request-local context through `AgentHarness::request_context`. The Coding Harness projects bounded facts from the existing `LoopContext`, progress ledger and Plan: cumulative elapsed time, resource spend and limits, commands executed, observed modifications, and the model's declared plan state.
+
+The projection is attached only to the current request. It is not appended to durable conversation history or compaction summaries; continuation and recovery regenerate it from the existing owners. Context accounting and estimates for missing provider usage cover the projection actually sent. Elapsed time includes model calls, tools and approval waits, not just inference. Estimated tokens remain distinguishable, and absent limits are not reported as zero.
+
+The model owns strategy changes based on these facts. Tool activity does not establish goal progress; a Plan remains a declaration, not completion evidence. The kernel does not infer stagnation from missing commits, unchanged plan steps, or language-specific commands. Existing resource budgets, cancellation and terminal authority remain in force. Feedback neither adds model calls nor changes the default task deadline.
 
 ## 6. Agent Runtime: Keeping Agents Alive Reliably
 
@@ -616,7 +624,6 @@ whether a command ran
 its exit status
 whether a file changed
 whether an event occurred
-whether verification ran
 whether an artifact exists
 whether a process exited
 ```
@@ -661,37 +668,25 @@ Closeout crosses one runtime lifecycle boundary:
 Running
    ↓ final assistant text ends
 Finalizing
-   ↓ dependency settlement, verification, required evidence/review, outcome resolution
+   ↓ dependency settlement, required review, outcome resolution
 Terminal (TaskFinished)
 ```
 
-`Finalizing` is a domain-neutral Runtime state. The Engine records its phases and timing, but does not interpret why a coding check passed, failed, or was exempted. Those semantics belong to the Coding Harness. Durable phase starts, the next phase start, and the `TaskFinished` timestamp are sufficient to calculate each interval mechanically; pure phase-completion timing must not add persistence to the authoritative terminal critical path or alter the result.
+`Finalizing` is a domain-neutral Runtime state. The Engine records its phases and timing. Durable phase starts, the next phase start, and the `TaskFinished` timestamp are sufficient to calculate each interval mechanically; pure phase-completion timing must not add persistence to the authoritative terminal critical path or alter the result.
 
-`TaskFinished` is the only authoritative task terminal. Clients project completed, failed, blocked, or verification-warning results only from a persisted `TaskFinished`; final prose, turn completion, and background cleanup cannot substitute for it. If the terminal transaction did not commit, a client may surface only a recoverable error, never synthesize `Failed` or any other terminal.
+`TaskFinished` is the only authoritative task terminal. Clients project completed, failed, or blocked results only from a persisted `TaskFinished`; final prose, turn completion, and background cleanup cannot substitute for it. If the terminal transaction did not commit, a client may surface only a recoverable error, never synthesize `Failed` or any other terminal.
 
-Once the authoritative result is committed, the Product must publish the user-visible terminal immediately. Only work already detached to an immutable task/run identity may continue afterward; it must not delay terminal visibility or move a client back into a running state. Session-scoped cleanup must snapshot its exact resource ids before publication. A continuation checkpoint belongs to the authoritative window boundary and is committed before `TaskFinished`, because letting it re-read “current session” afterward could absorb the next turn; failure to create that checkpoint fails the window instead of claiming it is safely resumable. A review configured as required is also completion evidence: it runs for each product-mutating turn, and failure to complete it or reported model findings produce completion warnings separate from project verification. Findings remain advisory model conclusions, not mechanical verification verdicts; an advisory review must not block.
+Once the authoritative result is committed, the Product must publish the user-visible terminal immediately. Only work already detached to an immutable task/run identity may continue afterward; it must not delay terminal visibility or move a client back into a running state. Session-scoped cleanup must snapshot its exact resource ids before publication. A continuation checkpoint belongs to the authoritative window boundary and is committed before `TaskFinished`, because letting it re-read “current session” afterward could absorb the next turn; failure to create that checkpoint fails the window instead of claiming it is safely resumable. A review configured as required may still produce completion warnings. Findings remain advisory model conclusions, not mechanical terminal verdicts; an advisory review must not block.
 
 A background process chooses its cleanup boundary explicitly when it starts. The default `goal` lifetime is reaped when its creating goal reaches a terminal state. Only an explicit user request for a server or watcher to remain alive after task completion selects the `runtime` lifetime. Both retain the creating session as owner and remain observable and stoppable through the same background-task interface; `runtime` skips only goal-terminal cleanup and is still settled on process exit, explicit stop, or runtime shutdown.
 
-### 10.5 Verification Observation and Gate Disposition Are Separate Facts
+Incremental background-task observation belongs to the process capability. `observe` validates reader positions, registers change notifications and delivers bounded output under the same task lock. New output, a non-running status, or the bounded wait interval can return control. Explicit cursors are independent and do not advance the default reader; truncated history reports a gap and undelivered bytes remain available. `wait_task` only adapts arguments and model-facing output; `get_task` reads the full retained log. Output arrival never satisfies completion-only `wait` or causes early settlement.
 
-Each verification check records at least:
+Terminal settlement facts remain immutable for the lifetime of the task record: reading must not consume a permission violation or make another reader see success. Mutation paths and snapshots may be reported once, but the delivery marker does not change the settlement facts.
 
-```text
-Observation: Passed | Failed | NotRun(reason)
-Disposition: Required | Skipped(reason)
-```
+### 10.5 Tests, Builds, and Linters Are Ordinary Tools
 
-Observation answers what the machine actually saw. Disposition answers whether that observation blocks this delivery. They must not be collapsed into one status string.
-
-A mechanically confirmed baseline failure is therefore represented as:
-
-```text
-Observation = Failed
-Disposition = Skipped(ConfirmedBaselineFailure { revision, provenance })
-```
-
-It is not `NotRun`. Conversely, a check without execution evidence can only be `NotRun` with a reason; a model's claim that the failure already existed cannot grant a baseline exemption. Confirmation requires comparable mechanical evidence, and checks that cannot yet be compared reliably continue to fail closed.
+The Runtime does not generate or execute a verification plan after task completion, and it does not map test, build, or lint results into a second terminal state. When the user explicitly asks, the model may still run these operations through ordinary command tools. Their output and exit code are recorded as ordinary tool facts; they do not create a `Passed / Failed / NotRun / Unavailable` session status, and clients do not render a verification status.
 
 ---
 

@@ -34,8 +34,6 @@ function observation(over: Partial<UiObservabilityLoaded> = {}): UiObservability
       request_retries: 0,
       tool_started: 21,
       tool_finished: 21,
-      verification_runs: 1,
-      verification: 'passed',
       compact_count: 0,
       subagent_started: 0,
       last_sequence: 12,
@@ -94,9 +92,9 @@ describe('product axes', () => {
 
 describe('finalization snapshot', () => {
   it('restores explicit finalizing chrome instead of generic running state', () => {
-    const state = stateWithSession({ status: 'running', finalization_stage: 'verification' });
+    const state = stateWithSession({ status: 'running', finalization_stage: 'review' });
     expect(state.current?.turnActive).toBe(true);
-    expect(state.current?.activity).toBe('正在验证');
+    expect(state.current?.activity).toBe('正在复核');
     expect(state.current?.lastTurn).toBeNull();
   });
 });
@@ -441,9 +439,9 @@ describe('chrome / diff focus', () => {
 describe('turn terminal truth', () => {
   it('keeps the full outcome and detail on lastTurn', () => {
     const state = stateWithSession();
-    reducer(state, { type: 'turn_terminal', outcome: 'unverified', detail: 'verification unavailable' });
-    expect(state.current?.lastTurn?.outcome).toBe('unverified');
-    expect(state.current?.lastTurn?.detail).toBe('verification unavailable');
+    reducer(state, { type: 'turn_terminal', outcome: 'incomplete', detail: 'budget exhausted' });
+    expect(state.current?.lastTurn?.outcome).toBe('incomplete');
+    expect(state.current?.lastTurn?.detail).toBe('budget exhausted');
     expect(state.current?.turnActive).toBe(false);
   });
 

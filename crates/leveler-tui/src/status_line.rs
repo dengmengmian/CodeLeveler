@@ -451,8 +451,6 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let frame = SPINNER[(state.tick as usize) % SPINNER.len()];
     let label = match state.finalization_stage {
         Some(FinalizationStage::SettlingDependencies) => t.finalizing_dependencies.to_string(),
-        Some(FinalizationStage::Verification) => t.finalizing_verification.to_string(),
-        Some(FinalizationStage::Evidence) => t.finalizing_evidence.to_string(),
         Some(FinalizationStage::Review) => t.finalizing_review.to_string(),
         Some(FinalizationStage::ResolvingOutcome) => t.finalizing_outcome.to_string(),
         Some(FinalizationStage::PublishingTerminal) => t.finalizing_terminal.to_string(),
@@ -539,8 +537,18 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     if let Some(est) = streaming_output_estimate(state) {
         parts.push(format!("↓~{}", fmt_tokens(est)));
     }
+    let live_part = parts[0].clone();
     let text = fit_status(&parts, width);
     let rest = text.strip_prefix(frame).unwrap_or(&text);
+    // The first part is the live state; everything appended after it is
+    // evidence/metadata. Only the thing happening now takes the accent.
+    let (live, metrics) = if text.starts_with(&live_part) {
+        let active_end = live_part.len();
+        (&text[frame.len()..active_end], &text[active_end..])
+    } else {
+        // At very narrow widths the first part itself is truncated.
+        (rest, "")
+    };
     vec![Line::from(vec![
         Span::styled(
             frame.to_string(),
@@ -548,7 +556,14 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
                 .fg(theme.accent.primary)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(rest.to_string(), Style::default().fg(theme.text.secondary)),
+        Span::styled(
+            live.to_string(),
+            Style::default().fg(theme.accent.secondary),
+        ),
+        Span::styled(
+            metrics.to_string(),
+            Style::default().fg(theme.text.secondary),
+        ),
     ])]
 }
 
@@ -849,12 +864,37 @@ mod tests {
     }
 
     #[test]
+    fn busy_status_colors_the_live_label_but_not_its_metrics() {
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        state.status = RuntimeStatus::Busy;
+        state.elapsed_secs = 2;
+        state.token_input = 224_318;
+        state.token_output = 3_563;
+
+        let line = status_line_content(&state, 120);
+        let label = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("等待模型"))
+            .expect("live status label");
+        let metrics = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("2s"))
+            .expect("elapsed and token metrics");
+
+        assert_eq!(label.style.fg, Some(state.theme.accent.secondary));
+        assert_eq!(metrics.style.fg, Some(state.theme.text.secondary));
+    }
+
+    #[test]
     fn finalizing_status_names_the_runtime_stage_not_the_model() {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
-        state.finalization_stage = Some(FinalizationStage::Verification);
+        state.finalization_stage = Some(FinalizationStage::Review);
         let status = status_line_content(&state, 120).to_string();
-        assert!(status.contains("正在验证"), "status: {status}");
+        assert!(status.contains("正在完成评审"), "status: {status}");
         assert!(!status.contains("等待模型"), "status: {status}");
     }
 

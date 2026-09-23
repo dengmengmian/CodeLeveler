@@ -13,7 +13,7 @@ import type {
   UiToolAggregate,
 } from '../types/protocol';
 
-export type ExecKind = 'model' | 'tool' | 'verify' | 'agent' | 'recovery' | 'system' | 'terminal';
+export type ExecKind = 'model' | 'tool' | 'agent' | 'recovery' | 'system' | 'terminal';
 export type ExecStatus = 'running' | 'ok' | 'fail' | 'info';
 
 export interface ExecStep {
@@ -61,7 +61,6 @@ export interface RuntimeSummary {
   toolStarted: number;
   toolFinished: number;
   requestCount: number;
-  verificationRuns: number;
   inputTokens: number;
   outputTokens: number;
   lastSequence: number | null;
@@ -83,7 +82,6 @@ const KIND: Record<ObservationClass, ExecKind> = {
   edit: 'tool',
   shell: 'tool',
   tool: 'tool',
-  verify: 'verify',
   agent: 'agent',
   recovery: 'recovery',
   system: 'system',
@@ -188,7 +186,6 @@ export function projectObservability(loaded: UiObservabilityLoaded): Observabili
       toolStarted: s.tool_started,
       toolFinished: s.tool_finished,
       requestCount: s.request_count,
-      verificationRuns: s.verification_runs,
       inputTokens: s.input_tokens,
       outputTokens: s.output_tokens,
       lastSequence: s.last_sequence ?? null,
@@ -206,7 +203,6 @@ export function shouldRefreshObservability(ev: RuntimeEvent): boolean {
     case 'tool_call_started':
     case 'tool_call_completed':
     case 'token_usage':
-    case 'verification_updated':
     case 'sub_agent_updated':
     case 'sub_agent_state_changed':
     case 'turn_completed':
@@ -214,8 +210,6 @@ export function shouldRefreshObservability(ev: RuntimeEvent): boolean {
     case 'turn_answered':
     case 'turn_failed':
     case 'turn_incomplete':
-    case 'turn_completed_unverified':
-    case 'turn_completed_checks_failed':
     case 'turn_cancelled':
     case 'context_compacted':
     case 'checkpoint_created':

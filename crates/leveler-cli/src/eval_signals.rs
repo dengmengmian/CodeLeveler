@@ -153,7 +153,7 @@ impl SignalCollector {
         }
         match event {
             // User-visible feedback: status/wait labels, streaming text,
-            // reasoning, tools, plan, verification, command heartbeats.
+            // reasoning, tools, plan, command heartbeats.
             // StreamAttemptStarted / AdvisoryStarted name the wait so TTFF is
             // not stuck behind the first model token (often tens of seconds).
             AgentEvent::StreamAttemptStarted
@@ -164,9 +164,6 @@ impl SignalCollector {
             | AgentEvent::ToolCall { .. }
             | AgentEvent::ToolResult { .. }
             | AgentEvent::PlanUpdated { .. }
-            | AgentEvent::VerificationStarted
-            | AgentEvent::VerificationCheck { .. }
-            | AgentEvent::VerificationFinished { .. }
             | AgentEvent::CommandProgress { .. }
             | AgentEvent::SubAgentStarted { .. }
             | AgentEvent::SubAgentActivity { .. }
@@ -334,7 +331,6 @@ impl SignalCollector {
                 }
             }
             AgentEvent::Compacted { .. } => self.signals.compactions += 1,
-            AgentEvent::VerificationStarted => self.signals.verification_ran = true,
             _ => {}
         }
     }

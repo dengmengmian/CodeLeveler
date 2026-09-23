@@ -68,7 +68,6 @@ pub enum TraceFilter {
     All,
     Model,
     Tools,
-    Verify,
     Agents,
     Recovery,
     Errors,
@@ -82,7 +81,6 @@ impl TraceFilter {
             Self::All => t.trace_filter_all,
             Self::Model => t.trace_filter_model,
             Self::Tools => t.trace_filter_tools,
-            Self::Verify => t.trace_filter_verify,
             Self::Agents => t.trace_filter_agents,
             Self::Recovery => t.trace_filter_recovery,
             Self::Errors => t.trace_filter_errors,
@@ -94,8 +92,7 @@ impl TraceFilter {
         match self {
             All => Model,
             Model => Tools,
-            Tools => Verify,
-            Verify => Agents,
+            Tools => Agents,
             Agents => Recovery,
             Recovery => Errors,
             Errors => All,
@@ -114,7 +111,6 @@ impl TraceFilter {
                     | ObservationClass::Shell
                     | ObservationClass::Tool
             ),
-            Self::Verify => row.class == ObservationClass::Verify,
             Self::Agents => row.class == ObservationClass::Agent,
             Self::Recovery => row.class == ObservationClass::Recovery,
             Self::Errors => row.status == "fail",

@@ -551,25 +551,6 @@
       }
     },
     {
-      "description": "Verification progress: a check finished or the run concluded (spec §22).",
-      "type": "object",
-      "required": [
-        "type",
-        "verification"
-      ],
-      "properties": {
-        "type": {
-          "type": "string",
-          "enum": [
-            "verification_updated"
-          ]
-        },
-        "verification": {
-          "$ref": "#/definitions/UiVerification"
-        }
-      }
-    },
-    {
       "description": "The working-tree diff was (re)computed (spec §21).",
       "type": "object",
       "required": [
@@ -998,44 +979,6 @@
           "type": "string",
           "enum": [
             "turn_incomplete"
-          ]
-        }
-      }
-    },
-    {
-      "description": "The turn finished its work, but the project's checks did not run or could not produce a verdict. Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish).",
-      "type": "object",
-      "required": [
-        "reason",
-        "type"
-      ],
-      "properties": {
-        "reason": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "turn_completed_unverified"
-          ]
-        }
-      }
-    },
-    {
-      "description": "The turn finished its work and the project's own checks then FAILED over the final tree. Done, checks failed — both facts stand; `reason` names the failing checks.",
-      "type": "object",
-      "required": [
-        "reason",
-        "type"
-      ],
-      "properties": {
-        "reason": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "turn_completed_checks_failed"
           ]
         }
       }
@@ -2086,54 +2029,6 @@
         }
       }
     },
-    "CheckState": {
-      "description": "The state of one verification check.\n\nThis is the check-level fact and not the task-level verdict, so the three ways a check can produce no verdict stay distinct. A check whose program is not installed is not a check that was deliberately skipped, and neither is a check the environment refused: each one is the reason a run ended unverified, and the reader is owed that reason rather than a shrug.",
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "running",
-            "passed",
-            "failed"
-          ]
-        },
-        {
-          "description": "Deliberately not run.",
-          "type": "string",
-          "enum": [
-            "skipped"
-          ]
-        },
-        {
-          "description": "No pass/fail observation was produced. `UiCheck::evidence` carries the reason projected by the runtime, such as cancellation or an unavailable dependency.",
-          "type": "string",
-          "enum": [
-            "not_run"
-          ]
-        },
-        {
-          "description": "The check's program is not on `PATH`, so it could not run at all.",
-          "type": "string",
-          "enum": [
-            "tool_missing"
-          ]
-        },
-        {
-          "description": "The check ran but the environment refused it (toolchain/MSRV mismatch).",
-          "type": "string",
-          "enum": [
-            "environment_unavailable"
-          ]
-        },
-        {
-          "description": "The row carried a status this build does not know. It is not a pass, and it is not a skip either — naming it one would invent a reason.",
-          "type": "string",
-          "enum": [
-            "unknown"
-          ]
-        }
-      ]
-    },
     "CheckpointId": {
       "description": "Identifies a conversation checkpoint (restore point).",
       "type": "string"
@@ -2652,20 +2547,6 @@
           ]
         },
         {
-          "description": "Run the configured checks over the final tree.",
-          "type": "string",
-          "enum": [
-            "verification"
-          ]
-        },
-        {
-          "description": "Persist verification and other completion evidence.",
-          "type": "string",
-          "enum": [
-            "evidence"
-          ]
-        },
-        {
           "description": "Run a completion review explicitly required by the task contract.",
           "type": "string",
           "enum": [
@@ -2727,7 +2608,6 @@
         "edit",
         "shell",
         "tool",
-        "verify",
         "agent",
         "recovery",
         "system",
@@ -3304,25 +3184,6 @@
           }
         },
         {
-          "description": "Verification progress: a check finished or the run concluded (spec §22).",
-          "type": "object",
-          "required": [
-            "type",
-            "verification"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "verification_updated"
-              ]
-            },
-            "verification": {
-              "$ref": "#/definitions/UiVerification"
-            }
-          }
-        },
-        {
           "description": "The working-tree diff was (re)computed (spec §21).",
           "type": "object",
           "required": [
@@ -3751,44 +3612,6 @@
               "type": "string",
               "enum": [
                 "turn_incomplete"
-              ]
-            }
-          }
-        },
-        {
-          "description": "The turn finished its work, but the project's checks did not run or could not produce a verdict. Done, not verified — distinct from `TurnIncomplete` (which means the work did not finish).",
-          "type": "object",
-          "required": [
-            "reason",
-            "type"
-          ],
-          "properties": {
-            "reason": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "turn_completed_unverified"
-              ]
-            }
-          }
-        },
-        {
-          "description": "The turn finished its work and the project's own checks then FAILED over the final tree. Done, checks failed — both facts stand; `reason` names the failing checks.",
-          "type": "object",
-          "required": [
-            "reason",
-            "type"
-          ],
-          "properties": {
-            "reason": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "turn_completed_checks_failed"
               ]
             }
           }
@@ -5162,29 +4985,6 @@
         }
       }
     },
-    "UiCheck": {
-      "description": "One verification check (spec §22).",
-      "type": "object",
-      "required": [
-        "name",
-        "status"
-      ],
-      "properties": {
-        "evidence": {
-          "description": "Captured evidence (command output), for failures.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "name": {
-          "type": "string"
-        },
-        "status": {
-          "$ref": "#/definitions/CheckState"
-        }
-      }
-    },
     "UiCheckpoint": {
       "description": "A conversation restore point (spec §68). Restoring truncates the transcript back to `ordinal` messages; working-tree files are left to the user's git.",
       "type": "object",
@@ -5568,8 +5368,6 @@
       "type": "object",
       "required": [
         "added",
-        "checks_passed",
-        "checks_total",
         "files_changed",
         "removed",
         "success"
@@ -5578,16 +5376,6 @@
         "added": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
-        },
-        "checks_passed": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0.0
-        },
-        "checks_total": {
-          "type": "integer",
-          "format": "uint",
           "minimum": 0.0
         },
         "files_changed": {
@@ -5601,17 +5389,8 @@
           "minimum": 0.0
         },
         "success": {
-          "description": "Whether the run completed and every gating check passed. Kept for existing clients; `verification` carries the full status.",
+          "description": "Whether the run completed successfully.",
           "type": "boolean"
-        },
-        "verification": {
-          "description": "The project's own checks over the final tree. Absent on reports written before the status/verification split (reads as `not_run`).",
-          "default": "not_run",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UiVerificationStatus"
-            }
-          ]
         }
       }
     },
@@ -5798,15 +5577,14 @@
       }
     },
     "UiGoalRecap": {
-      "description": "One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts.\n\nTruth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero. `verification` is `\"unmeasured\"` when nothing was proven — never a pass.",
+      "description": "One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts.\n\nTruth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero.",
       "type": "object",
       "required": [
         "checkpoint_id",
         "created_at",
         "display_summary",
         "goal_id",
-        "reason",
-        "verification"
+        "reason"
       ],
       "properties": {
         "checkpoint_id": {
@@ -5892,17 +5670,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "verification": {
-          "description": "`passed` | `failed` | `unmeasured`.",
-          "type": "string"
-        },
-        "verification_detail": {
-          "description": "Evidence for a pass, or the failure detail. Absent when unmeasured.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       }
     },
@@ -6494,8 +6261,6 @@
         "tool_finished",
         "tool_started",
         "updated_at",
-        "verification",
-        "verification_runs",
         "work_profile"
       ],
       "properties": {
@@ -6624,15 +6389,6 @@
         },
         "updated_at": {
           "type": "string"
-        },
-        "verification": {
-          "description": "The latest verdict the runtime actually recorded: `passed`, `failed`, `not_run` (nothing ever started), or `unavailable` (started and never reached a verdict). A count of runs is not a verdict.",
-          "type": "string"
-        },
-        "verification_runs": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
         },
         "work_profile": {
           "type": "string"
@@ -6821,17 +6577,6 @@
           "items": {
             "$ref": "#/definitions/UiUserShell"
           }
-        },
-        "verification": {
-          "default": null,
-          "anyOf": [
-            {
-              "$ref": "#/definitions/UiVerification"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "vision": {
           "description": "Whether the current model accepts image input (spec §42).",
@@ -7051,37 +6796,6 @@
           "type": "string"
         }
       }
-    },
-    "UiVerification": {
-      "description": "The verification result.\n\n`passed` is `None` while a check is still running, and it is also `None` when nothing was proven. It is never `Some(true)` for a run that was not verified — \"not verified\" and \"failed\" are different facts, and clients render them differently (`incomplete` versus `failed`).",
-      "type": "object",
-      "required": [
-        "checks"
-      ],
-      "properties": {
-        "checks": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/UiCheck"
-          }
-        },
-        "passed": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        }
-      }
-    },
-    "UiVerificationStatus": {
-      "description": "What the project's own checks reported over the final tree. Orthogonal to whether the run completed: `Passed` means the configured commands exited 0, never that the user's request was satisfied.",
-      "type": "string",
-      "enum": [
-        "passed",
-        "failed",
-        "not_run",
-        "unavailable"
-      ]
     },
     "UserShellId": {
       "description": "Identifies one user-originated shell execution (`!command`) — a session-scoped direct host execution. Deliberately NOT a [`ToolCallId`]: a user shell is not an agent tool call and never enters the model conversation.",

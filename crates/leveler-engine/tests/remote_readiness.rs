@@ -51,18 +51,13 @@ async fn pending_approval_survives_a_restart_via_the_event_log() {
     assert_eq!(resolved, 0, "it must still be unanswered");
 }
 
-/// #8: a failed or interrupted run is never a completed one, and the
-/// verification verdict travels beside the outcome instead of inside it.
+/// #8: a failed or interrupted run is never a completed one.
 #[tokio::test]
 async fn only_a_completed_run_reads_as_completed() {
     assert!(TaskOutcome::Completed.is_completed());
     assert!(!TaskOutcome::Blocked.is_completed());
     assert!(!TaskOutcome::Failed.is_completed());
     assert!(!TaskOutcome::Interrupted.is_completed());
-    assert_eq!(
-        leveler_lifecycle::VerificationStatus::default(),
-        leveler_lifecycle::VerificationStatus::NotRun
-    );
 }
 
 /// #6 / #9: transient deltas carry no replay value and are never persisted, so
@@ -86,7 +81,6 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
         None,
         EngineEvent::TaskFinished {
             outcome: TaskOutcome::Completed,
-            verification: leveler_lifecycle::VerificationStatus::NotRun,
             reason: None,
             failure: None,
             stop: None,
@@ -102,7 +96,6 @@ async fn transient_loss_is_harmless_and_canonical_events_replay() {
         replayed,
         vec![EngineEvent::TaskFinished {
             outcome: TaskOutcome::Completed,
-            verification: leveler_lifecycle::VerificationStatus::NotRun,
             reason: None,
             failure: None,
             stop: None,

@@ -249,8 +249,6 @@ compatibility:
             RuntimeEvent::TurnCompleted
                 | RuntimeEvent::TurnAnswered
                 | RuntimeEvent::TurnCompletedWithWarnings { .. }
-                | RuntimeEvent::TurnCompletedUnverified { .. }
-                | RuntimeEvent::TurnCompletedChecksFailed { .. }
                 | RuntimeEvent::TurnFailed { .. }
                 | RuntimeEvent::TurnCancelled
         );

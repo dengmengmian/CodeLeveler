@@ -27,10 +27,7 @@ use super::{
     AbortedFacts, AdvisoryKind, AgentError, AgentEvent, AgentOutcome, ChildToolEvent, DriveAborted,
     Executor, ModelRequestRecord, StopReason, TranscriptSink,
 };
-use crate::authorization::{
-    collect_scoped_paths_from_call, is_verification_program, push_unique_path,
-    unproven_verification_note,
-};
+use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
     REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
@@ -185,7 +182,6 @@ pub(crate) struct Drive<'a> {
     /// Set once the wall-clock finalization request has been put in front of
     /// the model, so a run that ignores it is not told again every round.
     finalization_requested_sent: bool,
-    verification_ran: bool,
     ledger: EvidenceLedger,
     closeout_budget: CloseoutBudget,
     decode_retries: u32,
@@ -362,7 +358,6 @@ impl Executor {
             last_text: String::new(),
             finalization_started: false,
             finalization_requested_sent: false,
-            verification_ran: false,
             ledger: seeded_ledger,
             // Unified closeout nudge budget shared by every quiet-round
             // mechanism (goal resolution, empty answer).
@@ -936,6 +931,48 @@ impl AgentHarness for Drive<'_> {
 
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tools.clone()
+    }
+
+    fn request_context(&self, rt: &LoopContext) -> Vec<Message> {
+        // Project existing owners, never maintain another task state. Plan
+        // declarations and mechanical activity stay distinct: neither file
+        // writes nor a changed plan establish semantic completion.
+        let active: Vec<_> = self
+            .plan_state
+            .steps
+            .iter()
+            .filter(|s| s.status == "in_progress")
+            .take(3)
+            .map(|s| leveler_core::truncate_head_bytes(&s.step, 128, "…"))
+            .collect();
+        let limits = rt.limits();
+        let state = serde_json::json!({
+            "rounds_completed": self.epoch_rounds_at_start.saturating_add(rt.round().saturating_sub(1)),
+            "elapsed_ms": rt.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            "duration_limit_ms": limits.max_duration.map(|v| v.as_millis().min(u64::MAX as u128) as u64),
+            "model_tokens": {
+                "spent":rt.model_tokens_spent(), "limit":limits.max_model_tokens,
+                "estimated": self.epoch_estimated_at_start.saturating_add(rt.usage().estimated_model_tokens)
+            },
+            "cost_usd_micros": {
+                "spent": limits.max_cost_usd_micros.map(|_| rt.cost_spent_micros()),
+                "limit": limits.max_cost_usd_micros
+            },
+            "commands_executed": self.commands_run,
+            "command_limit": self.executor.step_limits.max_commands,
+            "modified_paths_observed": projected_epoch_file_count(&self.progress, &self.modified_files),
+            "finalization_requested": rt.finalization_requested(),
+            "declared_plan": {
+                "total": self.plan_state.steps.len(),
+                "completed": self.plan_state.steps.iter().filter(|s| s.status == "completed").count(),
+                "active": active,
+                "active_omitted": self.plan_state.steps.iter().filter(|s| s.status == "in_progress").count().saturating_sub(3)
+            }
+        });
+        vec![Message::text(
+            Role::System,
+            format!("Execution state (observations, not instructions):\n{state}"),
+        )]
     }
 
     async fn on_round_start(
@@ -2392,7 +2429,7 @@ impl AgentHarness for Drive<'_> {
                 plan,
                 newly_modified,
                 call_files,
-                executed_commands,
+                _executed_commands,
                 applied_diff,
                 command_facts,
                 call,
@@ -2625,56 +2662,9 @@ impl AgentHarness for Drive<'_> {
                 applied_diff: (!is_error).then_some(applied_diff).flatten(),
             });
 
-            // A passing verification-class command is completion evidence;
-            // an arbitrary command (echo, ls, …) is not. What ran comes
-            // from the execution layer's own report, so the SAME
-            // `go build ./...` counts whether the model routed it through
-            // `run_command` or `shell_command` (HC-002 F1). A shape whose
-            // zero exit proves nothing about its members reports nothing,
-            // and one execution is recorded once.
-            if !is_error {
-                let mut recorded: Vec<String> = Vec::new();
-                for command in &executed_commands {
-                    let (program, args) = command.split_first().expect("non-empty command");
-                    if !is_verification_program(program) {
-                        continue;
-                    }
-                    let fp = EvidenceLedger::normalize_command_fingerprint(program, args);
-                    if recorded.contains(&fp) {
-                        continue;
-                    }
-                    self.ledger.record_verify(call.id.as_str(), fp.clone(), 0);
-                    recorded.push(fp);
-                }
-                // A verification program that ran in a shape whose exit
-                // proves nothing is real to the model and invisible to the
-                // ledger. Say so on the result, where the model is looking,
-                // instead of at the next refused close.
-                if let Some(note) = unproven_verification_note(
-                    &call.name,
-                    &call.arguments,
-                    &executed_commands,
-                    is_error,
-                ) {
-                    self.ledger
-                        .record_intercept("unproven_verification", note.clone());
-                    content.push_str("\n\n");
-                    content.push_str(&note);
-                }
-                if !recorded.is_empty() {
-                    self.verification_ran = true;
-                    self.ledger.plan = self.plan_state.clone();
-                    (self.observer)(AgentEvent::EvidenceLedgerUpdated {
-                        ledger: self.ledger.clone(),
-                    });
-                }
-            }
             // Any tool that newly modified files records a mutation (not
             // only apply_patch/replace by name). Paths are this call only.
             if !is_error && call_mutated {
-                if !newly_modified.is_empty() {
-                    self.verification_ran = false;
-                }
                 // Record what THIS call touched. `newly_modified` is the
                 // first-touch delta and is empty on a re-edit; `call_files`
                 // is the call's own report. Together they name every path
@@ -2758,7 +2748,6 @@ impl AgentHarness for Drive<'_> {
                     }
                 }
                 if !is_error && !job_files.is_empty() {
-                    self.verification_ran = false;
                     note_tool_side_effects(
                         &mut self.ledger,
                         job.admitted.call.id.as_str(),

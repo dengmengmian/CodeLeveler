@@ -49,8 +49,6 @@ function loaded(over: Partial<UiObservabilityLoaded> = {}): UiObservabilityLoade
       request_retries: 0,
       tool_started: 21,
       tool_finished: 21,
-      verification_runs: 1,
-      verification: 'passed',
       compact_count: 0,
       subagent_started: 0,
     },
@@ -100,7 +98,6 @@ describe('observability projection', () => {
       }),
     );
     expect(view.summary.toolStarted).toBe(21);
-    expect(view.summary.verificationRuns).toBe(1);
     expect(view.summary.requestCount).toBe(3);
     expect(view.tools[0]?.calls).toBe(40);
     expect(view.groups[0]?.steps).toHaveLength(2);

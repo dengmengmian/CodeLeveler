@@ -145,12 +145,6 @@ pub enum TurnEndStatus {
     Answered,
     Truncated,
     Incomplete,
-    /// Work finished, but leveler could not independently verify it. Done, not
-    /// verified — rendered as a ✓ with an "unverified" caveat, not an alarm.
-    Unverified,
-    /// Work finished and the project's own checks then failed over the final
-    /// tree. Done, checks failed — both facts on one marker.
-    ChecksFailed,
     /// The loop reached a clean end without committing an answer.
     ///
     /// Tool calls finishing is not a task finishing (§12): the turn's claim to

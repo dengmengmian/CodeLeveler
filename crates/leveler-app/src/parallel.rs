@@ -235,7 +235,6 @@ impl Application {
         let terminal = match &result {
             Ok(summary) if !summary.integrated.is_empty() => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Completed,
-                verification: leveler_lifecycle::VerificationStatus::Passed,
                 reason: None,
                 failure: None,
                 stop: None,
@@ -246,7 +245,6 @@ impl Application {
             },
             Ok(summary) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some(format!(
                     "{} candidate(s), {} verified, 0 integrated",
                     summary.candidates, summary.verified
@@ -261,7 +259,6 @@ impl Application {
             Err(AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
                 leveler_engine::TaskTerminal {
                     outcome: TaskOutcome::Interrupted,
-                    verification: leveler_lifecycle::VerificationStatus::NotRun,
                     reason: None,
                     failure: None,
                     stop: None,
@@ -273,7 +270,6 @@ impl Application {
             }
             Err(error) => leveler_engine::TaskTerminal {
                 outcome: TaskOutcome::Failed,
-                verification: leveler_lifecycle::VerificationStatus::NotRun,
                 reason: Some(error.to_string()),
                 failure: match error {
                     AppError::Model(model) => Some(model.clone()),

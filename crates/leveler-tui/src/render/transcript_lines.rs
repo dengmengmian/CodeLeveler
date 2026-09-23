@@ -287,19 +287,6 @@ fn goal_recap_lines(
     if let (Some(done), Some(total)) = (recap.plan_completed, recap.plan_total) {
         section(t.goal_recap_plan, &format!("{done}/{total}"), out);
     }
-    let verification = match recap.verification.as_str() {
-        "passed" => match &recap.verification_detail {
-            Some(detail) => format!("✓ {} · {detail}", t.goal_recap_verified),
-            None => format!("✓ {}", t.goal_recap_verified),
-        },
-        "failed" => match &recap.verification_detail {
-            Some(detail) => format!("✗ {} · {detail}", t.goal_recap_verify_failed),
-            None => format!("✗ {}", t.goal_recap_verify_failed),
-        },
-        // Explicit absence — never a checkmark, never omitted-and-implied.
-        _ => t.goal_recap_unmeasured.to_string(),
-    };
-    section(t.goal_recap_verification, &verification, out);
     let findings = match recap.findings_total {
         Some(total) => format!("{total}"),
         // UNKNOWN is a statement, not a zero.
@@ -398,11 +385,6 @@ pub(crate) fn turn_end_marker(
     theme: &Theme,
     t: &crate::i18n::UiText,
 ) -> (String, ratatui::style::Color) {
-    let detail_token = block.detail.as_deref().map(str::trim);
-    let no_code_changes = block.status == TurnEndStatus::Unverified
-        && detail_token == Some(leveler_client_protocol::REASON_NO_CODE_CHANGES);
-    let no_auto_verify = block.status == TurnEndStatus::Unverified
-        && detail_token == Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION);
     match block.status {
         TurnEndStatus::Completed | TurnEndStatus::Answered => {
             (format!("✓ {}", t.turn_end_completed), theme.status.success)
@@ -411,34 +393,7 @@ pub(crate) fn turn_end_marker(
             format!("⚠ {}", t.final_completed_warnings),
             theme.status.warning,
         ),
-        // Incomplete = the run stopped mid-task on its own (budget / loop guard /
-        // failed verification gate / model gave up). None of these are a *system*
-        // block, so the honest word is "未完成"; the detail says how to continue.
-        // A failed verification gate gets its own accurate word ("验证未通过")
-        // instead of the misleading "被阻塞" — that was the false-blocked UX.
-        TurnEndStatus::Incomplete => {
-            let is_gate_failure = detail_token.is_some_and(|d| d.starts_with("failed gate(s)"));
-            let word = if is_gate_failure {
-                t.final_verification_failed
-            } else {
-                t.final_blocked
-            };
-            (format!("⚠ {word}"), theme.status.warning)
-        }
-        TurnEndStatus::Unverified if no_code_changes => {
-            (t.turn_no_code_changes.to_string(), theme.status.success)
-        }
-        TurnEndStatus::Unverified if no_auto_verify => {
-            (t.turn_unverified.to_string(), theme.status.success)
-        }
-        TurnEndStatus::Unverified => (
-            format!("⚠ {}", t.final_completed_warnings),
-            theme.status.warning,
-        ),
-        // Done, and the project's checks failed: both facts, one marker.
-        TurnEndStatus::ChecksFailed => {
-            (format!("⚠ {}", t.turn_checks_failed), theme.status.warning)
-        }
+        TurnEndStatus::Incomplete => (format!("⚠ {}", t.final_blocked), theme.status.warning),
         // Not a failure — the run may have done real work — but not a
         // completion either. The wording names exactly what is missing.
         TurnEndStatus::NoFinalAnswer => (
@@ -458,14 +413,8 @@ fn turn_end_lines(
     out: &mut Vec<Line<'static>>,
     t: &crate::i18n::UiText,
 ) {
-    let detail_token = block.detail.as_deref().map(str::trim);
-    let no_code_changes = block.status == TurnEndStatus::Unverified
-        && detail_token == Some(leveler_client_protocol::REASON_NO_CODE_CHANGES);
-    let no_auto_verify = block.status == TurnEndStatus::Unverified
-        && detail_token == Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION);
     // The marker reads as `symbol + status word` (colored by outcome) followed
-    // by muted stats. Soft unverified (no gate / no edits) is a calm finish,
-    // not a warning, so it keeps its own low-key wording.
+    // by muted stats.
     let (label, color) = turn_end_marker(block, theme, t);
     let mut stats = String::new();
     if matches!(
@@ -473,8 +422,6 @@ fn turn_end_lines(
         TurnEndStatus::Completed
             | TurnEndStatus::CompletedWithWarnings
             | TurnEndStatus::Answered
-            | TurnEndStatus::Unverified
-            | TurnEndStatus::ChecksFailed
             | TurnEndStatus::NoFinalAnswer
     ) {
         if block.tool_calls > 0 {
@@ -493,18 +440,15 @@ fn turn_end_lines(
             stats.push_str(&format!(" · {summary}"));
         }
     }
-    // Soft machine tokens are already folded into the label — do not re-append.
-    // Other incomplete reasons stay on the marker only while they FIT there.
+    // Incomplete reasons stay on the marker only while they fit there.
     // The old rule compared the reason against the full width and so appended
-    // a medium one to a line already carrying the tool count, the elapsed and
-    // the verification — the border then clipped it mid-word, with nothing
-    // under it to read.
-    let folded = no_code_changes || no_auto_verify;
+    // a medium one to a line already carrying the tool count and elapsed — the
+    // border then clipped it mid-word, with nothing under it to read.
     let lead = "── ";
     let mut detail_below = false;
     if let Some(detail) = &block.detail {
         let d = localized_turn_detail(detail, t);
-        if !folded && !d.is_empty() {
+        if !d.is_empty() {
             // ` · ` plus the reason, and the marker still needs a rule after it.
             let room = width
                 .saturating_sub(UnicodeWidthStr::width(lead))
@@ -550,9 +494,6 @@ fn turn_end_lines(
 fn localized_turn_detail<'a>(detail: &'a str, t: &'a crate::i18n::UiText) -> &'a str {
     let d = detail.trim();
     match d {
-        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION => {
-            t.turn_no_automatic_verification
-        }
         // Executor machine tokens + long defaults → short product copy. The
         // "observe thrash" and "continue suppressed" tokens are replay-only:
         // the semantic watchdogs that wrote them are deleted, and a session
@@ -1044,17 +985,6 @@ fn completion_lines(
         ),
         Style::default().fg(theme.text.secondary),
     )));
-    if report.checks_total > 0 {
-        out.push(Line::from(Span::styled(
-            format!(
-                "  {}",
-                t.completion_verified
-                    .replacen("{}", &report.checks_passed.to_string(), 1)
-                    .replacen("{}", &report.checks_total.to_string(), 1)
-            ),
-            Style::default().fg(theme.text.secondary),
-        )));
-    }
     out.push(Line::from(Span::styled(
         format!("  {}", t.completion_diff_hint),
         Style::default().fg(theme.text.secondary),
@@ -1348,73 +1278,6 @@ mod tests {
         assert!(!text.contains("完成："), "{text:?}");
     }
 
-    #[test]
-    fn no_code_changes_marker_is_calm_and_omits_machine_token() {
-        let theme = Theme::default();
-        let t = Locale::Zh.text();
-        let item = TranscriptItem::TurnEnd(TurnEndBlock {
-            status: TurnEndStatus::Unverified,
-            tool_calls: 20,
-            elapsed_secs: 88,
-            summary: None,
-            detail: Some(leveler_client_protocol::REASON_NO_CODE_CHANGES.into()),
-        });
-        let lines = item_render(&item, &theme, 80, false, t);
-        assert_eq!(lines.len(), 1);
-        let text = line_text(&lines[0]);
-        assert!(
-            text.contains("◇ 结束 · 未改源码 · 20 次工具 · 1m 28s"),
-            "unexpected marker: {text}"
-        );
-        assert!(!text.contains("未验证"), "{text}");
-        assert!(!text.contains("no_code_changes"), "{text}");
-    }
-
-    #[test]
-    fn soft_unverified_is_calm_and_does_not_lecture() {
-        let theme = Theme::default();
-        let t = Locale::Zh.text();
-        let item = TranscriptItem::TurnEnd(TurnEndBlock {
-            status: TurnEndStatus::Unverified,
-            tool_calls: 3,
-            elapsed_secs: 12,
-            summary: None,
-            detail: Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.into()),
-        });
-        let lines = item_render(&item, &theme, 100, false, t);
-        assert_eq!(lines.len(), 1, "soft unverified stays one line");
-        let text = line_text(&lines[0]);
-        assert!(text.contains("实现完成 · 验证未运行"), "{text}");
-        assert!(text.contains("3 次工具"), "{text}");
-        // Product philosophy / browser disclaimer must not flood the marker.
-        assert!(!text.contains("浏览器预览"), "{text}");
-        assert!(!text.contains("未配置适用的自动验证命令"), "{text}");
-    }
-
-    #[test]
-    fn automatic_verification_marker_is_short_in_english() {
-        let theme = Theme::default();
-        let t = Locale::En.text();
-        let item = TranscriptItem::TurnEnd(TurnEndBlock {
-            status: TurnEndStatus::Unverified,
-            tool_calls: 0,
-            elapsed_secs: 0,
-            summary: None,
-            detail: Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.into()),
-        });
-        let lines = item_render(&item, &theme, 140, false, t);
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(
-            text.contains("implementation done · verification not run"),
-            "{text}"
-        );
-        assert!(!text.contains("browser preview"), "{text}");
-        assert!(
-            !text.contains("no applicable automatic verification"),
-            "{text}"
-        );
-    }
-
     fn turn_end_text(status: TurnEndStatus, detail: Option<&str>) -> String {
         let theme = Theme::default();
         let t = Locale::Zh.text();
@@ -1479,18 +1342,6 @@ mod tests {
         // Budget/loop/stall incompletes read as "未完成", not the old "被阻塞".
         let incomplete = turn_end_text(TurnEndStatus::Incomplete, Some("预算已耗尽"));
         assert!(incomplete.contains("⚠ 未完成"), "{incomplete}");
-        // A failed verification gate reads as "验证未通过" with just the gate name,
-        // NOT "被阻塞 · failed gate(s): cargo test" (the false-blocked UX).
-        let gate = turn_end_text(
-            TurnEndStatus::Incomplete,
-            Some("failed gate(s): cargo test"),
-        );
-        assert!(gate.contains("⚠ 验证未通过"), "{gate}");
-        assert!(gate.contains("cargo test"), "{gate}");
-        assert!(!gate.contains("被阻塞"), "{gate}");
-        assert!(!gate.contains("failed gate(s)"), "{gate}");
-        let unverified = turn_end_text(TurnEndStatus::Unverified, Some("verify failed"));
-        assert!(unverified.contains("⚠ 已完成，但有警告"), "{unverified}");
         let failed = turn_end_text(TurnEndStatus::Failed, Some("boom"));
         assert!(failed.contains("✗ 失败"), "{failed}");
         let cancelled = turn_end_text(TurnEndStatus::Cancelled, None);
@@ -1858,10 +1709,7 @@ mod tests {
             files_changed: 3,
             added: 86,
             removed: 31,
-            checks_passed: 4,
-            checks_total: 5,
             success: true,
-            verification: leveler_client_protocol::UiVerificationStatus::Passed,
         };
         let item = TranscriptItem::Completion(report);
         let zh = item_render(&item, &theme, 120, false, Locale::Zh.text())
@@ -1871,7 +1719,6 @@ mod tests {
             .join("\n");
         assert!(zh.contains("✓ 任务已完成"), "{zh}");
         assert!(zh.contains("修改 3 个文件  +86 / -31"), "{zh}");
-        assert!(zh.contains("验证 4/5 通过"), "{zh}");
         assert!(zh.contains("/diff 查看改动"), "{zh}");
 
         let en = item_render(&item, &theme, 120, false, Locale::En.text())
@@ -1881,7 +1728,6 @@ mod tests {
             .join("\n");
         assert!(en.contains("✓ Task completed"), "{en}");
         assert!(en.contains("3 files changed"), "{en}");
-        assert!(en.contains("verification 4/5 passed"), "{en}");
         assert!(en.contains("/diff to view changes"), "{en}");
     }
 }

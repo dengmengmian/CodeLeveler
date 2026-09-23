@@ -460,22 +460,6 @@ async fn drive_turn(
                     notes,
                 );
             }
-            RuntimeEvent::TurnCompletedUnverified { reason } => {
-                notes.push(format!("unverified:{reason}"));
-                println!("[turn] completed_unverified: {reason}");
-                return finish(
-                    "completed_unverified",
-                    started,
-                    model_rounds,
-                    tool_starts,
-                    tool_ends,
-                    edit_tools,
-                    sub_agent_activity,
-                    sub_agent_updated,
-                    assistant_deltas,
-                    notes,
-                );
-            }
             RuntimeEvent::TurnFailed { error, .. } => {
                 notes.push(format!("failed:{error}"));
                 println!("[turn] FAILED: {error}");
@@ -536,7 +520,7 @@ fn finish(
     assistant_deltas: usize,
     notes: Vec<String>,
 ) -> TurnReport {
-    let empty_spin = matches!(kind, "completed" | "answered" | "completed_unverified")
+    let empty_spin = matches!(kind, "completed" | "answered")
         && model_rounds == 0
         && tool_starts == 0
         && assistant_deltas == 0;

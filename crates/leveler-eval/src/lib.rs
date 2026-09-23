@@ -70,10 +70,7 @@ pub struct EvaluationCase {
     /// is reported either way.
     #[serde(default)]
     pub forbidden_edit_paths: Vec<String>,
-    /// The engine terminal outcome this case requires (default: a verified
-    /// completion). A weak-verification case whose CORRECT product semantics
-    /// is `CompletedUnverified` declares that here — and is then also failed
-    /// if the engine wrongly upgrades the run to a verified completion.
+    /// The engine terminal outcome this case requires.
     #[serde(default)]
     pub expected_outcome: ExpectedOutcome,
     /// A command that must succeed for the case to pass (run in the repo).
@@ -102,19 +99,13 @@ impl EvaluationCase {
     }
 }
 
-/// The engine terminal outcome a case expects. `Completed` is the default and
-/// preserves the historical semantics (verified completion); every other value
-/// is an explicit opt-in by the case author.
+/// The engine terminal outcome a case expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpectedOutcome {
-    /// The run must end as a verified completion.
+    /// The run must end as a completion.
     #[default]
     Completed,
-    /// The run must end as `CompletedUnverified`: real work, honestly not
-    /// endorsed because the project offers nothing to verify against. A run
-    /// that ends verified does NOT match — a wrongful upgrade must fail.
-    CompletedUnverified,
 }
 
 const fn default_max_rounds() -> u32 {
@@ -1292,23 +1283,13 @@ impl EvalReport {
 mod expected_outcome_tests {
     use super::*;
 
-    /// Legacy cases carry no `expected_outcome`; they must keep requiring a
-    /// verified completion.
+    /// Cases without `expected_outcome` require normal task completion.
     #[test]
     fn expected_outcome_defaults_to_completed() {
         let case: EvaluationCase =
             serde_yaml::from_str("id: x\nname: x\ntask: t\nexpect: { program: echo, args: [] }\n")
                 .unwrap();
         assert_eq!(case.expected_outcome, ExpectedOutcome::Completed);
-    }
-
-    #[test]
-    fn expected_outcome_can_opt_into_completed_unverified() {
-        let case: EvaluationCase = serde_yaml::from_str(
-            "id: x\nname: x\ntask: t\nexpected_outcome: completed_unverified\nexpect: { program: echo, args: [] }\n",
-        )
-        .unwrap();
-        assert_eq!(case.expected_outcome, ExpectedOutcome::CompletedUnverified);
     }
 }
 

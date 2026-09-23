@@ -193,8 +193,6 @@ fn overview(
     lines.push(kv(
         t.trace_kv_goal,
         t.trace_metrics_goal
-            .replacen("{}", &s.verification, 1)
-            .replacen("{}", &s.verification_runs.to_string(), 1)
             .replacen("{}", &s.compact_count.to_string(), 1)
             .replacen("{}", &s.subagent_started.to_string(), 1),
         state,

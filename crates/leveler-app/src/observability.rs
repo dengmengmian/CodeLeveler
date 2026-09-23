@@ -11,7 +11,6 @@ use leveler_client_protocol::{
 };
 use leveler_core::SessionId;
 use leveler_engine::EngineEvent;
-use leveler_lifecycle::VerificationStatus;
 use leveler_storage::{
     Database, EventRecord, EventStore, ModelRequestStore, SessionRepository, TurnRepository,
 };
@@ -112,16 +111,6 @@ pub async fn query_observability(
         .filter(|t| t.status == "interrupted" || (t.status == "running" && t.finished_at.is_none()))
         .count() as u32;
 
-    // Session-wide: the verdict is the latest one recorded, which may sit
-    // outside the event window entirely.
-    let verdict_rows = db
-        .load_by_types(
-            session_id,
-            &["verification_started", "verification_finished"],
-        )
-        .await
-        .map_err(AppError::from)?;
-    let verdict_decoded = decode_records(&verdict_rows)?;
     let session_duration_ms = parse_millis(&session.created_at)
         .zip(parse_millis(&session.updated_at))
         .and_then(|(a, b)| u64::try_from(b - a).ok());
@@ -177,8 +166,6 @@ pub async fn query_observability(
             request_retries,
             tool_started: count("tool_call_started"),
             tool_finished: count("tool_call_finished"),
-            verification_runs: count("verification_started"),
-            verification: verification_verdict(&verdict_decoded).to_string(),
             compact_count: count("compacted"),
             subagent_started: count("sub_agent_started"),
             duration_ms: session_duration_ms,
@@ -353,64 +340,6 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             "info".into(),
             vec![("Outcome".into(), format!("{outcome:?}"))],
         ),
-        EngineEvent::VerificationStarted => (
-            ObservationClass::Verify,
-            "verify started".into(),
-            String::new(),
-            "running".into(),
-            vec![],
-        ),
-        EngineEvent::VerificationCheck {
-            name,
-            status,
-            observation,
-            disposition,
-            ..
-        } => (
-            ObservationClass::Verify,
-            name.clone(),
-            status.clone(),
-            if status == "failed" { "fail" } else { "info" }.into(),
-            {
-                let mut fields = vec![
-                    ("Check".into(), name.clone()),
-                    ("Status".into(), status.clone()),
-                ];
-                if let Some(observation) = observation {
-                    fields.push(("Observation".into(), format!("{observation:?}")));
-                }
-                if let Some(disposition) = disposition {
-                    fields.push(("Disposition".into(), format!("{disposition:?}")));
-                }
-                fields
-            },
-        ),
-        EngineEvent::VerificationFinished {
-            passed,
-            verification,
-        } => {
-            // The completion gate is not a result. A run that proved nothing
-            // is not "ok", and it has not "passed".
-            let recorded = row_verification(*verification, *passed);
-            (
-                ObservationClass::Verify,
-                "verify finished".into(),
-                String::new(),
-                match recorded {
-                    Some(VerificationStatus::Passed) => "ok",
-                    Some(VerificationStatus::Failed) => "fail",
-                    _ => "info",
-                }
-                .into(),
-                vec![(
-                    "Verification".into(),
-                    recorded
-                        .map(|status| status.as_str())
-                        .unwrap_or("unavailable")
-                        .to_string(),
-                )],
-            )
-        }
         EngineEvent::SubAgentStarted {
             id,
             nickname,
@@ -882,52 +811,6 @@ fn lanes_for(rows: &[leveler_storage::ModelRequestRecord]) -> Vec<UiLaneAccounti
     ]
 }
 
-/// What one `verification_finished` row says about verification.
-///
-/// `None` is "this row does not say", and it is returned for exactly one
-/// case: a row written before the gate and the truth were split, whose gate
-/// was open. `passed: true` cannot distinguish `Passed` from `NotRun`, so
-/// nothing is claimed. A closed gate that failed can only mean the checks
-/// failed, which is why that one case is derived.
-fn row_verification(
-    verification: Option<VerificationStatus>,
-    passed: bool,
-) -> Option<VerificationStatus> {
-    match verification {
-        Some(status) => Some(status),
-        None if passed => None,
-        None => Some(VerificationStatus::Failed),
-    }
-}
-
-/// The latest verdict the runtime recorded, never a count of attempts.
-/// `not_run` means nothing started; `unavailable` means something started and
-/// the log records no verdict for it.
-fn verification_verdict(decoded: &[(EventRecord, EngineEvent)]) -> &'static str {
-    let mut verdict: Option<VerificationStatus> = None;
-    let mut started = false;
-    for (_, ev) in decoded {
-        match ev {
-            EngineEvent::VerificationStarted => {
-                started = true;
-                verdict = None;
-            }
-            EngineEvent::VerificationFinished {
-                passed,
-                verification,
-            } => {
-                verdict = row_verification(*verification, *passed);
-            }
-            _ => {}
-        }
-    }
-    match (started, verdict) {
-        (_, Some(status)) => status.as_str(),
-        (true, None) => VerificationStatus::Unavailable.as_str(),
-        (false, None) => VerificationStatus::NotRun.as_str(),
-    }
-}
-
 fn request_stats(
     rows: &[leveler_storage::ModelRequestRecord],
 ) -> (Option<u64>, Option<u64>, u32, u32, u64, u64) {
@@ -1046,16 +929,6 @@ mod tests {
             },
         )
         .await;
-        persist(&db, &sid, EngineEvent::VerificationStarted).await;
-        persist(
-            &db,
-            &sid,
-            EngineEvent::VerificationFinished {
-                passed: false,
-                verification: Some(VerificationStatus::Failed),
-            },
-        )
-        .await;
         persist(
             &db,
             &sid,
@@ -1143,12 +1016,6 @@ mod tests {
             "the child's contribution must be readable from the trace: {:?}",
             loaded.window
         );
-        assert!(
-            loaded
-                .window
-                .iter()
-                .any(|r| r.class == ObservationClass::Verify)
-        );
         assert_eq!(loaded.agents.len(), 1);
         assert_eq!(loaded.agents[0].nickname, "Reviewer");
         assert!(
@@ -1210,7 +1077,7 @@ mod tests {
         let sid = SessionId::new(rec.id.clone());
         SessionRepository::new(&db).create(&rec).await.unwrap();
 
-        // 40+20+10+8 pairs = 156 tool events; plus 10 verify markers → 166.
+        // 40+20+10+8 pairs plus 10 progress markers keeps the trace window busy.
         for i in 0..40 {
             persist(&db, &sid, tool_start(&format!("r{i}"), "read_file")).await;
             persist(&db, &sid, tool_end(&format!("r{i}"), "read_file", false)).await;
@@ -1228,7 +1095,14 @@ mod tests {
             persist(&db, &sid, tool_end(&format!("h{i}"), "run_command", false)).await;
         }
         for _ in 0..10 {
-            persist(&db, &sid, EngineEvent::VerificationStarted).await;
+            persist(
+                &db,
+                &sid,
+                EngineEvent::AssistantDelta {
+                    text: "progress".into(),
+                },
+            )
+            .await;
         }
 
         let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
@@ -1526,7 +1400,14 @@ mod tests {
         )
         .await;
         for _ in 0..30 {
-            persist(&db, &sid, EngineEvent::VerificationStarted).await;
+            persist(
+                &db,
+                &sid,
+                EngineEvent::AssistantDelta {
+                    text: "progress".into(),
+                },
+            )
+            .await;
         }
 
         let loaded = query_observability(&db, &sid, None, 0, 20).await.unwrap();
@@ -1716,15 +1597,9 @@ mod accounting_tests {
     //! what it cost or which lane spent it.
     use super::*;
     use leveler_core::now;
-    use leveler_engine::EngineEvent;
     use leveler_storage::{
-        EventStore, ModelRequestRecord, ModelRequestStore, SessionRecord, SessionRepository,
+        ModelRequestRecord, ModelRequestStore, SessionRecord, SessionRepository,
     };
-
-    async fn persist(db: &Database, sid: &SessionId, ev: EngineEvent) {
-        let (ty, payload) = ev.to_row().unwrap();
-        db.append(sid, None, &ty, &payload, now()).await.unwrap();
-    }
 
     fn req(
         id: &str,
@@ -1850,48 +1725,6 @@ mod accounting_tests {
             loaded.requests.len(),
             leveler_client_protocol::OBSERVABILITY_REQUESTS_MAX,
             "the display list stays capped"
-        );
-    }
-
-    #[tokio::test]
-    async fn verification_reports_its_verdict_not_only_that_it_ran() {
-        let (db, sid) = seeded().await;
-        let before = query_observability(&db, &sid, None, 0, 80).await.unwrap();
-        assert_eq!(before.session.verification, "not_run");
-
-        persist(&db, &sid, EngineEvent::VerificationStarted).await;
-        let running = query_observability(&db, &sid, None, 0, 80).await.unwrap();
-        assert_eq!(
-            running.session.verification, "unavailable",
-            "started and never finished is not a verdict"
-        );
-
-        persist(
-            &db,
-            &sid,
-            EngineEvent::VerificationFinished {
-                passed: false,
-                verification: Some(VerificationStatus::Failed),
-            },
-        )
-        .await;
-        let failed = query_observability(&db, &sid, None, 0, 80).await.unwrap();
-        assert_eq!(failed.session.verification, "failed");
-
-        persist(&db, &sid, EngineEvent::VerificationStarted).await;
-        persist(
-            &db,
-            &sid,
-            EngineEvent::VerificationFinished {
-                passed: true,
-                verification: Some(VerificationStatus::Passed),
-            },
-        )
-        .await;
-        let passed = query_observability(&db, &sid, None, 0, 80).await.unwrap();
-        assert_eq!(
-            passed.session.verification, "passed",
-            "the latest verdict wins"
         );
     }
 }

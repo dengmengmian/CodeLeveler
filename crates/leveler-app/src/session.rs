@@ -1,7 +1,7 @@
 //! Session orchestration: run, chat and resume through the task engine.
 //!
 //! Every path delegates to `leveler-engine`'s [`TaskEngine`], so turns, tool
-//! calls, approvals and verification results are persisted before observers
+//! calls and approvals are persisted before observers
 //! see them, and an interrupted run resumes from its exact transcript. The
 //! `AgentEvent` observer signature is kept as a temporary shim until the UIs
 //! consume `EngineEvent` directly (plan B6).
@@ -12,58 +12,13 @@ use std::sync::atomic::AtomicBool;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::coding::{TaskReport, TaskSpec};
-use leveler_agent::{AdvisoryKind, AgentEvent, AgentOutcome, AutoClarify, Clarifier, StopReason};
+use leveler_agent::{AdvisoryKind, AgentEvent, AgentOutcome, AutoClarify, Clarifier};
 use leveler_engine::{EngineError, EngineEvent, ExecutionKind, TaskOutcome};
 use leveler_execution::{Approver, PermissionProfile};
 use leveler_model::{ContentPart, ModelRef};
 use leveler_storage::SessionRepository;
-use leveler_verifier::{CheckStatus, Verdict, VerificationReport};
 
 use crate::{AppError, Application};
-
-/// Map a run result to the legacy persisted session status/state columns.
-/// (The engine additionally stamps the `outcome` column.)
-fn verification_failure_summary(report: &VerificationReport) -> String {
-    if !report.scope_ok {
-        return format!(
-            "modified files outside allowed scope: {}",
-            report.scope_violations.join(", ")
-        );
-    }
-    let failed_gates = report.failed_gates();
-    let failed: Vec<String> = failed_gates
-        .iter()
-        .map(|check| failed_gate_label(check))
-        .collect();
-    if failed.is_empty() {
-        "verification did not pass".to_string()
-    } else {
-        format!("failed gate(s): {}", failed.join(", "))
-    }
-}
-
-/// Terminal-marker label for one failed gate: the check name plus the parsed
-/// failing test ids (capped at two, with the remainder as a count) so the
-/// marker carries evidence instead of contradicting the agent's own summary
-/// unexplained. Falls back to the bare name when no test ids were parsed
-/// (build/fmt failures, unparsable output).
-fn failed_gate_label(check: &leveler_verifier::CheckOutcome) -> String {
-    if check.failed_tests.is_empty() {
-        return check.name.clone();
-    }
-    let shown: Vec<&str> = check
-        .failed_tests
-        .iter()
-        .take(2)
-        .map(String::as_str)
-        .collect();
-    let rest = check.failed_tests.len() - shown.len();
-    if rest == 0 {
-        format!("{} ({})", check.name, shown.join(", "))
-    } else {
-        format!("{} ({}, +{} more)", check.name, shown.join(", "), rest)
-    }
-}
 
 fn goal_from_content(content: &[ContentPart]) -> String {
     content
@@ -257,98 +212,24 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             is_error,
         },
         EngineEvent::RunFinished { text } => AgentEvent::Finished(text),
-        EngineEvent::VerificationStarted => AgentEvent::VerificationStarted,
-        EngineEvent::VerificationCheck {
-            name,
-            status,
-            evidence,
-            ..
-        } => AgentEvent::VerificationCheck {
-            name,
-            // Parsed by the vocabulary's owner. A spelling this build cannot
-            // read is not renderable as a check, and filing it under `Skipped`
-            // would invent the reason it did not run.
-            status: CheckStatus::from_wire(&status)?,
-            evidence,
-        },
-        EngineEvent::VerificationFinished {
-            passed,
-            verification,
-        } => AgentEvent::VerificationFinished {
-            passed,
-            verification,
-        },
         // Engine lifecycle & strategy events: persisted; engine-aware
         // consumers surface them directly.
         _ => return None,
     })
 }
 
-/// Map the engine's terminal report onto the app-level stop reason the UI
-/// renders. Two orthogonal facts arrive — how the run ended, and what the
-/// project's checks said — and both are surfaced without folding one into
-/// the other: a completed run with failed checks is "done, checks failed",
-/// never "incomplete" and never a bare "done".
+/// Map the engine's terminal report onto the app-level result.
 fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
-    use leveler_lifecycle::VerificationStatus;
-    // A run "did work" if it claimed completion or actually touched files. A
-    // pure conversational answer did neither, so it carries no verification
-    // verdict — it just ends as "answered".
-    let did_work = report.stop_reason == StopReason::Completed || !report.modified_files.is_empty();
-    let (stop_reason, detail) = match report.outcome {
-        // A guard-forced Incomplete stop keeps its honest stop reason: the
-        // checks describe the tree, not the task (R004 F4).
-        TaskOutcome::Completed if did_work && report.stop_reason != StopReason::Incomplete => {
-            match report.verification_status {
-                VerificationStatus::Passed => (StopReason::Completed, None),
-                VerificationStatus::Failed => (
-                    StopReason::CompletedChecksFailed,
-                    report
-                        .verification
-                        .as_ref()
-                        .map(verification_failure_summary),
-                ),
-                VerificationStatus::NotRun | VerificationStatus::Unavailable => (
-                    StopReason::CompletedUnverified,
-                    Some(unverified_detail(&report)),
-                ),
-            }
-        }
-        // Pure Q&A, or any other terminal reason: keep the executor's reason.
-        _ => (report.stop_reason, None),
-    };
     Ok(AgentOutcome {
         final_text: report.final_text,
         rounds: report.rounds,
         modified_files: report.modified_files,
-        stop_reason,
-        stop_detail: detail.or(report.stop_detail),
+        stop_reason: report.stop_reason,
+        stop_detail: report.stop_detail,
         budget_exhaustion: None,
         progress: Default::default(),
         objective: leveler_lifecycle::ObjectiveAnchor::from_user_message(""),
     })
-}
-
-/// Why the project's checks produced no verdict, as the stable UI token or
-/// the verifier's own reason.
-fn unverified_detail(report: &TaskReport) -> String {
-    if report.modified_files.is_empty() {
-        // Stable token for TUI: "◇ 结束 · 未改源码" (not "未验证" delivery).
-        return leveler_client_protocol::REASON_NO_CODE_CHANGES.to_string();
-    }
-    match &report.verification {
-        // The project configured no gating checks, so there was nothing to
-        // verify against. That is a calm "not auto-verified" finish, not a
-        // warning about THIS task.
-        Some(verification) if !verification.has_gating_checks() => {
-            leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
-        }
-        Some(verification) => match verification.verdict() {
-            Verdict::Unverified(reason) => reason,
-            _ => leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string(),
-        },
-        None => leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string(),
-    }
 }
 
 pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
@@ -545,8 +426,7 @@ impl Application {
             .map_err(app_error_from_engine)
     }
 
-    /// The direct-task spec for this repository: verification is discovered
-    /// from `.leveler/config.yaml` or the repo's manifests.
+    /// The direct-task spec for this repository.
     fn direct_spec(&self, goal: String, mode: PermissionProfile, sandbox: bool) -> TaskSpec {
         TaskSpec {
             runtime: leveler_agent::coding::RuntimeTaskSpec {
@@ -559,8 +439,6 @@ impl Application {
                 repository: self.layout.repo_root.clone(),
                 mode,
                 sandbox,
-                verification: leveler_verifier::discover::plan_for_repo(&self.layout.repo_root),
-                base_commit: None,
             },
         }
     }
@@ -901,7 +779,7 @@ impl Application {
         session_id: &leveler_core::SessionId,
     ) -> Result<Option<EngineEvent>, AppError> {
         use leveler_engine::TaskTerminal;
-        use leveler_lifecycle::{AgentState, SessionStatus, VerificationStatus};
+        use leveler_lifecycle::{AgentState, SessionStatus};
 
         let db = self.open_database().await?;
         let engine = self.task_engine(&db)?;
@@ -946,7 +824,6 @@ impl Application {
                 session_id,
                 TaskTerminal {
                     outcome: TaskOutcome::Cancelled,
-                    verification: VerificationStatus::NotRun,
                     reason: Some("user_cancelled_task".to_string()),
                     failure: None,
                     stop: None,
@@ -1118,8 +995,6 @@ mod unattended_limits_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_client_protocol::RuntimeEvent;
-    use leveler_engine::TaskOutcome;
     use leveler_execution::PermissionProfile;
 
     #[test]
@@ -1143,378 +1018,6 @@ mod tests {
             Some(PermissionProfile::RequestApproval)
         );
         assert_eq!(mode_from_str("bogus"), None);
-    }
-
-    fn report(outcome: TaskOutcome, stop_reason: StopReason, modified: &[&str]) -> TaskReport {
-        report_with(
-            outcome,
-            leveler_lifecycle::VerificationStatus::NotRun,
-            stop_reason,
-            modified,
-        )
-    }
-
-    fn report_with(
-        outcome: TaskOutcome,
-        verification_status: leveler_lifecycle::VerificationStatus,
-        stop_reason: StopReason,
-        modified: &[&str],
-    ) -> TaskReport {
-        TaskReport {
-            outcome,
-            final_text: String::new(),
-            modified_files: modified.iter().map(|s| s.to_string()).collect(),
-            verification: None,
-            verification_status,
-            stop_reason,
-            stop_detail: None,
-            rounds: 1,
-            windows: 1,
-            execution_duration_ms: 0,
-            review: None,
-            completion_warnings: Vec::new(),
-        }
-    }
-
-    /// R004 F4: a guard-forced Incomplete stop must never be laundered into
-    /// "Completed" by a green gate — gates describe the tree, not the task.
-    #[test]
-    fn incomplete_stop_survives_a_verified_outcome() {
-        let task = report_with(
-            TaskOutcome::Completed,
-            leveler_lifecycle::VerificationStatus::Passed,
-            StopReason::Incomplete,
-            &["a.rs"],
-        );
-        let out = report_to_result(task).unwrap();
-        assert_eq!(out.stop_reason, StopReason::Incomplete);
-
-        let task = report(TaskOutcome::Completed, StopReason::Incomplete, &["a.rs"]);
-        let out = report_to_result(task).unwrap();
-        assert_eq!(out.stop_reason, StopReason::Incomplete);
-    }
-
-    #[test]
-    fn executor_stop_detail_survives_without_a_stronger_report_detail() {
-        let mut task = report(TaskOutcome::BudgetLimited, StopReason::BudgetExhausted, &[]);
-        task.stop_detail = Some("budget exhausted: model_tokens spent=120 limit=100".into());
-
-        let out = report_to_result(task).unwrap();
-
-        assert_eq!(
-            out.stop_detail.as_deref(),
-            Some("budget exhausted: model_tokens spent=120 limit=100")
-        );
-    }
-
-    #[test]
-    fn no_progress_detail_survives_report_and_runtime_event_mapping() {
-        const DETAIL: &str = "no-progress streak; all-refused rounds short-circuited";
-        let mut task = report(TaskOutcome::Failed, StopReason::Incomplete, &[]);
-        task.stop_detail = Some(DETAIL.into());
-
-        let RuntimeEvent::TurnIncomplete { reason } =
-            crate::event_bridge::turn_runtime_event(report_to_result(task))
-        else {
-            panic!("an incomplete report must emit TurnIncomplete");
-        };
-
-        assert_eq!(reason, DETAIL);
-    }
-
-    #[test]
-    fn completed_unverified_work_is_not_reported_as_incomplete() {
-        // A finished run that did work but leveler could not independently
-        // verify must stay distinct from a genuinely-incomplete run
-        // (Stalled/audit-failed), so the UI says "done, unverified" not "not
-        // completed".
-        let out = report_to_result(report(
-            TaskOutcome::Completed,
-            StopReason::Completed,
-            &["README.md"],
-        ))
-        .unwrap();
-        assert_eq!(out.stop_reason, StopReason::CompletedUnverified);
-    }
-
-    #[test]
-    fn completed_without_tracked_changes_explains_why_checks_did_not_run() {
-        let mut task = report(TaskOutcome::Completed, StopReason::Completed, &[]);
-        task.stop_detail = Some("executor fallback".into());
-        let out = report_to_result(task).unwrap();
-
-        assert_eq!(out.stop_reason, StopReason::CompletedUnverified);
-        assert_eq!(
-            out.stop_detail.as_deref(),
-            Some(leveler_client_protocol::REASON_NO_CODE_CHANGES)
-        );
-    }
-
-    #[test]
-    fn completed_changes_without_a_plan_explain_that_no_gate_was_found() {
-        let out = report_to_result(report(
-            TaskOutcome::Completed,
-            StopReason::Completed,
-            &["README.md"],
-        ))
-        .unwrap();
-
-        assert_eq!(out.stop_reason, StopReason::CompletedUnverified);
-        assert_eq!(
-            out.stop_detail.as_deref(),
-            Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION)
-        );
-    }
-
-    /// §13 C: the durable spelling reaches the harness event as the status it
-    /// means, in the canonical spelling and in the older one.
-    #[test]
-    fn a_durable_check_status_projects_to_the_status_it_means() {
-        for (durable, expected) in [
-            ("passed", leveler_verifier::CheckStatus::Passed),
-            ("failed", leveler_verifier::CheckStatus::Failed),
-            ("skipped", leveler_verifier::CheckStatus::Skipped),
-            ("tool_missing", leveler_verifier::CheckStatus::ToolMissing),
-            ("toolmissing", leveler_verifier::CheckStatus::ToolMissing),
-            (
-                "environment_unavailable",
-                leveler_verifier::CheckStatus::EnvironmentUnavailable,
-            ),
-            (
-                "environmentunavailable",
-                leveler_verifier::CheckStatus::EnvironmentUnavailable,
-            ),
-        ] {
-            let projected = engine_event_to_agent(EngineEvent::VerificationCheck {
-                name: "test".to_string(),
-                status: durable.to_string(),
-                observation: None,
-                disposition: None,
-                execution: None,
-                evidence: None,
-            });
-            match projected {
-                Some(AgentEvent::VerificationCheck { status, .. }) => {
-                    assert_eq!(status, expected, "{durable}")
-                }
-                other => panic!("{durable}: expected a check event, got {other:?}"),
-            }
-        }
-    }
-
-    /// A spelling this build cannot read is dropped rather than filed as a
-    /// skip: the CLI cannot render a status it does not know, and calling it
-    /// `Skipped` would invent the reason it did not run.
-    #[test]
-    fn a_check_status_this_build_cannot_read_is_not_projected_as_a_skip() {
-        let projected = engine_event_to_agent(EngineEvent::VerificationCheck {
-            name: "test".to_string(),
-            status: "something-else".to_string(),
-            observation: None,
-            disposition: None,
-            execution: None,
-            evidence: None,
-        });
-        assert!(projected.is_none(), "{projected:?}");
-    }
-
-    #[test]
-    fn completed_changes_preserve_the_tool_missing_reason() {
-        let mut task = report_with(
-            TaskOutcome::Completed,
-            leveler_lifecycle::VerificationStatus::Unavailable,
-            StopReason::Completed,
-            &["src/main.ts"],
-        );
-        task.verification = Some(leveler_verifier::VerificationReport {
-            checks: vec![leveler_verifier::CheckOutcome {
-                name: "tsc".to_string(),
-                kind: leveler_verifier::CheckKind::Build,
-                gating: true,
-                observation: leveler_verifier::CheckObservation::NotRun(
-                    leveler_verifier::NotRunReason::ToolMissing,
-                ),
-                disposition: leveler_verifier::GateDisposition::Required,
-                execution: None,
-                evidence: String::new(),
-                failure: None,
-                failed_tests: std::collections::BTreeSet::new(),
-            }],
-            scope_ok: true,
-            scope_violations: Vec::new(),
-        });
-
-        let out = report_to_result(task).unwrap();
-
-        assert_eq!(
-            out.stop_detail.as_deref(),
-            Some("verification incomplete: tsc (tool missing)")
-        );
-    }
-
-    #[test]
-    fn zero_gating_checks_report_surfaces_the_token_not_the_raw_reason() {
-        // When the project configured no gating checks, the terminal detail
-        // must be the stable REASON_NO_AUTOMATIC_VERIFICATION token — not the
-        // verifier's raw English reason ("no gating verification checks were
-        // configured"), which used to leak into the UI as a ⚠ warning.
-        let mut task = report(
-            TaskOutcome::Completed,
-            StopReason::Completed,
-            &["src/lib.rs"],
-        );
-        task.verification = Some(leveler_verifier::VerificationReport {
-            checks: Vec::new(),
-            scope_ok: true,
-            scope_violations: Vec::new(),
-        });
-
-        let out = report_to_result(task).unwrap();
-
-        assert_eq!(out.stop_reason, StopReason::CompletedUnverified);
-        assert_eq!(
-            out.stop_detail.as_deref(),
-            Some(leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION)
-        );
-        assert_ne!(
-            out.stop_detail.as_deref(),
-            Some("no gating verification checks were configured")
-        );
-    }
-
-    /// Case 3 at the UI seam: the model declared completion and the checks
-    /// failed. The marker says both — done, checks failed — and carries the
-    /// parsed failing test ids, not just the check name.
-    #[test]
-    fn checks_failed_marker_names_the_failing_tests() {
-        use leveler_verifier::{
-            CheckExecution, CheckKind, CheckObservation, CheckOutcome, GateDisposition,
-            VerificationReport,
-        };
-        let mut task = report_with(
-            TaskOutcome::Completed,
-            leveler_lifecycle::VerificationStatus::Failed,
-            StopReason::Completed,
-            &["src/lib.rs"],
-        );
-        task.verification = Some(VerificationReport {
-            checks: vec![CheckOutcome {
-                name: "cargo test".into(),
-                kind: CheckKind::Test,
-                gating: true,
-                observation: CheckObservation::Failed,
-                disposition: GateDisposition::Required,
-                execution: Some(CheckExecution {
-                    program: "cargo".into(),
-                    args: vec!["test".into()],
-                    exit_code: Some(1),
-                    timed_out: false,
-                }),
-                evidence: String::new(),
-                failure: None,
-                failed_tests: ["permission_grants::always_allow_grants_survive_reassembly"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-            }],
-            scope_ok: true,
-            scope_violations: Vec::new(),
-        });
-
-        let out = report_to_result(task).unwrap();
-
-        assert_eq!(out.stop_reason, StopReason::CompletedChecksFailed);
-        assert_eq!(
-            out.stop_detail.as_deref(),
-            Some(
-                "failed gate(s): cargo test \
-                 (permission_grants::always_allow_grants_survive_reassembly)"
-            )
-        );
-    }
-
-    #[test]
-    fn checks_failed_marker_caps_the_test_list_and_keeps_the_count() {
-        // Many failing tests must not flood the one-line marker: show the
-        // first two ids and the size of the remainder.
-        use leveler_verifier::{
-            CheckExecution, CheckKind, CheckObservation, CheckOutcome, GateDisposition,
-            VerificationReport,
-        };
-        let mut task = report_with(
-            TaskOutcome::Completed,
-            leveler_lifecycle::VerificationStatus::Failed,
-            StopReason::Completed,
-            &["src/lib.rs"],
-        );
-        task.verification = Some(VerificationReport {
-            checks: vec![CheckOutcome {
-                name: "cargo test".into(),
-                kind: CheckKind::Test,
-                gating: true,
-                observation: CheckObservation::Failed,
-                disposition: GateDisposition::Required,
-                execution: Some(CheckExecution {
-                    program: "cargo".into(),
-                    args: vec!["test".into()],
-                    exit_code: Some(1),
-                    timed_out: false,
-                }),
-                evidence: String::new(),
-                failure: None,
-                failed_tests: ["a::one", "b::two", "c::three", "d::four"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-            }],
-            scope_ok: true,
-            scope_violations: Vec::new(),
-        });
-
-        let out = report_to_result(task).unwrap();
-
-        assert_eq!(
-            out.stop_detail.as_deref(),
-            Some("failed gate(s): cargo test (a::one, b::two, +2 more)")
-        );
-    }
-
-    #[test]
-    fn read_only_answer_stays_answered_not_unverified() {
-        // A conversational reply that changed nothing must not be stamped
-        // "done, unverified" — there was nothing to verify.
-        let out =
-            report_to_result(report(TaskOutcome::Completed, StopReason::Answered, &[])).unwrap();
-        assert_eq!(out.stop_reason, StopReason::Answered);
-    }
-
-    #[test]
-    fn verified_work_is_reported_completed_even_when_model_only_answered() {
-        // leveler's gate passed on real edits, but the model ended with prose
-        // instead of update_goal(complete). The passing gate is authoritative:
-        // surface it as done, not a bare "answered".
-        let out = report_to_result(report_with(
-            TaskOutcome::Completed,
-            leveler_lifecycle::VerificationStatus::Passed,
-            StopReason::Answered,
-            &["diff.go"],
-        ))
-        .unwrap();
-        assert_eq!(out.stop_reason, StopReason::Completed);
-    }
-
-    #[test]
-    fn verified_read_only_answer_stays_answered() {
-        // A gate that incidentally passes on a no-edit Q&A must not promote the
-        // reply to "completed" — nothing was done.
-        let out = report_to_result(report_with(
-            TaskOutcome::Completed,
-            leveler_lifecycle::VerificationStatus::Passed,
-            StopReason::Answered,
-            &[],
-        ))
-        .unwrap();
-        assert_eq!(out.stop_reason, StopReason::Answered);
     }
 }
 

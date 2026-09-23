@@ -102,10 +102,7 @@ fn stop_reason_wording(reason: StopReason, exhaustion: Option<&BudgetExhaustion>
         StopReason::Blocked => "it declared the task blocked",
         StopReason::Stalled => "it went quiet without resolving the task",
         StopReason::Incomplete => "it stopped without finishing",
-        StopReason::Completed
-        | StopReason::Answered
-        | StopReason::CompletedUnverified
-        | StopReason::CompletedChecksFailed => "",
+        StopReason::Completed | StopReason::Answered => "",
     }
     .to_string()
 }
@@ -114,10 +111,7 @@ fn stop_reason_wording(reason: StopReason, exhaustion: Option<&BudgetExhaustion>
 fn child_stop(reason: StopReason) -> leveler_lifecycle::ChildStop {
     use leveler_lifecycle::ChildStop;
     match reason {
-        StopReason::Completed
-        | StopReason::Answered
-        | StopReason::CompletedUnverified
-        | StopReason::CompletedChecksFailed => ChildStop::Completed,
+        StopReason::Completed | StopReason::Answered => ChildStop::Completed,
         StopReason::BudgetExhausted | StopReason::TurnLimitReached => ChildStop::Budget,
         StopReason::Blocked | StopReason::Stalled | StopReason::Incomplete => ChildStop::Incomplete,
     }
@@ -788,10 +782,7 @@ async fn run_prepared_sub_agent(
         Ok(outcome) => {
             let completed = matches!(
                 outcome.stop_reason,
-                StopReason::Completed
-                    | StopReason::Answered
-                    | StopReason::CompletedUnverified
-                    | StopReason::CompletedChecksFailed
+                StopReason::Completed | StopReason::Answered
             );
             // A non-clean stop's `final_text` is usually the SYNTHETIC stop
             // sentence ("reached the N-round ceiling…"), not the child's

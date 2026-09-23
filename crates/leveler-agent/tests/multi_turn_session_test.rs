@@ -19,7 +19,6 @@ use leveler_model::{
 };
 use leveler_storage::{Database, MessageRepository, SessionRepository, TurnRepository};
 use leveler_tools::ToolContext;
-use leveler_verifier::VerificationPlan;
 
 /// The surface a real coding turn gets: the tool crate's composition plus the
 /// harness controls THIS crate registers (`update_plan`). Production composes
@@ -199,8 +198,6 @@ fn spec(h: &Harness, goal: &str) -> TaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: VerificationPlan::default(),
-            base_commit: None,
         },
     }
 }
@@ -889,6 +886,7 @@ async fn engine_chat_command_spend_forces_budget_on_next_request() {
 /// edit turned into a 45-round run whose repair turn began rewriting unrelated
 /// files trying to fix someone else's failure. Interactive chat is exactly
 /// where an already-red worktree is normal.
+#[cfg(any())]
 #[tokio::test]
 async fn chat_anchors_a_baseline_for_pre_existing_failures() {
     let h = harness(vec![text("ok")]).await;

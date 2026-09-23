@@ -36,14 +36,11 @@ pub fn should_refresh_trace(event: &leveler_client_protocol::RuntimeEvent) -> bo
         ToolCallStarted { .. }
             | ToolCallCompleted { .. }
             | TokenUsage { .. }
-            | VerificationUpdated { .. }
             | SubAgentUpdated { .. }
             | TurnCompleted
             | TurnAnswered
             | TurnFailed { .. }
             | TurnIncomplete { .. }
-            | TurnCompletedUnverified { .. }
-            | TurnCompletedChecksFailed { .. }
             | TurnCancelled
             | ContextCompacted { .. }
             | CheckpointCreated { .. }

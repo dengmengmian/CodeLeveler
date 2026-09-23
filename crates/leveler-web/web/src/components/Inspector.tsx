@@ -6,7 +6,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { childDisplayName, shortFingerprint } from '../lib/agentDraft';
 import { choiceOrdinal, splitChoiceOption } from '../lib/choiceLabel';
 import { CTRL_ICON } from '../lib/icons';
-import { completionTruth, trustLabel, type ArtifactFacts } from '../lib/completionTruth';
+import { completionTruth, type ArtifactFacts } from '../lib/completionTruth';
 import { formatElapsed } from '../lib/format';
 import {
   childStateLabel,
@@ -22,22 +22,9 @@ import {
 import { presentTurnEnd } from '../lib/turn';
 import { useBridge } from '../state/bridge';
 import { useAppDispatch, useAppState, type SessionView, type SubAgentView } from '../state/store';
-import type { CheckState, UiApprovalRequest, UiClarificationRequest,
+import type { UiApprovalRequest, UiClarificationRequest,
   UiMemoryKind,
 } from '../types/protocol';
-
-const CHECK_GLYPH: Record<CheckState, string> = {
-  passed: '✓',
-  running: '◍',
-  failed: '✗',
-  skipped: '·',
-  not_run: '△',
-  // A check that could not run is not a check that was skipped, so it does
-  // not borrow the skip's mark.
-  tool_missing: '?',
-  environment_unavailable: '!',
-  unknown: '?',
-};
 
 export function Inspector() {
   const state = useAppState();
@@ -64,8 +51,6 @@ export function Inspector() {
                 return <ResultCard key="result" current={current} />;
               case 'plan':
                 return <PlanSection key="plan" current={current} />;
-              case 'verification':
-                return <VerificationSection key="verification" current={current} />;
               case 'changes':
                 return (
                   <InspectorBlock key="changes" title="CHANGES">
@@ -164,8 +149,6 @@ function ResultCard({ current }: { current: SessionView }) {
       </div>
       {truth && truth.kind !== 'idle' && (
         <dl className="kv runtime-kv">
-          <dt>Trust</dt>
-          <dd>{trustLabel(truth.trust)}</dd>
           <dt>Artifacts</dt>
           <dd>{artifactLine(truth.artifacts)}</dd>
         </dl>
@@ -189,43 +172,6 @@ function PlanSection({ current }: { current: SessionView }) {
         {plan.live ? '已完成' : '最后记录'} {plan.done}/{plan.total}
       </div>
       {plan.active && <div className="t-detail">进行中：{plan.active}</div>}
-    </InspectorBlock>
-  );
-}
-
-function VerificationSection({ current }: { current: SessionView }) {
-  const verification = current.verification;
-  if (!verification || verification.checks.length === 0) return null;
-  return (
-    <InspectorBlock title="VERIFICATION">
-      <div className="checks">
-        {verification.checks.map((c) => {
-          const cls = c.status === 'passed' ? 'ok' : c.status === 'failed' ? 'bad' : 'wait';
-          return (
-            <div className={`check ${cls}`} key={c.name}>
-              <span className="st">{CHECK_GLYPH[c.status]}</span>
-              <span>{c.name}</span>
-            </div>
-          );
-        })}
-      </div>
-      {verification.checks
-        .filter((c) => c.evidence)
-        .map((c) => (
-          <div className="diff-patch" key={`${c.name}-ev`}>
-            {c.evidence}
-          </div>
-        ))}
-      <dl className="kv" style={{ marginTop: 8 }}>
-        <dt>结果</dt>
-        <dd className={verification.passed ? 'good' : ''}>
-          {verification.passed === null
-            ? '进行中'
-            : verification.passed
-              ? '通过'
-              : '未通过'}
-        </dd>
-      </dl>
     </InspectorBlock>
   );
 }

@@ -11,7 +11,7 @@ use crate::PermissionProfile;
 use leveler_core::{SessionId, ToolCallId};
 use leveler_model::ModelRef;
 
-use crate::{UiCompletionReport, UiDiff, UiPlan, UiVerification};
+use crate::{UiCompletionReport, UiDiff, UiPlan};
 
 /// Identifies a single assistant/user message in the transcript.
 ///
@@ -105,7 +105,6 @@ mod tests {
             active_tools: Vec::new(),
             active_background_tasks: Vec::new(),
             plan: None,
-            verification: None,
             diff: None,
             checkpoints: Vec::new(),
             recaps: Vec::new(),
@@ -149,7 +148,6 @@ mod tests {
             active_tools: Vec::new(),
             active_background_tasks: Vec::new(),
             plan: None,
-            verification: None,
             diff: None,
             checkpoints: Vec::new(),
             recaps: Vec::new(),
@@ -480,8 +478,6 @@ pub struct UiSessionSnapshot {
     pub active_background_tasks: Vec<UiActiveBackgroundTask>,
     #[serde(default)]
     pub plan: Option<UiPlan>,
-    #[serde(default)]
-    pub verification: Option<UiVerification>,
     #[serde(default)]
     pub diff: Option<UiDiff>,
     #[serde(default)]

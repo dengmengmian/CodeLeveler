@@ -93,8 +93,6 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 RuntimeEvent::TurnCompleted
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
-                    | RuntimeEvent::TurnCompletedUnverified { .. }
-                    | RuntimeEvent::TurnCompletedChecksFailed { .. }
             );
             apply_runtime(state, event);
             let mut effects = Vec::new();
@@ -124,8 +122,6 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                         crate::transcript::TurnEndStatus::Completed
                             | crate::transcript::TurnEndStatus::CompletedWithWarnings
                             | crate::transcript::TurnEndStatus::Answered
-                            | crate::transcript::TurnEndStatus::Unverified
-                            | crate::transcript::TurnEndStatus::ChecksFailed
                     )
                 })
             {

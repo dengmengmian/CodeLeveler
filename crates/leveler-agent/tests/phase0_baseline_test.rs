@@ -463,8 +463,6 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: leveler_verifier::VerificationPlan::default(),
-            base_commit: None,
         },
     };
     let session = engine.create_task(&spec).await.unwrap();
@@ -552,8 +550,6 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: leveler_verifier::VerificationPlan::default(),
-            base_commit: None,
         },
     };
     let session = engine.create_task(&spec).await.unwrap();

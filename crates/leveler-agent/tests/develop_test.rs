@@ -22,7 +22,6 @@ use leveler_model::{
 };
 use leveler_storage::Database;
 use leveler_tools::ToolContext;
-use leveler_verifier::VerificationPlan;
 
 /// The surface a real coding turn gets: the tool crate's composition plus the
 /// harness controls THIS crate registers (`update_plan`). Production composes
@@ -210,8 +209,6 @@ fn spec(h: &Harness, goal: &str) -> TaskSpec {
             repository: h.dir.path().to_path_buf(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            verification: VerificationPlan::default(),
-            base_commit: None,
         },
     }
 }

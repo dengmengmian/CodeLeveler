@@ -25,7 +25,6 @@ function session(over: Partial<SessionView> = {}): SessionView {
     pendingApprovals: [],
     pendingClarifications: [],
     plan: null,
-    verification: null,
     diff: null,
     checkpoints: [],
     completionReport: null,
@@ -130,7 +129,6 @@ describe('headerWaitingCue', () => {
 describe('inspectorTerminalTone', () => {
   const cases: Array<[TurnOutcome, string | null, 'success' | 'calm' | 'warn' | 'error' | 'muted']> = [
     ['completed', null, 'success'],
-    ['unverified', 'no verification', 'warn'],
     ['incomplete', 'budget_exhausted', 'warn'],
     ['failed', 'boom', 'error'],
     ['cancelled', null, 'muted'],
@@ -208,7 +206,7 @@ describe('inspectorVisibleSections', () => {
 
   it('terminal uses Turn Truth result, not a fake success tab', () => {
     const sections = inspectorVisibleSections(
-      session({ lastTurn: { outcome: 'unverified', detail: 'no verification', ms: 13000 } }),
+      session({ lastTurn: { outcome: 'incomplete', detail: 'budget exhausted', ms: 13000 } }),
     );
     expect(sections[0]).toBe('result');
     expect(sections).not.toContain('verification');
@@ -220,18 +218,13 @@ describe('inspectorVisibleSections', () => {
     expect(sections).not.toContain('changes');
   });
 
-  it('shows verification only when checks exist — not a permanent tab', () => {
+  it('does not create a verification section', () => {
     const sections = inspectorVisibleSections(
       session({
         lastTurn: { outcome: 'completed', detail: null, ms: 4000 },
-        verification: {
-          passed: true,
-          checks: [{ name: 'cargo test', status: 'passed', evidence: null }],
-        },
       }),
     );
-    expect(sections).toContain('verification');
-    expect(sections.filter((s) => s === 'verification')).toHaveLength(1);
+    expect(sections.map(String)).not.toContain('verification');
   });
 });
 

@@ -45,8 +45,7 @@ impl UiUnfinishedGoal {
 ///
 /// Truth rules ride the shape: `findings_total == None` means the ledger was
 /// not readable when the checkpoint was cut — UNKNOWN, which a client must
-/// never render as zero. `verification` is `"unmeasured"` when nothing was
-/// proven — never a pass.
+/// never render as zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiGoalRecap {
@@ -76,11 +75,6 @@ pub struct UiGoalRecap {
     pub plan_total: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_milestones: Vec<String>,
-    /// `passed` | `failed` | `unmeasured`.
-    pub verification: String,
-    /// Evidence for a pass, or the failure detail. Absent when unmeasured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_detail: Option<String>,
     /// `None` = UNKNOWN (ledger unreadable) — never render as 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_total: Option<u32>,

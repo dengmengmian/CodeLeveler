@@ -147,7 +147,6 @@ enum TerminalKind {
     Completed,
     Answered,
     Incomplete,
-    Unverified,
     Failed,
     Cancelled,
     TimedOut,
@@ -385,20 +384,6 @@ async fn drive_turn_to_terminal(
                     notes,
                 };
             }
-            RuntimeEvent::TurnCompletedUnverified { reason } => {
-                notes.push(format!("unverified:{reason}"));
-                return TurnReport {
-                    kind: TerminalKind::Unverified,
-                    wall: started.elapsed(),
-                    tool_starts,
-                    tool_ends,
-                    assistant_deltas,
-                    edit_tools,
-                    sub_agent_activity,
-                    bad_prompt_hits,
-                    notes,
-                };
-            }
             RuntimeEvent::TurnFailed { error, .. } => {
                 notes.push(format!("failed:{error}"));
                 return TurnReport {
@@ -434,10 +419,7 @@ async fn drive_turn_to_terminal(
 fn is_success_terminal(kind: &TerminalKind) -> bool {
     matches!(
         kind,
-        TerminalKind::Completed
-            | TerminalKind::Answered
-            | TerminalKind::Unverified
-            | TerminalKind::Incomplete // incomplete can be a correct gate outcome
+        TerminalKind::Completed | TerminalKind::Answered | TerminalKind::Incomplete // incomplete can be a correct gate outcome
     )
 }
 

@@ -6,13 +6,11 @@ use tokio::sync::broadcast;
 use leveler_agent::{AdvisoryKind, AgentError, AgentOutcome, StopReason};
 use leveler_core::ToolCallId;
 use leveler_engine::EngineEvent;
-use leveler_lifecycle::VerificationStatus;
-use leveler_verifier::CheckStatus;
 
 use leveler_client_protocol::{
-    CheckState, ChildContribution, FailureCategory, FailureDelivery, FailureRetryability,
-    FailureSource, FinalizationStage, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
-    UiCheck, UiFailure, UiPlan, UiPlanStep, UiVerification,
+    ChildContribution, FailureCategory, FailureDelivery, FailureRetryability, FailureSource,
+    FinalizationStage, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent, UiFailure,
+    UiPlan, UiPlanStep,
 };
 
 use crate::AppError;
@@ -180,14 +178,6 @@ pub fn turn_end_event(stop: StopReason, stop_detail: Option<String>) -> RuntimeE
         StopReason::Stalled => RuntimeEvent::TurnIncomplete {
             reason: detail.unwrap_or_else(|| "goal 未确认完成".into()),
         },
-        StopReason::CompletedUnverified => RuntimeEvent::TurnCompletedUnverified {
-            reason: detail.unwrap_or_else(|| {
-                leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
-            }),
-        },
-        StopReason::CompletedChecksFailed => RuntimeEvent::TurnCompletedChecksFailed {
-            reason: detail.unwrap_or_else(|| "验证未通过".to_string()),
-        },
     }
 }
 
@@ -237,7 +227,6 @@ fn review_stage_label(action: &str, detail: &str) -> String {
 
 fn task_finished_event(
     outcome: leveler_lifecycle::TaskOutcome,
-    verification: VerificationStatus,
     reason: Option<String>,
     failure: Option<leveler_model::ModelError>,
     stop: Option<StopReason>,
@@ -252,52 +241,16 @@ fn task_finished_event(
         }
         parts.join("; ")
     };
-    if outcome == leveler_lifecycle::TaskOutcome::Completed
-        && verification == VerificationStatus::Failed
-    {
-        return RuntimeEvent::TurnCompletedChecksFailed {
-            reason: if reason.is_some() || !warnings.is_empty() {
-                detail_with_warnings()
-            } else {
-                "验证未通过".to_string()
-            },
-        };
-    }
     if outcome == leveler_lifecycle::TaskOutcome::Completed && !warnings.is_empty() {
         return RuntimeEvent::TurnCompletedWithWarnings {
             reason: detail_with_warnings(),
         };
     }
     if outcome == leveler_lifecycle::TaskOutcome::Completed && stop == Some(StopReason::Completed) {
-        return match verification {
-            VerificationStatus::Passed if !warnings.is_empty() || reason.is_some() => {
-                RuntimeEvent::TurnCompletedWithWarnings {
-                    reason: detail_with_warnings(),
-                }
-            }
-            VerificationStatus::Passed => RuntimeEvent::TurnCompleted,
-            VerificationStatus::Failed => unreachable!("failed verification handled above"),
-            VerificationStatus::NotRun | VerificationStatus::Unavailable => {
-                RuntimeEvent::TurnCompletedUnverified {
-                    reason: reason.unwrap_or_else(|| {
-                        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
-                    }),
-                }
-            }
-        };
+        return RuntimeEvent::TurnCompleted;
     }
     if outcome == leveler_lifecycle::TaskOutcome::Completed && stop.is_none() {
-        return match verification {
-            VerificationStatus::Passed => RuntimeEvent::TurnCompleted,
-            VerificationStatus::Failed => unreachable!("failed verification handled above"),
-            VerificationStatus::NotRun | VerificationStatus::Unavailable => {
-                RuntimeEvent::TurnCompletedUnverified {
-                    reason: reason.unwrap_or_else(|| {
-                        leveler_client_protocol::REASON_NO_AUTOMATIC_VERIFICATION.to_string()
-                    }),
-                }
-            }
-        };
+        return RuntimeEvent::TurnCompleted;
     }
     if let Some(stop) = stop {
         return turn_end_event(stop, reason);
@@ -324,69 +277,12 @@ fn finalization_stage(phase: &str) -> Option<FinalizationStage> {
     Some(match phase {
         "settling_dependencies" => FinalizationStage::SettlingDependencies,
         "settling_turn" => FinalizationStage::SettlingDependencies,
-        "verification" => FinalizationStage::Verification,
-        "evidence" => FinalizationStage::Evidence,
         "review" => FinalizationStage::Review,
         "continuation_checkpoint" => FinalizationStage::ResolvingOutcome,
         "resolving_outcome" => FinalizationStage::ResolvingOutcome,
         "publishing_terminal" => FinalizationStage::PublishingTerminal,
         _ => return None,
     })
-}
-
-fn project_verification_check(
-    legacy: &str,
-    observation: Option<&leveler_engine::VerificationObservation>,
-    disposition: Option<&leveler_engine::VerificationDisposition>,
-    evidence: Option<String>,
-) -> (CheckState, Option<String>) {
-    use leveler_engine::{VerificationDisposition as D, VerificationObservation as O};
-    match (observation, disposition) {
-        (Some(O::Passed), Some(D::Required)) => (CheckState::Passed, evidence),
-        (Some(O::Failed), Some(D::Required)) => (CheckState::Failed, evidence),
-        (
-            Some(O::Failed),
-            Some(D::Skipped {
-                reason,
-                revision,
-                source,
-                failed_tests,
-            }),
-        ) => {
-            let mut grounded = format!("skipped: {reason}");
-            if let Some(revision) = revision {
-                grounded.push_str(&format!("; revision={revision}"));
-            }
-            if let Some(source) = source {
-                grounded.push_str(&format!("; source={source}"));
-            }
-            if !failed_tests.is_empty() {
-                grounded.push_str(&format!("; failed_tests={}", failed_tests.join(",")));
-            }
-            if let Some(evidence) = evidence
-                && !evidence.is_empty()
-            {
-                grounded.push_str(&format!("\n{evidence}"));
-            }
-            (CheckState::Skipped, Some(grounded))
-        }
-        (Some(O::NotRun { reason }), _) => {
-            let state = match reason.as_str() {
-                "tool_missing" => CheckState::ToolMissing,
-                "environment_unavailable" => CheckState::EnvironmentUnavailable,
-                _ => CheckState::NotRun,
-            };
-            (
-                state,
-                evidence.or_else(|| Some(format!("not run: {reason}"))),
-            )
-        }
-        (_, Some(D::Skipped { reason, .. })) => (
-            CheckState::Skipped,
-            evidence.or_else(|| Some(format!("skipped: {reason}"))),
-        ),
-        _ => (map_check_status(legacy), evidence),
-    }
 }
 
 /// Translates the runtime's synchronous `AgentEvent`s into protocol events. Tool
@@ -399,7 +295,6 @@ pub struct EventBridge {
     tool_starts: HashMap<String, Instant>,
     /// The in-flight assistant message id, open while deltas stream (spec §16).
     open_assistant: Option<MessageId>,
-    verification_checks: Vec<UiCheck>,
     /// Recently completed assistant texts this turn, for the near-duplicate
     /// fold (a nudged model repeating its "task complete" summary). Display
     /// layer only — the persisted transcript keeps every message.
@@ -530,7 +425,6 @@ impl EventBridge {
             events,
             tool_starts: HashMap::new(),
             open_assistant: None,
-            verification_checks: Vec::new(),
             recent_assistant_texts: std::collections::VecDeque::new(),
             child_roles: HashMap::new(),
             terminal_published: false,
@@ -940,38 +834,6 @@ impl EventBridge {
                     });
                 }
             }
-            EngineEvent::VerificationStarted => {
-                self.verification_checks.clear();
-                self.emit_verification(None);
-            }
-            EngineEvent::VerificationCheck {
-                name,
-                status,
-                evidence,
-                observation,
-                disposition,
-                execution: _,
-            } => {
-                let (status, evidence) = project_verification_check(
-                    &status,
-                    observation.as_ref(),
-                    disposition.as_ref(),
-                    evidence,
-                );
-                self.verification_checks.push(UiCheck {
-                    name,
-                    status,
-                    evidence,
-                });
-                self.emit_verification(None);
-            }
-            // A client is told the verification truth, not the completion
-            // gate: `UiVerification::passed` answers "did verification pass",
-            // and a run that was not verified has not passed.
-            EngineEvent::VerificationFinished {
-                passed,
-                verification,
-            } => self.emit_verification(verification_outcome(verification, passed)),
             EngineEvent::SubAgentStarted {
                 id,
                 nickname,
@@ -1120,7 +982,6 @@ impl EventBridge {
             // must make an explicit projection decision here to compile.
             EngineEvent::TaskFinished {
                 outcome,
-                verification,
                 reason,
                 failure,
                 stop,
@@ -1129,12 +990,7 @@ impl EventBridge {
                 if !self.terminal_published {
                     self.terminal_published = true;
                     let _ = self.events.send(task_finished_event(
-                        outcome,
-                        verification,
-                        reason,
-                        failure,
-                        stop,
-                        warnings,
+                        outcome, reason, failure, stop, warnings,
                     ));
                     if let Some(callback) = self.on_terminal.take() {
                         callback();
@@ -1169,7 +1025,6 @@ impl EventBridge {
             | EngineEvent::PlanReady { .. }
             | EngineEvent::NodeStarted { .. }
             | EngineEvent::NodeFinished { .. }
-            | EngineEvent::RepairStarted { .. }
             | EngineEvent::CandidateStarted { .. }
             | EngineEvent::CandidateFinished { .. }
             | EngineEvent::ReviewStarted { .. }
@@ -1177,52 +1032,6 @@ impl EventBridge {
             | EngineEvent::ReviewFailed { .. }
             | EngineEvent::ReviewFinished { .. } => {}
         }
-    }
-
-    fn emit_verification(&self, passed: Option<bool>) {
-        let _ = self.events.send(RuntimeEvent::VerificationUpdated {
-            verification: UiVerification {
-                checks: self.verification_checks.clone(),
-                passed,
-            },
-        });
-    }
-}
-
-/// Wire status key → UI state, through the vocabulary's own parser.
-///
-/// A check that could not run is not a check that was skipped: collapsing
-/// `tool_missing` and `environment_unavailable` into `Skipped` threw away the
-/// reason the run was unverified, which is the one thing the reader needs.
-fn map_check_status(status: &str) -> CheckState {
-    match CheckStatus::from_wire(status) {
-        Some(CheckStatus::Passed) => CheckState::Passed,
-        Some(CheckStatus::Failed) => CheckState::Failed,
-        Some(CheckStatus::Skipped) => CheckState::Skipped,
-        Some(CheckStatus::ToolMissing) => CheckState::ToolMissing,
-        Some(CheckStatus::EnvironmentUnavailable) => CheckState::EnvironmentUnavailable,
-        // A spelling this vocabulary has never had. Not a pass, and not an
-        // invented reason either.
-        None if status == "not_run" => CheckState::NotRun,
-        None => CheckState::Unknown,
-    }
-}
-
-/// What `UiVerification::passed` may say, given the verdict and the gate.
-///
-/// `None` is "nothing was proven". It is deliberately not `Some(false)`
-/// either: "not verified" and "failed" are different facts, and clients
-/// render them differently (`incomplete` versus `failed`).
-fn verification_outcome(verification: Option<VerificationStatus>, passed: bool) -> Option<bool> {
-    match verification {
-        Some(VerificationStatus::Passed) => Some(true),
-        Some(VerificationStatus::Failed) => Some(false),
-        Some(VerificationStatus::NotRun | VerificationStatus::Unavailable) => None,
-        // A row written before the split. A closed gate that failed can only
-        // mean the checks failed; a closed gate that passed cannot say whether
-        // anything was proven, so it says nothing.
-        None if !passed => Some(false),
-        None => None,
     }
 }
 
@@ -1345,7 +1154,6 @@ mod bridge_tests {
         let model = leveler_model::ModelError::from_status(400, "bad").with_provider("moonshot");
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Failed,
-            verification: VerificationStatus::NotRun,
             reason: Some("execution error: model error [InvalidRequest]: bad".into()),
             failure: Some(model),
             stop: None,
@@ -1989,8 +1797,6 @@ mod bridge_tests {
             &projected,
             RuntimeEvent::TurnCompleted
                 | RuntimeEvent::TurnCompletedWithWarnings { .. }
-                | RuntimeEvent::TurnCompletedUnverified { .. }
-                | RuntimeEvent::TurnCompletedChecksFailed { .. }
                 | RuntimeEvent::TurnFailed { .. }
                 | RuntimeEvent::TurnCancelled
         ));
@@ -2111,11 +1917,6 @@ mod projection_equivalence {
                     .collect();
                 format!("plan:[{}]", steps.join(","))
             }
-            RuntimeEvent::VerificationUpdated { verification } => format!(
-                "verify:passed={:?}:checks={}",
-                verification.passed,
-                verification.checks.len()
-            ),
             RuntimeEvent::SubAgentUpdated { id, done, ok, .. } => {
                 format!("sub:{id}:done={done}:ok={ok}")
             }
@@ -2359,33 +2160,6 @@ mod projection_equivalence {
     }
 
     #[test]
-    fn verification_sequence_accumulates_checks() {
-        let shapes = project(vec![
-            EngineEvent::VerificationStarted,
-            EngineEvent::VerificationCheck {
-                name: "cargo test".into(),
-                status: "passed".into(),
-                observation: None,
-                disposition: None,
-                execution: None,
-                evidence: None,
-            },
-            EngineEvent::VerificationFinished {
-                passed: true,
-                verification: Some(VerificationStatus::Passed),
-            },
-        ]);
-        assert_eq!(
-            shapes,
-            [
-                "verify:passed=None:checks=0",
-                "verify:passed=None:checks=1",
-                "verify:passed=Some(true):checks=1"
-            ]
-        );
-    }
-
-    #[test]
     fn finalization_stages_precede_the_authoritative_terminal_event() {
         let (tx, mut rx) = broadcast::channel(16);
         let mut bridge = EventBridge::new(tx);
@@ -2400,13 +2174,12 @@ mod projection_equivalence {
             at: leveler_core::now(),
         });
         bridge.forward(EngineEvent::FinalizationPhaseStarted {
-            phase: "verification".into(),
+            phase: "review".into(),
             at: leveler_core::now(),
         });
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Failed,
-            reason: Some("failed gate(s): cargo test".into()),
+            reason: None,
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
             warnings: Vec::new(),
@@ -2426,10 +2199,10 @@ mod projection_equivalence {
                     stage: FinalizationStage::SettlingDependencies
                 },
                 RuntimeEvent::TurnFinalizing {
-                    stage: FinalizationStage::Verification
+                    stage: FinalizationStage::Review
                 },
-                RuntimeEvent::TurnCompletedChecksFailed { reason }
-            ] if reason == "failed gate(s): cargo test"
+                RuntimeEvent::TurnCompleted
+            ]
         ));
         assert!(bridge.terminal_published());
     }
@@ -2452,7 +2225,6 @@ mod projection_equivalence {
 
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Passed,
             reason: None,
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
@@ -2463,13 +2235,12 @@ mod projection_equivalence {
     }
 
     #[test]
-    fn completion_warning_does_not_rewrite_passed_verification() {
+    fn completion_warning_is_preserved() {
         let (tx, mut rx) = broadcast::channel(4);
         let mut bridge = EventBridge::new(tx);
 
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Passed,
             reason: Some("required independent review did not complete".into()),
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
@@ -2484,56 +2255,12 @@ mod projection_equivalence {
     }
 
     #[test]
-    fn completion_warning_cannot_mask_failed_verification() {
-        let (tx, mut rx) = broadcast::channel(4);
-        let mut bridge = EventBridge::new(tx);
-
-        bridge.forward(EngineEvent::TaskFinished {
-            outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Failed,
-            reason: Some("failed gate(s): cargo test".into()),
-            failure: None,
-            stop: Some(leveler_agent::StopReason::Completed),
-            warnings: vec!["required independent review reported 1 finding(s)".into()],
-        });
-
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RuntimeEvent::TurnCompletedChecksFailed { reason })
-                if reason.contains("failed gate(s): cargo test")
-                    && reason.contains("review reported 1 finding")
-        ));
-    }
-
-    #[test]
-    fn answered_stop_cannot_mask_failed_verification() {
-        let (tx, mut rx) = broadcast::channel(4);
-        let mut bridge = EventBridge::new(tx);
-
-        bridge.forward(EngineEvent::TaskFinished {
-            outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Failed,
-            reason: Some("failed gate(s): cargo test".into()),
-            failure: None,
-            stop: Some(leveler_agent::StopReason::Answered),
-            warnings: Vec::new(),
-        });
-
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RuntimeEvent::TurnCompletedChecksFailed { reason })
-                if reason == "failed gate(s): cargo test"
-        ));
-    }
-
-    #[test]
     fn legacy_completed_task_without_typed_stop_stays_completed() {
         let (tx, mut rx) = broadcast::channel(4);
         let mut bridge = EventBridge::new(tx);
 
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Passed,
             reason: None,
             failure: None,
             stop: None,
@@ -2544,34 +2271,11 @@ mod projection_equivalence {
     }
 
     #[test]
-    fn grounded_baseline_warning_projects_completed_with_warnings() {
-        let (tx, mut rx) = broadcast::channel(4);
-        let mut bridge = EventBridge::new(tx);
-
-        bridge.forward(EngineEvent::TaskFinished {
-            outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Unavailable,
-            reason: Some("required checks were not rerun".into()),
-            failure: None,
-            stop: Some(leveler_agent::StopReason::Completed),
-            warnings: vec!["mechanically confirmed baseline failure: cargo test".into()],
-        });
-
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RuntimeEvent::TurnCompletedWithWarnings { reason })
-                if reason.contains("required checks were not rerun")
-                    && reason.contains("mechanically confirmed baseline failure")
-        ));
-    }
-
-    #[test]
     fn terminal_latch_drops_every_post_terminal_event() {
         let (tx, mut rx) = broadcast::channel(16);
         let mut bridge = EventBridge::new(tx);
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Completed,
-            verification: VerificationStatus::Passed,
             reason: None,
             failure: None,
             stop: Some(leveler_agent::StopReason::Completed),
@@ -2586,10 +2290,11 @@ mod projection_equivalence {
         bridge.forward(EngineEvent::AssistantMessage {
             text: "post-terminal review".into(),
         });
-        bridge.forward(EngineEvent::VerificationStarted);
+        bridge.forward(EngineEvent::AssistantDelta {
+            text: "ignored".into(),
+        });
         bridge.forward(EngineEvent::TaskFinished {
             outcome: leveler_lifecycle::TaskOutcome::Failed,
-            verification: VerificationStatus::Failed,
             reason: Some("duplicate".into()),
             failure: None,
             stop: None,
@@ -2612,99 +2317,6 @@ mod projection_equivalence {
             }),
         });
         assert!(rx.try_recv().is_err());
-    }
-
-    /// §13 C/D: a check that could not run is not a check that was deliberately
-    /// skipped. Both spellings a durable row may carry land on the same state,
-    /// and none of them lands on `Skipped`.
-    #[test]
-    fn a_check_that_could_not_run_is_not_projected_as_a_skip() {
-        for (durable, expected) in [
-            ("passed", CheckState::Passed),
-            ("failed", CheckState::Failed),
-            ("skipped", CheckState::Skipped),
-            ("not_run", CheckState::NotRun),
-            ("tool_missing", CheckState::ToolMissing),
-            ("toolmissing", CheckState::ToolMissing),
-            (
-                "environment_unavailable",
-                CheckState::EnvironmentUnavailable,
-            ),
-            ("environmentunavailable", CheckState::EnvironmentUnavailable),
-        ] {
-            assert_eq!(map_check_status(durable), expected, "{durable}");
-        }
-        assert_ne!(map_check_status("tool_missing"), CheckState::Skipped);
-        assert_ne!(
-            map_check_status("environment_unavailable"),
-            CheckState::Skipped
-        );
-        // A status this build cannot read is neither a pass nor an invented
-        // reason.
-        assert_eq!(map_check_status("something-else"), CheckState::Unknown);
-    }
-
-    #[test]
-    fn typed_incomplete_check_projects_as_not_run_with_its_reason() {
-        let (status, evidence) = project_verification_check(
-            "skipped",
-            Some(&leveler_engine::VerificationObservation::NotRun {
-                reason: "verification_incomplete".into(),
-            }),
-            Some(&leveler_engine::VerificationDisposition::Required),
-            None,
-        );
-        assert_eq!(status, CheckState::NotRun);
-        assert_eq!(
-            evidence.as_deref(),
-            Some("not run: verification_incomplete")
-        );
-    }
-
-    /// The defect this split exists for. A run that owed no check has an open
-    /// completion gate — it must still complete — and the projection must not
-    /// turn that into a pass for a client to render.
-    #[test]
-    fn a_run_that_was_not_verified_never_projects_as_passed() {
-        for verification in [VerificationStatus::NotRun, VerificationStatus::Unavailable] {
-            let shapes = project(vec![
-                EngineEvent::VerificationStarted,
-                EngineEvent::VerificationFinished {
-                    passed: true,
-                    verification: Some(verification),
-                },
-            ]);
-            assert_eq!(
-                shapes,
-                ["verify:passed=None:checks=0", "verify:passed=None:checks=0"],
-                "{verification:?} is not a pass"
-            );
-        }
-    }
-
-    /// A row written before the gate and the truth were split carries only the
-    /// gate. `passed: true` cannot say whether anything was proven, so it says
-    /// nothing; `passed: false` can only have come from checks that failed, and
-    /// pretending not to know would hide a real failure.
-    #[test]
-    fn a_legacy_row_reports_what_it_can_and_nothing_more() {
-        let shapes = project(vec![
-            EngineEvent::VerificationFinished {
-                passed: false,
-                verification: None,
-            },
-            EngineEvent::VerificationFinished {
-                passed: true,
-                verification: None,
-            },
-        ]);
-        assert_eq!(
-            shapes,
-            [
-                "verify:passed=Some(false):checks=0",
-                "verify:passed=None:checks=0"
-            ]
-        );
     }
 
     /// The projection is what every client renders. Facts the runtime already

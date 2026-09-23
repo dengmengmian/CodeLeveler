@@ -307,7 +307,6 @@ impl World {
 fn completed() -> leveler_engine::TaskTerminal {
     leveler_engine::TaskTerminal {
         outcome: leveler_engine::TaskOutcome::Completed,
-        verification: leveler_lifecycle::VerificationStatus::NotRun,
         reason: None,
         failure: None,
         stop: None,

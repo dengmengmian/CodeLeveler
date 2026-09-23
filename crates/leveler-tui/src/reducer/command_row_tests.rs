@@ -421,57 +421,6 @@ fn a_failed_command_summarizes_its_error_not_its_exit_code() {
     );
 }
 
-/// The runtime passed verification, so a check that failed did not gate it.
-/// "验证 2/3" under a ✓ left the user to guess which one and whether it
-/// mattered; the line names it and says it does not block.
-#[test]
-fn a_passed_verification_names_the_check_that_did_not_block() {
-    use leveler_client_protocol::{CheckState, UiCheck, UiVerification};
-    let mut s = state();
-    start(&mut s, "c");
-    complete(&mut s, "c", true, 1_000, Some(0), None);
-    let check = |name: &str, status| UiCheck {
-        name: name.into(),
-        status,
-        evidence: None,
-    };
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::VerificationUpdated {
-            verification: UiVerification {
-                checks: vec![
-                    check("cargo fmt", CheckState::Failed),
-                    check("cargo check", CheckState::Passed),
-                    check("cargo test", CheckState::Passed),
-                ],
-                passed: Some(true),
-            },
-        }),
-    );
-    let message_id = leveler_client_protocol::MessageId::new("m");
-    for event in [
-        RuntimeEvent::AssistantMessageStarted {
-            message_id: message_id.clone(),
-        },
-        RuntimeEvent::AssistantTextDelta {
-            message_id: message_id.clone(),
-            delta: "续期检查通过。".into(),
-        },
-        RuntimeEvent::AssistantMessageCompleted { message_id },
-        RuntimeEvent::TurnCompleted,
-    ] {
-        reduce(&mut s, Action::Runtime(event));
-    }
-    let rows = plain(&s);
-    let end = rows
-        .iter()
-        .find(|r| r.contains("任务已完成"))
-        .unwrap_or_else(|| panic!("{rows:?}"));
-    assert!(end.contains("验证 ✓"), "{end}");
-    assert!(end.contains("cargo fmt 未通过（不阻断）"), "{end}");
-    assert!(!end.contains("2/3"), "{end}");
-}
-
 /// The diff is whatever `/diff` last fetched; nothing refreshes it when a turn
 /// ends. A later turn's end line must not repeat that old count as if the turn
 /// had changed those files.
@@ -760,12 +709,13 @@ fn a_refused_stop_returns_the_row_to_running() {
     assert!(!head.contains("正在停止"), "{head:?}");
 }
 
-/// A running command shows the tail of what it prints without being asked;
-/// a click opens its whole output, a second click returns to the tail.
+/// A command that stays running shows the tail of what it prints without being
+/// asked; a click opens its whole output, a second click returns to the tail.
 #[test]
 fn a_running_command_shows_its_tail_and_a_click_opens_all_of_it() {
     let mut s = state();
     start(&mut s, "c1");
+    s.elapsed_secs = 1;
     output(&mut s, "c1", "Processing /etc/letsencrypt/renewal\n");
     for i in 1..=10 {
         output(&mut s, "c1", &format!("Waiting for DNS {i}\n"));
@@ -803,6 +753,7 @@ fn a_running_command_shows_its_tail_and_a_click_opens_all_of_it() {
 fn a_command_settles_in_place_without_a_duplicate_row() {
     let mut s = state();
     start(&mut s, "c1");
+    s.elapsed_secs = 1;
     output(&mut s, "c1", "Congratulations, all renewals succeeded\n");
     assert!(row_with(&s, "Congratulations").is_some());
     complete(&mut s, "c1", true, 14_200, Some(0), None);
@@ -890,7 +841,6 @@ fn a_reconnect_restores_the_running_clock_and_output() {
         active_tools: Vec::new(),
         active_background_tasks: Vec::new(),
         plan: None,
-        verification: None,
         diff: None,
         checkpoints: Vec::new(),
         recaps: Vec::new(),

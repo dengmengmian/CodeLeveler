@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use leveler_client_protocol::{
     AttachmentRef, ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile,
     RuntimeStatus, SessionId, UiApprovalRequest, UiCheckpoint, UiClarificationRequest, UiDiff,
-    UiPlan, UiSessionSummary, UiVerification,
+    UiPlan, UiSessionSummary,
 };
 
 use crate::composer::Composer;
@@ -294,11 +294,6 @@ pub struct AppState {
     pub plan: Option<UiPlan>,
     /// Workspace-relative instruction sources active for the current turn.
     pub project_rule_sources: Vec<String>,
-    pub verification: Option<UiVerification>,
-    /// The verification the current turn produced. `verification` stays the
-    /// latest result for the verification screen; a turn-end summary only
-    /// speaks for checks its own turn ran.
-    pub turn_verification: Option<UiVerification>,
     /// How many files the diff reported during the current turn named. `diff`
     /// is whatever `/diff` last fetched — nothing refreshes it when a turn
     /// ends — so a turn-end summary counts only a diff its own turn saw.
@@ -563,8 +558,6 @@ impl AppState {
             clean: crate::clean::CleanState::default(),
             plan: None,
             project_rule_sources: Vec::new(),
-            verification: None,
-            turn_verification: None,
             turn_diff_files: None,
             history_query: None,
             diff: None,

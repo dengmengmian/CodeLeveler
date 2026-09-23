@@ -1,4 +1,4 @@
-//! The Develop workflow: `Analyze → Coding → Verify → Review`.
+//! The Develop workflow: `Analyze → Coding → Review`.
 //!
 //! An explicitly requested, complete development loop. It is Coding-Harness
 //! state, not Runtime state: the engine keeps owning lifecycle, ownership and
@@ -238,7 +238,6 @@ pub fn review_brief(
     goal: &str,
     work_order: &str,
     coding_report: &str,
-    verification: &str,
     modified_files: &[String],
     diff: Option<&str>,
 ) -> String {
@@ -264,9 +263,6 @@ pub fn review_brief(
          What the implementer reported:\n\
          ---\n{coding_report}\n---\n\
          \n\
-         What the project's own checks mechanically observed:\n\
-         ---\n{verification}\n---\n\
-         \n\
          Files changed:\n\
          ---\n{files}\n---\n\
          \n\
@@ -275,9 +271,7 @@ pub fn review_brief(
          \n\
          The implementer's report is a claim, not evidence. Read the changed code \
          yourself before deciding, and read around it far enough to see what the change \
-         affects. The mechanical verification above is authoritative about what the \
-         checks observed and says nothing about whether the goal was met — passing checks \
-         are not an accepted change, and you cannot overrule what they observed.\n\
+         affects.\n\
          \n\
          State your findings, each with file:line and why it matters. Then end your reply \
          with exactly one line:\n\
@@ -432,7 +426,6 @@ DECISION: REWORK
             "修复计划进度不更新",
             "work order",
             "I changed plan_cell.rs",
-            "format=passed build=passed test=failed",
             &["crates/leveler-tui/src/plan_cell.rs".to_string()],
             Some("@@ -88 +88 @@"),
         );
@@ -454,13 +447,12 @@ DECISION: REWORK
             brief.contains("修复计划进度不更新"),
             "Review judges against the ORIGINAL goal, not the work order"
         );
-        assert!(brief.contains("test=failed"), "verification must reach it");
         assert!(brief.contains("@@ -88 +88 @@"), "the diff must reach it");
     }
 
     #[test]
     fn the_review_brief_says_so_when_there_is_no_diff() {
-        let brief = review_brief("g", "w", "r", "v", &[], None);
+        let brief = review_brief("g", "w", "r", &[], None);
         assert!(brief.contains("(none)"), "an empty file list is stated");
         assert!(
             brief.contains("no diff available"),

@@ -835,7 +835,7 @@ fn append_checkpoint(
 /// and its repair turn alone.
 ///
 /// `completed` here means "the model said it was done" — with no gate there is
-/// nothing to verify against, so the engine can only report `CompletedUnverified`.
+/// nothing to verify against.
 /// The case still passes or fails on the independent `expect` command.
 async fn run_bare_case(
     app: &Application,
@@ -878,9 +878,6 @@ async fn run_bare_case(
             repository: app.layout.repo_root.clone(),
             mode: PermissionProfile::Assisted,
             sandbox: false,
-            // THE ablated variable: an empty plan means there is nothing to verify.
-            verification: leveler_verifier::VerificationPlan::default(),
-            base_commit: None,
         },
     };
     let session_id = match engine.create_task(&spec).await {
@@ -904,13 +901,9 @@ async fn run_bare_case(
             let termination = termination_from_report(report.outcome, report.stop_reason);
             (
                 Some(session_id),
-                // Completed AND the project's checks passed. Completion alone
-                // is the model's claim; the eval's own expectation check
-                // still decides pass/fail.
-                report.outcome.is_completed()
-                    && report.verification_status == leveler_lifecycle::VerificationStatus::Passed,
+                report.outcome.is_completed(),
                 report.rounds,
-                format!("{:?}/{:?}", report.outcome, report.verification_status),
+                format!("{:?}", report.outcome),
                 termination,
                 None,
             )
@@ -932,10 +925,7 @@ async fn run_bare_case(
 
 fn termination_from_stop_reason(reason: StopReason) -> leveler_eval::TerminationClass {
     match reason {
-        StopReason::Completed
-        | StopReason::Answered
-        | StopReason::CompletedUnverified
-        | StopReason::CompletedChecksFailed => leveler_eval::TerminationClass::Completed,
+        StopReason::Completed | StopReason::Answered => leveler_eval::TerminationClass::Completed,
         StopReason::BudgetExhausted => leveler_eval::TerminationClass::BudgetLimited,
         StopReason::TurnLimitReached => leveler_eval::TerminationClass::BudgetLimited,
         StopReason::Blocked => leveler_eval::TerminationClass::Blocked,
@@ -1296,17 +1286,10 @@ async fn run_eval_case(
                         Ok(o) => {
                             let termination = termination_from_stop_reason(o.stop_reason);
                             // `completed` = the run ended in the terminal
-                            // outcome THIS CASE requires. Default: a verified
-                            // completion (historical semantics). A declared
-                            // `completed_unverified` case matches exactly that
-                            // stop reason — and fails on a wrongful upgrade to
-                            // a verified completion.
+                            // outcome THIS CASE requires.
                             let completed = match case.expected_outcome {
                                 leveler_eval::ExpectedOutcome::Completed => {
                                     o.stop_reason == StopReason::Completed
-                                }
-                                leveler_eval::ExpectedOutcome::CompletedUnverified => {
-                                    o.stop_reason == StopReason::CompletedUnverified
                                 }
                             };
                             (
@@ -1682,69 +1665,6 @@ mod ablation_tests {
             super::termination_from_stop_reason(StopReason::Stalled),
             TerminationClass::Incomplete
         );
-    }
-
-    /// The whole point of `--no-verify-gate` is that ONE variable changes: the
-    /// post-edit verification plan is empty, so the gate never runs. Every other knob must match the normal direct path,
-    /// or a difference in results is not attributable to the gate.
-    #[test]
-    fn the_bare_spec_differs_from_the_direct_spec_only_in_verification() {
-        let case = leveler_eval::EvaluationCase {
-            id: "x".into(),
-            name: "x".into(),
-            repo: None,
-            base_ref: None,
-            files: Default::default(),
-            recovery: false,
-            task: "do the thing".into(),
-            max_rounds: 40,
-            relevant_paths: Vec::new(),
-            required_impact_paths: Vec::new(),
-            distractor_paths: Vec::new(),
-            forbidden_edit_paths: Vec::new(),
-            expected_outcome: Default::default(),
-            expect: leveler_eval::ExpectCommand {
-                program: "true".into(),
-                args: vec![],
-            },
-        };
-
-        let bare = leveler_agent::coding::TaskSpec {
-            runtime: leveler_agent::coding::RuntimeTaskSpec {
-                goal: case.task.clone(),
-                kind: leveler_engine::ExecutionKind::Direct,
-                continuation: leveler_agent::ContinuationPolicy::bounded(case.max_rounds),
-                limits: leveler_agent::StepLimits::default(),
-            },
-            coding: leveler_agent::coding::CodingTaskSpec {
-                repository: std::path::PathBuf::from("/repo"),
-                mode: leveler_execution::PermissionProfile::Assisted,
-                sandbox: false,
-                verification: leveler_verifier::VerificationPlan::default(),
-                base_commit: None,
-            },
-        };
-
-        assert!(
-            bare.coding.verification.commands.is_empty(),
-            "the ablated run must have nothing to verify with"
-        );
-        assert!(
-            !bare.coding.verification.has_gates(),
-            "an empty plan must report no gates, so the engine skips verification"
-        );
-        // The controls: identical to what the normal direct path passes.
-        assert_eq!(
-            bare.runtime.continuation,
-            leveler_agent::ContinuationPolicy::bounded(40),
-            "same round budget as the normal run"
-        );
-        assert_eq!(
-            bare.runtime.limits,
-            leveler_agent::StepLimits::default(),
-            "same step limits as the normal run"
-        );
-        assert_eq!(bare.runtime.kind, leveler_engine::ExecutionKind::Direct);
     }
 }
 

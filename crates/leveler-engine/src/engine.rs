@@ -10,7 +10,7 @@
 //! of agent produced it.
 
 use leveler_core::{GoalId, SessionId, TaskId, TurnId};
-use leveler_lifecycle::{AgentState, SessionStatus, StopReason, VerificationStatus};
+use leveler_lifecycle::{AgentState, SessionStatus, StopReason};
 use leveler_storage::{EngineStores, EventStore, SessionRecord};
 
 use crate::log::{DanglingCall, EventLog, SnapshotView};
@@ -281,12 +281,10 @@ pub struct TaskExecution {
 /// Harness-supplied terminal facts for one task.
 ///
 /// The engine persists these values atomically. It does not derive the
-/// outcome, workflow state, verification verdict, or goal disposition.
+/// outcome, workflow state, or goal disposition.
 pub struct TaskTerminal {
     /// How the harness says the task ended.
     pub outcome: TaskOutcome,
-    /// The harness's verification result, orthogonal to task outcome.
-    pub verification: VerificationStatus,
     /// Optional terminal detail for a non-success outcome.
     pub reason: Option<String>,
     /// The structured provider failure behind a failed outcome, when there was
@@ -301,7 +299,7 @@ pub struct TaskTerminal {
     pub state: AgentState,
     /// Optional long-goal projection committed with the terminal fact.
     pub goal: Option<leveler_storage::GoalTerminalUpdate>,
-    /// Completion-contract warnings orthogonal to project verification.
+    /// Completion-contract warnings.
     pub warnings: Vec<String>,
 }
 
@@ -323,7 +321,6 @@ impl TaskEngine {
     ) -> Result<(), EngineError> {
         let TaskTerminal {
             outcome,
-            verification,
             reason,
             failure,
             stop,
@@ -334,7 +331,6 @@ impl TaskEngine {
         } = terminal;
         let event = EngineEvent::TaskFinished {
             outcome,
-            verification,
             reason,
             failure,
             stop,
@@ -350,7 +346,6 @@ impl TaskEngine {
                 &event_type,
                 &payload,
                 outcome,
-                verification,
                 status,
                 state,
                 goal.as_ref(),

@@ -131,7 +131,6 @@ fn snapshot(id: &str, goal: &str, repo: &str, model: &str) -> UiSessionSnapshot 
         active_tools: Vec::new(),
         active_background_tasks: Vec::new(),
         plan: None,
-        verification: None,
         diff: None,
         checkpoints: Vec::new(),
         recaps: Vec::new(),
@@ -173,7 +172,6 @@ struct Replayed {
     largest_args: Vec<(String, usize)>,
     plan_steps_max: usize,
     diff_files: usize,
-    verification_states: Vec<String>,
     terminal: Option<String>,
     task_outcome: Option<String>,
     wrong_success_glyph: Vec<String>,
@@ -369,9 +367,6 @@ async fn replay_session(
 
     r.plan_steps_max = state.plan.as_ref().map(|p| p.steps.len()).unwrap_or(0);
     r.diff_files = state.diff.as_ref().map(|d| d.files.len()).unwrap_or(0);
-    if let Some(v) = state.verification.as_ref() {
-        r.verification_states = v.checks.iter().map(|c| format!("{:?}", c.status)).collect();
-    }
     r.largest_args.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     r.largest_args.truncate(5);
     r.replay_millis = started.elapsed().as_millis();

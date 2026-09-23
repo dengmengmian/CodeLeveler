@@ -25,8 +25,7 @@ pub use engine::{
 };
 pub use event::{
     DataClass, EngineEvent, ExecutionKind, NodeStatus, PublicAcceptanceStatus, PublicEvent,
-    PublicTurnKind, TurnKind, VerificationDisposition, VerificationExecution,
-    VerificationObservation,
+    PublicTurnKind, TurnKind,
 };
 // The engine produces terminal outcomes, but the type is owned by the shared
 // lifecycle vocabulary so storage and clients speak it without a back-edge.

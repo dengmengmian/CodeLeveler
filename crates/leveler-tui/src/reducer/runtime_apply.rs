@@ -286,10 +286,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             state.plan = Some(plan);
         }
-        RuntimeEvent::VerificationUpdated { verification } => {
-            state.turn_verification = Some(verification.clone());
-            state.verification = Some(verification);
-        }
         RuntimeEvent::DiffUpdated { diff } => {
             state.turn_diff_files = Some(diff.files.len());
             if state.diff_selected >= diff.files.len() {
@@ -384,14 +380,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             finish_turn(state, TurnEndStatus::Incomplete, Some(reason));
             state.notification = None;
         }
-        RuntimeEvent::TurnCompletedUnverified { reason } => {
-            finish_turn(state, TurnEndStatus::Unverified, Some(reason));
-            state.notification = None;
-        }
-        RuntimeEvent::TurnCompletedChecksFailed { reason } => {
-            finish_turn(state, TurnEndStatus::ChecksFailed, Some(reason));
-            state.notification = None;
-        }
         RuntimeEvent::TurnFailed { error, failure } => {
             state.status = RuntimeStatus::Error;
             state.finalization_stage = None;
@@ -454,7 +442,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 summary,
                 None,
             );
-            state.turn_verification = None;
             state.turn_diff_files = None;
         }
         RuntimeEvent::TurnCancelled => {
@@ -474,7 +461,6 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
             archive_active_plan(state);
-            state.turn_verification = None;
             state.turn_diff_files = None;
             state.transcript.push_turn_end(
                 TurnEndStatus::Cancelled,
@@ -1062,14 +1048,11 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         match status {
             TurnEndStatus::Completed
             | TurnEndStatus::CompletedWithWarnings
-            | TurnEndStatus::Answered
-            | TurnEndStatus::Unverified => goal.complete(now),
+            | TurnEndStatus::Answered => goal.complete(now),
             TurnEndStatus::Truncated | TurnEndStatus::Incomplete | TurnEndStatus::Cancelled => {
                 goal.pause(now)
             }
-            TurnEndStatus::ChecksFailed | TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => {
-                goal.fail(now)
-            }
+            TurnEndStatus::NoFinalAnswer | TurnEndStatus::Failed => goal.fail(now),
         }
     }
     state.cancel_armed = false;
@@ -1093,7 +1076,6 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         });
     let summary = turn_end_summary(state, status);
     archive_active_plan(state);
-    state.turn_verification = None;
     state.turn_diff_files = None;
     state.transcript.push_turn_end(
         status,
@@ -1116,11 +1098,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     seal_analysis_segment(state);
     if matches!(
         status,
-        TurnEndStatus::Completed
-            | TurnEndStatus::CompletedWithWarnings
-            | TurnEndStatus::Answered
-            | TurnEndStatus::Unverified
-            | TurnEndStatus::ChecksFailed
+        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
     ) {
         crate::away_summary::arm(state, std::time::Instant::now());
     } else {
@@ -1168,23 +1146,15 @@ fn estimate_text_tokens(text: &str) -> u32 {
     (cjk as f32 / 1.6 + other as f32 / 4.0).ceil() as u32
 }
 
-/// Compact product summary for the turn-end marker (files / verify).
-///
-/// Success verify chrome (`verify ✓`) is **outcome-gated**: an Unverified turn
-/// must never show it even when gate `passed` is true (`passed` means
-/// !Failed, not Verdict::Verified).
+/// Compact product summary for the turn-end marker.
 /// Terminal states where the WORK itself is finished. Task outcome, plan
-/// progress and verification outcome are three separate facts: a finished task
-/// with a plan last reported at 6/9 and verification at 2/3 is entirely legal,
-/// and the outcome is the runtime's to report, not the plan's to dispute.
+/// progress are separate facts: a finished task with a plan last reported at
+/// 6/9 is entirely legal, and the outcome is the runtime's to report, not the
+/// plan's to dispute.
 fn work_is_finished(status: TurnEndStatus) -> bool {
     matches!(
         status,
-        TurnEndStatus::Completed
-            | TurnEndStatus::CompletedWithWarnings
-            | TurnEndStatus::Answered
-            | TurnEndStatus::Unverified
-            | TurnEndStatus::ChecksFailed
+        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
     )
 }
 
@@ -1301,15 +1271,6 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
             t.summary_files_many.replace("{}", &n.to_string())
         });
     }
-    // An Unverified turn's own label already says "未自动验证". A check count
-    // beside it is a second authority on the same fact, and the line then
-    // reads "not verified · verified 1/1".
-    let label_states_verification = matches!(status, TurnEndStatus::Unverified);
-    // Unverified / incomplete / failed / cancelled: no success verify mark.
-    let allow_success_verify = matches!(
-        status,
-        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
-    );
     // Open plan steps travel with the summary only while the turn can still be
     // continued — there "计划 5/9" is real progress information. On a finished
     // turn it would be a stale plan arguing against the outcome the runtime
@@ -1322,48 +1283,6 @@ fn turn_end_summary(state: &AppState, status: TurnEndStatus) -> Option<String> {
             let (k, n) = crate::workbench::plan_done_total(p);
             (n > 0 && k < n).then_some((k, n))
         });
-    if let Some(v) = &state.turn_verification {
-        if let Some(passed) = v.passed {
-            if passed {
-                if allow_success_verify {
-                    // Prefer strict green: all listed checks Passed (and non-empty).
-                    let all_passed = !v.checks.is_empty()
-                        && v.checks
-                            .iter()
-                            .all(|c| c.status == leveler_client_protocol::CheckState::Passed);
-                    parts.push(t.summary_verify_ok.to_string());
-                    // Verification passed, so a check that failed did not gate
-                    // it: say which, and that it does not block.
-                    let advisory: Vec<&str> = v
-                        .checks
-                        .iter()
-                        .filter(|c| c.status == leveler_client_protocol::CheckState::Failed)
-                        .map(|c| c.name.as_str())
-                        .collect();
-                    if !all_passed && !advisory.is_empty() {
-                        parts.push(
-                            t.summary_verify_advisory_failed
-                                .replace("{}", &advisory.join("、")),
-                        );
-                    }
-                }
-                // else: Unverified turn — omit success chrome entirely
-            } else {
-                parts.push(t.summary_verify_failed.to_string());
-            }
-        } else if !v.checks.is_empty() && !label_states_verification {
-            let ok = v
-                .checks
-                .iter()
-                .filter(|c| c.status == leveler_client_protocol::CheckState::Passed)
-                .count();
-            parts.push(
-                t.summary_verify_partial
-                    .replacen("{}", &ok.to_string(), 1)
-                    .replacen("{}", &v.checks.len().to_string(), 1),
-            );
-        }
-    }
     if let Some((k, n)) = plan_open {
         parts.push(t.summary_plan.replacen("{}", &k.to_string(), 1).replacen(
             "{}",
@@ -1690,7 +1609,6 @@ fn apply_session_with(
     state.plan = (state.status == RuntimeStatus::Busy)
         .then_some(session.plan)
         .flatten();
-    state.verification = session.verification.clone();
     state.diff = session.diff.clone();
     if state
         .diff

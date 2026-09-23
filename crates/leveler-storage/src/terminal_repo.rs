@@ -1,7 +1,7 @@
 //! Atomic terminal transitions for the execution aggregate.
 
 use leveler_core::{SessionId, Timestamp, TurnId};
-use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome, VerificationStatus};
+use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, TurnOutcome};
 
 use crate::event_repo::EVENT_SCHEMA_VERSION;
 use crate::{Database, EventRecord, GoalTerminalUpdate, StorageError, TaskTerminalCommit};
@@ -36,7 +36,6 @@ impl<'a> TerminalRepository<'a> {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         now: Timestamp,
@@ -44,15 +43,14 @@ impl<'a> TerminalRepository<'a> {
         let mut tx = self.db.pool().begin().await?;
         let event = append_event(&mut tx, session_id, None, event_type, payload, &now).await?;
         let updated = sqlx::query(
-            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5, \
-             verification = ?6 WHERE id = ?1",
+            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5 \
+             WHERE id = ?1",
         )
         .bind(session_id.as_str())
         .bind(outcome.as_str())
         .bind(status.as_str())
         .bind(state.as_str())
         .bind(now.to_rfc3339())
-        .bind(verification.as_str())
         .execute(&mut *tx)
         .await;
         let updated = match updated {
@@ -137,7 +135,6 @@ impl TerminalRepository<'_> {
         event_type: &str,
         payload: &str,
         outcome: TaskOutcome,
-        verification: VerificationStatus,
         status: SessionStatus,
         state: AgentState,
         goal: Option<&GoalTerminalUpdate>,
@@ -166,14 +163,7 @@ impl TerminalRepository<'_> {
             return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
         }
         let payload = crate::terminal_store::task_terminal_payload_for_epoch(
-            payload,
-            session_id,
-            token,
-            outcome,
-            verification,
-            status,
-            state,
-            goal,
+            payload, session_id, token, outcome, status, state, goal,
         )
         .map_err(crate::OwnershipError::Storage)?;
         // The idempotency key is the durable task ownership epoch, not event
@@ -219,15 +209,14 @@ impl TerminalRepository<'_> {
             .await
             .map_err(crate::OwnershipError::Storage)?;
         let updated = sqlx::query(
-            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5, \
-             verification = ?6 WHERE id = ?1",
+            "UPDATE sessions SET outcome = ?2, status = ?3, state = ?4, updated_at = ?5 \
+             WHERE id = ?1",
         )
         .bind(session_id.as_str())
         .bind(outcome.as_str())
         .bind(status.as_str())
         .bind(state.as_str())
         .bind(now.to_rfc3339())
-        .bind(verification.as_str())
         .execute(&mut *tx)
         .await;
         match updated {
@@ -502,7 +491,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 Some(&update),
@@ -529,7 +517,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 Some(&update),
@@ -545,7 +532,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 Some(&update),
@@ -569,7 +555,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 Some(&different_goal_update),
@@ -588,7 +573,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"failed"}}"#,
                 TaskOutcome::Failed,
-                leveler_lifecycle::VerificationStatus::Failed,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 Some(&update),
@@ -639,7 +623,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"budget_limited"}}"#,
                 TaskOutcome::BudgetLimited,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Incomplete,
                 AgentState::Execute,
                 Some(&update),
@@ -693,7 +676,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 Some(&update),
@@ -745,7 +727,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 Some(&update),
@@ -792,7 +773,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"failed","reason":null}}"#,
                 TaskOutcome::Failed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 leveler_core::now(),
@@ -873,7 +853,6 @@ mod tests {
                 "task_finished",
                 r#"{"type":"task_finished","payload":{"outcome":"failed","reason":null}}"#,
                 TaskOutcome::Failed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 leveler_core::now(),
@@ -923,7 +902,6 @@ mod tests {
                 "task_finished",
                 &oversized_payload,
                 TaskOutcome::Failed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Failed,
                 AgentState::Failed,
                 leveler_core::now(),
@@ -957,7 +935,6 @@ mod tests {
                 "task_finished",
                 r#"{"api_key":"terminal-secret-value"}"#,
                 TaskOutcome::Completed,
-                leveler_lifecycle::VerificationStatus::NotRun,
                 SessionStatus::Completed,
                 AgentState::Complete,
                 leveler_core::now(),

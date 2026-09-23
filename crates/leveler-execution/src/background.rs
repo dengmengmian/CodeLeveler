@@ -112,6 +112,18 @@ pub struct BackgroundTaskSnapshot {
     pub owner_scope: Option<String>,
 }
 
+/// One atomic observation of status and a bounded slice of retained output.
+/// `snapshot.log` is the delta, not a second copy of the full task log.
+#[derive(Debug, Clone)]
+pub struct BackgroundTaskObservation {
+    pub snapshot: BackgroundTaskSnapshot,
+    /// Terminal truth is retained even after its mutation report is delivered.
+    pub settlement: Option<BackgroundSettlement>,
+    pub dropped_bytes: u64,
+    pub next_cursor: u64,
+    pub log_remaining: bool,
+}
+
 /// Registry-owned lifecycle facts for UI/runtime projections.
 #[derive(Debug, Clone)]
 pub enum BackgroundTaskEvent {
@@ -181,11 +193,17 @@ struct TaskInner {
     status: BackgroundTaskStatus,
     exit_code: Option<i32>,
     log: String,
+    /// Absolute byte position in the sanitized output stream. The retained
+    /// log may be truncated, so a plain index into `log` is not a cursor.
+    log_end: u64,
+    log_prefix_len: usize,
+    default_log_cursor: u64,
     started: Instant,
     finished: Option<Instant>,
     child: Option<ManagedProcess>,
     identity: Option<ProcessIdentity>,
     done: Arc<Notify>,
+    changed: Arc<Notify>,
     process_done: bool,
     log_pumps_remaining: u8,
     /// The process group this task owns has been confirmed gone, so any log
@@ -197,6 +215,7 @@ struct TaskInner {
     mutation_baseline: Option<MutationBaseline>,
     /// What the reaper found. Read by a waiter; never produced by one.
     settlement: Option<BackgroundSettlement>,
+    settlement_reported: bool,
     /// Keeps the private scratch, its OS lease and (on Windows) the write-root
     /// labels alive until the child and log pumps finish — so a backgrounded
     /// command holds its whole confinement for its whole life.
@@ -443,16 +462,21 @@ impl BackgroundTaskRegistry {
                 status: BackgroundTaskStatus::Running,
                 exit_code: None,
                 log: String::new(),
+                log_end: 0,
+                log_prefix_len: 0,
+                default_log_cursor: 0,
                 started: Instant::now(),
                 finished: None,
                 child: Some(process),
                 identity: Some(identity),
                 done: done.clone(),
+                changed: Arc::new(Notify::new()),
                 process_done: false,
                 log_pumps_remaining,
                 group_reaped: false,
                 mutation_baseline,
                 settlement: None,
+                settlement_reported: false,
                 sandbox_scratch,
             },
         );
@@ -617,11 +641,17 @@ impl BackgroundTaskRegistry {
         self.lifecycle_events.subscribe()
     }
 
-    /// Take the settlement exactly once, so a task's file changes are reported
-    /// to the agent loop a single time however often it is waited on.
+    /// Deliver the mutation report once without consuming the terminal facts.
+    /// Independent observers must still see a rejected mutation as failure.
     pub async fn take_settlement(&self, id: &str) -> Option<BackgroundSettlement> {
         let mut st = self.inner.lock().await;
-        st.tasks.get_mut(id).and_then(|t| t.settlement.take())
+        let task = st.tasks.get_mut(id)?;
+        if task.settlement_reported {
+            return None;
+        }
+        let settlement = task.settlement.clone()?;
+        task.settlement_reported = true;
+        Some(settlement)
     }
 
     pub async fn wait(
@@ -679,6 +709,71 @@ impl BackgroundTaskRegistry {
         self.get(id)
             .await
             .ok_or_else(|| format!("task `{id}` disappeared"))
+    }
+
+    /// Wait for unread output, a non-running status, or the bounded interval.
+    /// Registration, cursor validation and delivery share the task lock, so
+    /// output cannot land in a gap between checking and subscribing. Explicit
+    /// cursors never consume the convenience reader's position. Completion-only
+    /// consumers continue to use `wait`; log arrival must not settle a process.
+    pub async fn observe(
+        &self,
+        id: &str,
+        cursor: Option<u64>,
+        max_bytes: usize,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<BackgroundTaskObservation, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err("wait cancelled".into());
+            }
+            let mut st = self.inner.lock().await;
+            let task = st
+                .tasks
+                .get_mut(id)
+                .ok_or_else(|| format!("unknown task `{id}`"))?;
+            let mut position = cursor.unwrap_or(task.default_log_cursor);
+            if position > task.log_end {
+                return Err(format!(
+                    "log cursor {position} is beyond task `{id}` output"
+                ));
+            }
+            if position < task.log_end
+                || task.status != BackgroundTaskStatus::Running
+                || tokio::time::Instant::now() >= deadline
+            {
+                let (log, dropped_bytes) = take_log_delta(
+                    &task.log,
+                    task.log_end,
+                    task.log_prefix_len,
+                    &mut position,
+                    max_bytes,
+                )?;
+                if cursor.is_none() {
+                    task.default_log_cursor = position;
+                }
+                return Ok(BackgroundTaskObservation {
+                    snapshot: snapshot_with_log(task, log),
+                    settlement: task.settlement.clone(),
+                    dropped_bytes,
+                    next_cursor: position,
+                    log_remaining: position < task.log_end,
+                });
+            }
+            let changed = task.changed.clone();
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(st);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err("wait cancelled".into()),
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+        }
     }
 
     /// Kill every non-terminal task regardless of owner. Used on runtime
@@ -836,6 +931,7 @@ impl BackgroundTaskRegistry {
             }
             // Running → Killing; prefer pid/pgid so kill works after reaper take().
             task.status = BackgroundTaskStatus::Killing;
+            task.changed.notify_waiters();
             if let Some(child) = task.child.as_mut() {
                 child.start_kill();
             }
@@ -1013,6 +1109,7 @@ fn finalize_if_drained(task: &mut TaskInner) -> bool {
     // history retention.
     task.sandbox_scratch.take();
     task.done.notify_waiters();
+    task.changed.notify_waiters();
     true
 }
 
@@ -1034,21 +1131,58 @@ async fn append_log(
         return None;
     }
     task.log.push_str(&chunk);
-    truncate_log(&mut task.log);
+    task.log_end = task.log_end.saturating_add(chunk.len() as u64);
+    if let Some(prefix_len) = truncate_log(&mut task.log) {
+        task.log_prefix_len = prefix_len;
+    }
+    task.changed.notify_waiters();
     Some((task.owner_scope.clone(), chunk))
 }
 
-fn truncate_log(log: &mut String) {
+fn truncate_log(log: &mut String) -> Option<usize> {
     if log.len() > MAX_LOG_BYTES {
         // The marker embeds the dropped byte count, which depends on the
         // boundary-adjusted cut point — compute it first, then truncate.
         let dropped = leveler_core::ceil_char_boundary(log, log.len() - MAX_LOG_BYTES);
         let marker = format!("…[truncated {dropped} bytes]…");
         *log = leveler_core::truncate_tail_bytes(log, MAX_LOG_BYTES, &marker);
+        return Some(marker.len());
     }
+    None
+}
+
+fn take_log_delta(
+    log: &str,
+    end: u64,
+    prefix_len: usize,
+    cursor: &mut u64,
+    max_bytes: usize,
+) -> Result<(String, u64), String> {
+    let retained = &log[prefix_len..];
+    let retained_start = end.saturating_sub(retained.len() as u64);
+    let gap = retained_start.saturating_sub(*cursor);
+    let start = (*cursor).max(retained_start);
+    let offset = (start - retained_start) as usize;
+    if !retained.is_char_boundary(offset) {
+        return Err(format!("log cursor {} splits a UTF-8 character", *cursor));
+    }
+    if max_bytes < 4 && offset < retained.len() {
+        return Err("log output budget is too small".into());
+    }
+    let limit = leveler_core::floor_char_boundary(
+        retained,
+        offset.saturating_add(max_bytes).min(retained.len()),
+    );
+    let delta = retained[offset..limit].to_string();
+    *cursor = start + delta.len() as u64;
+    Ok((delta, gap))
 }
 
 fn snapshot(task: &TaskInner) -> BackgroundTaskSnapshot {
+    snapshot_with_log(task, task.log.clone())
+}
+
+fn snapshot_with_log(task: &TaskInner, log: String) -> BackgroundTaskSnapshot {
     let duration_ms = task
         .finished
         .unwrap_or_else(Instant::now)
@@ -1061,7 +1195,7 @@ fn snapshot(task: &TaskInner) -> BackgroundTaskSnapshot {
         cwd: task.cwd.clone(),
         status: task.status,
         exit_code: task.exit_code,
-        log: task.log.clone(),
+        log,
         duration_ms,
         owner_scope: task.owner_scope.clone(),
     }
@@ -1294,6 +1428,45 @@ mod tests {
     }
 
     #[test]
+    fn wait_delta_reports_gap_after_log_truncation() {
+        let mut cursor = 0;
+        let marker = "…[truncated]…";
+        let retained = "🙂new output\n";
+        let log = format!("{marker}{retained}");
+        let end = 100 + retained.len() as u64;
+        let (first, gap) = take_log_delta(&log, end, marker.len(), &mut cursor, 1024).unwrap();
+        assert_eq!(gap, 100);
+        assert_eq!(first, retained);
+        assert_eq!(cursor, end);
+        let (second, gap) = take_log_delta(&log, end, marker.len(), &mut cursor, 1024).unwrap();
+        assert_eq!(gap, 0);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn wait_delta_keeps_undelivered_bytes_for_next_call() {
+        let mut cursor = 0;
+        let log = "🙂abcdef";
+        let end = log.len() as u64;
+        let (first, gap) = take_log_delta(log, end, 0, &mut cursor, 5).unwrap();
+        assert_eq!(first, "🙂a");
+        assert_eq!(gap, 0);
+        assert_eq!(cursor, 5);
+        let (second, gap) = take_log_delta(log, end, 0, &mut cursor, 5).unwrap();
+        assert_eq!(second, "bcdef");
+        assert_eq!(gap, 0);
+        assert_eq!(cursor, end);
+    }
+
+    #[test]
+    fn wait_delta_rejects_cursor_inside_utf8_character() {
+        let mut cursor = 1;
+        let error = take_log_delta("🙂", 4, 0, &mut cursor, 1024).unwrap_err();
+        assert!(error.contains("UTF-8"));
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
     fn terminal_history_is_bounded_without_evicting_active_tasks() {
         let now = Instant::now();
         let mut state = RegistryState::default();
@@ -1317,16 +1490,21 @@ mod tests {
                     status: BackgroundTaskStatus::Exited,
                     exit_code: Some(0),
                     log: String::new(),
+                    log_end: 0,
+                    log_prefix_len: 0,
+                    default_log_cursor: 0,
                     started: finished,
                     finished: Some(finished),
                     child: None,
                     identity: None,
                     done: Arc::new(Notify::new()),
+                    changed: Arc::new(Notify::new()),
                     process_done: true,
                     log_pumps_remaining: 0,
                     group_reaped: false,
                     mutation_baseline: None,
                     settlement: None,
+                    settlement_reported: false,
                     sandbox_scratch: None,
                 },
             );
@@ -1347,16 +1525,21 @@ mod tests {
                     status,
                     exit_code: None,
                     log: String::new(),
+                    log_end: 0,
+                    log_prefix_len: 0,
+                    default_log_cursor: 0,
                     started: now,
                     finished: None,
                     child: None,
                     identity: None,
                     done: Arc::new(Notify::new()),
+                    changed: Arc::new(Notify::new()),
                     process_done: false,
                     log_pumps_remaining: 0,
                     group_reaped: false,
                     mutation_baseline: None,
                     settlement: None,
+                    settlement_reported: false,
                     sandbox_scratch: None,
                 },
             );
@@ -1392,16 +1575,21 @@ mod tests {
             status: BackgroundTaskStatus::Running,
             exit_code: Some(0),
             log: String::new(),
+            log_end: 0,
+            log_prefix_len: 0,
+            default_log_cursor: 0,
             started: Instant::now(),
             finished: None,
             child: None,
             identity: None,
             done: Arc::new(Notify::new()),
+            changed: Arc::new(Notify::new()),
             process_done: true,
             log_pumps_remaining: 0,
             group_reaped: true,
             mutation_baseline: None,
             settlement: None,
+            settlement_reported: false,
             sandbox_scratch: Some(crate::command::SandboxScratch::unleased(scratch)),
         };
 
