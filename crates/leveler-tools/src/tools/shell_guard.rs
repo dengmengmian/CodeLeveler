@@ -55,7 +55,7 @@ pub fn refuse_shell_script(cmd: &str) -> Option<String> {
         return Some(crate::recoverable::permission_refused(
             &format!(
                 "refused a `#` comment that would swallow trailing command-like \
-                 text ({detail}). Everything after `#` never runs."
+                 text ({detail}). Everything after `#` on that line never runs."
             ),
             "put the full pipeline as real shell (no mid-line `#` before \
              curl/wget/…), or split into separate tool calls.",
@@ -121,7 +121,12 @@ fn has_unix_job_control_background(cmd: &str) -> bool {
                 in_double = true;
                 i += 1;
             }
-            b'#' => break,
+            b'#' => {
+                // Comments end at the newline, not at the end of the script.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
             b'&' => {
                 let prev = bytes[..i].iter().rev().find(|c| !c.is_ascii_whitespace());
                 let next = bytes[i + 1..]
@@ -193,8 +198,16 @@ fn sensitive_shell_token(cmd: &str) -> Option<String> {
         match c {
             '\'' => in_single = true,
             '"' => in_double = true,
-            // Comment tail never executes; the `#`-swallow guard owns that case.
-            '#' => break,
+            '#' => {
+                if let Some(hit) = take_sensitive(&mut token) {
+                    return Some(hit);
+                }
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
             c if c.is_whitespace() => {
                 if let Some(hit) = take_sensitive(&mut token) {
                     return Some(hit);
@@ -312,15 +325,14 @@ fn comment_swallows_trailing_command(cmd: &str) -> Option<String> {
             continue;
         }
         if b == b'#' {
-            let tail = cmd[i + 1..].trim();
-            if tail.is_empty() {
-                return None;
-            }
+            let end = cmd[i..].find('\n').map_or(cmd.len(), |offset| i + offset);
+            let tail = cmd[i + 1..end].trim();
             if comment_tail_looks_like_command(tail) {
                 let preview: String = tail.chars().take(48).collect();
                 return Some(format!("`#{preview}…`"));
             }
-            return None;
+            i = end;
+            continue;
         }
         i += 1;
     }
@@ -409,6 +421,43 @@ mod tests {
         assert!(refuse_shell_script("curl -s http://127.0.0.1:5000/").is_none());
         assert!(refuse_shell_script("python3 -c 'print(1)'").is_none());
         assert!(refuse_shell_script("echo hi # just a note").is_none());
+    }
+
+    #[test]
+    fn multiline_comments_do_not_swallow_later_executable_lines() {
+        for cmd in [
+            "# prepare\npython3 -c 'print(1)'",
+            "echo ready # a note\r\npython3 -c 'print(1)'",
+            "# first\n# second\ncargo test -q",
+        ] {
+            assert!(refuse_shell_script(cmd).is_none(), "{cmd}");
+            assert!(
+                refuse_run_command_shell_bypass("sh", &["-c".into(), cmd.into()]).is_none(),
+                "{cmd}"
+            );
+        }
+        let error = refuse_shell_script("# first note\nsleep 1 # curl localhost")
+            .expect("a later genuinely swallowed command must still be refused");
+        assert!(error.contains("`#curl localhost"), "{error}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn multiline_comments_do_not_hide_later_background_commands() {
+        let error = refuse_shell_script("# prepare\necho ready &")
+            .expect("background work after a comment must still be detected");
+        assert!(error.contains("background=true"), "{error}");
+    }
+
+    #[test]
+    fn multiline_comments_do_not_hide_later_sensitive_paths() {
+        for cmd in [
+            "# prepare\ncat .env",
+            "echo ready # note\ncat credentials.json",
+        ] {
+            let error = refuse_shell_script(cmd).expect("later paths must still be checked");
+            assert!(error.contains("credential-bearing"), "{error}");
+        }
     }
 
     #[cfg(not(windows))]
