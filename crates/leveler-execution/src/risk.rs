@@ -34,6 +34,8 @@ pub enum WriteScope {
     None,
     /// Writes confined to this root plus the standard temp / cache dirs.
     Workspace { root: PathBuf },
+    /// Writes confined to this root, including its Git metadata.
+    WorkspaceWithGit { root: PathBuf },
     /// No write confinement (完全访问, or an approved elevation).
     Unrestricted,
 }
@@ -47,7 +49,7 @@ impl WriteScope {
     /// The writable root, when there is one.
     pub fn root(&self) -> Option<&Path> {
         match self {
-            Self::Workspace { root } => Some(root),
+            Self::Workspace { root } | Self::WorkspaceWithGit { root } => Some(root),
             Self::None | Self::Unrestricted => None,
         }
     }

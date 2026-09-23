@@ -495,7 +495,7 @@ mod tests {
         };
         let block = cp.context_block();
         assert!(block.starts_with("[GOAL CHECKPOINT]"));
-        assert!(block.contains("not measured"), "got: {block}");
+        assert!(block.contains("unknown (ledger not read)"), "got: {block}");
         assert!(block.contains("NOT zero"), "got: {block}");
         assert!(
             block.contains("newer than it"),

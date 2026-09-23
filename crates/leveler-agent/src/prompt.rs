@@ -310,7 +310,7 @@ impl TurnContext {
              - Git mutate (`git pull`/`fetch`/`commit`/`rebase`/…): under assisted/request-approval, \
              workspace `.git` is write-protected. Just run the git command; when the sandbox \
              denies it, retry that same command with `escalate` set (`filesystem` = \
-             `unrestricted`, plus `network` = true when contacting a remote) — one call, \
+             `git`, plus `network` = true when contacting a remote) — one call, \
              no separate permission round. Read-only git (`status`/`diff`/`log`) does not \
              need elevation.\n\
              - Host openers (`open` / `xdg-open` / Windows `start`): these leave the sandbox and \
@@ -743,6 +743,10 @@ mod tests {
         assert!(
             !git_rule.contains("request_permissions"),
             "the superseded two-step must be gone: {git_rule}"
+        );
+        assert!(
+            git_rule.contains("`git`"),
+            "git mutation must request the narrow repository grant: {git_rule}"
         );
     }
 

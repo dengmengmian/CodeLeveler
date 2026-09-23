@@ -1,10 +1,8 @@
 # CodeLeveler's own Agent Verification Contract.
 #
-# The harness verifies this repository with this repository's own checks, so
-# this file is what an agent's work is judged against inside the verification
-# sandbox — and what `leveler run` reports as `verification=` for this project.
-# It declares the checks that are safe and deterministic under the sandbox's
-# write fence; the full suite stays the operator/CI/release gate.
+# This repository keeps a confined verification contract for explicit check
+# workflows. It does not decide task completion. The full suite remains the
+# operator/CI/release gate.
 #
 # Layer 1 — this contract. Every command here runs confined to the workspace,
 # the per-command scratch and the tool cache: no nested sandbox, no daemon or
@@ -37,9 +35,6 @@ verify:
       # Needs nested confinement (its tests start sandboxes of their own).
       - --exclude
       - leveler-execution
-      # Needs nested confinement: the verifier under test runs real checks.
-      - --exclude
-      - leveler-verifier
       # Needs nested confinement: command tools execute confined children.
       - --exclude
       - leveler-tools

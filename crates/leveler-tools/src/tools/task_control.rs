@@ -709,7 +709,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(delivered, format!("{}Z", "0".repeat(2000)));
+        assert_eq!(delivered, format!("[stdout] {}Z", "0".repeat(2000)));
     }
 
     /// The context, the ONE background registry, and the command runtime built

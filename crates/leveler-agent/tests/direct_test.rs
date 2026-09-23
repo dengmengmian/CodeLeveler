@@ -21,7 +21,6 @@ use leveler_storage::{
     Database, EventRepository, GoalStore, MessageRepository, SessionRepository, TurnRepository,
 };
 use leveler_tools::ToolContext;
-type VerificationPlan = ();
 
 /// The surface a real coding turn gets: the tool crate's composition plus the
 /// harness controls THIS crate registers (`update_plan`). Production composes
@@ -268,7 +267,7 @@ async fn factory_reasoning_override_reaches_every_model_request() {
         reasoning_effort: Some(leveler_model::ReasoningEffort::High),
         ..leveler_agent::coding::ExecutionOverrides::default()
     });
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     h.engine
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
@@ -304,7 +303,7 @@ async fn main_reasoning_override_reaches_parent_requests_but_not_child_requests(
         main_reasoning_effort: Some(leveler_model::ReasoningEffort::High),
         ..leveler_agent::coding::ExecutionOverrides::default()
     });
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     h.engine
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
@@ -523,7 +522,7 @@ async fn a_failed_terminal_commit_leaves_no_half_visible_task_fact() {
         inner: h.db.clone(),
         failure: TerminalFailure::Task,
     });
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let result = h
@@ -570,7 +569,7 @@ async fn an_uncommitted_turn_terminal_prevents_the_task_terminal() {
         inner: h.db.clone(),
         failure: TerminalFailure::Turn,
     });
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let result = h
@@ -608,7 +607,7 @@ async fn a_failed_transcript_append_fails_the_turn_loudly() {
     )])
     .await;
     h.engine.engine.stores.messages = Arc::new(FailingMessages);
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let result = h
@@ -701,7 +700,7 @@ async fn stale_ownership_prevents_tool_dispatch() {
         session: session_cell.clone(),
         hijacked: std::sync::atomic::AtomicBool::new(false),
     });
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     session_cell.set(session.clone()).unwrap();
 
@@ -739,7 +738,7 @@ async fn stale_ownership_prevents_tool_dispatch() {
 #[tokio::test]
 async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
     let h = harness(Vec::new()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     let task = h
         .engine
@@ -800,7 +799,7 @@ async fn restart_reacquires_a_fresh_epoch_and_fences_the_old_token() {
 #[tokio::test]
 async fn a_foreign_owned_task_is_reported_not_touched() {
     let h = harness(Vec::new()).await;
-    let mut spec = spec(&h, VerificationPlan::default());
+    let mut spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     let task = h
         .engine
@@ -879,7 +878,7 @@ async fn a_foreign_owned_task_is_reported_not_touched() {
 #[tokio::test]
 async fn create_task_records_the_durable_task_association() {
     let h = harness(Vec::new()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let task = h
@@ -908,7 +907,7 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
     )])
     .await;
     h.engine.factory.allow_delegation = false;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     // A session written by an older binary: session row only, no task row.
     let record = leveler_storage::SessionRecord::new(
         h.dir.path().display().to_string(),
@@ -952,7 +951,7 @@ async fn running_a_legacy_session_backfills_its_task_and_stamps_task_started() {
     );
 }
 
-fn spec(h: &Harness, _plan: VerificationPlan) -> TaskSpec {
+fn spec(h: &Harness) -> TaskSpec {
     TaskSpec {
         runtime: leveler_agent::coding::RuntimeTaskSpec {
             goal: "add a function".to_string(),
@@ -966,10 +965,6 @@ fn spec(h: &Harness, _plan: VerificationPlan) -> TaskSpec {
             sandbox: false,
         },
     }
-}
-
-fn gate(name: &str, program: &str) -> VerificationPlan {
-    let _ = (name, program);
 }
 
 /// `grep`-style acceptance hint for the platform's shell (`sh -c` on Unix,
@@ -988,7 +983,7 @@ fn grep_hint(needle: &str, file: &str) -> String {
 async fn direct_run_persists_turns_messages_events_and_outcome() {
     // Impl-class Verified requires proven Met required AC (not empty fallback).
     let h = harness(patch_resolve_and_proven_ac()).await;
-    let spec = spec(&h, gate("ok", "true"));
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let mut seen: Vec<EngineEvent> = Vec::new();
@@ -1069,7 +1064,7 @@ async fn direct_run_persists_turns_messages_events_and_outcome() {
 #[tokio::test]
 async fn no_gates_means_completed_with_verification_not_run() {
     let h = harness(patch_then_resolve()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     let report = h
         .engine
@@ -1096,7 +1091,7 @@ async fn pure_qa_with_green_gates_is_completed_with_verification_not_run() {
         serde_json::json!({"status": "complete", "summary": "auth uses JWT sessions"}),
     )])
     .await;
-    let mut s = spec(&h, gate("ok", "true"));
+    let mut s = spec(&h);
     s.runtime.goal = "explain how auth works".to_string();
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
@@ -1162,7 +1157,7 @@ async fn a_branch_switch_does_not_inherit_the_projects_test_gate() {
         },
     )
     .await;
-    let mut s = spec(&h, gate("test", "false"));
+    let mut s = spec(&h);
     s.coding.mode = PermissionProfile::FullAccess;
     s.runtime.goal = "切换到 feat 分支".to_string();
 
@@ -1198,7 +1193,7 @@ async fn a_branch_switch_does_not_inherit_the_projects_test_gate() {
 #[tokio::test]
 async fn edits_with_green_gates_complete_with_checks_passed() {
     let h = harness(patch_resolve_and_proven_ac()).await;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -1233,7 +1228,7 @@ async fn edits_with_green_gates_complete_with_checks_passed() {
 async fn impl_green_gates_are_verified_without_proven_acceptance() {
     // No understand response → fallback optional AC → no proven required Met.
     let h = harness(patch_then_resolve()).await;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -1269,7 +1264,7 @@ async fn delete_file_with_green_gates_and_no_understand_is_verified() {
     ];
     let h = harness(responses).await;
     std::fs::write(h.dir.path().join("quicksort.py"), "def qs(): pass\n").unwrap();
-    let mut s = spec(&h, gate("ok", "true"));
+    let mut s = spec(&h);
     s.runtime.goal = "delete quicksort.py".to_string();
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
@@ -1311,7 +1306,7 @@ async fn top_level_goal_runs_until_terminal_past_the_old_model_round_budget() {
         ),
     ])
     .await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let report = h
@@ -1332,7 +1327,7 @@ async fn bounded_eval_goal_still_stops_at_the_case_round_limit() {
         tool_call("c3", "read_file", serde_json::json!({"path": "src/lib.rs"})),
     ])
     .await;
-    let mut spec = spec(&h, VerificationPlan::default());
+    let mut spec = spec(&h);
     spec.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(2);
     let session = h.engine.create_task(&spec).await.unwrap();
 
@@ -1350,7 +1345,7 @@ async fn bounded_eval_goal_still_stops_at_the_case_round_limit() {
 #[tokio::test]
 async fn direct_budget_stop_preserves_the_executor_detail() {
     let h = harness(vec![text("never reached")]).await;
-    let mut spec = spec(&h, VerificationPlan::default());
+    let mut spec = spec(&h);
     spec.runtime.limits.max_duration = Some(std::time::Duration::ZERO);
     let session = h.engine.create_task(&spec).await.unwrap();
 
@@ -1377,7 +1372,7 @@ async fn agent_failure_persists_terminal_task_and_turn_events() {
     // The query projections already become failed; the canonical log must carry
     // the same terminal facts so replay cannot disagree with those projections.
     let h = harness(Vec::new()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let error = h
@@ -1433,7 +1428,7 @@ async fn agent_failure_persists_terminal_task_and_turn_events() {
 #[tokio::test]
 async fn cancellation_is_recorded_as_interrupted() {
     let h = harness(patch_then_resolve()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let token = CancellationToken::new();
@@ -1460,7 +1455,7 @@ async fn cancellation_is_recorded_as_interrupted() {
 #[tokio::test]
 async fn a_wide_round_window_keeps_completion_and_cancellation_terminals() {
     let window = |h: &Harness| {
-        let mut s = spec(h, VerificationPlan::default());
+        let mut s = spec(h);
         s.runtime.continuation = leveler_agent::ContinuationPolicy::bounded(200);
         s
     };
@@ -1501,7 +1496,7 @@ async fn a_wide_round_window_keeps_completion_and_cancellation_terminals() {
 #[tokio::test]
 async fn cancellation_at_the_terminal_publish_boundary_wins_over_completion() {
     let h = harness(patch_then_resolve()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let cancellation = CancellationToken::new();
@@ -1557,7 +1552,7 @@ async fn cancellation_at_the_terminal_publish_boundary_wins_over_completion() {
 #[tokio::test]
 async fn starting_a_turn_reaps_orphan_running_siblings() {
     let h = harness(patch_then_resolve()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     // Simulate a zombie left by process kill: status running, no finished_at.
@@ -1623,7 +1618,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
     // Phase 1: interrupt immediately — the seed transcript persists, the
     // session ends `interrupted`.
     let h = harness(patch_then_resolve()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     let token = CancellationToken::new();
     token.cancel();
@@ -1728,7 +1723,7 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
 #[tokio::test]
 async fn resume_refuses_a_successfully_completed_session() {
     let h = harness(patch_then_resolve()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     h.engine
         .run(&session, &spec, &mut |_| {}, CancellationToken::new())
@@ -1749,7 +1744,7 @@ async fn resume_refuses_a_successfully_completed_session() {
 #[tokio::test]
 async fn resume_refuses_a_parallel_parent_session() {
     let h = harness(patch_then_resolve()).await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     SessionRepository::new(&h.db)
         .set_execution(
@@ -1783,7 +1778,7 @@ async fn quiet_without_update_goal_is_not_task_success() {
         responses.push(text("看起来做完了。"));
     }
     let h = harness(responses).await;
-    let s = spec(&h, VerificationPlan::default());
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -1816,7 +1811,7 @@ async fn quiet_without_update_goal_is_not_task_success() {
 #[tokio::test]
 async fn direct_spends_no_extra_model_call_on_acceptance() {
     let h = harness(patch_then_resolve()).await;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -1844,7 +1839,7 @@ async fn a_stalled_goal_ends_after_one_turn() {
         ),
     ])
     .await;
-    let spec = spec(&h, VerificationPlan::default());
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
 
     let report = h
@@ -1870,7 +1865,7 @@ async fn independent_review_required_launches_on_an_ordinary_change() {
     responses.push(text("ordinary change: no blocking defect"));
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
     h.engine
@@ -1987,7 +1982,7 @@ async fn an_unsettled_started_review_prevents_the_task_terminal() {
     responses.push(text("review completed without findings"));
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let spec = spec(&h, gate("ok", "true"));
+    let spec = spec(&h);
     let session = h.engine.create_task(&spec).await.unwrap();
     h.engine.engine.stores.events = Arc::new(RejectReviewTerminalEvents {
         inner: h.db.clone(),
@@ -2064,7 +2059,7 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
 
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
         .run(&session, &s, &mut |_| {}, CancellationToken::new())
@@ -2086,7 +2081,7 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
 // as no progress and the goal died with `outcome=failed` while work was landing.
 
 fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
-    let mut s = spec(h, VerificationPlan::default());
+    let mut s = spec(h);
     s.runtime.goal = goal.to_string();
     // UntilTerminal keeps the round budget UNPINNED, so hitting the per-turn
     // ceiling ends a WORK WINDOW (policy opens the next one), not the goal.
@@ -2330,7 +2325,7 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
 #[tokio::test]
 async fn not_required_review_is_still_recorded() {
     let h = harness(patch_then_resolve()).await;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let _ = h
         .engine
@@ -2399,7 +2394,7 @@ async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
     }
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
     let _ = h
@@ -2490,7 +2485,7 @@ async fn a_reviewer_finding_is_adopted_without_gating_the_closure() {
 
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -2554,7 +2549,7 @@ async fn a_reviewer_observation_does_not_refuse_the_closure() {
 
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -2604,7 +2599,7 @@ async fn persisted_findings_reload_without_duplication() {
     ];
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
         .run(&session, &s, &mut |_| {}, CancellationToken::new())
@@ -2664,7 +2659,7 @@ async fn a_reviewer_finding_reaches_the_terminal_contribution_trace() {
 
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
     let _ = h
@@ -2730,7 +2725,7 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
 
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
     let _ = h
@@ -2758,7 +2753,7 @@ async fn a_reviewer_without_findings_reports_a_measured_zero_not_null() {
 #[tokio::test]
 async fn completion_does_not_run_a_host_owned_verification_gate() {
     let h = harness(patch_resolve_and_proven_ac()).await;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
         .run(&session, &s, &mut |_| {}, CancellationToken::new())
@@ -2787,7 +2782,7 @@ async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
     let mut responses = patch_resolve_and_proven_ac();
     responses.extend(patch_resolve_and_proven_ac());
     let h = harness(responses).await;
-    let s = spec(&h, gate("nope", "false"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let report = h
         .engine
@@ -2827,7 +2822,7 @@ async fn a_failed_engine_gate_is_recorded_as_a_failed_observation() {
 #[tokio::test]
 async fn one_verification_attempt_has_one_canonical_check_fact() {
     let h = harness(patch_resolve_and_proven_ac()).await;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     h.engine
         .run(&session, &s, &mut |_| {}, CancellationToken::new())
@@ -2871,7 +2866,7 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
     responses.push(text("reviewed src/auth.rs: no blocking defect found"));
     let mut h = harness(responses).await;
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
     h.engine
@@ -2999,7 +2994,7 @@ async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
     // `IndependentReviewPolicy` defaults to `Off`: a run that spends in one
     // lane only cannot prove the two authorities agree, so ask for it.
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
-    let s = spec(&h, gate("ok", "true"));
+    let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
     let mut seen: Vec<EngineEvent> = Vec::new();
     h.engine

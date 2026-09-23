@@ -296,7 +296,7 @@ impl Executor {
         if grants.is_empty() {
             return Ok(PermissionRequestOutcome::Invalid {
                 message:
-                    "未请求任何可识别权限:请设置 network、filesystem=unrestricted 或 full_access。"
+                    "未请求任何可识别权限:请设置 network、filesystem=git、filesystem=unrestricted 或 full_access。"
                         .to_string(),
             });
         }
@@ -314,11 +314,27 @@ impl Executor {
         }
         let description = permission_request_description(action, reason, grants, scope);
         // Risk: filesystem elevation is at least as sensitive as network.
-        let risk = if grants.unrestricted_fs {
+        let risk = if grants.repository_git || grants.unrestricted_fs {
             RiskLevel::Privileged
         } else {
             RiskLevel::Network
         };
+        let rule_paths: Vec<std::path::PathBuf> = Vec::new();
+        if grants.repository_git
+            && !grants.unrestricted_fs
+            && self
+                .permission_rules
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .evaluate(&call.name, Some(action), &rule_paths)
+                == leveler_execution::RuleDecision::Allow
+        {
+            return Ok(PermissionRequestOutcome::Granted {
+                message: permission_grant_message(true, grants),
+                grants,
+                for_turn: false,
+            });
+        }
         // A permission request is a risky ACTION, not a question — it is exactly
         // the yes/no an Approver exists to answer. Routing it to the Clarifier
         // instead put it outside the approval policy, so `--auto-approve` (whose
@@ -332,7 +348,7 @@ impl Executor {
             tool: call.name.clone(),
             risk,
             description,
-            command: None,
+            command: Some(action.to_string()),
             paths: Vec::new(),
         };
         // Through the host's one ask path (PR 5): the reviewer, the human, and
@@ -342,20 +358,28 @@ impl Executor {
             signature: action_fingerprint(call),
             write: self.tool_context.write_scope(),
             network_allowed: !self.tool_context.policy.network_denied(),
-            command_line: None,
+            command_line: Some(action.to_string()),
             scoped_paths: Vec::new(),
             request,
         };
         match self.ask(&pending, None, None, cancellation).await {
-            super::host::AskOutcome::Allowed(evidence) => Ok(PermissionRequestOutcome::Granted {
-                message: permission_grant_message(true, grants),
-                grants,
-                for_turn: matches!(
-                    evidence,
-                    leveler_execution::AuthorizationEvidence::SessionGrant { .. }
-                        | leveler_execution::AuthorizationEvidence::ApprovedAlways
-                ),
-            }),
+            super::host::AskOutcome::Allowed(evidence) => {
+                if grants.repository_git
+                    && !grants.unrestricted_fs
+                    && evidence == leveler_execution::AuthorizationEvidence::ApprovedAlways
+                {
+                    self.remember_always(&call.name, Some(action), &[]);
+                }
+                Ok(PermissionRequestOutcome::Granted {
+                    message: permission_grant_message(true, grants),
+                    grants,
+                    for_turn: matches!(
+                        evidence,
+                        leveler_execution::AuthorizationEvidence::SessionGrant { .. }
+                            | leveler_execution::AuthorizationEvidence::ApprovedAlways
+                    ),
+                })
+            }
             super::host::AskOutcome::DeniedByUser => Ok(PermissionRequestOutcome::DeniedByUser {
                 requested: grants,
                 message: permission_denied_by_user_message(),

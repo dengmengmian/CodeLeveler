@@ -131,9 +131,9 @@ pub enum BackgroundTaskEvent {
         owner_scope: Option<String>,
         task: BackgroundTaskSnapshot,
     },
-    /// A chunk of the task's combined stdout/stderr, after sanitization and
-    /// the registry's own log cap. Live output for a detail view; the final
-    /// snapshot on [`Self::Exited`] stays authoritative.
+    /// A stream-tagged chunk of the task's stdout/stderr, after sanitization
+    /// and the registry's own log cap. Live output for a detail view; the
+    /// final snapshot on [`Self::Exited`] stays authoritative.
     Output {
         owner_scope: Option<String>,
         task_id: String,
@@ -143,6 +143,21 @@ pub enum BackgroundTaskEvent {
         owner_scope: Option<String>,
         task: BackgroundTaskSnapshot,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackgroundOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl BackgroundOutputStream {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
 }
 
 /// Tracks live process identities for kill-on-drop of the registry handle.
@@ -493,12 +508,14 @@ impl BackgroundTaskRegistry {
             reg.clone(),
             tid.clone(),
             stdout,
+            BackgroundOutputStream::Stdout,
             self.lifecycle_events.clone(),
         );
         spawn_log_pump(
             reg.clone(),
             tid.clone(),
             stderr,
+            BackgroundOutputStream::Stderr,
             self.lifecycle_events.clone(),
         );
 
@@ -983,6 +1000,7 @@ fn spawn_log_pump<R>(
     reg: Arc<Mutex<RegistryState>>,
     tid: String,
     stream: Option<R>,
+    output_stream: BackgroundOutputStream,
     lifecycle_events: broadcast::Sender<BackgroundTaskEvent>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -997,7 +1015,9 @@ fn spawn_log_pump<R>(
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Some((owner_scope, chunk)) = append_log(&reg, &tid, &buf[..n]).await {
+                    if let Some((owner_scope, chunk)) =
+                        append_log(&reg, &tid, output_stream, &buf[..n]).await
+                    {
                         let _ = lifecycle_events.send(BackgroundTaskEvent::Output {
                             owner_scope,
                             task_id: tid.clone(),
@@ -1119,6 +1139,7 @@ fn finalize_if_drained(task: &mut TaskInner) -> bool {
 async fn append_log(
     reg: &Arc<Mutex<RegistryState>>,
     id: &str,
+    stream: BackgroundOutputStream,
     bytes: &[u8],
 ) -> Option<(Option<String>, String)> {
     let mut st = reg.lock().await;
@@ -1126,10 +1147,11 @@ async fn append_log(
     let raw = String::from_utf8_lossy(bytes);
     // Sanitize BEFORE the registry buffer: the log cap and every projection are
     // then measured on the same clean text.
-    let chunk = leveler_core::sanitize_terminal_output(&raw);
-    if chunk.is_empty() {
+    let sanitized = leveler_core::sanitize_terminal_output(&raw);
+    if sanitized.is_empty() {
         return None;
     }
+    let chunk = format!("[{}] {sanitized}", stream.label());
     task.log.push_str(&chunk);
     task.log_end = task.log_end.saturating_add(chunk.len() as u64);
     if let Some(prefix_len) = truncate_log(&mut task.log) {
@@ -2012,6 +2034,26 @@ mod tests {
             "sandboxed background echo should produce log: {}",
             snap.log
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_log_identifies_stdout_and_stderr() {
+        let reg = BackgroundTaskRegistry::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let req = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "printf out; printf err >&2".into()],
+            dir.path().to_path_buf(),
+        );
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let snap = reg
+            .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .expect("wait");
+
+        assert!(snap.log.contains("[stdout] out"), "log: {}", snap.log);
+        assert!(snap.log.contains("[stderr] err"), "log: {}", snap.log);
     }
 
     /// Real OS confinement canary for background spawn (mirrors foreground

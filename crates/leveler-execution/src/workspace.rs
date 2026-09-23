@@ -238,7 +238,9 @@ impl Workspace {
         let input = input.as_ref();
         let bound = match scope {
             WriteScope::None => return Err(WorkspaceError::no_write_scope(input)),
-            WriteScope::Workspace { root } => Some(root.as_path()),
+            WriteScope::Workspace { root } | WriteScope::WorkspaceWithGit { root } => {
+                Some(root.as_path())
+            }
             WriteScope::Unrestricted => None,
         };
         self.resolve_bounded(input, bound, PathAccess::Write)

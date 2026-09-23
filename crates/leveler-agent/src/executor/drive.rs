@@ -154,6 +154,9 @@ pub(crate) struct Drive<'a> {
     epoch_estimated_at_start: u64,
     epoch_duration_at_start: std::time::Duration,
     budget_note_sent: bool,
+    /// Set after the one deterministic goal-mode reminder that turns an
+    /// initial read-only investigation into delivery work.
+    delivery_convergence_nudged: bool,
     plan_state: PlanState,
     /// True after an actually dispatched non-plan tool call until the model
     /// successfully publishes another full plan table. This is freshness only:
@@ -339,6 +342,7 @@ impl Executor {
             ),
             commands_run: progress.cumulative_commands,
             budget_note_sent: false,
+            delivery_convergence_nudged: false,
             plan_state: self.seeded_plan.clone(),
             plan_needs_reconciliation: false,
             context_diverged,
@@ -2079,10 +2083,10 @@ impl AgentHarness for Drive<'_> {
             // request_permissions is answered by the user, not the registry.
             if call.name == REQUEST_PERMISSIONS_TOOL {
                 let (_, _, requested) = parse_permission_request(&call.arguments);
-                if self
-                    .progress
-                    .covers_denied_request(requested.network, requested.unrestricted_fs)
-                {
+                if self.progress.covers_denied_request(
+                    requested.network,
+                    requested.repository_git || requested.unrestricted_fs,
+                ) {
                     results[index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
                             call_id: call.id,
@@ -2101,8 +2105,10 @@ impl AgentHarness for Drive<'_> {
                         self.turn_grants = self.turn_grants.merge(*grants);
                     }
                     PermissionRequestOutcome::DeniedByUser { requested, .. } => {
-                        self.progress
-                            .record_human_denial(requested.network, requested.unrestricted_fs);
+                        self.progress.record_human_denial(
+                            requested.network,
+                            requested.repository_git || requested.unrestricted_fs,
+                        );
                         (self.observer)(AgentEvent::ProgressUpdated {
                             ledger: self.progress.clone(),
                         });
@@ -2317,10 +2323,10 @@ impl AgentHarness for Drive<'_> {
                     );
                     continue;
                 }
-                if self
-                    .progress
-                    .covers_denied_request(requested.network, requested.unrestricted_fs)
-                {
+                if self.progress.covers_denied_request(
+                    requested.network,
+                    requested.repository_git || requested.unrestricted_fs,
+                ) {
                     self.settle_refused_call(
                         &call,
                         permission_already_denied_message(),
@@ -2356,8 +2362,10 @@ impl AgentHarness for Drive<'_> {
                         call_grants = *grants;
                     }
                     PermissionRequestOutcome::DeniedByUser { requested, .. } => {
-                        self.progress
-                            .record_human_denial(requested.network, requested.unrestricted_fs);
+                        self.progress.record_human_denial(
+                            requested.network,
+                            requested.repository_git || requested.unrestricted_fs,
+                        );
                         (self.observer)(AgentEvent::ProgressUpdated {
                             ledger: self.progress.clone(),
                         });
@@ -3411,6 +3419,24 @@ impl AgentHarness for Drive<'_> {
             self.sink.append(&[image_message]).await?;
         }
 
+        if has_next_round
+            && should_inject_delivery_convergence_nudge(
+                self.executor.policy.goal_mode,
+                self.delivery_convergence_nudged,
+                round,
+                !self.modified_files.is_empty(),
+                !call_snapshot.is_empty(),
+            )
+        {
+            let nudge = Message::text(
+                Role::User,
+                "DELIVERY CONVERGENCE: If the objective asks for workspace edits and the source reads above reveal a concrete requested edit, the next tool call must make that edit. Do not inspect more files, git state, test-runner configuration, temporary/probe/audit artifacts, or run exploratory probes first. Write the requested test/change, then use its result to discover remaining edge cases. If the objective is genuinely read-only analysis, ignore this message.",
+            );
+            self.sink.append(std::slice::from_ref(&nudge)).await?;
+            messages.push(nudge);
+            self.delivery_convergence_nudged = true;
+        }
+
         // Auto-compaction (spec §53): when the context size exceeds the
         // budget, fold the in-memory transcript before the next request so a
         // long task never overflows the window. Prefer the provider's
@@ -3684,6 +3710,16 @@ impl AgentHarness for Drive<'_> {
             }
         }
     }
+}
+
+fn should_inject_delivery_convergence_nudge(
+    goal_mode: bool,
+    already_sent: bool,
+    round: u32,
+    has_modified_files: bool,
+    had_tool_calls: bool,
+) -> bool {
+    goal_mode && !already_sent && round == 1 && !has_modified_files && had_tool_calls
 }
 
 /// Roll one settled child into the parent epoch: spend absorb, modified-file
@@ -4041,6 +4077,28 @@ fn sync_epoch_progress(
 #[cfg(test)]
 mod residual_budget_tests {
     use super::*;
+
+    #[test]
+    fn delivery_convergence_nudge_fires_once_after_the_first_read_only_goal_round() {
+        assert!(should_inject_delivery_convergence_nudge(
+            true, false, 1, false, true
+        ));
+        assert!(!should_inject_delivery_convergence_nudge(
+            false, false, 1, false, true
+        ));
+        assert!(!should_inject_delivery_convergence_nudge(
+            true, true, 1, false, true
+        ));
+        assert!(!should_inject_delivery_convergence_nudge(
+            true, false, 2, false, true
+        ));
+        assert!(!should_inject_delivery_convergence_nudge(
+            true, false, 1, true, true
+        ));
+        assert!(!should_inject_delivery_convergence_nudge(
+            true, false, 1, false, false
+        ));
+    }
     use crate::executor::StepLimits;
     use std::time::{Duration, Instant};
 

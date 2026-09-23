@@ -729,7 +729,7 @@ impl Executor {
     /// rule (shell scripts, memory writes, other tools) derive no rules and
     /// stay session-only; so does a missing rules path. Persistence failures
     /// are logged, never fatal — the user already approved this action.
-    fn remember_always(&self, tool: &str, command_line: Option<&str>, paths: &[String]) {
+    pub(crate) fn remember_always(&self, tool: &str, command_line: Option<&str>, paths: &[String]) {
         let rules = leveler_execution::always_rules_for(tool, command_line, paths);
         if rules.is_empty() {
             return;

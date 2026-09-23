@@ -1833,6 +1833,13 @@ impl Executor {
                  the same turn for independent investigation or disjoint edits (explorer vs \
                  worker with disjoint `files`). After children return, integrate results and \
                  continue until the whole goal is proven — do not stop after the first sub-task.\n\
+                 - **Converge on delivery:** for an edit request, spend at most ONE read-only investigation round. \
+                 Once you know a concrete pending action and no blocker exists, execute it before optional probes: \
+                 the next tool call MUST mutate the workspace. Learn remaining edge cases by writing the requested \
+                 test and running it, not by more exploratory commands. Do not reopen completed investigation or \
+                 inspect temporary/probe/audit artifacts unless a required acceptance check failed. Decide local \
+                 versus delegated execution once; keep small or tightly coupled work local, and never discuss or \
+                 revisit that decision again.\n\
                  - **Same-session follow-ups:** use prior messages and what you already learned. \
                  Do not pretend the conversation is empty or re-scan the whole repo unless the \
                  user asks something that needs new evidence.\n\
@@ -2339,6 +2346,87 @@ mod ownership_authority_tests {
             leveler_model::ModelRef::new("mock", "m"),
             4,
         )
+    }
+
+    #[test]
+    fn goal_prompt_prioritizes_delivery_over_optional_reinvestigation() {
+        let prompt = executor().with_goal_mode(true).system_prompt("fix it");
+
+        assert!(prompt.contains("execute it before optional probes"));
+        assert!(prompt.contains("at most ONE read-only investigation round"));
+        assert!(prompt.contains("the next tool call MUST mutate the workspace"));
+        assert!(prompt.contains("Do not reopen completed investigation"));
+        assert!(prompt.contains("never discuss or revisit that decision again"));
+    }
+
+    #[tokio::test]
+    async fn always_approved_repository_git_grant_is_reused_without_reprompting() {
+        use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Always {
+            asks: AtomicUsize,
+        }
+        #[async_trait]
+        impl Approver for Always {
+            async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+                self.asks.fetch_add(1, Ordering::SeqCst);
+                assert!(request.always_persists());
+                ApprovalDecision::ApproveAlways
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(Always {
+            asks: AtomicUsize::new(0),
+        });
+        let executor = Executor::new(
+            Arc::new(NullRuntime),
+            Arc::new(leveler_tools::default_registry()),
+            ToolContext::new(
+                leveler_execution::Workspace::new(dir.path()).unwrap(),
+                leveler_execution::PermissionProfile::Assisted,
+            ),
+            leveler_model::ModelRef::new("mock", "m"),
+            4,
+        )
+        .with_approver(approver.clone())
+        .with_permission_rules_path(Some(leveler_execution::project_rules_path(dir.path())));
+        let call = leveler_model::ToolCall {
+            id: leveler_core::ToolCallId::new("git-1"),
+            name: "shell_command".into(),
+            arguments: serde_json::json!({"cmd": "git commit -m test"}),
+        };
+        let grants = crate::injected_tools::TurnPermissionGrants {
+            network: false,
+            repository_git: true,
+            unrestricted_fs: false,
+        };
+
+        executor
+            .decide_permission(
+                &call,
+                "git commit -m test",
+                "sandbox denied .git write",
+                grants,
+                crate::injected_tools::GrantScope::SingleCall,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        executor
+            .decide_permission(
+                &call,
+                "git commit -m test",
+                "sandbox denied .git write",
+                grants,
+                crate::injected_tools::GrantScope::SingleCall,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(approver.asks.load(Ordering::SeqCst), 1);
     }
 
     /// The write-authority fallback is the dangerous edge: `effective_write_

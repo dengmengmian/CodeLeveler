@@ -376,6 +376,10 @@ fn macos_sandbox_command(
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             git_write_protected_paths(root),
         ),
+        WriteScope::WorkspaceWithGit { .. } => (
+            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
+            Vec::new(),
+        ),
         _ => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             Vec::new(),
@@ -533,7 +537,9 @@ fn writable_roots_for_scope(
     match scope {
         WriteScope::Unrestricted => Vec::new(),
         WriteScope::None => writable_roots_without_workspace(scratch_root, cache_write_roots),
-        WriteScope::Workspace { root } => writable_roots(root, scratch_root, cache_write_roots),
+        WriteScope::Workspace { root } | WriteScope::WorkspaceWithGit { root } => {
+            writable_roots(root, scratch_root, cache_write_roots)
+        }
     }
 }
 
@@ -618,6 +624,10 @@ fn linux_sandbox_command(
         WriteScope::Workspace { root } => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             git_write_protected_paths(root),
+        ),
+        WriteScope::WorkspaceWithGit { .. } => (
+            writable_roots_for_scope(scope, scratch_root, cache_write_roots),
+            Vec::new(),
         ),
         _ => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
@@ -3901,6 +3911,35 @@ mod tests {
             !out.success() || !git.join("evil").exists(),
             "write into .git must be blocked: {out:?}"
         );
+
+        // A repository-Git grant removes only the `.git` seal. The outer
+        // workspace boundary must still block the same escape target.
+        let git_allowed = git.join("allowed");
+        let mut git_grant = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                format!(
+                    "echo allowed > .git/allowed; echo escaped > {}",
+                    escape.display()
+                ),
+            ],
+            ws.clone(),
+        );
+        git_grant.write_scope = WriteScope::WorkspaceWithGit { root: ws.clone() };
+        let out = runner
+            .run(git_grant, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            git_allowed.exists(),
+            "Git metadata write must succeed: {out:?}"
+        );
+        assert!(
+            !escape.exists(),
+            "repository Git grant must not allow writes outside the workspace: {out:?}"
+        );
+
         // Normal workspace write still ok.
         let mut ok_write = ProcessRequest::new(
             "sh",

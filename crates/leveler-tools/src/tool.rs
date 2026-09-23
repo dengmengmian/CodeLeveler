@@ -102,6 +102,9 @@ pub struct ToolPolicy {
     /// confinement for `run_command` / `shell_command`. PRIVATE: granted only
     /// through [`Self::grant_unrestricted_fs`].
     turn_unrestricted_fs: bool,
+    /// Allow current-repository Git metadata writes while keeping the
+    /// workspace boundary in force.
+    turn_repository_git: bool,
     /// The policy an ADMITTED call executes under (PR 5). Set once by the
     /// ToolHost at admission; while present, [`Self::write_scope`] and
     /// [`Self::network_denied`] answer from it and never from the live
@@ -192,6 +195,15 @@ impl ToolPolicy {
         if self.turn_unrestricted_fs {
             return WriteScope::Unrestricted;
         }
+        if self.turn_repository_git {
+            if self.has_zero_write_authority() {
+                return WriteScope::None;
+            }
+            return match self.mode().write_scope(workspace_root) {
+                WriteScope::Workspace { root } => WriteScope::WorkspaceWithGit { root },
+                scope => scope,
+            };
+        }
         match self.mode().write_scope(workspace_root) {
             WriteScope::Workspace { .. } if self.has_zero_write_authority() => WriteScope::None,
             scope => scope,
@@ -208,6 +220,11 @@ impl ToolPolicy {
     /// post-approval host escape). The ONLY way to set the grant.
     pub fn grant_unrestricted_fs(&mut self) {
         self.turn_unrestricted_fs = true;
+    }
+
+    /// User-approved access to Git metadata in the current repository only.
+    pub fn grant_repository_git(&mut self) {
+        self.turn_repository_git = true;
     }
 
     /// Whether `path` (workspace-relative) is outside the live write allowlist.
@@ -278,6 +295,7 @@ impl ToolContext {
                 deny_network: false,
                 network_granted: false,
                 turn_unrestricted_fs: false,
+                turn_repository_git: false,
                 resolved: None,
                 deny_env: Arc::new(Vec::new()),
                 max_files_per_step: 0,

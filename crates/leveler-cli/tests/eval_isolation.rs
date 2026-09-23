@@ -80,12 +80,12 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
 fn write_case(dir: &Path, id: &str, expect_ok: bool) {
     std::fs::create_dir_all(dir).unwrap();
     let program = if expect_ok { "true" } else { "false" };
-    // The scratch workspace offers nothing to verify against, so the correct
-    // terminal outcome for this fixture is `completed_unverified`.
+    // Completion is the agent's declared terminal outcome; the separate
+    // expectation below decides whether this eval case passes.
     std::fs::write(
         dir.join(format!("{id}.yaml")),
         format!(
-            "id: {id}\nname: {id}\ntask: say hi\nexpected_outcome: completed_unverified\nexpect:\n  program: \"{program}\"\n"
+            "id: {id}\nname: {id}\ntask: say hi\nexpected_outcome: completed\nexpect:\n  program: \"{program}\"\n"
         ),
     )
     .unwrap();

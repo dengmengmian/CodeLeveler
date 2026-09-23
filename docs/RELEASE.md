@@ -1,25 +1,37 @@
-# CodeLeveler 1.0.6
+# CodeLeveler 1.0.7
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-A WebUI packaging and Apple Terminal compatibility release on top of 1.0.5.
-Installed stable builds can pick it up automatically, or run `leveler update`
-/ `/update`.
+This patch release improves long-running task convergence, background-task
+control, and command safety.
+Installed stable builds can update automatically, or use `leveler update`
+or `/update`.
+
+## Changed
+
+- Pasted file references take less space in the TUI composer.
+- The agent runtime no longer imposes a host-owned verification gate on task completion.
 
 ## Fixed
 
-- Release builds now compile the WebUI before the Rust binary, so `leveler web`
-  serves the embedded frontend instead of returning “WebUI assets are not
-  built”
-- The release contract fails when the frontend install/build steps are absent
-  or run after Rust compilation
-- Source-install instructions now include the required Node.js frontend build
-  before `cargo install`
-- Apple Terminal before macOS 26 now receives a nearest-colour xterm-256
-  palette, avoiding broken RGB rendering while preserving dark/light theme
-  polarity and contrast calculations
-- The active-goal header now keeps its detail affordance one column away from
-  the terminal's right edge
+- Running background tasks now have visible Stop buttons in the TUI list and
+  detail view. Stopping one task does not cancel the whole session. Closing a
+  TUI attached to a daemon still leaves its background tasks running.
+- CLI approval prompts show the operation and reason carried in the request
+  description, with terminal control characters sanitized.
+- The shell preflight treats comments as ending at the newline. Valid multiline
+  scripts are no longer rejected because of commands on later lines, and
+  later background commands and sensitive paths remain checked.
+- Goal-mode runs receive one runtime-owned delivery reminder after an initial
+  read-only round, preventing repeated self-audits from starving requested
+  workspace edits.
+- Redirects to `/dev/null`, `/dev/stdout`, and `/dev/stderr` no longer request
+  unnecessary write elevation. Other absolute device paths remain protected.
+- Repository metadata writes can be persistently approved without granting
+  unrestricted filesystem access, so local Git commits work in assisted mode
+  while writes outside the workspace remain confined.
+- Background-task output identifies each retained stdout and stderr chunk,
+  preserving the source of interleaved logs.
 
 ## Known limits
 

@@ -727,8 +727,7 @@ mod grant_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// D4 canary: after turn_unrestricted_fs, the same .git write succeeds
-    /// (model path: request_permissions filesystem=unrestricted → retry git).
+    /// Compatibility canary: an unrestricted grant still allows `.git` writes.
     #[cfg(unix)]
     #[tokio::test]
     async fn turn_unrestricted_fs_allows_git_dir_write() {

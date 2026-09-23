@@ -165,6 +165,16 @@ fn ordinary_relative_redirect_stays_safe() {
 }
 
 #[test]
+fn standard_device_redirects_stay_safe() {
+    assert_eq!(sh_c("echo hi > /dev/null"), CommandClass::Safe);
+    assert_eq!(sh_c("echo hi > /dev/stdout"), CommandClass::Safe);
+    assert_eq!(sh_c("echo hi 2> /dev/stderr"), CommandClass::Safe);
+
+    // Do not turn the exception into a general /dev allowlist.
+    assert_eq!(sh_c("echo hi > /dev/fd/2"), CommandClass::Dangerous);
+}
+
+#[test]
 fn ast_catches_commands_string_splitting_missed() {
     // Process substitution executes its body: string splitting saw one token
     // `cat` and called this Safe; the AST walks into `<(...)`.

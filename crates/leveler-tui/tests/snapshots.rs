@@ -1417,8 +1417,7 @@ fn compact_goal_recap_renders_in_history() {
 }
 
 /// §71/§72: expansion presents the persisted structured fields, and UNKNOWN
-/// truth stays explicit — unmeasured verification never renders as a pass,
-/// unknown findings never render as zero.
+/// truth stays explicit — unknown findings never render as zero.
 #[test]
 fn expanded_goal_recap_presents_structured_truth() {
     let mut state = opened_state();
@@ -1431,11 +1430,6 @@ fn expanded_goal_recap_presents_structured_truth() {
     assert!(text.contains("当前阶段"), "{text}");
     assert!(text.contains("Browser Capability Closure"), "{text}");
     assert!(text.contains("3/5"), "{text}");
-    assert!(text.contains("未测量"), "{text}");
-    assert!(
-        !text.contains("✓ 已通过"),
-        "unmeasured verification must not show a pass: {text}"
-    );
     assert!(text.contains("未知（账本不可读）"), "{text}");
     assert!(
         !text.contains("发现\n  0"),
@@ -1784,7 +1778,7 @@ fn chrome_follows_the_locale_while_the_model_id_does_not() {
     assert!(!zh.contains("MODEL"), "zh kept the English chrome:\n{zh}");
 
     // Class C: the identifier beside it is the same bytes in both.
-    for id in ["deepseek-v4-pro", "not_run", "balanced"] {
+    for id in ["deepseek-v4-pro", "balanced"] {
         assert!(zh.contains(id), "zh rewrote the identifier {id}:\n{zh}");
         assert!(en.contains(id), "en rewrote the identifier {id}:\n{en}");
     }

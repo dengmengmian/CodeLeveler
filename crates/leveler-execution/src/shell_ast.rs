@@ -167,9 +167,11 @@ fn strip_quotes(text: &str) -> &str {
 }
 
 /// A `file_redirect` is dangerous when its literal target escapes the working
-/// directory: an absolute path, or any `..` segment. Redirects to ordinary
-/// relative paths — and targets that don't resolve to a literal (`$OUT`,
-/// `>&2`) — do not by themselves change the verdict.
+/// directory: an absolute path, or any `..` segment. The three standard output
+/// devices are process I/O sinks, not arbitrary filesystem writes, so they are
+/// safe exact-name exceptions. Redirects to ordinary relative paths — and
+/// targets that don't resolve to a literal (`$OUT`, `>&2`) — do not by
+/// themselves change the verdict.
 fn redirect_target_is_dangerous(redirect: &Node, src: &[u8]) -> bool {
     let Some(destination) = redirect.child_by_field_name("destination") else {
         return false;
@@ -177,6 +179,9 @@ fn redirect_target_is_dangerous(redirect: &Node, src: &[u8]) -> bool {
     let Some(target) = resolve_literal(&destination, src) else {
         return false;
     };
+    if matches!(target.as_str(), "/dev/null" | "/dev/stdout" | "/dev/stderr") {
+        return false;
+    }
     if target.starts_with('/') {
         return true;
     }

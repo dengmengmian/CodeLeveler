@@ -54,7 +54,8 @@ impl FilesystemIntent {
     pub fn from_write_scope(scope: &crate::WriteScope, cwd: &Path) -> Self {
         match scope {
             crate::WriteScope::Unrestricted => Self::Unrestricted,
-            crate::WriteScope::Workspace { root } => Self::WorkspaceWrite {
+            crate::WriteScope::Workspace { root }
+            | crate::WriteScope::WorkspaceWithGit { root } => Self::WorkspaceWrite {
                 write_root: root.clone(),
             },
             crate::WriteScope::None => Self::ReadOnly {

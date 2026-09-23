@@ -33,8 +33,9 @@ pub fn sandbox_write_denied() -> &'static str {
      `.git` tree is write-protected (so `git pull`/`commit`/`fetch` that touch \
      index/refs will fail with Operation not permitted). Next: retry THIS EXACT \
      command once with `escalate` set — `{\"reason\": \"<one sentence>\", \
-     \"filesystem\": \"unrestricted\"}`, adding `\"network\": true` for remote git, or \
-     `\"full_access\": true` for both. The approval prompt that raises is how the \
+     \"filesystem\": \"git\"}` for `.git` writes, adding `\"network\": true` for \
+     remote git. Use `filesystem: \"unrestricted\"` only for a demonstrated write \
+     outside the workspace. The approval prompt that raises is how the \
      user consents, so do not ask in prose first. Do not claim the failure is \
      pre-existing or unrelated.\n"
 }
@@ -95,7 +96,7 @@ mod tests {
             !s.contains("request_permissions"),
             "steering a denied command back through the two-step is the bug: {s}"
         );
-        assert!(s.contains("filesystem=unrestricted") || s.contains("full_access"));
+        assert!(s.contains("\"filesystem\": \"git\""));
         assert!(s.contains("[recoverable]"));
         assert!(
             s.contains(".git") && s.contains("git pull"),

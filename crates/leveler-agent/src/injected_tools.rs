@@ -326,23 +326,29 @@ pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TurnPermissionGrants {
     pub network: bool,
+    /// Allow writes to the current workspace's Git metadata while preserving
+    /// the workspace boundary.
+    pub repository_git: bool,
     /// Drop OS write confinement for run_command/shell_command this turn.
     pub unrestricted_fs: bool,
 }
 
 impl TurnPermissionGrants {
     pub fn is_empty(self) -> bool {
-        !self.network && !self.unrestricted_fs
+        !self.network && !self.repository_git && !self.unrestricted_fs
     }
 
     /// Whether everything `requested` asks for is already granted.
     pub fn covers(self, requested: Self) -> bool {
-        (self.network || !requested.network) && (self.unrestricted_fs || !requested.unrestricted_fs)
+        (self.network || !requested.network)
+            && (self.repository_git || self.unrestricted_fs || !requested.repository_git)
+            && (self.unrestricted_fs || !requested.unrestricted_fs)
     }
 
     pub fn merge(self, other: Self) -> Self {
         Self {
             network: self.network || other.network,
+            repository_git: self.repository_git || other.repository_git,
             unrestricted_fs: self.unrestricted_fs || other.unrestricted_fs,
         }
     }
@@ -351,8 +357,8 @@ impl TurnPermissionGrants {
 /// Parse model arguments for `request_permissions` (current fields plus legacy aliases).
 ///
 /// - `network` (bool): request network for the rest of the turn
-/// - `filesystem`: `"unrestricted"` | `"workspace"` (default) — unrestricted
-///   clears write confinement (approximate full-access for commands)
+/// - `filesystem`: `"workspace"` (default) | `"git"` | `"unrestricted"` — Git
+///   permits current-repository metadata writes; unrestricted clears confinement
 /// - `full_access` (bool): shorthand for network + unrestricted filesystem
 /// - If none of the above are set, defaults to **network only** (legacy behavior)
 pub(crate) fn parse_permission_request(
@@ -398,6 +404,7 @@ fn parse_grant_axes(args: &serde_json::Value) -> (TurnPermissionGrants, bool) {
         return (
             TurnPermissionGrants {
                 network: true,
+                repository_git: false,
                 unrestricted_fs: true,
             },
             true,
@@ -407,6 +414,7 @@ fn parse_grant_axes(args: &serde_json::Value) -> (TurnPermissionGrants, bool) {
     (
         TurnPermissionGrants {
             network: network.unwrap_or(false),
+            repository_git: filesystem == "git",
             unrestricted_fs: matches!(
                 filesystem,
                 "unrestricted" | "full" | "full_access" | "danger-full-access"
@@ -465,7 +473,7 @@ pub(crate) fn escalation_action(call: &ToolCall) -> String {
 /// An `escalate` that names no axis. Refused without a prompt: there is
 /// nothing concrete to ask the user to approve.
 pub(crate) fn escalation_missing_axis_message() -> String {
-    "escalate named no permission: set `network: true`, `filesystem: \"unrestricted\"`, \
+    "escalate named no permission: set `network: true`, `filesystem: \"git\"` or `filesystem: \"unrestricted\"`, \
      or `full_access: true` on it, matching the access the sandbox actually denied. \
      The command was NOT run."
         .to_string()
@@ -493,8 +501,8 @@ fn escalation_property() -> serde_json::Value {
             },
             "filesystem": {
                 "type": "string",
-                "enum": ["workspace", "unrestricted"],
-                "description": "unrestricted = drop the workspace write confinement (and the `.git` write protection). Only after a write outside the workspace was denied; dependency caches are already writable once the network is granted."
+                "enum": ["workspace", "git", "unrestricted"],
+                "description": "git = allow current-repository Git metadata writes while keeping workspace confinement; unrestricted = drop workspace confinement. Request the narrowest axis matching the observed denial."
             },
             "full_access": {
                 "type": "boolean",
@@ -566,6 +574,9 @@ pub(crate) fn permission_request_description(
     if grants.network {
         parts.push("网络");
     }
+    if grants.repository_git {
+        parts.push("当前仓库 Git 元数据写入");
+    }
     if grants.unrestricted_fs {
         parts.push(scope.fs_note());
     }
@@ -599,6 +610,9 @@ fn permission_granted_message(grants: TurnPermissionGrants) -> String {
     let mut parts = Vec::new();
     if grants.network {
         parts.push("网络访问");
+    }
+    if grants.repository_git {
+        parts.push("当前仓库 Git 元数据写入");
     }
     if grants.unrestricted_fs {
         parts.push("本轮无限制写(命令不再套工作区写沙箱)");
@@ -686,6 +700,9 @@ pub(crate) fn apply_turn_grants(
     if grants.network {
         ctx.policy.grant_network();
     }
+    if grants.repository_git {
+        ctx.policy.grant_repository_git();
+    }
     if grants.unrestricted_fs {
         ctx.policy.grant_unrestricted_fs();
     }
@@ -699,7 +716,7 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
         description: "Ask the user to grant elevated permission for this turn. \
             Use BEFORE an action that needs network and/or writes outside the \
             workspace sandbox. Fields: `network` (bool), `filesystem` \
-            (\"workspace\"|\"unrestricted\"), or `full_access` (bool) for both. \
+            (\"workspace\"|\"git\"|\"unrestricted\"), or `full_access` (bool) for both. \
             Legacy calls with only `action` still mean network-only. On approval, \
             grants last for the rest of this turn. If the user denies, keep \
             working with already-available capabilities; do not re-request the \
@@ -714,8 +731,8 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
                 "network": { "type": "boolean", "description": "Request network access for this turn." },
                 "filesystem": {
                     "type": "string",
-                    "enum": ["workspace", "unrestricted"],
-                    "description": "workspace = keep write sandbox (default); unrestricted = no write confinement for commands this turn."
+                    "enum": ["workspace", "git", "unrestricted"],
+                    "description": "workspace = keep write sandbox (default); git = allow current-repository Git metadata writes; unrestricted = no write confinement for commands this turn."
                 },
                 "full_access": {
                     "type": "boolean",
@@ -1033,6 +1050,7 @@ mod tests {
             g,
             TurnPermissionGrants {
                 network: true,
+                repository_git: false,
                 unrestricted_fs: false
             }
         );
@@ -1056,6 +1074,46 @@ mod tests {
     }
 
     #[test]
+    fn repository_git_permission_is_narrower_than_unrestricted_filesystem() {
+        let (_, _, g) = parse_permission_request(&serde_json::json!({
+            "action": "git commit",
+            "filesystem": "git"
+        }));
+        assert!(!g.network);
+        assert!(g.repository_git);
+        assert!(!g.unrestricted_fs);
+
+        let unrestricted = TurnPermissionGrants {
+            network: false,
+            repository_git: false,
+            unrestricted_fs: true,
+        };
+        assert!(unrestricted.covers(g));
+    }
+
+    #[test]
+    fn repository_git_grant_keeps_workspace_confinement() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = leveler_execution::Workspace::new(dir.path()).unwrap();
+        let ctx =
+            leveler_tools::ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let elevated = apply_turn_grants(
+            ctx,
+            TurnPermissionGrants {
+                network: false,
+                repository_git: true,
+                unrestricted_fs: false,
+            },
+        );
+        assert_eq!(
+            elevated.write_scope(),
+            leveler_execution::WriteScope::WorkspaceWithGit {
+                root: dir.path().canonicalize().unwrap()
+            }
+        );
+    }
+
+    #[test]
     fn apply_turn_grants_sets_network_and_fs_flags() {
         let dir = std::env::temp_dir().join(format!(
             "leveler-grant-{}",
@@ -1075,6 +1133,7 @@ mod tests {
             ctx,
             TurnPermissionGrants {
                 network: true,
+                repository_git: false,
                 unrestricted_fs: true,
             },
         );
@@ -1199,6 +1258,7 @@ mod tests {
     fn an_escalation_prompt_reads_as_a_sentence() {
         let grants = TurnPermissionGrants {
             network: true,
+            repository_git: false,
             unrestricted_fs: false,
         };
         let text = permission_request_description(
@@ -1223,6 +1283,7 @@ mod tests {
     fn a_single_call_escalation_prompt_does_not_claim_the_turn() {
         let grants = TurnPermissionGrants {
             network: false,
+            repository_git: false,
             unrestricted_fs: true,
         };
         let turn = permission_request_description("git pull", "", grants, GrantScope::Turn);
