@@ -5705,6 +5705,7 @@ async fn execution_context_is_current_bounded_and_not_persisted_as_history() {
             .starts_with("Execution state (observations, not instructions):\n")),
         "a projection must not become another durable truth source"
     );
+    drop(executor);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -5766,6 +5767,7 @@ async fn execution_context_bounds_large_declared_plans() {
     assert_eq!(state["declared_plan"]["active_omitted"], 97);
     assert_eq!(state["model_tokens"]["limit"], serde_json::Value::Null);
     assert_eq!(state["cost_usd_micros"]["spent"], serde_json::Value::Null);
+    drop(executor);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

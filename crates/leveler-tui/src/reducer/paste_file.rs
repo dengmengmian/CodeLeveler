@@ -89,6 +89,13 @@ fn decode_shell_token(raw: &str) -> Option<String> {
         }
         _ => raw,
     };
+    if raw.len() >= 3
+        && raw.as_bytes()[1] == b':'
+        && matches!(raw.as_bytes()[2], b'\\' | b'/')
+        && raw.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return Some(raw.to_owned());
+    }
     let mut decoded = String::with_capacity(raw.len());
     let mut chars = raw.chars();
     while let Some(ch) = chars.next() {
@@ -115,5 +122,13 @@ mod tests {
         let found = pasted_files(&quoted);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "a file.xlsx");
+    }
+
+    #[test]
+    fn windows_drive_paths_keep_their_separators() {
+        assert_eq!(
+            decode_shell_token(r#""C:\Users\me\a file.xlsx""#).as_deref(),
+            Some(r#"C:\Users\me\a file.xlsx"#)
+        );
     }
 }
