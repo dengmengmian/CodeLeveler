@@ -163,6 +163,8 @@ A clean Git worktree is recommended so changes remain easy to inspect or discard
 
 On macOS and Linux, `leveler serve` keeps the runtime alive behind a local Unix socket after a UI closes. Windows has no local Unix-socket daemon; persisted sessions and `resume` still work.
 
+In the TUI, click the footer's background summary (`↗`) to open the job list, then click a job's `[Stop]` button to stop only that job. The detail page also has a `[Stop]` button. Keyboard controls are ↑↓ to select, Enter for details, and `x` to stop. Esc only returns; it does not stop work. When connected to a daemon, closing the terminal window does not stop background jobs either.
+
 ## Permissions and isolation
 
 The default permission profile is `assisted`. Ordinary repository writes, builds, tests, network actions, and commands such as `git push` or package publishing may run automatically inside the available OS sandbox. Irreversible deletion, privilege escalation, and host-escape operations require approval. Use `request-approval` when you want a stricter approval boundary.

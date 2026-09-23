@@ -132,7 +132,7 @@ fn reconnect_during_finalization_restores_busy_without_waiting_for_model() {
         Some(leveler_client_protocol::FinalizationStage::Review)
     );
     let frame = rendered(&mut state, 100, 24);
-    assert!(frame.contains("正在审查"), "{frame}");
+    assert!(frame.contains("正在完成评审"), "{frame}");
     assert!(!frame.contains("等待模型"), "{frame}");
 }
 
@@ -1596,7 +1596,7 @@ fn finalizing_is_busy_but_never_presented_as_waiting_for_the_model() {
     assert_eq!(s.status, RuntimeStatus::Busy);
     assert_eq!(s.finalization_stage, Some(FinalizationStage::Review));
     let finalizing = rendered(&mut s, 100, 24);
-    assert!(finalizing.contains("正在审查"), "screen: {finalizing}");
+    assert!(finalizing.contains("正在完成评审"), "screen: {finalizing}");
     assert!(!finalizing.contains("等待模型"), "screen: {finalizing}");
 
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));

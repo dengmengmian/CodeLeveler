@@ -52,6 +52,166 @@ fn render_text(state: &mut AppState, w: u16, h: u16) -> String {
     out
 }
 
+fn stop_button(text: &str, row_label: Option<&str>) -> (u16, u16) {
+    text.lines()
+        .enumerate()
+        .find_map(|(y, line)| {
+            if row_label.is_some_and(|label| !line.contains(label)) {
+                return None;
+            }
+            let index = line.find("[停止]")?;
+            Some((UnicodeWidthStr::width(&line[..index]) as u16, y as u16))
+        })
+        .unwrap_or_else(|| panic!("missing visible stop button: {text}"))
+}
+
+fn click(column: u16, row: u16) -> Action {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    Action::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn background_stop_button_targets_clicked_row_and_rechecks_live_state() {
+    use leveler_client_protocol::ClientCommand;
+    use leveler_tui::action::Effect;
+    let mut s = opened();
+    for id in ["first", "second"] {
+        runtime(
+            &mut s,
+            RuntimeEvent::BackgroundTaskStarted {
+                task_id: id.into(),
+                program: id.into(),
+                args: vec![],
+            },
+        );
+    }
+    s.active_screen = Screen::ActivityList;
+    s.background_list_selected = Some("first".into());
+    let text = render_text(&mut s, 60, 16);
+    println!("--- BACKGROUND STOP CONTROLS ---\n{text}");
+    let (x, y) = stop_button(&text, Some("second"));
+    let effects = reduce(&mut s, click(x, y));
+    assert!(
+        matches!(effects.as_slice(), [Effect::Send(ClientCommand::CancelBackgroundTask { session_id, task_id })]
+        if session_id.as_str() == "s1" && task_id == "second"),
+        "{effects:?}"
+    );
+    assert!(
+        s.background_task_labels
+            .values()
+            .all(|task| task.is_running()),
+        "sending cancel is not authoritative termination"
+    );
+
+    runtime(
+        &mut s,
+        RuntimeEvent::BackgroundTaskExited {
+            task_id: "second".into(),
+            exit_code: None,
+            duration_ms: 100,
+            ok: false,
+            stopped: true,
+            output: String::new(),
+        },
+    );
+    assert!(
+        reduce(&mut s, click(x, y)).is_empty(),
+        "stale paint must not cancel a terminal task"
+    );
+    let after = render_text(&mut s, 60, 16);
+    assert!(
+        !after
+            .lines()
+            .find(|line| line.contains("second"))
+            .unwrap()
+            .contains("[停止]")
+    );
+}
+
+#[test]
+fn background_stop_button_detail_is_clickable_and_cannot_leak_to_other_screens() {
+    use leveler_client_protocol::ClientCommand;
+    use leveler_tui::action::Effect;
+    let mut s = opened();
+    runtime(
+        &mut s,
+        RuntimeEvent::BackgroundTaskStarted {
+            task_id: "detail".into(),
+            program: "watch".into(),
+            args: vec![],
+        },
+    );
+    s.active_screen = Screen::Activity;
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background(
+        "detail".into(),
+    ));
+    let text = render_text(&mut s, 40, 12);
+    println!("--- BACKGROUND DETAIL STOP ---\n{text}");
+    let (x, y) = stop_button(&text, None);
+    assert!(matches!(reduce(&mut s, click(x, y)).as_slice(),
+        [Effect::Send(ClientCommand::CancelBackgroundTask { task_id, .. })] if task_id == "detail"));
+    let Action::Mouse(mut shifted) = click(x, y) else {
+        unreachable!()
+    };
+    shifted.modifiers = crossterm::event::KeyModifiers::SHIFT;
+    assert!(
+        reduce(&mut s, Action::Mouse(shifted)).is_empty(),
+        "native selection must not stop a task"
+    );
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background(
+        "other".into(),
+    ));
+    assert!(
+        reduce(&mut s, click(x, y)).is_empty(),
+        "a stale detail button cannot target the previously open task"
+    );
+    s.active_screen = Screen::Help;
+    assert!(reduce(&mut s, click(x, y)).is_empty());
+}
+
+#[test]
+fn background_stop_buttons_follow_scrolled_rows_and_resize() {
+    use leveler_client_protocol::ClientCommand;
+    use leveler_tui::action::Effect;
+    let mut s = opened();
+    for index in 0..20 {
+        s.elapsed_secs = index;
+        let id = format!("job-{index:02}");
+        runtime(
+            &mut s,
+            RuntimeEvent::BackgroundTaskStarted {
+                task_id: id.clone(),
+                program: id,
+                args: vec![],
+            },
+        );
+    }
+    s.active_screen = Screen::ActivityList;
+    s.background_list_selected = Some("job-19".into());
+    for width in [80, 28] {
+        let text = render_text(&mut s, width, 8);
+        assert!(
+            !text.contains("job-00"),
+            "selection must actually scroll the list"
+        );
+        let (x, y) = stop_button(&text, Some("job-19"));
+        assert!(x + 6 <= width);
+        assert!(matches!(reduce(&mut s, click(x, y)).as_slice(),
+            [Effect::Send(ClientCommand::CancelBackgroundTask { task_id, .. })] if task_id == "job-19"));
+    }
+    // A terminal narrower than the label must not retain a clickable invisible control.
+    let text = render_text(&mut s, 5, 8);
+    assert!(!text.contains("[停止]"));
+    assert!(s.background_stop_hits.is_empty());
+    s.locale = leveler_tui::Locale::En;
+    assert!(render_text(&mut s, 60, 10).contains("[Stop]"));
+}
+
 fn runtime(state: &mut AppState, event: RuntimeEvent) {
     reduce(state, Action::Runtime(event));
 }

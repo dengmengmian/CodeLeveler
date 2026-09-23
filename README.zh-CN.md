@@ -163,6 +163,8 @@ DeepSeek Flash 的模型引用是 `deepseek/deepseek-flash`。已有配置中的
 
 macOS 和 Linux 可以运行 `leveler serve`，通过本机 Unix 套接字让运行时在界面关闭后继续工作。Windows 没有本机 Unix 套接字 daemon，但持久化会话和 `resume` 仍然可用。
 
+TUI 中点击底部的后台任务摘要（`↗`）打开列表，点击任务行的 `[停止]` 可单独停止该任务；详情页也提供 `[停止]` 按钮。键盘可用 ↑↓ 选择、Enter 查看详情、`x` 停止。Esc 只返回，不停止任务；连接 daemon 时，关闭终端窗口也不等于停止后台任务。
+
 ## 权限与隔离
 
 默认权限是 `assisted`。普通的仓库内写入、构建、测试、网络操作，以及 `git push`、发布包等命令，可能会在操作系统沙箱内自动执行。不可逆删除、提权和逃出主机边界的操作需要审批。如果希望审批边界更严格，使用 `request-approval`。

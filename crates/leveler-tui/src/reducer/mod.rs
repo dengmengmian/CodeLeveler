@@ -572,11 +572,30 @@ fn snapshot_awaits_interaction(
 /// `Shift`+mouse is ignored so the terminal can offer native selection as a fallback
 /// when mouse capture is not fully exclusive.
 fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
-    if state.overlay.is_some() || state.active_screen != Screen::Conversation {
+    if state.overlay.is_some() {
         return Vec::new();
     }
     // Shift+drag: do not capture selection — leave room for terminal-native select.
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        return Vec::new();
+    }
+    if matches!(state.active_screen, Screen::Activity | Screen::ActivityList)
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some((_, _, task_id)) =
+            state
+                .background_stop_hits
+                .iter()
+                .find(|(screen, rect, id)| {
+                    *screen == state.active_screen
+                        && rect.contains((mouse.column, mouse.row).into())
+                        && (*screen == Screen::ActivityList
+                            || state.activity_open.as_ref()
+                                == Some(&crate::activity::ActivityId::Background(id.clone())))
+                })
+    {
+        return screen_nav::cancel_background_task(state, task_id);
+    }
+    if state.active_screen != Screen::Conversation {
         return Vec::new();
     }
     state.disarm_ctrlc();

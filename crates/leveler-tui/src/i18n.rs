@@ -841,6 +841,7 @@ pub struct UiText {
     pub background_hint_list_running: &'static str,
     /// List footer when no selectable running task is present.
     pub background_hint_list_idle: &'static str,
+    pub background_stop_button: &'static str,
     pub background_status_running: &'static str,
     pub background_status_completed: &'static str,
     pub background_status_failed: &'static str,
@@ -1663,6 +1664,7 @@ static ZH: UiText = UiText {
     background_list_empty: "暂无后台任务",
     background_hint_list_running: "↑↓ 选择 · Enter 打开 · x 停止 · Esc 返回",
     background_hint_list_idle: "↑↓ 选择 · Enter 打开 · Esc 返回",
+    background_stop_button: "[停止]",
     background_status_running: "运行中",
     background_status_completed: "已完成",
     background_status_failed: "失败",
@@ -2372,6 +2374,7 @@ static EN: UiText = UiText {
     background_list_empty: "No background tasks",
     background_hint_list_running: "↑↓ select · Enter open · x stop · Esc back",
     background_hint_list_idle: "↑↓ select · Enter open · Esc back",
+    background_stop_button: "[Stop]",
     background_status_running: "Running",
     background_status_completed: "Completed",
     background_status_failed: "Failed",

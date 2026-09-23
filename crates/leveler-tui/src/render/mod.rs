@@ -213,7 +213,26 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         ActivityKind::BackgroundTask => t.activity_title_background,
         ActivityKind::ChildAgent => t.activity_title_child,
     };
-    let layout = crate::secondary::layout(area, 0);
+    let mut layout = crate::secondary::layout(area, 0);
+    let stop = match &id {
+        crate::activity::ActivityId::Background(task_id)
+            if state
+                .background_task_labels
+                .get(task_id)
+                .is_some_and(|task| task.is_running()) =>
+        {
+            background_stop_rect(
+                crate::layout::horizontal_inset(layout.footer, crate::secondary::PADDING_X),
+                t,
+            )
+            .map(|rect| (rect, task_id.clone()))
+        }
+        _ => None,
+    };
+    if let Some((rect, _)) = &stop {
+        // Reserve the button before drawing hints, including on narrow terminals.
+        layout.footer.width = layout.footer.width.saturating_sub(rect.width + 2);
+    }
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
@@ -239,6 +258,9 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         .min(state.activity_view.max_scroll);
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
     frame.render_widget(Paragraph::new(visible), body);
+    if let Some((rect, task_id)) = stop {
+        render_background_stop(frame, rect, &task_id, state);
+    }
 }
 
 /// A closed / retired activity: still inside the shared shell, so the chrome
@@ -287,7 +309,15 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     if body.width == 0 || body.height == 0 {
         return;
     }
-    let (lines, selected_line) = background_list_body(state, &list, body.width as usize, theme, t);
+    let stop_rect = background_stop_rect(Rect { height: 1, ..body }, t);
+    let row_width = body
+        .width
+        .saturating_sub(stop_rect.map_or(0, |r| r.width + 2));
+    let BackgroundListBody {
+        lines,
+        selected_line,
+        stop_rows,
+    } = background_list_body(state, &list, row_width as usize, theme, t);
     let height = body.height as usize;
     // Keep the selection visible without a second scroll owner: the offset is
     // derived from the selection, so the list needs no scroll state and a
@@ -299,6 +329,52 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         .min(max_offset);
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
     frame.render_widget(Paragraph::new(visible), body);
+    if let Some(rect) = stop_rect {
+        for (line, task_id) in stop_rows {
+            if line >= offset && line < offset + height {
+                render_background_stop(
+                    frame,
+                    Rect {
+                        y: body.y + (line - offset) as u16,
+                        ..rect
+                    },
+                    &task_id,
+                    state,
+                );
+            }
+        }
+    }
+}
+
+struct BackgroundListBody {
+    lines: Vec<Line<'static>>,
+    selected_line: Option<usize>,
+    stop_rows: Vec<(usize, String)>,
+}
+
+fn background_stop_rect(row: Rect, t: &crate::i18n::UiText) -> Option<Rect> {
+    let width = unicode_width::UnicodeWidthStr::width(t.background_stop_button) as u16;
+    (row.height > 0 && row.width >= width).then(|| Rect {
+        x: row.right() - width,
+        y: row.y,
+        width,
+        height: 1,
+    })
+}
+
+fn render_background_stop(frame: &mut Frame, rect: Rect, task_id: &str, state: &mut AppState) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            state.t().background_stop_button,
+            Style::default()
+                .fg(state.theme.status.warning)
+                .add_modifier(Modifier::BOLD),
+        )),
+        rect,
+    );
+    state
+        .background_stop_hits
+        .push((state.active_screen, rect, task_id.to_string()));
 }
 
 /// The list body plus the line index of the selected row, or `None` when
@@ -309,16 +385,21 @@ fn background_list_body(
     width: usize,
     theme: &Theme,
     t: &crate::i18n::UiText,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> BackgroundListBody {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut selected_line = None;
+    let mut stop_rows = Vec::new();
     let selected = state.background_list_selected.as_deref();
     if list.is_empty() {
         lines.push(Line::from(Span::styled(
             t.background_list_empty.to_string(),
             Style::default().fg(theme.text.muted),
         )));
-        return (lines, None);
+        return BackgroundListBody {
+            lines,
+            selected_line,
+            stop_rows,
+        };
     }
     if !list.running.is_empty() {
         lines.push(section_line(
@@ -330,6 +411,7 @@ fn background_list_body(
             if on {
                 selected_line = Some(lines.len());
             }
+            stop_rows.push((lines.len(), summary.id.as_key().to_string()));
             lines.push(background_list_row(summary, on, width, theme));
         }
     }
@@ -347,7 +429,11 @@ fn background_list_body(
             lines.push(background_list_row(summary, on, width, theme));
         }
     }
-    (lines, selected_line)
+    BackgroundListBody {
+        lines,
+        selected_line,
+        stop_rows,
+    }
 }
 
 /// One job row: `→ ● label … duration`. The glyph carries the status ink, the
@@ -793,6 +879,7 @@ use screens::{render_diff_screen, render_help_screen, render_sessions_screen};
 /// Conversation uses the workbench layout (Header / Conversation viewport /
 /// Plan / Input / Footer). Other screens keep the classic full-screen panes.
 pub fn render(frame: &mut Frame, state: &mut AppState) {
+    state.background_stop_hits.clear();
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
         return;

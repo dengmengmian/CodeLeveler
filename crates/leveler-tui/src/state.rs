@@ -424,6 +424,9 @@ pub struct AppState {
     pub background_failures_seen: std::collections::HashSet<String>,
     /// Last-painted footer background-summary hit (row, x_start, x_end).
     pub background_footer_hit: Option<(u16, u16, u16)>,
+    /// Painted stop controls, bound to their screen and exact task identity.
+    /// These are hit regions only; cancellation rechecks the live projection.
+    pub background_stop_hits: Vec<(Screen, ratatui::layout::Rect, String)>,
     /// Last-painted one-line plan summary hit (row, x_start, x_end).
     pub plan_hit: Option<(u16, u16, u16)>,
     /// Last-painted header goal hit (row, x_start, x_end).
@@ -610,6 +613,7 @@ impl AppState {
             background_list_selected: None,
             background_failures_seen: std::collections::HashSet::new(),
             background_footer_hit: None,
+            background_stop_hits: Vec::new(),
             plan_hit: None,
             goal_hit: None,
             command_selected: None,

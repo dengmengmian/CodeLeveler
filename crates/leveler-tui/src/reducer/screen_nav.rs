@@ -184,18 +184,8 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                         },
                     )];
                 }
-                Some(crate::activity::ActivityId::Background(task_id))
-                    if state
-                        .background_task_labels
-                        .get(task_id)
-                        .is_some_and(|c| c.is_running()) =>
-                {
-                    return vec![Effect::Send(
-                        leveler_client_protocol::ClientCommand::CancelBackgroundTask {
-                            session_id: state.session_id.clone(),
-                            task_id: task_id.clone(),
-                        },
-                    )];
+                Some(crate::activity::ActivityId::Background(task_id)) => {
+                    return cancel_background_task(state, task_id);
                 }
                 _ => {}
             },
@@ -220,18 +210,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 let Some(task_id) = crate::activity::selected_list_task(state) else {
                     return Vec::new();
                 };
-                if state
-                    .background_task_labels
-                    .get(&task_id)
-                    .is_some_and(|c| c.is_running())
-                {
-                    return vec![Effect::Send(
-                        leveler_client_protocol::ClientCommand::CancelBackgroundTask {
-                            session_id: state.session_id.clone(),
-                            task_id,
-                        },
-                    )];
-                }
+                return cancel_background_task(state, &task_id);
             }
             _ => {}
         },
@@ -353,6 +332,22 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         Screen::Conversation => {}
     }
     Vec::new()
+}
+
+/// Keyboard and mouse share the same live-state check and runtime command.
+/// Sending the intent never manufactures a terminal state in the client.
+pub(super) fn cancel_background_task(state: &AppState, task_id: &str) -> Vec<Effect> {
+    if !state
+        .background_task_labels
+        .get(task_id)
+        .is_some_and(|task| task.is_running())
+    {
+        return Vec::new();
+    }
+    vec![Effect::Send(ClientCommand::CancelBackgroundTask {
+        session_id: state.session_id.clone(),
+        task_id: task_id.to_string(),
+    })]
 }
 
 pub(super) fn open_plan_screen(state: &mut AppState) {
