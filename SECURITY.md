@@ -32,6 +32,23 @@ Reports about a provider's service, an operating-system sandbox implementation,
 or a third-party dependency may need to be coordinated with that upstream
 project.
 
+## Privacy and telemetry
+
+CodeLeveler does not collect or report product telemetry or user work data to
+the CodeLeveler project or a central service by default. This includes source
+code, file contents, conversations, prompts, model output, command output,
+environment information, usage analytics, and crash context.
+
+This policy does not prohibit network use required by features the user
+explicitly enables. Model providers, MCP servers, web search, remote execution,
+and update checks may contact their configured destinations as required for
+their function. Those paths must remain explicit and scoped to the data needed
+for that capability; they must not become hidden telemetry channels.
+
+Any future diagnostics, crash reporting, or usage analytics must be explicit
+opt-in and disableable. Credentials and secrets must never be included as
+telemetry.
+
 ## In-repo configuration is inert until trusted
 
 Two files a repository can carry are gated, because both take effect before
