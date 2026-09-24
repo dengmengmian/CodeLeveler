@@ -55,40 +55,158 @@ fn layout(root: &std::path::Path) -> Layout {
     Layout::from_parts(root.to_path_buf(), root.join("configs"), root.join("state"))
 }
 
-/// A model endpoint that holds every request until the test lets one through,
-/// so a turn stays genuinely running for as long as the test needs. Once
-/// failing, every request — the held one and any retry — answers 400 at once.
-/// Asking, a request let through calls a command that needs approval.
+/// The user message every `submit` in this file sends, and the marker that
+/// tells the endpoint which requests the tests govern.
+const SUBMITTED_TEXT: &str = "work";
+
+/// The advisory instruction the predictor sends. It is how the endpoint — and
+/// the preemption test — recognises a prediction that is in flight. A change to
+/// that instruction fails that test loudly instead of leaving it quietly
+/// preempting nothing.
+const PREDICTION_INSTRUCTION: &str = "Predict the single most likely next message";
+
+/// A model endpoint that holds every request until a test releases it, so a
+/// turn stays genuinely running for as long as the test needs. Once failing,
+/// every request — the held one and any retry — answers 400 at once. Asking, a
+/// request let through calls a command that needs approval.
+///
+/// A release names the request it is for: [`Gate::release_turn`] releases the
+/// next request carrying [`SUBMITTED_TEXT`]. Everything else the app sends on
+/// its own — an advisory prompt prediction, the memory extractor after a turn
+/// settles — is held but never released, so it cannot spend a release meant
+/// for a turn. Handing out whichever request is first in line instead makes
+/// the test's outcome depend on which of the app's requests the endpoint
+/// happened to receive first.
 struct Gate {
-    permits: Arc<tokio::sync::Semaphore>,
+    held: Arc<std::sync::Mutex<Held>>,
     fail: Arc<std::sync::atomic::AtomicBool>,
     ask: Arc<std::sync::atomic::AtomicBool>,
+    /// Advisory requests a turn cancelled while the endpoint held them. That
+    /// is what a preemption looks like from the provider side.
+    cancelled: Arc<std::sync::atomic::AtomicUsize>,
     url: String,
+}
+
+/// What the endpoint holds, and which releases it still owes.
+#[derive(Default)]
+struct Held {
+    /// Requests waiting for a release, oldest first.
+    parked: Vec<Parked>,
+    /// Releases that arrived before the request they name.
+    released: Vec<String>,
+}
+
+struct Parked {
+    /// The marker this request carries, or `None` for a request no test
+    /// releases.
+    marker: Option<String>,
+    /// Whether this is the predictor's advisory request.
+    prediction: bool,
+    serve: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Held {
+    /// Whether a request carrying `marker` may go now.
+    fn take_release(&mut self, marker: Option<&str>) -> bool {
+        self.forget_departed();
+        let Some(marker) = marker else { return false };
+        match self.released.iter().position(|owed| owed == marker) {
+            Some(index) => {
+                self.released.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget handlers that already left, so a release is never handed to a
+    /// request whose client has hung up.
+    fn forget_departed(&mut self) {
+        self.parked.retain(|parked| !parked.serve.is_closed());
+    }
+
+    /// Advisory predictions the endpoint is holding right now.
+    fn held_predictions(&mut self) -> usize {
+        self.forget_departed();
+        self.parked
+            .iter()
+            .filter(|parked| parked.prediction)
+            .count()
+    }
 }
 
 impl Gate {
     async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = Arc::new(std::sync::Mutex::new(Held::default()));
         let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ask = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (held, failing, asking) = (permits.clone(), fail.clone(), ask.clone());
+        let cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holding = held.clone();
+        let failing = fail.clone();
+        let asking = ask.clone();
+        let cancelling = cancelled.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let (held, failing, asking) = (held.clone(), failing.clone(), asking.clone());
+                let held = holding.clone();
+                let failing = failing.clone();
+                let asking = asking.clone();
+                let cancelling = cancelling.clone();
                 tokio::spawn(async move {
-                    drain_request(&mut stream).await;
+                    let body = drain_request(&mut stream).await;
                     let fail = failing.load(std::sync::atomic::Ordering::SeqCst);
                     if !fail {
-                        // A cancelled model request drops its connection. Do
-                        // not let that abandoned handler consume the next
-                        // permit and strand the following execution.
-                        let permit = tokio::select! {
-                            permit = held.acquire() => permit.unwrap(),
-                            _ = stream.read_u8() => return,
+                        let marker = carries_a_turn(&body).then(|| SUBMITTED_TEXT.to_string());
+                        let prediction = body.contains(PREDICTION_INSTRUCTION);
+                        let owed = {
+                            let mut held = held
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            held.take_release(marker.as_deref())
                         };
-                        permit.forget();
+                        if !owed {
+                            // Hold it until the test releases this marker. A
+                            // request the app sent on its own waits for a
+                            // release nobody owes it until its client hangs up.
+                            let (serve, released) = tokio::sync::oneshot::channel();
+                            {
+                                let mut held = held
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                held.forget_departed();
+                                held.parked.push(Parked {
+                                    marker: marker.clone(),
+                                    prediction,
+                                    serve,
+                                });
+                            }
+                            let served = tokio::select! {
+                                biased;
+                                // The client hung up (the product cancelled an
+                                // advisory request). Checked first: a hang-up
+                                // that has already arrived must beat a release
+                                // handed out in the same instant.
+                                _ = stream.read_u8() => false,
+                                served = released => served.is_ok(),
+                            };
+                            if !served {
+                                if prediction {
+                                    cancelling.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                return;
+                            }
+                            // The socket itself is the final word: a release
+                            // handed out in the same instant the client hung up
+                            // is not spent on a request nobody awaits — it goes
+                            // to the next request that wants it.
+                            if client_hung_up(&mut stream) {
+                                if let Some(marker) = marker {
+                                    release(&held, &marker);
+                                }
+                                return;
+                            }
+                        }
                     }
                     let response = if fail {
                         let body = r#"{"error":{"message":"boom"}}"#;
@@ -125,23 +243,79 @@ impl Gate {
             }
         });
         Self {
-            permits,
+            held,
             fail,
             ask,
+            cancelled,
             url,
         }
     }
 
-    fn open_one(&self) {
-        self.permits.add_permits(1);
+    /// Whether the endpoint holds a prediction that is really in flight,
+    /// within `within`.
+    async fn holds_a_prediction_within(&self, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let holding = {
+                let mut held = self
+                    .held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                held.held_predictions()
+            };
+            if holding > 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
-    fn open_after_cancel(&self) {
-        // Reqwest may keep the cancelled request's socket alive for reuse, so
-        // its server handler can remain queued even though the runtime turn is
-        // already interrupted. Release that abandoned handler and the one live
-        // request that follows it.
-        self.permits.add_permits(2);
+    /// Predictions the endpoint has seen cancelled so far.
+    fn cancelled_predictions(&self) -> usize {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until a held prediction's client hung up: that is a preemption as
+    /// the provider sees it.
+    async fn wait_for_a_cancelled_prediction_since(&self, cancelled: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.cancelled_predictions() <= cancelled {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the endpoint held a prediction and it was never cancelled"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// What this endpoint holds when a test's deadline expires: a turn that
+    /// never settled either is waiting for a release this run still owes, or
+    /// was never sent.
+    fn diagnosis(&self) -> String {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.forget_departed();
+        format!(
+            "gate: {} request(s) held, {} release(s) waiting for a request",
+            held.parked.len(),
+            held.released.len()
+        )
+    }
+
+    /// Let the next request carrying `marker` through.
+    fn release(&self, marker: &str) {
+        release(&self.held, marker);
+    }
+
+    /// Let the next turn through, whichever of the app's requests arrive
+    /// first.
+    fn release_turn(&self) {
+        self.release(SUBMITTED_TEXT);
     }
 
     fn ask_for_approval(&self) {
@@ -150,19 +324,74 @@ impl Gate {
 
     fn fail_from_now(&self) {
         self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.open_one();
+        // A request that was already let through before failure is answered
+        // like every request after it.
+        self.release_turn();
     }
 }
 
-async fn drain_request(stream: &mut tokio::net::TcpStream) {
+/// Hand `marker`'s release to the next request waiting for it, or keep it for
+/// the one that has not arrived yet.
+fn release(held: &std::sync::Mutex<Held>, marker: &str) {
+    let mut held = held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.forget_departed();
+    match held
+        .parked
+        .iter()
+        .position(|parked| parked.marker.as_deref() == Some(marker))
+    {
+        Some(index) => {
+            let parked = held.parked.remove(index);
+            let _ = parked.serve.send(());
+        }
+        None => held.released.push(marker.to_string()),
+    }
+}
+
+/// Whether a request carries the user message the tests submit.
+///
+/// The JSON envelope, not the bare word: the app's own background callers (the
+/// memory extractor, the prompt predictor) render the transcript as prompt
+/// text, so only a real message envelope matches. A request that matched by
+/// accident would simply be held, never served.
+fn carries_a_turn(body: &str) -> bool {
+    body.contains(&format!("\"content\":\"{SUBMITTED_TEXT}\""))
+}
+
+/// Whether the client of an already-drained request is gone.
+///
+/// Read from the socket rather than waiting to be woken by the event: the
+/// question is asked exactly when a release was just handed out, which is the
+/// one moment a released request can still be one nobody awaits. Only a closed
+/// or reset connection qualifies — a read that failed for any other reason (an
+/// interrupted one, say) is not evidence that nobody is waiting.
+fn client_hung_up(stream: &mut tokio::net::TcpStream) -> bool {
+    use std::io::ErrorKind;
+    match stream.try_read(&mut [0u8; 1]) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
+        ),
+    }
+}
+
+async fn drain_request(stream: &mut tokio::net::TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
         let Ok(n) = stream.read(&mut chunk).await else {
-            return;
+            return String::new();
         };
         if n == 0 {
-            return;
+            return String::new();
         }
         buf.extend_from_slice(&chunk[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -175,12 +404,15 @@ async fn drain_request(stream: &mut tokio::net::TcpStream) {
         .find_map(|line| line.strip_prefix("content-length:"))
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
+    // The body is the one place a request says what it carries, so it is read
+    // whole before the endpoint decides what to do with the handler.
     while buf.len() < header_end + length {
         match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return String::new(),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
+    String::from_utf8_lossy(&buf[header_end..]).into_owned()
 }
 
 struct Window {
@@ -197,7 +429,7 @@ impl Window {
         self.client
             .send(ClientCommand::SubmitMessage {
                 session_id: session.clone(),
-                content: "work".to_string(),
+                content: SUBMITTED_TEXT.to_string(),
                 attachments: vec![],
             })
             .await
@@ -288,7 +520,8 @@ impl Windows {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "execution never settled: turns {rows:?}, session {status:?}"
+                "execution never settled: turns {rows:?}, session {status:?} ({})",
+                self.gate.diagnosis()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -330,7 +563,7 @@ async fn ownership_follows_the_running_execution_between_windows() {
 
     // B — A completes and stays open; B's send succeeds under a new
     // generation.
-    w.gate.open_one();
+    w.gate.release_turn();
     w.settled(1).await;
     assert_eq!(w.owner().await, Windows::unowned_at(running.epoch.get()));
     w.b.submit(&w.session)
@@ -349,13 +582,13 @@ async fn ownership_follows_the_running_execution_between_windows() {
     assert_eq!(w.owner().await, b_running);
 
     // D — B completes; A's send succeeds.
-    w.gate.open_one();
+    w.gate.release_turn();
     w.settled(2).await;
     w.a.submit(&w.session)
         .await
         .expect("A takes its turn again");
     assert_eq!(w.owner().await.epoch, b_running.epoch.next().unwrap());
-    w.gate.open_one();
+    w.gate.release_turn();
     let rows = w.settled(3).await;
     assert_eq!(
         rows,
@@ -378,22 +611,45 @@ async fn a_new_turn_preempts_an_in_flight_prompt_prediction() {
     let w = two_windows().await;
 
     w.a.submit(&w.session).await.unwrap();
-    w.gate.open_one();
+    w.gate.release_turn();
     w.settled(1).await;
 
-    w.a.client
-        .send(ClientCommand::RequestPromptSuggestion {
-            session_id: w.session.clone(),
-        })
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The window drops an advisory request made while it still holds the
+    // previous turn's lease, so ask until the endpoint really holds one: a
+    // prediction in flight is the premise the turn below must preempt.
+    let premise = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        w.a.client
+            .send(ClientCommand::RequestPromptSuggestion {
+                session_id: w.session.clone(),
+            })
+            .await
+            .unwrap();
+        if w.gate
+            .holds_a_prediction_within(Duration::from_millis(250))
+            .await
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < premise,
+            "no advisory request reached the endpoint"
+        );
+    }
+    let cancelled_before = w.gate.cancelled_predictions();
 
     w.a.submit(&w.session)
         .await
         .expect("the user turn preempts advisory generation");
-    w.gate.open_one();
+    w.gate.release_turn();
     assert_eq!(w.settled(2).await.len(), 2);
+    // The prediction was in flight when the turn was submitted, and nothing but
+    // the turn cancelling it can end it. Without this the test would pass on a
+    // product that never preempts anything: a release names the turn it is for,
+    // so the prediction cannot spend it either way.
+    w.gate
+        .wait_for_a_cancelled_prediction_since(cancelled_before)
+        .await;
 }
 
 /// A cancelled execution is a terminal one: the window that cancelled it
@@ -414,7 +670,9 @@ async fn an_interrupted_execution_releases_the_session() {
         .await
         .expect("B runs after A's interruption");
     assert_eq!(w.owner().await.boot, Some(w.b.boot()));
-    w.gate.open_after_cancel();
+    // The interrupted request's release is not spent on it: the release is
+    // named, so it goes to the live turn that follows.
+    w.gate.release_turn();
     w.settled(2).await;
 }
 
@@ -439,7 +697,7 @@ async fn an_execution_awaiting_approval_keeps_the_session() {
     let w = windows_with(PermissionProfile::RequestApproval).await;
     std::fs::write(w._tmp.path().join("scratch.txt"), "x").unwrap();
     w.gate.ask_for_approval();
-    w.gate.open_one();
+    w.gate.release_turn();
     let mut events = w.a.client.subscribe();
     w.a.submit(&w.session).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
