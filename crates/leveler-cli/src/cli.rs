@@ -269,11 +269,18 @@ pub enum Command {
         /// Work profile: economy | balanced (default balanced).
         #[arg(long, default_value = "balanced")]
         work_mode: String,
-        /// Task round budget for this run: default 200, a hard stop
-        /// (`budget_limited`) at N model rounds; `0` runs until the goal is
-        /// resolved with no round budget.
-        #[arg(long, value_name = "N")]
-        max_rounds: Option<u32>,
+        /// Model-step safety ceiling for this run: a mechanical circuit
+        /// breaker against a runaway model/tool loop, NOT a task budget. The
+        /// task ends on its goal lifecycle or a resource budget. Default 200,
+        /// far above normal runs (a task typically closes in 9-25 model
+        /// steps); `0` pins no ceiling. One model step = one logical model
+        /// request (provider retries included) plus the tool batch it produced.
+        #[arg(
+            long = "max-model-steps",
+            visible_alias = "max-rounds",
+            value_name = "N"
+        )]
+        max_model_steps: Option<u32>,
         /// Collaboration axis: chat | plan | goal.
         /// Default **chat** (ordinary turns). Use `goal` for
         /// long runs that must call update_goal to finish.
@@ -955,15 +962,27 @@ mod tests {
     }
 
     #[test]
-    fn run_parses_max_rounds() {
+    fn run_parses_the_model_step_ceiling_under_both_spellings() {
+        let cli = Cli::parse_from(["leveler", "run", "fix it", "--max-model-steps", "40"]);
+        match cli.command {
+            Some(Command::Run {
+                max_model_steps, ..
+            }) => assert_eq!(max_model_steps, Some(40)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // The pre-rename spelling stays a working alias with the same meaning.
         let cli = Cli::parse_from(["leveler", "run", "fix it", "--max-rounds", "40"]);
         match cli.command {
-            Some(Command::Run { max_rounds, .. }) => assert_eq!(max_rounds, Some(40)),
+            Some(Command::Run {
+                max_model_steps, ..
+            }) => assert_eq!(max_model_steps, Some(40)),
             other => panic!("unexpected: {other:?}"),
         }
         let cli = Cli::parse_from(["leveler", "run", "fix it"]);
         match cli.command {
-            Some(Command::Run { max_rounds, .. }) => assert_eq!(max_rounds, None),
+            Some(Command::Run {
+                max_model_steps, ..
+            }) => assert_eq!(max_model_steps, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

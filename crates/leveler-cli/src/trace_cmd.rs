@@ -42,11 +42,12 @@ pub(crate) async fn cmd_trace(
     println!("  axes     {} / {}", s.work_profile, s.collaboration);
     println!("  duration {}", opt_duration(s.duration_ms));
     println!(
-        "  requests {}   in {}  cached {}  out {}  last_lat {:?}",
+        "  requests {}   in {}  cached {}  out {}  reasoning {}  last_lat {:?}",
         s.request_count,
         s.input_tokens,
         opt_num(s.cached_input_tokens),
         s.output_tokens,
+        opt_num(s.reasoning_tokens),
         s.last_latency_ms
     );
     println!("  cost     {}", opt_cost(s.cost_usd_micros));
@@ -61,12 +62,13 @@ pub(crate) async fn cmd_trace(
             continue;
         }
         println!(
-            "  {:<8} requests {}  in {}  cached {}  out {}  cost {}",
+            "  {:<8} requests {}  in {}  cached {}  out {}  reasoning {}  cost {}",
             lane.lane,
             lane.requests,
             lane.input_tokens,
             opt_num(lane.cached_input_tokens),
             lane.output_tokens,
+            opt_num(lane.reasoning_tokens),
             opt_cost(lane.cost_usd_micros)
         );
     }
@@ -93,11 +95,12 @@ pub(crate) async fn cmd_trace(
         println!("\n{}", Line::heading("Requests"));
         for (i, r) in loaded.requests.iter().enumerate() {
             println!(
-                "  #{:<3} {:<16} in {:>6} out {:>5} {} {:?}",
+                "  #{:<3} {:<16} in {:>6} out {:>5} reasoning {:>5} {} {:?}",
                 i + 1,
                 r.model,
                 r.input_tokens,
                 r.output_tokens,
+                opt_num(r.reasoning_tokens),
                 r.latency_ms
                     .map(|ms| format!("{ms}ms"))
                     .unwrap_or_else(|| "—".into()),

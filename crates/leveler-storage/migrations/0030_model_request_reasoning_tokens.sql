@@ -1,0 +1,25 @@
+-- Record the reasoning share of a call's completion tokens.
+--
+-- Reasoning-capable gateways (GLM-5.3, DeepSeek) report
+-- `usage.completion_tokens_details.reasoning_tokens` alongside the completion
+-- total. `TokenUsage` carried `cached_input_tokens` all the way to the writer
+-- but had no field for the reasoning count, so the number was parsed and
+-- dropped: a session could say how many output tokens it spent and nothing
+-- about how many of them went to thinking.
+--
+-- Like `cached_input_tokens`, the column is nullable and NULL is load-bearing:
+--
+--   reasoning_tokens  NULL = the provider reported no reasoning breakdown on
+--                     this call, or the row predates this migration. It is an
+--                     absence of measurement.
+--                     0    = the provider reported that no reasoning tokens
+--                     were spent.
+--
+-- The two must not be collapsed, and old rows stay NULL rather than being
+-- backfilled with a zero nobody measured.
+--
+-- The value is a SUBSET of `output_tokens`, not an addition to it: every
+-- provider here reports `completion_tokens` as the total and the reasoning
+-- count as a breakdown of it. Cost and token totals therefore keep reading
+-- `output_tokens` alone.
+ALTER TABLE model_requests ADD COLUMN reasoning_tokens INTEGER;

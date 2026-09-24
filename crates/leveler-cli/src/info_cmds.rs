@@ -217,6 +217,16 @@ pub(crate) async fn cmd_model_probe(
             "  usage: {} in / {} out",
             report.usage.input_tokens, report.usage.output_tokens
         );
+        // The provider's reasoning breakdown, when it reported one. Showing it
+        // here is what makes "the wire said X" checkable without a database.
+        if let Some(reasoning) = report.usage.reasoning_tokens {
+            let visible = report
+                .usage
+                .visible_output_tokens()
+                .map(|visible| visible.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            println!("         reasoning: {reasoning} (visible out: {visible})");
+        }
     }
     if let Some(err) = &report.error {
         println!("{}", Line::fail(&format!("error: {err}")));

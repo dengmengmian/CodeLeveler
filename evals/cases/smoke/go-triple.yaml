@@ -1,0 +1,34 @@
+id: go-triple
+name: Add a Go triple function
+files:
+  go.mod: |
+    module evalcase
+
+    go 1.21
+  math.go: |
+    package evalcase
+
+    func Double(x int) int { return x * 2 }
+  math_test.go: |
+    package evalcase
+
+    import "testing"
+
+    func TestDouble(t *testing.T) {
+        if Double(2) != 4 {
+            t.Fatal("Double(2) should be 4")
+        }
+    }
+
+    func TestTriple(t *testing.T) {
+        if Triple(2) != 6 {
+            t.Fatal("Triple(2) should be 6")
+        }
+        if Triple(0) != 0 {
+            t.Fatal("Triple(0) should be 0")
+        }
+    }
+task: "Implement Triple(x int) int returning x*3 in math.go so both tests in math_test.go pass. Do not modify the test file."
+expect:
+  program: go
+  args: ["test", "./..."]

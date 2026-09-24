@@ -1316,7 +1316,7 @@ async fn top_level_goal_runs_until_terminal_past_the_old_model_round_budget() {
         .unwrap();
 
     assert_eq!(report.stop_reason, StopReason::Completed);
-    assert_eq!(report.rounds, 4);
+    assert_eq!(report.model_steps, 4);
 }
 
 #[tokio::test]
@@ -1339,7 +1339,7 @@ async fn bounded_eval_goal_still_stops_at_the_case_round_limit() {
 
     assert_eq!(report.outcome, TaskOutcome::BudgetLimited);
     assert_eq!(report.stop_reason, StopReason::BudgetExhausted);
-    assert_eq!(report.rounds, 2);
+    assert_eq!(report.model_steps, 2);
 }
 
 #[tokio::test]
@@ -2087,7 +2087,7 @@ fn spec_windowed(h: &Harness, goal: &str, rounds_per_window: u32) -> TaskSpec {
     // ceiling ends a WORK WINDOW (policy opens the next one), not the goal.
     s.runtime.continuation = leveler_agent::ContinuationPolicy::UntilTerminal;
     s.runtime.limits = leveler_agent::StepLimits {
-        max_rounds: Some(rounds_per_window),
+        max_model_steps: Some(rounds_per_window),
         ..leveler_agent::StepLimits::default()
     };
     s
@@ -2910,7 +2910,7 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
     let before = seen[..started_at]
         .iter()
         .filter_map(|e| match e {
-            EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_rounds),
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_model_steps),
             _ => None,
         })
         .next_back()
@@ -2918,7 +2918,7 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
     let after = seen[started_at..]
         .iter()
         .filter_map(|e| match e {
-            EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_rounds),
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger.cumulative_model_steps),
             _ => None,
         })
         .next_back()
@@ -2934,6 +2934,7 @@ fn with_usage(mut response: ModelResponse, input: u64, cached: u64, output: u64)
     response.usage = TokenUsage {
         input_tokens: input,
         cached_input_tokens: cached,
+        reasoning_tokens: None,
         output_tokens: output,
     };
     response
@@ -3053,5 +3054,206 @@ async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
         "the first round reports no usage at all; the estimate standing in for \
          it is what keeps a token budget binding, and it must stay visible as \
          an estimate rather than blend into the audited total"
+    );
+}
+
+// ── Model-step semantics: budget correctness, not a task budget ─────────────
+
+/// The last `ProgressUpdated` ledger the session persisted.
+async fn last_ledger(
+    db: &Database,
+    session: &leveler_core::SessionId,
+) -> leveler_lifecycle::ProgressLedger {
+    let store = leveler_storage::EngineStores::from_database(db);
+    let mut latest = None;
+    for row in store.events.load(session).await.unwrap() {
+        if let Ok(leveler_engine::EngineEvent::ProgressUpdated { ledger }) =
+            leveler_engine::EngineEvent::from_payload(&row.payload)
+        {
+            latest = Some(ledger);
+        }
+    }
+    latest.expect("a run persists its progress ledger")
+}
+
+/// §F: a goal task that needs MORE model steps than the small task-level counts
+/// the old wiring used (10/15) must still complete normally. The product's
+/// shape is `UntilTerminal` + a generous mechanical safety ceiling, so a model
+/// step count can never stand in for "the task is done".
+#[tokio::test]
+async fn a_goal_task_longer_than_a_small_step_count_still_completes() {
+    const READS: usize = 11;
+    let mut responses: Vec<ModelResponse> = (0..READS)
+        .map(|i| {
+            tool_call(
+                &format!("r{i}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/f{i}.rs")}),
+            )
+        })
+        .collect();
+    responses.push(patch_add("p1", "src/added.rs", "pub fn added() {}"));
+    responses.push(tool_call(
+        "g1",
+        "update_goal",
+        serde_json::json!({"status": "complete", "summary": "inspected and added a function"}),
+    ));
+
+    // Distinct files so every read is novel progress: the run is long because
+    // the WORK is long, which is exactly the case a step count must not cut.
+    let h = harness_with(responses, PermissionProfile::Assisted, |dir| {
+        for i in 0..READS {
+            std::fs::write(
+                dir.join("src").join(format!("f{i}.rs")),
+                format!("pub fn f{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+    })
+    .await;
+
+    let mut s = spec(&h);
+    s.runtime.continuation = leveler_agent::ContinuationPolicy::UntilTerminal;
+    s.runtime.limits = leveler_agent::StepLimits {
+        max_model_steps: Some(leveler_agent::DEFAULT_MODEL_STEP_CEILING),
+        ..leveler_agent::StepLimits::default()
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+    let report = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.outcome,
+        TaskOutcome::Completed,
+        "a >10 step task must complete, not be truncated: {report:?}"
+    );
+    assert_eq!(report.stop_reason, StopReason::Completed);
+    assert!(
+        report.model_steps as usize > 10,
+        "this task deliberately needs more than 10 model steps, got {}",
+        report.model_steps
+    );
+    assert!(
+        report.model_steps < leveler_agent::DEFAULT_MODEL_STEP_CEILING,
+        "the safety ceiling must not be what ended this run: {}",
+        report.model_steps
+    );
+}
+
+/// §G + §E end-to-end: the safety ceiling ends a drive honestly (resumable,
+/// `TurnLimitReached`, not a resource budget), and a resume continues the
+/// task's spend while getting a fresh per-drive step counter.
+#[tokio::test]
+async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
+    // Drive 1: the ceiling stops it after two model steps.
+    let h = harness(vec![
+        read_call_named("c1", "src/lib.rs"),
+        read_call_named("c2", "src/lib.rs"),
+        read_call_named("c3", "src/lib.rs"),
+    ])
+    .await;
+    let mut s = spec(&h);
+    s.runtime.continuation = leveler_agent::ContinuationPolicy::UntilTerminal;
+    s.runtime.limits = leveler_agent::StepLimits {
+        max_model_steps: Some(2),
+        ..leveler_agent::StepLimits::default()
+    };
+    let session = h.engine.create_task(&s).await.unwrap();
+    let first = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(first.stop_reason, StopReason::TurnLimitReached);
+    assert_eq!(
+        first.model_steps, 2,
+        "the pinned ceiling is exactly what fired"
+    );
+    let detail = first.stop_detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("model_step_ceiling=2"),
+        "the detail must name the ceiling that fired: {detail:?}"
+    );
+    let after_first = last_ledger(&h.db, &session).await;
+
+    // Drive 2: resume on the same database with a generous ceiling.
+    let dir2 = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir2.path().join("src")).unwrap();
+    std::fs::write(dir2.path().join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let workspace = Workspace::new(dir2.path()).unwrap();
+    let engine2 = CodingRuntime {
+        engine: TaskEngine {
+            stores: leveler_storage::EngineStores::from_database(&h.db),
+            runtime_id: leveler_core::RuntimeId::new("rt-test"),
+            boot: leveler_engine::EngineBoot {
+                id: leveler_core::BootId::generate(),
+                liveness: std::sync::Arc::new(leveler_test_support::TestBoots::new()),
+            },
+        },
+        factory: ExecutorFactory {
+            runtime: Arc::new(MockRuntime::new(vec![
+                patch_add("p1", "src/added.rs", "pub fn added() {}"),
+                tool_call(
+                    "g1",
+                    "update_goal",
+                    serde_json::json!({"status": "complete", "summary": "done"}),
+                ),
+            ])),
+            registry: Arc::new(default_registry()),
+            tool_context: ToolContext::with_environment(
+                workspace,
+                PermissionProfile::Assisted,
+                Arc::new(leveler_core::EnvSnapshot::new(
+                    std::env::vars_os(),
+                    std::env::current_dir().unwrap_or_default(),
+                    std::env::temp_dir(),
+                )),
+            ),
+            model: ModelRef::new("mock", "m"),
+            commit_co_author: true,
+            overrides: None,
+            memory_catalog: String::new(),
+            memory_expose: true,
+            memory_root: None,
+            background_tasks: std::sync::Arc::new(leveler_execution::BackgroundTaskRegistry::new()),
+            permission_rules: leveler_execution::PermissionRuleSet::default(),
+            permission_rules_path: None,
+            hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
+            steering: None,
+            allow_delegation: true,
+            independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
+            develop_model: None,
+        },
+        approver: Arc::new(AutoApprove),
+        clarifier: Arc::new(AutoClarify),
+        task_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let mut s2 = spec(&h);
+    s2.coding.repository = dir2.path().to_path_buf();
+    s2.runtime.continuation = leveler_agent::ContinuationPolicy::UntilTerminal;
+    s2.runtime.limits = leveler_agent::StepLimits {
+        max_model_steps: Some(leveler_agent::DEFAULT_MODEL_STEP_CEILING),
+        ..leveler_agent::StepLimits::default()
+    };
+
+    let second = engine2
+        .resume(&session, &s2, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(second.outcome, TaskOutcome::Completed);
+
+    // §G: the second drive's count is its OWN (a fresh per-drive ceiling), and
+    // the task epoch carries the sum. Neither number is a "task budget left".
+    let after_second = last_ledger(&h.db, &session).await;
+    assert_eq!(after_second.cumulative_model_steps, 2 + second.model_steps);
+    assert!(
+        after_second.cumulative_model_tokens > after_first.cumulative_model_tokens,
+        "task-level token spend must keep accumulating across a resume: {} -> {}",
+        after_first.cumulative_model_tokens,
+        after_second.cumulative_model_tokens
     );
 }

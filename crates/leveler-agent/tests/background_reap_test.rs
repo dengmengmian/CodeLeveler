@@ -539,7 +539,7 @@ async fn a_work_window_boundary_keeps_goal_owned_services_alive() {
     let h = harness(vec![spawn_sleep_server(), text("still working")]).await;
     let mut s = spec(&h, "start the dev server, then keep working");
     s.runtime.limits = StepLimits {
-        max_rounds: Some(1),
+        max_model_steps: Some(1),
         ..StepLimits::default()
     };
     let session = h.engine.create_task(&s).await.unwrap();

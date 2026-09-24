@@ -168,7 +168,11 @@ pub enum EngineEvent {
         /// that ended in an error instead of an executor outcome.
         #[serde(default)]
         stop: Option<leveler_lifecycle::StopReason>,
-        rounds: u32,
+        /// Model steps this turn started. Renamed from `rounds` on the Rust
+        /// side only: the persisted/wire key stays `rounds` so existing rows
+        /// and consumers keep decoding.
+        #[serde(rename = "rounds")]
+        model_steps: u32,
         modified_files: Vec<String>,
     },
     TaskFinished {
@@ -255,10 +259,17 @@ pub enum EngineEvent {
         snapshot: String,
     },
     /// TRANSIENT: token usage for the context gauge.
+    ///
+    /// `output_tokens` is the provider's total completion count and already
+    /// includes `reasoning_tokens`; the window in use is `input + output`.
     TokenUsage {
         input_tokens: u32,
         output_tokens: u32,
         cached_input_tokens: u32,
+        /// Provider-reported reasoning tokens (subset of `output_tokens`).
+        /// `None` = the provider reported no breakdown.
+        #[serde(default)]
+        reasoning_tokens: Option<u32>,
     },
     /// TRANSIENT: the accounting of the exact next model request, computed by
     /// the kernel before it is sent. Aggregate token estimates and category
@@ -796,13 +807,13 @@ impl EngineEvent {
             EngineEvent::TurnFinished {
                 turn_id,
                 outcome,
-                rounds,
+                model_steps,
                 modified_files,
                 ..
             } => PublicEvent::TurnFinished {
                 turn_id: turn_id.clone(),
                 outcome: *outcome,
-                rounds: *rounds,
+                model_steps: *model_steps,
                 modified_file_count: modified_files.len(),
             },
             EngineEvent::TaskFinished { outcome, .. } => PublicEvent::TaskFinished {
@@ -812,10 +823,12 @@ impl EngineEvent {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
+                reasoning_tokens,
             } => PublicEvent::TokenUsage {
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
                 cached_input_tokens: *cached_input_tokens,
+                reasoning_tokens: *reasoning_tokens,
             },
             EngineEvent::Compacted { from, to } => PublicEvent::Compacted {
                 from: *from,
@@ -948,7 +961,9 @@ pub enum PublicEvent {
     TurnFinished {
         turn_id: TurnId,
         outcome: TurnOutcome,
-        rounds: u32,
+        /// Model-step count. Wire key stays `rounds` for existing consumers.
+        #[serde(rename = "rounds")]
+        model_steps: u32,
         modified_file_count: usize,
     },
     TaskFinished {
@@ -958,6 +973,10 @@ pub enum PublicEvent {
         input_tokens: u32,
         output_tokens: u32,
         cached_input_tokens: u32,
+        /// Provider-reported reasoning tokens — a subset of `output_tokens`,
+        /// never an addition to it. `None` when the provider reported none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_tokens: Option<u32>,
     },
     Compacted {
         from: usize,
@@ -1202,7 +1221,7 @@ mod contract_tests {
                 turn_id: TurnId::new("turn-safe"),
                 outcome: TurnOutcome::Failed,
                 stop_reason: secret.into(),
-                rounds: 2,
+                model_steps: 2,
                 modified_files: vec![secret.into()],
                 stop: None,
             },
@@ -1275,6 +1294,7 @@ mod contract_tests {
                 input_tokens: 1,
                 output_tokens: 2,
                 cached_input_tokens: 0,
+                reasoning_tokens: None,
             },
             EngineEvent::RunFinished { text: "f".into() },
         ] {

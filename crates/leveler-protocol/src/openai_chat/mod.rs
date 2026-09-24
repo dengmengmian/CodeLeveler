@@ -190,6 +190,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.cached_input_tokens(),
+                reasoning_tokens: u.reasoning_tokens(),
             })
             .unwrap_or_default();
 
@@ -720,6 +721,72 @@ mod tests {
     }
 
     #[test]
+    fn passback_echoes_kernel_assembled_reasoning_not_an_empty_string() {
+        // The kernel assembles a streamed round as reasoning → text → tool
+        // calls. This is that exact shape: the captured reasoning must reach
+        // the wire as `reasoning_content` when the provider requires passback
+        // and the request exposes tools, never as the empty string the
+        // provider would otherwise receive.
+        let context = ProtocolContext {
+            passback_reasoning_content: true,
+            ..ctx()
+        };
+        let mut request = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-chat"),
+            vec![
+                Message::text(Role::User, "hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentPart::Reasoning {
+                            text: "分析...继续分析...".into(),
+                        },
+                        ContentPart::Text {
+                            text: "checking".into(),
+                        },
+                        ContentPart::ToolCall {
+                            call: ToolCall {
+                                id: leveler_core::ToolCallId::new("call_1"),
+                                name: "get_time".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: leveler_core::ToolCallId::new("call_1"),
+                            content: "12:00".into(),
+                            is_error: false,
+                        },
+                    }],
+                },
+            ],
+        );
+        request.tools = vec![ToolDefinition {
+            name: "get_time".into(),
+            description: "read the clock".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&request, &context, true)
+            .unwrap()
+            .body;
+        assert_eq!(
+            body["messages"][1]["reasoning_content"], "分析...继续分析...",
+            "captured reasoning must be echoed, not dropped: {body}"
+        );
+        assert_eq!(body["messages"][1]["content"], "checking");
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"],
+            "get_time"
+        );
+    }
+
+    #[test]
     fn passback_sends_empty_reasoning_when_the_round_produced_none() {
         // A round that ran with thinking disabled has no reasoning to echo —
         // the provider still requires the key, and the empty string satisfies
@@ -957,6 +1024,81 @@ mod tests {
         assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert_eq!(resp.usage.total(), 7);
         assert_eq!(resp.request_id.as_str(), "resp_1");
+    }
+
+    /// A reasoning-capable gateway reports the breakdown under
+    /// `completion_tokens_details`. `completion_tokens` stays the total, so the
+    /// parsed usage must carry 1000 output of which 700 were reasoning — not
+    /// 300, and not 1700.
+    #[test]
+    fn decodes_provider_reasoning_tokens() {
+        let adapter = OpenAiChatAdapter::new();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": "resp_2",
+            "choices": [{
+                "message": {"content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1000,
+                "completion_tokens_details": {"reasoning_tokens": 700}
+            }
+        }))
+        .unwrap();
+        let resp = adapter.decode_response(&body, &ctx()).unwrap();
+        assert_eq!(resp.usage.output_tokens, 1000);
+        assert_eq!(resp.usage.reasoning_tokens, Some(700));
+        assert_eq!(resp.usage.visible_output_tokens(), Some(300));
+        assert_eq!(resp.usage.total(), 1100);
+    }
+
+    #[test]
+    fn a_provider_without_a_reasoning_breakdown_stays_unknown() {
+        let adapter = OpenAiChatAdapter::new();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 40}
+        }))
+        .unwrap();
+        let resp = adapter.decode_response(&body, &ctx()).unwrap();
+        assert_eq!(resp.usage.reasoning_tokens, None);
+        assert_eq!(resp.usage.visible_output_tokens(), None);
+    }
+
+    /// A gateway may send the details object for other reasons without a
+    /// reasoning count; that is still an absent measurement.
+    #[test]
+    fn completion_details_without_reasoning_is_unknown() {
+        let adapter = OpenAiChatAdapter::new();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "completion_tokens_details": {"accepted_prediction_tokens": 0}
+            }
+        }))
+        .unwrap();
+        let resp = adapter.decode_response(&body, &ctx()).unwrap();
+        assert_eq!(resp.usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn a_reported_zero_reasoning_count_is_kept() {
+        let adapter = OpenAiChatAdapter::new();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "completion_tokens_details": {"reasoning_tokens": 0}
+            }
+        }))
+        .unwrap();
+        let resp = adapter.decode_response(&body, &ctx()).unwrap();
+        assert_eq!(resp.usage.reasoning_tokens, Some(0));
+        assert_eq!(resp.usage.visible_output_tokens(), Some(4));
     }
 
     #[test]

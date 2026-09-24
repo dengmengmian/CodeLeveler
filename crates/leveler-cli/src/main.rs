@@ -350,7 +350,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             pr_base,
             deny_network,
             work_mode,
-            max_rounds,
+            max_model_steps,
             collaboration,
             parallel,
         } => {
@@ -388,7 +388,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                     deny_network,
                     work_profile,
                     collab,
-                    max_rounds,
+                    max_model_steps,
                 )
                 .await
             }

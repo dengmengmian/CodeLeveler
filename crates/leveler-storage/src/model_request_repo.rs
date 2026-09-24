@@ -70,6 +70,15 @@ pub struct ModelRequestRecord {
     /// `Some(0)` means the provider reported no cache hit. The two must not be
     /// collapsed: one is an absence of measurement, the other a measurement.
     pub cached_input_tokens: Option<u64>,
+    /// Completion tokens the provider attributed to reasoning — a SUBSET of
+    /// [`Self::output_tokens`], never an amount to add to it.
+    ///
+    /// `None` means the provider reported no breakdown on this call (or the
+    /// row predates migration 0030); `Some(0)` means it reported that no
+    /// reasoning tokens were spent. The distinction is the same one
+    /// [`Self::cached_input_tokens`] makes: one is an absence of measurement,
+    /// the other a measurement.
+    pub reasoning_tokens: Option<u64>,
     /// Estimated cost of this call in micro-USD, computed from the usage above
     /// and the model's configured pricing at the time it ran. `None` when no
     /// pricing was configured, so a session's cost sums only over rows that
@@ -102,6 +111,32 @@ pub struct ModelRequestRecord {
     pub reasoning_effort: Option<String>,
 }
 
+/// One `model_requests` row as the loader reads it.
+///
+/// A named struct rather than a positional tuple: `reasoning_tokens` pushed the
+/// SELECT past SQLx's 16-element `FromRow` tuple bound, and naming the columns
+/// makes the mapping checkable against the query instead of counting positions.
+#[derive(sqlx::FromRow)]
+struct ModelRequestRow {
+    id: String,
+    provider: String,
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    finish_reason: Option<String>,
+    error_kind: Option<String>,
+    latency_ms: Option<i64>,
+    retry_count: i64,
+    created_at: String,
+    kind: String,
+    provider_request_id: Option<String>,
+    cached_input_tokens: Option<i64>,
+    cost_usd_micros: Option<i64>,
+    agent_id: Option<String>,
+    reasoning_effort: Option<String>,
+    reasoning_tokens: Option<i64>,
+}
+
 /// Read/write access to the `model_requests` table, borrowed from a [`Database`].
 pub struct ModelRequestRepository<'a> {
     db: &'a Database,
@@ -126,8 +161,8 @@ impl<'a> ModelRequestRepository<'a> {
              (id, session_id, provider, model, input_tokens, output_tokens, finish_reason, \
               error_kind, latency_ms, retry_count, created_at, kind, \
               provider_request_id, cached_input_tokens, cost_usd_micros, agent_id, \
-              reasoning_effort) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              reasoning_effort, reasoning_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )
         .bind(&record.id)
         .bind(record.session_id.as_str())
@@ -158,6 +193,11 @@ impl<'a> ModelRequestRepository<'a> {
         )
         .bind(&record.agent_id)
         .bind(&record.reasoning_effort)
+        .bind(
+            record
+                .reasoning_tokens
+                .map(|value| value.min(i64::MAX as u64) as i64),
+        )
         .execute(self.db.pool())
         .await?;
         Ok(())
@@ -174,30 +214,11 @@ impl<'a> ModelRequestRepository<'a> {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ModelRequestRecord>, StorageError> {
-        let rows = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                String,
-                i64,
-                i64,
-                Option<String>,
-                Option<String>,
-                Option<i64>,
-                i64,
-                String,
-                String,
-                Option<String>,
-                Option<i64>,
-                Option<i64>,
-                Option<String>,
-                Option<String>,
-            ),
-        >(
+        let rows = sqlx::query_as::<_, ModelRequestRow>(
             "SELECT id, provider, model, input_tokens, output_tokens, finish_reason, error_kind, \
                     latency_ms, retry_count, created_at, kind, provider_request_id, \
-                    cached_input_tokens, cost_usd_micros, agent_id, reasoning_effort \
+                    cached_input_tokens, cost_usd_micros, agent_id, reasoning_effort, \
+                    reasoning_tokens \
              FROM model_requests WHERE session_id = ?1 ORDER BY created_at, rowid",
         )
         .bind(session_id.as_str())
@@ -205,8 +226,8 @@ impl<'a> ModelRequestRepository<'a> {
         .await?;
 
         rows.into_iter()
-            .map(
-                |(
+            .map(|row| {
+                let ModelRequestRow {
                     id,
                     provider,
                     model,
@@ -223,7 +244,9 @@ impl<'a> ModelRequestRepository<'a> {
                     cost_usd_micros,
                     agent_id,
                     reasoning_effort,
-                )| {
+                    reasoning_tokens,
+                } = row;
+                {
                     Ok(ModelRequestRecord {
                         id,
                         session_id: session_id.clone(),
@@ -244,9 +267,10 @@ impl<'a> ModelRequestRepository<'a> {
                             StorageError::InvalidData(format!("model request timestamp: {error}"))
                         })?,
                         reasoning_effort,
+                        reasoning_tokens: reasoning_tokens.map(|value| value.max(0) as u64),
                     })
-                },
-            )
+                }
+            })
             .collect()
     }
 }
@@ -270,12 +294,20 @@ pub struct SessionUsageTotals {
     pub cached_input_tokens: u64,
     /// Completion tokens.
     pub output_tokens: u64,
+    /// Summed over rows that reported a reasoning breakdown — a subset of
+    /// [`Self::output_tokens`], not an amount to add to it. Rows that reported
+    /// none are counted in [`Self::rows_without_reasoning_usage`].
+    pub reasoning_tokens: u64,
     /// Summed over rows that carry a cost. Rows without pricing are counted in
     /// [`Self::rows_without_cost`].
     pub cost_usd_micros: u64,
     /// Rows whose cached usage was never recorded — pre-0022 rows. They are
     /// counted, not treated as zero cache hits.
     pub rows_without_cached_usage: u64,
+    /// Rows with no reasoning breakdown — a provider that does not report one,
+    /// or a row from before migration 0030. Counted, not read as "spent no
+    /// reasoning".
+    pub rows_without_reasoning_usage: u64,
     /// Rows with no cost, because the model had no pricing configured or the
     /// row predates the column. Not the same as a call that cost nothing.
     pub rows_without_cost: u64,
@@ -292,6 +324,10 @@ impl SessionUsageTotals {
             }
             None => self.rows_without_cached_usage += 1,
         }
+        match record.reasoning_tokens {
+            Some(value) => self.reasoning_tokens = self.reasoning_tokens.saturating_add(value),
+            None => self.rows_without_reasoning_usage += 1,
+        }
         match record.cost_usd_micros {
             Some(value) => self.cost_usd_micros = self.cost_usd_micros.saturating_add(value),
             None => self.rows_without_cost += 1,
@@ -301,6 +337,11 @@ impl SessionUsageTotals {
     /// Whether every row contributed both a cached-usage figure and a cost. A
     /// caller showing a cost has to be able to say whether it is the whole
     /// bill or part of one.
+    ///
+    /// Reasoning tokens are deliberately excluded: most providers report no
+    /// breakdown at all, so requiring one would report every DeepSeek-only
+    /// ledger as incomplete. [`Self::rows_without_reasoning_usage`] carries
+    /// that caveat instead.
     pub fn is_complete(&self) -> bool {
         self.rows_without_cached_usage == 0 && self.rows_without_cost == 0
     }
@@ -367,6 +408,7 @@ mod tests {
             agent_id: None,
             created_at: leveler_core::now(),
             reasoning_effort: None,
+            reasoning_tokens: Some(80),
         }
     }
 
@@ -394,6 +436,55 @@ mod tests {
         assert_eq!(loaded[0].output_tokens, 100);
         assert_eq!(loaded[0].cached_input_tokens, Some(900));
         assert_eq!(loaded[0].cost_usd_micros, Some(1_234));
+        assert_eq!(
+            loaded[0].reasoning_tokens,
+            Some(80),
+            "the provider's reasoning breakdown survives the round trip"
+        );
+    }
+
+    /// The reasoning count is a subset of the completion count, so storing it
+    /// changes no total: the row still reports 100 output tokens, and the cost
+    /// the writer recorded is the cost of those 100.
+    #[tokio::test]
+    async fn a_reasoning_breakdown_is_stored_without_touching_the_output_total() {
+        let (db, session) = seeded().await;
+        let repo = ModelRequestRepository::new(&db);
+        let mut row = record("r-reasoning", &session);
+        row.output_tokens = 1_000;
+        row.reasoning_tokens = Some(700);
+        repo.insert(&row).await.unwrap();
+
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        assert_eq!(loaded[0].output_tokens, 1_000);
+        assert_eq!(loaded[0].reasoning_tokens, Some(700));
+
+        let rec = repo.reconcile_session(&session).await.unwrap();
+        assert_eq!(rec.total.output_tokens, 1_000);
+        assert_eq!(rec.total.reasoning_tokens, 700);
+        assert_eq!(rec.total.rows_without_reasoning_usage, 0);
+        assert_eq!(rec.total.cost_usd_micros, 1_234);
+    }
+
+    /// A row that reported no breakdown is counted, not summed as zero.
+    #[tokio::test]
+    async fn a_missing_reasoning_breakdown_is_counted_not_read_as_zero() {
+        let (db, session) = seeded().await;
+        let repo = ModelRequestRepository::new(&db);
+        let mut absent = record("r-absent", &session);
+        absent.reasoning_tokens = None;
+        let mut measured_zero = record("r-zero", &session);
+        measured_zero.reasoning_tokens = Some(0);
+        repo.insert(&absent).await.unwrap();
+        repo.insert(&measured_zero).await.unwrap();
+
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        assert_eq!(loaded[0].reasoning_tokens, None);
+        assert_eq!(loaded[1].reasoning_tokens, Some(0));
+
+        let rec = repo.reconcile_session(&session).await.unwrap();
+        assert_eq!(rec.total.reasoning_tokens, 0);
+        assert_eq!(rec.total.rows_without_reasoning_usage, 1);
     }
 
     /// T3/T4. A sub-agent's call is attributable to the agent that made it.
@@ -435,6 +526,11 @@ mod tests {
         assert_eq!(rec.total.requests, 4, "four rows, counted once each");
         assert_eq!(rec.total.input_tokens, 4_000);
         assert_eq!(rec.total.cached_input_tokens, 3_600);
+        assert_eq!(
+            rec.total.reasoning_tokens,
+            4 * 80,
+            "each logical call contributes its reasoning share exactly once"
+        );
         assert_eq!(rec.total.cost_usd_micros, 4 * 1_234);
         assert_eq!(rec.root.requests, 1);
         let child_requests: u64 = rec.by_agent.iter().map(|(_, t)| t.requests).sum();
@@ -488,12 +584,17 @@ mod tests {
             rows[0].cached_input_tokens, None,
             "a row from before the column reads as unrecorded, not as a cache miss"
         );
+        assert_eq!(
+            rows[0].reasoning_tokens, None,
+            "and not as a provider that measured zero reasoning"
+        );
         assert_eq!(rows[0].cost_usd_micros, None, "and not as a free call");
         assert_eq!(rows[0].agent_id, None);
 
         let rec = repo.reconcile_session(&session_id).await.unwrap();
         assert_eq!(rec.total.input_tokens, 6_392_866);
         assert_eq!(rec.total.rows_without_cached_usage, 1);
+        assert_eq!(rec.total.rows_without_reasoning_usage, 1);
         assert_eq!(rec.total.rows_without_cost, 1);
         assert!(
             !rec.total.is_complete(),
@@ -521,6 +622,7 @@ mod tests {
         let repo = ModelRequestRepository::new(&db);
         let loaded = repo.load_for_session(&session).await.unwrap();
         assert_eq!(loaded[0].cached_input_tokens, None, "unknown, not zero");
+        assert_eq!(loaded[0].reasoning_tokens, None, "unknown, not zero");
         assert_eq!(loaded[0].cost_usd_micros, None);
         assert_eq!(loaded[0].agent_id, None);
 
@@ -531,6 +633,7 @@ mod tests {
         );
         assert_eq!(rec.total.cached_input_tokens, 0);
         assert_eq!(rec.total.rows_without_cached_usage, 1);
+        assert_eq!(rec.total.rows_without_reasoning_usage, 1);
         assert_eq!(rec.total.rows_without_cost, 1);
         assert!(
             !rec.total.is_complete(),
@@ -564,6 +667,7 @@ mod tests {
             agent_id: None,
             created_at: leveler_core::now(),
             reasoning_effort: Some("high".to_string()),
+            reasoning_tokens: Some(12),
         };
 
         let repo = ModelRequestRepository::new(&db);
@@ -579,6 +683,11 @@ mod tests {
         );
         assert_eq!(loaded[0].output_tokens, 20);
         assert_eq!(loaded[0].retry_count, 1);
+        assert_eq!(
+            loaded[0].reasoning_tokens,
+            Some(12),
+            "a reasoning count survives alongside the effort metadata"
+        );
     }
 
     /// Every lane survives the round trip, and each row stays one LOGICAL
@@ -614,6 +723,7 @@ mod tests {
                 agent_id: None,
                 created_at: leveler_core::now(),
                 reasoning_effort: None,
+                reasoning_tokens: None,
             })
             .await
             .unwrap();
@@ -662,6 +772,7 @@ mod tests {
                 agent_id: None,
                 created_at: leveler_core::now(),
                 reasoning_effort: None,
+                reasoning_tokens: None,
             })
             .await
             .expect("a repeated provider id is not a persistence failure");

@@ -60,7 +60,7 @@ async fn minimal_turn(
         detail,
         stale_ownership: false,
         model: None,
-        rounds: 0,
+        model_steps: 0,
         modified_files: Vec::new(),
     };
 
@@ -79,11 +79,12 @@ async fn minimal_turn(
         input_tokens: 1,
         output_tokens: 1,
         cached_input_tokens: 0,
+        reasoning_tokens: None,
     });
 
     Ok(TurnFacts {
         stop: StopReason::Answered,
-        rounds: 1,
+        model_steps: 1,
         modified_files: Vec::new(),
         outcome: MinimalResult {
             processed: format!("processed:{input}"),
@@ -569,7 +570,7 @@ async fn a_child_left_open_by_a_cancelled_turn_is_settled_as_cancelled() {
                     detail: "stopped".into(),
                     stale_ownership: false,
                     model: None,
-                    rounds: 0,
+                    model_steps: 0,
                     modified_files: Vec::new(),
                 })
             },
@@ -622,7 +623,7 @@ async fn an_interrupted_turn_keeps_its_rounds_and_modified_files() {
                     detail: "esc".into(),
                     stale_ownership: false,
                     model: None,
-                    rounds: 7,
+                    model_steps: 7,
                     modified_files: vec!["inventory/core.py".into(), "inventory/storage.py".into()],
                 })
             },
@@ -633,10 +634,10 @@ async fn an_interrupted_turn_keeps_its_rounds_and_modified_files() {
         .find_map(|event| match event {
             EngineEvent::TurnFinished {
                 outcome,
-                rounds,
+                model_steps,
                 modified_files,
                 ..
-            } => Some((*outcome, *rounds, modified_files.clone())),
+            } => Some((*outcome, *model_steps, modified_files.clone())),
             _ => None,
         })
         .expect("the interrupted turn still records a terminal");

@@ -310,6 +310,7 @@ fn token_usage_updates_context_gauge() {
             input_tokens: 1200,
             output_tokens: 300,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         }),
     );
     // Window in use = input + output; latest round replaces, not accumulates.
@@ -322,6 +323,7 @@ fn token_usage_updates_context_gauge() {
             input_tokens: 2000,
             output_tokens: 500,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         }),
     );
     assert_eq!(s.context_tokens, 2500);
@@ -1050,6 +1052,7 @@ fn zero_token_usage_does_not_wipe_gauge() {
             input_tokens: 100,
             output_tokens: 20,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         }),
     );
     reduce(
@@ -1058,6 +1061,7 @@ fn zero_token_usage_does_not_wipe_gauge() {
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         }),
     );
     assert_eq!(s.context_tokens, 120);
@@ -2809,6 +2813,7 @@ fn context_estimate_does_not_clobber_real_token_usage() {
             input_tokens: 5000,
             output_tokens: 200,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         }),
     );
     assert_eq!(s.context_tokens, 5200);

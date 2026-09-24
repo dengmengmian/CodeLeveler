@@ -152,6 +152,11 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
                 cached_input_tokens: u.cache_read_input_tokens,
+                // Anthropic bills thinking tokens inside `output_tokens` but
+                // reports no reasoning breakdown, so the split is unknown.
+                // Counting the thinking block's bytes would be an estimate
+                // dressed as a provider fact.
+                reasoning_tokens: None,
             })
             .unwrap_or_default();
 

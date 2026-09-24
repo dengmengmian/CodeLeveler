@@ -2,7 +2,7 @@
 //! shares with it.
 //!
 //! [`AgentHarness`] is the whole contract between the kernel and whatever
-//! embeds it. The kernel calls each seam at a fixed point of every round; the
+//! embeds it. The kernel calls each seam at a fixed point of every model step; the
 //! harness answers with a [`Flow`]. Every seam except the two that name the
 //! tools and run them has a neutral default, so a plain tool-calling agent is
 //! [`BasicHarness`] over a [`ToolRuntime`] and nothing else.
@@ -20,7 +20,9 @@ use leveler_model::{
 
 use crate::error::AgentCoreError;
 use crate::event::AgentEvent;
-use crate::limits::{RoundAdmission, RoundAdmissionInput, RoundLimits, admit_next_round};
+use crate::limits::{
+    ModelStepAdmission, ModelStepAdmissionInput, ModelStepLimits, admit_next_model_step,
+};
 use crate::model_round::ModelRound;
 use crate::stop::{LoopStop, StopReason};
 use crate::tool_runtime::{ToolRuntime, dispatch_calls};
@@ -29,9 +31,9 @@ use crate::usage::UsageProjection;
 /// What the loop does after a seam returns.
 #[derive(Debug)]
 pub enum Flow<S> {
-    /// Proceed with this round as the loop would on its own.
+    /// Proceed with this model step as the loop would on its own.
     Continue,
-    /// Skip the rest of this round and start the next one. The harness has
+    /// Skip the rest of this model step and start the next one. The harness has
     /// already put whatever it wanted the model to see into the transcript.
     NextRound,
     /// End the run with the harness's own outcome.
@@ -47,12 +49,17 @@ impl Drop for CancelOnDrop {
 }
 
 /// The loop's own state for one run, read and (for spend) extended by the
-/// harness. The kernel owns the round counter, the limits, the usage
+/// harness. The kernel owns the model-step counter, the limits, the usage
 /// projection, the wall clock, and the cancellation token every seam and
 /// tool runs under.
+///
+/// A **model step** is one admitted loop iteration: one logical model request
+/// (its provider retries included) plus the tool batch it produced, or the
+/// quiet exit that ended the run. It is a mechanical count of the agent's
+/// own request cadence and says nothing about how far the *task* has got.
 pub struct LoopContext {
-    round: u32,
-    limits: RoundLimits,
+    model_steps: u32,
+    limits: ModelStepLimits,
     usage: UsageProjection,
     started: Instant,
     /// The run's token: a child of the caller's, also cancelled by the
@@ -67,7 +74,7 @@ pub struct LoopContext {
 }
 
 impl LoopContext {
-    pub(crate) fn new(limits: RoundLimits, external: CancellationToken) -> Self {
+    pub(crate) fn new(limits: ModelStepLimits, external: CancellationToken) -> Self {
         let run_cancellation = external.child_token();
         let deadline_expired = Arc::new(AtomicBool::new(false));
         let finalization_requested = Arc::new(AtomicBool::new(false));
@@ -112,7 +119,7 @@ impl LoopContext {
             });
         }
         Self {
-            round: 0,
+            model_steps: 0,
             limits,
             usage: UsageProjection::default(),
             started: Instant::now(),
@@ -124,20 +131,20 @@ impl LoopContext {
         }
     }
 
-    /// Rounds started so far. Zero before the first model call; the counter
-    /// advances when a round is admitted, before its model call.
-    pub fn round(&self) -> u32 {
-        self.round
+    /// Model steps started so far. Zero before the first model call; the
+    /// counter advances when a step is admitted, before its model call.
+    pub fn model_steps(&self) -> u32 {
+        self.model_steps
     }
 
-    pub fn limits(&self) -> &RoundLimits {
+    pub fn limits(&self) -> &ModelStepLimits {
         &self.limits
     }
 
-    /// Whether the pinned window limit leaves room for a round after the
+    /// Whether the pinned model-step window leaves room for a step after the
     /// current one.
-    pub fn has_next_round(&self) -> bool {
-        self.limits.allows_round_after(self.round)
+    pub fn has_next_model_step(&self) -> bool {
+        self.limits.allows_model_step_after(self.model_steps)
     }
 
     /// The token every model stream, tool, and wait in this run observes.
@@ -194,7 +201,7 @@ impl LoopContext {
 
     /// Fold a model call the harness made on its own account (a fold's
     /// summary, a delegated child's call) into the spend the limits read.
-    /// The loop folds its own rounds automatically.
+    /// The loop folds its own model steps automatically.
     pub fn record_spend(
         &mut self,
         usage: TokenUsage,
@@ -209,11 +216,11 @@ impl LoopContext {
         &self.last_text
     }
 
-    pub(crate) fn admit(&self) -> RoundAdmission {
-        admit_next_round(&RoundAdmissionInput {
-            round: self.round,
-            round_ceiling: self.limits.round_ceiling,
-            window_round_limit: self.limits.window_round_limit,
+    pub(crate) fn admit(&self) -> ModelStepAdmission {
+        admit_next_model_step(&ModelStepAdmissionInput {
+            model_steps: self.model_steps,
+            model_step_ceiling: self.limits.model_step_ceiling,
+            model_step_window_limit: self.limits.model_step_window_limit,
             model_tokens_spent: self.model_tokens_spent(),
             max_model_tokens: self.limits.max_model_tokens,
             cost_spent_micros: self.cost_spent_micros(),
@@ -225,8 +232,8 @@ impl LoopContext {
         })
     }
 
-    pub(crate) fn advance_round(&mut self) {
-        self.round = self.round.saturating_add(1);
+    pub(crate) fn advance_model_step(&mut self) {
+        self.model_steps = self.model_steps.saturating_add(1);
     }
 
     pub(crate) fn note_text(&mut self, text: &str) {
@@ -235,21 +242,26 @@ impl LoopContext {
         }
     }
 
-    pub(crate) fn stop(&self, reason: StopReason, rounds: u32, messages: Vec<Message>) -> LoopStop {
+    pub(crate) fn stop(
+        &self,
+        reason: StopReason,
+        model_steps: u32,
+        messages: Vec<Message>,
+    ) -> LoopStop {
         LoopStop {
             reason,
-            rounds,
+            model_steps,
             last_text: self.last_text.clone(),
             messages,
         }
     }
 }
 
-/// The seams the loop calls, in round order:
+/// The seams the loop calls, in model-step order:
 ///
 /// 1. [`on_round_start`](Self::on_round_start) — before the loop decides
-///    whether another round may start.
-/// 2. [`on_round_admitted`](Self::on_round_admitted) — a round will start;
+///    whether another model step may start.
+/// 2. [`on_round_admitted`](Self::on_round_admitted) — a model step will start;
 ///    last chance to shape the transcript before the request is built.
 /// 3. [`tool_definitions`](Self::tool_definitions) — what the request
 ///    advertises.
@@ -293,7 +305,7 @@ pub trait AgentHarness: Send {
         Ok(Flow::Continue)
     }
 
-    /// A round was admitted and the counter advanced; the request is built
+    /// A model step was admitted and the counter advanced; the request is built
     /// from `messages` when this returns.
     async fn on_round_admitted(
         &mut self,
@@ -303,8 +315,9 @@ pub trait AgentHarness: Send {
         Ok(Flow::Continue)
     }
 
-    /// The model round failed after the loop's own retries. `Continue` or
-    /// `NextRound` re-runs the round with whatever the harness appended;
+    /// The model call behind this model step failed after the loop's own
+    /// retries. `Continue` or `NextRound` re-runs the round with whatever the
+    /// harness appended;
     /// `Stop` ends the run. Default: the error aborts the run.
     async fn on_model_error(
         &mut self,
@@ -321,6 +334,8 @@ pub trait AgentHarness: Send {
     /// harness has appended what it wants instead). The default treats a
     /// truncated, filtered, unknown, or tool-less `tool_calls` finish as a
     /// model error.
+    /// `round` is the completed request's result — the request half of the
+    /// model step: assistant message, usage, finish reason, retry count.
     async fn on_response(
         &mut self,
         _ctx: &mut LoopContext,
@@ -367,7 +382,7 @@ pub trait AgentHarness: Send {
 
     /// The response carried tool calls. The assistant message is already in
     /// `messages`; the harness runs the calls and appends their results in
-    /// call order. `Continue` and `NextRound` both start the next round.
+    /// call order. `Continue` and `NextRound` both start the next model step.
     async fn execute_calls(
         &mut self,
         ctx: &mut LoopContext,
@@ -449,17 +464,17 @@ impl<T: ToolRuntime> AgentHarness for BasicHarness<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::limits::RoundLimits;
+    use crate::limits::ModelStepLimits;
 
     /// The soft deadline is a request, never a stop. It raises the flag while
     /// the run keeps its full hard bound, so the harness can ask the model to
     /// synthesize before the hard timer cancels anything.
     #[tokio::test(start_paused = true)]
     async fn the_soft_deadline_requests_finalization_without_stopping() {
-        let limits = RoundLimits {
+        let limits = ModelStepLimits {
             max_duration: Some(Duration::from_secs(600)),
             finalize_at: Some(Duration::from_secs(300)),
-            ..RoundLimits::default()
+            ..ModelStepLimits::default()
         };
         let ctx = LoopContext::new(limits, CancellationToken::new());
         assert!(!ctx.finalization_requested());
@@ -485,10 +500,10 @@ mod tests {
     /// deadline can never extend a run.
     #[tokio::test(start_paused = true)]
     async fn a_finalization_point_past_the_hard_bound_is_ignored() {
-        let limits = RoundLimits {
+        let limits = ModelStepLimits {
             max_duration: Some(Duration::from_secs(60)),
             finalize_at: Some(Duration::from_secs(120)),
-            ..RoundLimits::default()
+            ..ModelStepLimits::default()
         };
         let ctx = LoopContext::new(limits, CancellationToken::new());
         tokio::time::sleep(Duration::from_secs(61)).await;
@@ -500,14 +515,14 @@ mod tests {
     /// already used most of its budget is asked to finalize immediately.
     #[tokio::test(start_paused = true)]
     async fn prior_spend_is_measured_into_the_soft_deadline() {
-        let limits = RoundLimits {
+        let limits = ModelStepLimits {
             max_duration: Some(Duration::from_secs(600)),
             finalize_at: Some(Duration::from_secs(300)),
             spent_before: crate::limits::SpentBefore {
                 duration: Duration::from_secs(400),
                 ..crate::limits::SpentBefore::default()
             },
-            ..RoundLimits::default()
+            ..ModelStepLimits::default()
         };
         let ctx = LoopContext::new(limits, CancellationToken::new());
         tokio::time::sleep(Duration::from_millis(1)).await;

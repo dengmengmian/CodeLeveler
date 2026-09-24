@@ -123,6 +123,11 @@ pub struct UiSessionObservation {
     /// cache miss nobody observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
+    /// Reasoning tokens summed over the requests that reported a breakdown —
+    /// a SUBSET of `output_tokens`, never an addition to it. `None` when no
+    /// request reported one, which is an absence of measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     /// Summed over the requests that carry a price. `None` when none does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
@@ -142,6 +147,8 @@ pub struct UiLaneAccounting {
     pub output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
 }
@@ -164,6 +171,10 @@ pub struct UiRequestObservation {
     pub retry_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
+    /// Subset of `output_tokens` spent on reasoning, when the provider
+    /// reported a breakdown. `None` = not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
     /// The sub-agent that made the call; absent for the root session's own.

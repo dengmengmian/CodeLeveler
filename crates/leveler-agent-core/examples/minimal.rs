@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent_core::{
-    Agent, AgentEvent, BasicHarness, RoundLimits, ToolOutcome, ToolRuntime, ToolRuntimeError,
+    Agent, AgentEvent, BasicHarness, ModelStepLimits, ToolOutcome, ToolRuntime, ToolRuntimeError,
 };
 use leveler_core::{RequestId, ToolCallId};
 use leveler_model::{
@@ -35,6 +35,7 @@ impl ScriptedModel {
             input_tokens: 120 + u64::from(turn) * 40,
             output_tokens: 20,
             cached_input_tokens: 0,
+            reasoning_tokens: Some(12),
         };
         let (content, finish_reason) = match turn {
             0 => (
@@ -190,9 +191,9 @@ async fn main() {
         }),
         ModelRef::new("scripted", "demo"),
     )
-    .with_limits(RoundLimits {
-        window_round_limit: Some(8),
-        ..RoundLimits::default()
+    .with_limits(ModelStepLimits {
+        model_step_window_limit: Some(8),
+        ..ModelStepLimits::default()
     });
 
     let mut harness = BasicHarness::new(DemoTools).with_events(|event| match event {
@@ -244,7 +245,7 @@ async fn main() {
 
     println!();
     println!("stop reason: {:?}", stop.reason);
-    println!("rounds: {}", stop.rounds);
+    println!("model steps: {}", stop.model_steps);
     println!("transcript: {} message(s)", stop.messages.len());
     println!("final answer: {}", stop.last_text);
 }

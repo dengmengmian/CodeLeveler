@@ -479,20 +479,20 @@ Red 必须有意义。
 
 先运行目标测试。
 
-通过后逐级扩大验证范围。
-
-推荐：
+通过后按改动范围逐级扩大，直到覆盖本轮修改，然后停止：
 
 ```text
 targeted test
-→ module/package/crate
-→ affected integration tests
-→ project-defined gate
+→ affected package / crate
+→ affected runtime slice（仅当改动跨边界）
+→ STOP
 ```
+
+项目 gate（workspace check / clippy / full test / release build）不是普通开发循环的默认下一步，只在 commit / PR / release 或用户明确要求时执行。完整规则见 §一.10。
 
 不要机械地为每一个小改动运行成本巨大的完整 dogfood。
 
-验证范围应与改动风险匹配。
+验证范围应与改动风险匹配，并且一旦获得足够确定性就停止。
 
 ---
 
@@ -1095,28 +1095,140 @@ getUser()
 
 ## 10. 验证策略
 
-验证必须与风险匹配。
+验证必须与风险匹配，并且默认只做“本轮改动所需的最小可信验证”。
 
-推荐从小到大：
-
-```text
-最小复现
-→ targeted test
-→ module/package/crate test
-→ integration test
-→ static analysis
-→ project gate
-→ runtime acceptance
-→ dogfood
-```
-
-项目已有 gate 时，以项目定义为准。
-
-不要自己发明额外 gate。
+本节是开发验证策略的唯一权威；其他章节只引用，不重复定义。
 
 ---
 
-### 10.1 验证必须回答目标
+### 10.1 默认：Minimum Sufficient Verification
+
+普通开发循环是：
+
+```text
+Edit
+→ 判定受影响范围
+→ 执行最小充分验证
+→ PASS
+→ STOP
+```
+
+不是：
+
+```text
+Edit
+→ 不断扩大测试范围
+→ workspace
+→ release build
+→ full gate
+```
+
+验证范围必须与本轮实际修改范围匹配。只改了 `crates/<crate>/src/<file>.rs`，就不应该顺带验证整个 workspace。
+
+---
+
+### 10.2 默认验证顺序
+
+普通代码修改默认按以下级别收窄，达到足以覆盖本轮修改的级别即可停止：
+
+| 级别 | 何时使用 | 命令形态 |
+| --- | --- | --- |
+| L0 Compile / type check | 任何代码改动 | `cargo check -p <affected-package>` |
+| L1 Targeted test | 直接覆盖本轮行为的最小测试 | `cargo test -p <package> --lib <filter>` 或 `cargo test -p <package> --test <target> <filter>` |
+| L2 Affected crate | targeted test 不足以覆盖 | `cargo test -p <package>`（必要时收窄到 `--lib` / `--test <target>`） |
+| L3 Runtime slice | 改动真正跨边界 | 只跑与该边界相关的包 / 测试 |
+
+优先使用 `package + target + test filter` 三层收窄。
+
+不要默认：
+
+```bash
+cargo check --workspace --all-features
+```
+
+---
+
+### 10.3 普通开发阶段禁止自动运行
+
+除非本轮任务本身明确需要，或用户明确要求，普通开发验证禁止主动运行：
+
+```bash
+cargo test --workspace
+cargo test --workspace --all-features
+cargo check --workspace --all-features
+cargo clippy --workspace --all-targets --all-features
+cargo build --release
+```
+
+同样禁止：
+
+- 与本轮修改无直接关系的 crate tests；
+- 大型 crate 的所有 integration test binaries；
+- 为了“更放心”而额外执行的 full test suite；
+- release-grade gate、eval、dogfood。
+
+尤其：`cargo build --release` 不得作为普通开发任务的例行验证步骤。
+
+---
+
+### 10.4 Verification Escalation Rule
+
+验证只能基于明确技术原因逐级扩大。
+
+允许升级的典型情况：
+
+```text
+targeted test 不足以覆盖修改
+→ affected crate
+
+修改跨 crate contract
+→ runtime slice
+
+修改 Cargo feature / workspace dependency / build config
+→ 可以扩大 compile/check 范围
+
+用户明确要求 full gate / PR gate / release validation
+→ full deterministic gate
+```
+
+禁止因为以下原因升级：
+
+```text
+“为了保险”
+“为了增加信心”
+“既然已经跑了一部分”
+“顺便跑一下”
+“还有时间”
+“想确保整个项目没问题”
+```
+
+这些都不是扩大验证范围的充分理由。
+
+---
+
+### 10.5 Verification Stop Rule
+
+当本轮所需的最低验证级别全部 PASS 后，立即停止验证。
+
+不要在已经获得足够确定性后继续扩大测试范围。PASS 后停止，是正确行为。
+
+---
+
+### 10.6 Development / Gate / Release
+
+| 阶段 | 目标 | 包含 |
+| --- | --- | --- |
+| Development | 最小可信反馈，尽可能快 | L0–L3 中足以覆盖本轮修改的最小集合 |
+| Gate | commit / PR / 明确要求完整 deterministic verification | `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、workspace check、deterministic tests |
+| Release | release / RC 阶段 | release build、full deterministic gate、eval、TUI verification、dogfood、性能 / completion-rate 检查 |
+
+Gate 不是每轮开发的默认动作。Release 只在 release / RC 阶段执行。
+
+项目已有 gate 时，以项目定义为准，但“gate 的定义”不等于“普通开发循环的默认下一步”。不要自己发明额外 gate。
+
+---
+
+### 10.7 验证必须回答目标
 
 不要因为运行了很多测试就认为验证充分。
 
@@ -1146,7 +1258,7 @@ kill 后真实不存在
 
 ---
 
-### 10.2 失败不能模糊化
+### 10.8 失败不能模糊化
 
 如果验证失败：
 
@@ -1162,6 +1274,27 @@ kill 后真实不存在
 不要全部写成：
 
 > test failed。
+
+---
+
+### 10.9 汇报要求
+
+普通开发任务完成时，明确报告：
+
+```text
+Changed:
+- 本轮修改内容
+
+Verification:
+- 实际执行了哪些 check/test
+- 为什么这些验证足以覆盖本轮修改
+
+Not run:
+- 哪些更重的 gate 没有运行
+- 如需执行，可在 commit / PR / release 阶段运行
+```
+
+不要把“没有跑 full gate”描述成缺陷。对于普通开发任务，只完成 minimum sufficient verification 是预期行为。
 
 ---
 
@@ -1327,6 +1460,7 @@ Authority decides.
 - 测试是否真的证明目标？
 - 是否只是“测试绿”但 property 没被验证？
 - 是否漏掉关键 runtime evidence？
+- 是否在最低验证级别 PASS 后继续扩大验证范围？（PASS 后应停止）
 
 ### Hygiene
 
@@ -2039,13 +2173,17 @@ Authority
 
 ## 10. 测试与验证
 
-Canonical 验证命令：
+普通开发阶段的验证策略（Minimum Sufficient Verification、默认验证顺序、升级规则、停止规则、Development / Gate / Release 区分）以 **§一.10 验证策略** 为唯一权威，本节不重复定义。
+
+以下命令是本仓库的 **Gate / Release** 命令，不是普通开发任务每轮默认执行的验证：
 
 ```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
+
+普通开发优先使用 `.cargo/config.toml` 中的窄范围 alias，或直接 `cargo check -p <package>` / `cargo test -p <package> --lib <filter>`。
 
 基本要求：
 

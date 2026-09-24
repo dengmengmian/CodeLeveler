@@ -62,7 +62,7 @@ async fn interrupt_turns_owned(
             turn_id: turn_id.clone(),
             outcome: TurnOutcome::Interrupted,
             stop_reason: "unclean process exit".to_string(),
-            rounds: 0,
+            model_steps: 0,
             modified_files: Vec::new(),
         };
         let (event_type, payload) = event.to_row()?;

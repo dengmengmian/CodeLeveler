@@ -54,9 +54,16 @@ pub struct ProgressLedger {
     pub closing: bool,
     pub phase: TurnPhase,
     pub objective_version: u32,
-    /// Rounds spent across continues/resumes of this task epoch (absolute).
-    #[serde(default)]
-    pub cumulative_rounds: u32,
+    /// Model steps spent across continues/resumes of this task epoch
+    /// (absolute).
+    ///
+    /// Mechanical accounting, not a progress measure: it counts admitted
+    /// model steps, including the ones a provider repair or a closeout nudge
+    /// consumed. The wire/durable key stays `cumulative_rounds` so persisted
+    /// `progress_updated` payloads and client projections keep decoding; the
+    /// Rust-side name is the accurate one.
+    #[serde(rename = "cumulative_rounds", default)]
+    pub cumulative_model_steps: u32,
     /// Model tokens spent across continues/resumes of this task epoch.
     ///
     /// This is the number a token budget admits on. It is the durable
@@ -140,11 +147,11 @@ impl ProgressLedger {
 
     /// Fold one finished drive's rounds into the epoch totals.
     ///
-    /// Rounds only. Spend has exactly one way in — [`Self::absorb_request_spend`],
+    /// Model steps only. Spend has exactly one way in — [`Self::absorb_request_spend`],
     /// fed by the finalized records — and a second writer for tokens is how the
     /// runtime came to hold a number the bill could not account for.
-    pub fn accumulate_drive_rounds(&mut self, rounds: u32) {
-        self.cumulative_rounds = self.cumulative_rounds.saturating_add(rounds);
+    pub fn accumulate_drive_model_steps(&mut self, model_steps: u32) {
+        self.cumulative_model_steps = self.cumulative_model_steps.saturating_add(model_steps);
     }
 
     /// Absolute epoch spend snapshot (used when a drive ends or is mid-flight).
@@ -154,7 +161,7 @@ impl ProgressLedger {
     #[allow(clippy::too_many_arguments)]
     pub fn set_epoch_spend(
         &mut self,
-        rounds: u32,
+        model_steps: u32,
         model_tokens: u64,
         estimated_model_tokens: u64,
         commands: u32,
@@ -162,7 +169,7 @@ impl ProgressLedger {
         duration_ms: u64,
         modified_files: u32,
     ) {
-        self.cumulative_rounds = rounds;
+        self.cumulative_model_steps = model_steps;
         self.cumulative_model_tokens = model_tokens;
         self.cumulative_estimated_model_tokens = estimated_model_tokens;
         self.cumulative_commands = commands;
@@ -203,9 +210,9 @@ impl ProgressLedger {
     /// its rounds, while its rows also carry the folds and advisory calls it
     /// made. Spend has one path in, and it is the record.
     pub fn absorb_child_work(&mut self, child: &ProgressLedger) {
-        self.cumulative_rounds = self
-            .cumulative_rounds
-            .saturating_add(child.cumulative_rounds);
+        self.cumulative_model_steps = self
+            .cumulative_model_steps
+            .saturating_add(child.cumulative_model_steps);
         self.cumulative_commands = self
             .cumulative_commands
             .saturating_add(child.cumulative_commands);
@@ -343,10 +350,10 @@ mod tests {
         assert!(!led.is_terminal_for_inheritance());
         led.enter_closing();
         assert!(led.is_terminal_for_inheritance());
-        led.accumulate_drive_rounds(5);
-        assert_eq!(led.cumulative_rounds, 5);
-        led.accumulate_drive_rounds(3);
-        assert_eq!(led.cumulative_rounds, 8);
+        led.accumulate_drive_model_steps(5);
+        assert_eq!(led.cumulative_model_steps, 5);
+        led.accumulate_drive_model_steps(3);
+        assert_eq!(led.cumulative_model_steps, 8);
         led.enter_closed();
         assert!(led.is_terminal_for_inheritance());
         assert_eq!(led.phase, TurnPhase::Closed);
@@ -378,7 +385,7 @@ mod tests {
         child.merge_modified_paths(["b.rs", "c.rs"]);
         parent.absorb_child_work(&child);
         assert_eq!(parent.cumulative_commands, 3);
-        assert_eq!(parent.cumulative_rounds, 2);
+        assert_eq!(parent.cumulative_model_steps, 2);
         // Spend does NOT ride the child's ledger: its records carry it, and
         // folding both would bill every delegated token twice.
         assert_eq!(parent.cumulative_model_tokens, 0);

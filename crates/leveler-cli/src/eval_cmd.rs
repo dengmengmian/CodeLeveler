@@ -902,7 +902,9 @@ async fn run_bare_case(
             (
                 Some(session_id),
                 report.outcome.is_completed(),
-                report.rounds,
+                // Eval artifacts keep their own `rounds` field name; the product
+                // struct it reads from now names it for what it is.
+                report.model_steps,
                 format!("{:?}", report.outcome),
                 termination,
                 None,
@@ -1073,6 +1075,7 @@ async fn run_eval_case(
         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         input_tokens: 0,
         output_tokens: 0,
+        reasoning_tokens: None,
         cost_usd_micros: None,
         failure_category: Some(failure_category),
         failure_source: Some(leveler_eval::FailureSource::Auto),
@@ -1295,7 +1298,7 @@ async fn run_eval_case(
                             (
                                 Some(session_id),
                                 completed,
-                                o.rounds,
+                                o.model_steps,
                                 format!("{:?}", o.stop_reason),
                                 termination,
                                 None,
@@ -1327,28 +1330,37 @@ async fn run_eval_case(
     // requests. `rounds` is 0 on the error paths above (the outcome that carries
     // it never came back), so fall back to the request count — otherwise a failed
     // run reports zero effort, which is simply false.
-    let (input_tokens, output_tokens, observed_rounds) = if let Some(session_id) = &session_id {
-        match app.open_database().await {
-            Ok(db) => leveler_storage::ModelRequestRepository::new(&db)
-                .load_for_session(session_id)
-                .await
-                .map(|records| {
-                    let requests = records.len() as u32;
-                    let (input, output) =
-                        records.into_iter().fold((0u64, 0u64), |total, record| {
+    let (input_tokens, output_tokens, reasoning_tokens, observed_rounds) =
+        if let Some(session_id) = &session_id {
+            match app.open_database().await {
+                Ok(db) => leveler_storage::ModelRequestRepository::new(&db)
+                    .load_for_session(session_id)
+                    .await
+                    .map(|records| {
+                        let requests = records.len() as u32;
+                        let (input, output) = records.iter().fold((0u64, 0u64), |total, record| {
                             (
                                 total.0.saturating_add(record.input_tokens),
                                 total.1.saturating_add(record.output_tokens),
                             )
                         });
-                    (input, output, requests)
-                })
-                .unwrap_or_default(),
-            Err(_) => (0, 0, 0),
-        }
-    } else {
-        (0, 0, 0)
-    };
+                        // `None` unless every request reported a breakdown: a
+                        // partial sum would understate the case's reasoning and
+                        // silently overstate its visible output.
+                        let reasoning = records
+                            .iter()
+                            .map(|record| record.reasoning_tokens)
+                            .try_fold(0u64, |total, value| {
+                                value.map(|value| total.saturating_add(value))
+                            });
+                        (input, output, reasoning, requests)
+                    })
+                    .unwrap_or_default(),
+                Err(_) => (0, 0, None, 0),
+            }
+        } else {
+            (0, 0, None, 0)
+        };
 
     let rounds = if rounds > 0 { rounds } else { observed_rounds };
 
@@ -1409,6 +1421,7 @@ async fn run_eval_case(
         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         input_tokens,
         output_tokens,
+        reasoning_tokens,
         cost_usd_micros,
         failure_category: leveler_eval::attribute_failure(
             completed,

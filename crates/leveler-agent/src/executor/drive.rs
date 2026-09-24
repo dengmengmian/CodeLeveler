@@ -49,7 +49,7 @@ use leveler_context::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 
 use leveler_agent_core::{
     Agent, AgentCoreError, AgentHarness, BudgetDimension, BudgetExhaustion, Flow, LoopContext,
-    LoopStop, ModelRound, RoundLimits, SpentBefore, StopReason as KernelStop,
+    LoopStop, ModelRound, ModelStepLimits, SpentBefore, StopReason as KernelStop,
 };
 use leveler_lifecycle::ProgressLedger;
 use leveler_model::ToolDefinition;
@@ -143,17 +143,18 @@ pub(crate) struct Drive<'a> {
     /// The tool table every request advertises.
     tools: Vec<ToolDefinition>,
     modified_files: Vec<String>,
-    /// Model rounds this drive has started. Reported on abort so an
-    /// interrupted/failed turn records what it actually spent.
-    rounds: u32,
+    /// Model steps this drive has started. Reported on abort so an
+    /// interrupted/failed turn records what it actually spent. A mechanical
+    /// count of the agent's request cadence, never a task-progress measure.
+    model_steps: u32,
     scoped_paths: Vec<String>,
     progress_caps: ProgressCaps,
     progress: ProgressLedger,
-    epoch_rounds_at_start: u32,
+    epoch_model_steps_at_start: u32,
     epoch_tokens_at_start: u64,
     epoch_estimated_at_start: u64,
     epoch_duration_at_start: std::time::Duration,
-    budget_note_sent: bool,
+    model_step_note_sent: bool,
     /// Set after the one deterministic goal-mode reminder that turns an
     /// initial read-only investigation into delivery work.
     delivery_convergence_nudged: bool,
@@ -195,7 +196,7 @@ pub(crate) struct Drive<'a> {
     budget_exceeded: Option<(String, BudgetExhaustion)>,
     /// Provider-reported total for the round just finished, which the
     /// compaction threshold prefers over its own estimate.
-    last_round_usage_total: u64,
+    last_model_call_usage_total: u64,
     /// Shared record of the most recent compaction fold. Written here when the
     /// harness folds; read by the kernel when it builds the accounting
     /// snapshot. One handle, two views of the same fact.
@@ -331,17 +332,17 @@ impl Executor {
             sink,
             tools,
             modified_files: Vec::new(),
-            rounds: 0,
+            model_steps: 0,
             scoped_paths: Vec::new(),
             progress_caps: ProgressCaps::default(),
-            epoch_rounds_at_start: progress.cumulative_rounds,
+            epoch_model_steps_at_start: progress.cumulative_model_steps,
             epoch_tokens_at_start: progress.cumulative_model_tokens,
             epoch_estimated_at_start: progress.cumulative_estimated_model_tokens,
             epoch_duration_at_start: std::time::Duration::from_millis(
                 progress.cumulative_duration_ms,
             ),
             commands_run: progress.cumulative_commands,
-            budget_note_sent: false,
+            model_step_note_sent: false,
             delivery_convergence_nudged: false,
             plan_state: self.seeded_plan.clone(),
             plan_needs_reconciliation: false,
@@ -370,7 +371,7 @@ impl Executor {
             length_continuations: 0,
             continued_text: String::new(),
             budget_exceeded: None,
-            last_round_usage_total: 0,
+            last_model_call_usage_total: 0,
             compaction: compaction_record.clone(),
             progress,
             objective,
@@ -387,20 +388,28 @@ impl Executor {
         }
 
         // Hard step limits (spec §27) as the kernel enforces them: the epoch's
-        // prior spend is what makes them task-level rather than per-drive.
-        // Rounds stop a run only where a caller asked for it: an explicit
-        // `StepLimits.max_rounds` ceiling, or a bounded window (an eval case,
-        // an orchestration node, `leveler run --max-rounds N`), whose N is
-        // itself the hard edge. No hidden count sits under that window — a
-        // 100-round default used to cap every larger window silently. A
-        // top-level `UntilTerminal` turn gets no round count at all: a round is
-        // a property of the model's tool cadence, not of the user's task, so
-        // such a turn ends on a semantic terminal state or a real mechanical
-        // guard (cancellation, the token/cost/duration budgets, the
-        // no-progress watchdog).
-        let limits = RoundLimits {
-            round_ceiling: self.step_limits.max_rounds,
-            window_round_limit: self.continuation.round_limit(),
+        // prior spend is what makes the resource limits task-level rather than
+        // per-drive.
+        //
+        // A model-step count bounds a run in exactly two shapes, and neither is
+        // a task budget:
+        //
+        // - `StepLimits.max_model_steps` is the SAFETY CEILING: the circuit
+        //   breaker that stops a runaway model↔tool loop. The host pins it far
+        //   outside the normal operating range (`leveler run` defaults it to
+        //   `DEFAULT_MODEL_STEP_CEILING`).
+        // - `model_step_window_limit` is a deliberately BOUNDED UNIT OF WORK the
+        //   host owns — an eval case, a delegated agent's manifest budget. Its N
+        //   is the hard edge of that unit.
+        //
+        // No hidden count sits under either. A top-level `UntilTerminal` turn
+        // with neither ends on a semantic terminal state or a real resource
+        // guard (cancellation, the token/cost/duration budgets, the no-progress
+        // watchdog). A step count is a property of the model's tool cadence, not
+        // of the user's task, so it can never be what decides a task is over.
+        let limits = ModelStepLimits {
+            model_step_ceiling: self.step_limits.max_model_steps,
+            model_step_window_limit: self.continuation.model_step_window_limit(),
             max_model_tokens: self.step_limits.max_model_tokens,
             max_cost_usd_micros: self.step_limits.max_cost_usd_micros,
             max_duration: self.step_limits.max_duration,
@@ -433,7 +442,7 @@ impl Executor {
         // An abort still leaves the loop's proven facts behind: the rounds it
         // started and the files it confirmed it changed. Report them so a
         // failed/interrupted turn never claims it did nothing.
-        aborted.rounds = harness.rounds;
+        aborted.model_steps = harness.model_steps;
         aborted.modified_files = harness.modified_files.clone();
         result.map_err(|error| DriveAborted {
             error,
@@ -455,6 +464,11 @@ impl<'a> Drive<'a> {
                 input_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
                 output_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
                 cached_input_tokens: usage.cached_input_tokens.min(u32::MAX as u64) as u32,
+                // `None` stays `None`: an unreported breakdown must not become
+                // a measured zero on its way to a client.
+                reasoning_tokens: usage
+                    .reasoning_tokens
+                    .map(|value| value.min(u32::MAX as u64) as u32),
             },
             Kernel::ContextUsage(accounting) => AgentEvent::ContextUsage { accounting },
             Kernel::ModelRetrying {
@@ -513,10 +527,10 @@ impl<'a> Drive<'a> {
     fn flush_epoch(&mut self, rt: &LoopContext) {
         sync_epoch_progress(
             &mut self.progress,
-            self.epoch_rounds_at_start,
+            self.epoch_model_steps_at_start,
             self.epoch_duration_at_start,
             rt.run_started(),
-            rt.round(),
+            rt.model_steps(),
             rt.model_tokens_spent(),
             self.epoch_estimated_at_start
                 .saturating_add(rt.usage().estimated_model_tokens),
@@ -914,7 +928,7 @@ impl<'a> Drive<'a> {
         self.settle_finalization_dependencies(rt, messages).await?;
         Ok(AgentOutcome::drive_result(
             final_text,
-            rt.round(),
+            rt.model_steps(),
             self.modified_files.clone(),
             stop,
             Some(detail.to_string()),
@@ -951,7 +965,14 @@ impl AgentHarness for Drive<'_> {
             .collect();
         let limits = rt.limits();
         let state = serde_json::json!({
-            "rounds_completed": self.epoch_rounds_at_start.saturating_add(rt.round().saturating_sub(1)),
+            // Mechanical counts of the agent's own request cadence. Neither is
+            // a measure of task progress, and the runtime never reads them as
+            // one: a step consumed by a provider repair or a closeout nudge is
+            // still a step.
+            "model_steps_completed": rt.model_steps().saturating_sub(1),
+            "task_model_steps_completed": self.epoch_model_steps_at_start
+                .saturating_add(rt.model_steps().saturating_sub(1)),
+            "model_step_ceiling": limits.model_step_ceiling,
             "elapsed_ms": rt.elapsed().as_millis().min(u64::MAX as u128) as u64,
             "duration_limit_ms": limits.max_duration.map(|v| v.as_millis().min(u64::MAX as u128) as u64),
             "model_tokens": {
@@ -1018,8 +1039,8 @@ impl AgentHarness for Drive<'_> {
         rt: &mut LoopContext,
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
-        let round = rt.round();
-        self.rounds = round;
+        let model_steps = rt.model_steps();
+        self.model_steps = model_steps;
         let _ = rt;
         // Nested AGENTS.md rules for directories touched so far. Appended at
         // the tail rather than folded into the system prompt: rewriting the
@@ -1067,21 +1088,24 @@ impl AgentHarness for Drive<'_> {
             }
         }
 
-        // A pinned task budget is the model's to spend: at 80% it is told
-        // where it stands, once. `epoch_rounds_at_start + round_limit` is
-        // the task total the engine clamped this window to.
+        // Once the model-step safety ceiling is nearly reached, the model is
+        // told so, once — against THIS drive's counter and ceiling, so the
+        // number it reads is the bound that actually applies to it. Resumes
+        // re-pin the ceiling per drive, so an epoch-relative total would
+        // understate what is left.
+        //
+        // This is a mechanical fact about the run, not a task budget: it does
+        // not ask the model to hurry up, and it is not a signal that the task
+        // is nearly done.
         if self.executor.depth == 0
-            && let Some(remaining) = self.executor.continuation.round_limit()
-            && let Some(note) = budget_note(
-                self.epoch_rounds_at_start.saturating_add(round),
-                self.epoch_rounds_at_start.saturating_add(remaining),
-                self.budget_note_sent,
-            )
+            && let Some(ceiling) = self.executor.step_limits.max_model_steps
+            && let Some(note) =
+                model_step_note(rt.model_steps(), ceiling, self.model_step_note_sent)
         {
             let note = Message::text(Role::User, note);
             self.sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
-            self.budget_note_sent = true;
+            self.model_step_note_sent = true;
         }
         Ok(Flow::Continue)
     }
@@ -1124,9 +1148,9 @@ impl AgentHarness for Drive<'_> {
         round_result: &ModelRound,
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
-        let round = rt.round();
+        let model_steps = rt.model_steps();
         let cancellation = rt.cancellation().clone();
-        let has_next_round = rt.has_next_round();
+        let has_next_model_step = rt.has_next_model_step();
         // Priced once, by the kernel, against the usage the provider reported
         // — cached share included, because charging every input token at the
         // uncached rate overstated a session's cost by roughly 4x at a 90% hit
@@ -1159,7 +1183,7 @@ impl AgentHarness for Drive<'_> {
         {
             self.budget_exceeded = Some((
                 format!(
-                    "Stopped: the {max}-micro-USD model cost budget was exhausted after {round} round(s)."
+                    "Stopped: the {max}-micro-USD model cost budget was exhausted after {model_steps} model step(s)."
                 ),
                 BudgetExhaustion::new(BudgetDimension::Cost, rt.cost_spent_micros(), max),
             ));
@@ -1170,7 +1194,7 @@ impl AgentHarness for Drive<'_> {
         self.flush_epoch(rt);
 
         self.decode_retries = 0;
-        self.last_round_usage_total = round_result.usage.total();
+        self.last_model_call_usage_total = round_result.usage.total();
         let assistant = round_result.message.clone();
         let text = assistant.text_content();
         let calls = round_result.tool_calls();
@@ -1184,7 +1208,7 @@ impl AgentHarness for Drive<'_> {
                     // chance text truncation gets — nudge for a smaller
                     // re-issue instead of killing the whole turn.
                     if self.length_continuations >= MAX_LENGTH_CONTINUATIONS
-                        || !has_next_round
+                        || !has_next_model_step
                         || cancellation.is_cancelled()
                     {
                         return Err(AgentError::Model(ModelError::new(
@@ -1205,7 +1229,7 @@ impl AgentHarness for Drive<'_> {
                 }
                 if text.trim().is_empty()
                     || self.length_continuations >= MAX_LENGTH_CONTINUATIONS
-                    || !has_next_round
+                    || !has_next_model_step
                 {
                     return Err(AgentError::Model(ModelError::new(
                         leveler_model::ModelErrorKind::Truncated,
@@ -1241,7 +1265,7 @@ impl AgentHarness for Drive<'_> {
                 // not a model mistake: bounded feedback retry, same budget
                 // as parameter-level decode failures.
                 if self.decode_retries < MAX_DECODE_RETRIES
-                    && has_next_round
+                    && has_next_model_step
                     && !cancellation.is_cancelled()
                 {
                     self.decode_retries += 1;
@@ -1289,10 +1313,10 @@ impl AgentHarness for Drive<'_> {
         assistant: Message,
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
-        let round = rt.round();
+        let model_steps = rt.model_steps();
         let cancellation = rt.cancellation().clone();
-        let has_next_round = rt.has_next_round();
-        // Cost tip-over after this response with no tools: end now (no more rounds).
+        let has_next_model_step = rt.has_next_model_step();
+        // Cost tip-over after this response with no tools: end now (no more steps).
         if let Some((reason, exhaustion)) = self.budget_exceeded.take() {
             self.sink.append(&[assistant]).await?;
             (self.observer)(AgentEvent::Finished(reason.clone()));
@@ -1301,7 +1325,7 @@ impl AgentHarness for Drive<'_> {
             self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_budget_exhausted(
                 reason,
-                round,
+                model_steps,
                 self.modified_files.clone(),
                 exhaustion,
                 &self.progress,
@@ -1350,7 +1374,7 @@ impl AgentHarness for Drive<'_> {
                 goal_mode: self.executor.policy.goal_mode,
                 has_final_text,
                 cancelled: cancellation.is_cancelled(),
-                can_continue: has_next_round,
+                can_continue: has_next_model_step,
                 budget_remaining: self.closeout_budget.remaining(),
                 human_boundary_seen: self.progress.human_boundary_seen(),
                 plan_needs_reconciliation: self.plan_needs_reconciliation,
@@ -1359,7 +1383,7 @@ impl AgentHarness for Drive<'_> {
             // another model call is the difference between "the model is
             // slow" and "we added a round" — indistinguishable on screen.
             tracing::info!(
-                round,
+                model_steps,
                 ?action,
                 goal_mode = self.executor.policy.goal_mode,
                 has_final_text,
@@ -1423,7 +1447,7 @@ impl AgentHarness for Drive<'_> {
                 } else if self.executor.policy.goal_mode {
                     // One no-progress tick per stalled drive so Engine
                     // continue_active_goal cannot open unbounded turns.
-                    self.progress.note_no_progress_round(round);
+                    self.progress.note_no_progress_round(model_steps);
                     if self
                         .progress
                         .should_hard_stop_no_progress(self.progress_caps)
@@ -1466,7 +1490,7 @@ impl AgentHarness for Drive<'_> {
             self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_result(
                 self.last_text.clone(),
-                round,
+                model_steps,
                 self.modified_files.clone(),
                 stop_reason,
                 stop_detail,
@@ -1483,9 +1507,9 @@ impl AgentHarness for Drive<'_> {
         calls: Vec<ToolCall>,
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
-        let round = rt.round();
+        let model_steps = rt.model_steps();
         let cancellation = rt.cancellation().clone();
-        let has_next_round = rt.has_next_round();
+        let has_next_model_step = rt.has_next_model_step();
         let model_tokens_spent = rt.model_tokens_spent();
         let cost_spent_micros = rt.cost_spent_micros();
         // Tool results, filled by call index. Parallel-safe read-only tools
@@ -3335,7 +3359,7 @@ impl AgentHarness for Drive<'_> {
         let all_refused =
             !call_snapshot.is_empty() && denied_calls_this_round == call_snapshot.len();
         if all_refused {
-            self.progress.note_no_progress_round(round);
+            self.progress.note_no_progress_round(model_steps);
             (self.observer)(AgentEvent::ProgressUpdated {
                 ledger: self.progress.clone(),
             });
@@ -3349,14 +3373,14 @@ impl AgentHarness for Drive<'_> {
                         rt,
                         messages,
                         StopReason::Incomplete,
-                        "no-progress streak; all-refused rounds short-circuited",
+                        "no-progress streak; all-refused model steps short-circuited",
                         "Stopped: no progress (every attempted action was refused).",
                     )
                     .await?,
                 ));
             }
         } else if !call_snapshot.is_empty() {
-            self.progress.note_progress(round);
+            self.progress.note_progress(model_steps);
         }
 
         // Goal mode: an explicit update_goal this round ends the run now that
@@ -3381,7 +3405,7 @@ impl AgentHarness for Drive<'_> {
             self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_result(
                 final_text,
-                round,
+                model_steps,
                 self.modified_files.clone(),
                 reason,
                 None,
@@ -3399,7 +3423,7 @@ impl AgentHarness for Drive<'_> {
             self.settle_finalization_dependencies(rt, messages).await?;
             return Ok(Flow::Stop(AgentOutcome::drive_budget_exhausted(
                 reason,
-                round,
+                model_steps,
                 self.modified_files.clone(),
                 exhaustion,
                 &self.progress,
@@ -3419,11 +3443,11 @@ impl AgentHarness for Drive<'_> {
             self.sink.append(&[image_message]).await?;
         }
 
-        if has_next_round
+        if has_next_model_step
             && should_inject_delivery_convergence_nudge(
                 self.executor.policy.goal_mode,
                 self.delivery_convergence_nudged,
-                round,
+                model_steps,
                 !self.modified_files.is_empty(),
                 !call_snapshot.is_empty(),
             )
@@ -3444,13 +3468,15 @@ impl AgentHarness for Drive<'_> {
         // gateways don't report streaming usage, and without a fallback
         // compaction would silently never fire. The persisted transcript
         // (sink) is untouched — only what we resend shrinks.
-        let context_tokens = self.last_round_usage_total.max(estimate_tokens(messages));
+        let context_tokens = self
+            .last_model_call_usage_total
+            .max(estimate_tokens(messages));
         // Fold when the last request's estimate crossed the budget. One
         // threshold, one action: the runtime does not read the model's
         // re-reads as evidence that it "deserves" a bigger window.
         let over_budget = self.executor.policy.context_budget > 0
             && context_tokens > u64::from(self.executor.policy.context_budget);
-        if has_next_round && over_budget {
+        if has_next_model_step && over_budget {
             let before = messages.len();
             // Cap the retained working set at half the live budget so a
             // huge recent tool output can't keep the fold over the window;
@@ -3526,7 +3552,7 @@ impl AgentHarness for Drive<'_> {
                     Err(error) => {
                         tracing::warn!(
                             %error,
-                            "goal checkpoint failed; keeping context uncompacted this round"
+                            "goal checkpoint failed; keeping context uncompacted this model step"
                         );
                         fold_permitted = false;
                     }
@@ -3580,7 +3606,7 @@ impl AgentHarness for Drive<'_> {
         // from the transcript, and snapshotting it anyway made the log
         // grow by the whole context every round. `context_trace` (eval
         // measurement) restores the per-round copy on request.
-        if has_next_round && (self.context_diverged || self.executor.policy.context_trace) {
+        if has_next_model_step && (self.context_diverged || self.executor.policy.context_trace) {
             (self.observer)(AgentEvent::ContextSnapshot {
                 messages: messages.clone(),
             });
@@ -3594,7 +3620,7 @@ impl AgentHarness for Drive<'_> {
         rt: &mut LoopContext,
         stop: LoopStop,
     ) -> Result<AgentOutcome, AgentError> {
-        let rounds = stop.rounds;
+        let model_steps = stop.model_steps;
         let mut messages = stop.messages;
         match stop.reason {
             KernelStop::Cancelled => {
@@ -3606,9 +3632,11 @@ impl AgentHarness for Drive<'_> {
             }
             // Unconditional circuit breaker: even a busy loop that evades
             // every progress watchdog terminates here.
-            KernelStop::RoundCeiling { ceiling } => {
-                let reason =
-                    format!("Stopped: reached the {ceiling}-round ceiling for a single turn.");
+            KernelStop::ModelStepCeiling { ceiling } => {
+                let reason = format!(
+                    "Stopped: reached the {ceiling} model-step safety ceiling for a single turn. \
+                     This is a mechanical limit on the run's model/tool loop, not a task budget."
+                );
                 (self.observer)(AgentEvent::Finished(reason.clone()));
                 self.enter_finalization();
                 self.flush_epoch(rt);
@@ -3616,10 +3644,12 @@ impl AgentHarness for Drive<'_> {
                     .await?;
                 Ok(AgentOutcome::drive_result(
                     reason,
-                    rounds,
+                    model_steps,
                     self.modified_files.clone(),
                     StopReason::TurnLimitReached,
-                    Some("round ceiling reached".to_string()),
+                    Some(format!(
+                        "model_step_ceiling={ceiling}; mechanical safety breaker, not a task budget"
+                    )),
                     &self.progress,
                     &self.objective,
                 ))
@@ -3628,15 +3658,15 @@ impl AgentHarness for Drive<'_> {
                 let dimension = exhaustion.dimension;
                 let reason = match dimension {
                     BudgetDimension::Cost => format!(
-                        "Stopped: the {}-micro-USD model cost budget was exhausted after {rounds} round(s).",
+                        "Stopped: the {}-micro-USD model cost budget was exhausted after {model_steps} model step(s).",
                         exhaustion.cap
                     ),
                     BudgetDimension::Duration => format!(
-                        "Stopped: the {}s duration budget was exhausted after {rounds} round(s).",
+                        "Stopped: the {}s duration budget was exhausted after {model_steps} model step(s).",
                         std::time::Duration::from_millis(exhaustion.cap).as_secs_f64()
                     ),
                     _ => format!(
-                        "Stopped: the {}-token model budget was exhausted after {rounds} round(s).",
+                        "Stopped: the {}-token model budget was exhausted after {model_steps} model step(s).",
                         exhaustion.cap
                     ),
                 };
@@ -3647,7 +3677,7 @@ impl AgentHarness for Drive<'_> {
                     .await?;
                 Ok(AgentOutcome::drive_budget_exhausted(
                     reason,
-                    rounds,
+                    model_steps,
                     self.modified_files.clone(),
                     exhaustion,
                     &self.progress,
@@ -3658,12 +3688,17 @@ impl AgentHarness for Drive<'_> {
             // exit, so it drains running background children like every other
             // one, or the abort-on-drop backstop hard-kills them (spend and
             // findings lost).
-            KernelStop::WindowLimit { limit: round_limit } => {
-                // Budget exhausted: never return an empty answer. Surface the
-                // last thing the model said plus how far it got, so the
-                // caller/UI shows real state.
+            KernelStop::ModelStepWindowLimit { limit: round_limit } => {
+                // A host-pinned, deliberately bounded unit of work (an eval
+                // case, a delegated agent's budget) used up its model steps.
+                // Never return an empty answer: surface the last thing the
+                // model said plus how far it got, so the caller/UI shows real
+                // state.
                 let summary = {
-                    let mut s = format!("Reached the {round_limit}-round limit before finishing.");
+                    let mut s = format!(
+                        "Reached the {round_limit}-model-step limit pinned for this bounded unit \
+                         of work before finishing."
+                    );
                     if !self.modified_files.is_empty() {
                         s.push_str(&format!(
                             " Files changed so far: {}.",
@@ -3685,7 +3720,10 @@ impl AgentHarness for Drive<'_> {
                     round_limit,
                     self.modified_files.clone(),
                     StopReason::BudgetExhausted,
-                    None,
+                    Some(format!(
+                        "model_step_window_limit={round_limit}; host-pinned bounded unit of work, \
+                         not a resource budget"
+                    )),
                     &self.progress,
                     &self.objective,
                 ))
@@ -3700,7 +3738,7 @@ impl AgentHarness for Drive<'_> {
                     .await?;
                 Ok(AgentOutcome::drive_result(
                     self.last_text.clone(),
-                    rounds,
+                    model_steps,
                     self.modified_files.clone(),
                     StopReason::Answered,
                     None,
@@ -3946,22 +3984,22 @@ fn projected_epoch_file_count(
     epoch_modified_paths(progress, drive_files).len()
 }
 
-/// Once a pinned task budget is 80% spent, the model is told so, once. The
-/// budget is the model's to spend and it cannot see it otherwise. Tiny budgets
-/// (tests, evals with a handful of rounds) get no note — there is nothing to
-/// pace. A resource fact, not a judgement about the work.
-pub(crate) const BUDGET_NOTE_MIN_TOTAL: u32 = 20;
+/// Once the model-step safety ceiling is 80% reached, the model is told so,
+/// once. Tiny ceilings (tests, evals with a handful of steps) get no note —
+/// there is nothing to state. It reports a mechanical limit of the run, never
+/// a task budget and never a prompt to converge.
+pub(crate) const MODEL_STEP_NOTE_MIN_TOTAL: u32 = 20;
 
-pub(crate) fn budget_note(used: u32, total: u32, already_sent: bool) -> Option<String> {
+pub(crate) fn model_step_note(used: u32, ceiling: u32, already_sent: bool) -> Option<String> {
     if already_sent
-        || total < BUDGET_NOTE_MIN_TOTAL
-        || used.saturating_mul(5) < total.saturating_mul(4)
+        || ceiling < MODEL_STEP_NOTE_MIN_TOTAL
+        || used.saturating_mul(5) < ceiling.saturating_mul(4)
     {
         return None;
     }
     Some(format!(
-        "Budget: {used} of {total} rounds for this task are used. If the goal \
-         cannot be reached in what remains, update_goal(blocked) says so."
+        "Model steps: {used} of {ceiling} used. This is a mechanical safety \
+         ceiling on the run's model/tool loop, not a budget for the task."
     ))
 }
 
@@ -4047,10 +4085,10 @@ fn file_budget_refusal(
 #[allow(clippy::too_many_arguments)]
 fn sync_epoch_progress(
     progress: &mut leveler_lifecycle::ProgressLedger,
-    epoch_rounds_at_start: u32,
+    epoch_model_steps_at_start: u32,
     epoch_duration_at_start: std::time::Duration,
     run_started: std::time::Instant,
-    round: u32,
+    model_steps: u32,
     model_tokens_spent: u64,
     estimated_tokens_spent: u64,
     commands_run: u32,
@@ -4064,7 +4102,7 @@ fn sync_epoch_progress(
     progress.merge_modified_paths(modified_files.iter().cloned());
     let files_total = progress.cumulative_modified_files;
     progress.set_epoch_spend(
-        epoch_rounds_at_start.saturating_add(round),
+        epoch_model_steps_at_start.saturating_add(model_steps),
         model_tokens_spent,
         estimated_tokens_spent,
         commands_run,

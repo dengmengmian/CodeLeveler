@@ -4,6 +4,12 @@
 # workflows. It does not decide task completion. The full suite remains the
 # operator/CI/release gate.
 #
+# This is a Gate / Release contract, not the default per-task verification.
+# Ordinary development uses Minimum Sufficient Verification (AGENTS.md §一.10):
+# check and test the affected package first and stop once the change is covered.
+# Run this contract only for explicit full verification, commit/PR gates, or
+# release.
+#
 # Layer 1 — this contract. Every command here runs confined to the workspace,
 # the per-command scratch and the tool cache: no nested sandbox, no daemon or
 # control-plane socket, no write to the user's home.

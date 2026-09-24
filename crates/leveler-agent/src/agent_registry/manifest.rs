@@ -27,6 +27,11 @@ pub const MAX_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 
 /// Upper bound on a definition's `budget.max_rounds`.
+///
+/// The YAML key keeps its historical spelling; what it counts is **model
+/// steps** — one logical model request (provider retries included) plus the
+/// tool batch it produced. A delegated agent's budget is a deliberately
+/// bounded unit of work, not a task-progress measure.
 pub const MAX_AGENT_ROUNDS: u32 = 1000;
 
 /// The runtime capability class an agent runs under. A class is an existing
@@ -97,6 +102,8 @@ pub struct WorkspaceSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetSpec {
+    /// Model steps this delegated agent may run for. The key spelling is
+    /// unchanged for existing `agent.yaml` files; the unit is a model step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -181,6 +181,7 @@ impl ChatStreamAssembler {
                     input_tokens: usage.prompt_tokens,
                     output_tokens: usage.completion_tokens,
                     cached_input_tokens: usage.cached_input_tokens(),
+                    reasoning_tokens: usage.reasoning_tokens(),
                 },
             });
         }
@@ -469,9 +470,83 @@ mod tests {
                     input_tokens: 12,
                     output_tokens: 3,
                     cached_input_tokens: 0,
+                    reasoning_tokens: None,
                 }
             }]
         );
+    }
+
+    /// The final usage chunk is where a reasoning-capable gateway reports the
+    /// breakdown. It must reach the event with the total completion count
+    /// intact, so later accounting never has to re-derive what was spent.
+    #[test]
+    fn reasoning_tokens_in_the_final_usage_chunk_are_surfaced() {
+        let mut a = ChatStreamAssembler::new();
+        a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {"content": "x"}}]
+        })));
+        let evs = a.on_chunk(chunk(serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1000,
+                "completion_tokens_details": {"reasoning_tokens": 700}
+            }
+        })));
+        let usage = evs
+            .iter()
+            .find_map(|e| match e {
+                ModelEvent::UsageUpdated { usage } => Some(*usage),
+                _ => None,
+            })
+            .expect("final usage chunk must yield a usage event");
+        assert_eq!(usage.output_tokens, 1000);
+        assert_eq!(usage.reasoning_tokens, Some(700));
+        assert_eq!(usage.visible_output_tokens(), Some(300));
+        // Exactly one usage event: the assembler must not also emit a second,
+        // reasoning-less one from the finish path.
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, ModelEvent::UsageUpdated { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// Several usage chunks are not summed by the assembler: each chunk is its
+    /// own report of that moment's totals, and the consumer replaces rather
+    /// than accumulates. Whatever the chunk says about reasoning follows the
+    /// same rule.
+    #[test]
+    fn repeated_usage_chunks_are_reported_verbatim_and_not_summed() {
+        let mut a = ChatStreamAssembler::new();
+        let first = a.on_chunk(chunk(serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 400,
+                "completion_tokens_details": {"reasoning_tokens": 250}
+            }
+        })));
+        let second = a.on_chunk(chunk(serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1000,
+                "completion_tokens_details": {"reasoning_tokens": 700}
+            }
+        })));
+        let usage_of = |evs: &[ModelEvent]| -> TokenUsage {
+            evs.iter()
+                .find_map(|e| match e {
+                    ModelEvent::UsageUpdated { usage } => Some(*usage),
+                    _ => None,
+                })
+                .expect("usage event")
+        };
+        assert_eq!(usage_of(&first).reasoning_tokens, Some(250));
+        assert_eq!(usage_of(&second).reasoning_tokens, Some(700));
+        assert_eq!(usage_of(&second).output_tokens, 1000);
     }
 
     /// DeepSeek sends `usage` in the same chunk that carries `finish_reason`.

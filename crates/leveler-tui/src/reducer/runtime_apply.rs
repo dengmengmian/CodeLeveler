@@ -333,6 +333,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            // Reasoning is a breakdown already inside `output_tokens`; a gauge
+            // of the window in use has nothing to add for it.
+            ..
         } => {
             // Ignore all-zero reports so a missing provider usage chunk cannot
             // wipe a previous good reading (or a transcript estimate).

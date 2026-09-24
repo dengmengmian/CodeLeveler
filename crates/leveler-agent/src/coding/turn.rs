@@ -178,7 +178,7 @@ pub async fn drive_turn(
             detail: error.to_string(),
             stale_ownership: false,
             model: None,
-            rounds: 0,
+            model_steps: 0,
             modified_files: Vec::new(),
         })?
         .with_approver(approver)
@@ -358,7 +358,7 @@ pub async fn drive_turn(
     match result {
         Ok(outcome) => Ok(TurnFacts {
             stop: outcome.stop_reason,
-            rounds: outcome.rounds,
+            model_steps: outcome.model_steps,
             modified_files: outcome.modified_files.clone(),
             outcome,
         }),
@@ -393,7 +393,7 @@ fn seed_failure(error: EngineError) -> TurnFailure {
         ),
         detail: error.to_string(),
         model: None,
-        rounds: 0,
+        model_steps: 0,
         modified_files: Vec::new(),
     }
 }
@@ -522,8 +522,8 @@ fn failure(aborted: DriveAborted) -> TurnFailure {
             _ => None,
         },
         // The loop's proven work before it aborted: a failed turn that ran
-        // rounds and changed files must not record none of that.
-        rounds: aborted.facts.rounds,
+        // model steps and changed files must not record none of that.
+        model_steps: aborted.facts.model_steps,
         modified_files: aborted.facts.modified_files,
     }
 }
@@ -538,7 +538,7 @@ fn unstarted_failure(error: AgentError) -> TurnFailure {
             AgentError::Model(error) => Some(error),
             _ => None,
         },
-        rounds: 0,
+        model_steps: 0,
         modified_files: Vec::new(),
     }
 }

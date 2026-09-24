@@ -214,6 +214,9 @@ impl AnthropicStreamAssembler {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
                 cached_input_tokens: self.cache_read,
+                // See the non-streaming path: no provider-reported reasoning
+                // breakdown exists in this protocol.
+                reasoning_tokens: None,
             },
         }];
 

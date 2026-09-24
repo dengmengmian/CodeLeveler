@@ -308,11 +308,18 @@ pub enum AgentEvent {
     WorkspaceSnapshot { call_id: String, snapshot: String },
     /// Token usage reported by the model for a request (may arrive mid-stream
     /// or at the end). Drives the context gauge.
+    ///
+    /// `output_tokens` is the provider's total completion count and already
+    /// includes `reasoning_tokens`; a gauge that showed their sum would
+    /// overstate the window in use.
     Usage {
         input_tokens: u32,
         output_tokens: u32,
         /// Subset of `input_tokens` served from the provider's prefix cache.
         cached_input_tokens: u32,
+        /// Subset of `output_tokens` spent on reasoning, when the provider
+        /// reported a breakdown. `None` = not reported.
+        reasoning_tokens: Option<u32>,
     },
     /// The context accounting of the exact next request (computed by the
     /// kernel before it is sent). Transient — the TUI renders it, nothing
@@ -561,29 +568,40 @@ mod advisory_kind_tests {
 
 // PlanStep lives in leveler-lifecycle; re-exported from crate root.
 
-/// What decides whether another model/tool round may start.
+/// What decides whether another model step may start.
 ///
-/// Top-level user turns run until a semantic terminal state. Bounded work is
-/// reserved for measured units whose ownership requires a hard edge
-/// (orchestration nodes and eval cases). Sub-agents use the same semantic
-/// completion rule as their parent, with a wall-clock safety limit instead.
+/// Top-level user turns run until a semantic terminal state — a resolved goal,
+/// a resource budget, or the host's own cancellation. Bounded work is reserved
+/// for measured units whose ownership requires a hard edge (eval cases and
+/// delegated agents' manifest budgets), because such a unit has an owner that
+/// must not wait forever for it.
+///
+/// A model-step count is never a task budget: it counts the agent's own
+/// request cadence, so a top-level task must not be bounded by one. The
+/// unbounded case is still bounded by the model-step *safety ceiling* and by
+/// every resource limit; see `LevelerAgentCore::ModelStepLimits`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContinuationPolicy {
     UntilTerminal,
-    Bounded { max_rounds: std::num::NonZeroU32 },
+    Bounded {
+        /// Model steps this bounded unit of work may run for.
+        max_model_steps: std::num::NonZeroU32,
+    },
 }
 
 impl ContinuationPolicy {
-    pub fn bounded(max_rounds: u32) -> Self {
+    pub fn bounded(max_model_steps: u32) -> Self {
         Self::Bounded {
-            max_rounds: std::num::NonZeroU32::new(max_rounds.max(1)).expect("max(1) is non-zero"),
+            max_model_steps: std::num::NonZeroU32::new(max_model_steps.max(1))
+                .expect("max(1) is non-zero"),
         }
     }
 
-    pub fn round_limit(self) -> Option<u32> {
+    /// The model-step window of a bounded unit of work, when one is pinned.
+    pub fn model_step_window_limit(self) -> Option<u32> {
         match self {
             Self::UntilTerminal => None,
-            Self::Bounded { max_rounds } => Some(max_rounds.get()),
+            Self::Bounded { max_model_steps } => Some(max_model_steps.get()),
         }
     }
 }
@@ -618,25 +636,34 @@ pub struct StepLimits {
     /// model profile; callers must reject a configured cost cap when pricing is
     /// unavailable rather than inventing a price.
     pub max_cost_usd_micros: Option<u64>,
-    /// Absolute per-turn round ceiling. `None` falls back to a built-in default.
-    /// This is an unconditional circuit breaker — independent of progress
-    /// heuristics — so an `UntilTerminal` turn always terminates.
-    pub max_rounds: Option<u32>,
+    /// Model-step safety ceiling for this run: the unconditional circuit
+    /// breaker — independent of progress heuristics — that stops a runaway
+    /// model↔tool loop. `None` means the host pins no ceiling, so the kernel's
+    /// `DEFAULT_MODEL_STEP_CEILING` applies.
+    ///
+    /// It is a mechanical limit, never a task budget. Task lifetime is carried
+    /// by the resource limits above and by the host's own goal lifecycle.
+    pub max_model_steps: Option<u32>,
 }
 
 /// The result of an executor run.
 #[derive(Debug, Clone)]
 pub struct AgentOutcome {
     pub final_text: String,
-    pub rounds: u32,
+    /// Model steps this run started. A mechanical count of the agent's own
+    /// request cadence, not a measure of task progress.
+    pub model_steps: u32,
     pub modified_files: Vec<String>,
     pub stop_reason: StopReason,
     /// Human-readable cause for non-success stops (audit gaps, stall, budget…).
     /// Empty when the stop reason is self-explanatory.
     pub stop_detail: Option<String>,
     /// When `stop_reason` is [`StopReason::BudgetExhausted`], which limit fired
-    /// and spent vs cap. `None` for other stops (and for legacy bounded-round
-    /// exits that reuse the BudgetExhausted label without a resource dimension).
+    /// and spent vs cap. `None` for other stops — including a host-pinned
+    /// model-step window (`StopReason::BudgetExhausted` without a dimension,
+    /// which is a deliberately bounded unit of work rather than a resource
+    /// budget) and the model-step safety ceiling
+    /// (`StopReason::TurnLimitReached`).
     pub budget_exhaustion: Option<BudgetExhaustion>,
     /// Final progress / closeout state (engine continue_active_goal reads this).
     pub progress: ProgressLedger,
@@ -652,7 +679,7 @@ impl AgentOutcome {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn drive_result(
         final_text: String,
-        rounds: u32,
+        model_steps: u32,
         modified_files: Vec<String>,
         stop_reason: StopReason,
         stop_detail: Option<String>,
@@ -661,7 +688,7 @@ impl AgentOutcome {
     ) -> Self {
         Self {
             final_text,
-            rounds,
+            model_steps,
             modified_files,
             stop_reason,
             stop_detail,
@@ -676,7 +703,7 @@ impl AgentOutcome {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn drive_budget_exhausted(
         final_text: String,
-        rounds: u32,
+        model_steps: u32,
         modified_files: Vec<String>,
         exhaustion: BudgetExhaustion,
         progress: &ProgressLedger,
@@ -685,7 +712,7 @@ impl AgentOutcome {
         let stop_detail = Some(exhaustion.stop_detail());
         Self {
             final_text,
-            rounds,
+            model_steps,
             modified_files,
             stop_reason: StopReason::BudgetExhausted,
             stop_detail,
@@ -747,11 +774,11 @@ impl AgentError {
 ///
 /// A failed or interrupted turn must still record what it actually did; the
 /// engine's turn terminal is written from these. Without them an interruption
-/// reports `rounds = 0, modified_files = []` and erases real work.
+/// reports `model_steps = 0, modified_files = []` and erases real work.
 #[derive(Debug, Clone, Default)]
 pub struct AbortedFacts {
-    /// Model rounds this drive started.
-    pub rounds: u32,
+    /// Model steps this drive started (a mechanical iteration count).
+    pub model_steps: u32,
     /// Files this drive confirmed it modified.
     pub modified_files: Vec<String>,
 }
@@ -1172,7 +1199,7 @@ impl Executor {
         registry: Arc<ToolRegistry>,
         tool_context: ToolContext,
         model: ModelRef,
-        max_rounds: u32,
+        model_step_window: u32,
     ) -> Self {
         // Ownership exclusivity must follow the workspace volume's real path
         // identity, not a platform guess: a case-folding volume makes
@@ -1186,10 +1213,10 @@ impl Executor {
             registry,
             tool_context,
             model,
-            continuation: if max_rounds == 0 {
+            continuation: if model_step_window == 0 {
                 ContinuationPolicy::UntilTerminal
             } else {
-                ContinuationPolicy::bounded(max_rounds)
+                ContinuationPolicy::bounded(model_step_window)
             },
             max_output_tokens: 4096,
             pricing: None,
@@ -1474,11 +1501,11 @@ impl Executor {
     /// it to another model is worse than falling back to the shared base.
     /// Apply a named agent definition's own policy to this (child) executor.
     ///
-    /// `tools` empty and `max_rounds` 0 both mean "inherit" (a spawn recorded in
+    /// `tools` empty and `max_model_steps` 0 both mean "inherit" (a spawn recorded in
     /// [`leveler_lifecycle::ChildSpawnSpec`]). Narrowing only: a definition can take
     /// capability away, never add it back, so an explorer persona cannot name a
     /// write tool into existence.
-    pub(crate) fn apply_agent_policy(&mut self, tools: &[String], max_rounds: u32) {
+    pub(crate) fn apply_agent_policy(&mut self, tools: &[String], max_model_steps: u32) {
         if !tools.is_empty() {
             // Harness controls are not capabilities a definition narrows:
             // a child keeps its plan like every other child.
@@ -1486,8 +1513,8 @@ impl Executor {
             allowed.push("update_plan".to_string());
             self.registry = Arc::new(self.registry.named_subset(&allowed));
         }
-        if max_rounds > 0 {
-            self.continuation = ContinuationPolicy::bounded(max_rounds);
+        if max_model_steps > 0 {
+            self.continuation = ContinuationPolicy::bounded(max_model_steps);
         }
     }
 
@@ -3027,6 +3054,7 @@ mod child_accounting_tests {
                 input_tokens: 1_000,
                 output_tokens: 100,
                 cached_input_tokens: 900,
+                reasoning_tokens: Some(60),
             },
             finish_reason: FinishReason::Stop,
             latency_ms: 10,

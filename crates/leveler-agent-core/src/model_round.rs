@@ -310,6 +310,12 @@ async fn stream_round(
     };
 
     let mut text = String::new();
+    // Reasoning is assistant content: accumulated so it can be assembled into
+    // the message and echoed back to providers that require it
+    // (`CompatibilityConfig::passback_reasoning_content`). It is still emitted
+    // live as a `ReasoningDelta` event, which is what the UI reads; the raw
+    // text never enters the user-visible transcript.
+    let mut reasoning = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
     // Whether the model had begun describing a tool call before a cut. An
     // unfinished call is never executed, but it IS output the model produced,
@@ -359,6 +365,7 @@ async fn stream_round(
             }
             Ok(ModelEvent::ReasoningDelta { delta }) if !completed => {
                 if !delta.is_empty() {
+                    reasoning.push_str(&delta);
                     on_event(AgentEvent::ReasoningDelta(delta));
                 }
             }
@@ -454,7 +461,13 @@ async fn stream_round(
         on_event(AgentEvent::Usage(usage));
     }
 
+    // Same part order as the non-streaming path
+    // (`leveler_model::stream_from_response`): reasoning, then text, then the
+    // tool calls, so the two response paths cannot drift apart.
     let mut content = Vec::new();
+    if !reasoning.is_empty() {
+        content.push(ContentPart::Reasoning { text: reasoning });
+    }
     if !text.is_empty() {
         content.push(ContentPart::Text { text });
     }
@@ -936,6 +949,116 @@ mod retry_decision_tests {
         )));
     }
 
+    /// A runtime that reports usage on every attempt and fails the first
+    /// `fail_times` ones with a retryable, no-output stream cut.
+    struct UsageReportingRuntime {
+        fail_times: u32,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelRuntime for UsageReportingRuntime {
+        async fn generate(
+            &self,
+            _r: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<leveler_model::ModelResponse, ModelError> {
+            unimplemented!()
+        }
+        async fn stream(
+            &self,
+            _r: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<leveler_model::ModelEventStream, ModelError> {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            // The interrupted attempt spent 200 output tokens of which 150 were
+            // reasoning; the attempt that lands spends 1000 of which 700 were.
+            let (output, reasoning) = if n <= self.fail_times {
+                (200u64, 150u64)
+            } else {
+                (1_000u64, 700u64)
+            };
+            let mut events: Vec<Result<ModelEvent, ModelError>> = vec![
+                Ok(ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::new("r"),
+                }),
+                Ok(ModelEvent::UsageUpdated {
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: output,
+                        cached_input_tokens: 0,
+                        reasoning_tokens: Some(reasoning),
+                    },
+                }),
+            ];
+            if n <= self.fail_times {
+                events.push(Err(no_output_cut()));
+            } else {
+                events.push(Ok(ModelEvent::TextDelta { delta: "ok".into() }));
+                events.push(Ok(ModelEvent::MessageCompleted {
+                    finish_reason: FinishReason::Stop,
+                }));
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+        async fn profile(&self, _m: &ModelRef) -> Result<leveler_model::ModelProfile, ModelError> {
+            unimplemented!()
+        }
+    }
+
+    /// A retry must not add the abandoned attempt's reasoning to the one that
+    /// landed: the round reports the surviving attempt's breakdown exactly, and
+    /// the live usage signals replace rather than accumulate.
+    #[tokio::test]
+    async fn a_retry_does_not_double_count_reasoning_tokens() {
+        let calls = Arc::new(Mutex::new(0));
+        let runtime = UsageReportingRuntime {
+            fail_times: 1,
+            calls: calls.clone(),
+        };
+        let mut events = Vec::new();
+        let round = run_model_round_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut |e| events.push(e),
+            instant_policy(),
+        )
+        .await
+        .expect("the second attempt lands");
+
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(round.retry_count, 1);
+        assert_eq!(round.usage.output_tokens, 1_000);
+        assert_eq!(
+            round.usage.reasoning_tokens,
+            Some(700),
+            "the round reports one attempt's breakdown, not the sum of both"
+        );
+        assert_eq!(round.usage.visible_output_tokens(), Some(300));
+
+        let live: Vec<Option<u64>> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Usage(usage) => Some(usage.reasoning_tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            live.last().copied().flatten(),
+            Some(700),
+            "the last live signal is the surviving attempt's, not a running total"
+        );
+        assert!(
+            !live.iter().flatten().any(|v| *v == 850),
+            "no signal may report 150 + 700: {live:?}"
+        );
+    }
+
     /// Three failures then success: the count is three, not two or four.
     #[tokio::test]
     async fn three_failures_then_success_counts_three_retries() {
@@ -1132,5 +1255,117 @@ mod retry_decision_tests {
             4,
             "one request per attempt, never duplicated"
         );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_assembly_tests {
+    //! Streamed reasoning must be assembled into the round's assistant
+    //! message, not just emitted as a transient event. The raw text is what a
+    //! provider that requires `reasoning_content` passback needs, and it is
+    //! also what context accounting charges as assistant content. The live
+    //! `ReasoningDelta` events stay exactly as they were; only the assembled
+    //! message gains the part.
+    use super::*;
+
+    /// Replays a fixed event sequence once, with no provider involved.
+    struct ScriptedStreamRuntime {
+        events: Vec<ModelEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelRuntime for ScriptedStreamRuntime {
+        async fn generate(
+            &self,
+            _r: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<leveler_model::ModelResponse, ModelError> {
+            unimplemented!()
+        }
+
+        async fn stream(
+            &self,
+            _r: ModelRequest,
+            _c: CancellationToken,
+        ) -> Result<leveler_model::ModelEventStream, ModelError> {
+            let events: Vec<Result<ModelEvent, ModelError>> =
+                self.events.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn profile(
+            &self,
+            _m: &leveler_model::ModelRef,
+        ) -> Result<leveler_model::ModelProfile, ModelError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_is_assembled_before_text_and_tool_calls() {
+        let call = ToolCall {
+            id: leveler_core::ToolCallId::new("call_1"),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        let runtime = ScriptedStreamRuntime {
+            events: vec![
+                ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::new("r"),
+                },
+                ModelEvent::ReasoningDelta {
+                    delta: "分析...".into(),
+                },
+                ModelEvent::ReasoningDelta {
+                    delta: "继续分析...".into(),
+                },
+                ModelEvent::ToolCallCompleted { call: call.clone() },
+                ModelEvent::TextDelta {
+                    delta: "answer".into(),
+                },
+                ModelEvent::MessageCompleted {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+        };
+        let request = ModelRequest::new(
+            leveler_model::ModelRef::new("mock", "m"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        let cancel = CancellationToken::new();
+        let mut events = Vec::new();
+        let round = run_model_round(&runtime, request, &cancel, &mut |e| events.push(e))
+            .await
+            .expect("scripted stream completes");
+
+        // Reasoning is joined in order, ahead of the text and the call — the
+        // same part order the non-streaming path assembles.
+        assert_eq!(
+            round.message.content,
+            vec![
+                ContentPart::Reasoning {
+                    text: "分析...继续分析...".into()
+                },
+                ContentPart::Text {
+                    text: "answer".into()
+                },
+                ContentPart::ToolCall { call },
+            ]
+        );
+
+        // The live events are unchanged: each reasoning chunk is still a
+        // `ReasoningDelta`, and text still streams as `AssistantDelta`.
+        let reasoning_events: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ReasoningDelta(d) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning_events, vec!["分析...", "继续分析..."]);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::AssistantDelta(d) if d == "answer"
+        )));
     }
 }

@@ -369,6 +369,11 @@ pub enum RuntimeEvent {
         /// Subset of `input_tokens` the provider served from its prefix cache.
         /// Zero when the provider reports no cache stats.
         cached_input_tokens: u32,
+        /// Subset of `output_tokens` the provider attributed to reasoning.
+        /// `None` when it reported no breakdown — unreported is not a measured
+        /// zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_tokens: Option<u32>,
     },
     /// The accounting of the exact next model request, computed by the kernel
     /// before the request is sent. Transient: nothing persists it, and a
@@ -834,6 +839,7 @@ mod tests {
                 subagent_started: 0,
                 duration_ms: None,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
                 cost_usd_micros: None,
                 lanes: Vec::new(),
             },
@@ -1206,6 +1212,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 50,
                 cached_input_tokens: 40,
+                reasoning_tokens: Some(30),
             },
             "token_usage",
         );

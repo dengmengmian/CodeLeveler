@@ -253,7 +253,9 @@ pub struct TurnPorts {
 /// it.
 pub struct TurnFacts<T> {
     pub stop: StopReason,
-    pub rounds: u32,
+    /// Model steps the harness started. Mechanical: it counts admitted model
+    /// steps, including any a provider repair or a closeout nudge consumed.
+    pub model_steps: u32,
     pub modified_files: Vec<String>,
     pub outcome: T,
 }
@@ -270,9 +272,9 @@ pub struct TurnFailure {
     pub stale_ownership: bool,
     /// The provider failure behind this stop, when there was one.
     pub model: Option<leveler_model::ModelError>,
-    /// Model rounds the harness started before it failed. An interruption is
+    /// Model steps the harness started before it failed. An interruption is
     /// not nothing: the terminal record keeps the work that actually happened.
-    pub rounds: u32,
+    pub model_steps: u32,
     /// Files the harness had confirmed it modified before it failed, in the
     /// order it first recorded them.
     pub modified_files: Vec<String>,
@@ -362,6 +364,9 @@ pub fn storage_model_request(
         // reported no cache hit, and the `None` this never writes is
         // reserved for rows from before the column existed.
         cached_input_tokens: Some(record.usage.cached_input_tokens),
+        // Likewise recorded, never inferred: `None` here means the provider
+        // reported no reasoning breakdown on this call.
+        reasoning_tokens: record.usage.reasoning_tokens,
         cost_usd_micros: record.cost_usd_micros,
         agent_id: record.agent_id.clone(),
         finish_reason,
@@ -776,7 +781,7 @@ impl TurnRunner<'_> {
         // many model rounds it started and which files it changed. Those
         // travel with the failure so the terminal row can record them instead
         // of erasing a turn's real work (R012).
-        let (run_result, aborted_rounds, aborted_files): (
+        let (run_result, aborted_model_steps, aborted_files): (
             Result<TurnFacts<T>, EngineError>,
             u32,
             Vec<String>,
@@ -784,9 +789,9 @@ impl TurnRunner<'_> {
             Ok(()) => match exec_result {
                 Ok(facts) => (Ok(facts), 0, Vec::new()),
                 Err(failure) => {
-                    let rounds = failure.rounds;
+                    let model_steps = failure.model_steps;
                     let files = failure.modified_files.clone();
-                    (Err(EngineError::from(failure)), rounds, files)
+                    (Err(EngineError::from(failure)), model_steps, files)
                 }
             },
             Err(error) => (Err(error), 0, Vec::new()),
@@ -809,26 +814,26 @@ impl TurnRunner<'_> {
             })?;
         // The terminal event and query projection commit atomically. Forwarding
         // happens only after commit, so observers never see an uncommitted fact.
-        let (terminal, stop_reason, stop, rounds, modified_files) = match &run_result {
+        let (terminal, stop_reason, stop, model_steps, modified_files) = match &run_result {
             Ok(facts) => (
                 TurnOutcome::Completed,
                 format!("{:?}", facts.stop),
                 Some(facts.stop),
-                facts.rounds,
+                facts.model_steps,
                 facts.modified_files.clone(),
             ),
             Err(EngineError::Cancelled) => (
                 TurnOutcome::Interrupted,
                 "cancelled".to_string(),
                 None,
-                aborted_rounds,
+                aborted_model_steps,
                 aborted_files.clone(),
             ),
             Err(error) => (
                 TurnOutcome::Failed,
                 error.to_string(),
                 None,
-                aborted_rounds,
+                aborted_model_steps,
                 aborted_files.clone(),
             ),
         };
@@ -837,7 +842,7 @@ impl TurnRunner<'_> {
             outcome: terminal,
             stop_reason,
             stop,
-            rounds,
+            model_steps,
             modified_files,
         };
         let (event_type, payload) = event.to_row().map_err(|error| {

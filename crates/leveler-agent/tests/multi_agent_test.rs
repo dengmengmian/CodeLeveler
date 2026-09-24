@@ -320,6 +320,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
         input_tokens: 700,
         output_tokens: 30,
         cached_input_tokens: 300,
+        reasoning_tokens: None,
     };
     let runtime = Arc::new(SleepyRuntime::new(
         vec![
@@ -337,6 +338,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
                     input_tokens: 1_200,
                     output_tokens: 80,
                     cached_input_tokens: 600,
+                    reasoning_tokens: None,
                 },
             ),
             assistant_text("parent done"),
@@ -967,7 +969,7 @@ async fn until_terminal_run_is_not_cut_off_by_a_round_budget() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(outcome.rounds, 4);
+    assert_eq!(outcome.model_steps, 4);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1001,7 +1003,7 @@ async fn bounded_run_stops_at_the_round_budget() {
         .await
         .unwrap();
     assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
-    assert_eq!(outcome.rounds, 2);
+    assert_eq!(outcome.model_steps, 2);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -6467,6 +6469,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
         input_tokens: 700,
         output_tokens: 30,
         cached_input_tokens: 300,
+        reasoning_tokens: None,
     };
     let runtime = Arc::new(SleepyRuntime::new(
         vec![
@@ -6482,6 +6485,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
                     input_tokens: 500,
                     output_tokens: 25,
                     cached_input_tokens: 200,
+                    reasoning_tokens: None,
                 };
                 spawn_round
             },
@@ -6492,6 +6496,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
                     input_tokens: 1_200,
                     output_tokens: 80,
                     cached_input_tokens: 600,
+                    reasoning_tokens: None,
                 },
             ),
             assistant_text_with_usage(
@@ -6500,6 +6505,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
                     input_tokens: 400,
                     output_tokens: 20,
                     cached_input_tokens: 100,
+                    reasoning_tokens: None,
                 },
             ),
         ],

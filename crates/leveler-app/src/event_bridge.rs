@@ -630,11 +630,13 @@ impl EventBridge {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
+                reasoning_tokens,
             } => {
                 let _ = self.events.send(RuntimeEvent::TokenUsage {
                     input_tokens,
                     output_tokens,
                     cached_input_tokens,
+                    reasoning_tokens,
                 });
             }
             EngineEvent::ContextUsage { accounting } => {
@@ -1749,7 +1751,7 @@ mod bridge_tests {
     fn outcome(stop_reason: StopReason) -> AgentOutcome {
         AgentOutcome {
             final_text: String::new(),
-            rounds: 1,
+            model_steps: 1,
             modified_files: Vec::new(),
             stop_reason,
             stop_detail: None,
@@ -1876,7 +1878,11 @@ mod projection_equivalence {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
-            } => format!("usage:{input_tokens}/{output_tokens}/{cached_input_tokens}"),
+                reasoning_tokens,
+            } => format!(
+                "usage:{input_tokens}/{output_tokens}/{cached_input_tokens}/{}",
+                reasoning_tokens.map_or("?".to_string(), |v| v.to_string())
+            ),
             RuntimeEvent::Notification { level, message } => {
                 format!("note[{level:?}]:{message}")
             }
@@ -2150,10 +2156,11 @@ mod projection_equivalence {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 8,
+                reasoning_tokens: Some(4),
             },
             EngineEvent::Compacted { from: 100, to: 40 },
         ]);
-        assert_eq!(shapes[0], "usage:10/5/8");
+        assert_eq!(shapes[0], "usage:10/5/8/4");
         // Phase-5 structured-event migration: the compaction fact is typed;
         // clients localize ("上下文已压缩 100 → 40 条" moves to the TUI).
         assert_eq!(shapes[1], "compacted:100->40");

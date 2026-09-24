@@ -695,7 +695,7 @@ async fn executor_reads_patches_and_finishes() {
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     assert!(outcome.final_text.contains("added"));
-    assert_eq!(outcome.rounds, 3);
+    assert_eq!(outcome.model_steps, 3);
     assert!(outcome.modified_files.contains(&"src/lib.rs".to_string()));
 
     let content = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
@@ -1023,6 +1023,18 @@ async fn invalid_tool_call_json_is_fed_back_and_retried() {
         requests.len(),
         2,
         "should have retried once after the error"
+    );
+
+    // §C: the repair IS another admitted model step (honest mechanical
+    // accounting), but it is not a task-level resource budget: nothing about
+    // the task's budget was consumed by a provider protocol failure.
+    assert_eq!(
+        outcome.model_steps, 2,
+        "the decode repair is one more model step"
+    );
+    assert!(
+        outcome.budget_exhaustion.is_none(),
+        "a provider Decode failure must not read as a spent task budget: {outcome:?}"
     );
 
     // The retry request carried the decode error back to the model.
@@ -1380,7 +1392,10 @@ async fn completion_evidence_gate_allows_plain_text_without_workspace_change() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(outcome.rounds, 1, "plain chat must not be forced to verify");
+    assert_eq!(
+        outcome.model_steps, 1,
+        "plain chat must not be forced to verify"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1465,6 +1480,7 @@ async fn configured_token_budget_stops_before_another_model_request() {
             input_tokens: 60,
             output_tokens: 40,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         },
     });
     let executor = Executor::new(
@@ -1490,7 +1506,7 @@ async fn configured_token_budget_stops_before_another_model_request() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
-    assert_eq!(outcome.rounds, 1);
+    assert_eq!(outcome.model_steps, 1);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(outcome.final_text.contains("token"));
     let exhaustion = outcome
@@ -1531,6 +1547,7 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
             input_tokens: 10,
             output_tokens: 10,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         },
     });
     let executor = Executor::new(
@@ -1561,7 +1578,7 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
-    assert_eq!(outcome.rounds, 1);
+    assert_eq!(outcome.model_steps, 1);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(outcome.final_text.contains("cost"));
     let exhaustion = outcome
@@ -1669,6 +1686,7 @@ impl ModelRuntime for CompactingRuntime {
                 input_tokens: 500_000,
                 output_tokens: 100,
                 cached_input_tokens: 0,
+                reasoning_tokens: None,
             },
         }));
         events.push(Ok(ModelEvent::MessageCompleted {
@@ -2393,9 +2411,9 @@ async fn an_until_terminal_turn_is_not_cut_off_by_a_hidden_round_count() {
         "a top-level turn must not end on a hidden round count: {outcome:?}"
     );
     assert!(
-        outcome.rounds > 100,
+        outcome.model_steps > 100,
         "the turn ran past the old ceiling: {} rounds",
-        outcome.rounds
+        outcome.model_steps
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -2451,7 +2469,7 @@ async fn bounded_continuation_still_stops_at_its_window() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.rounds, 3, "bounded work stops at its window");
+    assert_eq!(outcome.model_steps, 3, "bounded work stops at its window");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2507,7 +2525,7 @@ async fn a_bounded_window_above_one_hundred_rounds_is_the_hard_edge() {
         .unwrap();
 
     assert_eq!(
-        outcome.rounds, 130,
+        outcome.model_steps, 130,
         "the explicit window governs: {outcome:?}"
     );
     assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
@@ -2560,7 +2578,7 @@ async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
         0, // 0 => UntilTerminal (no continuation round limit)
     )
     .with_step_limits(leveler_agent::StepLimits {
-        max_rounds: Some(5),
+        max_model_steps: Some(5),
         ..Default::default()
     });
 
@@ -2575,11 +2593,26 @@ async fn absolute_round_ceiling_terminates_a_busy_never_ending_loop() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::TurnLimitReached);
-    assert_eq!(outcome.rounds, 5, "must stop exactly at the round ceiling");
+    assert_eq!(
+        outcome.model_steps, 5,
+        "must stop exactly at the model-step ceiling"
+    );
     assert!(
         outcome.final_text.contains("ceiling"),
         "should report the ceiling stop: {}",
         outcome.final_text
+    );
+    // §E: the mechanical breaker must not be reported as a resource budget,
+    // and its detail must say which limit fired.
+    assert!(
+        outcome.budget_exhaustion.is_none(),
+        "a model-step ceiling is not a resource budget: {outcome:?}"
+    );
+    assert_eq!(outcome.stop_reason, StopReason::TurnLimitReached);
+    let detail = outcome.stop_detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("model_step_ceiling=5") && detail.contains("not a task budget"),
+        "the detail must name the mechanical ceiling: {detail:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -2802,7 +2835,7 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
         "quiet-nudge exhaustion must not be reported as a successful completion"
     );
     assert_eq!(
-        outcome.rounds, 2,
+        outcome.model_steps, 2,
         "one protocol repair, then the next quiet round stalls"
     );
     assert_eq!(
@@ -2861,7 +2894,7 @@ async fn conversational_turn_with_inert_change_answers_on_first_quiet_round() {
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     assert_eq!(
-        outcome.rounds, 2,
+        outcome.model_steps, 2,
         "the first quiet round must close the turn"
     );
     assert_eq!(outcome.final_text, "Cleaned up.");
@@ -2919,7 +2952,7 @@ async fn evidence_gate_does_not_nudge_inert_changes() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(outcome.rounds, 2);
+    assert_eq!(outcome.model_steps, 2);
     let requests = requests.lock().unwrap();
     assert!(
         !requests
@@ -3049,7 +3082,7 @@ async fn cargo_command_is_completion_evidence() {
 
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     assert_eq!(
-        outcome.rounds, 3,
+        outcome.model_steps, 3,
         "a verification-class command satisfies the evidence gate"
     );
 
@@ -3107,7 +3140,7 @@ async fn command_budget_is_enforced_before_the_call() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
-    assert_eq!(outcome.rounds, 2);
+    assert_eq!(outcome.model_steps, 2);
     assert!(
         outcome.final_text.contains("command"),
         "the reason must name the exhausted budget: {}",
@@ -3326,7 +3359,7 @@ async fn duration_budget_stops_the_run_between_rounds() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
-    assert_eq!(outcome.rounds, 1, "round 2 must never be requested");
+    assert_eq!(outcome.model_steps, 1, "round 2 must never be requested");
     assert!(
         outcome.final_text.contains("duration") || outcome.final_text.contains("time"),
         "the reason must name the exhausted budget: {}",
@@ -3738,6 +3771,7 @@ impl ModelRuntime for SummarizingCompactRuntime {
                 input_tokens: 500_000,
                 output_tokens: 100,
                 cached_input_tokens: 0,
+                reasoning_tokens: None,
             },
         }));
         events.push(Ok(ModelEvent::MessageCompleted {
@@ -5131,9 +5165,9 @@ async fn text_only_after_explore_does_not_force_plan_repair() {
     // Must not loop on forced plan repair: text-only ends the turn.
     assert_eq!(outcome.stop_reason, StopReason::Answered, "{outcome:?}");
     assert!(
-        outcome.rounds <= 4,
+        outcome.model_steps <= 4,
         "must not spin on plan repair; rounds={}",
-        outcome.rounds
+        outcome.model_steps
     );
     let requests = runtime.recorded_requests();
     for (i, req) in requests.iter().enumerate() {
@@ -5647,7 +5681,7 @@ async fn execution_context_is_current_bounded_and_not_persisted_as_history() {
         8,
     )
     .with_seeded_progress(leveler_lifecycle::ProgressLedger {
-        cumulative_rounds: 7,
+        cumulative_model_steps: 7,
         cumulative_model_tokens: 4000,
         cumulative_duration_ms: 90_000,
         cumulative_commands: 2,
@@ -5689,7 +5723,33 @@ async fn execution_context_is_current_bounded_and_not_persisted_as_history() {
             serde_json::from_str(blocks[0].split_once('\n').unwrap().1).unwrap()
         })
         .collect();
-    assert_eq!(states[0]["rounds_completed"], 7);
+    // §10: the projection reports mechanical model-step counts, never a
+    // "task progress round". Both numbers are model steps: this drive's and
+    // the task epoch's. There is no task-progress field to misread.
+    // This executor was seeded with 7 model steps of prior epoch spend, so the
+    // FIRST request of this drive reports 0 steps completed *in this drive*
+    // and 7 across the task epoch. The two are separate on purpose: one is the
+    // drive's mechanical counter, the other the task's accumulated one.
+    assert_eq!(states[0]["model_steps_completed"], 0);
+    assert_eq!(states[0]["task_model_steps_completed"], 7);
+    assert!(
+        states[3]["model_steps_completed"].as_u64().unwrap() > 0,
+        "the drive-local counter must advance with the drive: {states:?}"
+    );
+    assert!(
+        states[0].get("rounds_completed").is_none(),
+        "the old task-progress-sounding key must be gone: {states:?}"
+    );
+    // No ceiling was pinned on this executor, so the projection must say so
+    // rather than invent a budget: `null` is "the host pinned none".
+    assert!(states[0]["model_step_ceiling"].is_null());
+    // The projection states mechanical facts only: it never hands the model a
+    // "remaining budget" it did not compute, which would read as an
+    // instruction to converge.
+    assert!(
+        states[0].get("model_steps_remaining").is_none(),
+        "no fabricated remaining-budget field: {states:?}"
+    );
     assert_eq!(states[0]["model_tokens"]["spent"], 4000);
     assert_eq!(states[0]["model_tokens"]["limit"], 100_000);
     assert!(states[0]["elapsed_ms"].as_u64().unwrap() >= 90_000);
@@ -6192,6 +6252,14 @@ async fn length_truncated_tool_call_recovers_with_a_smaller_reissue() {
         "the truncated call must never execute: {events:?}"
     );
     assert_eq!(outcome.final_text, "done smaller");
+    // §D: the truncated attempt and the smaller re-issue are two logical
+    // requests, so they are two model steps — and still no resource budget.
+    assert_eq!(
+        outcome.model_steps, 3,
+        "truncated attempt + re-issue + answer: {}",
+        outcome.model_steps
+    );
+    assert!(outcome.budget_exhaustion.is_none(), "{outcome:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -6720,6 +6788,16 @@ async fn exhausted_request_start_timeout_is_retried() {
     .unwrap();
     assert_eq!(attempts, 2, "one exhausted-timeout retry then success");
     assert!(outcome.final_text.contains("recovered"), "{outcome:?}");
+    // §B: a provider retry is internal to the logical request, so the whole
+    // thing is ONE model step — the retry must not consume task progress.
+    assert_eq!(
+        outcome.model_steps, 1,
+        "a retried attempt stays inside one logical model step"
+    );
+    assert!(
+        outcome.budget_exhaustion.is_none(),
+        "a retry is not a resource budget: {outcome:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -7376,6 +7454,7 @@ impl ModelRuntime for CheckpointProbeRuntime {
                 input_tokens: 500_000,
                 output_tokens: 100,
                 cached_input_tokens: 0,
+                reasoning_tokens: None,
             },
         }));
         events.push(Ok(ModelEvent::MessageCompleted {
@@ -7709,6 +7788,7 @@ async fn token_admission_spends_exactly_what_the_records_say() {
         usage: TokenUsage {
             input_tokens: 60,
             cached_input_tokens: 20,
+            reasoning_tokens: None,
             output_tokens: 40,
         },
     });
@@ -7773,6 +7853,7 @@ async fn resumed_spend_continues_from_the_seeded_epoch_without_recounting() {
         usage: TokenUsage {
             input_tokens: 30,
             cached_input_tokens: 10,
+            reasoning_tokens: None,
             output_tokens: 20,
         },
     });
@@ -8572,7 +8653,7 @@ async fn a_long_novel_exploration_is_not_interrupted_by_a_progress_heuristic() {
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Completed, "{outcome:?}");
-    assert_eq!(outcome.rounds as usize, ROUNDS + 1);
+    assert_eq!(outcome.model_steps as usize, ROUNDS + 1);
     let injected: Vec<String> = runtime
         .recorded_requests()
         .iter()

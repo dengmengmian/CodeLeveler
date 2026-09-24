@@ -70,10 +70,12 @@ impl From<AgentEvent> for EngineEvent {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
+                reasoning_tokens,
             } => EngineEvent::TokenUsage {
                 input_tokens,
                 output_tokens,
                 cached_input_tokens,
+                reasoning_tokens,
             },
             A::ContextUsage { accounting } => EngineEvent::ContextUsage { accounting },
             A::Compacted { from, to } => EngineEvent::Compacted { from, to },

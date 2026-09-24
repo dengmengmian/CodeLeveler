@@ -34,12 +34,12 @@ pub(crate) async fn cmd_run(
     sandbox: bool,
     work_profile: leveler_lifecycle::WorkProfile,
     collaboration: leveler_lifecycle::CollaborationMode,
-    max_rounds: Option<u32>,
+    max_model_steps: Option<u32>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let mut app = Application::assemble(layout)?
         .with_work_profile(work_profile)
         .with_collaboration(collaboration)
-        .with_task_round_budget(max_rounds);
+        .with_model_step_ceiling(max_model_steps);
     if let Some(overrides) = parent_reasoning_override(std::env::var(PARENT_REASONING_ENV).ok())? {
         app = app.with_execution_overrides(overrides);
     }
@@ -1855,51 +1855,54 @@ fn finish(
                 match outcome.stop_reason {
                     StopReason::Completed => println!(
                         "{}",
-                        Line::ok(&format!("Completed in {} round(s).", outcome.rounds))
+                        Line::ok(&format!(
+                            "Completed in {} model step(s).",
+                            outcome.model_steps
+                        ))
                     ),
                     StopReason::Answered => println!(
                         "{}",
                         Line::warn(&format!(
-                            "Answer ended after {} round(s); task completion was not independently verified.",
-                            outcome.rounds
+                            "Answer ended after {} model step(s); task completion was not independently verified.",
+                            outcome.model_steps
                         ))
                     ),
                     StopReason::Incomplete => println!(
                         "{}",
                         Line::warn(&format!(
-                            "Stopped after {} round(s): completeness could not be established.",
-                            outcome.rounds
+                            "Stopped after {} model step(s): completeness could not be established.",
+                            outcome.model_steps
                         ))
                     ),
                     StopReason::BudgetExhausted => println!(
                         "{}",
                         Line::warn(&format!(
-                            "Stopped after {} round(s): {} Resume with: leveler resume {session_id}",
-                            outcome.rounds, outcome.final_text
+                            "Stopped after {} model step(s): {} Resume with: leveler resume {session_id}",
+                            outcome.model_steps, outcome.final_text
                         ))
                     ),
                     StopReason::TurnLimitReached => println!(
                         "{}",
                         Line::warn(&format!(
-                            "Hit absolute round ceiling after {} round(s). \
+                            "Hit the model-step safety ceiling after {} model step(s). \
                              The turn was force-stopped to guarantee termination; \
                              check if the model was looping.",
-                            outcome.rounds
+                            outcome.model_steps
                         ))
                     ),
                     StopReason::Blocked => println!(
                         "{}",
                         Line::warn(&format!(
-                            "Stopped: the model reported the goal blocked after {} round(s).",
-                            outcome.rounds
+                            "Stopped: the model reported the goal blocked after {} model step(s).",
+                            outcome.model_steps
                         ))
                     ),
                     StopReason::Stalled => println!(
                         "{}",
                         Line::warn(&format!(
                             "Stopped: the model went quiet without resolving the goal \
-                             after {} round(s) (not verified).",
-                            outcome.rounds
+                             after {} model step(s) (not verified).",
+                            outcome.model_steps
                         ))
                     ),
                 }
@@ -1908,7 +1911,10 @@ fn finish(
                     "type": "session_completed",
                     "session_id": session_id,
                     "stop_reason": format!("{:?}", outcome.stop_reason),
-                    "rounds": outcome.rounds,
+                    // Wire/CLI key kept as `rounds` for existing consumers; the
+                    // value is the model-step count (a mechanical iteration
+                    // count, never a task-progress measure).
+                    "rounds": outcome.model_steps,
                     "modified_files": outcome.modified_files,
                 }));
             }

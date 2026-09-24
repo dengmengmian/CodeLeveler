@@ -187,6 +187,7 @@ fn footer_shows_cache_hit_rate_when_provider_reports_it() {
             input_tokens: 1000,
             output_tokens: 50,
             cached_input_tokens: 700,
+            reasoning_tokens: None,
         }),
     );
     // token_input drives used when context_tokens is still low.
@@ -303,6 +304,7 @@ fn token_usage_does_not_spam_input_or_footer() {
             input_tokens: 1200,
             output_tokens: 300,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         }),
     );
 
@@ -1623,6 +1625,7 @@ fn trace_state(locale: leveler_tui::Locale, tab: char) -> String {
             subagent_started: 0,
             duration_ms: None,
             cached_input_tokens: None,
+            reasoning_tokens: None,
             cost_usd_micros: None,
             lanes: Vec::new(),
         },
@@ -1640,6 +1643,7 @@ fn trace_state(locale: leveler_tui::Locale, tab: char) -> String {
             latency_ms: Some(1800),
             retry_count: 0,
             cached_input_tokens: None,
+            reasoning_tokens: None,
             cost_usd_micros: None,
             agent_id: None,
             created_at: "t1".into(),

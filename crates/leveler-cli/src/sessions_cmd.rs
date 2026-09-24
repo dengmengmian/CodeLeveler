@@ -9,18 +9,28 @@ use crate::cli::SessionsCommand;
 use crate::output::Line;
 
 /// Aggregate token usage across a session's model requests: total requests,
-/// summed input/output tokens, and a per-model breakdown (model → (count,
-/// input, output)), ordered by first appearance.
+/// summed input/output tokens, the reasoning share of the output, and a
+/// per-model breakdown (model → (count, input, output)), ordered by first
+/// appearance.
+///
+/// `reasoning` is `None` unless every request reported a breakdown: a partial
+/// sum would understate reasoning and silently overstate visible output.
+/// Reasoning is a subset of `output`, never an addition to it.
 fn summarize_usage(
     requests: &[leveler_storage::ModelRequestRecord],
-) -> (usize, u64, u64, Vec<(String, usize, u64, u64)>) {
+) -> (usize, u64, u64, Option<u64>, Vec<(String, usize, u64, u64)>) {
     let mut order: Vec<String> = Vec::new();
     let mut per: std::collections::HashMap<String, (usize, u64, u64)> =
         std::collections::HashMap::new();
     let (mut total_in, mut total_out) = (0u64, 0u64);
+    let mut reasoning: Option<u64> = if requests.is_empty() { None } else { Some(0) };
     for r in requests {
         total_in += r.input_tokens;
         total_out += r.output_tokens;
+        reasoning = match (reasoning, r.reasoning_tokens) {
+            (Some(total), Some(value)) => Some(total + value),
+            _ => None,
+        };
         let entry = per.entry(r.model.clone()).or_insert_with(|| {
             order.push(r.model.clone());
             (0, 0, 0)
@@ -36,7 +46,7 @@ fn summarize_usage(
             (m, c, i, o)
         })
         .collect();
-    (requests.len(), total_in, total_out, breakdown)
+    (requests.len(), total_in, total_out, reasoning, breakdown)
 }
 
 /// Render the readable `sessions show` view: config, turns, token usage and an
@@ -85,12 +95,20 @@ async fn render_session_show(
         .load_for_session(sid)
         .await?;
     if !requests.is_empty() {
-        let (count, total_in, total_out, per_model) = summarize_usage(&requests);
+        let (count, total_in, total_out, reasoning, per_model) = summarize_usage(&requests);
         println!("\n{}", Line::heading("Token usage"));
         println!(
             "  {count} request(s)   input: {total_in}   output: {total_out}   total: {}",
             total_in + total_out
         );
+        match reasoning {
+            Some(reasoning) => println!(
+                "  reasoning: {reasoning} of the output   visible output: {}",
+                total_out.saturating_sub(reasoning)
+            ),
+            // Unreported is not zero: say so rather than subtract a partial sum.
+            None => println!("  reasoning: not reported by every request"),
+        }
         if per_model.len() > 1 {
             for (model, c, i, o) in per_model {
                 println!("    {model}: {c} req, in {i}, out {o}");
@@ -225,6 +243,7 @@ mod usage_tests {
             agent_id: None,
             created_at: leveler_core::now(),
             reasoning_effort: None,
+            reasoning_tokens: None,
         }
     }
 
@@ -235,10 +254,13 @@ mod usage_tests {
             req("kimi/k2", 50, 10),
             req("deepseek/v4", 200, 30),
         ];
-        let (count, total_in, total_out, per_model) = summarize_usage(&reqs);
+        let (count, total_in, total_out, reasoning, per_model) = summarize_usage(&reqs);
         assert_eq!(count, 3);
         assert_eq!(total_in, 350);
         assert_eq!(total_out, 60);
+        // No row reported a breakdown, so the reasoning total stays unknown
+        // rather than being reported as a measured zero.
+        assert_eq!(reasoning, None);
         // First-seen order: deepseek before kimi; deepseek's two requests fold.
         assert_eq!(
             per_model,
@@ -249,10 +271,33 @@ mod usage_tests {
         );
     }
 
+    /// A single request with no breakdown makes the session's reasoning total
+    /// unknown: a partial sum would understate it and overstate visible output.
+    #[test]
+    fn one_unreported_breakdown_makes_the_reasoning_total_unknown() {
+        let mut with = req("deepseek/v4", 100, 20);
+        with.reasoning_tokens = Some(15);
+        let reqs = vec![with, req("kimi/k2", 50, 10)];
+        let (_, _, _, reasoning, _) = summarize_usage(&reqs);
+        assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn reasoning_is_summed_when_every_request_reported_it() {
+        let mut a = req("deepseek/v4", 100, 20);
+        a.reasoning_tokens = Some(15);
+        let mut b = req("deepseek/v4", 200, 30);
+        b.reasoning_tokens = Some(25);
+        let (_, _, total_out, reasoning, _) = summarize_usage(&[a, b]);
+        assert_eq!(total_out, 50, "the output total is not re-derived");
+        assert_eq!(reasoning, Some(40));
+    }
+
     #[test]
     fn empty_requests_summarize_to_zero() {
-        let (count, total_in, total_out, per_model) = summarize_usage(&[]);
+        let (count, total_in, total_out, reasoning, per_model) = summarize_usage(&[]);
         assert_eq!((count, total_in, total_out), (0, 0, 0));
+        assert_eq!(reasoning, None, "nothing reported nothing");
         assert!(per_model.is_empty());
     }
 }

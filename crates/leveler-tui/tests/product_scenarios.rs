@@ -618,6 +618,7 @@ fn s03_long_task() {
             input_tokens: 420_568,
             output_tokens: 16_076,
             cached_input_tokens: 396_288,
+            reasoning_tokens: None,
         }),
     );
     reduce(

@@ -91,6 +91,10 @@ pub async fn query_observability(
         .iter()
         .find(|l| l.lane == "total")
         .and_then(|l| l.cached_input_tokens);
+    let reasoning_tokens = lanes
+        .iter()
+        .find(|l| l.lane == "total")
+        .and_then(|l| l.reasoning_tokens);
     let cost_usd_micros = lanes
         .iter()
         .find(|l| l.lane == "total")
@@ -170,6 +174,7 @@ pub async fn query_observability(
             subagent_started: count("sub_agent_started"),
             duration_ms: session_duration_ms,
             cached_input_tokens,
+            reasoning_tokens,
             cost_usd_micros,
             lanes,
         },
@@ -314,7 +319,7 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             turn_id,
             outcome,
             stop_reason,
-            rounds,
+            model_steps,
             ..
         } => (
             ObservationClass::Terminal,
@@ -327,7 +332,7 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
             .into(),
             vec![
                 ("Turn".into(), turn_id.as_str().to_string()),
-                ("Rounds".into(), rounds.to_string()),
+                ("Model steps".into(), model_steps.to_string()),
                 ("Outcome".into(), format!("{outcome:?}")),
             ],
         ),
@@ -772,14 +777,15 @@ fn request_view(r: &leveler_storage::ModelRequestRecord) -> UiRequestObservation
         latency_ms: r.latency_ms,
         retry_count: r.retry_count,
         cached_input_tokens: r.cached_input_tokens,
+        reasoning_tokens: r.reasoning_tokens,
         cost_usd_micros: r.cost_usd_micros,
         agent_id: r.agent_id.clone(),
         created_at: r.created_at.to_rfc3339(),
     }
 }
 
-/// Sum one lane's spend. `cached` and `cost` stay `None` unless at least one
-/// row carried the figure — an unmeasured column is not a zero.
+/// Sum one lane's spend. `cached`, `reasoning` and `cost` stay `None` unless
+/// at least one row carried the figure — an unmeasured column is not a zero.
 fn lane(name: &str, rows: &[&leveler_storage::ModelRequestRecord]) -> UiLaneAccounting {
     let sum_opt = |pick: fn(&leveler_storage::ModelRequestRecord) -> Option<u64>| {
         rows.iter()
@@ -792,6 +798,7 @@ fn lane(name: &str, rows: &[&leveler_storage::ModelRequestRecord]) -> UiLaneAcco
         input_tokens: rows.iter().map(|r| r.input_tokens).sum(),
         output_tokens: rows.iter().map(|r| r.output_tokens).sum(),
         cached_input_tokens: sum_opt(|r| r.cached_input_tokens),
+        reasoning_tokens: sum_opt(|r| r.reasoning_tokens),
         cost_usd_micros: sum_opt(|r| r.cost_usd_micros),
     }
 }
@@ -982,6 +989,7 @@ mod tests {
             agent_id: None,
             created_at: now(),
             reasoning_effort: None,
+            reasoning_tokens: None,
         })
         .await
         .unwrap();
@@ -1608,6 +1616,7 @@ mod accounting_tests {
         cached: Option<u64>,
         output: u64,
         cost: Option<u64>,
+        reasoning: Option<u64>,
         sid: &SessionId,
     ) -> ModelRequestRecord {
         ModelRequestRecord {
@@ -1628,6 +1637,7 @@ mod accounting_tests {
             agent_id: agent.map(str::to_string),
             created_at: now(),
             reasoning_effort: None,
+            reasoning_tokens: reasoning,
         }
     }
 
@@ -1638,13 +1648,45 @@ mod accounting_tests {
         SessionRepository::new(&db).create(&rec).await.unwrap();
         // Two root calls and one a reviewer child made.
         for r in [
-            req("r1", None, 1000, Some(900), 50, Some(1200), &sid),
-            req("r2", None, 2000, Some(1800), 70, Some(2300), &sid),
-            req("c1", Some("ag1"), 500, Some(400), 30, Some(600), &sid),
+            req("r1", None, 1000, Some(900), 50, Some(1200), Some(10), &sid),
+            req("r2", None, 2000, Some(1800), 70, Some(2300), Some(60), &sid),
+            req(
+                "c1",
+                Some("ag1"),
+                500,
+                Some(400),
+                30,
+                Some(600),
+                Some(5),
+                &sid,
+            ),
         ] {
             db.insert(&r).await.unwrap();
         }
         (db, sid)
+    }
+
+    #[tokio::test]
+    async fn the_session_reports_reasoning_tokens_per_request_and_in_total() {
+        let (db, sid) = seeded().await;
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let s = &loaded.session;
+        assert_eq!(s.reasoning_tokens, Some(75), "10 + 60 + 5");
+        assert_eq!(
+            s.output_tokens, 150,
+            "the completion total is unchanged by the breakdown"
+        );
+        let main = s.lanes.iter().find(|l| l.lane == "main").unwrap();
+        let children = s.lanes.iter().find(|l| l.lane == "children").unwrap();
+        assert_eq!(main.reasoning_tokens, Some(70));
+        assert_eq!(children.reasoning_tokens, Some(5));
+        let r1 = loaded
+            .requests
+            .iter()
+            .find(|r| r.id == "r1")
+            .expect("per-request view");
+        assert_eq!(r1.reasoning_tokens, Some(10));
+        assert_eq!(r1.output_tokens, 50);
     }
 
     #[tokio::test]
@@ -1667,12 +1709,16 @@ mod accounting_tests {
         let rec = SessionRecord::new("/repo", "g", "deepseek/v4", now());
         let sid = SessionId::new(rec.id.clone());
         SessionRepository::new(&db).create(&rec).await.unwrap();
-        db.insert(&req("r1", None, 1000, None, 50, None, &sid))
+        db.insert(&req("r1", None, 1000, None, 50, None, None, &sid))
             .await
             .unwrap();
         let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
         assert_eq!(loaded.session.cached_input_tokens, None);
         assert_eq!(loaded.session.cost_usd_micros, None);
+        assert_eq!(
+            loaded.session.reasoning_tokens, None,
+            "a provider that reported no breakdown is unmeasured, not zero"
+        );
     }
 
     #[tokio::test]
@@ -1712,14 +1758,24 @@ mod accounting_tests {
         SessionRepository::new(&db).create(&rec).await.unwrap();
         let n = leveler_client_protocol::OBSERVABILITY_REQUESTS_MAX + 50;
         for i in 0..n {
-            db.insert(&req(&format!("r{i}"), None, 10, Some(4), 1, Some(2), &sid))
-                .await
-                .unwrap();
+            db.insert(&req(
+                &format!("r{i}"),
+                None,
+                10,
+                Some(4),
+                1,
+                Some(2),
+                Some(1),
+                &sid,
+            ))
+            .await
+            .unwrap();
         }
         let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
         assert_eq!(loaded.session.request_count, n as u32);
         assert_eq!(loaded.session.input_tokens, (n as u64) * 10);
         assert_eq!(loaded.session.cached_input_tokens, Some((n as u64) * 4));
+        assert_eq!(loaded.session.reasoning_tokens, Some(n as u64));
         assert_eq!(loaded.session.cost_usd_micros, Some((n as u64) * 2));
         assert_eq!(
             loaded.requests.len(),

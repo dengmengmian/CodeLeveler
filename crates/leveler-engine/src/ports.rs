@@ -174,6 +174,10 @@ impl ModelRequestRecord {
     /// reported — including how much of the prompt it served from cache. A row
     /// that carries its own cost can be summed later without re-deriving it
     /// from a price table that may since have changed.
+    ///
+    /// Reasoning tokens are deliberately absent from the pricing inputs: the
+    /// provider's `output_tokens` already contains them, so charging them again
+    /// would bill the same thinking twice.
     pub fn priced(mut self, pricing: Option<&leveler_model::ModelPricing>) -> Self {
         self.cost_usd_micros = pricing.map(|p| {
             p.cost_usd_micros_cached(
@@ -268,5 +272,78 @@ pub trait LostChildVoice: Send + Sync {
     /// child semantics continues none.
     async fn continues(&self, _interrupted: &[LostChild]) -> Vec<String> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod priced_tests {
+    use leveler_model::{FinishReason, ModelPricing, TokenUsage};
+
+    use super::{ModelCallKind, ModelRequestRecord};
+
+    fn record(usage: TokenUsage) -> ModelRequestRecord {
+        ModelRequestRecord {
+            provider_request_id: None,
+            provider: "deepseek".to_string(),
+            model: "deepseek-flash".to_string(),
+            usage,
+            finish_reason: FinishReason::Stop,
+            latency_ms: 1,
+            retry_count: 0,
+            kind: ModelCallKind::Round,
+            agent_id: None,
+            cost_usd_micros: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// 1000 in (900 cached) + 1000 out, at the configured DeepSeek-Flash rates.
+    fn pricing() -> ModelPricing {
+        ModelPricing {
+            input_usd_per_mtok: 0.1389,
+            output_usd_per_mtok: 0.2778,
+            cached_input_usd_per_mtok: Some(0.0139),
+        }
+    }
+
+    /// The reasoning breakdown is a SUBSET of the completion count, so a row
+    /// that carries one must cost exactly what the same row costs without it.
+    /// Pricing `output + reasoning` would bill the same thinking twice.
+    #[test]
+    fn a_reasoning_breakdown_does_not_change_the_price() {
+        let without = record(TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+            cached_input_tokens: 900,
+            reasoning_tokens: None,
+        })
+        .priced(Some(&pricing()));
+        let with = record(TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 1_000,
+            cached_input_tokens: 900,
+            reasoning_tokens: Some(700),
+        })
+        .priced(Some(&pricing()));
+
+        assert_eq!(with.cost_usd_micros, without.cost_usd_micros);
+        // 100 uncached in × 0.1389 + 900 cached × 0.0139 + 1000 out × 0.2778
+        // = 13.89 + 12.51 + 277.80 micro-USD.
+        assert_eq!(with.cost_usd_micros, Some(304));
+        // And the stored output total is still the provider's own.
+        assert_eq!(with.usage.output_tokens, 1_000);
+    }
+
+    /// An unpriced model stays unpriced: a reasoning count is not a price.
+    #[test]
+    fn reasoning_does_not_invent_a_cost_for_an_unpriced_model() {
+        let row = record(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            reasoning_tokens: Some(7),
+        })
+        .priced(None);
+        assert_eq!(row.cost_usd_micros, None);
     }
 }

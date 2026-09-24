@@ -265,6 +265,10 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             "input_tokens": record.usage.input_tokens,
             "cached_input_tokens": record.usage.cached_input_tokens,
             "output_tokens": record.usage.output_tokens,
+            // A subset of `output_tokens` when the provider broke it out, and
+            // null when it did not — never `0` for "it did not say".
+            "reasoning_tokens": record.usage.reasoning_tokens,
+            "visible_output_tokens": record.usage.visible_output_tokens(),
             "cost_usd_micros": record.cost_usd_micros,
         }),
         AgentEvent::AssistantDelta(delta) => {
@@ -301,11 +305,15 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            reasoning_tokens,
         } => serde_json::json!({
             "type": "usage",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cached_input_tokens": cached_input_tokens,
+            // Null means the provider reported no breakdown, not that it
+            // reported zero.
+            "reasoning_tokens": reasoning_tokens,
         }),
         AgentEvent::Compacted { from, to } => serde_json::json!({
             "type": "compacted", "from": from, "to": to,

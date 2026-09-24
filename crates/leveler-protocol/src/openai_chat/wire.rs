@@ -186,6 +186,12 @@ pub struct Usage {
     /// OpenAI reports the same thing nested under this key.
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// `completion_tokens` broken down into reasoning and the rest. This is
+    /// where a reasoning-capable gateway (GLM-5.3, DeepSeek) reports
+    /// `reasoning_tokens`; without the field the number was parsed away at the
+    /// first hop and no later layer could recover it.
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -194,12 +200,31 @@ pub struct PromptTokensDetails {
     pub cached_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct CompletionTokensDetails {
+    /// Provider-reported reasoning/thinking tokens. A subset of
+    /// `completion_tokens`; `Option` because a provider may break out
+    /// `completion_tokens_details` for other reasons (or omit the key)
+    /// without reporting reasoning at all.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+}
+
 impl Usage {
     /// Cached input tokens, normalized across the two spellings providers use.
     pub fn cached_input_tokens(&self) -> u64 {
         self.prompt_cache_hit_tokens
             .or_else(|| self.prompt_tokens_details.map(|d| d.cached_tokens))
             .unwrap_or(0)
+    }
+
+    /// Reasoning tokens, when the provider reported a breakdown.
+    ///
+    /// `None` means unreported — never folded into `0`, which would claim the
+    /// provider measured no reasoning.
+    pub fn reasoning_tokens(&self) -> Option<u64> {
+        self.completion_tokens_details
+            .and_then(|details| details.reasoning_tokens)
     }
 }
 

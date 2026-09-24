@@ -243,7 +243,9 @@ pub struct TaskReport {
     pub stop_reason: StopReason,
     /// The executor's concrete reason for a non-success stop, when available.
     pub stop_detail: Option<String>,
-    pub rounds: u32,
+    /// Model steps this task's turn started — a mechanical iteration count,
+    /// never a measure of how much of the task is done.
+    pub model_steps: u32,
     /// Executor wall time used to preserve the required review's bounded tail.
     pub execution_duration_ms: u64,
     /// Turns this invocation ran for the goal. One: the engine no longer
@@ -266,7 +268,7 @@ impl TaskReport {
         final_text: String,
         modified_files: Vec<String>,
         stop_reason: StopReason,
-        rounds: u32,
+        model_steps: u32,
     ) -> Self {
         Self {
             outcome,
@@ -274,7 +276,7 @@ impl TaskReport {
             modified_files,
             stop_reason,
             stop_detail: None,
-            rounds,
+            model_steps,
             execution_duration_ms: 0,
             windows: 1,
             review: None,
@@ -345,7 +347,7 @@ fn report_from_agent_outcome(
         outcome.final_text,
         outcome.modified_files,
         outcome.stop_reason,
-        outcome.rounds,
+        outcome.model_steps,
     )
     .with_stop_detail(outcome.stop_detail);
     report.execution_duration_ms = execution_duration_ms;

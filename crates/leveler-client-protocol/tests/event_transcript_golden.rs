@@ -121,6 +121,7 @@ fn turn() -> Vec<RuntimeEvent> {
             input_tokens: 12,
             output_tokens: 3,
             cached_input_tokens: 0,
+            reasoning_tokens: None,
         },
         RuntimeEvent::AssistantTextDelta {
             message_id: MessageId::new("m_assistant_2"),

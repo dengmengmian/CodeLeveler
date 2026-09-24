@@ -291,10 +291,17 @@ pub struct Application {
     work_profile: WorkProfile,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
-    /// Round limit for headless goal runs (`leveler run`). `None` keeps a
-    /// goal until-terminal; the CLI sets it from `--max-rounds` or the
-    /// default. Eval and the interactive UI never set it.
-    task_round_limit: Option<u32>,
+    /// Model-step safety ceiling for this application's top-level runs, from
+    /// the CLI's `--max-model-steps` (alias `--max-rounds`). `None` pins no
+    /// ceiling; the CLI resolves "flag absent" to
+    /// [`DEFAULT_MODEL_STEP_CEILING`]. Eval sets its own bounded window and the
+    /// interactive UI pins no ceiling.
+    ///
+    /// This is a mechanical circuit breaker against a runaway model↔tool
+    /// loop, never a task budget: a top-level task ends on its goal lifecycle
+    /// or a resource budget (tokens/cost/duration), all of which are carried
+    /// across continues and resumes by the epoch ledger.
+    model_step_ceiling: Option<u32>,
     environment: Arc<leveler_core::EnvSnapshot>,
     /// Process-lived background task registry, shared (cloned) into every
     /// engine/turn so `background=true` servers survive between messages. A
@@ -535,7 +542,7 @@ impl Application {
             execution_overrides: None,
             work_profile: WorkProfile::Balanced,
             collaboration: CollaborationMode::Chat,
-            task_round_limit: None,
+            model_step_ceiling: None,
             environment,
             background_tasks,
             browser,
@@ -625,12 +632,16 @@ impl Application {
         self
     }
 
-    /// Engine-paced task budget for headless goal runs, from the CLI's
-    /// `--max-rounds`: absent means the default ([`DEFAULT_TASK_ROUNDS`]),
-    /// `0` means unbounded, `n` means `n` rounds. A hard limit: the run
-    /// stops there and reports it, nothing extends it.
-    pub fn with_task_round_budget(mut self, max_rounds: Option<u32>) -> Self {
-        self.task_round_limit = task_round_limit_from_flag(max_rounds);
+    /// Model-step safety ceiling for this application's top-level runs, from
+    /// the CLI's `--max-model-steps` (alias `--max-rounds`): absent means the
+    /// default ([`DEFAULT_MODEL_STEP_CEILING`]), `0` means no ceiling, `n`
+    /// means `n` model steps.
+    ///
+    /// A ceiling, not a task budget: reaching it stops a runaway model↔tool
+    /// loop and reports `TurnLimitReached`. Nothing about a task's remaining
+    /// work is decided by a model-step count.
+    pub fn with_model_step_ceiling(mut self, max_model_steps: Option<u32>) -> Self {
+        self.model_step_ceiling = model_step_ceiling_from_flag(max_model_steps);
         self
     }
 
@@ -728,7 +739,12 @@ impl Application {
     }
 
     pub(crate) fn top_level_limits(&self) -> leveler_agent::StepLimits {
-        top_level_limits_from_config(&self.project_config().limits)
+        let mut limits = top_level_limits_from_config(&self.project_config().limits);
+        // The one place a top-level run's model-step safety ceiling is pinned.
+        // `None` here means "this application pins no ceiling" (the
+        // interactive UI), not "unbounded by accident".
+        limits.max_model_steps = self.model_step_ceiling;
+        limits
     }
 
     /// Connect to the configured MCP servers once and cache their tools, so
@@ -1372,48 +1388,54 @@ mod merge_tests {
     }
 }
 
-/// The default round limit for `leveler run`. From the C2 batches: every
-/// run that closed did so within 169 rounds.
-pub const DEFAULT_TASK_ROUNDS: u32 = 200;
+/// The default model-step safety ceiling for a top-level run.
+///
+/// One source of truth with the kernel: this is the ceiling applied when a
+/// host pins none, and the value `leveler run` uses when
+/// `--max-model-steps`/`--max-rounds` is absent. It is a mechanical circuit
+/// breaker against a runaway model↔tool loop, deliberately an order of
+/// magnitude above the measured normal range (task runs close in 9–25 model
+/// steps), and it must never be lowered to "bound useful work".
+pub const DEFAULT_MODEL_STEP_CEILING: u32 = leveler_agent::DEFAULT_MODEL_STEP_CEILING;
 
-/// `--max-rounds` → round limit: absent = default, `0` = unbounded, `n` = n.
-pub fn task_round_limit_from_flag(max_rounds: Option<u32>) -> Option<u32> {
-    match max_rounds {
-        None => Some(DEFAULT_TASK_ROUNDS),
+/// `--max-model-steps` → safety ceiling: absent = default, `0` = no ceiling,
+/// `n` = n.
+pub fn model_step_ceiling_from_flag(max_model_steps: Option<u32>) -> Option<u32> {
+    match max_model_steps {
+        None => Some(DEFAULT_MODEL_STEP_CEILING),
         Some(0) => None,
         Some(n) => Some(n),
     }
 }
 
-/// The continuation a goal runs under for a given round limit: pinned to the
-/// limit when there is one, until-terminal otherwise.
-pub fn goal_continuation_for(limit: Option<u32>) -> leveler_agent::ContinuationPolicy {
-    match limit {
-        Some(n) => leveler_agent::ContinuationPolicy::bounded(n),
-        None => leveler_agent::ContinuationPolicy::UntilTerminal,
-    }
-}
-
 #[cfg(test)]
-mod task_round_limit_tests {
-    use super::{DEFAULT_TASK_ROUNDS, goal_continuation_for, task_round_limit_from_flag};
+mod model_step_ceiling_tests {
+    use super::{DEFAULT_MODEL_STEP_CEILING, model_step_ceiling_from_flag};
 
     #[test]
-    fn the_flag_maps_to_default_unbounded_or_a_limit() {
-        assert_eq!(task_round_limit_from_flag(None), Some(DEFAULT_TASK_ROUNDS));
-        assert_eq!(task_round_limit_from_flag(Some(0)), None);
-        assert_eq!(task_round_limit_from_flag(Some(40)), Some(40));
+    fn the_flag_maps_to_default_no_ceiling_or_a_ceiling() {
+        assert_eq!(
+            model_step_ceiling_from_flag(None),
+            Some(DEFAULT_MODEL_STEP_CEILING)
+        );
+        assert_eq!(model_step_ceiling_from_flag(Some(0)), None);
+        assert_eq!(model_step_ceiling_from_flag(Some(40)), Some(40));
     }
 
-    /// The bug exp8 ran with: a limit on the spec and an until-terminal
-    /// continuation pinned over it is a limit that never binds.
+    /// The product default must BE the kernel's ceiling: one concept, one
+    /// value. (The "far above normal runs" invariant is a compile-time
+    /// assertion next to the kernel constant.)
     #[test]
-    fn a_limit_pins_the_continuation() {
+    fn the_product_default_is_the_kernel_ceiling() {
         assert_eq!(
-            goal_continuation_for(Some(DEFAULT_TASK_ROUNDS)).round_limit(),
-            Some(DEFAULT_TASK_ROUNDS)
+            DEFAULT_MODEL_STEP_CEILING,
+            leveler_agent::DEFAULT_MODEL_STEP_CEILING
         );
-        assert_eq!(goal_continuation_for(None).round_limit(), None);
+        assert_eq!(
+            model_step_ceiling_from_flag(None),
+            Some(leveler_agent::DEFAULT_MODEL_STEP_CEILING),
+            "a run with no flag must still get the mechanical breaker"
+        );
     }
 }
 

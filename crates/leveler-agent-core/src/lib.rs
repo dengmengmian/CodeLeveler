@@ -39,8 +39,9 @@ pub use error::AgentCoreError;
 pub use event::AgentEvent;
 pub use harness::{AgentHarness, BasicHarness, Flow, LoopContext};
 pub use limits::{
-    BudgetDimension, BudgetExhaustion, DEFAULT_ROUND_CEILING, RoundAdmission, RoundAdmissionInput,
-    RoundLimits, SpentBefore, admit_next_round,
+    BudgetDimension, BudgetExhaustion, DEFAULT_MODEL_STEP_CEILING, DEFAULT_ROUND_CEILING,
+    ModelStepAdmission, ModelStepAdmissionInput, ModelStepLimits, SpentBefore,
+    admit_next_model_step,
 };
 pub use model_round::{ModelRound, run_model_round};
 pub use stop::{LoopStop, StopReason};

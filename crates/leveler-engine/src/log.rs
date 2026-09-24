@@ -1018,6 +1018,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 2,
                 cached_input_tokens: 0,
+                reasoning_tokens: None,
             },
             &mut |_| forwarded += 1,
         )

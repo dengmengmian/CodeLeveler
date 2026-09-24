@@ -18,7 +18,20 @@ pub struct UsageProjection {
     /// The cached subset of [`Self::input_tokens`].
     pub cached_input_tokens: u64,
     /// Completion tokens.
+    ///
+    /// This is the provider's own total and already INCLUDES the reasoning
+    /// share, so every budget and cost reading below uses it as it stands —
+    /// adding [`Self::reasoning_tokens`] on top would double-charge thinking.
     pub output_tokens: u64,
+    /// Summed over the calls that reported a reasoning breakdown. A SUBSET of
+    /// [`Self::output_tokens`], not an addition to it. Calls that reported
+    /// none are counted in [`Self::records_without_reasoning_usage`] rather
+    /// than contributing zero, because unreported is not the same as none.
+    pub reasoning_tokens: u64,
+    /// Calls the provider reported no reasoning breakdown for. A session that
+    /// folded any of these cannot state a visible-output total, which is why
+    /// [`Self::visible_output_tokens`] returns `None` for it.
+    pub records_without_reasoning_usage: u64,
     /// Summed over calls that carried a price. Calls without one are counted
     /// in [`Self::records_without_cost`] rather than read as free.
     pub cost_usd_micros: u64,
@@ -55,6 +68,12 @@ impl UsageProjection {
         self.cached_input_tokens = self
             .cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        match usage.reasoning_tokens {
+            Some(reasoning) => {
+                self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning)
+            }
+            None => self.records_without_reasoning_usage += 1,
+        }
         match cost_usd_micros {
             Some(cost) => self.cost_usd_micros = self.cost_usd_micros.saturating_add(cost),
             None => self.records_without_cost = self.records_without_cost.saturating_add(1),
@@ -83,6 +102,29 @@ impl UsageProjection {
     /// Cost a `max_cost_usd_micros` cap is measured against.
     pub fn admission_cost_usd_micros(&self) -> u64 {
         self.cost_usd_micros
+    }
+
+    /// Output tokens that were not reasoning — `output - reasoning`.
+    ///
+    /// `Some` only when every folded call reported a breakdown, so the sum is
+    /// a statement about the whole run. `None` means at least one provider
+    /// reported nothing, and subtracting a partial sum would silently claim a
+    /// visible share nobody measured.
+    pub fn visible_output_tokens(&self) -> Option<u64> {
+        if self.requests == 0 || self.records_without_reasoning_usage > 0 {
+            return None;
+        }
+        self.output_tokens.checked_sub(self.reasoning_tokens)
+    }
+
+    /// Share of output tokens spent on reasoning, in `0.0..=1.0`. `None`
+    /// unless [`Self::visible_output_tokens`] is derivable.
+    pub fn reasoning_share(&self) -> Option<f64> {
+        self.visible_output_tokens()?;
+        if self.output_tokens == 0 {
+            return Some(0.0);
+        }
+        Some(self.reasoning_tokens as f64 / self.output_tokens as f64)
     }
 }
 
@@ -149,6 +191,14 @@ mod tests {
             input_tokens: input,
             cached_input_tokens: cached,
             output_tokens: output,
+            reasoning_tokens: None,
+        }
+    }
+
+    fn reasoning_usage(input: u64, cached: u64, output: u64, reasoning: u64) -> TokenUsage {
+        TokenUsage {
+            reasoning_tokens: Some(reasoning),
+            ..usage(input, cached, output)
         }
     }
 
@@ -163,6 +213,40 @@ mod tests {
         assert_eq!(p.output_tokens, 300);
         assert_eq!(p.cost_usd_micros, 120);
         assert_eq!(p.reported_model_tokens(), 3_300);
+    }
+
+    /// Reasoning is a breakdown of the completion count: folding it changes no
+    /// admission number and no bill, only what the run can say about where the
+    /// output tokens went.
+    #[test]
+    fn reasoning_is_folded_without_changing_the_admitted_totals() {
+        let mut p = UsageProjection::default();
+        p.record(reasoning_usage(1_000, 900, 1_000, 700), Some(50), None);
+        p.record(reasoning_usage(2_000, 1_800, 500, 100), Some(70), None);
+        assert_eq!(p.input_tokens, 3_000);
+        assert_eq!(p.output_tokens, 1_500, "provider totals, not re-derived");
+        assert_eq!(p.reasoning_tokens, 800);
+        assert_eq!(p.visible_output_tokens(), Some(700));
+        assert_eq!(p.reasoning_share(), Some(800.0 / 1_500.0));
+        assert_eq!(
+            p.admission_model_tokens(),
+            4_500,
+            "the budget reads the same total with or without the breakdown"
+        );
+        assert_eq!(p.reported_model_tokens(), 4_500);
+    }
+
+    /// One call without a breakdown makes the run's visible-output total
+    /// unknown, rather than quietly subtracting a partial sum.
+    #[test]
+    fn an_unreported_breakdown_makes_visible_output_unknown() {
+        let mut p = UsageProjection::default();
+        p.record(reasoning_usage(10, 0, 100, 40), None, None);
+        p.record(usage(10, 0, 100), None, None);
+        assert_eq!(p.records_without_reasoning_usage, 1);
+        assert_eq!(p.output_tokens, 200);
+        assert_eq!(p.visible_output_tokens(), None);
+        assert_eq!(p.reasoning_share(), None);
     }
 
     /// An unpriced call is counted as unpriced, never as free.

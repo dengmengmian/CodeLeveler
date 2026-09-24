@@ -1,0 +1,36 @@
+id: rust-mul
+name: Add a Rust multiply function
+files:
+  Cargo.toml: |
+    [package]
+    name = "evalcase"
+    version = "0.1.0"
+    edition = "2021"
+
+    [lib]
+    path = "lib.rs"
+  lib.rs: |
+    pub fn add(a: i32, b: i32) -> i32 {
+        a + b
+    }
+  tests/spec.rs: |
+    use evalcase::mul;
+
+    #[test]
+    fn multiplies_two_positive_numbers() {
+        assert_eq!(mul(2, 3), 6);
+    }
+
+    #[test]
+    fn multiplies_by_zero() {
+        assert_eq!(mul(0, 5), 0);
+    }
+
+    #[test]
+    fn multiplies_a_negative() {
+        assert_eq!(mul(-4, 3), -12);
+    }
+task: "Implement pub fn mul(a: i32, b: i32) -> i32 in lib.rs returning a*b, so all tests in tests/spec.rs pass. Do not modify the tests."
+expect:
+  program: cargo
+  args: ["test", "--quiet"]

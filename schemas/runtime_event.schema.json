@@ -812,6 +812,15 @@
           "format": "uint32",
           "minimum": 0.0
         },
+        "reasoning_tokens": {
+          "description": "Subset of `output_tokens` the provider attributed to reasoning. `None` when it reported no breakdown — unreported is not a measured zero.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "type": {
           "type": "string",
           "enum": [
@@ -3445,6 +3454,15 @@
               "format": "uint32",
               "minimum": 0.0
             },
+            "reasoning_tokens": {
+              "description": "Subset of `output_tokens` the provider attributed to reasoning. `None` when it reported no breakdown — unreported is not a measured zero.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -5736,6 +5754,14 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "requests": {
           "type": "integer",
           "format": "uint32",
@@ -6223,6 +6249,15 @@
         "provider": {
           "type": "string"
         },
+        "reasoning_tokens": {
+          "description": "Subset of `output_tokens` spent on reasoning, when the provider reported a breakdown. `None` = not reported.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "retry_count": {
           "type": "integer",
           "format": "uint32",
@@ -6345,6 +6380,15 @@
         },
         "output_tokens": {
           "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reasoning_tokens": {
+          "description": "Reasoning tokens summed over the requests that reported a breakdown — a SUBSET of `output_tokens`, never an addition to it. `None` when no request reported one, which is an absence of measurement.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint64",
           "minimum": 0.0
         },

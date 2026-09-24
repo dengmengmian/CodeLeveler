@@ -99,10 +99,12 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            reasoning_tokens,
         } => AgentEvent::Usage {
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            reasoning_tokens,
         },
         EngineEvent::Compacted { from, to } => AgentEvent::Compacted { from, to },
         EngineEvent::AdvisoryStarted { kind } => AgentEvent::AdvisoryStarted {
@@ -222,7 +224,7 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
 fn report_to_result(report: TaskReport) -> Result<AgentOutcome, AppError> {
     Ok(AgentOutcome {
         final_text: report.final_text,
-        rounds: report.rounds,
+        model_steps: report.model_steps,
         modified_files: report.modified_files,
         stop_reason: report.stop_reason,
         stop_detail: report.stop_detail,
@@ -427,12 +429,17 @@ impl Application {
     }
 
     /// The direct-task spec for this repository.
+    ///
+    /// The continuation is `UntilTerminal` on purpose: a top-level task ends
+    /// on its goal lifecycle (complete/blocked/stalled), a resource budget, or
+    /// cancellation — never on a model-step count. Its only model-step bound
+    /// is the mechanical safety ceiling carried in `top_level_limits()`.
     fn direct_spec(&self, goal: String, mode: PermissionProfile, sandbox: bool) -> TaskSpec {
         TaskSpec {
             runtime: leveler_agent::coding::RuntimeTaskSpec {
                 goal,
                 kind: ExecutionKind::Direct,
-                continuation: crate::goal_continuation_for(self.task_round_limit),
+                continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
                 limits: self.top_level_limits(),
             },
             coding: leveler_agent::coding::CodingTaskSpec {
@@ -477,9 +484,10 @@ impl Application {
             // the canonical stream one-way.
             &mut |event| forward_engine_event(event, observer),
             cancellation,
-            // Headless goals run under the task round limit when one is set;
-            // pinning UntilTerminal over it was the exp8 null result.
-            crate::goal_continuation_for(self.task_round_limit),
+            // A headless goal is a top-level task like any other: its lifetime
+            // is the goal's, not a model-step count. `top_level_limits()`
+            // carries the mechanical safety ceiling.
+            leveler_agent::ContinuationPolicy::UntilTerminal,
             unattended_limits(self.top_level_limits()),
             false,
         )

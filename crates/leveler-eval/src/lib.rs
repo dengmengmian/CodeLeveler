@@ -195,6 +195,12 @@ pub struct CaseResult {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// The reasoning share of [`Self::output_tokens`], summed over the requests
+    /// that reported one — a SUBSET, never an addition. `None` means at least
+    /// one request (or a legacy artifact) carried no breakdown, so a
+    /// visible-output figure cannot be derived for this case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     /// Provider pricing is optional. `None` means no configured, auditable
     /// price was available; the harness never invents a cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1398,6 +1404,7 @@ mod tests {
             latency_ms: 0,
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: None,
             cost_usd_micros: None,
             failure_category: None,
             failure_source: None,
@@ -2083,6 +2090,7 @@ mod tests {
             latency_ms: 0,
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: None,
             cost_usd_micros: None,
             failure_category: None,
             failure_source: None,
@@ -2412,6 +2420,7 @@ expect: { program: cargo, args: [test] }
                 latency_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: None,
                 cost_usd_micros: None,
                 failure_category: Some(FailureCategory::Verification),
                 failure_source: None,
@@ -2460,6 +2469,7 @@ expect: { program: cargo, args: [test] }
                 latency_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                reasoning_tokens: None,
                 cost_usd_micros: None,
                 failure_category: Some(FailureCategory::Runtime),
                 failure_source: None,
