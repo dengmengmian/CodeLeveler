@@ -167,6 +167,58 @@ RUNTIME DEFECT
 
 The Runtime fixes engineering problems—failure, concurrency, cancellation, recovery, authority, consistency—not intelligence limits.
 
+### 4.1 Model Independence: Maximize Model Capability, Minimize Model Adaptation
+
+One of CodeLeveler's core goals is to let different models exercise as much of their native capability as possible on the same stable Harness and Runtime, rather than maintaining model-specific execution logic for every model.
+
+Design goal:
+
+> **Maximize native model capability, minimize model-specific adaptation.**
+
+Model identity itself must not be an input to execution policy. The architecture must not grow branches such as:
+
+```text
+if DeepSeek { ... }
+if GLM { ... }
+if GPT { ... }
+if Claude { ... }
+```
+
+Real model differences must be expressed through explicit, observable capabilities such as:
+
+```text
+context window
+reasoning support
+parallel tool calls
+vision
+structured output
+tool calling
+maximum output
+```
+
+The system negotiates capabilities instead of guessing behavior from a model name.
+
+The Agent Kernel owns only model-independent mechanical facts and mechanisms: model steps, tool execution, streaming, cancellation, timeout, budgets, usage, retries, persistence, and recovery. The Kernel must not encode assumptions such as “this model tends to repeat work,” “this model needs extra prompting,” or “this model should plan in a particular way.”
+
+The Coding Harness may provide generic soft policy or execution feedback based on observed runtime facts, but it must not assume how a particular model should think or act. Corrective behavior must be triggered by observable behavior—such as repeated verification, prolonged lack of effective progress, repeated identical failures, or failure to converge—not by model identity.
+
+Any adaptive policy must be:
+
+```text
+observable
+explainable
+disableable
+measurable
+A/B testable
+model-independent
+```
+
+Adaptive policy may improve the execution environment, capability surface, or quality of feedback. It must not replace the model's planning, reasoning, or semantic completion judgment, and it must not turn the Harness into a second Agent Brain.
+
+As model capability improves, unnecessary Harness intervention should naturally decrease. Better models should translate directly into better CodeLeveler performance rather than forcing CodeLeveler to be restructured, retuned, or given new model-specific branches.
+
+CodeLeveler provides a stable execution environment, capabilities, feedback, and boundaries; the model uses those conditions to perform the intelligent work.
+
 ---
 
 ## 5. Harness: Defining What Kind of Agent This Is
@@ -600,6 +652,36 @@ If file mutation follows one authority, commands another, and child agents a thi
 For controlled real side effects:
 
 > **Requests may come from many places. Final execution authority must remain singular.**
+
+### 9.2 Data Egress and Privacy Boundary
+
+Network access is a real host side effect, so data egress follows the same Host Authority and least-necessary-data principles.
+
+By default, CodeLeveler itself does not collect or report product telemetry or user work data to the CodeLeveler project or a central service, including:
+
+```text
+source code and file contents
+conversations and prompts
+model output
+commands and command output
+environment information
+usage analytics
+crash context
+```
+
+This does not mean that CodeLeveler never uses the network. Explicitly enabled external capabilities—such as a model Provider, MCP, web search, remote execution, or update checks—may make the network requests required to perform that capability.
+
+Such egress must be:
+
+```text
+triggered by an explicit feature
+explainable in destination and purpose
+limited to data necessary for that capability
+not broadened through hidden fallback
+never used to send credentials or secrets as telemetry
+```
+
+If diagnostics, crash reporting, or usage analytics are added in the future, they must be explicit opt-in, disableable, and decoupled from core Agent execution. Using CodeLeveler must never implicitly grant permission to upload user work data.
 
 ---
 
@@ -1359,6 +1441,23 @@ Adding a semantically different Harness must not require redesigning the Agent K
 ```text
 Moving responsibility between layers must not weaken
 mechanical correctness, authority, persistence, cancellation, recovery, or safety.
+```
+
+### 18.11 Model Independence Boundary
+
+```text
+Model identity does not determine runtime behavior.
+Model differences are expressed through capabilities.
+Behavioral correction is based on observable runtime facts, not model names.
+As models become stronger, unnecessary Harness intervention should decrease.
+```
+
+### 18.12 Data and Privacy Boundary
+
+```text
+CodeLeveler does not report product telemetry or user work data by default.
+Necessary data egress must be triggered by an explicitly enabled capability and follow least-necessary-data rules.
+Hidden data upload must not become part of Runtime, Harness, or Provider adaptation.
 ```
 
 ---
