@@ -399,10 +399,13 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
             MdBlock::Heading { level, spans } => {
                 // Render as a styled heading (no literal "#" markers). H1/H2
                 // use the readable accent across the whole heading and get a
-                // leading bar, so long answers remain easy to scan. Minor
-                // headings stay primary text to avoid painting every section.
+                // leading bar, so long answers remain easy to scan. H3 uses
+                // the quieter primary accent without the bar; deeper headings
+                // stay primary text to avoid painting every subsection.
                 let color = if *level <= 2 {
                     theme.accent.secondary
+                } else if *level == 3 {
+                    theme.accent.primary
                 } else {
                     theme.text.primary
                 };
@@ -897,7 +900,7 @@ fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec
             style = style.add_modifier(Modifier::ITALIC);
         }
         if s.code {
-            style = Style::default().fg(theme.text.secondary);
+            style = Style::default().fg(theme.text.code);
         }
         if s.link.is_some() {
             // Match bare-URL treatment so markdown links and bare URLs look
@@ -1067,6 +1070,7 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Vec<((u8, u8, u8), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeId;
 
     #[test]
     fn parses_headings_bold_and_code() {
@@ -1212,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn minor_headings_remain_bold_primary_text() {
+    fn h3_uses_the_secondary_heading_accent_without_a_leading_bar() {
         let theme = Theme::dark();
         let lines = MdDoc::parse("### 细节").to_lines(40, &theme);
 
@@ -1220,8 +1224,29 @@ mod tests {
             lines[0]
                 .spans
                 .iter()
+                .all(|span| span.style.fg == Some(theme.accent.primary)),
+            "H3 should separate sections with the quieter heading accent"
+        );
+        assert!(!lines[0].to_string().starts_with('▎'));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn h4_and_below_remain_bold_primary_text() {
+        let theme = Theme::dark();
+        let lines = MdDoc::parse("#### 细节").to_lines(40, &theme);
+
+        assert!(
+            lines[0]
+                .spans
+                .iter()
                 .all(|span| span.style.fg == Some(theme.text.primary)),
-            "H3-H6 should not make long answers overly colorful"
+            "H4-H6 should not make long answers overly colorful"
         );
         assert!(
             lines[0]
@@ -1229,6 +1254,33 @@ mod tests {
                 .iter()
                 .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
         );
+    }
+
+    #[test]
+    fn inline_code_uses_a_distinct_noninteractive_color() {
+        for id in ThemeId::FIXED {
+            let theme = Theme::named(id);
+            let lines =
+                MdDoc::parse("open `backend/internal/modules/` then [docs](https://example.com)")
+                    .to_lines(100, &theme);
+            let code = lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.contains("backend/internal/modules/"))
+                .expect("inline code span");
+
+            assert_eq!(code.style.fg, Some(theme.text.code), "{id}");
+            assert_ne!(code.style.fg, Some(theme.text.primary), "{id}");
+            assert_ne!(code.style.fg, Some(theme.text.secondary), "{id}");
+            assert_ne!(code.style.fg, Some(theme.accent.primary), "{id}");
+            assert!(
+                !code
+                    .style
+                    .add_modifier
+                    .intersects(Modifier::BOLD | Modifier::UNDERLINED),
+                "inline code must not look clickable: {id}"
+            );
+        }
     }
 
     #[test]
