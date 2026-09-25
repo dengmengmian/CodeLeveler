@@ -280,7 +280,7 @@ export type RuntimeEvent =
   /** A user shell execution ended. `status` is `success | failed | cancelled`; `exit_code` is `None` when the process was killed or never spawned. */
   | { type: 'user_shell_exited'; duration_ms: number; execution_id: UserShellId; exit_code?: number | null; status: string }
   /** Real token usage reported by the model for the latest request. The context gauge tracks how full the window is; `input_tokens` already includes the whole prompt (system + history + tools), so the window in use is `input_tokens + output_tokens`. */
-  | { type: 'token_usage'; cached_input_tokens: number; input_tokens: number; output_tokens: number }
+  | { type: 'token_usage'; cached_input_tokens: number; input_tokens: number; output_tokens: number; reasoning_tokens?: number | null }
   /** The accounting of the exact next model request, computed by the kernel before the request is sent. Transient: nothing persists it, and a reconnecting client gets the latest through its live view. */
   | { type: 'context_usage'; accounting: ContextAccounting }
   /** An orchestrated run completed; carries the summary report (spec §23). */
@@ -719,6 +719,7 @@ export interface UiLaneAccounting {
   input_tokens: number;
   lane: string;
   output_tokens: number;
+  reasoning_tokens?: number | null;
   requests: number;
 }
 
@@ -852,6 +853,8 @@ export interface UiRequestObservation {
   model: string;
   output_tokens: number;
   provider: string;
+  /** Subset of `output_tokens` spent on reasoning, when the provider reported a breakdown. `None` = not reported. */
+  reasoning_tokens?: number | null;
   retry_count: number;
 }
 
@@ -878,6 +881,8 @@ export interface UiSessionObservation {
   last_sequence?: number | null;
   model: string;
   output_tokens: number;
+  /** Reasoning tokens summed over the requests that reported a breakdown — a SUBSET of `output_tokens`, never an addition to it. `None` when no request reported one, which is an absence of measurement. */
+  reasoning_tokens?: number | null;
   repository: string;
   request_count: number;
   request_failures: number;
