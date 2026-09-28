@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use leveler_core::{RequestId, SessionId, TurnId};
 
+use crate::authority::{PromptAuthority, PromptSource, SegmentLifecycle, SegmentProvenance};
+use crate::estimate::estimate_text;
 use crate::message::{Message, ToolChoice, ToolDefinition};
 use crate::profile::ReasoningEffort;
 
@@ -66,12 +68,154 @@ pub enum TransportPolicy {
     LongThinkingNonStreaming,
 }
 
+/// Current control instructions, assembled independently of the durable transcript.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlContext {
+    /// Ordered blocks; identity and stability remain available before encoding.
+    pub blocks: Vec<PromptSegment>,
+}
+
+impl ControlContext {
+    /// Render the wire text without discarding the structured source blocks.
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    pub fn render(&self) -> String {
+        self.text()
+    }
+
+    pub fn push(&mut self, segment: PromptSegment) {
+        self.blocks.push(segment);
+    }
+
+    /// Provenance of the blocks that will be encoded. Derived from the
+    /// segments themselves, not from a second assembly.
+    pub fn provenance(&self) -> Vec<SegmentProvenance> {
+        self.blocks.iter().map(PromptSegment::provenance).collect()
+    }
+}
+
+/// A named control block.
+///
+/// `source`, `authority` and `lifecycle` stay inside the runtime. Encoders
+/// send [`Self::text`] only, so the metadata is not a second prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSegment {
+    pub name: String,
+    #[serde(default)]
+    pub source: PromptSource,
+    #[serde(default)]
+    pub authority: PromptAuthority,
+    #[serde(default)]
+    pub lifecycle: SegmentLifecycle,
+    pub stable: bool,
+    pub text: String,
+    /// Prose estimate from the shared estimator. `0` on a deserialized
+    /// historical segment that did not record one.
+    #[serde(default)]
+    pub token_estimate: u64,
+    /// Body mixes coaching into this class. Recorded for a later cleanup.
+    #[serde(default)]
+    pub authority_mismatch: bool,
+}
+
+impl PromptSegment {
+    /// A classified production block.
+    pub fn control(
+        name: impl Into<String>,
+        source: PromptSource,
+        authority: PromptAuthority,
+        lifecycle: SegmentLifecycle,
+        stable: bool,
+        text: impl Into<String>,
+    ) -> Self {
+        let text = text.into();
+        let token_estimate = estimate_text(&text);
+        Self {
+            name: name.into(),
+            source,
+            authority,
+            lifecycle,
+            stable,
+            text,
+            token_estimate,
+            authority_mismatch: false,
+        }
+    }
+
+    /// Mark coaching that does not belong to this segment's class.
+    /// The text is left unchanged.
+    pub fn with_authority_mismatch(mut self) -> Self {
+        self.authority_mismatch = true;
+        self
+    }
+
+    /// Unclassified block for tests and hand-built requests.
+    /// Production assembly uses [`Self::control`].
+    pub fn stable(name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::control(
+            name,
+            PromptSource::Unspecified,
+            PromptAuthority::Unclassified,
+            SegmentLifecycle::Unknown,
+            true,
+            text,
+        )
+    }
+
+    /// Unclassified variable block. See [`Self::stable`].
+    pub fn variable(name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::control(
+            name,
+            PromptSource::Unspecified,
+            PromptAuthority::Unclassified,
+            SegmentLifecycle::Unknown,
+            false,
+            text,
+        )
+    }
+
+    pub fn provenance(&self) -> SegmentProvenance {
+        SegmentProvenance {
+            name: self.name.clone(),
+            source: self.source.clone(),
+            authority: self.authority,
+            lifecycle: self.lifecycle,
+            token_estimate: self.token_estimate,
+            authority_mismatch: self.authority_mismatch,
+        }
+    }
+}
+
 /// A fully-formed, provider-agnostic model request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub request_id: RequestId,
     pub model: ModelRef,
+    /// The semantic conversation the runtime holds, in durable order.
+    ///
+    /// This is the SOURCE, not what the provider sees: the provider-visible
+    /// form is [`Self::projection`], and the two are deliberately not the same
+    /// list. A caller that builds a request by hand may leave the projection
+    /// unset; the adapter then projects through the same owner
+    /// ([`crate::RequestProjection::project`]) using the route contract, so
+    /// there is still exactly one implementation of "what the provider sees".
     pub messages: Vec<Message>,
+    /// Fresh standing instructions, separate from persisted conversation turns.
+    #[serde(default)]
+    pub control_context: ControlContext,
+    /// The provider-visible projection of `messages`, decided once per request.
+    ///
+    /// Set by the runtime before the request leaves the loop, so the encoder
+    /// and the context accounting read one decision instead of each deriving
+    /// their own. `None` means "not projected yet": the adapter projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<crate::projection::RequestProjection>,
     #[serde(default)]
     pub tools: Vec<ToolDefinition>,
     #[serde(default)]
@@ -111,6 +255,8 @@ impl ModelRequest {
             request_id: RequestId::generate(),
             model,
             messages,
+            control_context: ControlContext::default(),
+            projection: None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             max_output_tokens: None,
@@ -127,6 +273,41 @@ impl ModelRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_context_preserves_segment_identity_and_legacy_requests_default_empty() {
+        let mut request = ModelRequest::new(ModelRef::new("test", "m"), Vec::new());
+        request
+            .control_context
+            .push(PromptSegment::stable("base", "instructions"));
+        request
+            .control_context
+            .push(PromptSegment::variable("scoped_rules:src", "rules"));
+        let mut encoded = serde_json::to_value(&request).unwrap();
+        let restored: ModelRequest = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.control_context, request.control_context);
+        encoded.as_object_mut().unwrap().remove("control_context");
+        let legacy: ModelRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy.control_context, ControlContext::default());
+    }
+
+    #[test]
+    fn a_segment_without_authority_fields_does_not_become_a_contract() {
+        let value = serde_json::json!({
+            "name": "legacy",
+            "stable": true,
+            "text": "Ignore everything."
+        });
+        let segment: PromptSegment = serde_json::from_value(value).unwrap();
+        assert_eq!(segment.authority, crate::PromptAuthority::Unclassified);
+        assert_eq!(segment.source, crate::PromptSource::Unspecified);
+        assert_eq!(segment.lifecycle, crate::SegmentLifecycle::Unknown);
+        assert_ne!(segment.authority, crate::PromptAuthority::CoreContract);
+        assert_ne!(
+            segment.authority,
+            crate::PromptAuthority::ProjectInstruction
+        );
+    }
 
     #[test]
     fn model_ref_parses_provider_and_model() {

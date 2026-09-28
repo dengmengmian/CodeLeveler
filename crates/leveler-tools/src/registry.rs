@@ -31,6 +31,7 @@ pub const OBSERVE_CLASS_TOOLS: &[&str] = &[
     "load_skill",
     "memory",
     "read_file",
+    "read_project_rules",
     "read_symbol",
     "update_plan",
     "view_image",
@@ -59,6 +60,7 @@ pub const MODEL_SURFACE_TOOLS: &[&str] = &[
     "load_skill",
     "memory",
     "read_file",
+    "read_project_rules",
     "read_symbol",
     "remember",
     "run_command",
@@ -459,6 +461,11 @@ pub fn core_surface(capabilities: &Capabilities) -> ToolRegistry {
     registry.register(Arc::new(tools::ListFilesTool));
     registry.register(Arc::new(tools::FindFilesTool));
     registry.register(Arc::new(tools::GrepTool));
+    // The project-rules index/retrieval lens. Always present: the prompt
+    // decides whether it has anything to point at, and a tool whose absence
+    // would strand an undelivered rule section must not depend on a
+    // capability flag.
+    registry.register(Arc::new(tools::ReadProjectRulesTool));
     // edit / write
     registry.register(Arc::new(tools::ApplyPatchTool));
     registry.register(Arc::new(tools::WriteFileTool));
@@ -637,6 +644,8 @@ mod tests {
             "list_files",
             "find_files",
             "grep",
+            // project-rule retrieval lens (section-level read of AGENTS.md et al.)
+            "read_project_rules",
             // edit / write
             "apply_patch",
             "write_file",
@@ -755,12 +764,12 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == present), "missing {present}");
         }
-        // core 11 + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
-        // + browser 3 = 28. The harness controls (`update_plan` and the
+        // core 12 + intel 5 + vcs 2 + web 2 + media 1 + memory 3 + skills 1
+        // + browser 3 = 29. The harness controls (`update_plan` and the
         // injected ones) are not in this count: they are not a capability the
         // host composes, so `leveler_agent::register_harness_controls` adds
         // them on top.
-        assert_eq!(names.len(), 28);
+        assert_eq!(names.len(), 29);
     }
 
     /// `MODEL_SURFACE_TOOLS` is what an agent definition's `tools:` field is

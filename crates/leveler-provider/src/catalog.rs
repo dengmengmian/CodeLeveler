@@ -67,6 +67,12 @@ fn validate_model_config(
             reason,
         });
     }
+    if let Err(reason) = leveler_model::validate_model_limits(&cfg.profile.limits) {
+        return Err(ConfigError::InvalidLimits {
+            path: source.to_string(),
+            reason,
+        });
+    }
     Ok(cfg)
 }
 
@@ -131,9 +137,6 @@ limits:
   max_output_tokens: 8192
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 1
-compatibility:
-  synthesize_tool_call_ids: true
-  drop_unsupported_fields: true
 "#;
         let cfg: ModelConfigFile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.profile.id, "default");
@@ -166,9 +169,6 @@ limits:
   max_output_tokens: 8192
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 4
-compatibility:
-  synthesize_tool_call_ids: true
-  drop_unsupported_fields: true
 "#;
         let cfg: ModelConfigFile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.profile.provider, "anthropic");
@@ -291,7 +291,10 @@ limits:
                         profile.id
                     );
                 }
-                ReasoningStyle::OpenAiEffort | ReasoningStyle::ThinkingFlag => {
+                ReasoningStyle::OpenAiEffort
+                | ReasoningStyle::ThinkingFlag
+                | ReasoningStyle::AdaptiveThinking
+                | ReasoningStyle::BudgetedThinking { .. } => {
                     assert!(
                         !profile.reasoning.supported_efforts.is_empty(),
                         "{}: reasoning model must declare supported_efforts",
@@ -349,6 +352,21 @@ limits:
                 ]
             );
             assert_eq!(profile.reasoning.default_effort, Some(ReasoningEffort::Max));
+            // GLM's Coding Plan endpoint keeps its own thinking history
+            // server-side (`clear_thinking`) and CodeLeveler enables no
+            // preserved-thinking mode for it, so this route replays nothing.
+            // The contract is resolved from GLM's OWN facts — not inherited
+            // from DeepSeek — and this is the GLM regression gate: a change
+            // that starts replaying reasoning (or fabricating the empty key)
+            // on this route fails here.
+            let replay = leveler_model::ReasoningReplayContract::resolve(
+                profile.protocol,
+                &profile.compatibility,
+            );
+            assert_eq!(replay.arm_name(), "never", "{file}");
+            assert!(!replay.replays_captured(true), "{file}");
+            assert!(!replay.replays_captured(false), "{file}");
+            assert_eq!(replay.missing, leveler_model::MissingReasoningReplay::Omit);
         }
     }
 
@@ -377,7 +395,14 @@ limits:
         assert!(flash.compatibility.supports_temperature);
         assert_eq!(flash.limits.max_parallel_tool_calls, 0);
         assert!(!flash.compatibility.thinking_supports_forced_tool_choice);
-        assert!(flash.compatibility.passback_reasoning_content);
+        // The shipped route's RESOLVED replay contract: the wire behaviour is a
+        // fact about the route, not something the encoder decides per message.
+        let replay =
+            leveler_model::ReasoningReplayContract::resolve(flash.protocol, &flash.compatibility);
+        assert_eq!(replay.arm_name(), "when_tools+empty");
+        assert!(replay.replays_captured(true));
+        assert!(!replay.replays_captured(false));
+        assert!(replay.requires_empty_key(true));
         assert!(
             flash.pricing.is_none(),
             "dynamic peak/off-peak pricing must not be guessed"

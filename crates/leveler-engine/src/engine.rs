@@ -68,7 +68,23 @@ pub(crate) fn merge_prior_messages(
     snapshot: Option<SnapshotView>,
     threshold: u64,
 ) -> (Vec<leveler_model::Message>, PriorMerge) {
-    let raw_tokens = leveler_context::estimate_tokens(&raw);
+    merge_prior_messages_measured(
+        raw,
+        raw_offset,
+        snapshot,
+        threshold,
+        &leveler_context::estimate_tokens,
+    )
+}
+
+pub(crate) fn merge_prior_messages_measured(
+    raw: Vec<leveler_model::Message>,
+    raw_offset: u64,
+    snapshot: Option<SnapshotView>,
+    threshold: u64,
+    measure: &dyn Fn(&[leveler_model::Message]) -> u64,
+) -> (Vec<leveler_model::Message>, PriorMerge) {
+    let raw_tokens = measure(&raw);
     if raw_tokens <= threshold {
         return (raw, PriorMerge::Fits { merged: false });
     }
@@ -115,7 +131,7 @@ pub(crate) fn merge_prior_messages(
         },
         _ => raw,
     };
-    let tokens = leveler_context::estimate_tokens(&base);
+    let tokens = measure(&base);
     if tokens <= threshold {
         // Snapshot+tail already fits: persist so next request starts shorter.
         return (base, PriorMerge::Fits { merged: true });
@@ -593,8 +609,8 @@ impl TaskEngine {
         session_id: &SessionId,
         checkpoint_ordinal: Option<u64>,
         strict: Option<&str>,
+        threshold: u64,
     ) -> Result<crate::RawTranscript, EngineError> {
-        let threshold = leveler_context::PRE_REQUEST_COMPACT_THRESHOLD;
         // An unusable snapshot bounds nothing: the merge will not use it, so
         // the rows before its watermark are still reachable.
         let snapshot_ordinal = EventLog::new(self.stores.events.as_ref(), session_id.clone())
@@ -687,6 +703,7 @@ mod multi_turn_session_tests {
 
     fn assistant_call(id: &str) -> Message {
         Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: leveler_model::ToolCall {
@@ -700,6 +717,7 @@ mod multi_turn_session_tests {
 
     fn tool_result(id: &str) -> Message {
         Message {
+            origin: None,
             role: Role::Tool,
             content: vec![ContentPart::ToolResult {
                 result: leveler_model::ToolResultContent {

@@ -24,9 +24,8 @@ use crate::snapshot::SnapshotId;
 pub struct MutationBaseline {
     pub snapshot: SnapshotId,
     pub workspace_root: PathBuf,
-    /// Paths this task was allowed to modify. `None` means unconstrained: the
-    /// task's changes are still accounted, but nothing is restored.
-    pub write_allowlist: Option<Vec<String>>,
+    /// Namespace admitted at spawn, retained through process-group settlement.
+    pub write_scope: crate::WriteScope,
 }
 
 /// What the runtime found when the task's process exited.
@@ -35,15 +34,14 @@ pub struct MutationBaseline {
 /// waiter reads it; it never computes it (`docs/ARCHITECTURE.md` §18.3 H).
 #[derive(Debug, Clone)]
 pub struct BackgroundSettlement {
-    /// Workspace-relative paths the task changed, after any restore.
+    /// Workspace-relative paths changed in this task's admitted namespace.
     pub modified: Vec<String>,
-    /// The write-scope violation this task committed, and what was done about
-    /// it. `None` when the task stayed inside its authority.
+    /// An execution invariant failure, when one was mechanically observed.
     pub violation: Option<String>,
     /// Why the change set is unknown, when the workspace could not be diffed.
     pub note: Option<String>,
-    /// The snapshot the task was measured against.
-    pub snapshot: SnapshotId,
+    /// A full-workspace recovery snapshot, absent for scoped accounting trees.
+    pub snapshot: Option<SnapshotId>,
 }
 
 const MAX_CONCURRENT: usize = 4;
@@ -201,6 +199,8 @@ struct TaskInner {
     /// no owner. Session-owned task cleanup follows `lifetime`; runtime shutdown
     /// reaps every remaining task regardless of lifetime (R004 F7).
     owner_scope: Option<String>,
+    writer_scope: String,
+    write_scope: crate::WriteScope,
     lifetime: BackgroundTaskLifetime,
     program: String,
     args: Vec<String>,
@@ -226,7 +226,7 @@ struct TaskInner {
     /// task Running. Set by the post-reap group watcher.
     group_reaped: bool,
     /// Consumed by the reaper when the process exits, so the diff and any
-    /// restore run exactly once and without waiting for a tool call.
+    /// accounting runs exactly once and without waiting for a tool call.
     mutation_baseline: Option<MutationBaseline>,
     /// What the reaper found. Read by a waiter; never produced by one.
     settlement: Option<BackgroundSettlement>,
@@ -414,6 +414,18 @@ impl BackgroundTaskRegistry {
         owner_scope: Option<&str>,
         lifetime: BackgroundTaskLifetime,
     ) -> Result<String, String> {
+        self.spawn_for_writer(request, mutation_baseline, owner_scope, "parent", lifetime)
+            .await
+    }
+
+    pub async fn spawn_for_writer(
+        &self,
+        request: ProcessRequest,
+        mutation_baseline: Option<MutationBaseline>,
+        owner_scope: Option<&str>,
+        writer_scope: &str,
+        lifetime: BackgroundTaskLifetime,
+    ) -> Result<String, String> {
         let (id, mut reservation) = {
             let mut st = self.inner.lock().await;
             prune_terminal_tasks(&mut st);
@@ -470,6 +482,8 @@ impl BackgroundTaskRegistry {
             TaskInner {
                 id: id.clone(),
                 owner_scope: owner_scope.map(str::to_string),
+                writer_scope: writer_scope.to_string(),
+                write_scope: request.write_scope.clone(),
                 lifetime,
                 program: request.program.clone(),
                 args: request.args.clone(),
@@ -504,12 +518,14 @@ impl BackgroundTaskRegistry {
         reservation.commit();
         drop(st);
 
+        let log_cancel = CancellationToken::new();
         spawn_log_pump(
             reg.clone(),
             tid.clone(),
             stdout,
             BackgroundOutputStream::Stdout,
             self.lifecycle_events.clone(),
+            log_cancel.clone(),
         );
         spawn_log_pump(
             reg.clone(),
@@ -517,6 +533,7 @@ impl BackgroundTaskRegistry {
             stderr,
             BackgroundOutputStream::Stderr,
             self.lifecycle_events.clone(),
+            log_cancel.clone(),
         );
 
         let lifecycle_events = self.lifecycle_events.clone();
@@ -542,102 +559,62 @@ impl BackgroundTaskRegistry {
                 };
                 (code, identity)
             };
-            // Settle before publishing the terminal state, so a waiter woken
-            // by `finalize_if_drained` never observes a task that is finished
-            // but not yet accounted for.
+            {
+                let mut st = reg.lock().await;
+                let Some(task) = st.tasks.get_mut(&tid) else {
+                    return;
+                };
+                task.process_done = true;
+                task.exit_code = code;
+            }
+            // The process group, not its launcher, owns the write lifetime.
+            // Keep the baseline and prohibit terminal publication until every
+            // member is gone and its final mutations have been settled.
+            if let Some(identity) = identity {
+                while !identity.group_gone().await {
+                    tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
+                }
+            }
             let baseline = {
                 let mut st = reg.lock().await;
-                st.tasks
-                    .get_mut(&tid)
-                    .and_then(|t| t.mutation_baseline.take())
+                st.tasks.get_mut(&tid).and_then(|task| {
+                    // Group identity expires when the group is gone, before
+                    // potentially slow git accounting can reuse that pgid.
+                    task.identity = None;
+                    task.mutation_baseline.take()
+                })
             };
             let settlement = match baseline {
                 Some(baseline) => Some(settle(&baseline).await),
                 None => None,
             };
-            let finalized_at_reap = {
+            // Pipes may have been inherited outside the owned group. Allow a
+            // bounded drain; no log pump can publish terminal before this block.
+            let deadline = Instant::now() + LOG_DRAIN_GRACE;
+            loop {
+                let drained = {
+                    let st = reg.lock().await;
+                    st.tasks
+                        .get(&tid)
+                        .is_none_or(|task| task.log_pumps_remaining == 0)
+                };
+                if drained || Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            log_cancel.cancel();
+            {
                 let mut st = reg.lock().await;
-                match st.tasks.get_mut(&tid) {
-                    Some(task) => {
-                        task.process_done = true;
-                        task.exit_code = code;
-                        task.settlement = settlement;
-                        // `identity` is deliberately NOT cleared here: only a
-                        // terminal task releases ownership of its group.
-                        if finalize_if_drained(task) {
-                            let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
-                                owner_scope: task.owner_scope.clone(),
-                                task: snapshot(task),
-                            });
-                            true
-                        } else {
-                            false
-                        }
+                if let Some(task) = st.tasks.get_mut(&tid) {
+                    task.settlement = settlement;
+                    task.group_reaped = true;
+                    if finalize_if_drained(task) {
+                        let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
+                            owner_scope: task.owner_scope.clone(),
+                            task: snapshot(task),
+                        });
                     }
-                    None => true,
-                }
-            };
-
-            // The direct child is reaped, but the task is not finished until
-            // the process group it owns is gone: descendants that share the
-            // group are still its workload, whether or not they keep the log
-            // pipes open. Watch the group; polling is deliberately
-            // low-frequency (an owned dev server can run for hours) and only
-            // probes membership, it never signals the process.
-            if !finalized_at_reap && let Some(identity) = identity {
-                loop {
-                    if identity.group_gone().await {
-                        break;
-                    }
-                    let terminal = {
-                        let st = reg.lock().await;
-                        st.tasks
-                            .get(&tid)
-                            .is_none_or(|task| task.status.is_terminal())
-                    };
-                    if terminal {
-                        break;
-                    }
-                    tokio::time::sleep(GROUP_WATCH_INTERVAL).await;
-                }
-                // Record the group's end first: a log pump that reaches EOF
-                // from here on may finish the task on its own.
-                {
-                    let mut st = reg.lock().await;
-                    if let Some(task) = st.tasks.get_mut(&tid) {
-                        task.group_reaped = true;
-                    }
-                }
-                // Bounded final drain. The group is gone, so every writer it
-                // had is gone and the pumps should EOF imminently; give them
-                // a short window to flush before finishing even if an fd was
-                // inherited by a process outside the group.
-                let drain_deadline = Instant::now() + LOG_DRAIN_GRACE;
-                loop {
-                    let done = {
-                        let st = reg.lock().await;
-                        match st.tasks.get(&tid) {
-                            Some(task) => {
-                                task.status.is_terminal()
-                                    || task.log_pumps_remaining == 0
-                                    || Instant::now() >= drain_deadline
-                            }
-                            None => true,
-                        }
-                    };
-                    if done {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                let mut st = reg.lock().await;
-                if let Some(task) = st.tasks.get_mut(&tid)
-                    && finalize_if_drained(task)
-                {
-                    let _ = lifecycle_events.send(BackgroundTaskEvent::Exited {
-                        owner_scope: task.owner_scope.clone(),
-                        task: snapshot(task),
-                    });
                 }
             }
             if let Some(kod) = kill_on_drop.upgrade() {
@@ -651,6 +628,133 @@ impl BackgroundTaskRegistry {
     pub async fn get(&self, id: &str) -> Option<BackgroundTaskSnapshot> {
         let st = self.inner.lock().await;
         st.tasks.get(id).map(snapshot)
+    }
+
+    pub async fn get_owned(&self, id: &str, owner: &str) -> Result<BackgroundTaskSnapshot, String> {
+        let st = self.inner.lock().await;
+        let task = st
+            .tasks
+            .get(id)
+            .ok_or_else(|| format!("unknown task `{id}`"))?;
+        check_owner(task, owner)?;
+        Ok(snapshot(task))
+    }
+
+    pub async fn wait_owned(
+        &self,
+        id: &str,
+        owner: &str,
+        timeout: Option<Duration>,
+        cancellation: &CancellationToken,
+    ) -> Result<BackgroundTaskSnapshot, String> {
+        // Task IDs are never reused and owner_scope is immutable. The wait
+        // subscribes only after this locked authorization; observation checks
+        // ownership again before delivering bytes or advancing a cursor.
+        self.get_owned(id, owner).await?;
+        self.wait(id, timeout, cancellation).await
+    }
+
+    pub async fn take_settlement_owned(
+        &self,
+        id: &str,
+        owner: &str,
+    ) -> Result<Option<BackgroundSettlement>, String> {
+        let mut st = self.inner.lock().await;
+        let task = st
+            .tasks
+            .get_mut(id)
+            .ok_or_else(|| format!("unknown task `{id}`"))?;
+        check_owner(task, owner)?;
+        if task.settlement_reported {
+            return Ok(None);
+        }
+        let settlement = task.settlement.clone();
+        if settlement.is_some() {
+            task.settlement_reported = true;
+        }
+        Ok(settlement)
+    }
+
+    /// End a writer's processes before its path ownership can be released.
+    /// Failure keeps the writer's ownership live; signalling alone is not proof.
+    pub async fn settle_writer(&self, owner: &str, writer: &str) -> Result<(), String> {
+        let ids: Vec<String> = {
+            let st = self.inner.lock().await;
+            st.tasks
+                .values()
+                .filter(|task| {
+                    task.owner_scope.as_deref() == Some(owner)
+                        && task.writer_scope == writer
+                        && task.status.is_active()
+                })
+                .map(|task| task.id.clone())
+                .collect()
+        };
+        for id in &ids {
+            self.kill_owned(id, owner).await?;
+        }
+        for id in &ids {
+            let state = self
+                .wait_owned(
+                    id,
+                    owner,
+                    Some(Duration::from_secs(5)),
+                    &CancellationToken::new(),
+                )
+                .await?;
+            if !state.status.is_terminal() {
+                return Err(format!("background task `{id}` has not finished settling"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Live workloads retain their namespace until settlement. The ownership
+    /// authority checks this before granting overlapping paths to a new writer.
+    pub async fn write_conflicts(&self, owner: &str, paths: &[String]) -> Vec<String> {
+        let st = self.inner.lock().await;
+        st.tasks
+            .values()
+            .filter(|task| {
+                task.owner_scope.as_deref() == Some(owner)
+                    && task.status.is_active()
+                    && paths
+                        .iter()
+                        .any(|path| scope_overlaps(&task.write_scope, &task.cwd, path))
+            })
+            .map(|task| task.id.clone())
+            .collect()
+    }
+
+    /// The actual namespaces still leased by other writers, including writers
+    /// from an earlier turn whose cleanup did not complete. The current host's
+    /// ownership map may be new; active process capabilities remain authoritative.
+    pub async fn foreign_write_paths(&self, owner: &str, writer: &str) -> Vec<String> {
+        let state = self.inner.lock().await;
+        let mut paths = Vec::new();
+        for task in state.tasks.values().filter(|task| {
+            task.owner_scope.as_deref() == Some(owner)
+                && task.writer_scope != writer
+                && task.status.is_active()
+        }) {
+            match &task.write_scope {
+                crate::WriteScope::None => {}
+                crate::WriteScope::ScopedWorkspace { root, allowed, .. } => {
+                    for path in allowed {
+                        let relative = path.strip_prefix(root).unwrap_or(std::path::Path::new("."));
+                        paths.push(if relative.as_os_str().is_empty() {
+                            ".".into()
+                        } else {
+                            relative.to_string_lossy().into_owned()
+                        });
+                    }
+                }
+                _ => paths.push(".".into()),
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Subscribe to authoritative process lifecycle transitions.
@@ -741,6 +845,32 @@ impl BackgroundTaskRegistry {
         timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<BackgroundTaskObservation, String> {
+        self.observe_scoped(id, None, cursor, max_bytes, timeout, cancellation)
+            .await
+    }
+
+    pub async fn observe_owned(
+        &self,
+        id: &str,
+        owner: &str,
+        cursor: Option<u64>,
+        max_bytes: usize,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<BackgroundTaskObservation, String> {
+        self.observe_scoped(id, Some(owner), cursor, max_bytes, timeout, cancellation)
+            .await
+    }
+
+    async fn observe_scoped(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+        cursor: Option<u64>,
+        max_bytes: usize,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<BackgroundTaskObservation, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if cancellation.is_cancelled() {
@@ -751,6 +881,9 @@ impl BackgroundTaskRegistry {
                 .tasks
                 .get_mut(id)
                 .ok_or_else(|| format!("unknown task `{id}`"))?;
+            if let Some(owner) = owner {
+                check_owner(task, owner)?;
+            }
             let mut position = cursor.unwrap_or(task.default_log_cursor);
             if position > task.log_end {
                 return Err(format!(
@@ -926,12 +1059,31 @@ impl BackgroundTaskRegistry {
     }
 
     pub async fn kill(&self, id: &str) -> Result<BackgroundTaskSnapshot, String> {
+        self.kill_scoped(id, None).await
+    }
+
+    pub async fn kill_owned(
+        &self,
+        id: &str,
+        owner: &str,
+    ) -> Result<BackgroundTaskSnapshot, String> {
+        self.kill_scoped(id, Some(owner)).await
+    }
+
+    async fn kill_scoped(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+    ) -> Result<BackgroundTaskSnapshot, String> {
         let identity = {
             let mut st = self.inner.lock().await;
             let task = st
                 .tasks
                 .get_mut(id)
                 .ok_or_else(|| format!("unknown task `{id}`"))?;
+            if let Some(owner) = owner {
+                check_owner(task, owner)?;
+            }
             if task.status.is_terminal() {
                 return Ok(snapshot(task));
             }
@@ -942,6 +1094,9 @@ impl BackgroundTaskRegistry {
             let has_child = task.child.is_some();
             // Without pid/pgid and without Child we cannot signal at all.
             if identity.is_none() && !has_child {
+                if task.process_done {
+                    return Ok(snapshot(task));
+                }
                 return Err(format!(
                     "task `{id}` has no process identity to signal (Child already taken)"
                 ));
@@ -976,6 +1131,30 @@ impl BackgroundTaskRegistry {
     }
 }
 
+fn scope_overlaps(scope: &crate::WriteScope, cwd: &std::path::Path, path: &str) -> bool {
+    let root = scope.root().unwrap_or(cwd);
+    let path = root.join(path);
+    let overlaps =
+        |allowed: &std::path::Path| path.starts_with(allowed) || allowed.starts_with(&path);
+    match scope {
+        crate::WriteScope::None => false,
+        crate::WriteScope::Unrestricted => true,
+        crate::WriteScope::Workspace { root } | crate::WriteScope::WorkspaceWithGit { root } => {
+            overlaps(root)
+        }
+        crate::WriteScope::ScopedWorkspace {
+            allowed, excluded, ..
+        } => allowed.iter().any(|a| overlaps(a)) && !excluded.iter().any(|e| path.starts_with(e)),
+    }
+}
+
+fn check_owner(task: &TaskInner, owner: &str) -> Result<(), String> {
+    if task.owner_scope.as_deref() != Some(owner) {
+        return Err("background task is not owned by this session".into());
+    }
+    Ok(())
+}
+
 /// Evict the oldest completed records while preserving every running/killing
 /// task. Called only before a spawn: completion waiters therefore get a stable
 /// chance to observe their terminal snapshot.
@@ -1002,6 +1181,7 @@ fn spawn_log_pump<R>(
     stream: Option<R>,
     output_stream: BackgroundOutputStream,
     lifecycle_events: broadcast::Sender<BackgroundTaskEvent>,
+    cancellation: CancellationToken,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -1012,7 +1192,12 @@ fn spawn_log_pump<R>(
         let mut reader = BufReader::new(stream);
         let mut buf = [0u8; 4096];
         loop {
-            match reader.read(&mut buf).await {
+            let read = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => break,
+                read = reader.read(&mut buf) => read,
+            };
+            match read {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some((owner_scope, chunk)) =
@@ -1041,20 +1226,21 @@ fn spawn_log_pump<R>(
     });
 }
 
-/// Diff the workspace against the task's baseline and, when the task wrote
-/// outside the authority it was spawned with, restore it.
-///
-/// Restore runs ONLY under an explicit allowlist. A default background task —
-/// a dev server, a watcher — is accounted and never rolled back: it is
-/// supposed to write, and reverting a running server's output is worse than
-/// reporting it (K17).
+/// Account only the namespace enforced at spawn, after its entire process
+/// group has exited. Settlement never rewrites the shared workspace.
 async fn settle(baseline: &MutationBaseline) -> BackgroundSettlement {
     let root = &baseline.workspace_root;
     let id = &baseline.snapshot;
 
     let mut modified = Vec::new();
     let mut note = None;
-    match crate::snapshot::WorkspaceSnapshot::changed_since(root, id).await {
+    match crate::snapshot::WorkspaceSnapshot::changed_since_for_scope(
+        root,
+        id,
+        &baseline.write_scope,
+    )
+    .await
+    {
         Ok(changed) => modified = changed,
         Err(error) => {
             note = Some(format!(
@@ -1064,43 +1250,16 @@ async fn settle(baseline: &MutationBaseline) -> BackgroundSettlement {
         }
     }
 
-    let mut violation = None;
-    if let Some(allowlist) = baseline.write_allowlist.as_deref() {
-        let outside: Vec<&str> = modified
-            .iter()
-            .map(String::as_str)
-            .filter(|path| !allowlist.iter().any(|allowed| path_allows(allowed, path)))
-            .collect();
-        if !outside.is_empty() {
-            let detail = format!(
-                "background task modified files outside allowed paths: {}",
-                outside.join(", ")
-            );
-            match crate::snapshot::WorkspaceSnapshot::restore(root, id).await {
-                Ok(()) => {
-                    modified.clear();
-                    violation = Some(format!("{detail}; workspace restored"));
-                }
-                Err(error) => {
-                    violation = Some(format!(
-                        "{detail}; automatic workspace restore failed: {error}"
-                    ));
-                }
-            }
-        }
-    }
-
     BackgroundSettlement {
         modified,
-        violation,
+        violation: None,
         note,
-        snapshot: id.clone(),
+        snapshot: (!matches!(
+            baseline.write_scope,
+            crate::WriteScope::ScopedWorkspace { .. }
+        ))
+        .then(|| id.clone()),
     }
-}
-
-fn path_allows(allowed: &str, modified: &str) -> bool {
-    let allowed = allowed.trim_end_matches('/');
-    modified == allowed || modified.starts_with(&format!("{allowed}/"))
 }
 
 fn finalize_if_drained(task: &mut TaskInner) -> bool {
@@ -1144,6 +1303,9 @@ async fn append_log(
 ) -> Option<(Option<String>, String)> {
     let mut st = reg.lock().await;
     let task = st.tasks.get_mut(id)?;
+    if task.status.is_terminal() {
+        return None;
+    }
     let raw = String::from_utf8_lossy(bytes);
     // Sanitize BEFORE the registry buffer: the log cap and every projection are
     // then measured on the same clean text.
@@ -1505,6 +1667,8 @@ mod tests {
                 TaskInner {
                     id,
                     owner_scope: None,
+                    writer_scope: "parent".into(),
+                    write_scope: crate::WriteScope::Unrestricted,
                     lifetime: BackgroundTaskLifetime::Goal,
                     program: "true".into(),
                     args: Vec::new(),
@@ -1540,6 +1704,8 @@ mod tests {
                 TaskInner {
                     id: id.into(),
                     owner_scope: None,
+                    writer_scope: "parent".into(),
+                    write_scope: crate::WriteScope::Unrestricted,
                     lifetime: BackgroundTaskLifetime::Goal,
                     program: "sleep".into(),
                     args: Vec::new(),
@@ -1590,6 +1756,8 @@ mod tests {
         let mut task = TaskInner {
             id: "done".into(),
             owner_scope: None,
+            writer_scope: "parent".into(),
+            write_scope: crate::WriteScope::Unrestricted,
             lifetime: BackgroundTaskLifetime::Goal,
             program: "true".into(),
             args: Vec::new(),
@@ -1622,8 +1790,145 @@ mod tests {
         assert!(!scratch_path.exists());
     }
 
+    #[tokio::test]
+    async fn killing_a_reaped_group_waits_for_settlement_without_signalling() {
+        let task = TaskInner {
+            id: "done".into(),
+            owner_scope: Some("owner".into()),
+            writer_scope: "parent".into(),
+            write_scope: crate::WriteScope::Unrestricted,
+            lifetime: BackgroundTaskLifetime::Goal,
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: PathBuf::new(),
+            status: BackgroundTaskStatus::Running,
+            exit_code: Some(0),
+            log: String::new(),
+            log_end: 0,
+            log_prefix_len: 0,
+            default_log_cursor: 0,
+            started: Instant::now(),
+            finished: None,
+            child: None,
+            identity: None,
+            done: Arc::new(Notify::new()),
+            changed: Arc::new(Notify::new()),
+            process_done: true,
+            log_pumps_remaining: 0,
+            group_reaped: false,
+            mutation_baseline: None,
+            settlement: None,
+            settlement_reported: false,
+            sandbox_scratch: None,
+        };
+
+        let registry = BackgroundTaskRegistry::new();
+        registry
+            .inner
+            .lock()
+            .await
+            .tasks
+            .insert("done".into(), task);
+        let state = registry
+            .kill_owned("done", "owner")
+            .await
+            .expect("already reaped is a valid settling state");
+        assert_eq!(state.status, BackgroundTaskStatus::Running);
+        let state = registry
+            .wait_owned(
+                "done",
+                "owner",
+                Some(Duration::ZERO),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !state.status.is_terminal(),
+            "only settlement can publish terminal"
+        );
+        {
+            let mut state = registry.inner.lock().await;
+            let task = state.tasks.get_mut("done").unwrap();
+            task.group_reaped = true;
+            assert!(finalize_if_drained(task));
+        }
+        assert!(
+            registry
+                .get_owned("done", "owner")
+                .await
+                .unwrap()
+                .status
+                .is_terminal()
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_settlement_keeps_other_writers_alive_and_releases_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = host_registry();
+        let mut request = ProcessRequest::new("sleep", vec!["30".into()], dir.path().to_path_buf());
+        request.write_scope = crate::WriteScope::Workspace {
+            root: dir.path().to_path_buf(),
+        };
+        let child = reg
+            .spawn_for_writer(
+                request.clone(),
+                None,
+                Some("session"),
+                "child",
+                BackgroundTaskLifetime::Goal,
+            )
+            .await
+            .unwrap();
+        let peer = reg
+            .spawn_for_writer(
+                request,
+                None,
+                Some("session"),
+                "peer",
+                BackgroundTaskLifetime::Goal,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reg.write_conflicts("session", &["src".into()]).await.len(),
+            2
+        );
+        assert_eq!(
+            reg.foreign_write_paths("session", "parent").await,
+            vec!["."]
+        );
+        assert!(
+            reg.foreign_write_paths("other-session", "parent")
+                .await
+                .is_empty()
+        );
+        reg.settle_writer("session", "child").await.unwrap();
+        assert!(reg.get(&child).await.unwrap().status.is_terminal());
+        assert_eq!(
+            reg.get(&peer).await.unwrap().status,
+            BackgroundTaskStatus::Running
+        );
+        assert_eq!(
+            reg.write_conflicts("session", &["src".into()]).await,
+            vec![peer.clone()]
+        );
+        reg.settle_writer("session", "peer").await.unwrap();
+        assert!(
+            reg.foreign_write_paths("session", "parent")
+                .await
+                .is_empty()
+        );
+        assert!(
+            reg.write_conflicts("session", &["src".into()])
+                .await
+                .is_empty()
+        );
+    }
+
     /// The baseline is consumed by the reaper, so a task is diffed and
-    /// restored at most once however many times it is inspected afterwards.
+    /// accounted at most once however many times it is inspected afterwards.
     #[tokio::test]
     async fn a_task_is_settled_at_most_once() {
         use crate::snapshot::WorkspaceSnapshot;
@@ -1640,7 +1945,7 @@ mod tests {
         let baseline = MutationBaseline {
             snapshot: snap,
             workspace_root: dir.path().to_path_buf(),
-            write_allowlist: None,
+            write_scope: crate::WriteScope::Unrestricted,
         };
 
         let reg = BackgroundTaskRegistry::new();
@@ -1658,14 +1963,7 @@ mod tests {
         );
     }
 
-    /// The runtime settles a background task when its process exits, not when
-    /// the model happens to call `wait_task`.
-    ///
-    /// A background process outlives the round that started it. If the write
-    /// allowlist were only enforced at wait-end, a model that never waits —
-    /// or a turn that ends first — would leave an authority violation standing
-    /// on disk. Settlement is a runtime guarantee, so it does not wait for a
-    /// tool call.
+    /// Terminal state implies completed accounting even without wait_task.
     #[tokio::test]
     async fn a_background_task_is_settled_on_exit_without_anyone_waiting() {
         use crate::snapshot::WorkspaceSnapshot;
@@ -1676,24 +1974,30 @@ mod tests {
         std::fs::write(dir.path().join("protected"), "original\n").expect("seed");
         leveler_test_support::git::run(dir.path(), &["add", "-A"]);
         leveler_test_support::git::run(dir.path(), &["commit", "-qm", "i"]);
-        let snapshot = WorkspaceSnapshot::capture(dir.path())
+        let scope = crate::WriteScope::ScopedWorkspace {
+            root: dir.path().to_path_buf(),
+            allowed: vec![dir.path().join("allowed")],
+            excluded: Vec::new(),
+        };
+        let snapshot = WorkspaceSnapshot::capture_for_scope(dir.path(), &scope)
             .await
             .expect("capture")
             .expect("git repo");
 
-        let reg = BackgroundTaskRegistry::new();
-        let request = ProcessRequest::new(
+        let reg = host_registry();
+        let mut request = ProcessRequest::new(
             "sh",
             vec!["-c".into(), "echo tampered > protected".into()],
             dir.path().to_path_buf(),
         );
+        request.write_scope = scope.clone();
         let id = reg
             .spawn(
                 request,
                 Some(MutationBaseline {
                     snapshot,
                     workspace_root: dir.path().to_path_buf(),
-                    write_allowlist: Some(vec!["allowed".to_string()]),
+                    write_scope: scope,
                 }),
             )
             .await
@@ -1716,17 +2020,12 @@ mod tests {
         }
 
         let settlement = reg.take_settlement(&id).await.expect("settlement recorded");
-        assert!(
-            settlement
-                .violation
-                .as_deref()
-                .is_some_and(|v| v.contains("protected")),
-            "the violation must name the path: {settlement:?}"
-        );
+        assert!(settlement.modified.is_empty(), "{settlement:?}");
+        assert_ne!(reg.get(&id).await.unwrap().exit_code, Some(0));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("protected")).expect("read"),
             "original\n",
-            "the runtime must have restored the file the task was not allowed to touch"
+            "the sandbox must prevent the unauthorized write"
         );
         assert!(
             reg.take_settlement(&id).await.is_none(),
@@ -2573,5 +2872,61 @@ mod unified_runner_tests {
             }
         }
         drop(listener);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settlement_waits_for_descendant_writes() {
+        let dir = leveler_test_support::git::scratch_repo();
+        let snapshot = crate::WorkspaceSnapshot::capture(dir.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let registry = super::tests::host_registry();
+        let request = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "(while [ ! -e release ]; do sleep 0.01; done; printf late > late.txt) &".into(),
+            ],
+            dir.path().to_path_buf(),
+        );
+        let id = registry
+            .spawn(
+                request,
+                Some(MutationBaseline {
+                    snapshot,
+                    workspace_root: dir.path().to_path_buf(),
+                    write_scope: crate::WriteScope::Unrestricted,
+                }),
+            )
+            .await
+            .unwrap();
+        let before_release = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let st = registry.inner.lock().await;
+                let task = st.tasks.get(&id).unwrap();
+                if task.process_done {
+                    break task.settlement.is_some();
+                }
+                drop(st);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("direct child must exit");
+        std::fs::write(dir.path().join("release"), "go").unwrap();
+        let _ = registry
+            .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .unwrap();
+        let settlement = registry.take_settlement(&id).await.unwrap();
+        assert!(
+            !before_release,
+            "settlement must remain pending while the descendant can write"
+        );
+        assert!(
+            settlement.modified.contains(&"late.txt".to_string()),
+            "{settlement:?}"
+        );
     }
 }

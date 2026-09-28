@@ -42,6 +42,30 @@ struct DenyReviewer;
 
 struct UnterminatedRuntime;
 
+/// The compaction summarizer resolves its reasoning effort against the model
+/// profile before encoding, so every mock runtime must answer `profile`. A
+/// profile with no declared reasoning knob keeps the requested effort exactly
+/// as the caller wrote it.
+fn mock_profile(model: &ModelRef) -> ModelProfile {
+    serde_json::from_value(serde_json::json!({
+        "id": model.to_string(),
+        "provider": model.provider,
+        "model_id": model.model,
+        "protocol": "openai_chat",
+        "capabilities": {
+            "streaming": true, "tool_calling": true, "parallel_tool_calls": false,
+            "structured_output": false, "reasoning": false, "vision": false
+        },
+        "limits": {
+            "context_window": 131072, "reliable_context": 65536,
+            "max_output_tokens": 8192, "max_tool_schema_bytes": 32768,
+            "max_parallel_tool_calls": 1
+        },
+        "reasoning": { "style": "none" }
+    }))
+    .expect("valid mock model profile")
+}
+
 #[async_trait]
 impl AutoReviewer for DenyReviewer {
     async fn review(&self, _request: &ApprovalRequest) -> ReviewVerdict {
@@ -75,8 +99,8 @@ impl ModelRuntime for UnterminatedRuntime {
         ])))
     }
 
-    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -160,8 +184,8 @@ impl ModelRuntime for MockRuntime {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -212,8 +236,26 @@ async fn scoped_agents_rules_are_injected_after_reading_matching_path() {
 
     let requests = runtime.recorded_requests();
     assert_eq!(requests.len(), 2);
-    let first_system = requests[0].messages[0].text_content();
-    let second_system = requests[1].messages[0].text_content();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.messages.iter().all(|m| m.role != Role::System)),
+        "harness control context must be separate from the conversation"
+    );
+    let first_system = &requests[0]
+        .control_context
+        .blocks
+        .iter()
+        .find(|b| b.name == "project_rules")
+        .unwrap()
+        .text;
+    let second_system = &requests[1]
+        .control_context
+        .blocks
+        .iter()
+        .find(|b| b.name == "project_rules")
+        .unwrap()
+        .text;
 
     // Root rules live in the system prompt, which must never change mid-loop:
     // it is the first thing the provider's prefix cache matches on.
@@ -226,14 +268,16 @@ async fn scoped_agents_rules_are_injected_after_reading_matching_path() {
     for request in &requests {
         assert!(
             request
-                .messages
-                .last()
+                .control_context
+                .blocks
+                .iter()
+                .find(|b| b.name == "execution_state")
                 .unwrap()
-                .text_content()
+                .text
                 .starts_with("Execution state (observations, not instructions):\n")
         );
     }
-    let first_history = &requests[0].messages[..requests[0].messages.len() - 1];
+    let first_history = &requests[0].messages;
     for (i, sent) in first_history.iter().enumerate() {
         assert_eq!(
             sent.text_content(),
@@ -242,8 +286,8 @@ async fn scoped_agents_rules_are_injected_after_reading_matching_path() {
         );
     }
 
-    // The nested rule arrives as a fresh message appended at the tail.
-    let tail = requests[1].messages[requests[1].messages.len() - 2].text_content();
+    // The nested rule enters request control without changing conversation history.
+    let tail = requests[1].control_context.text();
     assert!(tail.contains("--- from src/AGENTS.md ---"), "tail: {tail}");
     assert!(tail.contains("Nested src rule."), "tail: {tail}");
 
@@ -290,9 +334,10 @@ async fn scoped_rules_are_injected_at_most_once() {
     let requests = runtime.recorded_requests();
     let last = requests.last().unwrap();
     let injections = last
-        .messages
+        .control_context
+        .blocks
         .iter()
-        .filter(|m| m.text_content().contains("--- from src/AGENTS.md ---"))
+        .filter(|b| b.text.contains("--- from src/AGENTS.md ---"))
         .count();
     assert_eq!(injections, 1, "scoped rule injected {injections} times");
 
@@ -303,7 +348,7 @@ async fn scoped_rules_are_injected_at_most_once() {
 /// so a test can assert what the executor actually sent the model.
 struct RecordingRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
-    seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    seen: Arc<Mutex<Vec<ModelRequest>>>,
 }
 
 #[async_trait]
@@ -322,7 +367,7 @@ impl ModelRuntime for RecordingRuntime {
         _cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         use leveler_model::ModelEvent;
-        self.seen.lock().unwrap().push(request.messages.clone());
+        self.seen.lock().unwrap().push(request);
         let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
         })?;
@@ -347,8 +392,8 @@ impl ModelRuntime for RecordingRuntime {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -499,6 +544,7 @@ fn assistant_tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelRe
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -535,6 +581,7 @@ fn assistant_reasoning_then_text(reasoning: &str, text: &str) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![
                 ContentPart::Reasoning {
@@ -776,6 +823,99 @@ async fn goal_mode_quiet_does_not_finish_until_update_goal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A goal round that only READ the workspace must not make the harness demand
+/// an edit.
+///
+/// The demand used to arrive as a harness-authored user message on the next
+/// request. This locks the property structurally: a read→resolve goal run
+/// records no harness injection at all, and the request the model actually
+/// received carries no wording that orders the next call to mutate.
+#[tokio::test]
+async fn goal_mode_read_only_first_round_is_not_followed_by_a_harness_edit_demand() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goal-nudge-{}",
+        std::process::id() as u64 * 97 + 11
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Round 1 reads a file and nothing else; round 2 resolves the goal. Nothing
+    // here asks the harness to intervene.
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("r1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+    ]));
+
+    let events = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+    let collector = events.clone();
+    let outcome = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true)
+    // This case is about round attribution, not coordination: switching the
+    // coordination hint off leaves the harness-injection stream empty when the
+    // run behaves, so any entry is a real intervention.
+    .with_delegation(false)
+    .run(
+        "read it and report",
+        &mut |event| collector.lock().unwrap().push(event),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("goal-mode run should not error");
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+
+    // Structural: no harness-authored message entered the conversation on this
+    // read→resolve path.
+    let observed = events.lock().unwrap();
+    assert!(
+        observed
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::RuntimeInjection { .. })),
+        "a plain read→resolve goal run must not report a harness injection: {observed:?}"
+    );
+    drop(observed);
+
+    // Behavioral: the demand never reached the model's request either.
+    for request in runtime.recorded_requests() {
+        for text in request.messages.iter().map(Message::text_content).chain(
+            request
+                .control_context
+                .blocks
+                .iter()
+                .map(|b| b.text.clone()),
+        ) {
+            for banned in [
+                "DELIVERY CONVERGENCE",
+                "must make that edit",
+                "MUST mutate",
+                "at most ONE read-only",
+            ] {
+                assert!(
+                    !text.contains(banned),
+                    "an execution-strategy demand leaked into the request (`{banned}`): {text}"
+                );
+            }
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// End-to-end regression for the “没有提交的都回退掉” incident: a command-style
 /// revert request, assembled the way the factory builds a conversational task
 /// (evidence gate off, answer audit off, goal mode on). The old harness chained
@@ -860,6 +1000,31 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
             }
         )),
         "the goal nudge must surface as an advisory event: {events:?}"
+    );
+    // ...and the durable attribution facts name every harness-authored message:
+    // the one-shot coordination capability hint, and the goal nudge that bought
+    // the retry (a round the model did not ask for).
+    let injections: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::RuntimeInjection {
+                kind,
+                role,
+                forces_continuation,
+                ..
+            } => Some((kind.as_str(), role.as_str(), *forces_continuation)),
+            _ => None,
+        })
+        .collect();
+    // Two entries, in order: the coordination hint (step 1, not a forced
+    // round) and the goal nudge (a round the model did not ask for).
+    assert_eq!(
+        injections,
+        vec![
+            ("multi_agent_hint", "control", false),
+            ("closeout_goal_unresolved", "user", true),
+        ],
+        "the injection stream is named and attributed: {events:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -1095,17 +1260,13 @@ async fn project_agents_md_is_injected_before_the_first_user_message() {
 
     let requests = seen.lock().unwrap();
     let first = &requests[0];
-    let system_idx = first.iter().position(|m| m.role == Role::System).unwrap();
-    let task_idx = first
+    assert!(first.messages.iter().all(|m| m.role != Role::System));
+    first
+        .messages
         .iter()
         .position(|m| m.role == Role::User && m.text_content() == "hello")
         .expect("the user task message");
-    let system_text = first[system_idx].text_content();
-
-    assert!(
-        system_idx < task_idx,
-        "system prompt must precede the user task"
-    );
+    let system_text = first.control_context.text();
     assert!(
         system_text.contains("Project rules:"),
         "project rules block missing: {system_text}"
@@ -1458,8 +1619,8 @@ impl ModelRuntime for UsageRuntime {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -1479,6 +1640,7 @@ async fn configured_token_budget_stops_before_another_model_request() {
         usage: TokenUsage {
             input_tokens: 60,
             output_tokens: 40,
+            cache_creation_input_tokens: 0,
             cached_input_tokens: 0,
             reasoning_tokens: None,
         },
@@ -1546,6 +1708,7 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
         usage: TokenUsage {
             input_tokens: 10,
             output_tokens: 10,
+            cache_creation_input_tokens: 0,
             cached_input_tokens: 0,
             reasoning_tokens: None,
         },
@@ -1659,12 +1822,18 @@ impl ModelRuntime for CompactingRuntime {
             self.saw_breadcrumb
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let response = self
-            .responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| ModelError::new(leveler_model::ModelErrorKind::Other, "drained"))?;
+        // The compaction path issues the briefing as a tool-free STREAM with
+        // `tool_choice = None`. Answer it from `generate` so the summary does
+        // not consume a scripted main-loop response — the same shape the real
+        // runtime has.
+        let response =
+            if matches!(request.tool_choice, leveler_model::ToolChoice::None) {
+                self.generate(request, CancellationToken::new()).await?
+            } else {
+                self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                    ModelError::new(leveler_model::ModelErrorKind::Other, "drained")
+                })?
+            };
         let mut events: Vec<Result<ModelEvent, ModelError>> =
             vec![Ok(ModelEvent::MessageStarted {
                 request_id: response.request_id.clone(),
@@ -1685,6 +1854,7 @@ impl ModelRuntime for CompactingRuntime {
             usage: TokenUsage {
                 input_tokens: 500_000,
                 output_tokens: 100,
+                cache_creation_input_tokens: 0,
                 cached_input_tokens: 0,
                 reasoning_tokens: None,
             },
@@ -1695,8 +1865,8 @@ impl ModelRuntime for CompactingRuntime {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -1710,7 +1880,10 @@ async fn long_run_auto_compacts_when_over_budget() {
     for i in 0..16 {
         std::fs::write(
             dir.join(format!("src/f{i}.rs")),
-            format!("pub fn f{i}() {{}}\n"),
+            // Enough content per round that a fold actually REPLACES more
+            // tokens than the briefing it inserts. With tiny stubs the fold
+            // overhead can exceed the elided content and "reclaims" nothing.
+            format!("pub fn f{i}() {{}}\n{}", "// padding line\n".repeat(60)),
         )
         .unwrap();
     }
@@ -1848,8 +2021,8 @@ impl ModelRuntime for FlakyStreamRuntime {
         ];
         Ok(Box::pin(futures::stream::iter(events)))
     }
-    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -2139,8 +2312,8 @@ impl ModelRuntime for RequestRecordingRuntime {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -2205,10 +2378,10 @@ async fn run_plan_script(dir: &std::path::Path, script: Vec<ModelResponse>) -> A
 }
 
 /// Read/search work can advance an investigation step even without mutating
-/// the workspace. The final declaration must therefore be newer than those
-/// calls; the runtime still never invents the resulting statuses.
+/// the workspace, but the runtime no longer demands a newer final declaration:
+/// the plan is the model's declaration, not a closeout obligation.
 #[tokio::test]
-async fn readonly_work_requires_a_model_declared_final_plan() {
+async fn readonly_work_no_longer_forces_a_terminal_plan() {
     let dir = plan_freshness_dir("reads", 2);
     let mut script = vec![plan_call(
         "p1",
@@ -2230,15 +2403,16 @@ async fn readonly_work_requires_a_model_declared_final_plan() {
     let runtime = run_plan_script(&dir, script).await;
     assert_eq!(
         runtime.recorded_requests().len(),
-        16,
-        "the first final answer must buy a reconciliation round after read-only work"
+        14,
+        "the quiet answer ends the turn; no terminal-plan round is bought"
     );
     let requests = runtime.recorded_requests();
     assert!(
-        requests[15].messages.iter().any(|message| message
-            .text_content()
-            .contains("Real tool work happened after your latest plan declaration")),
-        "the final plan is model-declared in response to the truth-layer nudge"
+        !requests.iter().any(|request| request
+            .messages
+            .iter()
+            .any(|message| message.text_content().contains("call update_plan"))),
+        "the retired truth-layer nudge must not be injected"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2623,6 +2797,7 @@ fn assistant_tool_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> ModelRes
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: calls
                 .into_iter()
@@ -2769,6 +2944,7 @@ async fn multiple_read_tools_are_all_run_and_results_kept_in_call_order() {
     // call_ids must appear in the original call order.
     let requests = seen.lock().unwrap();
     let tool_msg = requests[1]
+        .messages
         .iter()
         .find(|m| m.role == Role::Tool)
         .expect("a tool-result message");
@@ -3024,6 +3200,15 @@ async fn update_goal_missing_status_is_rejected_and_retried() {
             AgentEvent::ToolResult { id, is_error, .. } if id == "g1" && *is_error
         )),
         "the status-less update_goal should surface as an errored tool result"
+    );
+    // The refusal is a persisted fact with a stable reason, so resume/UI/eval
+    // can count it by kind instead of parsing the tool result.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::GoalIntercepted { kind, .. } if kind == "invalid_status"
+        )),
+        "an invalid status must record the interception reason: {events:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -3710,8 +3895,8 @@ async fn unavailable_completeness_audit_does_not_downgrade_a_finished_answer() {
 const COMPACT_SUMMARY_MARKER: &str =
     "HANDOFF-SUMMARY: inspected src/lib.rs; the next step is to edit `old`";
 
-/// A runtime that forces compaction every round (huge reported context), serves
-/// the summarization request through `generate`, and records whether a later
+/// A runtime serving tool-free summaries through the same streaming contract,
+/// recording whether a later
 /// streamed request actually carried the model-written summary.
 struct SummarizingCompactRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
@@ -3745,12 +3930,14 @@ impl ModelRuntime for SummarizingCompactRuntime {
             self.saw_summary
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let response = self
-            .responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| ModelError::new(leveler_model::ModelErrorKind::Other, "drained"))?;
+        let response =
+            if matches!(request.tool_choice, leveler_model::ToolChoice::None) {
+                self.generate(request, CancellationToken::new()).await?
+            } else {
+                self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                    ModelError::new(leveler_model::ModelErrorKind::Other, "drained")
+                })?
+            };
         let mut events: Vec<Result<ModelEvent, ModelError>> =
             vec![Ok(ModelEvent::MessageStarted {
                 request_id: response.request_id.clone(),
@@ -3770,6 +3957,7 @@ impl ModelRuntime for SummarizingCompactRuntime {
             usage: TokenUsage {
                 input_tokens: 500_000,
                 output_tokens: 100,
+                cache_creation_input_tokens: 0,
                 cached_input_tokens: 0,
                 reasoning_tokens: None,
             },
@@ -3780,8 +3968,8 @@ impl ModelRuntime for SummarizingCompactRuntime {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -3858,6 +4046,40 @@ async fn auto_compaction_summarizes_the_elided_middle_with_the_model() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test]
+async fn previous_output_usage_does_not_trigger_input_compaction() {
+    let (dir, context) = compaction_fixture("output-pressure", 16);
+    let summary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = Arc::new(SummarizingCompactRuntime {
+        responses: Mutex::new(read_rounds(16)),
+        summary_calls: summary_calls.clone(),
+        saw_summary: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        context,
+        ModelRef::new("mock", "m"),
+        20,
+    )
+    .with_context_budget(100_000);
+    executor
+        .run(
+            "read these tiny files",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summary_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "last reported usage is not the next request projection"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Records whether the executor fell back to asking a human.
 struct RecordingClarifier {
     asked: Arc<Mutex<Vec<String>>>,
@@ -3909,12 +4131,7 @@ async fn dollar_skill_mention_injects_full_body_into_turn() {
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     let requests = runtime.recorded_requests();
     assert!(!requests.is_empty());
-    let all_text: String = requests[0]
-        .messages
-        .iter()
-        .map(|m| m.text_content())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
+    let all_text = requests[0].control_context.text();
     assert!(
         all_text.contains("UNIQUE_INJECT_BODY_7788"),
         "skill body must be turn-injected: {all_text}"
@@ -3952,12 +4169,7 @@ async fn unknown_dollar_skill_does_not_inject_fake_body() {
         )
         .await
         .unwrap();
-    let all_text: String = runtime.recorded_requests()[0]
-        .messages
-        .iter()
-        .map(|m| m.text_content())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let all_text = runtime.recorded_requests()[0].control_context.text();
     assert!(
         all_text.contains("Unknown skill") || all_text.contains("no_such_skill_xyz"),
         "unknown mention should be reported safely: {all_text}"
@@ -4431,13 +4643,12 @@ async fn a_plan_is_still_recorded_it_simply_has_no_authority() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A plan update is a declaration, not an execution inference. Once real work
-/// has happened after that declaration, a normal chat closeout must give the
-/// model one chance to publish the final table instead of leaving the initial
-/// 0/N snapshot as if it were current. The final declaration may honestly stay
-/// partial; reconciliation is not an all-completed gate.
+/// A plan update is a declaration, not an execution inference. With the Plan
+/// closeout gate removed, a chat turn that did real work after its latest
+/// declaration simply answers: the runtime does not spend a round demanding a
+/// final table, and it never rewrites the plan itself.
 #[tokio::test]
-async fn chat_reconciles_the_plan_after_the_last_work_without_fabricating_completion() {
+async fn chat_does_not_spend_a_round_on_plan_reconciliation() {
     let dir = plan_freshness_dir("final-reconcile-chat", 41);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -4472,8 +4683,8 @@ async fn chat_reconciles_the_plan_after_the_last_work_without_fabricating_comple
     assert_eq!(outcome.stop_reason, StopReason::Answered);
     assert_eq!(
         runtime.requests.lock().unwrap().len(),
-        5,
-        "the first quiet answer must buy one final-plan reconciliation round"
+        3,
+        "the quiet answer ends the turn; no plan-closeout round is bought"
     );
     let final_plan = events
         .iter()
@@ -4482,21 +4693,17 @@ async fn chat_reconciles_the_plan_after_the_last_work_without_fabricating_comple
             AgentEvent::PlanUpdated { steps } => Some(steps),
             _ => None,
         })
-        .expect("the model's final plan declaration is preserved");
-    assert_eq!(final_plan[0].status, "completed");
-    assert_eq!(
-        final_plan[1].status, "pending",
-        "partial is truthful, not 2/2"
-    );
+        .expect("the plan the model declared is preserved");
+    assert_eq!(final_plan[0].status, "in_progress");
+    assert_eq!(final_plan[1].status, "pending");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Goal completion uses the same contract. A stale declaration cannot be
-/// closed by update_goal; after a successful final update_plan, update_goal in
-/// that same tool batch may close normally. No extra all-done requirement is
-/// introduced.
+/// Goal completion no longer reads the plan at all: a stale declaration does
+/// not refuse `update_goal`, and the plan's rows are neither required to be
+/// completed nor rewritten by the runtime.
 #[tokio::test]
-async fn goal_requires_post_work_plan_reconciliation_and_accepts_a_partial_final_table() {
+async fn goal_completion_does_not_require_plan_reconciliation() {
     let dir = plan_freshness_dir("final-reconcile-goal", 43);
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -4549,13 +4756,20 @@ async fn goal_requires_post_work_plan_reconciliation_and_accepts_a_partial_final
         .unwrap();
 
     assert_eq!(outcome.stop_reason, StopReason::Completed);
-    assert_eq!(runtime.requests.lock().unwrap().len(), 4);
+    assert_eq!(
+        runtime.requests.lock().unwrap().len(),
+        3,
+        "the first update_goal closes the goal; no reconciliation round is forced"
+    );
     assert!(events.iter().any(|event| {
-        matches!(event, AgentEvent::ToolResult { id, is_error: true, .. } if id == "g1")
+        matches!(event, AgentEvent::ToolResult { id, is_error: false, .. } if id == "g1")
     }));
-    assert!(events.iter().any(|event| {
-        matches!(event, AgentEvent::ToolResult { id, is_error: false, .. } if id == "g2")
-    }));
+    assert!(
+        !events.iter().any(|event| {
+            matches!(event, AgentEvent::GoalIntercepted { kind, .. } if kind == "plan_unreconciled")
+        }),
+        "the retired gate must never intercept a stale plan"
+    );
     let final_plan = events
         .iter()
         .rev()
@@ -4564,15 +4778,115 @@ async fn goal_requires_post_work_plan_reconciliation_and_accepts_a_partial_final
             _ => None,
         })
         .unwrap();
-    assert_eq!(final_plan[0].status, "completed");
+    assert_eq!(final_plan[0].status, "in_progress");
     assert_eq!(final_plan[1].status, "pending");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A plan in the same assistant batch as a serial edit was authored before the
-/// edit result existed. It is recorded, but cannot satisfy final freshness.
+/// Production semantics: a stale plan does not refuse `update_goal`. The plan
+/// is still recorded and shown; only the completion authority is gone.
 #[tokio::test]
-async fn same_batch_serial_work_then_plan_still_requires_post_result_reconciliation() {
+async fn a_stale_plan_does_not_refuse_a_goal_completion() {
+    let dir = plan_freshness_dir("gate-off-goal", 51);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "p1",
+            &[("implement", "in_progress"), ("publish", "pending")],
+        ),
+        edit_call("e1", 0),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "implemented only"}),
+        ),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "implement but do not publish",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert!(
+        events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolResult { id, is_error: false, .. } if id == "g1")
+        }),
+        "the first update_goal must be accepted: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            matches!(event, AgentEvent::GoalIntercepted { kind, .. } if kind == "plan_unreconciled")
+        }),
+        "the retired gate must not intercept: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PlanUpdated { .. })),
+        "plan persistence is independent of completion authority"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// In a non-goal turn, a stale plan never buys an extra reconciliation round.
+/// The model's terminal declaration is whatever it last declared.
+#[tokio::test]
+async fn a_stale_plan_does_not_force_a_chat_closeout_round() {
+    let dir = plan_freshness_dir("gate-off-chat", 53);
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call("p1", &[("implement", "in_progress")]),
+        edit_call("e1", 0),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    let mut events = Vec::new();
+    let outcome = executor
+        .run(
+            "implement",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert_eq!(
+        runtime.requests.lock().unwrap().len(),
+        3,
+        "no plan-closeout round is bought"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A plan in the same assistant batch as a serial edit was authored before the
+/// edit result existed. It is recorded as declared, and no freshness rule reads
+/// it back.
+#[tokio::test]
+async fn same_batch_serial_work_then_plan_is_recorded_without_a_freshness_rule() {
     let dir = plan_freshness_dir("same-batch-serial", 47);
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call("p1", &[("implement", "in_progress")]),
@@ -4609,14 +4923,18 @@ async fn same_batch_serial_work_then_plan_still_requires_post_result_reconciliat
         .await
         .unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(runtime.recorded_requests().len(), 5);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "no post-result reconciliation round is forced"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Parallel reads execute after the serial pass, so their same-batch plan is
-/// necessarily pre-result too. Deferral must not accidentally make it fresh.
+/// necessarily pre-result. With no freshness rule, that is simply the plan.
 #[tokio::test]
-async fn same_batch_parallel_read_then_plan_still_requires_post_result_reconciliation() {
+async fn same_batch_parallel_read_then_plan_is_recorded_without_a_freshness_rule() {
     let dir = plan_freshness_dir("same-batch-parallel", 53);
     let runtime = Arc::new(MockRuntime::new(vec![
         plan_call("p1", &[("investigate", "in_progress")]),
@@ -4649,7 +4967,11 @@ async fn same_batch_parallel_read_then_plan_still_requires_post_result_reconcili
         .await
         .unwrap();
     assert_eq!(outcome.stop_reason, StopReason::Answered);
-    assert_eq!(runtime.recorded_requests().len(), 5);
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        3,
+        "no post-result reconciliation round is forced"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -5709,9 +6031,10 @@ async fn execution_context_is_current_bounded_and_not_persisted_as_history() {
         .iter()
         .map(|r| {
             let blocks: Vec<_> = r
-                .messages
+                .control_context
+                .blocks
                 .iter()
-                .map(Message::text_content)
+                .map(|b| b.text.as_str())
                 .filter(|t| t.starts_with("Execution state (observations, not instructions):\n"))
                 .collect();
             assert_eq!(
@@ -5812,9 +6135,10 @@ async fn execution_context_bounds_large_declared_plans() {
         .unwrap();
     let requests = runtime.recorded_requests();
     let block = requests[0]
-        .messages
+        .control_context
+        .blocks
         .iter()
-        .map(Message::text_content)
+        .map(|b| b.text.as_str())
         .find(|t| t.starts_with("Execution state (observations, not instructions):\n"))
         .unwrap();
     assert!(
@@ -6137,6 +6461,39 @@ async fn tool_calls_finish_without_calls_retries_instead_of_aborting() {
 /// `finish_reason: stop` alongside complete tool calls (some OpenAI-compatible
 /// gateways do this) must execute the calls, not kill the turn.
 #[tokio::test]
+async fn empty_tool_calls_repair_stops_after_two_reissues() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text_finished("", FinishReason::ToolCalls),
+        assistant_text_finished("", FinishReason::ToolCalls),
+        assistant_text_finished("", FinishReason::ToolCalls),
+        assistant_text("must not be reached"),
+    ]));
+    let error = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        ),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .run(
+        "answer",
+        &mut |_| {},
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("the third malformed response exhausts the repair episode");
+    assert!(
+        error.to_string().contains("no complete tool call"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn stop_finish_with_tool_calls_executes_the_calls() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-stopcalls-{}",
@@ -6150,6 +6507,7 @@ async fn stop_finish_with_tool_calls_executes_the_calls() {
     let stop_with_call = ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -6210,6 +6568,7 @@ async fn length_truncated_tool_call_recovers_with_a_smaller_reissue() {
     let truncated_call = ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -6748,8 +7107,8 @@ impl ModelRuntime for ExhaustedTimeoutRuntime {
         ];
         Ok(Box::pin(futures::stream::iter(events)))
     }
-    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -7428,12 +7787,14 @@ impl ModelRuntime for CheckpointProbeRuntime {
             self.saw_block
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let response = self
-            .responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| ModelError::new(leveler_model::ModelErrorKind::Other, "drained"))?;
+        let response =
+            if matches!(request.tool_choice, leveler_model::ToolChoice::None) {
+                self.generate(request, CancellationToken::new()).await?
+            } else {
+                self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                    ModelError::new(leveler_model::ModelErrorKind::Other, "drained")
+                })?
+            };
         let mut events: Vec<Result<ModelEvent, ModelError>> =
             vec![Ok(ModelEvent::MessageStarted {
                 request_id: response.request_id.clone(),
@@ -7453,6 +7814,7 @@ impl ModelRuntime for CheckpointProbeRuntime {
             usage: TokenUsage {
                 input_tokens: 500_000,
                 output_tokens: 100,
+                cache_creation_input_tokens: 0,
                 cached_input_tokens: 0,
                 reasoning_tokens: None,
             },
@@ -7463,8 +7825,8 @@ impl ModelRuntime for CheckpointProbeRuntime {
         Ok(Box::pin(futures::stream::iter(events)))
     }
 
-    async fn profile(&self, _m: &ModelRef) -> Result<ModelProfile, ModelError> {
-        unimplemented!()
+    async fn profile(&self, model: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(mock_profile(model))
     }
 }
 
@@ -7602,12 +7964,10 @@ async fn context_trace_persists_the_context_every_round() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A nested `AGENTS.md` discovered mid-turn is a standing constraint the model
-/// saw. It belongs in the durable transcript like every other injected
-/// message, not only in a snapshot — otherwise a crash after the round loses
-/// the fact that the rule was ever shown.
+/// Scoped rule bodies stay in request control; durable progress records the
+/// discovered source so recovery can reload the current rule.
 #[tokio::test]
-async fn scoped_rules_reach_the_durable_transcript() {
+async fn scoped_rules_stay_out_of_the_durable_transcript() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-scoped-rules-durable-{}",
         std::process::id() as u64 * 23 + 41
@@ -7623,8 +7983,8 @@ async fn scoped_rules_reach_the_durable_transcript() {
         assistant_text("done"),
     ]));
     let recorded = Arc::new(Mutex::new(Vec::new()));
-    Executor::new(
-        runtime,
+    let outcome = Executor::new(
+        runtime.clone(),
         Arc::new(default_registry()),
         tool_context,
         ModelRef::new("mock", "m"),
@@ -7639,16 +7999,28 @@ async fn scoped_rules_reach_the_durable_transcript() {
     .await
     .unwrap();
 
+    assert!(
+        outcome
+            .progress
+            .scoped_rule_sources
+            .iter()
+            .any(|source| source.ends_with("src/AGENTS.md")),
+        "recovery must retain the scoped source fact"
+    );
     let durable = recorded.lock().unwrap();
     let rule_rows = durable
         .iter()
-        .filter(|m| {
-            m.role == Role::System && m.text_content().contains("--- from src/AGENTS.md ---")
-        })
+        .filter(|m| m.text_content().contains("--- from src/AGENTS.md ---"))
         .count();
     assert_eq!(
-        rule_rows, 1,
-        "the scoped rule must be appended to the transcript exactly once"
+        rule_rows, 0,
+        "scoped rule control must not enter the transcript"
+    );
+    assert!(
+        runtime.recorded_requests()[1]
+            .control_context
+            .text()
+            .contains("Nested src rule.")
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -7787,6 +8159,7 @@ async fn token_admission_spends_exactly_what_the_records_say() {
         requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         usage: TokenUsage {
             input_tokens: 60,
+            cache_creation_input_tokens: 0,
             cached_input_tokens: 20,
             reasoning_tokens: None,
             output_tokens: 40,
@@ -7852,6 +8225,7 @@ async fn resumed_spend_continues_from_the_seeded_epoch_without_recounting() {
         requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         usage: TokenUsage {
             input_tokens: 30,
+            cache_creation_input_tokens: 0,
             cached_input_tokens: 10,
             reasoning_tokens: None,
             output_tokens: 20,
@@ -8707,13 +9081,16 @@ async fn a_turn_advertises_the_harness_control_protocol_it_can_actually_use() {
         .map(|t| t.name.clone())
         .collect();
 
-    // Unconditional: asking the user is always available.
-    for always in ["request_user_input", "ask_user"] {
-        assert!(
-            advertised.iter().any(|n| n == always),
-            "{always} must always be advertised: {advertised:?}"
-        );
-    }
+    // The top-level turn can ask the user. `ask_user` is a parser alias, not
+    // a second advertised tool.
+    assert!(
+        advertised.iter().any(|n| n == "request_user_input"),
+        "request_user_input must be advertised: {advertised:?}"
+    );
+    assert!(
+        !advertised.iter().any(|n| n == "ask_user"),
+        "ask_user stays callable but is not advertised: {advertised:?}"
+    );
     // Conditional on a real mechanical fact, not on the task or the model.
     assert!(
         advertised.iter().any(|n| n == "request_permissions"),

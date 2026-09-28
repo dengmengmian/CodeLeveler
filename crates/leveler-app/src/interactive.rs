@@ -33,7 +33,7 @@ use leveler_execution::{Approver, AutoApprove, PermissionProfile};
 use leveler_media::{MediaError, MediaStore};
 use leveler_model::{
     ContentPart, ImageSource, Message, ModelProfile, ModelRef, ModelRequest, ModelRuntime, Role,
-    ToolChoice, resolve_reasoning_effort,
+    ToolChoice, TranscriptOrigin, resolve_reasoning_effort,
 };
 use leveler_storage::{MessageRepository, SessionRepository};
 
@@ -740,6 +740,24 @@ impl leveler_agent::SteeringSource for SessionSteering {
     fn tool_call_ended(&self, id: &str) {
         release_cancel(&self.tool_calls, &self.session_id, id);
     }
+}
+
+/// The `/btw` mode contract, with the person's question quoted inside it.
+///
+/// The contract bounds SIDE EFFECTS, not tool calls: read-only investigation is
+/// allowed (the surface handed to the model holds no mutating tool), while
+/// workspace mutation and any change to the main task stay forbidden. The row
+/// is a runtime notice. It is not submitted user input, and it is not appended
+/// to the main transcript.
+fn side_question_message(question: &str) -> Message {
+    Message::user(
+        format!(
+            "【旁问 / btw】这是主任务之外的旁问。回答需要时可以使用只读工具。\n\n不要修改工作区，不要推进或改变主任务，也不要改动它的目标、计划、完成状态或执行状态。\n\n独立回答这个旁问，然后回到主任务，不改变主任务。\n\n{question}"
+        ),
+        TranscriptOrigin::RuntimeNotice {
+            notice: leveler_model::RuntimeNoticeKind::SideQuestion,
+        },
+    )
 }
 
 /// Drop a settled child's or call's handle.
@@ -1488,7 +1506,7 @@ impl InProcessRuntimeClient {
                     )
                     .await;
 
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                 let run = tokio::spawn({
                     let cancel = cancel.clone();
                     async move { runner.run_streaming(request, cancel, tx).await }
@@ -1515,6 +1533,27 @@ impl InProcessRuntimeClient {
                     }),
                 };
                 let status = crate::user_shell::terminal_status(&result);
+                if let Ok(output) = &result
+                    && output.truncated
+                {
+                    store.mark_output_truncated(&session_id, &id);
+                    let note = format!(
+                        "\n[output truncated; at least {} bytes omitted]\n",
+                        output.dropped_bytes
+                    );
+                    store.append_output(&session_id, &id, &note);
+                    let _ = log
+                        .append(
+                            None,
+                            leveler_engine::EngineEvent::UserShellOutput {
+                                execution_id: id.clone(),
+                                stream: "stderr".to_string(),
+                                chunk: note,
+                            },
+                            &mut forward,
+                        )
+                        .await;
+                }
                 let exit_code = match &result {
                     Ok(output) => output.exit_code,
                     Err(_) => None,
@@ -1889,30 +1928,48 @@ impl InProcessRuntimeClient {
             .first_user_texts()
             .await
             .unwrap_or_default();
-        SessionRepository::new(&db)
-            .list()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| {
-                let goal = if r.goal == PLACEHOLDER_GOAL || r.goal.trim().is_empty() {
-                    first_texts
-                        .get(&r.id)
-                        .and_then(|text| title_from_first_message(text))
-                        .unwrap_or(r.goal)
-                } else {
-                    r.goal
-                };
-                UiSessionSummary {
-                    id: SessionId::new(r.id),
-                    goal,
-                    status: r.status.as_str().to_string(),
-                    model: r.model,
-                    updated_at: r.updated_at,
-                    repository: Some(self.app.layout.repo_root.display().to_string()),
+        let rows = SessionRepository::new(&db).list().await.unwrap_or_default();
+        let mut summaries = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id = SessionId::new(r.id.clone());
+            let declaration = match leveler_storage::EventRepository::new(&db)
+                .load_last_by_type(&id, "task_finished", None)
+                .await
+            {
+                Ok(Some(record)) => {
+                    match leveler_engine::EngineEvent::from_payload(&record.payload) {
+                        Ok(leveler_engine::EngineEvent::TaskFinished {
+                            stop: Some(leveler_lifecycle::StopReason::Answered),
+                            ..
+                        }) => Some(leveler_client_protocol::UiTaskDeclaration::Answered),
+                        Ok(leveler_engine::EngineEvent::TaskFinished {
+                            stop: Some(leveler_lifecycle::StopReason::Completed),
+                            ..
+                        }) => Some(leveler_client_protocol::UiTaskDeclaration::Completed),
+                        _ => None,
+                    }
                 }
-            })
-            .collect()
+                _ => None,
+            };
+            let goal = if r.goal == PLACEHOLDER_GOAL || r.goal.trim().is_empty() {
+                first_texts
+                    .get(&r.id)
+                    .and_then(|text| title_from_first_message(text))
+                    .unwrap_or(r.goal)
+            } else {
+                r.goal
+            };
+            summaries.push(UiSessionSummary {
+                id: SessionId::new(r.id),
+                goal,
+                status: r.status.as_str().to_string(),
+                declaration,
+                model: r.model,
+                updated_at: r.updated_at,
+                repository: Some(self.app.layout.repo_root.display().to_string()),
+            });
+        }
+        summaries
     }
 
     fn approver(&self, session_id: &SessionId, cancel: CancellationToken) -> Arc<dyn Approver> {
@@ -1998,9 +2055,12 @@ impl InProcessRuntimeClient {
                 emit_project_rules(&events, &repo);
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
+                let terminal_events = events.clone();
                 let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_callback(move || {
-                        terminal_active.finish(&terminal_admission);
+                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                        terminal_active.finish_with(&terminal_admission, || {
+                            let _ = terminal_events.send(event);
+                        });
                     });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
                 let observer_acceptance = accepted_tx.clone();
@@ -2043,9 +2103,12 @@ impl InProcessRuntimeClient {
                 // EventBridge projects it immediately. Only failures that never
                 // reached that commit need the wrapper fallback.
                 if !bridge.terminal_published() {
-                    let _ = events.send(turn_runtime_event(result));
+                    active.finish_with(&admission, || {
+                        let _ = events.send(turn_runtime_event(result));
+                    });
+                } else {
+                    active.finish(&admission);
                 }
-                active.finish(&admission);
                 // Session-owned background reap moved to the engine's terminal
                 // settlement (finish_from_result) so chat-routed continuations
                 // are covered too — one reap site, not one per spawn function
@@ -2087,9 +2150,8 @@ impl InProcessRuntimeClient {
         // Plan read_only is applied inside engine from session.collaboration.
         let accepted = if collaboration_routes_submit_to_goal(&config.collaboration) {
             if !attachments.is_empty() {
-                // Goal path is text-first; attachments still need the
-                // multimodal content turn (goal_mode stays false unless the
-                // user used /goal). Prefer content when media present.
+                // The content entry resolves the same session-owned Goal
+                // profile while preserving every attachment.
                 self.spawn_turn(session_id, content, attachments, cancel, config)
             } else {
                 self.spawn_goal_turn(session_id, content, cancel, config)
@@ -2155,7 +2217,7 @@ impl InProcessRuntimeClient {
                 "continuation intent resumes the session's logical task"
             );
         }
-        let instruction = Message::text(Role::User, content.clone());
+        let instruction = Message::user_input(content.clone());
         let cancel = self.stage_turn(&session_id, &content, false, 0).await?;
         let accepted = self.spawn_resume_turn(session_id, instruction, cancel);
         if self.durable_wire_ack {
@@ -2250,9 +2312,12 @@ impl InProcessRuntimeClient {
                 emit_project_rules(&events, &repo);
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
+                let terminal_events = events.clone();
                 let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_callback(move || {
-                        terminal_active.finish(&terminal_admission);
+                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                        terminal_active.finish_with(&terminal_admission, || {
+                            let _ = terminal_events.send(event);
+                        });
                     });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
                 let observer_acceptance = accepted_tx.clone();
@@ -2289,9 +2354,12 @@ impl InProcessRuntimeClient {
                     let _ = tx.send(Err(turn_rejection(&result)));
                 }
                 if !bridge.terminal_published() {
-                    let _ = events.send(turn_runtime_event(result));
+                    active.finish_with(&admission, || {
+                        let _ = events.send(turn_runtime_event(result));
+                    });
+                } else {
+                    active.finish(&admission);
                 }
-                active.finish(&admission);
             });
         });
         accepted_rx
@@ -2329,9 +2397,12 @@ impl InProcessRuntimeClient {
                 emit_project_rules(&events, &repo);
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
+                let terminal_events = events.clone();
                 let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_callback(move || {
-                        terminal_active.finish(&terminal_admission);
+                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                        terminal_active.finish_with(&terminal_admission, || {
+                            let _ = terminal_events.send(event);
+                        });
                     });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
                 let observer_acceptance = accepted_tx.clone();
@@ -2371,9 +2442,12 @@ impl InProcessRuntimeClient {
                     let _ = tx.send(Err(turn_rejection(&result)));
                 }
                 if !bridge.terminal_published() {
-                    let _ = events.send(turn_runtime_event(result));
+                    active.finish_with(&admission, || {
+                        let _ = events.send(turn_runtime_event(result));
+                    });
+                } else {
+                    active.finish(&admission);
                 }
-                active.finish(&admission);
             });
         });
         accepted_rx
@@ -2487,14 +2561,34 @@ impl InProcessRuntimeClient {
                  第二行：以「下一步：」开头，说明接下来要做什么。\
                  只依据给出的内容，不要编造未发生的事实。\n\n{tail}"
             );
-            let mut request = ModelRequest::new(model, vec![Message::text(Role::User, prompt)]);
+            let mut request =
+                ModelRequest::new(model.clone(), vec![Message::text(Role::User, prompt)]);
             request.tool_choice = ToolChoice::None;
             request.max_output_tokens = Some(256);
-            let resp = app
+            // A recap is a small bounded wording task, not coding work.
+            request.reasoning_effort = Some(leveler_model::ReasoningEffort::Low);
+            let started = std::time::Instant::now();
+            let outcome = app
                 .registry
                 .generate(request, CancellationToken::new())
-                .await
-                .ok()?;
+                .await;
+            let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            crate::observability::record_auxiliary_call(
+                app,
+                &db,
+                session_id,
+                leveler_storage::ModelCallKind::SemanticRecap,
+                &model.provider,
+                &model.model,
+                Some("low"),
+                &outcome,
+                latency_ms,
+                None,
+                None,
+            )
+            .await
+            .ok()?;
+            let resp = outcome.ok()?;
             let text = resp.message.text_content();
             let mut lines = text.lines().filter(|l| !l.trim().is_empty());
             let display = lines.next()?.trim().to_string();
@@ -2527,6 +2621,12 @@ impl InProcessRuntimeClient {
         let app = self.app.clone();
         let events = self.events_for(&session_id);
         let model = config.model;
+        // The session axes the read-only side surface is composed from. Read
+        // before the side thread starts, so a later profile switch cannot make
+        // the tool composition and the recorded turn disagree.
+        let mode = config.mode;
+        let sandbox = config.sandbox;
+        let work_profile = config.work_profile.clone();
         let btw = self.btw.clone();
 
         // One answer at a time per side thread: a second question while one is
@@ -2562,43 +2662,240 @@ impl InProcessRuntimeClient {
 
                 let result: Result<String, String> = async {
                     let db = app.open_database().await.map_err(|e| e.to_string())?;
-                    // Same budgeted path as main turns — never dump unbounded
-                    // raw history. Advisory side-question: bare fold, no model
-                    // summary call, and no snapshot persisted.
-                    let raw = leveler_engine::RawTranscript::load_lossy(&db, &session_id)
+                    let profile = app
+                        .registry
+                        .profile(&model)
                         .await
                         .map_err(|e| e.to_string())?;
-                    let log = leveler_engine::EventLog::new(&db, session_id.clone());
-                    let context = raw
-                        .assemble(
-                            &log,
-                            None,
-                            Some(question.as_str()),
-                            u64::from(leveler_agent::coding::CHAT_CONTEXT_BUDGET),
+                    let policy = leveler_agent::coding::resolve_execution_policy(
+                        &profile,
+                        leveler_agent::coding::ExecutionRole::Main,
+                        &leveler_agent::coding::TurnProfile::Chat {
+                            continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
+                            limits: leveler_agent::StepLimits::default(),
+                        },
+                        app.execution_overrides.as_ref(),
+                    );
+                    let question_message = side_question_message(&question);
+                    // The read-only tool surface the side question may use.
+                    // Composed from the same owner as a normal turn, narrowed to
+                    // the observe-class tools — no mutating tool and no harness
+                    // control — so a side question cannot change the workspace or
+                    // steer the main task. `None` when the model cannot call
+                    // tools at all, which keeps the request unchanged for it.
+                    //
+                    // It is built BEFORE any pressure figure is taken: the
+                    // projection must be of the request that is actually sent,
+                    // and a tool-bearing request replays captured reasoning the
+                    // way its route contract requires. Measuring a tool-less
+                    // request instead would drop that reasoning from the wire
+                    // (the provider validates it) and would understate both the
+                    // fold decision and the recorded prompt size.
+                    let side_tools = if profile.capabilities.tool_calling {
+                        Some(
+                            app.side_question_tools(
+                                &model,
+                                mode,
+                                sandbox,
+                                leveler_agent::WorkProfile::from_persisted(&work_profile),
+                                Some(session_id.as_str()),
+                            )
+                            .await
+                            .map_err(|e| format!("构建旁问只读工具失败: {e}"))?,
                         )
+                    } else {
+                        None
+                    };
+                    let tool_definitions = side_tools
+                        .as_ref()
+                        .map(|(registry, _)| registry.definitions())
+                        .unwrap_or_default();
+                    let project = |messages: &[Message]| {
+                        leveler_model::RequestProjection::project(
+                            messages,
+                            &tool_definitions,
+                            policy.reasoning_replay,
+                            policy.reasoning_retention,
+                        )
+                    };
+                    // Pressure includes the entire side conversation and the
+                    // question, before choosing a snapshot or a summary.
+                    let measure_main = |main: &[Message]| {
+                        let mut complete = main.to_vec();
+                        complete.extend(history.iter().cloned());
+                        complete.push(question_message.clone());
+                        project(&complete).estimated_tokens()
+                    };
+                    let raw = leveler_engine::RawTranscript::load_strict(
+                        &db,
+                        &session_id,
+                        "side question",
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let log = leveler_engine::EventLog::new(&db, session_id.clone());
+                    let threshold = u64::from(policy.context_policy.pressure_threshold);
+                    let context = raw
+                        .assemble_unfolded_measured(&log, threshold, &measure_main)
                         .await
                         .map_err(|e| e.to_string())?;
-                    // Fresh main projection, then this side thread's own turns,
-                    // then the new question. Only the newest question carries the
-                    // "no tools" instruction so the stored history reads as a
-                    // natural dialogue.
                     let mut messages = context.prior;
                     messages.extend(history);
-                    messages.push(Message::text(
-                        Role::User,
-                        format!(
-                            "【旁问 / btw】请用当前对话上下文简短回答下面的问题。\
-                             不要调用任何工具，不要修改文件，不要继续主任务。\n\n{question}"
-                        ),
-                    ));
-                    let mut request = ModelRequest::new(model, messages);
-                    request.tool_choice = ToolChoice::None;
-                    let resp = app
-                        .registry
-                        .generate(request, cancel.clone())
+                    messages.push(question_message);
+                    let mut projection = project(&messages);
+                    if policy.context_policy.folding_enabled()
+                        && projection.estimated_tokens() > threshold
+                    {
+                        let retention = policy.context_policy.retention;
+                        let summary_request = leveler_context::summary_request(
+                            app.registry.as_ref(),
+                            &model,
+                            policy.reasoning_effort,
+                            &messages,
+                            retention.keep_recent_messages,
+                            retention.keep_recent_tokens,
+                            policy.max_output_tokens,
+                        )
                         .await
-                        .map_err(|e| e.to_string())?;
-                    Ok(resp.message.text_content())
+                        .ok_or("旁问上下文超过预算，无法生成有效摘要；原历史已保留")?;
+                        let summary_input = summary_request
+                            .projection
+                            .as_ref()
+                            .map(|p| p.estimated_tokens())
+                            .unwrap_or_default();
+                        let window = u64::from(policy.context_policy.context_window);
+                        if window > 0
+                            && summary_input
+                                .saturating_add(u64::from(
+                                    summary_request.max_output_tokens.unwrap_or(0),
+                                ))
+                                .saturating_add(u64::from(policy.context_policy.headroom))
+                                > window
+                        {
+                            return Err("旁问摘要请求超过模型窗口；原历史已保留".into());
+                        }
+                        let summary_effort = summary_request.reasoning_effort.map(|e| e.as_wire());
+                        let started = std::time::Instant::now();
+                        let outcome = app.registry.generate(summary_request, cancel.clone()).await;
+                        let latency_ms =
+                            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        crate::observability::record_auxiliary_call(
+                            &app,
+                            &db,
+                            &session_id,
+                            leveler_storage::ModelCallKind::Compaction,
+                            &model.provider,
+                            &model.model,
+                            summary_effort,
+                            &outcome,
+                            latency_ms,
+                            None,
+                            Some(summary_input),
+                        )
+                        .await
+                        .map_err(|e| format!("记录旁问摘要请求失败: {e}"))?;
+                        let response = outcome.map_err(|e| e.to_string())?;
+                        let summary = leveler_context::accepted_summary(&response)
+                            .ok_or("旁问摘要未正常完成；原历史已保留")?;
+                        messages = leveler_context::compact_messages(
+                            &messages,
+                            retention.keep_recent_messages,
+                            retention.keep_recent_tokens,
+                            Some(&summary),
+                            Some(question.as_str()),
+                        );
+                        projection = project(&messages);
+                        if projection.estimated_tokens() > threshold {
+                            return Err("旁问摘要后仍超过上下文预算；原历史已保留".into());
+                        }
+                    }
+                    // A bounded loop: a side question may look things up, but it
+                    // is not an open-ended main turn. One step is one model
+                    // request plus the read-only calls it asked for; the
+                    // exchange lives only in this local `messages` vector.
+                    const MAX_SIDE_QUESTION_STEPS: usize = 12;
+                    let mut answer = String::new();
+                    for step in 0..MAX_SIDE_QUESTION_STEPS {
+                        let projection = project(&messages);
+                        let estimated_input = projection.estimated_tokens();
+                        let mut request = ModelRequest::new(model.clone(), messages.clone());
+                        request.tools = tool_definitions.clone();
+                        request.tool_choice = if tool_definitions.is_empty() {
+                            ToolChoice::None
+                        } else {
+                            ToolChoice::Auto
+                        };
+                        request.max_output_tokens = Some(policy.max_output_tokens);
+                        request.reasoning_effort = policy.reasoning_effort;
+                        request.projection = Some(projection);
+                        let started = std::time::Instant::now();
+                        let outcome = app.registry.generate(request, cancel.clone()).await;
+                        let latency_ms =
+                            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        crate::observability::record_auxiliary_call(
+                            &app,
+                            &db,
+                            &session_id,
+                            leveler_storage::ModelCallKind::SideQuestion,
+                            &model.provider,
+                            &model.model,
+                            policy.reasoning_effort.map(|e| e.as_wire()),
+                            &outcome,
+                            latency_ms,
+                            None,
+                            Some(estimated_input),
+                        )
+                        .await
+                        .map_err(|e| format!("记录模型请求失败: {e}"))?;
+                        let resp = outcome.map_err(|e| e.to_string())?;
+                        let calls: Vec<leveler_model::ToolCall> = resp
+                            .message
+                            .content
+                            .iter()
+                            .filter_map(|part| match part {
+                                ContentPart::ToolCall { call } => Some(call.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        // No call to run (or the last permitted step): the text
+                        // is the answer. A final step that still asks for tools
+                        // returns its text rather than leaving an unanswered
+                        // exchange; nothing is sent after this point.
+                        if calls.is_empty() || step + 1 == MAX_SIDE_QUESTION_STEPS {
+                            answer = resp.message.text_content();
+                            break;
+                        }
+                        messages.push(resp.message);
+                        let (registry, tool_context) = side_tools
+                            .as_ref()
+                            .expect("a tool call implies the side surface exists");
+                        let mut parts = Vec::with_capacity(calls.len());
+                        for call in calls {
+                            let (content, is_error) = match registry
+                                .execute(
+                                    &call.name,
+                                    call.arguments.clone(),
+                                    tool_context.clone(),
+                                    cancel.clone(),
+                                )
+                                .await
+                            {
+                                Ok(output) => (output.content, output.is_error),
+                                Err(error) => {
+                                    (format!("tool `{}` failed: {error}", call.name), true)
+                                }
+                            };
+                            parts.push(ContentPart::ToolResult {
+                                result: leveler_model::ToolResultContent {
+                                    call_id: call.id.clone(),
+                                    content,
+                                    is_error,
+                                },
+                            });
+                        }
+                        messages.push(Message::from_parts(Role::Tool, parts, None));
+                    }
+                    Ok(answer)
                 }
                 .await;
 
@@ -2626,9 +2923,7 @@ impl InProcessRuntimeClient {
                     let thread = threads.entry(session_id.clone()).or_default();
                     thread.cancel = None;
                     if let Some(text) = record {
-                        thread
-                            .history
-                            .push(Message::text(Role::User, question.clone()));
+                        thread.history.push(Message::user_input(question.clone()));
                         if !text.is_empty() {
                             thread.history.push(Message::text(Role::Assistant, text));
                         }
@@ -2783,9 +3078,12 @@ impl InProcessRuntimeClient {
                 emit_project_rules(&events, &repo);
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
+                let terminal_events = events.clone();
                 let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_callback(move || {
-                        terminal_active.finish(&terminal_admission);
+                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                        terminal_active.finish_with(&terminal_admission, || {
+                            let _ = terminal_events.send(event);
+                        });
                     });
                 let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
                 let observer_acceptance = accepted_tx.clone();
@@ -2825,9 +3123,12 @@ impl InProcessRuntimeClient {
                     let _ = tx.send(Err(turn_rejection(&result)));
                 }
                 if !bridge.terminal_published() {
-                    let _ = events.send(turn_runtime_event(result));
+                    active.finish_with(&admission, || {
+                        let _ = events.send(turn_runtime_event(result));
+                    });
+                } else {
+                    active.finish(&admission);
                 }
-                active.finish(&admission);
             });
         });
         accepted_rx
@@ -4745,26 +5046,139 @@ async fn compact_conversation(
     // What the compaction replaces, for the durable `Compacted` fact below.
     let compacted_from = request_messages.len();
     request_messages.push(Message::text(Role::User, COMPACT_PROMPT));
-    let request = ModelRequest::new(model.clone(), request_messages);
+    let mut request = ModelRequest::new(model.clone(), request_messages);
+    let requested_effort = leveler_engine::ModelCallKind::Compaction.default_reasoning_effort();
+    let profile = match app.registry.profile(model).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            fail(format!(
+                "压缩失败：无法读取模型配置: {error}（原历史未改动）"
+            ));
+            return false;
+        }
+    };
+    request.reasoning_effort =
+        resolve_reasoning_effort(requested_effort, &profile.reasoning).effective;
+    request.max_output_tokens = Some(profile.limits.max_output_tokens.min(4096));
+    request.projection = Some(leveler_model::RequestProjection::project(
+        &request.messages,
+        &request.tools,
+        leveler_model::ReasoningReplayContract::resolve(profile.protocol, &profile.compatibility),
+        leveler_model::ReasoningRetention::default(),
+    ));
+    let estimated_tokens = request
+        .projection
+        .as_ref()
+        .map(|projection| projection.estimated_tokens());
+    let progress =
+        match leveler_agent::load_auxiliary_budget_progress(&db, &db, &db, session_id).await {
+            Ok(progress) => progress,
+            Err(error) => {
+                fail(format!(
+                    "压缩失败：无法重建任务预算: {error}（原历史未改动）"
+                ));
+                return false;
+            }
+        };
+    let limits = app.top_level_limits();
+    if !leveler_agent::auxiliary_budget_available(
+        limits,
+        &progress,
+        &request,
+        profile.pricing.as_ref(),
+    ) {
+        fail("压缩失败：剩余任务预算不足或已有请求费用未知（原历史未改动）".to_string());
+        return false;
+    }
+    let effort = request.reasoning_effort.map(|value| value.as_wire());
     // Show a spinner while the (blocking, non-streaming) summary is generated —
     // otherwise the whole briefing "appears out of nowhere" with no feedback.
     let _ = events.send(RuntimeEvent::AgentActivity {
         label: "正在压缩上下文…".to_string(),
     });
-    let summary = match app.registry.generate(request, cancellation).await {
-        Ok(resp) => resp.message.text_content(),
+    let started = std::time::Instant::now();
+    let call_cancel = cancellation.child_token();
+    let generate = app.registry.generate(request, call_cancel.clone());
+    tokio::pin!(generate);
+    let response = if let Some(max_duration) = limits.max_duration {
+        let remaining = max_duration.saturating_sub(std::time::Duration::from_millis(
+            progress.cumulative_duration_ms,
+        ));
+        tokio::select! {
+            result = &mut generate => result,
+            _ = tokio::time::sleep(remaining) => {
+                call_cancel.cancel();
+                generate.await
+            }
+        }
+    } else {
+        generate.await
+    };
+    let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    if let Err(error) = crate::observability::record_auxiliary_call(
+        app,
+        &db,
+        session_id,
+        leveler_storage::ModelCallKind::Compaction,
+        &model.provider,
+        &model.model,
+        effort,
+        &response,
+        latency_ms,
+        progress.budget_scope.as_deref(),
+        estimated_tokens,
+    )
+    .await
+    {
+        fail(format!(
+            "压缩失败：无法记录模型请求: {error}（原历史与任务状态未改动）"
+        ));
+        return false;
+    }
+    if progress.budget_scope.is_some() {
+        let persisted = async {
+            let mut updated =
+                leveler_agent::load_auxiliary_budget_progress(&db, &db, &db, session_id).await?;
+            updated.cumulative_duration_ms =
+                updated.cumulative_duration_ms.saturating_add(latency_ms);
+            let (tag, payload) =
+                leveler_engine::EngineEvent::ProgressUpdated { ledger: updated }.to_row()?;
+            leveler_storage::EventRepository::new(&db)
+                .append(session_id, None, &tag, &payload, leveler_core::now())
+                .await?;
+            Ok::<(), leveler_engine::EngineError>(())
+        }
+        .await;
+        if let Err(error) = persisted {
+            fail(format!(
+                "压缩失败：无法保存任务预算: {error}（原历史与检查点未改动）"
+            ));
+            return false;
+        }
+    }
+    let summary = match response {
+        Ok(resp) => match leveler_context::accepted_summary(&resp) {
+            Some(summary) => summary,
+            None => {
+                fail(
+                    "压缩失败：摘要为空、未完整结束或包含工具调用（原历史与任务状态未改动）"
+                        .to_string(),
+                );
+                return false;
+            }
+        },
         Err(e) => {
             fail(format!("压缩失败：{e}"));
             return false;
         }
     };
 
-    let summary_msg = Message::text(
-        Role::User,
+    let summary_msg = Message::user(
         format!(
             "{}：\n{summary}",
             leveler_client_protocol::COMPACTION_SUMMARY_PREFIX
         ),
+        TranscriptOrigin::CompactionSummary,
     );
     if let Err(e) =
         commit_compaction_epoch(&db, session_id, summary_msg.clone(), compacted_from).await
@@ -5027,6 +5441,32 @@ fn take_cancel(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get_mut(session_id)
         .and_then(|running| running.remove(child_id))
+}
+
+#[cfg(test)]
+mod side_question_tests {
+    use super::*;
+
+    #[test]
+    fn side_question_keeps_the_mode_contract_and_is_not_a_runtime_fact() {
+        let message = side_question_message("why this design?");
+        let text = message.text_content();
+        // The contract bounds side effects, not investigation.
+        assert!(text.contains("可以使用只读工具"), "{text}");
+        assert!(!text.contains("不要调用任何工具"), "{text}");
+        assert!(text.contains("不要修改工作区"), "{text}");
+        assert!(text.contains("不要推进或改变主任务"), "{text}");
+        assert!(text.contains("why this design?"), "{text}");
+        assert_ne!(message.origin, Some(TranscriptOrigin::UserInput));
+        let class = leveler_model::classify_transcript_origin(message.origin.as_ref());
+        assert_ne!(class.authority, leveler_model::PromptAuthority::RuntimeFact);
+        assert_eq!(
+            class.authority,
+            leveler_model::PromptAuthority::CoreContract
+        );
+        assert!(!class.authority_mismatch);
+        assert_ne!(class.authority, leveler_model::PromptAuthority::UserIntent);
+    }
 }
 
 #[cfg(test)]
@@ -5559,41 +5999,6 @@ mod context_ops_tests {
     }
 
     #[test]
-    fn btw_history_builder_uses_budgeted_path_not_raw_dump() {
-        // Same function /btw calls: oversized raw history is folded under threshold.
-        let mut raw = Vec::new();
-        for i in 0..80 {
-            raw.push(Message::text(
-                Role::User,
-                format!("history line {i} with enough padding to burn tokens xxxxxxxx"),
-            ));
-            raw.push(Message::text(
-                Role::Assistant,
-                format!("reply {i} also padded so estimate_tokens exceeds a tiny budget"),
-            ));
-        }
-        let before = raw.len();
-        let (budgeted, _) = leveler_engine::budget_prior_messages(
-            raw,
-            None,
-            None,
-            Some("side question"),
-            // Force compaction path with a tiny threshold.
-            500,
-        );
-        assert!(
-            budgeted.len() < before,
-            "btw must not send full raw transcript: before={before} after={}",
-            budgeted.len()
-        );
-        assert!(
-            leveler_agent::estimate_tokens(&budgeted) <= 2_000
-                || budgeted.len() <= leveler_agent::COMPACT_KEEP_RECENT + 4,
-            "budgeted btw history must be bounded"
-        );
-    }
-
-    #[test]
     fn compact_parse_rejects_corrupt_row_without_dropping_siblings() {
         let good = serde_json::to_string(&Message::text(Role::User, "ok")).unwrap();
         let payloads = vec![
@@ -5651,5 +6056,221 @@ mod in_flight_tests {
         assert!(registered(&registry, &command_id));
         first.keep_for_this_boot();
         assert!(registered(&registry, &command_id));
+    }
+}
+
+#[cfg(test)]
+mod terminal_assist_tests {
+    use super::*;
+    use leveler_test_support::{MockResponse, MockServer};
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_terminal_prediction_survives_the_admission_release_boundary() {
+        let server = MockServer::start_one(MockResponse::json_ok(
+            r#"{"id":"assist","choices":[{"message":{"role":"assistant","content":"运行测试"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+        )).await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("configs/providers")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("configs/models")).unwrap();
+        std::fs::write(
+            tmp.path().join("configs/providers/mock.yaml"),
+            format!(
+                "id: mock\nprotocol: openai_chat\nbase_url: {}\n",
+                server.base_url()
+            ),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("configs/models/m.yaml"), r#"
+id: m
+provider: mock
+model_id: mock-model
+protocol: openai_chat
+capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: false, vision: false }
+limits: { context_window: 8192, reliable_context: 4096, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }
+compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
+"#).unwrap();
+        let layout = leveler_project::Layout::from_parts(
+            tmp.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        );
+        let mut app = Application::assemble(layout).unwrap();
+        app.config.assist_prompt_suggestions = true;
+        let app = Arc::new(app);
+        let model = ModelRef::new("mock", "m");
+        let session = app
+            .create_session(&model, "prediction boundary")
+            .await
+            .unwrap();
+        let db = app.open_database().await.unwrap();
+        let history = [
+            Message::text(Role::User, "完成修复后运行测试"),
+            Message::text(Role::Assistant, "修复已完成，等待运行测试。"),
+        ]
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap())
+        .collect::<Vec<_>>();
+        MessageRepository::new(&db)
+            .append(&session, &history, leveler_core::now())
+            .await
+            .unwrap();
+        let client = Arc::new(InProcessRuntimeClient::new(
+            app.clone(),
+            model,
+            PermissionProfile::Assisted,
+            false,
+        ));
+        let active = client.active.clone();
+        let lease = active.admit(&session).unwrap();
+        let events = client.events_for(&session);
+        let mut rx = events.subscribe();
+        let (published_tx, published_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let producer_active = active.clone();
+        let producer_events = events.clone();
+        let producer = std::thread::spawn(move || {
+            let mut bridge =
+                EventBridge::new(producer_events.clone()).with_terminal_publisher(move |event| {
+                    producer_active.finish_with(&lease, || {
+                        producer_events.send(event).unwrap();
+                        published_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    });
+                });
+            bridge.forward(leveler_engine::EngineEvent::TaskFinished {
+                outcome: leveler_lifecycle::TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(leveler_agent::StopReason::Completed),
+                warnings: Vec::new(),
+            });
+        });
+        published_rx.await.unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            RuntimeEvent::TurnCompleted
+        ));
+        let (attempt_tx, attempt_rx) = oneshot::channel();
+        let (done_tx, mut done_rx) = oneshot::channel();
+        let handle = tokio::runtime::Handle::current();
+        let consumer = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            handle
+                .block_on(client.send(ClientCommand::RequestPromptSuggestion {
+                    session_id: session,
+                }))
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        attempt_rx.await.unwrap();
+        let returned_before_release =
+            tokio::time::timeout(Duration::from_millis(100), &mut done_rx)
+                .await
+                .is_ok();
+        release_tx.send(()).unwrap();
+        producer.join().unwrap();
+        consumer.join().unwrap();
+        assert!(
+            !returned_before_release,
+            "the terminal consumer discarded its single request before admission release; provider requests: {}",
+            server.request_count()
+        );
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, RuntimeEvent::PromptSuggestion { text } if text == "运行测试"));
+        assert_eq!(
+            server.request_count(),
+            1,
+            "one command must cause one provider request"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_declaration_tests {
+    use super::*;
+    use leveler_client_protocol::UiTaskDeclaration;
+    use leveler_lifecycle::{AgentState, SessionStatus, StopReason, TaskOutcome};
+
+    #[tokio::test]
+    async fn session_list_projects_latest_durable_declaration_without_rewriting_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("configs/models")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("configs/providers")).unwrap();
+        let app = Arc::new(
+            Application::assemble(leveler_project::Layout::from_parts(
+                tmp.path().to_path_buf(),
+                tmp.path().join("configs"),
+                tmp.path().join("state"),
+            ))
+            .unwrap(),
+        );
+        let db = app.open_database().await.unwrap();
+        let row = leveler_storage::SessionRecord::new(
+            "/repo",
+            "a question",
+            "mock/m",
+            leveler_core::now(),
+        );
+        SessionRepository::new(&db).create(&row).await.unwrap();
+        let id = SessionId::new(row.id);
+        SessionRepository::new(&db)
+            .update_status(
+                &id,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let client = InProcessRuntimeClient::new(
+            app,
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        );
+        let summaries = client.list_sessions().await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].declaration, None,
+            "legacy completion must remain unknown"
+        );
+        for (stop, declaration) in [
+            (
+                Some(StopReason::Answered),
+                Some(UiTaskDeclaration::Answered),
+            ),
+            (
+                Some(StopReason::Completed),
+                Some(UiTaskDeclaration::Completed),
+            ),
+            (Some(StopReason::BudgetExhausted), None),
+            (None, None),
+        ] {
+            let event = leveler_engine::EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                stop,
+                failure: None,
+                warnings: Vec::new(),
+            };
+            let (tag, payload) = event.to_row().unwrap();
+            leveler_storage::EventRepository::new(&db)
+                .append(&id, None, &tag, &payload, leveler_core::now())
+                .await
+                .unwrap();
+            let summaries = client.list_sessions().await;
+            assert_eq!(
+                summaries[0].declaration, declaration,
+                "latest stop is the only declaration source"
+            );
+            assert_eq!(
+                summaries[0].status, "completed",
+                "projection must not rewrite session lifecycle"
+            );
+        }
     }
 }

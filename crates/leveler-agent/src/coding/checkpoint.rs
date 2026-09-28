@@ -527,12 +527,12 @@ pub async fn resume_prior_from_checkpoint(
         return Ok(None);
     };
     let mut prior = Vec::with_capacity(1 + delta.len());
-    prior.push(leveler_model::Message {
-        role: leveler_model::Role::User,
-        content: vec![leveler_model::ContentPart::Text {
-            text: checkpoint.payload.context_block(),
-        }],
-    });
+    prior.push(leveler_model::Message::user(
+        checkpoint.payload.context_block(),
+        leveler_model::TranscriptOrigin::RuntimeNotice {
+            notice: leveler_model::RuntimeNoticeKind::GoalCheckpoint,
+        },
+    ));
     prior.extend_from_slice(delta);
     Ok(Some(prior))
 }

@@ -1,6 +1,6 @@
 //! Anchored context compaction: span selection, folding, token estimate.
 
-use leveler_model::{ContentPart, Message, Role};
+use leveler_model::{ContentPart, Message, Role, RuntimeNoticeKind, TranscriptOrigin};
 
 /// How many trailing messages (the working set) auto-compaction keeps verbatim.
 pub const COMPACT_KEEP_RECENT: usize = 12;
@@ -118,6 +118,64 @@ pub(crate) fn compaction_span(
     Some((head_end, tail_start))
 }
 
+/// What a measured request's pressure means for the context fold, and
+/// therefore what a failed briefing costs the turn.
+///
+/// The fold has TWO bounds, and they answer different questions. The quality
+/// threshold is where recall is expected to degrade — folding there is a
+/// quality choice that may be abandoned. The hard capacity is where a request
+/// can no longer legally be sent — folding there is REQUIRED, and a fold that
+/// cannot be produced must still be brought under capacity mechanically or the
+/// turn fails explicitly.
+///
+/// This is the ONE contract every active-context entry shares: coding/drive,
+/// chat, resume and [`crate`]-level assembly. Entries provide the measured
+/// facts (projected tokens, resolved bounds); this decides what a failure
+/// means. A caller must never re-derive the split from a model identity, a
+/// turn count, or an "is it stuck" guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldRequirement {
+    /// At or below the quality boundary: nothing to fold.
+    None,
+    /// Over the quality boundary but within hard capacity. Sending the request
+    /// uncompacted is legal, so a failed briefing keeps the original active
+    /// history and the turn continues.
+    Soft,
+    /// Over the hard capacity. Without a fold the request cannot legally be
+    /// sent, so a failed briefing must be folded mechanically or the turn
+    /// fails without ever sending an oversized request.
+    HardRequired,
+}
+
+impl FoldRequirement {
+    /// Classify from facts only.
+    ///
+    /// `hard_capacity` is `None` when the model declares no window: with no
+    /// hard limit there is no request compaction is obliged to make legal, so
+    /// nothing may claim a hard requirement.
+    pub fn classify(
+        projected_tokens: u64,
+        quality_threshold: u64,
+        hard_capacity: Option<u64>,
+    ) -> Self {
+        if let Some(capacity) = hard_capacity
+            && projected_tokens > capacity
+        {
+            return Self::HardRequired;
+        }
+        if projected_tokens > quality_threshold {
+            return Self::Soft;
+        }
+        Self::None
+    }
+
+    /// Whether a fold must succeed (mechanically at minimum) before the next
+    /// request can be sent.
+    pub fn fold_is_mandatory(self) -> bool {
+        matches!(self, Self::HardRequired)
+    }
+}
+
 /// Marker for the host-pinned active objective re-injected after compaction.
 /// Marks the host-pinned objective block so a fold can recognise and
 /// replace its own previous injection instead of stacking a second one.
@@ -127,13 +185,15 @@ pub const ACTIVE_OBJECTIVE_MARKER: &str = "[Active objective — host-pinned]";
 pub(crate) fn objective_pin_message(objective: &str) -> Message {
     let obj = objective.trim();
     Message {
+        origin: Some(TranscriptOrigin::RuntimeNotice {
+            notice: RuntimeNoticeKind::ObjectivePin,
+        }),
         role: Role::User,
         content: vec![ContentPart::Text {
             text: format!(
                 "{ACTIVE_OBJECTIVE_MARKER}\n\
                  <objective>\n{obj}\n</objective>\n\
-                 This is the only active request for this turn. Do not resurrect \
-                 earlier questions that were already answered."
+                 This is the active request for this turn."
             ),
         }],
     }
@@ -227,17 +287,18 @@ pub fn compact_messages(
     let body = match summary {
         Some(summary) => format!(
             "[Earlier context was compacted to fit the window: {elided} steps elided.{files_note}]\n\n\
-             Summary of the elided work — build on it, do not redo it:\n{summary}\n\n\
-             [Continue from the messages below.]"
+             Earlier conversation history was compacted. {elided} steps were elided.\n\
+             The following summary was generated from the elided history and may omit details:\n\
+             {summary}\n"
         ),
         None => format!(
             "[Earlier context was compacted to fit the window: {elided} steps elided.{files_note} \
-             Summarization was unavailable, so the details of those steps are LOST — \
-             re-establish any fact you need with tools instead of assuming it. \
-             Continue from the messages below.]"
+             Summarization was unavailable. Some earlier details are no longer available \
+             in the active context.]"
         ),
     };
     let breadcrumb = Message {
+        origin: Some(TranscriptOrigin::CompactionSummary),
         role: Role::User,
         content: vec![ContentPart::Text { text: body }],
     };
@@ -270,120 +331,123 @@ pub(crate) fn summary_prompt_for(to_summarize: &[Message]) -> &'static str {
     }
 }
 
-/// Ask `runtime` for a compaction handoff briefing over the middle the fold
-/// is about to elide. Returns `None` when there is nothing to fold or the
-/// call fails/times out — callers then fold with a bare breadcrumb, which
-/// still beats overflowing the window (and the loss stays explicit).
-/// A handoff briefing plus what producing it cost. The cost travels with the
-/// text because a fold's summarization is a real provider call that nothing
-/// else records: without this the token totals of a session that folded are
-/// short by exactly the calls a fold makes.
-#[derive(Debug, Clone)]
-pub struct CompactionSummary {
-    pub text: String,
-    pub usage: leveler_model::TokenUsage,
-    pub request_id: leveler_core::RequestId,
-    pub finish_reason: leveler_model::FinishReason,
-    pub latency_ms: u64,
+/// Mechanical acceptance for a summary that will replace model-visible history.
+pub fn accepted_summary(response: &leveler_model::ModelResponse) -> Option<String> {
+    if response.finish_reason != leveler_model::FinishReason::Stop
+        || response
+            .message
+            .content
+            .iter()
+            .any(|part| matches!(part, ContentPart::ToolCall { .. }))
+    {
+        return None;
+    }
+    let text = response.message.text_content().trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
-pub async fn summarize_with_model(
+pub async fn summary_request(
     runtime: &dyn leveler_model::ModelRuntime,
     model: &leveler_model::ModelRef,
     reasoning_effort: Option<leveler_model::ReasoningEffort>,
     messages: &[Message],
     keep_recent: usize,
     keep_recent_tokens: u64,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> Option<CompactionSummary> {
-    // Advisory call: never let a slow summarizer stall the main loop.
-    const SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    resolved_max_output_tokens: u32,
+) -> Option<leveler_model::ModelRequest> {
     let (_, tail_start) = compaction_span(messages, keep_recent, keep_recent_tokens)?;
     let to_summarize = &messages[..tail_start];
     let mut summary_messages = to_summarize.to_vec();
     summary_messages.push(Message::text(Role::User, summary_prompt_for(to_summarize)));
 
+    let profile = runtime.profile(model).await.ok()?;
+    let reasoning_effort =
+        leveler_model::resolve_reasoning_effort(reasoning_effort, &profile.reasoning).effective;
     let mut request = leveler_model::ModelRequest::new(model.clone(), summary_messages);
     request.tool_choice = leveler_model::ToolChoice::None;
-    request.max_output_tokens = Some(1024);
-    request.reasoning_effort = reasoning_effort;
-
-    let started = std::time::Instant::now();
-    let response = tokio::time::timeout(
-        SUMMARY_TIMEOUT,
-        runtime.generate(request, cancellation.child_token()),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let text = response.message.text_content().trim().to_string();
-    (!text.is_empty()).then_some(CompactionSummary {
-        text,
-        usage: response.usage,
-        request_id: response.request_id,
-        finish_reason: response.finish_reason,
-        latency_ms,
-    })
-}
-
-/// Coarse token estimate over a transcript's textual content. A fallback for
-/// providers/gateways that don't report streaming usage, so auto-compaction
-/// still triggers on a growing conversation.
-///
-/// ASCII averages ~4 bytes/token; CJK and other non-ASCII text spends ~1 token
-/// per character (~3 UTF-8 bytes), so those bytes are weighted at 3 bytes/token
-/// — a flat ÷4 under-counts Chinese-heavy transcripts by ~25% and fires
-/// compaction only after the request already exceeds the provider window.
-pub fn estimate_tokens(messages: &[Message]) -> u64 {
-    // A conservative flat cost (in ASCII byte-equivalents, ÷4 below) for one
-    // image, so a vision turn isn't counted as ~free. Real vision billing is
-    // tile-based and model-specific; ~1000 tokens/image is a safe floor that
-    // keeps compaction firing on image-heavy conversations when the gateway
-    // reports no usage.
-    const IMAGE_BYTE_EQUIV: u64 = 4096;
-    let mut ascii_text: u64 = 0;
-    let mut ascii_tool: u64 = 0;
-    let mut wide_bytes: u64 = 0;
-    let mut flat: u64 = 0;
-    let split = |s: &str| -> (u64, u64) {
-        let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
-        (ascii, s.len() as u64 - ascii)
-    };
-    for part in messages.iter().flat_map(|m| &m.content) {
-        match part {
-            ContentPart::Text { text } => {
-                let (a, w) = split(text);
-                ascii_text += a;
-                wide_bytes += w;
-            }
-            // Tool payloads are JSON/log shaped — brackets, quotes, repeated
-            // keys, hex ids — and tokenize far denser than prose: measured
-            // ~2.5–2.9 bytes/token against DeepSeek-reported usage (C5-S2),
-            // where a flat ÷4 under-counted tool-heavy transcripts by
-            // 27–38% and fired
-            // compaction only after the request was already oversized.
-            // Weighted at 2.5 so the residual error sits on the safe
-            // (slightly over-estimating) side.
-            ContentPart::ToolCall { call } => {
-                let (a, w) = split(&call.name);
-                ascii_tool += a;
-                wide_bytes += w;
-                let (a, w) = split(&call.arguments.to_string());
-                ascii_tool += a;
-                wide_bytes += w;
-            }
-            ContentPart::ToolResult { result } => {
-                let (a, w) = split(&result.content);
-                ascii_tool += a;
-                wide_bytes += w;
-            }
-            ContentPart::Image { .. } => flat += IMAGE_BYTE_EQUIV / 4,
-            _ => {}
-        }
+    // Summaries use the seat's resolved completion allowance, bounded by
+    // the provider declaration. Reasoning and the final briefing share this
+    // allowance; a fixed 1024 cap can leave no room for either to complete.
+    let output_cap = resolved_max_output_tokens.min(profile.limits.max_output_tokens);
+    if output_cap == 0
+        || matches!(profile.reasoning.style,
+            leveler_model::ReasoningStyle::BudgetedThinking { budget_tokens }
+                if budget_tokens >= output_cap)
+    {
+        // No valid summary can fit. The caller keeps its original context.
+        return None;
     }
-    ascii_text / 4 + ascii_tool * 2 / 5 + wide_bytes / 3 + flat
+    request.max_output_tokens = Some(output_cap);
+    request.reasoning_effort = reasoning_effort;
+    request.projection = Some(leveler_model::RequestProjection::project(
+        &request.messages,
+        &request.tools,
+        leveler_model::ReasoningReplayContract::resolve(profile.protocol, &profile.compatibility),
+        leveler_model::ReasoningRetention::All,
+    ));
+
+    Some(request)
 }
+
+#[cfg(test)]
+mod summary_acceptance_tests {
+    use super::accepted_summary;
+    use leveler_model::{
+        ContentPart, FinishReason, Message, ModelResponse, Role, TokenUsage, ToolCall,
+    };
+
+    #[test]
+    fn only_a_complete_nonempty_tool_free_summary_is_accepted() {
+        let mut response = ModelResponse {
+            request_id: leveler_core::RequestId::generate(),
+            message: Message::text(Role::Assistant, " summary "),
+            usage: TokenUsage::default(),
+            finish_reason: FinishReason::Stop,
+        };
+        assert_eq!(accepted_summary(&response).as_deref(), Some("summary"));
+        for reason in [
+            FinishReason::Length,
+            FinishReason::ContentFilter,
+            FinishReason::Other,
+            FinishReason::ToolCalls,
+        ] {
+            response.finish_reason = reason;
+            assert_eq!(accepted_summary(&response), None, "{reason:?}");
+        }
+        response.finish_reason = FinishReason::Stop;
+        response.message.content.push(ContentPart::ToolCall {
+            call: ToolCall {
+                id: leveler_core::ToolCallId::new("unexpected"),
+                name: "read_file".into(),
+                arguments: Default::default(),
+            },
+        });
+        assert_eq!(accepted_summary(&response), None);
+        response.message = Message::text(Role::Assistant, " \n ");
+        assert_eq!(accepted_summary(&response), None);
+        response.message = Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![ContentPart::Reasoning {
+                text: "unfinished internal reasoning".into(),
+            }],
+        };
+        assert_eq!(
+            accepted_summary(&response),
+            None,
+            "reasoning is never promoted into a briefing"
+        );
+    }
+}
+
+/// Coarse token estimate over a transcript's model-visible content.
+///
+/// The implementation — and the single definition of the density weights —
+/// lives in `leveler-model` (`leveler_model::estimate`), because the same
+/// arithmetic must serve compaction pressure, the agent's token-budget
+/// fallback and the context-accounting breakdown. Re-exported here so the
+/// context crate's callers keep one import.
+pub use leveler_model::estimate_tokens;
 
 #[cfg(test)]
 mod estimate_tests {
@@ -398,6 +462,7 @@ mod estimate_tests {
         let body = "{\"path\":\"src/lib.rs\",\"exit\":0}".repeat(100);
         let as_text = estimate_tokens(&[Message::text(Role::User, body.clone())]);
         let as_tool = estimate_tokens(&[Message {
+            origin: None,
             role: Role::User,
             content: vec![ContentPart::ToolResult {
                 result: leveler_model::ToolResultContent {
@@ -438,6 +503,7 @@ mod estimate_tests {
         ] {
             let message = if tool {
                 Message {
+                    origin: None,
                     role: Role::User,
                     content: vec![ContentPart::ToolResult {
                         result: leveler_model::ToolResultContent {
@@ -494,6 +560,7 @@ mod span_tests {
 
     fn assistant_call(id: &str, name: &str) -> Message {
         Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: leveler_model::ToolCall {
@@ -507,6 +574,7 @@ mod span_tests {
 
     fn tool_result(id: &str) -> Message {
         Message {
+            origin: None,
             role: Role::Tool,
             content: vec![ContentPart::ToolResult {
                 result: leveler_model::ToolResultContent {
@@ -718,6 +786,49 @@ mod span_tests {
             out.iter()
                 .any(|m| m.text_content().contains(COMPACTION_BREADCRUMB_MARKER)),
             "fold breadcrumb no longer contains the detection marker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fold_requirement_tests {
+    use super::FoldRequirement;
+
+    /// The boundary between soft and hard is the CAPACITY, and it is inclusive:
+    /// a request that exactly fits may still be sent unfolded.
+    #[test]
+    fn the_capacity_boundary_is_inclusive() {
+        assert_eq!(
+            FoldRequirement::classify(1_000, 500, Some(1_000)),
+            FoldRequirement::Soft
+        );
+        assert_eq!(
+            FoldRequirement::classify(1_001, 500, Some(1_000)),
+            FoldRequirement::HardRequired
+        );
+    }
+
+    /// Under the quality boundary nothing happens; over it the fold is a
+    /// quality choice.
+    #[test]
+    fn the_quality_boundary_separates_none_from_soft() {
+        assert_eq!(
+            FoldRequirement::classify(500, 500, Some(10_000)),
+            FoldRequirement::None
+        );
+        assert_eq!(
+            FoldRequirement::classify(501, 500, Some(10_000)),
+            FoldRequirement::Soft
+        );
+    }
+
+    /// With no declared window there is no capacity to exceed: every fold is a
+    /// quality choice and none is mandatory.
+    #[test]
+    fn an_unknown_capacity_never_requires_a_fold() {
+        assert_eq!(
+            FoldRequirement::classify(u64::MAX - 1, 500, None),
+            FoldRequirement::Soft
         );
     }
 }

@@ -102,6 +102,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -1141,6 +1142,7 @@ async fn seed_interrupted_child_session_scoped(
         Message::text(Role::System, "you are a sub-agent"),
         Message::text(Role::User, RESUMED_TASK),
         Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -1151,6 +1153,7 @@ async fn seed_interrupted_child_session_scoped(
             }],
         },
         Message {
+            origin: None,
             role: Role::Tool,
             content: vec![ContentPart::ToolResult {
                 result: leveler_model::ToolResultContent {

@@ -177,13 +177,20 @@ pub struct CaseResult {
     /// One-based repetition number for variance measurement.
     #[serde(default = "default_repetition")]
     pub repetition: u32,
-    /// The agent reported completion (verification gate passed).
+    /// The runtime's DECLARED completion, not independent proof of the work:
+    /// the agent resolved the task as done (`StopReason::Completed`, in goal
+    /// mode an explicit `update_goal(complete)`). `expect_passed` is the
+    /// independent check; a case passes only when both hold.
     pub completed: bool,
     /// Why execution stopped, independent from functional correctness and the
     /// runtime's completion claim. Absent on legacy baseline files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination: Option<TerminationClass>,
-    /// The `expect` command succeeded.
+    /// The `expect` command succeeded. A single boolean over an opaque
+    /// command: it folds functional acceptance together with whatever policy
+    /// the case's own script asserts (scope, test hygiene, …). Read it next to
+    /// [`Self::verification_evidence`], never as proof that the product, rather
+    /// than the case, is wrong.
     pub expect_passed: bool,
     /// Tool/agent rounds used.
     pub rounds: u32,
@@ -304,6 +311,69 @@ pub struct CaseResult {
     /// Impact paths the run never reached, by name — the half-fix, named.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missed_impact_paths: Vec<String>,
+
+    // ── Investigation batching (read-only observation density) ──────────────
+    /// Read-only observation calls in total: `read_calls + search_calls`.
+    #[serde(default)]
+    pub read_only_calls: u32,
+    /// Model rounds whose single assistant turn carried at least two read-only
+    /// calls. Zero on a run that read one thing per round.
+    #[serde(default)]
+    pub multi_read_rounds: u32,
+    /// Model rounds that carried at least one read-only call — the density
+    /// denominator that does not get diluted by rounds spent writing.
+    #[serde(default)]
+    pub rounds_with_read_only: u32,
+    /// Read-only calls per model round, in round order (see
+    /// [`TrajectorySignals::per_round_read_only`]). Empty on legacy artifacts
+    /// and on a run that never read anything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_round_read_only: Vec<u32>,
+    /// The widest read-only batch seen in one model round.
+    #[serde(default)]
+    pub max_read_only_calls_per_round: u32,
+    /// Verification-class commands that failed.
+    #[serde(default)]
+    pub verification_failures: u32,
+    /// Rounds at/after the first edit that contained an errored tool result.
+    #[serde(default)]
+    pub recovery_rounds: u32,
+
+    // ── Harness intervention (round attribution) ────────────────────────────
+    /// Distinct model rounds the harness put a message in front of. An extra
+    /// round can be the model's choice or the harness's; this is the latter's
+    /// footprint, so `rounds` can be read with it rather than assumed.
+    #[serde(default)]
+    pub runtime_injected_rounds: u32,
+    /// Harness injections that bought a round the model did not ask for
+    /// (closeout nudge, provider-response repair, length continuation).
+    #[serde(default)]
+    pub runtime_forced_continuations: u32,
+    /// Stable keys of the harness injections observed, first-seen order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_injection_kinds: Vec<String>,
+    /// `update_goal` refusals by the runtime, by stable reason key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goal_interceptions: Vec<String>,
+
+    // ── Model time (per-round ledger, not wall clock) ───────────────────────
+    /// Summed provider latency of this run's main-agent model rounds (ms) —
+    /// what the model itself cost, excluding tool time and scheduling.
+    #[serde(default)]
+    pub model_time_ms: u64,
+    /// Model time spent through the round that first invoked an edit tool.
+    /// `None` when the run never edited: the absence of a first edit is not a
+    /// zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_time_before_first_edit_ms: Option<u64>,
+    /// Reasoning tokens spent through the first edit round. `None` when the run
+    /// never edited, or when any of those rounds reported no breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens_before_first_edit: Option<u64>,
+    /// Largest input-token count any single round sent. Batching more results
+    /// into one turn raises this before it raises anything else.
+    #[serde(default)]
+    pub peak_input_tokens: u64,
 }
 
 const fn default_repetition() -> u32 {
@@ -351,6 +421,44 @@ pub struct VerificationEvidence {
     pub passed: bool,
     /// Exit code when the command started; `None` means it could not be spawned.
     pub exit_code: Option<i32>,
+    /// Bounded stdout of the acceptance command. `None` for legacy baselines
+    /// (written before this field existed) and when the command produced none.
+    /// Truncation is applied at capture time, never here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    /// Bounded stderr of the acceptance command — where a failing assertion's
+    /// own message lands. `None` under the same rules as [`Self::stdout`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    /// Why the command could not be spawned at all (missing program, permission
+    /// denied, …). `None` when it ran; then `exit_code` is the reason code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl VerificationEvidence {
+    /// The shortest human-actionable reason for a failure, DERIVED from the
+    /// persisted facts (never a second stored copy): the first non-empty line of
+    /// stderr — where a shell assertion prints its own message — else of stdout,
+    /// else the spawn error, else the exit code. `None` for a pass, so no
+    /// invented reason is ever emitted for success.
+    pub fn failure_reason(&self) -> Option<String> {
+        if self.passed {
+            return None;
+        }
+        for stream in [&self.stderr, &self.stdout] {
+            if let Some(line) = stream
+                .as_deref()
+                .and_then(|text| text.lines().map(str::trim).find(|l| !l.is_empty()))
+            {
+                return Some(line.to_string());
+            }
+        }
+        if let Some(error) = &self.error {
+            return Some(error.clone());
+        }
+        self.exit_code.map(|code| format!("exit code {code}"))
+    }
 }
 
 impl CaseResult {
@@ -393,9 +501,16 @@ impl EvalReport {
         self.cases.iter().map(|c| c.rounds as f32).sum::<f32>() / self.total() as f32
     }
 
-    /// Cases where the agent claimed completion but the independent check
-    /// disproved it (`completed && !expect_passed`). This is the headline
-    /// agent-quality signal — a *false* "done", distinct from an honest give-up.
+    /// Cases where the agent DECLARED completion and the independent acceptance
+    /// did not hold (`completed && !expect_passed`). This is a mechanical
+    /// mismatch signal, and the headline agent-quality signal for a *false*
+    /// "done" as distinct from an honest give-up.
+    ///
+    /// The mismatch proves the pair (declared done, acceptance failed) — it does
+    /// not, by itself, attribute the failure to the product. A mis-scoped or
+    /// otherwise defective case script produces the same pair, so triage reads
+    /// [`CaseResult::verification_evidence`] (which command failed, with what
+    /// exit code and message) before calling it a product false completion.
     pub fn false_completion_count(&self) -> usize {
         self.cases
             .iter()
@@ -429,7 +544,8 @@ impl EvalReport {
         truly_done as f32 / claimed as f32
     }
 
-    /// Ids of the false-completion cases, for failure triage.
+    /// Ids of the declared-complete / acceptance-failed cases, for failure
+    /// triage.
     pub fn false_completion_case_ids(&self) -> Vec<String> {
         self.cases
             .iter()
@@ -475,6 +591,41 @@ impl EvalReport {
         }
         let verified = self.cases.iter().filter(|c| c.verification_ran).count();
         verified as f32 / self.total() as f32
+    }
+
+    /// Harness-intervention metric — mean model rounds per case that the
+    /// harness put a message in front of.
+    ///
+    /// Read next to [`Self::avg_rounds`]: rounds a harness injection preceded
+    /// are not the model's own cadence, so an ablation that removes an
+    /// injection is only attributable when this number moves with it.
+    pub fn avg_runtime_injected_rounds(&self) -> f32 {
+        if self.cases.is_empty() {
+            return 0.0;
+        }
+        self.cases
+            .iter()
+            .map(|c| c.runtime_injected_rounds as f32)
+            .sum::<f32>()
+            / self.total() as f32
+    }
+
+    /// Harness-intervention metric — total rounds bought by an injection the
+    /// model did not ask for (closeout nudge, protocol repair, length
+    /// continuation).
+    pub fn runtime_forced_continuations(&self) -> u32 {
+        self.cases
+            .iter()
+            .map(|c| c.runtime_forced_continuations)
+            .sum()
+    }
+
+    /// Total `update_goal` refusals by the runtime across cases.
+    pub fn goal_interceptions(&self) -> u32 {
+        self.cases
+            .iter()
+            .map(|c| c.goal_interceptions.len() as u32)
+            .sum()
     }
 
     /// Mean TTFF over cases that observed at least one feedback event.
@@ -1108,7 +1259,7 @@ pub enum FailureSource {
 /// signals are observable facts; the classifier never inspects model text.
 /// Timing fields (`ttff_ms`, `max_silent_ms`) are filled by the eval signal
 /// collector from wall-clock observation of feedback events.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrajectorySignals {
     /// Sandbox denial, network block, or a workspace/expect command that could
     /// not run at all.
@@ -1203,6 +1354,47 @@ pub struct TrajectorySignals {
     /// the right region, or reading the file and hoping.
     pub broad_reads: u32,
     pub narrow_reads: u32,
+    /// Read-only calls per model round, in round order. The round shape behind
+    /// [`Self::read_only_calls`] and [`Self::multi_read_rounds`]: a run that
+    /// reads three files in one turn is `[3]`, one per turn is `[1,1,1]`.
+    pub per_round_read_only: Vec<u32>,
+    /// Read-only observation calls in total (the runtime's parallel-safe
+    /// class). The numerator of observation density.
+    pub read_only_calls: u32,
+    /// Rounds that carried at least one read-only call — the denominator of
+    /// observation density, so a round spent writing does not dilute it.
+    pub rounds_with_read_only: u32,
+    /// Rounds whose assistant turn carried at least two read-only calls — the
+    /// direct evidence that the model batched independent observations instead
+    /// of serializing one call per round.
+    pub multi_read_rounds: u32,
+    /// The widest read-only batch observed in a single round.
+    pub max_read_only_calls_per_round: u32,
+    /// Verification-class commands that failed. Distinct from
+    /// [`Self::verification_ran`] (any check ran) and from edit failures:
+    /// this is a check that landed and disproved the work.
+    pub verification_failures: u32,
+    /// Rounds at or after the first edit in which at least one tool result was
+    /// an error — the observable shape of rework. Not "the model was wrong":
+    /// a failed probe or an expected refusal counts the same.
+    pub recovery_rounds: u32,
+    /// Distinct model steps the HARNESS put a message in front of.
+    ///
+    /// An extra round can be the model choosing more work or the harness
+    /// injecting one; this counts the latter's footprint, so a run's round
+    /// count can be attributed instead of assumed. Never a judgment about why
+    /// the task is unfinished.
+    pub runtime_injected_rounds: u32,
+    /// Harness injections that BUY a round the model did not ask for: the
+    /// unified closeout nudge, provider-response repairs, and length
+    /// continuations. The subset of `runtime_injection_kinds` that forces a
+    /// continuation.
+    pub runtime_forced_continuations: u32,
+    /// Stable keys of the harness injections observed, first-seen order.
+    pub runtime_injection_kinds: Vec<String>,
+    /// `update_goal` resolutions the runtime refused, by stable reason key
+    /// (`plan_unreconciled`, `outstanding_children`, `invalid_status`).
+    pub goal_interceptions: Vec<String>,
 }
 
 /// First-cause attribution for a failed case, applied in fixed priority order
@@ -1439,6 +1631,21 @@ mod tests {
             narrow_reads: 0,
             verification_driven_impact_discovery: false,
             missed_impact_paths: Vec::new(),
+            per_round_read_only: Vec::new(),
+            read_only_calls: 0,
+            multi_read_rounds: 0,
+            rounds_with_read_only: 0,
+            max_read_only_calls_per_round: 0,
+            verification_failures: 0,
+            recovery_rounds: 0,
+            runtime_injected_rounds: 0,
+            runtime_forced_continuations: 0,
+            runtime_injection_kinds: Vec::new(),
+            goal_interceptions: Vec::new(),
+            model_time_ms: 0,
+            model_time_before_first_edit_ms: None,
+            reasoning_tokens_before_first_edit: None,
+            peak_input_tokens: 0,
         }
     }
 
@@ -1583,7 +1790,7 @@ mod tests {
             classify_failure(&TrajectorySignals {
                 env_failure: true,
                 loop_guard_trips: 5,
-                ..base
+                ..base.clone()
             }),
             FailureCategory::Environment,
             "environment outranks tooling"
@@ -1593,7 +1800,7 @@ mod tests {
                 loop_guard_trips: 1,
                 edit_attempts: 4,
                 edit_failures: 4,
-                ..base
+                ..base.clone()
             }),
             FailureCategory::Tooling,
             "tooling outranks editing"
@@ -1602,7 +1809,7 @@ mod tests {
             classify_failure(&TrajectorySignals {
                 edit_attempts: 4,
                 edit_failures: 3,
-                ..base
+                ..base.clone()
             }),
             FailureCategory::Editing,
             ">50% edit failure rate is an editing failure"
@@ -1613,13 +1820,13 @@ mod tests {
                 edit_failures: 2,
                 verification_ran: true,
                 touched_relevant_files: true,
-                ..base
+                ..base.clone()
             }),
             FailureCategory::Understanding,
             "half-failed edits are not (yet) an editing failure; verified but wrong lands on understanding"
         );
         assert_eq!(
-            classify_failure(&TrajectorySignals { ..base }),
+            classify_failure(&TrajectorySignals { ..base.clone() }),
             FailureCategory::Localization,
             "read everything, edited nothing, never found the defect files"
         );
@@ -1627,7 +1834,7 @@ mod tests {
             classify_failure(&TrajectorySignals {
                 touched_relevant_files: true,
                 compactions: 2,
-                ..base
+                ..base.clone()
             }),
             FailureCategory::Context,
             "repeated compaction on a failed run points at context"
@@ -1637,7 +1844,7 @@ mod tests {
                 touched_relevant_files: true,
                 node_total: 4,
                 node_failures: 3,
-                ..base
+                ..base.clone()
             }),
             FailureCategory::Planning,
             "majority node failure is a planning failure"
@@ -1648,7 +1855,7 @@ mod tests {
                 edit_failures: 0,
                 touched_relevant_files: true,
                 verification_ran: false,
-                ..base
+                ..base.clone()
             }),
             FailureCategory::Verification,
             "edited but never verified"
@@ -2125,6 +2332,21 @@ mod tests {
             narrow_reads: 0,
             verification_driven_impact_discovery: false,
             missed_impact_paths: Vec::new(),
+            per_round_read_only: Vec::new(),
+            read_only_calls: 0,
+            multi_read_rounds: 0,
+            rounds_with_read_only: 0,
+            max_read_only_calls_per_round: 0,
+            verification_failures: 0,
+            recovery_rounds: 0,
+            runtime_injected_rounds: 0,
+            runtime_forced_continuations: 0,
+            runtime_injection_kinds: Vec::new(),
+            goal_interceptions: Vec::new(),
+            model_time_ms: 0,
+            model_time_before_first_edit_ms: None,
+            reasoning_tokens_before_first_edit: None,
+            peak_input_tokens: 0,
         }
     }
 
@@ -2455,6 +2677,21 @@ expect: { program: cargo, args: [test] }
                 narrow_reads: 0,
                 verification_driven_impact_discovery: false,
                 missed_impact_paths: Vec::new(),
+                per_round_read_only: Vec::new(),
+                read_only_calls: 0,
+                multi_read_rounds: 0,
+                rounds_with_read_only: 0,
+                max_read_only_calls_per_round: 0,
+                verification_failures: 0,
+                recovery_rounds: 0,
+                runtime_injected_rounds: 0,
+                runtime_forced_continuations: 0,
+                runtime_injection_kinds: Vec::new(),
+                goal_interceptions: Vec::new(),
+                model_time_ms: 0,
+                model_time_before_first_edit_ms: None,
+                reasoning_tokens_before_first_edit: None,
+                peak_input_tokens: 0,
             }
             .passed()
         );
@@ -2504,6 +2741,21 @@ expect: { program: cargo, args: [test] }
                 narrow_reads: 0,
                 verification_driven_impact_discovery: false,
                 missed_impact_paths: Vec::new(),
+                per_round_read_only: Vec::new(),
+                read_only_calls: 0,
+                multi_read_rounds: 0,
+                rounds_with_read_only: 0,
+                max_read_only_calls_per_round: 0,
+                verification_failures: 0,
+                recovery_rounds: 0,
+                runtime_injected_rounds: 0,
+                runtime_forced_continuations: 0,
+                runtime_injection_kinds: Vec::new(),
+                goal_interceptions: Vec::new(),
+                model_time_ms: 0,
+                model_time_before_first_edit_ms: None,
+                reasoning_tokens_before_first_edit: None,
+                peak_input_tokens: 0,
             }
             .passed()
         );
@@ -2538,5 +2790,94 @@ expect: { program: cargo, args: [test] }
             other => panic!("expected Compare, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A baseline written before the acceptance-output fields existed still
+    /// loads, and the new fields are omitted when absent so legacy artifacts
+    /// are not rewritten with null noise.
+    #[test]
+    fn verification_evidence_without_output_is_still_a_valid_legacy_shape() {
+        let legacy = serde_json::json!({
+            "program": "bash",
+            "args": ["-c", "exit 1"],
+            "passed": false,
+            "exit_code": 1
+        });
+        let evidence: VerificationEvidence = serde_json::from_value(legacy).unwrap();
+        assert!(!evidence.passed);
+        assert_eq!(evidence.exit_code, Some(1));
+        assert!(evidence.stdout.is_none());
+        assert!(evidence.stderr.is_none());
+        let reemitted = serde_json::to_value(&evidence).unwrap();
+        assert!(reemitted.get("stdout").is_none());
+        assert!(reemitted.get("stderr").is_none());
+    }
+
+    /// The diagnostics requirement, as a serialization contract: a failing
+    /// acceptance carries its exit code and bounded streams into the artifact,
+    /// so triage is a read of `json-out`, not a `KEEP_WORKSPACE` re-run.
+    #[test]
+    fn a_failed_acceptance_serializes_its_reason_into_the_artifact() {
+        let mut case = result("window", true, false);
+        case.verification_evidence = Some(VerificationEvidence {
+            program: "bash".into(),
+            args: vec!["-c".into()],
+            passed: false,
+            exit_code: Some(1),
+            stdout: None,
+            stderr: Some(
+                "changed outside the windowing package: internal/pipeline/pipeline_test.go".into(),
+            ),
+            error: None,
+        });
+        let report = EvalReport {
+            model: "m".into(),
+            cases: vec![case],
+        };
+        let encoded = serde_json::to_value(BaselineDocument::from_run(meta(), report)).unwrap();
+        let evidence = &encoded["report"]["cases"][0]["verification_evidence"];
+        assert_eq!(evidence["passed"], serde_json::json!(false));
+        assert_eq!(evidence["exit_code"], serde_json::json!(1));
+        assert_eq!(
+            evidence["stderr"],
+            serde_json::json!(
+                "changed outside the windowing package: internal/pipeline/pipeline_test.go"
+            )
+        );
+        assert!(
+            evidence.get("stdout").is_none(),
+            "a stream with no output stays absent"
+        );
+    }
+
+    /// Diagnostics name the failing command, not just a boolean: an assertion
+    /// message when the script printed one, never an invented reason for a pass.
+    #[test]
+    fn failure_reason_prefers_the_printed_message_and_never_invents_one() {
+        let mut evidence = VerificationEvidence {
+            program: "bash".into(),
+            args: Vec::new(),
+            passed: false,
+            exit_code: Some(1),
+            stdout: Some("all output".into()),
+            stderr: Some("\nchanged outside the windowing package: a.go\n".into()),
+            error: None,
+        };
+        assert_eq!(
+            evidence.failure_reason().as_deref(),
+            Some("changed outside the windowing package: a.go")
+        );
+        // stdout is the fallback when stderr carried nothing.
+        evidence.stderr = None;
+        assert_eq!(evidence.failure_reason().as_deref(), Some("all output"));
+        // Then the exit code, then nothing.
+        evidence.stdout = None;
+        assert_eq!(evidence.failure_reason().as_deref(), Some("exit code 1"));
+        evidence.exit_code = None;
+        assert_eq!(evidence.failure_reason(), None);
+        // A pass never carries a reason, even with a non-empty stderr.
+        evidence.passed = true;
+        evidence.stderr = Some("warning only".into());
+        assert_eq!(evidence.failure_reason(), None);
     }
 }

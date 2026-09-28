@@ -472,7 +472,6 @@ async fn choose_model(
         api_key: Some(api_key.to_string()),
         headers: Default::default(),
         timeouts: Default::default(),
-        retry: Default::default(),
     };
     println!(
         "\n  {}",
@@ -845,7 +844,14 @@ context_window = 131072
             assert_eq!(facts["max_output_tokens"].as_integer(), Some(393_216));
             assert_eq!(facts["supports_temperature"].as_bool(), Some(true));
             assert_eq!(facts["max_parallel_tool_calls"].as_integer(), Some(0));
-            assert_eq!(facts["passback_reasoning_content"].as_bool(), Some(true));
+            assert_eq!(
+                facts["reasoning_replay_scope"].as_str(),
+                Some("when_tools_present")
+            );
+            assert_eq!(
+                facts["reasoning_content_key_required"].as_bool(),
+                Some(true)
+            );
         }
     }
 

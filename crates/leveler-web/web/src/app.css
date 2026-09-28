@@ -455,7 +455,7 @@ button { font-family: inherit; }
 .dot.idle { background: var(--text-tertiary); }
 .dot.wait, .dot.waiting, .dot.blocked { background: var(--warning); }
 .dot.failed { background: var(--danger); }
-.dot.completed { background: var(--success); }
+.dot.completed { background: var(--text-tertiary); }
 .dot.interrupted, .dot.incomplete { background: var(--text-tertiary); }
 .sess-mark { flex: none; font-size: 11px; color: var(--success); width: 10px; text-align: center; }
 @keyframes pulse { 50% { opacity: .35; } }

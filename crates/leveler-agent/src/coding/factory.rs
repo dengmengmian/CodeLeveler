@@ -163,15 +163,17 @@ impl ExecutorFactory {
             self.model.clone(),
             0,
         )
+        .with_background_tasks(self.background_tasks.clone())
         .with_continuation_policy(continuation)
         .with_max_output_tokens(resolved.max_output_tokens)
         .with_pricing(model_profile.pricing)
-        .with_context_budget(resolved.context_budget)
-        .with_context_window(resolved.context_window)
+        .with_context_policy(resolved.context_policy)
+        .with_reasoning_replay(resolved.reasoning_replay)
         .with_reasoning_effort(resolved.reasoning_effort)
         .with_context_trace(resolved.context_trace)
-        // A model profile may ship its own system prompt; None keeps the default.
-        .with_base_instructions(model_profile.instructions.clone())
+        .with_investigation_batching(resolved.investigation_batching)
+        .with_post_edit_action_throughput(resolved.post_edit_action_throughput)
+        .with_reasoning_retention(resolved.reasoning_retention)
         .with_permission_rules(self.permission_rules.clone())
         .with_permission_rules_path(self.permission_rules_path.clone())
         .with_hook_runner(self.hook_runner.clone())

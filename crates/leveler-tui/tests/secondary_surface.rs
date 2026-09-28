@@ -260,3 +260,22 @@ fn context_footer_lists_only_real_keys() {
         "Context has no refresh binding: {footer}"
     );
 }
+
+#[test]
+fn session_list_distinguishes_answers_declarations_and_legacy_endings() {
+    let mut state = opened();
+    state.active_screen = Screen::Sessions;
+    state.sessions = [("answer", Some("answered")), ("declaration", Some("completed")), ("legacy", None)]
+        .into_iter().map(|(id, declaration)| serde_json::from_value(serde_json::json!({
+            "id": id, "goal": id, "status": "completed", "model": "m", "updated_at": "now", "declaration": declaration
+        })).unwrap()).collect();
+    let text = frame(&mut state, 100, 24).join("\n");
+    for (goal, label) in [
+        ("answer", "已回答"),
+        ("declaration", "声明完成"),
+        ("legacy", "已结束"),
+    ] {
+        let row = text.lines().find(|line| line.contains(goal)).unwrap();
+        assert!(row.contains(label), "{row}");
+    }
+}

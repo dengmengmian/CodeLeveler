@@ -113,6 +113,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -1268,6 +1269,7 @@ fn no_engine_path_hands_a_model_an_unassembled_transcript() {
 /// message and the tool message answering it.
 fn tool_round_payloads(id: &str, pad: &str) -> [String; 2] {
     let call = Message {
+        origin: None,
         role: Role::Assistant,
         content: vec![ContentPart::ToolCall {
             call: ToolCall {
@@ -1278,6 +1280,7 @@ fn tool_round_payloads(id: &str, pad: &str) -> [String; 2] {
         }],
     };
     let result = Message {
+        origin: None,
         role: Role::Tool,
         content: vec![ContentPart::ToolResult {
             result: leveler_model::ToolResultContent {

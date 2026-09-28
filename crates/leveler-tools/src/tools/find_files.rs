@@ -42,8 +42,8 @@ impl Tool for FindFilesTool {
          the file name at any depth (`Cargo.toml`, `*.rs`), and a pattern \
          containing `/` matches the path relative to the search root \
          (`src/**/*.rs`). It is never a substring match. Results are paths \
-         relative to the workspace root. Use `grep` for file contents and \
-         `list_files` to inspect one directory."
+         relative to the workspace root. This tool does not search file \
+         contents and does not list only the direct children of one directory."
     }
 
     fn input_schema(&self) -> serde_json::Value {

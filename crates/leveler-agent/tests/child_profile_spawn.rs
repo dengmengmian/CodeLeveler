@@ -89,6 +89,7 @@ fn assistant_with(parts: Vec<ContentPart>, finish: FinishReason) -> ModelRespons
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: parts,
         },

@@ -68,10 +68,7 @@ pub(crate) fn settlement_notice(
         "## Background sub-agent settled\n\
          {nickname} ({id}, role={}) has finished and will do no further work.\n\
          {scope_line}{result_for_parent}\n\
-         Inspect and integrate this result where it matters; do not redo work \
-         it completed. If this completes or changes your active plan step, \
-         synchronize the plan with update_plan before moving on — a child \
-         finishing does not advance the plan on its own.",
+         The parent's plan status does not change because this child finished.",
         role.label()
     )
 }
@@ -101,9 +98,7 @@ pub(crate) fn settled_children_redelivery_note(children: &[SettledChildNotice]) 
         "## Sub-agent results re-delivered after restart\n\
          The previous session window ended after these sub-agents settled, \
          possibly before their results were acted on. Their recorded outcomes \
-         follow (re-delivered; one may repeat a notice you already saw). \
-         Integrate them — do NOT re-delegate or redo work that is already \
-         done:\n",
+         follow (re-delivered; one may repeat a notice you already saw):\n",
     );
     for child in children {
         let status = if child.ok {
@@ -140,8 +135,7 @@ pub(crate) fn resumed_children_note(children: &[ResumableChild]) -> String {
         "## Sub-agents resumed after restart\n\
          The previous session window ended while these sub-agents were still \
          working. Each continues its own task in the background under the same \
-         id, from its saved progress; its settlement will arrive as usual. Do not \
-         re-delegate their work:\n",
+         id, from its saved progress; its settlement will arrive as usual:\n",
     );
     for child in children {
         if child.spec.files.is_empty() {
@@ -172,7 +166,7 @@ pub(crate) fn lost_children_note(outstanding: &[String]) -> String {
          The previous session window ended while these background sub-agents \
          were still running. They did NOT survive the restart — their work is \
          NOT done, their exclusive scopes are released, and no settlement will \
-         arrive. Re-delegate or do the work yourself if it is still needed:\n",
+         arrive:\n",
     );
     for entry in outstanding {
         // id|nickname|role|scope

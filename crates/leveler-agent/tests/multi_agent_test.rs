@@ -68,6 +68,8 @@ struct SleepyRuntime {
     /// The message list of every request, in stream order, so tests can assert
     /// what the model was actually shown on each round.
     requests: Mutex<Vec<Vec<Message>>>,
+    /// Control text of every request, in stream order.
+    controls: Mutex<Vec<String>>,
 }
 
 impl SleepyRuntime {
@@ -79,6 +81,7 @@ impl SleepyRuntime {
             on_stream: None,
             stream_count: std::sync::atomic::AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
+            controls: Mutex::new(Vec::new()),
         }
     }
 
@@ -114,6 +117,10 @@ impl ModelRuntime for SleepyRuntime {
     ) -> Result<ModelEventStream, ModelError> {
         use leveler_model::ModelEvent;
         self.requests.lock().unwrap().push(request.messages.clone());
+        self.controls
+            .lock()
+            .unwrap()
+            .push(request.control_context.text());
         let index = self
             .stream_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -203,6 +210,7 @@ fn assistant_with(parts: Vec<ContentPart>, finish: FinishReason) -> ModelRespons
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: parts,
         },
@@ -319,6 +327,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
     first_child_round.usage = TokenUsage {
         input_tokens: 700,
         output_tokens: 30,
+        cache_creation_input_tokens: 0,
         cached_input_tokens: 300,
         reasoning_tokens: None,
     };
@@ -337,6 +346,7 @@ async fn sub_agent_reports_active_state_and_its_own_cumulative_usage() {
                 TokenUsage {
                     input_tokens: 1_200,
                     output_tokens: 80,
+                    cache_creation_input_tokens: 0,
                     cached_input_tokens: 600,
                     reasoning_tokens: None,
                 },
@@ -914,6 +924,7 @@ fn read_call(id: &str) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![tool_call_part(
                 id,
@@ -1778,14 +1789,19 @@ async fn a_child_stopped_by_its_duration_cap_says_the_duration_ran_out() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Whether any request the model received carried the wall-clock finalization
-/// request. The nudge is injected into the child's own transcript, so it can
-/// only be observed in the request that follows it.
+/// Whether any request carried `finalization_requested=true` in execution state.
 fn saw_finalization_request(runtime: &SleepyRuntime) -> bool {
-    runtime.requests.lock().unwrap().iter().any(|messages| {
-        messages
-            .iter()
-            .any(|m| m.text_content().contains("wall-clock budget for this task"))
+    runtime.controls.lock().unwrap().iter().any(|text| {
+        text.contains("\"finalization_requested\":true")
+            || text.contains("\"finalization_requested\": true")
+    })
+}
+
+fn saw_finalization_coaching(runtime: &SleepyRuntime) -> bool {
+    runtime.controls.lock().unwrap().iter().any(|text| {
+        text.contains("Stop expanding")
+            || text.contains("Do not start new searches")
+            || text.contains("wall-clock budget for this task")
     })
 }
 
@@ -1939,7 +1955,11 @@ async fn a_child_near_its_cap_is_asked_to_finalize_and_can_still_finish() {
     );
     assert!(
         saw_finalization_request(&runtime),
-        "the child must have been asked to finalize before its hard cap"
+        "the child must see finalization_requested before its hard cap"
+    );
+    assert!(
+        !saw_finalization_coaching(&runtime),
+        "finalization is a runtime fact, not an investigation order"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2023,7 +2043,11 @@ async fn a_child_that_ignores_the_finalization_request_is_cut_at_the_hard_cap() 
     );
     assert!(
         saw_finalization_request(&runtime),
-        "the child was asked to finalize before the hard cap fired"
+        "the child saw finalization_requested before the hard cap fired"
+    );
+    assert!(
+        !saw_finalization_coaching(&runtime),
+        "finalization is a runtime fact, not an investigation order"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2407,8 +2431,8 @@ mod named_agents {
 
     struct CapturingRuntime {
         parent_done: std::sync::atomic::AtomicBool,
-        /// Every prompt blob the runtime was asked to answer.
-        seen: Mutex<Vec<String>>,
+        /// Every request, keeping control separate from conversation.
+        seen: Mutex<Vec<ModelRequest>>,
         /// Tool names advertised on each request, in the same order.
         tools_seen: Mutex<Vec<Vec<String>>>,
         parent_call: Mutex<Option<serde_json::Value>>,
@@ -2431,7 +2455,7 @@ mod named_agents {
                 .map(|m| m.text_content())
                 .collect::<Vec<_>>()
                 .join("\n");
-            self.seen.lock().unwrap().push(blob.clone());
+            self.seen.lock().unwrap().push(request.clone());
             self.tools_seen
                 .lock()
                 .unwrap()
@@ -2493,13 +2517,13 @@ mod named_agents {
         }
     }
 
-    /// Returns (events, prompt blobs, advertised tool names) — one entry per
+    /// Returns (events, requests, advertised tool names) — one entry per
     /// model request, in order.
     #[allow(clippy::type_complexity)]
     async fn run_with(
         dir: &std::path::Path,
         args: serde_json::Value,
-    ) -> (Vec<AgentEvent>, Vec<String>, Vec<Vec<String>>) {
+    ) -> (Vec<AgentEvent>, Vec<ModelRequest>, Vec<Vec<String>>) {
         let workspace = Workspace::new(dir).unwrap();
         let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
         let runtime = Arc::new(CapturingRuntime::new(args));
@@ -2536,15 +2560,31 @@ mod named_agents {
 
         let child = seen
             .iter()
-            .find(|blob| blob.contains("SUBTASK_MARKER"))
+            .find(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|m| m.text_content().contains("SUBTASK_MARKER"))
+            })
             .expect("the child must have been asked something");
         assert!(
-            child.contains("代码探查者"),
-            "the built-in persona never reached the child: {child}"
+            child.control_context.text().contains("代码探查者"),
+            "the built-in persona never reached child control: {child:?}"
         );
         assert!(
-            child.contains("查登录流程"),
+            child
+                .messages
+                .iter()
+                .any(|m| m.text_content().contains("查登录流程")),
             "the concrete assignment must travel with it"
+        );
+
+        assert!(
+            !child
+                .messages
+                .iter()
+                .any(|m| m.text_content().contains("代码探查者")),
+            "the persona must not enter the child conversation"
         );
 
         // The definition carries role: explorer, and no `role` was passed.
@@ -2581,7 +2621,12 @@ mod named_agents {
 
         let child = seen
             .iter()
-            .position(|b| b.contains("SUBTASK_MARKER"))
+            .position(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|m| m.text_content().contains("SUBTASK_MARKER"))
+            })
             .expect("the child must have run");
         let child_tools = &tools[child];
         assert!(
@@ -4786,6 +4831,10 @@ async fn a_resumed_run_reports_children_lost_at_restart() {
         note.contains("Newton (agent-2, role=worker, scope: src/lib.rs)"),
         "{note}"
     );
+    assert!(
+        !note.contains("Re-delegate"),
+        "a lost child is a fact, not an order to delegate again: {note}"
+    );
     drop(requests);
     // The durable record is cleared so the note never repeats.
     let cleared = events.iter().rev().find_map(|e| match e {
@@ -5135,6 +5184,36 @@ async fn settlement_notices_are_appended_to_the_transcript_sink() {
         "the settlement notice must be persisted to the sink when injected — exactly once \
          (a duplicate would double-inject the child's report on resume)"
     );
+    let notice = recorded
+        .iter()
+        .find(|message| {
+            message.role == Role::User
+                && message
+                    .text_content()
+                    .contains("## Background sub-agent settled")
+        })
+        .unwrap();
+    let restored: Message = serde_json::from_str(&serde_json::to_string(notice).unwrap()).unwrap();
+    let class = leveler_model::RequestProjection::project(
+        std::slice::from_ref(&restored),
+        &[],
+        leveler_model::ReasoningReplayContract::NONE,
+        leveler_model::ReasoningRetention::All,
+    )
+    .transcript_authority()
+    .pop()
+    .unwrap();
+    assert_ne!(class.authority, leveler_model::PromptAuthority::UserIntent);
+    assert_eq!(
+        class.authority,
+        leveler_model::PromptAuthority::AdvisoryContext
+    );
+    assert!(matches!(
+        class.source,
+        leveler_model::PromptSource::RuntimeNotice {
+            notice: leveler_model::RuntimeNoticeKind::ChildSettlement
+        }
+    ));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -6468,6 +6547,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
     child_round.usage = TokenUsage {
         input_tokens: 700,
         output_tokens: 30,
+        cache_creation_input_tokens: 0,
         cached_input_tokens: 300,
         reasoning_tokens: None,
     };
@@ -6484,6 +6564,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
                 spawn_round.usage = TokenUsage {
                     input_tokens: 500,
                     output_tokens: 25,
+                    cache_creation_input_tokens: 0,
                     cached_input_tokens: 200,
                     reasoning_tokens: None,
                 };
@@ -6495,6 +6576,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
                 TokenUsage {
                     input_tokens: 1_200,
                     output_tokens: 80,
+                    cache_creation_input_tokens: 0,
                     cached_input_tokens: 600,
                     reasoning_tokens: None,
                 },
@@ -6504,6 +6586,7 @@ async fn a_delegated_child_is_charged_to_the_parent_once() {
                 TokenUsage {
                     input_tokens: 400,
                     output_tokens: 20,
+                    cache_creation_input_tokens: 0,
                     cached_input_tokens: 100,
                     reasoning_tokens: None,
                 },
@@ -7499,5 +7582,257 @@ async fn a_bad_capability_in_an_agent_definition_names_the_definition() {
             && content.contains("is invalid")
             && content.contains("capability"),
         "{content}"
+    );
+}
+
+/// Two activations share a real task ledger. The older one pauses after a paid
+/// round while a later sibling exhausts the task cap; its local residual is
+/// intentionally still positive when it resumes.
+struct SharedTaskBudgetRuntime {
+    calls: Mutex<Vec<String>>,
+    older_rounds: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ModelRuntime for SharedTaskBudgetRuntime {
+    async fn generate(
+        &self,
+        _: ModelRequest,
+        _: CancellationToken,
+    ) -> Result<ModelResponse, ModelError> {
+        unreachable!("executor calls stream")
+    }
+
+    async fn profile(&self, _: &ModelRef) -> Result<ModelProfile, ModelError> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "id":"m", "provider":"mock", "model_id":"m", "protocol":"openai_chat",
+            "capabilities":{"streaming":true,"tool_calling":true,"parallel_tool_calls":true,"structured_output":false,"reasoning":false,"vision":false},
+            "limits":{"context_window":64000,"reliable_context":32000,"max_output_tokens":2048,"max_tool_schema_bytes":65536,"max_parallel_tool_calls":4}
+        })).unwrap())
+    }
+
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        _: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        let older = request
+            .messages
+            .iter()
+            .any(|message| message.text_content().contains("OLDER_BUDGET_WRITER"));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(if older { "older" } else { "later" }.into());
+        let mut response = if older
+            && self
+                .older_rounds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+        {
+            assistant_with(
+                vec![tool_call_part(
+                    "hold-budget",
+                    "hold_for_sibling_spend",
+                    serde_json::json!({}),
+                )],
+                FinishReason::ToolCalls,
+            )
+        } else {
+            assistant_text("The activation ended.")
+        };
+        response.usage = TokenUsage {
+            input_tokens: if older { 10 } else { 100_000 },
+            ..Default::default()
+        };
+        Ok(leveler_model::stream_from_response(response))
+    }
+}
+
+struct HoldForSiblingSpend {
+    ready: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl leveler_tools::Tool for HoldForSiblingSpend {
+    fn name(&self) -> &'static str {
+        "hold_for_sibling_spend"
+    }
+    fn description(&self) -> &'static str {
+        "Test synchronization after the older writer's first paid round."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{}})
+    }
+    fn risk(&self) -> leveler_tools::RiskLevel {
+        leveler_tools::RiskLevel::Safe
+    }
+    async fn execute(
+        &self,
+        _: serde_json::Value,
+        _: ToolContext,
+        cancellation: CancellationToken,
+    ) -> Result<leveler_tools::ToolOutput, leveler_tools::ToolError> {
+        self.ready.notify_one();
+        tokio::select! {
+            _ = self.release.notified() => {},
+            _ = cancellation.cancelled() => return Ok(leveler_tools::ToolOutput::error("cancelled")),
+        }
+        Ok(leveler_tools::ToolOutput::ok("sibling spend is durable"))
+    }
+}
+
+struct SharedBudgetSqlSink {
+    database: leveler_storage::Database,
+    session: leveler_core::SessionId,
+}
+
+#[async_trait]
+impl leveler_agent::TranscriptSink for SharedBudgetSqlSink {
+    async fn append(&mut self, _: &[Message]) -> Result<(), leveler_engine::PortError> {
+        Ok(())
+    }
+    async fn record_model_request(
+        &mut self,
+        record: &leveler_agent::ModelRequestRecord,
+    ) -> Result<(), leveler_engine::PortError> {
+        use leveler_storage::ModelRequestStore;
+        self.database
+            .insert(&leveler_engine::storage_model_request(
+                record,
+                &self.session,
+            ))
+            .await
+            .map_err(|error| leveler_engine::PortError::Persistence(error.to_string()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_background_writer_cannot_spend_after_a_later_sibling_exhausts_the_task_cap() {
+    use leveler_storage::{ModelRequestStore, SessionRecord, SessionRepository};
+    let dir = tempfile::tempdir().unwrap();
+    let database = leveler_storage::Database::connect_in_memory()
+        .await
+        .unwrap();
+    let record = SessionRecord::new(
+        dir.path().to_string_lossy().as_ref(),
+        "shared task",
+        "mock/m",
+        leveler_core::now(),
+    );
+    SessionRepository::new(&database)
+        .create(&record)
+        .await
+        .unwrap();
+    let session = leveler_core::SessionId::new(record.id);
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let runtime = Arc::new(SharedTaskBudgetRuntime {
+        calls: Mutex::new(Vec::new()),
+        older_rounds: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut registry = default_registry();
+    registry.register(Arc::new(HoldForSiblingSpend {
+        ready: ready.clone(),
+        release: release.clone(),
+    }));
+    let registry = Arc::new(registry);
+    let context = ToolContext::new(
+        Workspace::new(dir.path()).unwrap(),
+        PermissionProfile::Assisted,
+    )
+    .with_session_scope(session.as_str());
+    let executor = |writer: &str| {
+        Executor::new(
+            runtime.clone(),
+            registry.clone(),
+            context.clone(),
+            ModelRef::new("mock", "m"),
+            0,
+        )
+        .with_agent_id(writer)
+        .with_step_limits(leveler_agent::StepLimits {
+            max_model_tokens: Some(100_000),
+            max_duration: Some(Duration::from_secs(10)),
+            ..Default::default()
+        })
+        .with_budget_scope("one-shared-task".into())
+        .with_model_request_store(Arc::new(database.clone()), session.clone())
+    };
+    let older = executor("earlier-background-child");
+    let mut older_sink = SharedBudgetSqlSink {
+        database: database.clone(),
+        session: session.clone(),
+    };
+    let older_run = tokio::spawn(async move {
+        older
+            .run(
+                "OLDER_BUDGET_WRITER",
+                &mut |_| {},
+                &mut older_sink,
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), ready.notified())
+        .await
+        .expect("the older writer must have a paid round in flight before the sibling starts");
+    let rows = database
+        .load_for_budget_scope(&session, "one-shared-task")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.input_tokens + row.output_tokens)
+            .sum::<u64>(),
+        10
+    );
+
+    let mut later_sink = SharedBudgetSqlSink {
+        database: database.clone(),
+        session: session.clone(),
+    };
+    executor("later-sibling")
+        .run(
+            "LATER_BUDGET_WRITER",
+            &mut |_| {},
+            &mut later_sink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let rows = database
+        .load_for_budget_scope(&session, "one-shared-task")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.input_tokens + row.output_tokens)
+            .sum::<u64>(),
+        100_010,
+        "already admitted attempts may complete and must be recorded"
+    );
+    release.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), older_run)
+        .await
+        .expect("older writer must terminate at the shared cap")
+        .unwrap()
+        .unwrap();
+    let calls = runtime.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec!["older", "later"],
+        "the older writer retained local budget but the shared task ledger is exhausted"
+    );
+    assert_eq!(outcome.stop_reason, StopReason::BudgetExhausted);
+    let rows = database
+        .load_for_budget_scope(&session, "one-shared-task")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the refusal must not invent a paid provider attempt"
     );
 }

@@ -1644,6 +1644,8 @@ fn trace_state(locale: leveler_tui::Locale, tab: char) -> String {
             retry_count: 0,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            projected_input_tokens: None,
+            projected_reasoning_tokens: None,
             cost_usd_micros: None,
             agent_id: None,
             created_at: "t1".into(),

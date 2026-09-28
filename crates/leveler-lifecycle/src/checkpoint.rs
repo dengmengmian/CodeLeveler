@@ -322,10 +322,7 @@ impl GoalCheckpoint {
         if let Some(next) = &self.next_action {
             push_section(&mut out, "Next", next);
         }
-        out.push_str(
-            "\nEvents and messages after this checkpoint are newer than it: \
-             when they contradict this summary, they win.\n",
-        );
+        out.push_str("\nEvents and messages after this checkpoint are newer than it.\n");
         out
     }
 }

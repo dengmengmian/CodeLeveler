@@ -69,6 +69,11 @@ pub enum EngineError {
     /// because a cancelled turn is `interrupted`, not `failed`.
     #[error("cancelled")]
     Cancelled,
+    /// Context compaction could not establish a request that fits the model's
+    /// hard context capacity. There is no legal context to continue with, so
+    /// the turn fails explicitly, before any oversized request is sent.
+    #[error("context management failure: {0}")]
+    ContextManagementFailure(String),
     /// The run aborted because this runtime no longer owns the task. Kept
     /// distinct from a plain execution failure: a stale runtime writes no
     /// further canonical facts, not even a terminal one.

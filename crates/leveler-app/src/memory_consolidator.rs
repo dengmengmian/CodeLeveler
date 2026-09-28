@@ -6,8 +6,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use leveler_agent::{
-    BatchSourceTurn, DEFAULT_EXTRACTION_TIMEOUT, MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS,
-    MAX_EXTRACTOR_INPUT_CHARS, ModelSemanticExtractor, SemanticExtractor,
+    BatchSourceTurn, DEFAULT_EXTRACTION_TIMEOUT, ExtractionCall, MAX_BATCH_INPUT_CHARS,
+    MAX_BATCH_TURNS, MAX_EXTRACTOR_INPUT_CHARS, ModelSemanticExtractor, SemanticExtractor,
     validate_batch_candidates,
 };
 use leveler_core::{BootId, BootLiveness};
@@ -15,7 +15,10 @@ use leveler_memory::{
     AdmitOutcome, AppliedOperation, MemoryCandidate, MemoryStore, ProposeOutcome,
 };
 use leveler_model::{ModelRef, ModelRuntime};
-use leveler_storage::{Database, MemoryInboxItem, MemoryInboxReadyState, MemoryInboxRepository};
+use leveler_storage::{
+    Database, MemoryInboxItem, MemoryInboxReadyState, MemoryInboxRepository, ModelRequestRecord,
+    ModelRequestRepository,
+};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -367,6 +370,10 @@ impl MemoryConsolidator {
         extractor: &dyn SemanticExtractor,
     ) -> Result<Vec<StagedTurnResult>, String> {
         let mut sources = Vec::with_capacity(items.len());
+        // Session per source turn, index-aligned with `sources`. A provider
+        // request never spans two sessions, so every recorded call has one
+        // owning session and cost attribution stays exact.
+        let mut source_sessions: Vec<String> = Vec::with_capacity(items.len());
         let mut staged = items
             .iter()
             .map(|_| StagedTurnResult {
@@ -401,10 +408,25 @@ impl MemoryConsolidator {
             if user_text.trim().is_empty() {
                 continue;
             }
+            // Deterministic pre-provider secret gate. A turn that appears to
+            // carry credential material is not sent to the extractor at all:
+            // the model is never asked "is this a secret?", and the turn
+            // produces no candidate. This affects ONLY auto-memory extraction —
+            // the user's conversation, the main coding request, and the
+            // authoritative turn payload are untouched.
+            if leveler_memory::looks_like_secret(&user_text) {
+                tracing::info!(
+                    event = "memory_secret_gate_skipped",
+                    turn_id = %item.turn_id,
+                    "turn withheld from memory extraction by the secret gate"
+                );
+                continue;
+            }
             sources.push(BatchSourceTurn {
                 source_turn_id: item.turn_id.clone(),
                 user_text,
             });
+            source_sessions.push(item.session_id.clone());
         }
 
         let mut candidates = Vec::new();
@@ -420,7 +442,13 @@ impl MemoryConsolidator {
             while batch_start < sources.len() {
                 let mut batch_end = batch_start;
                 let mut input_chars = 0;
+                let batch_session = source_sessions[batch_start].as_str();
                 while batch_end < sources.len() && batch_end - batch_start < MAX_BATCH_TURNS {
+                    // A batch is one session: a single provider request must
+                    // have one owning session for cost attribution.
+                    if source_sessions[batch_end] != batch_session {
+                        break;
+                    }
                     let next_chars = sources[batch_end].user_text.chars().count();
                     if batch_end > batch_start && input_chars + next_chars > MAX_BATCH_INPUT_CHARS {
                         break;
@@ -428,12 +456,13 @@ impl MemoryConsolidator {
                     input_chars += next_chars;
                     batch_end += 1;
                 }
-                candidates.extend(
-                    extractor
-                        .extract_batch(&sources[batch_start..batch_end], &self.cancel)
-                        .await
-                        .map_err(|e| e.to_string())?,
-                );
+                let (result, call) = extractor
+                    .extract_batch_recorded(&sources[batch_start..batch_end], &self.cancel)
+                    .await;
+                if let Some(call) = call {
+                    self.record_extraction_call(batch_session, &call).await;
+                }
+                candidates.extend(result.map_err(|e| e.to_string())?);
                 batch_start = batch_end;
             }
         }
@@ -475,6 +504,91 @@ impl MemoryConsolidator {
             .await
             .map_err(|error| error.to_string())?;
         Ok(staged)
+    }
+
+    /// Record ONE memory-extraction provider call in the session's model-call
+    /// ledger. `MemoryExtraction` is its own lane, so a user asking "why was
+    /// there another model call after my turn?" can read the answer, and
+    /// auxiliary spend is separable from the coding work.
+    ///
+    /// Never records user text or candidate bodies — only the shape of the
+    /// exchange, exactly like every other row in this table.
+    async fn record_extraction_call(&self, session_id: &str, call: &ExtractionCall) {
+        let session = leveler_core::SessionId::new(session_id);
+        // Pricing is optional: an unpriced model records `None` rather than a
+        // fabricated zero cost.
+        let pricing = self
+            .runtime
+            .profile(&call.model)
+            .await
+            .ok()
+            .and_then(|profile| profile.pricing);
+        let usage = call.usage.unwrap_or_default();
+        let cost_usd_micros = pricing
+            .filter(|_| usage.total() > 0)
+            .and_then(|p| p.cost_for_usage(&usage));
+        let record = ModelRequestRecord {
+            budget_scope: None,
+            estimated_tokens: None,
+            id: leveler_core::EventId::generate().into_inner(),
+            provider_request_id: call.provider_request_id.clone(),
+            session_id: session,
+            provider: call.model.provider.clone(),
+            model: call.model.model.clone(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: call.usage.map(|u| u.cached_input_tokens),
+            reasoning_tokens: usage.reasoning_tokens,
+            // The memory-extraction call builds its own request; no projection
+            // was measured for it, which is an absence, not a zero.
+            projected_input_tokens: None,
+            projected_reasoning_tokens: None,
+            cost_usd_micros,
+            agent_id: None,
+            finish_reason: call.finish_reason.map(|reason| {
+                serde_json::to_value(reason)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_else(|| format!("{reason:?}").to_ascii_lowercase())
+            }),
+            // The class of failure, not the provider's message: a diagnostics
+            // row must not carry raw upstream text.
+            error_kind: call
+                .error
+                .as_deref()
+                .map(|_| "memory_extraction_failed".to_string()),
+            latency_ms: Some(call.latency_ms),
+            attempt_ms: None,
+            connect_ms: None,
+            ttft_ms: None,
+            max_event_gap_ms: None,
+            retry_count: 0,
+            kind: leveler_storage::ModelCallKind::MemoryExtraction,
+            created_at: leveler_core::now(),
+            reasoning_effort: call
+                .reasoning_effort
+                .map(|effort| effort.as_wire().to_string()),
+        };
+        if let Err(error) = ModelRequestRepository::new(&self.db).insert(&record).await {
+            // A diagnostics row must never fail the consolidation it describes.
+            tracing::warn!(
+                %error,
+                event = "memory_extraction_record_failed",
+                "could not record the memory extraction model call"
+            );
+        }
+        tracing::info!(
+            event = "memory_extraction_call",
+            model = %call.model,
+            source_turn_count = call.source_turn_count,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            reasoning_tokens = ?usage.reasoning_tokens,
+            latency_ms = call.latency_ms,
+            cost_usd_micros = ?cost_usd_micros,
+            error = ?call.error,
+            "memory extraction model call completed"
+        );
     }
 
     async fn apply_staged(
@@ -627,7 +741,10 @@ mod tests {
         }
 
         async fn profile(&self, _: &ModelRef) -> Result<ModelProfile, ModelError> {
-            panic!("test supplies its extractor directly")
+            Err(ModelError::new(
+                leveler_model::ModelErrorKind::ProviderUnavailable,
+                "no profile in tests",
+            ))
         }
     }
 
@@ -650,13 +767,42 @@ mod tests {
         }
 
         async fn profile(&self, _: &ModelRef) -> Result<ModelProfile, ModelError> {
-            unreachable!()
+            Err(ModelError::new(
+                leveler_model::ModelErrorKind::ProviderUnavailable,
+                "no profile in tests",
+            ))
         }
     }
 
     struct ReversedExtractor;
 
     struct OneCandidateExtractor;
+
+    /// Counts provider-side invocations so a test can prove the extractor was
+    /// never asked to read a turn.
+    struct CountingExtractor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SemanticExtractor for CountingExtractor {
+        async fn extract(
+            &self,
+            _: &str,
+            _: &CancellationToken,
+        ) -> Result<Vec<SemanticCandidate>, ExtractionError> {
+            unreachable!()
+        }
+
+        async fn extract_batch(
+            &self,
+            _: &[BatchSourceTurn],
+            _: &CancellationToken,
+        ) -> Result<Vec<BatchSemanticCandidate>, ExtractionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
 
     struct BackgroundCorrectionExtractor;
 
@@ -710,7 +856,10 @@ mod tests {
         }
 
         async fn profile(&self, _: &ModelRef) -> Result<ModelProfile, ModelError> {
-            unreachable!()
+            Err(ModelError::new(
+                leveler_model::ModelErrorKind::ProviderUnavailable,
+                "no profile in tests",
+            ))
         }
     }
 
@@ -866,6 +1015,86 @@ mod tests {
             .into_iter()
             .map(|(_, admitted_at)| admitted_at)
             .collect()
+    }
+
+    /// Admit one fresh user turn for a session whose memory flag is `enabled`.
+    async fn admit_with_memory_flag(db: &Database, enabled: bool, text: &str) -> i64 {
+        let record = SessionRecord::new("/repo", "goal", "mock/model", leveler_core::now());
+        let session = leveler_core::SessionId::new(record.id.clone());
+        SessionRepository::new(db).create(&record).await.unwrap();
+        SessionRepository::new(db)
+            .set_memory_enabled(&session, enabled)
+            .await
+            .unwrap();
+        let payload = serde_json::json!({
+            "version": 1,
+            "initiating_message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}]
+            }
+        });
+        TurnRepository::new(db)
+            .start(
+                &session,
+                "user",
+                Some(&payload.to_string()),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        MemoryInboxRepository::new(db)
+            .counts()
+            .await
+            .unwrap()
+            .pending as i64
+    }
+
+    #[tokio::test]
+    async fn a_disabled_memory_policy_admits_no_turn() {
+        let db = Database::connect_in_memory().await.unwrap();
+        assert_eq!(admit_with_memory_flag(&db, false, "记住用 Pro").await, 0);
+        assert_eq!(admit_with_memory_flag(&db, true, "记住用 Flash").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_secret_bearing_turn_never_reaches_the_extractor() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_messages(
+            &db,
+            ["我的 api_key = sk-abcdefghijklmnopqrstuvwxyz012345".to_string()],
+        )
+        .await;
+        let boot = BootId::generate();
+        let items = MemoryInboxRepository::new(&db)
+            .claim_batch(&boot, leveler_core::now(), 8)
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let extractor = CountingExtractor {
+            calls: calls.clone(),
+        };
+        let worker = MemoryConsolidator::new(
+            db,
+            boot,
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            Arc::new(UnusedRuntime),
+            Arc::new(|_| {}),
+        );
+
+        let outcome = worker.process_claimed(&items, &extractor).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "secret turn was extracted");
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.rejected, 0);
+        assert!(
+            MemoryStore::open(temp.path().join("memory"))
+                .unwrap()
+                .list_pending()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1208,6 +1437,47 @@ mod tests {
         assert_eq!(worker.run_once().await.unwrap().claimed, 1);
         assert_eq!(worker.run_once().await.unwrap().claimed, 0);
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_memory_extraction_call_lands_in_the_model_call_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        admitted_turns(&db, 1).await;
+        let runtime = ScriptedRuntime::new(vec![Ok("[]")]);
+        let worker = MemoryConsolidator::new(
+            db.clone(),
+            BootId::generate(),
+            temp.path().to_path_buf(),
+            temp.path().join("memory"),
+            runtime,
+            Arc::new(|_| {}),
+        );
+
+        worker.run_once().await.unwrap();
+
+        // The extraction is visible as its OWN lane, with a low effort, so
+        // "why was there another model call after my turn?" has an answer and
+        // auxiliary spend is separable from the coding work.
+        // Query every session in this in-memory database: `admitted_turns`
+        // names its session from a fresh random id, so the assertion must not
+        // depend on that id.
+        let mut rows = Vec::new();
+        for session in SessionRepository::new(&db).list().await.unwrap() {
+            rows.extend(
+                leveler_storage::ModelRequestRepository::new(&db)
+                    .load_for_session(&leveler_core::SessionId::new(session.id))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let memory_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == leveler_storage::ModelCallKind::MemoryExtraction)
+            .collect();
+        assert_eq!(memory_rows.len(), 1, "one batch, one ledger row");
+        assert_eq!(memory_rows[0].reasoning_effort.as_deref(), Some("low"));
+        assert!(memory_rows[0].error_kind.is_none());
     }
 
     #[tokio::test]

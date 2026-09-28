@@ -450,6 +450,14 @@ mod tests {
         dir
     }
 
+    /// Skill content is data: reading it is read-only and confers no new
+    /// capability. Permissions, sandbox and write scope stay runtime-enforced.
+    #[test]
+    fn loading_a_skill_is_read_only() {
+        assert_eq!(Tool::risk(&LoadSkillTool), RiskLevel::Safe);
+        assert_eq!(Tool::name(&LoadSkillTool), "load_skill");
+    }
+
     #[tokio::test]
     async fn load_skill_surfaces_structured_scripts_and_dir() {
         let dir = tmp("struct");

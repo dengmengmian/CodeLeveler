@@ -18,6 +18,7 @@ mod memory;
 pub mod patch;
 mod read_file;
 mod read_symbol;
+mod rules;
 mod run_command;
 mod shell_command;
 mod shell_guard;
@@ -43,6 +44,7 @@ pub use list_files::ListFilesTool;
 pub use memory::{ForgetTool, MemoryRoot, MemoryTool, RememberTool};
 pub use read_file::ReadFileTool;
 pub use read_symbol::ReadSymbolTool;
+pub use rules::ReadProjectRulesTool;
 pub use run_command::RunCommandTool;
 pub use shell_command::ShellCommandTool;
 pub use skills::{

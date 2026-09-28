@@ -81,6 +81,30 @@ pub(crate) struct SignalCollector {
     /// so a repeat can be counted the first time it repeats.
     files_read: HashSet<String>,
     search_queries: HashSet<String>,
+    /// Read-only calls seen in the CURRENT round (reset at every round
+    /// boundary), whether this round has already been counted as a multi-read
+    /// round, and the running maxima — the observation-density ledger.
+    read_only_calls: u32,
+    round_read_only: u32,
+    round_counted_multi: bool,
+    rounds_with_read_only: u32,
+    multi_read_rounds: u32,
+    max_read_only_calls_per_round: u32,
+    /// Rounds in which a verification-class command failed, and rounds whose
+    /// tool batch contained any errored result. Recovery is the second set
+    /// restricted to rounds at/after the first edit.
+    verification_failures: u32,
+    errored_rounds: HashSet<u32>,
+    /// Read-only calls per finished model round, in order. Closed when the
+    /// next round starts and again at `finish`.
+    per_round_read_only: Vec<u32>,
+    /// Distinct model steps the harness put a message in front of, the subset
+    /// of those that bought a model round, and the stable injection keys seen.
+    injected_rounds: HashSet<u32>,
+    forced_continuations: u32,
+    injection_kinds: Vec<String>,
+    /// Stable `update_goal` refusal reasons observed.
+    goal_interceptions: Vec<String>,
 }
 
 impl SignalCollector {
@@ -119,6 +143,19 @@ impl SignalCollector {
             rounds_started: 0,
             files_read: HashSet::new(),
             search_queries: HashSet::new(),
+            read_only_calls: 0,
+            round_read_only: 0,
+            round_counted_multi: false,
+            rounds_with_read_only: 0,
+            multi_read_rounds: 0,
+            max_read_only_calls_per_round: 0,
+            verification_failures: 0,
+            errored_rounds: HashSet::new(),
+            per_round_read_only: Vec::new(),
+            injected_rounds: HashSet::new(),
+            forced_continuations: 0,
+            injection_kinds: Vec::new(),
+            goal_interceptions: Vec::new(),
         }
     }
 
@@ -150,6 +187,12 @@ impl SignalCollector {
     pub(crate) fn observe_agent(&mut self, event: &AgentEvent) {
         if matches!(event, AgentEvent::StreamAttemptStarted) {
             self.rounds_started = self.rounds_started.saturating_add(1);
+            // A new round is a new batch: close the previous round's count.
+            if self.rounds_started > 1 {
+                self.per_round_read_only.push(self.round_read_only);
+            }
+            self.round_read_only = 0;
+            self.round_counted_multi = false;
         }
         match event {
             // User-visible feedback: status/wait labels, streaming text,
@@ -179,9 +222,24 @@ impl SignalCollector {
                 id,
                 name,
                 arguments,
-                ..
+                parallel,
             } => {
                 self.signals.tool_calls += 1;
+                // Observation density: the read-only class is the runtime's
+                // own `supports_parallel` answer, not a name list here.
+                if *parallel {
+                    self.read_only_calls = self.read_only_calls.saturating_add(1);
+                    if self.round_read_only == 0 {
+                        self.rounds_with_read_only = self.rounds_with_read_only.saturating_add(1);
+                    }
+                    self.round_read_only = self.round_read_only.saturating_add(1);
+                    self.max_read_only_calls_per_round =
+                        self.max_read_only_calls_per_round.max(self.round_read_only);
+                    if self.round_read_only >= 2 && !self.round_counted_multi {
+                        self.round_counted_multi = true;
+                        self.multi_read_rounds = self.multi_read_rounds.saturating_add(1);
+                    }
+                }
                 // Coverage: every metrics-only path this call names, whether it
                 // reads it or patches it. `arguments` is the raw JSON, so a
                 // path inside an apply_patch body counts the same as a
@@ -293,8 +351,10 @@ impl SignalCollector {
                     }
                 }
                 if *is_error {
+                    self.errored_rounds.insert(self.rounds_started.max(1));
                     if self.verify_calls.contains(id) {
                         self.verification_failed = true;
+                        self.verification_failures = self.verification_failures.saturating_add(1);
                     }
                     if preview.contains(LOOP_GUARD_MARKER) {
                         self.signals.loop_guard_trips += 1;
@@ -331,6 +391,28 @@ impl SignalCollector {
                 }
             }
             AgentEvent::Compacted { .. } => self.signals.compactions += 1,
+            AgentEvent::RuntimeInjection {
+                kind,
+                model_step,
+                forces_continuation,
+                ..
+            } => {
+                // A harness-authored message the model will read. Counting the
+                // STEP (not the message) is what makes rounds attributable:
+                // two injections before one request are still one round.
+                self.injected_rounds.insert(*model_step);
+                if *forces_continuation {
+                    self.forced_continuations = self.forced_continuations.saturating_add(1);
+                }
+                if !self.injection_kinds.iter().any(|k| k == kind) {
+                    self.injection_kinds.push(kind.clone());
+                }
+            }
+            AgentEvent::GoalIntercepted { kind, .. } => {
+                if !self.goal_interceptions.iter().any(|k| k == kind) {
+                    self.goal_interceptions.push(kind.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -382,14 +464,44 @@ impl SignalCollector {
         ));
         self.signals.relevant_paths_before_edit = relevant_before;
         self.signals.impact_paths_before_edit = impact_before;
+        self.signals.read_only_calls = self.read_only_calls;
+        self.signals.rounds_with_read_only = self.rounds_with_read_only;
+        self.signals.multi_read_rounds = self.multi_read_rounds;
+        self.signals.max_read_only_calls_per_round = self.max_read_only_calls_per_round;
+        self.signals.verification_failures = self.verification_failures;
+        self.signals.recovery_rounds = self
+            .signals
+            .first_edit_round
+            .map(|first| {
+                self.errored_rounds
+                    .iter()
+                    .filter(|round| **round >= first)
+                    .count() as u32
+            })
+            .unwrap_or(0);
+        if self.rounds_started >= 1 {
+            self.per_round_read_only.push(self.round_read_only);
+        }
+        self.signals.per_round_read_only = self.per_round_read_only;
+        self.signals.runtime_injected_rounds = self.injected_rounds.len() as u32;
+        self.signals.runtime_forced_continuations = self.forced_continuations;
+        self.signals.runtime_injection_kinds = self.injection_kinds;
+        self.signals.goal_interceptions = self.goal_interceptions;
         self.signals
+    }
+
+    /// The round of the first edit attempt, read BEFORE `finish`. The eval
+    /// harness uses it to slice the per-round model ledger; the agent run is
+    /// already over when it asks, so no further event can change the answer.
+    pub(crate) fn first_edit_round(&self) -> Option<u32> {
+        self.signals.first_edit_round
     }
 
     /// Impact-surface paths the run never reached. Empty is the good case; a
     /// non-empty list on a case the agent called done is the half-fix, named.
     #[cfg(test)]
     pub(crate) fn clone_signals(&self) -> TrajectorySignals {
-        self.signals
+        self.signals.clone()
     }
 
     pub(crate) fn missed_impact_paths(&self) -> Vec<String> {
@@ -453,15 +565,36 @@ mod tests {
         }
     }
 
+    /// A read-only call as the executor emits it: `parallel` is the runtime's
+    /// own `supports_parallel` answer, which is what observation density counts.
+    fn read_call(id: &str, name: &str, args: serde_json::Value) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.to_string(),
+            parallel: true,
+        }
+    }
+
     fn result(id: &str, name: &str, is_error: bool, preview: &str) -> AgentEvent {
         AgentEvent::ToolResult {
             exit_code: None,
             stop: None,
+            execution_status: None,
             id: id.into(),
             name: name.into(),
             is_error,
             preview: preview.into(),
             applied_diff: None,
+        }
+    }
+
+    fn injection(kind: &str, model_step: u32, forces_continuation: bool) -> AgentEvent {
+        AgentEvent::RuntimeInjection {
+            kind: kind.into(),
+            role: "user".into(),
+            model_step,
+            forces_continuation,
         }
     }
 
@@ -666,6 +799,7 @@ mod tests {
         c.observe_agent(&AgentEvent::ToolResult {
             exit_code: None,
             stop: None,
+            execution_status: None,
             id: id.to_string(),
             name: name.to_string(),
             is_error: false,
@@ -778,6 +912,7 @@ mod tests {
         c.observe_agent(&AgentEvent::ToolResult {
             exit_code: None,
             stop: None,
+            execution_status: None,
             id: "miss".to_string(),
             name: "read_file".to_string(),
             is_error: true,
@@ -891,6 +1026,7 @@ mod tests {
         c.observe_agent(&AgentEvent::ToolResult {
             exit_code: None,
             stop: None,
+            execution_status: None,
             id: "build".to_string(),
             name: "run_command".to_string(),
             is_error: true,
@@ -1034,6 +1170,90 @@ mod tests {
         assert!(s.ttff_ms.is_some());
     }
 
+    /// Observation density is per-round: three read-only calls in one round is
+    /// one multi-read round at width 3, three one-per-round rounds is three
+    /// rounds at width 1. Same observations, different serialization — the
+    /// distinction this metric exists to make.
+    #[test]
+    fn observation_density_distinguishes_one_batch_from_three_serial_rounds() {
+        let mut batched = SignalCollector::new(Vec::new());
+        batched.observe_agent(&AgentEvent::StreamAttemptStarted);
+        for (i, path) in ["a.rs", "b.rs", "c.rs"].iter().enumerate() {
+            batched.observe_agent(&read_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({ "path": path }),
+            ));
+        }
+        let s = batched.finish(false);
+        assert_eq!(s.read_only_calls, 3);
+        assert_eq!(s.rounds_with_read_only, 1);
+        assert_eq!(s.multi_read_rounds, 1);
+        assert_eq!(s.max_read_only_calls_per_round, 3);
+
+        let mut serial = SignalCollector::new(Vec::new());
+        for (i, path) in ["a.rs", "b.rs", "c.rs"].iter().enumerate() {
+            serial.observe_agent(&AgentEvent::StreamAttemptStarted);
+            serial.observe_agent(&read_call(
+                &format!("c{i}"),
+                "read_file",
+                serde_json::json!({ "path": path }),
+            ));
+        }
+        let s = serial.finish(false);
+        assert_eq!(s.read_only_calls, 3, "same observations either way");
+        assert_eq!(s.rounds_with_read_only, 3);
+        assert_eq!(s.multi_read_rounds, 0);
+        assert_eq!(s.max_read_only_calls_per_round, 1);
+    }
+
+    /// A mutating call is not an observation. A round that only writes must not
+    /// dilute the density denominator.
+    #[test]
+    fn a_serial_write_round_is_not_a_read_only_round() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&AgentEvent::StreamAttemptStarted);
+        c.observe_agent(&call(
+            "a1",
+            "apply_patch",
+            serde_json::json!({ "path": "a.rs" }),
+        ));
+        c.observe_agent(&result("a1", "apply_patch", false, "ok"));
+        let s = c.finish(false);
+        assert_eq!(s.read_only_calls, 0);
+        assert_eq!(s.rounds_with_read_only, 0);
+    }
+
+    /// Recovery is rework of a change, so an errored round before the first
+    /// edit is not one. A failed check is a verification failure in its own
+    /// right, not an edit failure.
+    #[test]
+    fn recovery_rounds_and_verification_failures_count_post_edit_errors() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 1: probe error
+        c.observe_agent(&call("e0", "grep", serde_json::json!({ "pattern": "x" })));
+        c.observe_agent(&result("e0", "grep", true, "no such directory"));
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 2: first edit
+        c.observe_agent(&call(
+            "a1",
+            "apply_patch",
+            serde_json::json!({ "path": "a.rs" }),
+        ));
+        c.observe_agent(&result("a1", "apply_patch", false, "ok"));
+        c.observe_agent(&AgentEvent::StreamAttemptStarted); // round 3: failed check
+        c.observe_agent(&call(
+            "v1",
+            "run_command",
+            serde_json::json!({ "program": "cargo", "args": ["test"] }),
+        ));
+        c.observe_agent(&result("v1", "run_command", true, "test failed"));
+        let s = c.finish(false);
+        assert_eq!(s.first_edit_round, Some(2));
+        assert_eq!(s.recovery_rounds, 1, "only the post-edit errored round");
+        assert_eq!(s.verification_failures, 1);
+        assert_eq!(s.edit_failures, 0, "a failed check is not a failed edit");
+    }
+
     #[test]
     fn stream_attempt_and_task_started_count_as_early_feedback() {
         // Host-side "work started" must set TTFF without waiting for tokens.
@@ -1062,5 +1282,79 @@ mod tests {
             "TaskStarted is immediate host feedback, got {:?}",
             s.ttff_ms
         );
+    }
+
+    /// Harness injections are counted by model STEP, so two messages before one
+    /// request are one injected round; the forced subset is the rounds the model
+    /// did not ask for. `update_goal` refusals are collected by reason.
+    #[test]
+    fn harness_injections_and_goal_interceptions_are_attributed() {
+        let mut c = SignalCollector::new(Vec::new());
+        // Two messages before step 2 are still ONE injected round.
+        c.observe_agent(&injection("closeout_goal_unresolved", 2, true));
+        c.observe_agent(&injection("finalization", 2, false));
+        c.observe_agent(&injection("protocol_repair", 4, true));
+        c.observe_agent(&AgentEvent::GoalIntercepted {
+            kind: "plan_unreconciled".into(),
+            detail: "tool work after the last plan declaration".into(),
+        });
+        c.observe_agent(&AgentEvent::GoalIntercepted {
+            kind: "invalid_status".into(),
+            detail: "no status".into(),
+        });
+        let s = c.finish(false);
+
+        assert_eq!(s.runtime_injected_rounds, 2, "steps 2 and 4, not messages");
+        assert_eq!(s.runtime_forced_continuations, 2, "closeout nudge + repair");
+        assert_eq!(
+            s.runtime_injection_kinds,
+            vec![
+                "closeout_goal_unresolved".to_string(),
+                "finalization".to_string(),
+                "protocol_repair".to_string()
+            ]
+        );
+        assert_eq!(
+            s.goal_interceptions,
+            vec![
+                "plan_unreconciled".to_string(),
+                "invalid_status".to_string()
+            ]
+        );
+    }
+
+    /// The engine→agent shim must carry the injection through, or the eval
+    /// collector (which reads engine events) would see nothing.
+    #[test]
+    fn a_runtime_injection_survives_the_engine_projection() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_engine(EngineEvent::RuntimeInjection {
+            kind: "closeout_empty_answer".into(),
+            role: "user".into(),
+            model_step: 3,
+            forces_continuation: true,
+        });
+        let s = c.finish(false);
+        assert_eq!(s.runtime_injected_rounds, 1);
+        assert_eq!(s.runtime_forced_continuations, 1);
+        assert_eq!(s.runtime_injection_kinds, vec!["closeout_empty_answer"]);
+    }
+
+    /// The same key twice is one kind, and a run with no injection reports zero
+    /// — never a fabricated count.
+    #[test]
+    fn injection_kinds_dedupe_and_absence_is_zero() {
+        let mut c = SignalCollector::new(Vec::new());
+        c.observe_agent(&injection("finalization", 1, false));
+        c.observe_agent(&injection("finalization", 3, false));
+        let s = c.finish(false);
+        assert_eq!(s.runtime_injected_rounds, 2, "two distinct steps");
+        assert_eq!(s.runtime_forced_continuations, 0);
+        assert_eq!(s.runtime_injection_kinds, vec!["finalization".to_string()]);
+
+        let empty = SignalCollector::new(Vec::new()).finish(false);
+        assert_eq!(empty.runtime_injected_rounds, 0);
+        assert!(empty.runtime_injection_kinds.is_empty());
+        assert!(empty.goal_interceptions.is_empty());
     }
 }

@@ -60,6 +60,11 @@ impl CommandExecution {
         lifetime: BackgroundTaskLifetime,
         context: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
+        let _gate = if context.command_lease.is_none() {
+            Some(context.execution.command_gate.clone().lock_owned().await)
+        } else {
+            None
+        };
         let reg = &self.background_tasks;
         let rel = cwd_rel.unwrap_or(".").to_string();
         let cwd = context
@@ -67,16 +72,18 @@ impl CommandExecution {
             .workspace
             .resolve_command_cwd(&rel, &context.write_scope())?;
 
-        // Pre-spawn snapshot the runtime settles against when the process exits.
-        // Restore only applies when a write allowlist is set; default Goal
-        // background (dev servers) keeps the baseline for accounting only.
+        // Pre-spawn baseline for namespace accounting after process-group exit.
         let root = context.execution.workspace.root().to_path_buf();
         let mutation_baseline = if context.policy.read_only {
             None
         } else {
-            match WorkspaceSnapshot::capture(&root).await {
+            match WorkspaceSnapshot::capture_for_scope(&root, &context.write_scope()).await {
                 Ok(Some(id)) => {
-                    if let Err(error) = WorkspaceSnapshot::persist_last(&root, &id).await {
+                    if !matches!(
+                        context.write_scope(),
+                        leveler_execution::WriteScope::ScopedWorkspace { .. }
+                    ) && let Err(error) = WorkspaceSnapshot::persist_last(&root, &id).await
+                    {
                         tracing::warn!("could not persist pre-background snapshot: {error}");
                     }
                     Some(MutationBaseline {
@@ -85,11 +92,7 @@ impl CommandExecution {
                         // The authority this task runs under is the one it is
                         // spawned with: it outlives this round, so there is no
                         // later scope for the runtime to consult when it settles.
-                        write_allowlist: context
-                            .policy
-                            .command_write_allowlist
-                            .as_deref()
-                            .map(|allow| allow.to_vec()),
+                        write_scope: context.write_scope(),
                     })
                 }
                 Ok(None) => None,
@@ -99,21 +102,15 @@ impl CommandExecution {
                 }
             }
         };
-        // Allowlist-constrained workers need a recoverable snapshot to restore on
-        // wait. Without git we cannot enforce the constraint.
-        // A background process outlives the round that started it, so a scope
-        // claimed later cannot bound it: a child with no write authority may not
-        // detach one at all. Foreground commands instead run with a read-only
-        // workspace (see `execute_program`).
-        if let Some(output) = refuse_zero_write_authority(&context) {
-            return Ok(output);
-        }
+        // Write-capable scoped tasks require an accounting baseline. Read-only
+        // tasks can run without one because the sandbox denies their writes.
         if context.policy.command_write_allowlist.is_some()
+            && !context.policy.has_zero_write_authority()
             && mutation_baseline.is_none()
             && !context.policy.read_only
         {
             return Ok(ToolOutput::error(
-                "Refused: command mutation constraints require a recoverable git workspace snapshot.\n",
+                "Refused: command mutation constraints require a git workspace mutation baseline.\n",
             ));
         }
 
@@ -122,10 +119,11 @@ impl CommandExecution {
         // decides whether goal terminal cleanup includes it; daemon-scoped
         // spawning remains reserved for runtime-internal services.
         match reg
-            .spawn_owned_with_lifetime(
+            .spawn_for_writer(
                 req,
                 mutation_baseline,
                 Some(context.session_scope()),
+                context.writer_scope(),
                 lifetime,
             )
             .await
@@ -169,6 +167,11 @@ impl CommandExecution {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        let _gate = if context.command_lease.is_none() {
+            Some(context.execution.command_gate.clone().lock_owned().await)
+        } else {
+            None
+        };
         let rel = cwd_rel.unwrap_or(".").to_string();
         let cwd = context
             .execution
@@ -204,9 +207,13 @@ impl CommandExecution {
         let snapshot = if context.policy.read_only || context.policy.has_zero_write_authority() {
             None
         } else {
-            match WorkspaceSnapshot::capture(&root).await {
+            match WorkspaceSnapshot::capture_for_scope(&root, &context.write_scope()).await {
                 Ok(Some(id)) => {
-                    if let Err(error) = WorkspaceSnapshot::persist_last(&root, &id).await {
+                    if !matches!(
+                        context.write_scope(),
+                        leveler_execution::WriteScope::ScopedWorkspace { .. }
+                    ) && let Err(error) = WorkspaceSnapshot::persist_last(&root, &id).await
+                    {
                         tracing::warn!("could not persist pre-command snapshot: {error}");
                     }
                     Some(id)
@@ -229,7 +236,7 @@ impl CommandExecution {
             && !context.policy.has_zero_write_authority();
         if constrained && snapshot.is_none() && !context.policy.read_only {
             return Ok(ToolOutput::error(
-                "Refused: command mutation constraints require a recoverable git workspace snapshot.\n",
+                "Refused: command mutation constraints require a git workspace mutation baseline.\n",
             ));
         }
 
@@ -243,12 +250,6 @@ impl CommandExecution {
         };
 
         let sandboxed = request.write_scope.confines();
-        // Hold the workspace-wide gate for the command AND the mutation detection
-        // that follows: concurrent sub-agents share one working tree, so a command
-        // that observes the tree mid-edit produces an authoritative-looking wrong
-        // answer. Background commands never reach here (they return earlier), so a
-        // long-lived server cannot hold the gate.
-        let _gate = context.execution.command_gate.clone().lock_owned().await;
         let output = match context.output.clone() {
             Some(chunks) => {
                 context
@@ -265,51 +266,31 @@ impl CommandExecution {
         let mut command_modified: Vec<String> = Vec::new();
         let mut snapshot_note: Option<String> = None;
         match (&snapshot, context.policy.read_only) {
-            (Some(id), _) => match WorkspaceSnapshot::changed_since(&root, id).await {
-                Ok(changed) => command_modified = changed,
-                Err(error) => {
-                    snapshot_note = Some(format!(
-                        "\n[note] could not diff the workspace after this command ({error}); \
+            (Some(id), _) => {
+                match WorkspaceSnapshot::changed_since_for_scope(&root, id, &context.write_scope())
+                    .await
+                {
+                    Ok(changed) => command_modified = changed,
+                    Err(error) => {
+                        snapshot_note = Some(format!(
+                            "\n[note] could not diff the workspace after this command ({error}); \
                          its file changes were not tracked.\n"
-                    ));
+                        ));
+                    }
                 }
-            },
+            }
             (None, true) => {}
             (None, false) => {
                 snapshot_note = Some(
-                    "\n[note] this workspace is not a git repository; file changes made by \
-                     this command cannot be rolled back.\n"
+                    "\n[note] a workspace mutation baseline was unavailable; file changes made by \
+                     this command were not tracked and cannot be rolled back.\n"
                         .to_string(),
                 );
             }
         }
 
         let mut mutation_error = None;
-        if let Some(id) = &snapshot {
-            // The diff covers the WHOLE workspace, so in a shared tree it also
-            // reports what a concurrent sibling wrote inside its own exclusive
-            // scope. This command cannot have written those — the ownership fence
-            // and the write allowlist refuse them — and charging them here rolls
-            // the sibling's authorized work back along with everything else.
-            command_modified.retain(|path| {
-                !context
-                    .policy
-                    .command_foreign_paths
-                    .iter()
-                    .any(|owned| path_allows(owned, path))
-            });
-            let outside: Vec<&str> = context
-                .policy
-                .command_write_allowlist
-                .as_deref()
-                .map(|allowlist| {
-                    command_modified
-                        .iter()
-                        .map(String::as_str)
-                        .filter(|path| !allowlist.iter().any(|allowed| path_allows(allowed, path)))
-                        .collect()
-                })
-                .unwrap_or_default();
+        if snapshot.is_some() {
             let newly_modified = command_modified
                 .iter()
                 .filter(|path| !context.policy.command_previously_modified.contains(path))
@@ -319,31 +300,12 @@ impl CommandExecution {
                 .command_modified_files_remaining
                 .is_some_and(|remaining| newly_modified > remaining);
 
-            let violation = if !outside.is_empty() {
-                Some(format!(
-                    "command modified files outside allowed paths: {}",
-                    outside.join(", ")
-                ))
-            } else if budget_exceeded {
-                Some(format!(
+            if budget_exceeded {
+                // The command really wrote these owned paths. Preserve them
+                // and report the budget overrun; never roll a shared tree back.
+                mutation_error = Some(format!(
                     "command exceeded the remaining file budget (modified {newly_modified})"
-                ))
-            } else {
-                None
-            };
-
-            if let Some(violation) = violation {
-                match WorkspaceSnapshot::restore(&root, id).await {
-                    Ok(()) => {
-                        command_modified.clear();
-                        mutation_error = Some(format!("{violation}; workspace restored"));
-                    }
-                    Err(error) => {
-                        mutation_error = Some(format!(
-                            "{violation}; automatic workspace restore failed: {error}"
-                        ));
-                    }
-                }
+                ));
             }
         }
 
@@ -353,9 +315,8 @@ impl CommandExecution {
         // reported every file differing between the branches used to hang the
         // project's whole `cargo test` gate on a task that wrote nothing.
         //
-        // Deliberately AFTER the write-allowlist, file-budget and rollback checks
-        // above: those still see every path the command touched, however it
-        // touched it, so a repository operation can never walk past a write scope.
+        // The OS write boundary prevents repository commands from crossing scope;
+        // file budgets still count all observed changes before attribution.
         if !command_modified.is_empty()
         && let Some(before) = &head_before
         && let Some(after) = WorkspaceSnapshot::head_commit(&root).await
@@ -404,14 +365,11 @@ impl CommandExecution {
             body.push_str(&shown);
             locators.extend(locator);
         }
-        // The sandbox denied this call the network and the command failed
-        // reaching it: a permission the user has not granted, not a broken
-        // command. Said first, so every reader (the model, a client row)
-        // meets the cause before the output.
-        if network_denied && !output.success() && network_failure_in(&body) {
+        if network_denied {
             body.insert_str(0, crate::recoverable::network_permission_required());
-        } else if let Some(hint) = sandbox_denial_hint(sandboxed, output.success(), &body) {
-            body.push_str(hint);
+        }
+        if sandboxed {
+            body.push_str(crate::recoverable::sandbox_write_denied());
         }
         if let Some(note) = snapshot_note {
             body.push_str(&note);
@@ -447,9 +405,17 @@ impl CommandExecution {
             is_error: !output.success() || mutation_error.is_some(),
             metadata: serde_json::json!({
                 "exit_code": output.exit_code,
+                "network_denied": network_denied,
+                "filesystem_confined": sandboxed,
                 "timed_out": output.timed_out,
+                // Whether the RUNNER completed, independent of the exit code: a
+                // command that ran and failed a test reports `completed` with a
+                // non-zero `exit_code`. Consumers that count tool failures must
+                // read this, not `is_error` (which also carries a non-zero exit
+                // and a rejected mutation).
+                "execution_status": output.execution_status(),
                 "modified_files": command_modified,
-                "workspace_snapshot": snapshot.as_ref().map(|id| id.0.clone()),
+                "workspace_snapshot": snapshot.as_ref().filter(|_| !matches!(context.write_scope(), leveler_execution::WriteScope::ScopedWorkspace { .. })).map(|id| id.0.clone()),
                 // What this execution proves ran, stated by the layer that ran it.
                 // Every command tool funnels through here, so completion evidence
                 // reads one execution fact instead of guessing from tool names
@@ -459,92 +425,6 @@ impl CommandExecution {
             }),
         };
         Ok(out)
-    }
-}
-
-/// Empty claimed scope: refuse a BACKGROUND command before spawn. Only the
-/// detached path — it outlives the round, so a scope claimed later cannot bound
-/// it, and git cannot audit empty-dir removals after the fact. Foreground
-/// commands are NOT refused: they run under a read-only workspace
-/// (`WriteScope::None`), so exploration still works before a claim.
-pub(super) fn refuse_zero_write_authority(context: &ToolContext) -> Option<ToolOutput> {
-    context.policy.has_zero_write_authority().then(|| {
-        ToolOutput::error(
-            "Refused: no write scope is currently owned, so this command may not run \
-             (it could modify the workspace). Read the relevant code, then use \
-             claim_write_scope(paths) to take the bounded scope you need.\n",
-        )
-    })
-}
-
-pub(super) fn path_allows(allowed: &str, modified: &str) -> bool {
-    let allowed = allowed.trim_end_matches('/');
-    modified == allowed || modified.starts_with(&format!("{allowed}/"))
-}
-
-/// Whether a failed command's output shows it could not reach the network:
-/// name resolution, connection or socket-permission failures as the common
-/// clients and runtimes report them. Read only for a call the sandbox ran
-/// with the network denied, so it classifies an effect the sandbox caused —
-/// it never decides what a command may do.
-pub(super) fn network_failure_in(body: &str) -> bool {
-    const SIGNATURES: &[&str] = &[
-        "could not resolve host",
-        "couldn't connect to server",
-        "failed to connect to",
-        "temporary failure in name resolution",
-        "name or service not known",
-        "nodename nor servname",
-        "getaddrinfo",
-        "enotfound",
-        "eai_again",
-        "network is unreachable",
-        "enetunreach",
-        "no route to host",
-        "connect eperm",
-        // A fresh network namespace has no route out and its loopback is down,
-        // so a client reaching for anything — including 127.0.0.1 — is refused
-        // rather than timing out. Node says `connect ECONNREFUSED 127.0.0.1:…`
-        // and Python `ConnectionRefusedError: [Errno 111] Connection refused`
-        // (measured under `bwrap --unshare-net`). Same condition as curl's
-        // `couldn't connect to server` above: the denied call is why the
-        // connection could not succeed.
-        "connect econnrefused",
-        "connection refused",
-        // Go: `proxyconnect tcp: dial tcp …`, `dial tcp: lookup host: no such host`.
-        "dial tcp",
-        "no such host",
-        // A local listener, which the macOS sandbox denies with the network.
-        "bind: operation not permitted",
-        "listen eperm",
-        "urlopen error",
-        "sock.connect",
-        "dns error",
-        "error sending request",
-        "failed to download",
-        "unable to access",
-    ];
-    let body = body.to_ascii_lowercase();
-    SIGNATURES.iter().any(|s| body.contains(s))
-}
-
-/// When a workspace-sandboxed command fails with an OS write denial, explain
-/// that it is the sandbox — so the model reports the cause accurately instead of
-/// guessing (e.g. calling it a "pre-existing, unrelated" failure). Writes
-/// outside the workspace (temp/toolchain caches aside) are denied by design.
-pub(super) fn sandbox_denial_hint(
-    sandboxed: bool,
-    success: bool,
-    body: &str,
-) -> Option<&'static str> {
-    let body = body.to_ascii_lowercase();
-    let denied = body.contains("operation not permitted")
-        || body.contains("permission denied")
-        || body.contains("read-only file system");
-    if sandboxed && !success && denied {
-        Some(crate::recoverable::sandbox_write_denied())
-    } else {
-        None
     }
 }
 
@@ -587,6 +467,206 @@ pub(super) fn truncate_or_spill(
 /// Default command timeout, and the ceiling we clamp any request to.
 pub(super) const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub(super) const MAX_TIMEOUT_SECS: u64 = 3600;
+
+#[cfg(test)]
+mod exit_taxonomy_tests {
+    //! C2 regression: execution outcome and command outcome are two axes.
+    //!
+    //! A command that ran to completion and exited non-zero must stay an
+    //! execution SUCCESS carrying its non-zero exit code and its output. Only
+    //! a process the runtime could not run (spawn failure, timeout,
+    //! cancellation) is an execution failure. `is_error` keeps its old
+    //! model-visible meaning; the machine-readable status is `metadata`.
+    use super::*;
+    use crate::tool::ToolContext;
+    use leveler_execution::{PermissionProfile, ToolExecutionStatus, Workspace};
+
+    fn ws() -> (std::path::PathBuf, ToolContext) {
+        ws_with(PermissionProfile::Assisted)
+    }
+
+    fn ws_with(profile: PermissionProfile) -> (std::path::PathBuf, ToolContext) {
+        let dir = std::env::temp_dir().join(format!(
+            "leveler-exit-taxonomy-{}",
+            crate::tools::test_ordinal()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::new(&dir).unwrap();
+        (dir, ToolContext::new(ws, profile))
+    }
+
+    fn commands() -> CommandExecution {
+        CommandExecution::new(
+            std::sync::Arc::new(BackgroundTaskRegistry::with_environment(
+                std::sync::Arc::new(leveler_core::environment().clone()),
+            )),
+            None,
+        )
+    }
+
+    fn status_of(out: &ToolOutput) -> ToolExecutionStatus {
+        serde_json::from_value(out.metadata["execution_status"].clone())
+            .unwrap_or_else(|e| panic!("execution_status missing/invalid: {e}; {out:?}"))
+    }
+
+    #[tokio::test]
+    async fn exit_zero_is_a_completed_execution() {
+        let (dir, ctx) = ws();
+        let out = commands()
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "echo ok; exit 0".into()],
+                Some("."),
+                Some(30),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{out:?}");
+        assert_eq!(status_of(&out), ToolExecutionStatus::Completed);
+        assert_eq!(out.metadata["exit_code"], 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact case the benchmark mis-counted: a test/check command that ran
+    /// normally and reported failure.
+    #[tokio::test]
+    async fn nonzero_exit_is_completed_with_a_command_failure_visible() {
+        let (dir, ctx) = ws();
+        let out = commands()
+            .run_foreground(
+                "sh",
+                vec![
+                    "-c".into(),
+                    "printf 'test failed: 1\n' >&2; exit 101".into(),
+                ],
+                Some("."),
+                Some(30),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            status_of(&out),
+            ToolExecutionStatus::Completed,
+            "a command that ran and failed is not a tool failure: {out:?}"
+        );
+        assert_eq!(out.metadata["exit_code"], 101);
+        // The model-visible contract is unchanged: it still sees the exit code
+        // and the failing output, and the result is still flagged as an error.
+        assert!(out.is_error, "model-visible failure signal must survive");
+        assert!(out.content.contains("exit: 101"), "{out:?}");
+        assert!(out.content.contains("test failed: 1"), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A probe that uses `exit 1` to mean "false" (grep with no match, a
+    /// diff that found a difference) is a completed execution, not a failure.
+    #[tokio::test]
+    async fn probe_exit_one_is_a_completed_execution() {
+        let (dir, ctx) = ws();
+        let out = commands()
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "exit 1".into()],
+                Some("."),
+                Some(30),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_of(&out), ToolExecutionStatus::Completed);
+        assert_eq!(out.metadata["exit_code"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no OS sandbox in front of it (full access), a program that does not
+    /// exist is a genuine spawn failure: the runtime never ran a command, so
+    /// there is no command outcome to report. (Under the sandbox the wrapper
+    /// process itself runs and reports the exec failure as its own exit code —
+    /// a *completed* execution — which is why this test does not confine.)
+    #[tokio::test]
+    async fn spawn_failure_is_an_execution_failure() {
+        let (dir, ctx) = ws_with(PermissionProfile::FullAccess);
+        let error = commands()
+            .run_foreground(
+                "leveler-no-such-binary-7f3c1a",
+                vec![],
+                Some("."),
+                Some(30),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a missing binary cannot execute");
+        assert!(
+            matches!(error, ToolError::Process(_)),
+            "expected a process error, got {error:?}"
+        );
+        let ToolError::Process(process) = error else {
+            unreachable!()
+        };
+        assert_eq!(process.execution_status(), ToolExecutionStatus::SpawnFailed);
+        assert!(process.execution_status().is_execution_failure());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn timeout_is_an_execution_failure() {
+        let (dir, ctx) = ws();
+        let out = commands()
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "sleep 30".into()],
+                Some("."),
+                Some(1),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_of(&out), ToolExecutionStatus::TimedOut);
+        assert_eq!(out.metadata["timed_out"], true);
+        assert!(out.content.contains("[timed out after 1s]"), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_not_a_command_outcome() {
+        let (dir, ctx) = ws();
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            canceller.cancel();
+        });
+        let error = commands()
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "sleep 30".into()],
+                Some("."),
+                Some(30),
+                ctx,
+                token,
+            )
+            .await
+            .expect_err("a cancelled command did not run to completion");
+        let ToolError::Process(process) = error else {
+            panic!("expected a process error: {error:?}")
+        };
+        assert!(
+            matches!(
+                process.execution_status(),
+                ToolExecutionStatus::Cancelled | ToolExecutionStatus::CancelUnconfirmed
+            ),
+            "cancellation must be distinguishable from a command outcome: {process:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 
 /// Resolve the effective timeout. A missing or zero value uses the default
 /// (zero would otherwise mean "expire immediately"); anything above the ceiling

@@ -161,11 +161,20 @@ impl ActiveTurns {
     /// harmless, and a stale turn can never remove a newer turn admitted for
     /// the same session after terminal publication.
     pub(crate) fn finish(&self, lease: &TurnLease) -> bool {
+        self.finish_with(lease, || {})
+    }
+
+    /// Publish the terminal and release its admission as one synchronized
+    /// boundary. A consumer awakened by publication cannot observe the old
+    /// turn as busy, and a new turn cannot overtake its terminal event.
+    /// `publish` must be synchronous and must not call back into ActiveTurns.
+    pub(crate) fn finish_with(&self, lease: &TurnLease, publish: impl FnOnce()) -> bool {
         let mut active = self.active.lock().unwrap();
         let owns_slot = active
             .get(&lease.session_id)
             .is_some_and(|turn| turn.generation == lease.generation);
         if owns_slot {
+            publish();
             active.remove(&lease.session_id);
         }
         owns_slot
@@ -278,6 +287,12 @@ mod tests {
         assert!(turns.finish(&old));
 
         let current = turns.admit(&session).unwrap();
+        let mut published = false;
+        assert!(!turns.finish_with(&old, || published = true));
+        assert!(
+            !published,
+            "a stale turn must not publish a terminal for a newer epoch"
+        );
         assert!(
             !turns.finish(&old),
             "the old wrapper's late release must be an idempotent no-op"

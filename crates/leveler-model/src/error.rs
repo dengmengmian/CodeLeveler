@@ -58,6 +58,9 @@ pub enum ModelErrorKind {
 pub struct StreamProgress {
     /// Assistant text was received before the cut.
     pub text: bool,
+    /// Reasoning was received before the cut, even if no answer text arrived.
+    #[serde(default)]
+    pub reasoning: bool,
     /// Tool-call arguments began streaming before the cut. Such a call did not
     /// complete and must never be executed.
     pub tool_args: bool,
@@ -67,7 +70,7 @@ impl StreamProgress {
     /// Whether any output at all was produced. A stream cut before any output
     /// carries nothing to duplicate, so re-requesting is still safe.
     pub fn any(self) -> bool {
-        self.text || self.tool_args
+        self.text || self.reasoning || self.tool_args
     }
 }
 
@@ -85,7 +88,8 @@ pub enum DeliveryState {
     /// before any request byte was written.
     NotSent,
     /// The request was written; no response was observed. Whether the provider
-    /// processed it is not knowable here.
+    /// processed it is not knowable here — but nothing came back either: no
+    /// headers, text, reasoning, tool call or tool result exists to duplicate.
     SentNoResponse,
     /// The provider returned a complete HTTP status (the request reached the
     /// gateway). Whether the model itself ran is a function of the status.
@@ -115,6 +119,13 @@ pub enum Retryability {
     /// The request provably did no provider-side work, or the provider
     /// explicitly asked to be retried. A bounded automatic retry cannot
     /// duplicate anything.
+    ///
+    /// This is the *blind-replay* class, and the transport's cheap fast path
+    /// admits nothing else into it. A failure the logical lifecycle may still
+    /// recover — one that received no response content, but which the provider
+    /// may nevertheless have processed — reads as
+    /// [`Retryability::Unknown`] here and is decided by
+    /// [`ModelError::is_retryable_by_lifecycle`].
     Safe,
     /// The request may have reached the provider. Retrying could duplicate
     /// generation, cost, or a tool call, so it is never automatic: the runtime
@@ -270,10 +281,17 @@ impl ModelError {
         Self::new(ModelErrorKind::Cancelled, "request cancelled")
     }
 
-    /// Whether a failed attempt may be retried, from the kind and the delivery
-    /// truth. This is THE retry policy: recovery layers must not consult
-    /// `message`, and must not retry anything this returns as anything other
-    /// than [`Retryability::Safe`].
+    /// Whether a failed attempt may be *blindly replayed*, from the kind and
+    /// the delivery truth: the strict question, and the only one the
+    /// transport's cheap pre-delivery fast path may ask. `Safe` is reserved for
+    /// a failure that provably did no provider-side work, so re-sending costs
+    /// nothing and duplicates nothing.
+    ///
+    /// The bounded logical retry lifecycle owns a whole model request and asks
+    /// the weaker question — may an attempt be re-sent when nothing observable
+    /// would be duplicated. That is
+    /// [`Self::is_retryable_by_lifecycle`]. Recovery layers must consult one of
+    /// those two and never `message`.
     pub fn retryability(&self) -> Retryability {
         use ModelErrorKind as K;
         // Re-sending the identical request cannot help, whatever the delivery
@@ -317,10 +335,62 @@ impl ModelError {
         }
     }
 
-    /// Whether this failure is worth a bounded automatic retry. Convenience
-    /// over [`Self::retryability`]; the single definition stays there.
+    /// Whether this failure may be blind-replayed. Convenience over
+    /// [`Self::retryability`]; the single definition stays there.
     pub fn is_safe_to_retry(&self) -> bool {
         self.retryability() == Retryability::Safe
+    }
+
+    /// Whether the bounded logical retry lifecycle may spend another attempt on
+    /// this failure.
+    ///
+    /// Deliberately weaker than [`Self::retryability`], which the transport's
+    /// cheap pre-delivery fast path also reads. The lifecycle owns recovery for
+    /// a whole model request, and the one thing a re-send must never do is
+    /// duplicate output the caller already received — so it may also recover a
+    /// failure that received nothing at all, even when the provider may have
+    /// generated (and billed) an answer that never arrived. That cost is the
+    /// accepted price of a *bounded* recovery, and it is exactly why such a
+    /// failure is not `Safe` and must not be taken by the fast path.
+    ///
+    /// This closes the asymmetry that used to end a whole run: a stream cut
+    /// after the headers were read was retried, while the same transient
+    /// condition one phase earlier — request fully sent, no response headers
+    /// ever returned — was terminal.
+    ///
+    /// Everything else stays terminal: a failure that received output, a status
+    /// that is not safely retryable, and every non-transient kind whatever the
+    /// delivery truth says — cancellation included.
+    pub fn is_retryable_by_lifecycle(&self) -> bool {
+        match self.retryability() {
+            Retryability::Safe => true,
+            // Non-transient: the provider would reject the identical request
+            // the same way, whatever delivery proved.
+            Retryability::Never => false,
+            // The provider may have done work. Recoverable only when the
+            // evidence says nothing was received back — which `Caution` never
+            // satisfies (a complete status, or a stream that produced output).
+            Retryability::Caution | Retryability::Unknown => self.received_no_content(),
+        }
+    }
+
+    /// Whether the failed attempt provably received no response content: no
+    /// headers, no text, no reasoning, no tool call arguments.
+    ///
+    /// A failure seen *inside* a stream is rewritten by the round to
+    /// [`DeliveryState::StreamInterrupted`] with the progress it actually made,
+    /// so a `SentNoResponse` reaching here can only mean the response never
+    /// started.
+    fn received_no_content(&self) -> bool {
+        match self.delivery_state {
+            DeliveryState::NotSent | DeliveryState::SentNoResponse => true,
+            DeliveryState::StreamInterrupted { progress } => !progress.any(),
+            // A send-boundary transport fault: no response stream exists. A
+            // mid-stream fault is never left as `Unknown`.
+            DeliveryState::Unknown => self.kind == ModelErrorKind::Transport,
+            // A complete status was received, so the provider answered.
+            DeliveryState::Responded => false,
+        }
     }
 
     /// Map an HTTP status code to a normalized error kind. A complete status
@@ -489,7 +559,9 @@ mod tests {
                 .retryability(),
             Retryability::Safe
         );
-        // Written, no response: unknown, never automatic.
+        // Written, no response: the provider may have run, so this is never a
+        // *blind* replay — but the logical lifecycle may still recover it, as
+        // the tests below pin down.
         assert_eq!(
             ModelError::new(ModelErrorKind::Timeout, "read timed out")
                 .with_delivery_state(DeliveryState::SentNoResponse)
@@ -510,6 +582,7 @@ mod tests {
             ModelError::new(ModelErrorKind::StreamInterrupted, "cut")
                 .with_delivery_state(DeliveryState::StreamInterrupted {
                     progress: StreamProgress {
+                        reasoning: false,
                         text: true,
                         tool_args: false,
                     },
@@ -522,6 +595,7 @@ mod tests {
             ModelError::new(ModelErrorKind::StreamInterrupted, "cut")
                 .with_delivery_state(DeliveryState::StreamInterrupted {
                     progress: StreamProgress {
+                        reasoning: false,
                         text: false,
                         tool_args: true,
                     },
@@ -529,6 +603,78 @@ mod tests {
                 .retryability(),
             Retryability::Caution
         );
+    }
+
+    /// The two retry questions must not be confused. A request that was written
+    /// and never answered is not *blindly* replayable, but nothing was received
+    /// either, so the bounded logical lifecycle may still spend an attempt on
+    /// it instead of ending the run.
+    #[test]
+    fn a_failure_that_received_no_response_content_is_recoverable_by_the_lifecycle() {
+        // Written, unanswered: no headers were ever read, so no text, reasoning,
+        // tool call or tool result exists to duplicate.
+        let timeout = ModelError::new(ModelErrorKind::Timeout, "read timed out")
+            .with_delivery_state(DeliveryState::SentNoResponse);
+        assert!(timeout.is_retryable_by_lifecycle());
+        // The same phase classified as a generic transport fault: the delivery
+        // truth decides, not the kind.
+        let transport = ModelError::new(ModelErrorKind::Transport, "connection reset")
+            .with_delivery_state(DeliveryState::SentNoResponse);
+        assert!(transport.is_retryable_by_lifecycle());
+        // A stream that began and produced nothing is the same situation.
+        let empty_cut = ModelError::new(ModelErrorKind::StreamInterrupted, "cut")
+            .with_delivery_state(DeliveryState::StreamInterrupted {
+                progress: StreamProgress::default(),
+            });
+        assert!(empty_cut.is_retryable_by_lifecycle());
+        // The request never left at all.
+        let never_sent = ModelError::new(ModelErrorKind::Transport, "refused")
+            .with_delivery_state(DeliveryState::NotSent);
+        assert!(never_sent.is_retryable_by_lifecycle());
+    }
+
+    /// The other half of the same contract: once output exists, no retry rule
+    /// may replay it — there is no protocol-level stream resume, so a replay
+    /// would duplicate generation, cost and tool calls.
+    #[test]
+    fn a_failure_that_received_output_is_never_recoverable_by_the_lifecycle() {
+        for progress in [
+            StreamProgress {
+                reasoning: false,
+                text: true,
+                tool_args: false,
+            },
+            StreamProgress {
+                reasoning: false,
+                text: false,
+                tool_args: true,
+            },
+        ] {
+            let err = ModelError::new(ModelErrorKind::StreamInterrupted, "cut")
+                .with_delivery_state(DeliveryState::StreamInterrupted { progress });
+            assert!(
+                !err.is_retryable_by_lifecycle(),
+                "{progress:?} must never be replayed"
+            );
+        }
+        // A complete status is the provider's own answer to the request.
+        assert!(!ModelError::from_status(504, "gateway timeout").is_retryable_by_lifecycle());
+    }
+
+    /// A non-transient kind stays terminal however delivery was classified —
+    /// including cancellation, which must never retry itself.
+    #[test]
+    fn non_transient_kinds_are_terminal_whatever_delivery_proved() {
+        for error in [
+            ModelError::new(ModelErrorKind::Auth, "bad key"),
+            ModelError::new(ModelErrorKind::InvalidRequest, "bad request"),
+            ModelError::new(ModelErrorKind::Decode, "undecodable body"),
+            ModelError::cancelled(),
+        ] {
+            let error = error.with_delivery_state(DeliveryState::SentNoResponse);
+            assert_eq!(error.retryability(), Retryability::Never, "{error:?}");
+            assert!(!error.is_retryable_by_lifecycle(), "{error:?}");
+        }
     }
 
     #[test]

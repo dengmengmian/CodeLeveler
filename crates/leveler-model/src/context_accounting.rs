@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use leveler_core::ToolCallId;
 
-use crate::message::{ContentPart, Message, Role, ToolDefinition};
+use crate::message::{ContentPart, Role};
+use crate::projection::{ReasoningProjectionSummary, RequestProjection};
 use crate::request::ModelRef;
 
 /// Stable prefix of the fold breadcrumb the runtime injects as a user message
@@ -121,57 +122,20 @@ pub struct ContextAccounting {
     /// Most recent compaction fold, when one has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction: Option<CompactionRecord>,
+    /// What the request projection did with the requested reasoning-retention
+    /// arm: which turns carried reasoning, and how many the route contract had
+    /// to keep against the request. Present on every snapshot computed from a
+    /// projection, so an overridden treatment is visible rather than assumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_projection: Option<ReasoningProjectionSummary>,
 }
 
-/// A conservative flat cost (in ASCII byte-equivalents) for one image, so a
-/// vision turn is not counted as ~free. Mirrors `leveler-context`'s
-/// `IMAGE_BYTE_EQUIV` so the two estimates cannot drift.
-const IMAGE_BYTE_EQUIV: u64 = 4096;
-
-/// (ascii bytes, wide bytes) split. Non-ASCII (CJK, …) spends ~1 token per
-/// character (~3 UTF-8 bytes), so those bytes are weighted at 3 bytes/token
-/// rather than the flat ÷4 used for ASCII prose.
-fn split(s: &str) -> (u64, u64) {
-    let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
-    (ascii, s.len() as u64 - ascii)
-}
-
-/// Per-slice estimator state. Accumulates the same four buckets the
-/// `leveler-context` calibrated estimator uses, then divides once, so the
-/// weights stay identical.
-#[derive(Debug, Default)]
-struct SliceTokens {
-    ascii_text: u64,
-    ascii_tool: u64,
-    wide: u64,
-    flat: u64,
-}
-
-impl SliceTokens {
-    fn add_text(&mut self, s: &str) {
-        let (a, w) = split(s);
-        self.ascii_text += a;
-        self.wide += w;
-    }
-
-    /// Tool payloads are JSON/log shaped and tokenize far denser than prose:
-    /// ~2.5–2.9 bytes/token measured against DeepSeek-reported usage, where a
-    /// flat ÷4 under-counted by 27–38%. Weighted at 2.5 so the residual error
-    /// sits on the safe side.
-    fn add_tool(&mut self, s: &str) {
-        let (a, w) = split(s);
-        self.ascii_tool += a;
-        self.wide += w;
-    }
-
-    fn add_image(&mut self) {
-        self.flat += IMAGE_BYTE_EQUIV / 4;
-    }
-
-    fn total(&self) -> u64 {
-        self.ascii_text / 4 + self.ascii_tool * 2 / 5 + self.wide / 3 + self.flat
-    }
-}
+/// Per-slice estimator state: the SAME accumulator the compaction-pressure
+/// estimator uses ([`crate::TokenEstimate`]), so a slice total and a
+/// whole-transcript total are one arithmetic on one set of weights. Two
+/// independent estimators were how the accounting counted reasoning the
+/// pressure estimate could not see.
+type SliceTokens = crate::TokenEstimate;
 
 /// A slice being accumulated: its stable name, label, estimator state, and the
 /// tool call count it carries (for tool leaves).
@@ -197,7 +161,7 @@ impl Slice {
         ContextCategory {
             name: self.name.clone(),
             label: self.label.clone(),
-            tokens: self.tokens.total(),
+            tokens: self.tokens.tokens(),
             calls: self.calls,
             children: Vec::new(),
         }
@@ -207,18 +171,23 @@ impl Slice {
 impl ContextAccounting {
     /// Project one assembled request into its mutually exclusive slices.
     ///
-    /// `messages` and `tools` are the exact payload the runtime is about to
-    /// send; `context_window` is the model's declared window (exact fact);
-    /// `compact_at` is the fold threshold; `last_compaction` is the most
+    /// `projection` is the provider-visible view of the request — the SAME
+    /// decision the wire encoder serializes. The accounting therefore cannot
+    /// count a block the provider will not see (the drift that made historical
+    /// reasoning look present for routes that never received it), and it needs
+    /// to understand nothing about JSON, HTTP or wire structs to do it.
+    /// `context_window` is the model's declared window (exact fact);
+    /// `compact_at` is the pressure threshold; `last_compaction` is the most
     /// recent fold recorded by the harness.
     pub fn compute(
         model: ModelRef,
-        messages: &[Message],
-        tools: &[ToolDefinition],
+        projection: &RequestProjection,
         context_window: Option<u32>,
         compact_at: Option<u32>,
         last_compaction: Option<CompactionRecord>,
     ) -> Self {
+        let messages = projection.messages();
+        let tools = projection.tools();
         // Build the call_id → tool-name map from assistant tool calls, so a
         // tool result can be attributed to the tool that produced it without
         // guessing from its content.
@@ -232,8 +201,14 @@ impl ContextAccounting {
         }
 
         let mut system = Slice::new("system", "System");
+        system.tokens.add_text(&projection.control_text());
         let mut user = Slice::new("user", "User");
         let mut assistant = Slice::new("assistant", "Assistant");
+        // Historical reasoning is the one slice whose size someone will ask
+        // about by name ("why 80k input?"). It stays its own category instead
+        // of hiding inside `assistant`, and it is counted — an estimator that
+        // skipped it could not answer that question at all.
+        let mut reasoning = Slice::new("reasoning", "Reasoning");
         let mut tool_calls = Slice::new("tool_calls", "Tool calls");
         let mut compaction = Slice::new("compaction_summary", "Compaction summary");
         let mut other = Slice::new("other", "Other");
@@ -243,6 +218,11 @@ impl ContextAccounting {
         let mut tool_results: HashMap<String, Slice> = HashMap::new();
 
         for message in messages {
+            // The reasoning channel is a projection decision, not content:
+            // it is counted exactly when (and only when) the provider carries it.
+            if let Some(text) = message.reasoning.as_wire() {
+                reasoning.tokens.add_text(text);
+            }
             for part in &message.content {
                 match part {
                     ContentPart::Text { text } => match message.role {
@@ -254,15 +234,12 @@ impl ContextAccounting {
                         Role::Assistant => assistant.tokens.add_text(text),
                         Role::Tool => other.tokens.add_text(text),
                     },
-                    ContentPart::Reasoning { text } => {
-                        // Reasoning is assistant content and is passed back to
-                        // providers that require it; count it as assistant.
-                        assistant.tokens.add_text(text);
+                    ContentPart::SignedReasoning { .. } | ContentPart::RedactedReasoning { .. } => {
+                        reasoning.tokens.add_part(part)
                     }
                     ContentPart::ToolCall { call } => {
-                        let mut s = call.name.clone();
-                        s.push_str(&call.arguments.to_string());
-                        tool_calls.tokens.add_tool(&s);
+                        tool_calls.tokens.add_tool(&call.name);
+                        tool_calls.tokens.add_tool(&call.arguments.to_string());
                         tool_calls.calls += 1;
                     }
                     ContentPart::ToolResult { result } => {
@@ -279,17 +256,17 @@ impl ContextAccounting {
                         leaf.calls += 1;
                     }
                     ContentPart::Image { .. } => other.tokens.add_image(),
+                    // A projected message never carries a reasoning part: the
+                    // channel above is the only representation. Counting it
+                    // here as well would double-count it.
+                    ContentPart::Reasoning { .. } => {}
                 }
             }
         }
 
         let mut tool_definitions = Slice::new("tool_definitions", "Tool definitions");
         for tool in tools {
-            tool_definitions.tokens.add_text(&tool.description);
-            tool_definitions.tokens.add_tool(&tool.name);
-            tool_definitions
-                .tokens
-                .add_tool(&tool.input_schema.to_string());
+            tool_definitions.tokens.add_tool_definition(tool);
         }
 
         // Drill-down: Messages → user / assistant / tool calls / tool results
@@ -316,6 +293,7 @@ impl ContextAccounting {
         let mut messages_children = vec![
             user.finish(),
             assistant.finish(),
+            reasoning.finish(),
             tool_calls.finish(),
             tool_results_cat,
             compaction.finish(),
@@ -358,7 +336,33 @@ impl ContextAccounting {
             pressure,
             categories: top,
             last_compaction,
+            reasoning_projection: Some(projection.summary().clone()),
         }
+    }
+}
+
+impl ContextAccounting {
+    /// Estimated tokens of the historical-reasoning channel in THIS request —
+    /// exactly the projection the wire carries, and zero when the route
+    /// carries none.
+    ///
+    /// It is the `reasoning` category of the breakdown, exposed as a number so
+    /// "of this round's input, how much was replayed thinking?" is answerable
+    /// without walking categories. The number comes from the same
+    /// [`RequestProjection`] the wire encoder serializes, so it can never price
+    /// reasoning a provider does not see.
+    pub fn projected_reasoning_tokens(&self) -> u64 {
+        self.categories
+            .iter()
+            .find(|category| category.name == "messages")
+            .and_then(|messages| {
+                messages
+                    .children
+                    .iter()
+                    .find(|child| child.name == "reasoning")
+            })
+            .map(|reasoning| reasoning.tokens)
+            .unwrap_or(0)
     }
 }
 
@@ -390,10 +394,60 @@ fn compute_pressure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{Message, ToolDefinition};
+    use crate::projection::{
+        MissingReasoningReplay, ReasoningReplayContract, ReasoningReplayScope,
+    };
+    use crate::retention::ReasoningRetention;
     use leveler_core::ToolCallId;
+
+    /// A route that carries captured reasoning on every request it spans, so an
+    /// accounting test measures the channel rather than a route's silence.
+    fn reasoning_route() -> ReasoningReplayContract {
+        ReasoningReplayContract::raw_field(
+            ReasoningReplayScope::Always,
+            MissingReasoningReplay::Omit,
+        )
+    }
+
+    /// The provider-visible view of `messages` under a reasoning-carrying route.
+    fn projection(messages: &[Message], tools: &[ToolDefinition]) -> RequestProjection {
+        RequestProjection::project(messages, tools, reasoning_route(), ReasoningRetention::All)
+    }
 
     fn model() -> ModelRef {
         ModelRef::new("deepseek", "deepseek-chat")
+    }
+
+    #[test]
+    fn control_context_is_counted_without_polluting_transcript() {
+        let messages = vec![Message::text(Role::User, "work")];
+        let control = crate::ControlContext {
+            blocks: vec![
+                crate::PromptSegment::stable("base", "base instructions"),
+                crate::PromptSegment::variable("rules", "current project rules"),
+            ],
+        };
+        let projected = RequestProjection::project_with_control_context(
+            &messages,
+            &[],
+            reasoning_route(),
+            ReasoningRetention::All,
+            &control,
+        );
+        let plain = projection(&messages, &[]);
+        assert_eq!(projected.messages(), plain.messages());
+        assert_eq!(projected.control_context(), &control);
+        assert_eq!(
+            projected.control_text(),
+            "base instructions\n\ncurrent project rules"
+        );
+        let accounting = ContextAccounting::compute(model(), &projected, None, None, None);
+        assert_eq!(accounting.used_tokens, projected.estimated_tokens());
+        assert!(projected.estimated_tokens() > plain.estimated_tokens());
+        let restored: RequestProjection =
+            serde_json::from_value(serde_json::to_value(&projected).unwrap()).unwrap();
+        assert_eq!(restored.control_context(), &control);
     }
 
     fn tool_call(name: &str, id: &str, args: serde_json::Value) -> ContentPart {
@@ -429,7 +483,13 @@ mod tests {
 
     #[test]
     fn empty_session_has_zero_used() {
-        let acc = ContextAccounting::compute(model(), &[], &[], Some(128_000), Some(64_000), None);
+        let acc = ContextAccounting::compute(
+            model(),
+            &projection(&[], &[]),
+            Some(128_000),
+            Some(64_000),
+            None,
+        );
         assert_eq!(acc.used_tokens, 0);
         assert!(acc.categories.is_empty());
         assert_eq!(acc.free_tokens, Some(128_000));
@@ -440,8 +500,13 @@ mod tests {
     #[test]
     fn system_only_session_counts_system() {
         let messages = vec![text(Role::System, "you are an agent")];
-        let acc =
-            ContextAccounting::compute(model(), &messages, &[], Some(128_000), Some(64_000), None);
+        let acc = ContextAccounting::compute(
+            model(),
+            &projection(&messages, &[]),
+            Some(128_000),
+            Some(64_000),
+            None,
+        );
         let system = category(&acc, "system");
         assert!(system.tokens > 0);
         assert_eq!(acc.used_tokens, system.tokens);
@@ -453,6 +518,7 @@ mod tests {
             text(Role::System, "you are an agent"),
             text(Role::User, "fix the bug"),
             Message {
+                origin: None,
                 role: Role::Assistant,
                 content: vec![
                     text(Role::Assistant, "reading").content[0].clone(),
@@ -460,6 +526,7 @@ mod tests {
                 ],
             },
             Message {
+                origin: None,
                 role: Role::Tool,
                 content: vec![tool_result("c1", &"x".repeat(4000))],
             },
@@ -471,8 +538,7 @@ mod tests {
         }];
         let acc = ContextAccounting::compute(
             model(),
-            &messages,
-            &tools,
+            &projection(&messages, &tools),
             Some(128_000),
             Some(64_000),
             None,
@@ -493,6 +559,116 @@ mod tests {
         assert_eq!(results.tokens, leaves);
     }
 
+    /// The accounting and the pressure estimator are ONE arithmetic: the
+    /// snapshot's total is [`crate::estimate_tokens`] over the same messages
+    /// plus the same tool schemas — same buckets, same weights, same
+    /// accumulator type (`SliceTokens` IS the shared `TokenEstimate`). The two
+    /// differ by at most one token per priced slice, and only because the
+    /// accounting divides each slice once (so the drill-down sums to the
+    /// total) where the whole-transcript estimate divides once. A projection
+    /// change cannot move one number without the other.
+    #[test]
+    fn accounting_total_is_the_shared_estimator_over_the_same_request() {
+        let messages = vec![
+            text(Role::System, "rules"),
+            text(Role::User, "inspect"),
+            Message {
+                origin: None,
+                role: Role::Assistant,
+                content: vec![
+                    ContentPart::Reasoning {
+                        text: "thinking about it".repeat(50),
+                    },
+                    tool_call("read_file", "c1", serde_json::json!({"path": "a.rs"})),
+                ],
+            },
+            Message {
+                origin: None,
+                role: Role::Tool,
+                content: vec![tool_result("c1", &"body ".repeat(200))],
+            },
+            Message {
+                origin: None,
+                role: Role::User,
+                content: vec![ContentPart::Image {
+                    source: crate::message::ImageSource::Url {
+                        url: "https://x/y.png".into(),
+                    },
+                }],
+            },
+        ];
+        let tools = vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let acc =
+            ContextAccounting::compute(model(), &projection(&messages, &tools), None, None, None);
+        let shared = crate::estimate_tokens(&messages) + crate::estimate_tool_definitions(&tools);
+        // One token per priced slice is the most integer-division placement
+        // can differ by; anything larger is a different formula or different
+        // inputs, which is the drift this invariant exists to catch.
+        assert!(
+            acc.used_tokens.abs_diff(shared) <= acc.categories.len() as u64,
+            "accounting and compaction pressure must price the same request: \
+             accounting={} shared_estimator={shared}",
+            acc.used_tokens
+        );
+    }
+
+    /// Reasoning is its own category, and dropping it from the request must
+    /// move the total by exactly the estimator's price for it.
+    #[test]
+    fn reasoning_has_its_own_category_and_is_counted() {
+        let reasoning_text = "why ".repeat(400);
+        let with = vec![Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::Reasoning {
+                    text: reasoning_text.clone(),
+                },
+                ContentPart::Text {
+                    text: "done".into(),
+                },
+            ],
+        }];
+        let without = vec![Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![ContentPart::Text {
+                text: "done".into(),
+            }],
+        }];
+        let acc = ContextAccounting::compute(model(), &projection(&with, &[]), None, None, None);
+        let reasoning = category(&acc, "messages")
+            .children
+            .iter()
+            .find(|c| c.name == "reasoning")
+            .expect("reasoning child");
+        assert_eq!(
+            reasoning.tokens,
+            crate::estimate_tokens(&with) - crate::estimate_tokens(&without)
+        );
+        let without_acc =
+            ContextAccounting::compute(model(), &projection(&without, &[]), None, None, None);
+        assert_eq!(acc.used_tokens - without_acc.used_tokens, reasoning.tokens);
+        // The same number is exposed directly, and it is zero on a route that
+        // carries no reasoning channel: the figure is the projection's, not a
+        // recount of the semantic transcript.
+        assert_eq!(acc.projected_reasoning_tokens(), reasoning.tokens);
+        assert_eq!(without_acc.projected_reasoning_tokens(), 0);
+        let silent_route = RequestProjection::project(
+            &with,
+            &[],
+            ReasoningReplayContract::NONE,
+            ReasoningRetention::All,
+        );
+        let silent = ContextAccounting::compute(model(), &silent_route, None, None, None);
+        assert_eq!(silent.projected_reasoning_tokens(), 0);
+        assert_eq!(silent.used_tokens, without_acc.used_tokens);
+    }
+
     #[test]
     fn large_tool_result_is_visible_in_context_breakdown() {
         let small = "hello";
@@ -501,6 +677,7 @@ mod tests {
             text(Role::System, "you are an agent"),
             text(Role::User, "inspect"),
             Message {
+                origin: None,
                 role: Role::Assistant,
                 content: vec![tool_call(
                     "run_command",
@@ -509,16 +686,23 @@ mod tests {
                 )],
             },
             Message {
+                origin: None,
                 role: Role::Tool,
                 content: vec![tool_result("c1", &large)],
             },
             Message {
+                origin: None,
                 role: Role::Assistant,
                 content: vec![text(Role::Assistant, small).content[0].clone()],
             },
         ];
-        let acc =
-            ContextAccounting::compute(model(), &messages, &[], Some(128_000), Some(64_000), None);
+        let acc = ContextAccounting::compute(
+            model(),
+            &projection(&messages, &[]),
+            Some(128_000),
+            Some(64_000),
+            None,
+        );
         let messages_cat = category(&acc, "messages");
         let tool_results = messages_cat
             .children
@@ -549,10 +733,12 @@ mod tests {
     #[test]
     fn tool_result_with_unknown_call_id_falls_into_other() {
         let messages = vec![Message {
+            origin: None,
             role: Role::Tool,
             content: vec![tool_result("never-seen", "body")],
         }];
-        let acc = ContextAccounting::compute(model(), &messages, &[], None, None, None);
+        let acc =
+            ContextAccounting::compute(model(), &projection(&messages, &[]), None, None, None);
         let messages_cat = category(&acc, "messages");
         let tool_results = messages_cat
             .children
@@ -576,7 +762,8 @@ mod tests {
                 &format!("{COMPACTION_BREADCRUMB_MARKER} to fit the window: 9 steps elided.]"),
             ),
         ];
-        let acc = ContextAccounting::compute(model(), &messages, &[], None, None, None);
+        let acc =
+            ContextAccounting::compute(model(), &projection(&messages, &[]), None, None, None);
         let messages_cat = category(&acc, "messages");
         let compaction = messages_cat
             .children
@@ -600,7 +787,7 @@ mod tests {
             description: "read a file at a path".into(),
             input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
         }];
-        let acc = ContextAccounting::compute(model(), &[], &tools, None, None, None);
+        let acc = ContextAccounting::compute(model(), &projection(&[], &tools), None, None, None);
         let defs = category(&acc, "tool_definitions");
         assert!(defs.tokens > 0);
         assert_eq!(acc.used_tokens, defs.tokens);
@@ -635,7 +822,13 @@ mod tests {
     #[test]
     fn free_tokens_is_window_minus_used_and_never_underflows() {
         let messages = vec![text(Role::User, &"x".repeat(1_000_000))];
-        let acc = ContextAccounting::compute(model(), &messages, &[], Some(128_000), None, None);
+        let acc = ContextAccounting::compute(
+            model(),
+            &projection(&messages, &[]),
+            Some(128_000),
+            None,
+            None,
+        );
         assert_eq!(
             acc.free_tokens,
             Some(0),
@@ -647,7 +840,8 @@ mod tests {
     #[test]
     fn unknown_window_reports_no_free_and_no_fake_ratio() {
         let messages = vec![text(Role::User, "hi")];
-        let acc = ContextAccounting::compute(model(), &messages, &[], None, None, None);
+        let acc =
+            ContextAccounting::compute(model(), &projection(&messages, &[]), None, None, None);
         assert_eq!(acc.context_window_tokens, None);
         assert_eq!(acc.free_tokens, None);
     }
@@ -656,8 +850,9 @@ mod tests {
     fn cjk_text_is_weighted_by_character_not_four_bytes() {
         let cjk = vec![text(Role::User, &"修".repeat(1000))];
         let ascii = vec![text(Role::User, &"a".repeat(3000))];
-        let cjk_acc = ContextAccounting::compute(model(), &cjk, &[], None, None, None);
-        let ascii_acc = ContextAccounting::compute(model(), &ascii, &[], None, None, None);
+        let cjk_acc = ContextAccounting::compute(model(), &projection(&cjk, &[]), None, None, None);
+        let ascii_acc =
+            ContextAccounting::compute(model(), &projection(&ascii, &[]), None, None, None);
         assert!(
             cjk_acc.used_tokens >= 950,
             "CJK must not be under-counted: {}",

@@ -64,9 +64,10 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ChatContent>,
     /// Reasoning echoed on historical assistant messages when the provider
-    /// requires it and the current request exposes tools
-    /// (`CompatibilityConfig::passback_reasoning_content`). `Some` even when
-    /// empty — the provider validates the key's presence.
+    /// requires it and the current request exposes tools. `Some` even when
+    /// empty: some endpoints validate the key's presence on a replayed
+    /// assistant turn that captured no reasoning —
+    /// `CompatibilityConfig::reasoning_content_key_required`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

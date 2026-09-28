@@ -102,6 +102,7 @@ pub fn run_with_memory(
     // Surface global-config load failures (incl. MCP plaintext env) even when
     // the rest of doctor runs against a lenient empty LoadedConfig.
     results.push(check_global_config());
+    results.extend(check_retired_model_instructions());
 
     // Per-provider API key.
     for provider in &config.providers {
@@ -265,7 +266,13 @@ fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
                 &name,
                 "always-on (no effort knob); CodeLeveler default n/a".to_string(),
             )),
-            ReasoningStyle::OpenAiEffort | ReasoningStyle::ThinkingFlag => {
+            ReasoningStyle::BudgetedThinking { budget_tokens } => results.push(CheckResult::ok(
+                &name,
+                format!("explicit thinking budget={budget_tokens}"),
+            )),
+            ReasoningStyle::OpenAiEffort
+            | ReasoningStyle::ThinkingFlag
+            | ReasoningStyle::AdaptiveThinking => {
                 let supported = profile
                     .reasoning
                     .supported_efforts
@@ -339,6 +346,35 @@ fn check_global_config() -> CheckResult {
     }
 }
 
+/// A retired key must not be ignored in silence: an old config that still
+/// carries `instructions` would look like it was applying a per-model prompt
+/// when every model now shares the base prompt.
+fn check_retired_model_instructions() -> Vec<CheckResult> {
+    let Ok(config) = crate::global_config::GlobalConfig::load() else {
+        // `check_global_config` already reports the load failure.
+        return Vec::new();
+    };
+    retired_model_instruction_warnings(&config)
+}
+
+/// The warning rows for a loaded config, split out so the message is testable
+/// without process-global `LEVELER_HOME`.
+fn retired_model_instruction_warnings(
+    config: &crate::global_config::GlobalConfig,
+) -> Vec<CheckResult> {
+    config
+        .retired_model_instructions()
+        .into_iter()
+        .map(|id| {
+            CheckResult::warn(
+                &format!("config: model {id}"),
+                "model.instructions is retired and ignored; all models now share the \
+                 CodeLeveler base prompt — remove the key",
+            )
+        })
+        .collect()
+}
+
 /// MCP servers declare env **name** references only. Warn when a referenced
 /// source variable is unset so the server would start without the credential.
 /// Never prints raw config values (legacy plaintext must not be echoed).
@@ -393,6 +429,23 @@ mod tests {
     use super::*;
     use leveler_memory::{MemoryStore, new_entry};
 
+    /// A retired per-model `instructions` key must produce a visible doctor
+    /// warning instead of being silently ignored.
+    #[test]
+    fn the_retired_instructions_key_produces_a_doctor_warning() {
+        let config: crate::global_config::GlobalConfig =
+            toml::from_str("[models.m]\nprovider = \"p\"\ninstructions = \"be special\"\n")
+                .unwrap();
+        let warnings = retired_model_instruction_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].status, CheckStatus::Warn);
+        assert!(warnings[0].detail.contains("retired and ignored"));
+
+        let clean: crate::global_config::GlobalConfig =
+            toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
+        assert!(retired_model_instruction_warnings(&clean).is_empty());
+    }
+
     fn sample_model(provider: &str, id: &str) -> leveler_provider::ModelConfigFile {
         use leveler_model::{ModelCapabilities, ModelLimits, ModelProfile, ProtocolKind};
         leveler_provider::ModelConfigFile {
@@ -420,7 +473,6 @@ mod tests {
                 context_quality: None,
                 reasoning: Default::default(),
                 compatibility: Default::default(),
-                instructions: None,
                 pricing: None,
             },
             policy: None,
@@ -436,7 +488,6 @@ mod tests {
             api_key: Some("sk-test".into()),
             headers: Default::default(),
             timeouts: Default::default(),
-            retry: Default::default(),
         }
     }
 
@@ -540,7 +591,6 @@ mod tests {
             api_key: None,
             headers: Default::default(),
             timeouts: Default::default(),
-            retry: Default::default(),
         };
         let result = check_api_key(&provider);
         assert_eq!(result.status, CheckStatus::Fail);

@@ -88,6 +88,13 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             let refresh = state.active_screen == Screen::Trace
                 && crate::observability::should_refresh_trace(&event);
             let opened = matches!(event, RuntimeEvent::SessionOpened { .. });
+            let restored_history = matches!(
+                &event,
+                RuntimeEvent::SessionHistoryLoaded { query_id, session_id, .. }
+                    if query_id.is_some()
+                        && query_id == &state.history_query
+                        && session_id == &state.session_id
+            );
             let turn_ended = matches!(
                 event,
                 RuntimeEvent::TurnCompleted
@@ -109,6 +116,19 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 // No conversation exists yet, so the runtime derives a starter
                 // from repository context. It returns as the same transient
                 // ghost used after ordinary turns.
+                effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
+                    session_id: state.session_id.clone(),
+                }));
+            }
+            // History owns the restored transcript; ask only after its matching
+            // response, while the user has left this input window untouched.
+            if restored_history
+                && state.status == RuntimeStatus::Idle
+                && state.prompt_suggestion_allowed
+                && state.composer.is_empty()
+                && state.pending_attachments.is_empty()
+                && state.prompt_suggestion.is_none()
+            {
                 effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
                     session_id: state.session_id.clone(),
                 }));

@@ -10,7 +10,7 @@ use futures::StreamExt;
 use leveler_model::{
     ContentPart, FinishReason, ImageSource, Message, ModelError, ModelErrorKind, ModelEvent,
     ModelRequest, ModelResponse, ProtocolAdapter, ProtocolContext, ProtocolError, ProtocolKind,
-    RawByteStream, ReasoningStyle, Role, TokenUsage, ToolCall, ToolChoice,
+    RawByteStream, ReasoningStyle, RequestProjection, Role, TokenUsage, ToolCall, ToolChoice,
 };
 
 use crate::sse::SseDecoder;
@@ -44,11 +44,8 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         context: &ProtocolContext,
         stream: bool,
     ) -> Result<EncodedRequest, ProtocolError> {
-        let messages = convert_messages(
-            &request.messages,
-            context.passback_reasoning_content,
-            !request.tools.is_empty(),
-        );
+        let projection = RequestProjection::for_request(request, context.reasoning_replay);
+        let messages = convert_messages(&projection);
 
         let tools = request
             .tools
@@ -82,6 +79,11 @@ impl ProtocolAdapter for OpenAiChatAdapter {
             (Some(Thinking { kind: "disabled" }), None)
         } else {
             match context.reasoning.style {
+                ReasoningStyle::AdaptiveThinking | ReasoningStyle::BudgetedThinking { .. } => {
+                    return Err(ProtocolError::Encode(
+                        "thinking style requires a Messages protocol route".into(),
+                    ));
+                }
                 ReasoningStyle::None => (None, None),
                 ReasoningStyle::OpenAiEffort => (None, effort.map(|e| e.as_wire().to_string())),
                 ReasoningStyle::ThinkingFlag => (
@@ -190,6 +192,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.cached_input_tokens(),
+                cache_creation_input_tokens: 0,
                 reasoning_tokens: u.reasoning_tokens(),
             })
             .unwrap_or_default();
@@ -197,6 +200,7 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         Ok(ModelResponse {
             request_id: request_id_from(&resp.id),
             message: Message {
+                origin: None,
                 role: Role::Assistant,
                 content,
             },
@@ -289,14 +293,24 @@ impl ProtocolAdapter for OpenAiChatAdapter {
     }
 }
 
-/// Convert unified messages to OpenAI chat messages.
-fn convert_messages(
-    messages: &[Message],
-    passback_reasoning: bool,
-    request_has_tools: bool,
-) -> Vec<ChatMessage> {
+/// Convert a provider-visible projection to OpenAI chat messages.
+///
+/// This function carries NO replay policy: whether a turn's reasoning reaches
+/// the wire was decided by [`leveler_model::RequestProjection`], and what this
+/// encoder does is spell the decision.
+fn convert_messages(projection: &RequestProjection) -> Vec<ChatMessage> {
     let mut out = Vec::new();
-    for msg in messages {
+    let control = projection.control_text();
+    if !control.is_empty() {
+        out.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(wire::ChatContent::Text(control)),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+    }
+    for msg in projection.messages() {
         // Tool-result messages map to one `role: tool` message per result.
         if msg.role == Role::Tool {
             for part in &msg.content {
@@ -314,13 +328,11 @@ fn convert_messages(
         }
 
         let mut text = String::new();
-        let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
         let mut images: Vec<wire::ChatImageUrl> = Vec::new();
         for part in &msg.content {
             match part {
                 ContentPart::Text { text: t } => text.push_str(t),
-                ContentPart::Reasoning { text: t } => reasoning.push_str(t),
                 ContentPart::ToolCall { call } => tool_calls.push(ChatToolCall {
                     id: call.id.to_string(),
                     kind: "function".to_string(),
@@ -336,15 +348,7 @@ fn convert_messages(
             }
         }
 
-        // DeepSeek's thinking-mode contract applies to the complete assistant
-        // history whenever the current request exposes tools, not only to
-        // rounds that happened to produce a tool call. Echo every historical
-        // assistant round's captured reasoning (or the empty string) in that
-        // case. Requests without tools retain the legacy wire and never expose
-        // the provider-specific field.
-        let reasoning_content =
-            (passback_reasoning && request_has_tools && msg.role == Role::Assistant)
-                .then_some(reasoning);
+        let reasoning_content = msg.reasoning.as_wire().map(str::to_string);
 
         // Use the multimodal array form only when images are present.
         let content = if images.is_empty() {
@@ -416,6 +420,24 @@ mod tests {
         ModelRef, ReasoningConfig, ReasoningEffort, ReasoningStyle, ToolDefinition,
     };
 
+    /// The DeepSeek-shaped route contract: captured reasoning is carried on
+    /// tool-bearing requests, and a turn that captured none still carries the
+    /// empty key.
+    fn reasoning_carrying_contract() -> leveler_model::ReasoningReplayContract {
+        leveler_model::ReasoningReplayContract::raw_field(
+            leveler_model::ReasoningReplayScope::WhenToolsPresent,
+            leveler_model::MissingReasoningReplay::EmptyString,
+        )
+    }
+
+    /// The same scope without the empty-key requirement.
+    fn reasoning_carrying_without_empty_key() -> leveler_model::ReasoningReplayContract {
+        leveler_model::ReasoningReplayContract::raw_field(
+            leveler_model::ReasoningReplayScope::WhenToolsPresent,
+            leveler_model::MissingReasoningReplay::Omit,
+        )
+    }
+
     fn ctx() -> ProtocolContext {
         ProtocolContext {
             base_url: "https://api.deepseek.com".into(),
@@ -426,7 +448,7 @@ mod tests {
             parallel_tool_calls: true,
             supports_temperature: true,
             thinking_supports_forced_tool_choice: true,
-            passback_reasoning_content: false,
+            reasoning_replay: leveler_model::ReasoningReplayContract::NONE,
         }
     }
 
@@ -680,10 +702,12 @@ mod tests {
             vec![
                 Message::text(Role::User, "hi"),
                 Message {
+                    origin: None,
                     role: Role::Assistant,
                     content: assistant_parts,
                 },
                 Message {
+                    origin: None,
                     role: Role::Tool,
                     content: vec![ContentPart::ToolResult {
                         result: leveler_model::ToolResultContent {
@@ -709,7 +733,7 @@ mod tests {
     #[test]
     fn passback_echoes_captured_reasoning_on_assistant_tool_call_messages() {
         let context = ProtocolContext {
-            passback_reasoning_content: true,
+            reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
         let body = encode_tool_loop(&context, Some("check the clock"));
@@ -720,6 +744,120 @@ mod tests {
         );
     }
 
+    /// Request-body contract for the reasoning-retention projection: a route
+    /// that replays captured reasoning replays the full reasoning of every
+    /// retained assistant turn, so the wire keeps every turn's reasoning under
+    /// every arm — the arm cannot strip one while the turn is present. Nothing
+    /// else about the assistant turn changes, and a turn that captured no
+    /// reasoning still carries the key the provider validates.
+    #[test]
+    fn retention_projection_cannot_strip_a_retained_turns_reasoning() {
+        use leveler_model::ReasoningRetention;
+
+        fn tool_turn(i: usize) -> Vec<Message> {
+            vec![
+                Message {
+                    origin: None,
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentPart::Reasoning {
+                            text: format!("r{i}"),
+                        },
+                        ContentPart::Text {
+                            text: format!("t{i}"),
+                        },
+                        ContentPart::ToolCall {
+                            call: ToolCall {
+                                id: leveler_core::ToolCallId::new(format!("c{i}")),
+                                name: "get_time".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                        },
+                    ],
+                },
+                Message {
+                    origin: None,
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: leveler_core::ToolCallId::new(format!("c{i}")),
+                            content: format!("o{i}"),
+                            is_error: false,
+                        },
+                    }],
+                },
+            ]
+        }
+
+        let transcript: Vec<Message> = std::iter::once(Message::text(Role::User, "go"))
+            .chain((1..=5).flat_map(tool_turn))
+            .collect();
+        let context = ProtocolContext {
+            reasoning_replay: reasoning_carrying_contract(),
+            ..ctx()
+        };
+
+        for policy in [
+            ReasoningRetention::All,
+            ReasoningRetention::LastTurns(3),
+            ReasoningRetention::None,
+        ] {
+            let mut request = ModelRequest::new(
+                ModelRef::new("deepseek", "deepseek-flash"),
+                transcript.clone(),
+            );
+            request.tools = vec![ToolDefinition {
+                name: "get_time".into(),
+                description: "read the clock".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }];
+            request.projection = Some(leveler_model::RequestProjection::project(
+                &request.messages,
+                &request.tools,
+                context.reasoning_replay,
+                policy,
+            ));
+            let body = OpenAiChatAdapter::new()
+                .encode_request(&request, &context, true)
+                .unwrap()
+                .body;
+            let messages = body["messages"].as_array().unwrap();
+            let assistant: Vec<&serde_json::Value> = messages
+                .iter()
+                .filter(|m| m["role"] == "assistant")
+                .collect();
+            let carried: Vec<&str> = assistant
+                .iter()
+                .filter_map(|m| m["reasoning_content"].as_str())
+                .collect();
+            assert_eq!(
+                carried,
+                vec!["r1", "r2", "r3", "r4", "r5"],
+                "{policy:?} must keep every retained turn's reasoning"
+            );
+            for message in &assistant {
+                assert!(
+                    message.get("reasoning_content").is_some(),
+                    "{policy:?}: the required key is present on every replayed assistant turn"
+                );
+            }
+            let assistant_texts: Vec<&str> = assistant
+                .iter()
+                .map(|m| m["content"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                assistant_texts,
+                vec!["t1", "t2", "t3", "t4", "t5"],
+                "{policy:?}"
+            );
+            let tool_calls: usize = messages
+                .iter()
+                .map(|m| m["tool_calls"].as_array().map(Vec::len).unwrap_or(0))
+                .sum();
+            assert_eq!(tool_calls, 5, "{policy:?} must keep every tool call");
+        }
+    }
+
     #[test]
     fn passback_echoes_kernel_assembled_reasoning_not_an_empty_string() {
         // The kernel assembles a streamed round as reasoning → text → tool
@@ -728,7 +866,7 @@ mod tests {
         // and the request exposes tools, never as the empty string the
         // provider would otherwise receive.
         let context = ProtocolContext {
-            passback_reasoning_content: true,
+            reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
         let mut request = ModelRequest::new(
@@ -736,6 +874,7 @@ mod tests {
             vec![
                 Message::text(Role::User, "hi"),
                 Message {
+                    origin: None,
                     role: Role::Assistant,
                     content: vec![
                         ContentPart::Reasoning {
@@ -754,6 +893,7 @@ mod tests {
                     ],
                 },
                 Message {
+                    origin: None,
                     role: Role::Tool,
                     content: vec![ContentPart::ToolResult {
                         result: leveler_model::ToolResultContent {
@@ -792,11 +932,434 @@ mod tests {
         // the provider still requires the key, and the empty string satisfies
         // it (measured against DeepSeek 2026-08-07).
         let context = ProtocolContext {
-            passback_reasoning_content: true,
+            reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
         let body = encode_tool_loop(&context, None);
         assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    /// The wire and the accounting read ONE projection.
+    ///
+    /// This is the owner seam, not a comparison of two implementations: the
+    /// same [`leveler_model::RequestProjection`] is handed to the encoder and to
+    /// [`leveler_model::ContextAccounting`], and both must agree with it about
+    /// every turn — including the turns where the route carries nothing.
+    #[test]
+    fn wire_and_accounting_read_one_projection() {
+        use leveler_model::{
+            ContextAccounting, ModelRef, ReasoningReplayContract, ReasoningReplayScope,
+            RequestProjection,
+        };
+
+        fn history(with_reasoning: bool, call: bool) -> Vec<Message> {
+            let mut assistant = Vec::new();
+            if with_reasoning {
+                assistant.push(ContentPart::Reasoning {
+                    text: "deliberation".into(),
+                });
+            }
+            assistant.push(ContentPart::Text {
+                text: "checking".into(),
+            });
+            if call {
+                assistant.push(ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: leveler_core::ToolCallId::new("c1"),
+                        name: "get_time".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                });
+            }
+            vec![
+                Message::text(Role::User, "hi"),
+                Message {
+                    origin: None,
+                    role: Role::Assistant,
+                    content: assistant,
+                },
+                Message {
+                    origin: None,
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: leveler_core::ToolCallId::new("c1"),
+                            content: "12:00".into(),
+                            is_error: false,
+                        },
+                    }],
+                },
+            ]
+        }
+
+        let contracts = [
+            ("never", ReasoningReplayContract::NONE),
+            ("when_tools", reasoning_carrying_without_empty_key()),
+            ("when_tools+empty", reasoning_carrying_contract()),
+            (
+                "always",
+                ReasoningReplayContract::raw_field(
+                    ReasoningReplayScope::Always,
+                    leveler_model::MissingReasoningReplay::Omit,
+                ),
+            ),
+        ];
+        let tool = ToolDefinition {
+            name: "get_time".into(),
+            description: "read the clock".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+
+        for (name, contract) in contracts {
+            for has_tools in [true, false] {
+                for with_reasoning in [true, false] {
+                    let mut request = ModelRequest::new(
+                        ModelRef::new("deepseek", "deepseek-chat"),
+                        history(with_reasoning, true),
+                    );
+                    if has_tools {
+                        request.tools = vec![tool.clone()];
+                    }
+                    let projection = RequestProjection::project(
+                        &request.messages,
+                        &request.tools,
+                        contract,
+                        leveler_model::ReasoningRetention::All,
+                    );
+                    let accounting = ContextAccounting::compute(
+                        request.model.clone(),
+                        &projection,
+                        Some(128_000),
+                        Some(64_000),
+                        None,
+                    );
+                    request.projection = Some(projection.clone());
+                    let context = ProtocolContext {
+                        reasoning_replay: contract,
+                        ..ctx()
+                    };
+                    let body = OpenAiChatAdapter::new()
+                        .encode_request(&request, &context, true)
+                        .unwrap()
+                        .body;
+
+                    for (index, projected) in projection.messages().iter().enumerate() {
+                        let wire = body["messages"][index].get("reasoning_content");
+                        assert_eq!(
+                            wire.and_then(|v| v.as_str()),
+                            projected.reasoning.as_wire(),
+                            "{name} tools={has_tools} reasoning={with_reasoning} message {index}"
+                        );
+                    }
+
+                    // The accounting prices exactly the channel the wire
+                    // carried, and the whole snapshot is the projection's own
+                    // estimate (within per-slice integer division).
+                    let mut carried = leveler_model::TokenEstimate::new();
+                    for message in projection.messages() {
+                        if let Some(text) = message.reasoning.as_wire() {
+                            carried.add_text(text);
+                        }
+                    }
+                    let reasoning_tokens = carried.tokens();
+                    let category = accounting
+                        .categories
+                        .iter()
+                        .find(|c| c.name == "messages")
+                        .and_then(|m| m.children.iter().find(|c| c.name == "reasoning"))
+                        .map(|c| c.tokens)
+                        .unwrap_or(0);
+                    assert_eq!(
+                        category, reasoning_tokens,
+                        "{name} tools={has_tools} reasoning={with_reasoning}: \
+                         the meter must price the channel the wire carried"
+                    );
+                    assert!(
+                        accounting
+                            .used_tokens
+                            .abs_diff(projection.estimated_tokens())
+                            <= accounting.categories.len() as u64,
+                        "{name} tools={has_tools} reasoning={with_reasoning}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The complete serialization matrix for `reasoning_content`, as an
+    /// invariant rather than a list of expected bodies:
+    ///
+    /// * the field is present iff the route replays reasoning, the request
+    ///   exposes tools, the turn is an assistant turn, and the turn either
+    ///   captured reasoning or the route requires the key's presence;
+    /// * turning replay on/off changes ONLY that field — `role`, `content`,
+    ///   `tool_calls` and the tool-result message are byte-identical either
+    ///   way, so a reasoning decision can never silently reshape a turn.
+    ///
+    /// Shapes: reasoning+text+call, reasoning+call, reasoning+text,
+    /// reasoning only, text only, call only, empty.
+    #[test]
+    fn reasoning_content_matrix_preserves_every_other_field() {
+        fn shape(reasoning: bool, text: bool, call: bool) -> Message {
+            let mut content = Vec::new();
+            if reasoning {
+                content.push(ContentPart::Reasoning {
+                    text: "because".into(),
+                });
+            }
+            if text {
+                content.push(ContentPart::Text {
+                    text: "checking".into(),
+                });
+            }
+            if call {
+                content.push(ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: leveler_core::ToolCallId::new("call_1"),
+                        name: "get_time".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                });
+            }
+            Message {
+                origin: None,
+                role: Role::Assistant,
+                content,
+            }
+        }
+
+        let shapes = [
+            ("reasoning+text+call", shape(true, true, true), true),
+            ("reasoning+call", shape(true, false, true), true),
+            ("reasoning+text", shape(true, true, false), true),
+            ("reasoning only", shape(true, false, false), true),
+            ("text only", shape(false, true, false), false),
+            ("call only", shape(false, false, true), false),
+            ("empty", shape(false, false, false), false),
+        ];
+
+        for (name, assistant, captured) in shapes {
+            let messages = vec![
+                Message::text(Role::User, "hi"),
+                assistant,
+                Message {
+                    origin: None,
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        result: leveler_model::ToolResultContent {
+                            call_id: leveler_core::ToolCallId::new("call_1"),
+                            content: "12:00".into(),
+                            is_error: false,
+                        },
+                    }],
+                },
+            ];
+            let tool = ToolDefinition {
+                name: "get_time".into(),
+                description: "read the clock".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            };
+
+            for tools in [true, false] {
+                for (replay, key_required) in [(false, false), (true, false), (true, true)] {
+                    let context = ProtocolContext {
+                        reasoning_replay: if key_required {
+                            reasoning_carrying_contract()
+                        } else if replay {
+                            reasoning_carrying_without_empty_key()
+                        } else {
+                            leveler_model::ReasoningReplayContract::NONE
+                        },
+                        ..ctx()
+                    };
+                    let mut request = ModelRequest::new(
+                        ModelRef::new("deepseek", "deepseek-chat"),
+                        messages.clone(),
+                    );
+                    if tools {
+                        request.tools = vec![tool.clone()];
+                    }
+                    let body = OpenAiChatAdapter::new()
+                        .encode_request(&request, &context, true)
+                        .unwrap()
+                        .body;
+                    let got = &body["messages"][1];
+                    let expect_key = replay && tools && (captured || key_required);
+                    assert_eq!(
+                        got.get("reasoning_content").is_some(),
+                        expect_key,
+                        "{name} tools={tools} replay={replay} key_required={key_required}: {got}"
+                    );
+                    if expect_key && captured {
+                        assert_eq!(got["reasoning_content"], "because", "{name}");
+                    }
+                    if expect_key && !captured {
+                        assert_eq!(got["reasoning_content"], "", "{name}");
+                    }
+                    // The rest of the turn is a function of the shape alone.
+                    assert_eq!(got["role"], "assistant", "{name}");
+                    let has_call = got["tool_calls"].as_array().is_some_and(|c| !c.is_empty());
+                    assert_eq!(has_call, shape_has_call(&messages[1]), "{name}");
+                    assert_eq!(
+                        got["content"].as_str() == Some("checking"),
+                        shape_has_text(&messages[1]),
+                        "{name}"
+                    );
+                    // The tool-result turn is never touched by a reasoning decision.
+                    assert_eq!(body["messages"][2]["role"], "tool", "{name}");
+                    assert_eq!(body["messages"][2]["content"], "12:00", "{name}");
+                    assert!(
+                        body["messages"][2].get("reasoning_content").is_none(),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn shape_has_call(message: &Message) -> bool {
+        message
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolCall { .. }))
+    }
+
+    fn shape_has_text(message: &Message) -> bool {
+        message
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::Text { .. }))
+    }
+
+    /// The shipped DeepSeek route's wire, pinned byte for byte.
+    ///
+    /// The context-architecture refactor moved the replay decision out of this
+    /// encoder and into the projection; the bytes a DeepSeek request uploads
+    /// must not have moved with it, or every cached prefix in every existing
+    /// session is re-billed at the uncached rate.
+    #[test]
+    fn shipped_deepseek_wire_is_unchanged_by_the_projection_refactor() {
+        let context = ProtocolContext {
+            reasoning_replay: reasoning_carrying_contract(),
+            ..ctx()
+        };
+        // Reasoning present: carried verbatim, alongside the tool call.
+        let with = encode_tool_loop(&context, Some("check the clock"));
+        assert_eq!(
+            with["messages"][1],
+            serde_json::json!({
+                "role": "assistant",
+                "reasoning_content": "check the clock",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_time", "arguments": "{}"}
+                }]
+            }),
+            "the assistant turn's exact bytes"
+        );
+        // No reasoning captured: the key is present and empty.
+        let without = encode_tool_loop(&context, None);
+        assert_eq!(
+            without["messages"][1],
+            serde_json::json!({
+                "role": "assistant",
+                "reasoning_content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_time", "arguments": "{}"}
+                }]
+            })
+        );
+        // The tool result turn is untouched by any of this.
+        assert_eq!(
+            without["messages"][2],
+            serde_json::json!({"role": "tool", "content": "12:00", "tool_call_id": "call_1"})
+        );
+    }
+
+    /// The scope is a contract value, not a hard-coded `has_tools` check: a
+    /// route that declares `Always` carries reasoning even with no tools, and a
+    /// route that declares `Never` carries none even with tools.
+    #[test]
+    fn replay_scope_is_honoured_in_both_directions() {
+        use leveler_model::{MissingReasoningReplay, ReasoningReplayScope};
+        let with_tools_already = |scope| ProtocolContext {
+            reasoning_replay: leveler_model::ReasoningReplayContract::raw_field(
+                scope,
+                MissingReasoningReplay::Omit,
+            ),
+            ..ctx()
+        };
+        let mut request = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-chat"),
+            vec![
+                Message::text(Role::User, "hi"),
+                Message {
+                    origin: None,
+                    role: Role::Assistant,
+                    content: vec![ContentPart::Reasoning {
+                        text: "thought".into(),
+                    }],
+                },
+                Message::text(Role::User, "again"),
+            ],
+        );
+
+        // Always: no tools in the request, reasoning still carried.
+        let body = OpenAiChatAdapter::new()
+            .encode_request(
+                &request,
+                &with_tools_already(ReasoningReplayScope::Always),
+                true,
+            )
+            .unwrap()
+            .body;
+        assert_eq!(body["messages"][1]["reasoning_content"], "thought");
+
+        // WhenToolsPresent: the same request with no tools carries nothing.
+        let body = OpenAiChatAdapter::new()
+            .encode_request(
+                &request,
+                &with_tools_already(ReasoningReplayScope::WhenToolsPresent),
+                true,
+            )
+            .unwrap()
+            .body;
+        assert!(body["messages"][1].get("reasoning_content").is_none());
+
+        // Never: even with tools exposed, nothing is carried.
+        request.tools = vec![ToolDefinition {
+            name: "grep".into(),
+            description: "search".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let body = OpenAiChatAdapter::new()
+            .encode_request(
+                &request,
+                &with_tools_already(ReasoningReplayScope::Never),
+                true,
+            )
+            .unwrap()
+            .body;
+        assert!(body["messages"][1].get("reasoning_content").is_none());
+    }
+
+    /// A route that replays reasoning but does NOT validate the key's presence
+    /// must leave a turn without captured reasoning alone: fabricating an
+    /// empty field would add content the model never produced.
+    #[test]
+    fn replay_without_key_requirement_omits_the_field_for_a_reasoning_free_turn() {
+        let context = ProtocolContext {
+            reasoning_replay: reasoning_carrying_without_empty_key(),
+            ..ctx()
+        };
+        let body = encode_tool_loop(&context, None);
+        assert!(
+            body["messages"][1].get("reasoning_content").is_none(),
+            "{body}"
+        );
     }
 
     #[test]
@@ -811,7 +1374,7 @@ mod tests {
     #[test]
     fn passback_does_not_touch_plain_assistant_text_messages_without_tools() {
         let context = ProtocolContext {
-            passback_reasoning_content: true,
+            reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
         let req = ModelRequest::new(
@@ -835,7 +1398,7 @@ mod tests {
     #[test]
     fn passback_echoes_reasoning_from_plain_assistant_rounds_when_tools_are_available() {
         let context = ProtocolContext {
-            passback_reasoning_content: true,
+            reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
         let mut request = ModelRequest::new(
@@ -843,6 +1406,7 @@ mod tests {
             vec![
                 Message::text(Role::User, "first"),
                 Message {
+                    origin: None,
                     role: Role::Assistant,
                     content: vec![
                         ContentPart::Reasoning {
@@ -875,7 +1439,7 @@ mod tests {
     #[test]
     fn passback_omits_plain_round_reasoning_when_current_request_has_no_tools() {
         let context = ProtocolContext {
-            passback_reasoning_content: true,
+            reasoning_replay: reasoning_carrying_contract(),
             ..ctx()
         };
         let request = ModelRequest::new(
@@ -883,6 +1447,7 @@ mod tests {
             vec![
                 Message::text(Role::User, "first"),
                 Message {
+                    origin: None,
                     role: Role::Assistant,
                     content: vec![
                         ContentPart::Reasoning {
@@ -1144,6 +1709,7 @@ mod tests {
     #[test]
     fn round_trips_tool_result_message() {
         let msgs = vec![Message {
+            origin: None,
             role: Role::Tool,
             content: vec![ContentPart::ToolResult {
                 result: leveler_model::ToolResultContent {
@@ -1153,7 +1719,12 @@ mod tests {
                 },
             }],
         }];
-        let converted = convert_messages(&msgs, false, false);
+        let converted = convert_messages(&leveler_model::RequestProjection::project(
+            &msgs,
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        ));
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("c1"));
@@ -1167,6 +1738,7 @@ mod tests {
     fn image_content_serializes_as_image_url_part() {
         use leveler_model::ImageSource;
         let msgs = vec![Message {
+            origin: None,
             role: Role::User,
             content: vec![
                 ContentPart::Text {
@@ -1180,7 +1752,12 @@ mod tests {
                 },
             ],
         }];
-        let converted = convert_messages(&msgs, false, false);
+        let converted = convert_messages(&leveler_model::RequestProjection::project(
+            &msgs,
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        ));
         let json = serde_json::to_value(&converted[0]).unwrap();
         assert_eq!(json["content"][0]["type"], "text");
         assert_eq!(json["content"][1]["type"], "image_url");

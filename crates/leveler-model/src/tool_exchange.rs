@@ -115,6 +115,7 @@ mod tests {
 
     fn call(ids: &[&str]) -> Message {
         Message {
+            origin: None,
             role: Role::Assistant,
             content: ids
                 .iter()
@@ -131,6 +132,7 @@ mod tests {
 
     fn results(ids: &[&str]) -> Message {
         Message {
+            origin: None,
             role: Role::Tool,
             content: ids
                 .iter()

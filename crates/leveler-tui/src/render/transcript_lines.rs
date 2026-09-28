@@ -168,9 +168,13 @@ pub fn item_render(
         }
         TranscriptItem::TurnEnd(block) => turn_end_lines(block, theme, wrap_width, &mut out, t),
         TranscriptItem::Recap(block) => {
-            let text = match &block.summary {
-                Some(summary) => format!("{summary} · {}{}", t.recap_next_step, block.next_step),
-                None => format!("{}{}", t.recap_next_step, block.next_step),
+            let text = match (&block.summary, &block.next_step) {
+                (Some(summary), Some(next_step)) => {
+                    format!("{summary} · {}{next_step}", t.recap_next_step)
+                }
+                (Some(summary), None) => summary.clone(),
+                (None, Some(next_step)) => format!("{}{next_step}", t.recap_next_step),
+                (None, None) => return out,
             };
             push_prefixed(
                 &mut out,

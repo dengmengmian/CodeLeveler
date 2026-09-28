@@ -104,6 +104,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -370,6 +371,7 @@ async fn tool_side_effect_cannot_precede_durable_tool_call_started() {
                         content: vec![ContentPart::Text {
                             text: "add a function".into(),
                         }],
+                        origin: leveler_model::TranscriptOrigin::UserInput,
                     },
                     true,
                     h.session.clone(),

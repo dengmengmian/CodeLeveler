@@ -22,9 +22,6 @@ pub fn refuse_shell_script(cmd: &str) -> Option<String> {
                  (`cmd &`, `nohup`, `disown`). That pattern traps or orphans \
                  long-lived processes and is how turns hang on \
                  `python app.py & sleep …`.",
-                "use `run_command` with `background=true` for servers/watchers, \
-                 then a separate tool call for curl/health checks (no `&`, no \
-                 `#` after the real pipeline).",
             ));
         }
     }
@@ -35,31 +32,21 @@ pub fn refuse_shell_script(cmd: &str) -> Option<String> {
                 "refused Windows process detaching in a foreground shell tool \
                  (`start …`, `Start-Process`). Detached processes cannot be \
                  reaped by this tool and orphan on timeout.",
-                "use `run_command` with `background=true` for servers/watchers, \
-                 then a separate tool call for health checks.",
             ));
         }
     }
     if let Some(token) = sensitive_shell_token(cmd) {
-        return Some(crate::recoverable::permission_refused(
-            &format!(
-                "refused a command touching a credential-bearing file (`{token}`). \
+        return Some(crate::recoverable::permission_refused(&format!(
+            "refused a command touching a credential-bearing file (`{token}`). \
                  .env*, key/cert files, .ssh/.aws paths, credentials.json and \
                  similar are blocked from tool access at every layer."
-            ),
-            "if the task truly needs that value, ask the user to supply it or \
-             wire it via configuration instead of reading the secret file.",
-        ));
+        )));
     }
     if let Some(detail) = comment_swallows_trailing_command(cmd) {
-        return Some(crate::recoverable::permission_refused(
-            &format!(
-                "refused a `#` comment that would swallow trailing command-like \
+        return Some(crate::recoverable::permission_refused(&format!(
+            "refused a `#` comment that would swallow trailing command-like \
                  text ({detail}). Everything after `#` on that line never runs."
-            ),
-            "put the full pipeline as real shell (no mid-line `#` before \
-             curl/wget/…), or split into separate tool calls.",
-        ));
+        )));
     }
     None
 }
@@ -261,16 +248,12 @@ pub(crate) fn refuse_sensitive_args(args: &[String]) -> Option<String> {
     let hit = args.iter().map(|a| a.trim()).find(|a| {
         !a.is_empty() && !a.contains(char::is_whitespace) && arg_touches_sensitive_path(a)
     })?;
-    Some(crate::recoverable::permission_refused(
-        &format!(
-            "refused a command argument pointing at a credential-bearing file \
+    Some(crate::recoverable::permission_refused(&format!(
+        "refused a command argument pointing at a credential-bearing file \
              (`{hit}`). .env*, key/cert files, .ssh/.aws paths, \
              credentials.json and similar are blocked from tool access at \
              every layer."
-        ),
-        "if the task truly needs that value, ask the user to supply it or \
-         wire it via configuration instead of reading the secret file.",
-    ))
+    )))
 }
 
 /// Windows background/hang anti-patterns: cmd's `start` (segment-initial) and
@@ -366,7 +349,7 @@ mod tests {
     #[test]
     fn refuses_server_background_sleep_comment_curl_anti_pattern() {
         let err = refuse_shell_script(HANG_ANTI_PATTERN).expect("must refuse");
-        assert!(err.contains("[recoverable]"), "{err}");
+        assert!(err.contains("[permission refused]"), "{err}");
         // Unix catches the `&` job-control backgrounding first and points at
         // `run_command background=true`. That detection is Unix-only; on Windows
         // the same string is refused by the `#`-comment guard instead.
@@ -377,8 +360,8 @@ mod tests {
                 "{err}"
             );
             assert!(
-                err.contains("run_command") && err.contains("background=true"),
-                "must tell the model the correct next step: {err}"
+                err.contains("foreground shell tool") && err.contains("job-control"),
+                "must name the rejected operation: {err}"
             );
         }
         #[cfg(windows)]
@@ -411,7 +394,7 @@ mod tests {
             err.contains('#') || err.contains("comment") || err.contains("swallow"),
             "{err}"
         );
-        assert!(err.contains("[recoverable]"), "{err}");
+        assert!(err.contains("[permission refused]"), "{err}");
     }
 
     #[test]
@@ -446,7 +429,7 @@ mod tests {
     fn multiline_comments_do_not_hide_later_background_commands() {
         let error = refuse_shell_script("# prepare\necho ready &")
             .expect("background work after a comment must still be detected");
-        assert!(error.contains("background=true"), "{error}");
+        assert!(error.contains("job-control"), "{error}");
     }
 
     #[test]
@@ -475,7 +458,7 @@ mod tests {
         // `.expect` already proves the bypass is guarded; the guidance string is
         // Unix-specific (`background=true`) vs. the Windows `#`-comment refusal.
         #[cfg(not(windows))]
-        assert!(err.contains("background=true"), "{err}");
+        assert!(err.contains("job-control"), "{err}");
         #[cfg(windows)]
         assert!(err.contains("comment"), "{err}");
     }

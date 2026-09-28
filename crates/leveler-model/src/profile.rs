@@ -50,6 +50,31 @@ pub struct ModelLimits {
     pub max_tool_output_bytes: Option<usize>,
 }
 
+/// Reject a limits declaration that cannot describe a usable request.
+///
+/// This is a FACT check, not a policy one: it asks whether the declared
+/// numbers can describe a request at all. How much of the resulting room the
+/// harness decides to use — the completion reservation, any headroom, the
+/// fold threshold, the retention budget — is `ResolvedContextPolicy` in the
+/// harness, which is the owner of that decision.
+///
+/// Called where a model profile is loaded, so a bad declaration fails at
+/// configuration time with the file named — not later, as a provider 400 on a
+/// request nobody can explain.
+pub fn validate_model_limits(limits: &ModelLimits) -> Result<(), String> {
+    if limits.context_window == 0 {
+        return Ok(());
+    }
+    if limits.max_output_tokens >= limits.context_window {
+        return Err(format!(
+            "max_output_tokens ({}) must be below context_window ({}): a request for the \
+             full window would leave no room for its own completion",
+            limits.max_output_tokens, limits.context_window
+        ));
+    }
+    Ok(())
+}
+
 /// Measured long-context quality for a model. Only ever filled from a real
 /// measurement — `measured_at` names when and forces the question "how do you
 /// know?" at review time.
@@ -79,6 +104,10 @@ pub enum ReasoningStyle {
     /// DeepSeek/GLM-style: `thinking: {"type": "enabled"}`, plus
     /// `reasoning_effort` when an effort is configured.
     ThinkingFlag,
+    /// Adaptive thinking + output_config.effort on a Messages-style route.
+    AdaptiveThinking,
+    /// Explicit fixed thinking budget; never inferred from a model name.
+    BudgetedThinking { budget_tokens: u32 },
 }
 
 /// How hard the model should think. Serialized verbatim as `reasoning_effort`.
@@ -273,7 +302,18 @@ pub fn validate_reasoning_config(
             }
             Ok(())
         }
-        ReasoningStyle::OpenAiEffort | ReasoningStyle::ThinkingFlag => {
+        ReasoningStyle::BudgetedThinking { budget_tokens }
+            if config.supported_efforts.is_empty() && config.default_effort.is_none() =>
+        {
+            if budget_tokens < 1024 {
+                return Err("budgeted thinking requires at least 1024 tokens".into());
+            }
+            Ok(())
+        }
+        ReasoningStyle::OpenAiEffort
+        | ReasoningStyle::ThinkingFlag
+        | ReasoningStyle::AdaptiveThinking
+        | ReasoningStyle::BudgetedThinking { .. } => {
             let supported = if config.supported_efforts.is_empty() {
                 match config.default_effort {
                     Some(def) => vec![def],
@@ -304,12 +344,6 @@ pub fn validate_reasoning_config(
 /// Provider-quirk configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatibilityConfig {
-    /// Synthesize stable tool-call ids when the provider omits them.
-    #[serde(default)]
-    pub synthesize_tool_call_ids: bool,
-    /// Drop fields the provider rejects rather than erroring.
-    #[serde(default)]
-    pub drop_unsupported_fields: bool,
     /// Whether the provider accepts a caller-chosen `temperature`. Kimi For
     /// Coding rejects every value but its own default, so a caller asking for a
     /// deterministic `0.0` would get a hard 400. Set false to omit the field.
@@ -325,14 +359,66 @@ pub struct CompatibilityConfig {
     /// the forced ToolChoice contract instead of downgrading it.
     #[serde(default = "default_true")]
     pub thinking_supports_forced_tool_choice: bool,
-    /// Whether tool-enabled requests must echo `reasoning_content` on every
-    /// historical assistant message. DeepSeek's thinking mode validates the
-    /// complete assistant history when tools are available; the value is the
-    /// captured reasoning, or the empty string when a round produced none.
-    /// Requests without tools never send this provider-specific field.
-    /// Default false: the field is never sent.
+    /// Whether, and in which request shapes, captured historical assistant
+    /// reasoning is carried back to this provider.
+    ///
+    /// This is the REPLAY SCOPE — a route fact resolved into a
+    /// [`crate::ReasoningReplayContract`], never a harness preference and
+    /// never a model-name branch. [`ReasoningReplayScope::Never`] (the
+    /// default) means the route has no historical-reasoning channel;
+    /// [`ReasoningReplayScope::WhenToolsPresent`] replays only on requests
+    /// that expose tools; [`ReasoningReplayScope::Always`] replays on every
+    /// request that spans the history.
+    ///
+    /// Backward compatibility: configuration written before the scope became
+    /// explicit spells this as the boolean `passback_reasoning_content`
+    /// (`true` = `when_tools_present`, `false` = `never`). That spelling is
+    /// accepted for this field, so an existing user configuration keeps the
+    /// exact wire it had.
+    #[serde(
+        default,
+        alias = "passback_reasoning_content",
+        deserialize_with = "deserialize_reasoning_replay_scope"
+    )]
+    pub reasoning_replay_scope: crate::ReasoningReplayScope,
+    /// Whether an assistant turn being replayed must carry the
+    /// `reasoning_content` key even when it captured no reasoning (the empty
+    /// string agrees with this provider's validator).
+    ///
+    /// This is the *structural* half: some OpenAI-compatible endpoints
+    /// validate the key's presence on replayed assistant turns independently
+    /// of whether the turn produced reasoning (for example a turn that ran
+    /// with thinking explicitly disabled, or a session persisted before
+    /// reasoning was captured). Other endpoints treat a fabricated field as
+    /// content and ask clients not to send it.
+    ///
+    /// Only meaningful together with a replaying
+    /// [`Self::reasoning_replay_scope`].
+    /// Default false: a turn without captured reasoning sends no field.
     #[serde(default)]
-    pub passback_reasoning_content: bool,
+    pub reasoning_content_key_required: bool,
+}
+
+/// Accept either the explicit replay-scope spelling or the legacy boolean
+/// (`passback_reasoning_content`), so widening the fact from two states to
+/// three does not change the meaning of any configuration already written.
+pub fn deserialize_reasoning_replay_scope<'de, D>(
+    deserializer: D,
+) -> Result<crate::ReasoningReplayScope, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ScopeOrLegacy {
+        Scope(crate::ReasoningReplayScope),
+        Legacy(bool),
+    }
+    Ok(match ScopeOrLegacy::deserialize(deserializer)? {
+        ScopeOrLegacy::Scope(scope) => scope,
+        ScopeOrLegacy::Legacy(true) => crate::ReasoningReplayScope::WhenToolsPresent,
+        ScopeOrLegacy::Legacy(false) => crate::ReasoningReplayScope::Never,
+    })
 }
 
 fn default_true() -> bool {
@@ -345,11 +431,10 @@ fn default_true() -> bool {
 impl Default for CompatibilityConfig {
     fn default() -> Self {
         Self {
-            synthesize_tool_call_ids: false,
-            drop_unsupported_fields: false,
             supports_temperature: true,
             thinking_supports_forced_tool_choice: true,
-            passback_reasoning_content: false,
+            reasoning_replay_scope: crate::ReasoningReplayScope::Never,
+            reasoning_content_key_required: false,
         }
     }
 }
@@ -373,12 +458,6 @@ pub struct ModelProfile {
     pub reasoning: ReasoningConfig,
     #[serde(default)]
     pub compatibility: CompatibilityConfig,
-    /// This model's own system prompt, replacing the agent's default. One
-    /// prompt does not serve every model equally — the length and the worked
-    /// examples that help one are noise to another — so the prompt is per-model
-    /// configuration. Omit to use the default.
-    #[serde(default)]
-    pub instructions: Option<String>,
     /// Optional provider pricing for cost accounting. Absent means cost is
     /// never computed — the harness must not invent a price.
     #[serde(default)]
@@ -399,6 +478,20 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
+    /// Price only what the declared tariff can represent. Cache writes have
+    /// provider/TTL-dependent rates absent from this tariff; their cost stays
+    /// unknown rather than being silently billed as ordinary input.
+    pub fn cost_for_usage(&self, usage: &crate::TokenUsage) -> Option<u64> {
+        if usage.total() == 0 || usage.cache_creation_input_tokens > 0 {
+            return None;
+        }
+        Some(self.cost_usd_micros_cached(
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+        ))
+    }
+
     /// Total cost in micro-USD, ignoring any cache discount.
     ///
     /// Kept for callers that have no cached-token figure. Where one exists,
@@ -438,6 +531,32 @@ mod tests {
 
     /// USD/Mtok is micro-USD/token: deepseek-style $0.27/$1.10 per Mtok over
     /// 1M in + 100k out = 270_000 + 110_000 micro-USD.
+    #[test]
+    fn absent_usage_and_unpriced_cache_writes_are_not_free_calls() {
+        let pricing = ModelPricing {
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 2.0,
+            cached_input_usd_per_mtok: Some(0.1),
+        };
+        assert_eq!(pricing.cost_for_usage(&crate::TokenUsage::default()), None);
+        assert_eq!(
+            pricing.cost_for_usage(&crate::TokenUsage {
+                input_tokens: 50,
+                cache_creation_input_tokens: 30,
+                ..Default::default()
+            }),
+            None
+        );
+        assert_eq!(
+            pricing.cost_for_usage(&crate::TokenUsage {
+                input_tokens: 50,
+                cached_input_tokens: 30,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            Some(33)
+        );
+    }
     #[test]
     fn pricing_cost_is_a_weighted_sum_in_micro_usd() {
         let pricing = ModelPricing {
@@ -540,6 +659,29 @@ mod tests {
         }
     }
 
+    fn limits(context_window: u32, reliable: u32, max_output: u32) -> ModelLimits {
+        ModelLimits {
+            context_window,
+            reliable_context: reliable,
+            max_output_tokens: max_output,
+            max_tool_schema_bytes: 32_768,
+            max_parallel_tool_calls: 16,
+            max_tool_output_bytes: None,
+        }
+    }
+
+    /// The fold threshold used to be derived here from `reliable_context`
+    /// alone; that is a HARNESS policy decision (how much of a model's capacity
+    /// to spend, and what to reserve), so it now lives in
+    /// `ResolvedContextPolicy` and this struct describes facts only.
+    #[test]
+    fn a_completion_at_or_above_the_window_is_refused() {
+        assert!(validate_model_limits(&limits(8_192, 4_096, 8_192)).is_err());
+        assert!(validate_model_limits(&limits(8_192, 4_096, 8_191)).is_ok());
+        // An undeclared window is not validated: there is no fact to check.
+        assert!(validate_model_limits(&limits(0, 0, 0)).is_ok());
+    }
+
     #[test]
     fn model_capabilities_defaults_to_false() {
         let caps = ModelCapabilities {
@@ -584,16 +726,13 @@ mod tests {
                 default_effort: Some(ReasoningEffort::High),
             },
             compatibility: CompatibilityConfig {
-                synthesize_tool_call_ids: true,
-                drop_unsupported_fields: false,
                 // Non-default on purpose: a roundtrip that only ever sees the
                 // default value can't catch a field dropped from (de)serialization.
                 supports_temperature: false,
                 thinking_supports_forced_tool_choice: false,
-                passback_reasoning_content: true,
+                reasoning_replay_scope: crate::ReasoningReplayScope::Always,
+                reasoning_content_key_required: true,
             },
-            // Likewise non-default: a model's own prompt must survive the trip.
-            instructions: Some("You are a terse agent.".to_string()),
             pricing: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
@@ -613,12 +752,15 @@ mod tests {
         assert!(compat.supports_temperature);
     }
 
-    /// `instructions` is optional: every existing model config predates it and
-    /// must keep loading, falling back to the agent's default prompt.
+    /// Every model profile loads the same behavioral contract: a profile that
+    /// still carries the retired `instructions` key must not resurrect a
+    /// per-model system prompt. Model differences belong in `capabilities`,
+    /// `limits`, `reasoning` and `compatibility`.
     #[test]
-    fn a_profile_without_instructions_still_loads() {
+    fn a_retired_instructions_key_is_ignored_not_honored() {
         let profile: ModelProfile = serde_json::from_value(serde_json::json!({
             "id": "m", "provider": "mock", "model_id": "m", "protocol": "openai_chat",
+            "instructions": "You are a special snowflake.",
             "capabilities": {
                 "streaming": true, "tool_calling": true, "parallel_tool_calls": false,
                 "structured_output": true, "reasoning": false, "vision": false
@@ -630,14 +772,82 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(profile.instructions, None);
+        assert_eq!(profile.model_id, "m");
+        // serde ignores the unknown key: it must not survive as a field, and
+        // nothing downstream can read it back.
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("snowflake"), "{json}");
+        assert!(!json.contains("instructions"), "{json}");
     }
 
     #[test]
     fn compatibility_config_defaults_are_empty() {
         let config: CompatibilityConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(!config.synthesize_tool_call_ids);
-        assert!(!config.drop_unsupported_fields);
+        // A route carries no historical reasoning until it declares that it
+        // does; nothing inherits another route's requirement by default.
+        assert_eq!(
+            config.reasoning_replay_scope,
+            crate::ReasoningReplayScope::Never
+        );
+        assert!(!config.reasoning_content_key_required);
+    }
+
+    /// The three replay scopes are expressible as declared route facts, so a
+    /// generic OpenAI-compatible route configures `never` / `when_tools_present`
+    /// / `always` without any model name entering the harness.
+    #[test]
+    fn replay_scope_accepts_the_explicit_three_state_spelling() {
+        for (spelling, expected) in [
+            ("never", crate::ReasoningReplayScope::Never),
+            (
+                "when_tools_present",
+                crate::ReasoningReplayScope::WhenToolsPresent,
+            ),
+            ("always", crate::ReasoningReplayScope::Always),
+        ] {
+            let compat: CompatibilityConfig = serde_json::from_value(serde_json::json!({
+                "reasoning_replay_scope": spelling
+            }))
+            .unwrap();
+            assert_eq!(compat.reasoning_replay_scope, expected, "{spelling}");
+        }
+    }
+
+    /// Configuration written before the scope was explicit spells the same
+    /// fact as a boolean. It must keep its exact meaning — `true` is the
+    /// tool-scoped replay DeepSeek's shipped profile declared, `false` is no
+    /// replay at all — or an existing user config would silently stop
+    /// replaying and start getting provider 400s.
+    #[test]
+    fn legacy_passback_boolean_keeps_its_meaning() {
+        let enabled: CompatibilityConfig =
+            serde_json::from_value(serde_json::json!({"passback_reasoning_content": true}))
+                .unwrap();
+        assert_eq!(
+            enabled.reasoning_replay_scope,
+            crate::ReasoningReplayScope::WhenToolsPresent
+        );
+        let disabled: CompatibilityConfig =
+            serde_json::from_value(serde_json::json!({"passback_reasoning_content": false}))
+                .unwrap();
+        assert_eq!(
+            disabled.reasoning_replay_scope,
+            crate::ReasoningReplayScope::Never
+        );
+    }
+
+    #[test]
+    fn replay_scope_writes_back_as_the_explicit_spelling() {
+        let compat = CompatibilityConfig {
+            reasoning_replay_scope: crate::ReasoningReplayScope::Always,
+            ..CompatibilityConfig::default()
+        };
+        let json = serde_json::to_string(&compat).unwrap();
+        assert!(
+            json.contains("\"reasoning_replay_scope\":\"always\""),
+            "{json}"
+        );
+        assert!(!json.contains("passback_reasoning_content"), "{json}");
     }
 
     #[test]

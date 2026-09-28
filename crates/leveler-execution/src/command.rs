@@ -372,6 +372,14 @@ fn macos_sandbox_command(
     // repository mutation fails in the kernel regardless of which program
     // attempts it.
     let (write_roots, protected) = match scope {
+        WriteScope::ScopedWorkspace { root, excluded, .. } => {
+            let mut protected = git_write_protected_paths(root);
+            protected.extend(excluded.iter().cloned());
+            (
+                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
+                protected,
+            )
+        }
         WriteScope::Workspace { root } => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             git_write_protected_paths(root),
@@ -535,6 +543,11 @@ fn writable_roots_for_scope(
     cache_write_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
     match scope {
+        WriteScope::ScopedWorkspace { allowed, .. } => {
+            let mut roots = writable_roots_without_workspace(scratch_root, cache_write_roots);
+            roots.extend(allowed.iter().cloned());
+            roots
+        }
         WriteScope::Unrestricted => Vec::new(),
         WriteScope::None => writable_roots_without_workspace(scratch_root, cache_write_roots),
         WriteScope::Workspace { root } | WriteScope::WorkspaceWithGit { root } => {
@@ -621,6 +634,14 @@ fn linux_sandbox_command(
     // writable root rw — omitting the workspace leaves it read-only while
     // scratch and toolchain caches stay usable.
     let (roots, protected) = match scope {
+        WriteScope::ScopedWorkspace { root, excluded, .. } => {
+            let mut protected = git_write_protected_paths(root);
+            protected.extend(excluded.iter().cloned());
+            (
+                writable_roots_for_scope(scope, scratch_root, cache_write_roots),
+                protected,
+            )
+        }
         WriteScope::Workspace { root } => (
             writable_roots_for_scope(scope, scratch_root, cache_write_roots),
             git_write_protected_paths(root),
@@ -684,6 +705,56 @@ fn bwrap_args(
     a
 }
 
+/// Whether the RUNNER completed the execution, independent of what the executed
+/// program reported.
+///
+/// Execution outcome and command outcome are two orthogonal axes. A command
+/// that spawned, ran to completion and exited 101 is an execution SUCCESS whose
+/// process reported a non-zero result — `cargo test` failing a test is not a
+/// broken tool. Collapsing the two into one boolean is what made
+/// `exit_code != 0` indistinguishable from "the tool could not run", and every
+/// metric downstream of that (tool-error counts, recovery rounds) inherited the
+/// error.
+///
+/// `Completed` therefore says nothing about the exit code: read
+/// [`ProcessOutput::exit_code`] for the program's own result. Consumers that
+/// need "did it succeed" ask for the exit code; consumers that need "did the
+/// tool work" ask for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionStatus {
+    /// The process spawned, ran to completion inside its time budget, and was
+    /// reaped. Its exit code may be anything, including non-zero.
+    Completed,
+    /// The process could not be spawned at all (missing binary, permission,
+    /// exec failure). Nothing ran, so there is no command outcome.
+    SpawnFailed,
+    /// The runtime's own I/O failed while supervising the process.
+    IoError,
+    /// The process exceeded its time budget and the runtime killed it. The exit
+    /// code is whatever the kill produced and is not the program's own result.
+    TimedOut,
+    /// The call was cancelled and the whole process tree is confirmed gone.
+    Cancelled,
+    /// Cancellation was requested and the tree was signalled, but its
+    /// termination could not be confirmed.
+    CancelUnconfirmed,
+    /// The OS confinement layer refused or failed to set up the sandbox, so the
+    /// process was never started under the policy it was admitted with.
+    SandboxPolicy,
+    /// Process-tree setup (Windows Job Object) failed before the process ran.
+    ProcessTreeSetup,
+}
+
+impl ToolExecutionStatus {
+    /// Whether the tool failed to execute the command, as opposed to executing
+    /// it and reporting a result. `TimedOut` and cancellation are execution
+    /// failures: the program did not run to its own completion.
+    pub fn is_execution_failure(self) -> bool {
+        !matches!(self, Self::Completed)
+    }
+}
+
 /// The result of running a process.
 #[derive(Debug, Clone)]
 pub struct ProcessOutput {
@@ -691,15 +762,27 @@ pub struct ProcessOutput {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
-    /// Whether output exceeded the cap and the middle was dropped.
+    /// Whether retained output or bounded live delivery omitted bytes.
     pub truncated: bool,
-    /// How many bytes were dropped across both streams.
+    /// Lower bound on bytes omitted across retained output and live delivery.
+    /// A byte lost in both is counted once; the channels may overlap.
     pub dropped_bytes: u64,
 }
 
 impl ProcessOutput {
     pub fn success(&self) -> bool {
         self.exit_code == Some(0) && !self.timed_out
+    }
+
+    /// The tool's own execution status. A non-zero `exit_code` stays
+    /// [`ToolExecutionStatus::Completed`]: the program ran and reported its
+    /// result, which is the information the caller asked for.
+    pub fn execution_status(&self) -> ToolExecutionStatus {
+        if self.timed_out {
+            ToolExecutionStatus::TimedOut
+        } else {
+            ToolExecutionStatus::Completed
+        }
     }
 }
 
@@ -729,6 +812,22 @@ pub enum ProcessError {
     /// Windows Job Object create/assign failed; process was not left running plain.
     #[error("process-tree (Job) setup failed: {0}")]
     ProcessTreeSetup(String),
+}
+
+impl ProcessError {
+    /// Which execution failure this is, for callers that must report a
+    /// machine-readable reason. Every variant here means the process did not run
+    /// to its own completion, so there is no command outcome to read.
+    pub fn execution_status(&self) -> ToolExecutionStatus {
+        match self {
+            Self::Spawn { .. } => ToolExecutionStatus::SpawnFailed,
+            Self::Io { .. } => ToolExecutionStatus::IoError,
+            Self::Cancelled => ToolExecutionStatus::Cancelled,
+            Self::CancelUnconfirmed => ToolExecutionStatus::CancelUnconfirmed,
+            Self::SandboxPolicy(_) => ToolExecutionStatus::SandboxPolicy,
+            Self::ProcessTreeSetup(_) => ToolExecutionStatus::ProcessTreeSetup,
+        }
+    }
 }
 
 /// How a cancelled command ended, as the execution layer established it.
@@ -875,7 +974,7 @@ impl CommandRunner {
         &self,
         request: ProcessRequest,
         cancellation: CancellationToken,
-        chunks: tokio::sync::mpsc::UnboundedSender<OutputChunk>,
+        chunks: tokio::sync::mpsc::Sender<OutputChunk>,
     ) -> Result<ProcessOutput, ProcessError> {
         self.run_observed(request, cancellation, Some(chunks)).await
     }
@@ -884,7 +983,7 @@ impl CommandRunner {
         &self,
         request: ProcessRequest,
         cancellation: CancellationToken,
-        chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
+        chunks: Option<tokio::sync::mpsc::Sender<OutputChunk>>,
     ) -> Result<ProcessOutput, ProcessError> {
         // `spawn` is where a request that cannot be confined fails closed —
         // one gate, whichever read mode the caller wanted.
@@ -900,6 +999,16 @@ impl CommandRunner {
     /// ordinary spawn, so a background command is no less confined than a
     /// foreground one.
     pub async fn spawn(&self, request: &ProcessRequest) -> Result<ManagedProcess, ProcessError> {
+        if matches!(request.write_scope, WriteScope::ScopedWorkspace { .. }) {
+            let scope = request.write_scope.clone();
+            tokio::task::spawn_blocking(move || validate_scoped_write_boundary(&scope))
+                .await
+                .map_err(|error| {
+                    ProcessError::SandboxPolicy(format!(
+                        "write boundary validation failed: {error}"
+                    ))
+                })??;
+        }
         let intent = request.filesystem_intent();
         if let Err(err) =
             crate::windows_sandbox::assert_intent_spawn_allowed(&intent, request.deny_network)
@@ -1016,6 +1125,138 @@ impl CommandRunner {
             })
         }
     }
+}
+
+/// A path grant must retain its lexical identity: a symlink cannot turn an
+/// owned name into authority over a different owner's file. Linux bind mounts
+/// require existing roots; unsupported boundaries fail before process spawn.
+fn validate_scoped_write_boundary(scope: &WriteScope) -> Result<(), ProcessError> {
+    let WriteScope::ScopedWorkspace {
+        root,
+        allowed,
+        excluded,
+    } = scope
+    else {
+        return Ok(());
+    };
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(ProcessError::SandboxPolicy(
+            "this host cannot enforce scoped workspace writes".into(),
+        ));
+    }
+    for path in allowed.iter().chain(excluded) {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| ProcessError::SandboxPolicy("write scope escapes workspace".into()))?;
+        let mut ancestor = root.clone();
+        for component in relative.components() {
+            if !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            ) {
+                return Err(ProcessError::SandboxPolicy(
+                    "write scope contains a parent traversal".into(),
+                ));
+            }
+            ancestor.push(component);
+            if std::fs::symlink_metadata(&ancestor).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(ProcessError::SandboxPolicy(format!(
+                    "write scope contains a symlink: {}",
+                    ancestor.display()
+                )));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !path.exists() {
+            return Err(ProcessError::SandboxPolicy(format!(
+                "scoped Linux write root does not exist: {}",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(unix)]
+    validate_scoped_hardlinks(root, allowed, excluded)?;
+    Ok(())
+}
+
+/// Path policies cannot separate inode aliases. Count every writable name and
+/// reject an inode when even one of its links lies outside the granted namespace.
+/// Owned-only links (e.g. Cargo's target binaries) remain usable.
+#[cfg(unix)]
+pub(crate) fn validate_scoped_hardlinks(
+    root: &Path,
+    allowed: &[PathBuf],
+    excluded: &[PathBuf],
+) -> Result<(), ProcessError> {
+    use std::collections::{HashMap, HashSet};
+    use std::os::unix::fs::MetadataExt;
+    let mut pending = allowed.to_vec();
+    let mut visited = HashSet::new();
+    let mut links: HashMap<(u64, u64), (u64, u64, PathBuf)> = HashMap::new();
+    let git = root.join(".git");
+    while let Some(path) = pending.pop() {
+        if path.starts_with(&git) || excluded.iter().any(|excluded| path.starts_with(excluded)) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ProcessError::SandboxPolicy(format!(
+                    "cannot inspect scoped path {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let real = path.canonicalize().map_err(|error| {
+            ProcessError::SandboxPolicy(format!(
+                "cannot resolve scoped path {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !visited.insert(real.clone()) {
+            continue;
+        }
+        if metadata.is_file() && metadata.nlink() > 1 {
+            let entry = links.entry((metadata.dev(), metadata.ino())).or_insert((
+                0,
+                metadata.nlink(),
+                real,
+            ));
+            entry.0 += 1;
+            entry.1 = entry.1.max(metadata.nlink());
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|error| {
+                ProcessError::SandboxPolicy(format!(
+                    "cannot inspect scoped directory {}: {error}",
+                    path.display()
+                ))
+            })? {
+                pending.push(
+                    entry
+                        .map_err(|error| {
+                            ProcessError::SandboxPolicy(format!(
+                                "cannot inspect scoped directory: {error}"
+                            ))
+                        })?
+                        .path(),
+                );
+            }
+        }
+    }
+    for (_, (owned, total, path)) in links {
+        if owned != total {
+            return Err(ProcessError::SandboxPolicy(format!(
+                "scoped write inode has aliases outside its granted namespace: {} ({owned} of {total} links owned)",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Identity needed to signal a process tree after the handle is gone (the
@@ -1238,7 +1479,7 @@ async fn drive_to_completion(
     mut process: ManagedProcess,
     request: &ProcessRequest,
     cancellation: CancellationToken,
-    chunks: Option<tokio::sync::mpsc::UnboundedSender<OutputChunk>>,
+    chunks: Option<tokio::sync::mpsc::Sender<OutputChunk>>,
 ) -> Result<ProcessOutput, ProcessError> {
     let mut stdout_pipe = process.take_stdout();
     let mut stderr_pipe = process.take_stderr();
@@ -1267,6 +1508,7 @@ async fn drive_to_completion(
             process.wait_deadline().await
         }
         _ = cancellation.cancelled() => {
+            drain.cancel();
             process.terminate_tree().await;
             let reaped = process.wait_reaped().await;
             return if reaped && process.tree_gone().await {
@@ -1296,6 +1538,12 @@ async fn drive_to_completion(
     let (stderr, stderr_dropped) = stderr_task.await.unwrap_or_default();
     let dropped_bytes = stdout_dropped + stderr_dropped;
     process.reap_group();
+    if !process.tree_gone().await {
+        return Err(ProcessError::Io {
+            program: request.program.clone(),
+            source: std::io::Error::other("process group termination could not be confirmed"),
+        });
+    }
 
     Ok(ProcessOutput {
         exit_code: status.code(),
@@ -1474,10 +1722,7 @@ async fn read_capped(
     pipe: &mut Option<impl AsyncReadExt + Unpin>,
     cap: usize,
     drain: CancellationToken,
-    chunks: Option<(
-        OutputStream,
-        tokio::sync::mpsc::UnboundedSender<OutputChunk>,
-    )>,
+    chunks: Option<(OutputStream, tokio::sync::mpsc::Sender<OutputChunk>)>,
 ) -> (String, u64) {
     let Some(p) = pipe else {
         return (String::new(), 0);
@@ -1487,6 +1732,7 @@ async fn read_capped(
     let mut head: Vec<u8> = Vec::new();
     let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let mut dropped: u64 = 0;
+    let mut live_dropped: u64 = 0;
     let mut buf = [0u8; 16 * 1024];
     loop {
         // Stop reading once the drain deadline fires: after the child itself
@@ -1504,10 +1750,15 @@ async fn read_capped(
                     // Live observer: forward the raw chunk before the
                     // retained-buffer capping below. A closed receiver just
                     // means nobody is watching anymore.
-                    let _ = tx.send(OutputChunk {
-                        stream: *stream,
-                        text: String::from_utf8_lossy(&buf[..n]).into_owned(),
-                    });
+                    if tx
+                        .try_send(OutputChunk {
+                            stream: *stream,
+                            text: String::from_utf8_lossy(&buf[..n]).into_owned(),
+                        })
+                        .is_err()
+                    {
+                        live_dropped = live_dropped.saturating_add(n as u64);
+                    }
                 }
                 for &byte in &buf[..n] {
                     if head.len() < head_cap {
@@ -1525,17 +1776,89 @@ async fn read_capped(
     }
     if dropped == 0 {
         head.extend(tail);
-        return (String::from_utf8_lossy(&head).into_owned(), 0);
+        let mut text = String::from_utf8_lossy(&head).into_owned();
+        if live_dropped > 0 {
+            text.push_str(&format!("\n[live output omitted: {live_dropped} bytes]\n"));
+        }
+        return (text, live_dropped);
     }
     let mut text = String::from_utf8_lossy(&head).into_owned();
     text.push_str(&format!("\n…[{dropped} bytes dropped]…\n"));
     text.push_str(&String::from_utf8_lossy(tail.make_contiguous()));
-    (text, dropped)
+    if live_dropped > 0 {
+        text.push_str(&format!("\n[live output omitted: {live_dropped} bytes]\n"));
+    }
+    // Both views can omit the same bytes; report a lower bound, never charge
+    // the retained-buffer and live-channel losses twice.
+    (text, dropped.max(live_dropped))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C2: execution status and command outcome are separate axes. A non-zero
+    /// exit is a *completed* execution; only the runtime failing to run the
+    /// process is an execution failure.
+    #[test]
+    fn execution_status_separates_process_failure_from_exit_code() {
+        let completed = ProcessOutput {
+            exit_code: Some(101),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            truncated: false,
+            dropped_bytes: 0,
+        };
+        assert!(!completed.success(), "the command reported failure");
+        assert_eq!(completed.execution_status(), ToolExecutionStatus::Completed);
+        assert!(!completed.execution_status().is_execution_failure());
+
+        let timed_out = ProcessOutput {
+            exit_code: None,
+            timed_out: true,
+            ..completed.clone()
+        };
+        assert_eq!(timed_out.execution_status(), ToolExecutionStatus::TimedOut);
+        assert!(timed_out.execution_status().is_execution_failure());
+    }
+
+    #[test]
+    fn every_process_error_maps_to_an_execution_failure() {
+        let cases = [
+            (
+                ProcessError::Spawn {
+                    program: "x".into(),
+                    source: std::io::Error::other("gone"),
+                },
+                ToolExecutionStatus::SpawnFailed,
+            ),
+            (
+                ProcessError::Io {
+                    program: "x".into(),
+                    source: std::io::Error::other("pipe"),
+                },
+                ToolExecutionStatus::IoError,
+            ),
+            (ProcessError::Cancelled, ToolExecutionStatus::Cancelled),
+            (
+                ProcessError::CancelUnconfirmed,
+                ToolExecutionStatus::CancelUnconfirmed,
+            ),
+            (
+                ProcessError::SandboxPolicy("denied".into()),
+                ToolExecutionStatus::SandboxPolicy,
+            ),
+            (
+                ProcessError::ProcessTreeSetup("job".into()),
+                ToolExecutionStatus::ProcessTreeSetup,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.execution_status(), expected, "{error:?}");
+            assert!(error.execution_status().is_execution_failure());
+        }
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn unix_host_runner() -> CommandRunner {
@@ -5024,9 +5347,33 @@ mod streaming_tests {
     /// The streaming contract: chunks arrive WHILE the child runs, not after
     /// it exits, and stderr is tagged separately from stdout.
     #[tokio::test]
+    async fn a_slow_live_observer_cannot_retain_unbounded_output() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut request = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), "head -c 2097152 /dev/zero".into()],
+            std::env::temp_dir(),
+        );
+        request.max_output_bytes = 1024;
+        let output = CommandRunner::new()
+            .run_streaming(request, CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let mut queued_bytes = 0;
+        while let Ok(chunk) = rx.try_recv() {
+            queued_bytes += chunk.text.len();
+        }
+        assert!(
+            queued_bytes <= 64 * 16 * 1024,
+            "live queue retained {queued_bytes} bytes"
+        );
+        assert!(output.truncated);
+    }
+
+    #[tokio::test]
     async fn run_streaming_delivers_output_before_exit() {
         let runner = CommandRunner::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let request = ProcessRequest::new(
             "sh",
             vec![
@@ -5071,7 +5418,7 @@ mod streaming_tests {
     #[tokio::test]
     async fn run_streaming_cancel_terminates() {
         let runner = CommandRunner::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let cancel = CancellationToken::new();
         let request = ProcessRequest::new(
             "sh",

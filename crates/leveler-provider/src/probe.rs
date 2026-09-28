@@ -58,6 +58,11 @@ fn probe_request(model: &ModelRef) -> ModelRequest {
     // internal reasoning, rather than exhausting the budget mid-thought.
     req.max_output_tokens = Some(256);
     req.temperature = Some(0.0);
+    // A health probe is the smallest useful call the product makes. It asks
+    // for the lowest effort instead of letting a configured coding default
+    // (`default_effort = max`) apply; the adapter remaps this onto whatever
+    // the model actually supports.
+    req.reasoning_effort = Some(leveler_model::ReasoningEffort::Low);
     req
 }
 

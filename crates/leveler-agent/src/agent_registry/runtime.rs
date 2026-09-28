@@ -99,9 +99,8 @@ impl AgentRegistry {
     pub fn render_catalog(&self) -> String {
         let mut out = format!(
             "{CATALOG_HEADER}\n\
-             Run one with spawn_agent(agent=\"<name>\", task=...). Being listed only \
-             makes an agent available: use one when the task calls for it or the \
-             user names it.\n"
+             Run one with spawn_agent(agent=\"<name>\", task=...). Being listed \
+             makes an agent available.\n"
         );
         let defs: Vec<&AgentDefinition> = self
             .entries()

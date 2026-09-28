@@ -68,6 +68,14 @@ pub static BUILTIN_TAXONOMY: &[ToolTaxonomyEntry] = &[
         visibility: ActivityVisibility::Normal,
     },
     ToolTaxonomyEntry {
+        name: "read_project_rules",
+        kind: ToolKind::Read,
+        presentation_en: "Read project rules",
+        presentation_zh: "读取项目规则",
+        read_only_default: true,
+        visibility: ActivityVisibility::Normal,
+    },
+    ToolTaxonomyEntry {
         name: "list_files",
         kind: ToolKind::ListDir,
         presentation_en: "List Files",

@@ -18,7 +18,7 @@ use leveler_engine::{
 };
 use leveler_execution::{Approver, Clarifier, PermissionProfile, RiskLevel};
 use leveler_lifecycle::{AgentState, PlanState, ProgressLedger, SessionStatus, StopReason};
-use leveler_model::{Message, Role};
+use leveler_model::{ContentPart, Message, Role, RuntimeNoticeKind, TranscriptOrigin};
 #[cfg(test)]
 use leveler_storage::EventStore;
 
@@ -359,17 +359,7 @@ fn task_terminal_reason(report: &TaskReport) -> Option<String> {
 }
 
 fn task_terminal_stop(report: &TaskReport) -> StopReason {
-    if report.outcome == TaskOutcome::Completed
-        && report.stop_reason == StopReason::Answered
-        && !report.modified_files.is_empty()
-    {
-        // `Answered` is a truthful executor stop for pure Q&A. Once the Coding
-        // Harness has observed a product mutation, the durable task terminal
-        // records the task as completed.
-        StopReason::Completed
-    } else {
-        report.stop_reason
-    }
+    report.stop_reason
 }
 
 pub fn mode_str(mode: PermissionProfile) -> &'static str {
@@ -382,38 +372,221 @@ pub struct ModelSummarizer<'a> {
     runtime: &'a dyn leveler_model::ModelRuntime,
     model: &'a leveler_model::ModelRef,
     cancellation: &'a CancellationToken,
+    engine: &'a TaskEngine,
+    session_id: &'a SessionId,
+    limits: StepLimits,
+    budget_scope: String,
+    overrides: Option<&'a crate::coding::ExecutionOverrides>,
 }
 
 #[async_trait::async_trait]
 impl leveler_engine::ContextSummarizer for ModelSummarizer<'_> {
-    async fn summarize(&self, messages: &[leveler_model::Message]) -> Option<String> {
-        crate::summarize_with_model(
+    async fn summarize(
+        &self,
+        messages: &[leveler_model::Message],
+    ) -> Result<Option<String>, EngineError> {
+        let profile = self
+            .runtime
+            .profile(self.model)
+            .await
+            .map_err(|error| EngineError::Config(error.to_string()))?;
+        let policy = crate::coding::policy::resolve_execution_policy(
+            &profile,
+            crate::coding::policy::ExecutionRole::Main,
+            &TurnProfile::Chat {
+                continuation: ContinuationPolicy::UntilTerminal,
+                limits: StepLimits::default(),
+            },
+            self.overrides,
+        );
+        let Some(request) = leveler_context::summary_request(
             self.runtime,
             self.model,
-            None,
+            crate::ModelCallKind::Compaction.default_reasoning_effort(),
             messages,
-            crate::COMPACT_KEEP_RECENT,
-            0,
-            self.cancellation,
+            policy.context_policy.retention.keep_recent_messages,
+            policy.context_policy.retention.keep_recent_tokens,
+            policy.max_output_tokens,
         )
         .await
-        .map(|summary| summary.text)
+        else {
+            return Ok(None);
+        };
+        let progress = crate::coding::turn::persisted_budget_progress(
+            self.engine.stores.events.as_ref(),
+            self.session_id,
+            &self.budget_scope,
+        )
+        .await?
+        .unwrap_or_default();
+        let progress = crate::coding::turn::reconcile_model_spend(
+            progress,
+            self.engine.stores.model_requests.as_ref(),
+            self.session_id,
+            &self.budget_scope,
+        )
+        .await?;
+        if !crate::executor::auxiliary_budget_available(
+            self.limits,
+            &progress,
+            &request,
+            profile.pricing.as_ref(),
+        ) {
+            return Ok(None);
+        }
+        let mut recorder = PreTurnSummaryObserver {
+            summarizer: self,
+            pricing: profile.pricing,
+            reasoning_effort: request.reasoning_effort,
+            request: &request,
+        };
+        let round = crate::executor::run_auxiliary_round(
+            self.runtime,
+            request.clone(),
+            self.cancellation,
+            &mut recorder,
+            self.limits.max_duration.map(|duration| {
+                duration.saturating_sub(std::time::Duration::from_millis(
+                    progress.cumulative_duration_ms,
+                ))
+            }),
+        )
+        .await;
+        let round = match round {
+            Ok(round) => round,
+            // No auxiliary budget: no briefing. The lifecycle (not this
+            // summarizer) decides what that costs — soft keeps the original
+            // history, hard folds mechanically.
+            Err(crate::AgentError::AuxiliaryBudgetUnavailable) => return Ok(None),
+            // The harness cancelled the AUXILIARY child token when its own
+            // deadline elapsed; the task's own token is still live. A real
+            // task cancellation is NOT this case and propagates below.
+            Err(crate::AgentError::Cancelled) if !self.cancellation.is_cancelled() => {
+                return Ok(None);
+            }
+            Err(error) => {
+                // A real task cancellation is not a summary failure.
+                if self.cancellation.is_cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
+                // A provider fault or timeout produced no briefing. The
+                // context lifecycle decides what that costs; the summarizer
+                // does not.
+                if matches!(error, crate::AgentError::Model(_)) {
+                    return Ok(None);
+                }
+                // Ownership, persistence and configuration faults are not
+                // recoverable by a fold and must not be hidden.
+                return Err(EngineError::Config(error.to_string()));
+            }
+        };
+        Ok(leveler_context::accepted_summary(
+            &leveler_model::ModelResponse {
+                request_id: leveler_core::RequestId::new(round.request_id),
+                message: round.message,
+                usage: round.usage,
+                finish_reason: round.finish_reason,
+            },
+        ))
     }
 }
-/// Keep only the last `max` messages for Goal history injection (bounded).
-///
-/// The cut is moved to a round boundary so the tail never begins on a tool
-/// result whose owning assistant call fell off the front.
-pub(crate) fn bound_goal_history(
-    messages: Vec<leveler_model::Message>,
-    max: usize,
-) -> Vec<leveler_model::Message> {
-    if messages.len() <= max {
-        return messages;
-    }
-    let start = leveler_context::round_boundary(&messages, messages.len() - max);
-    messages[start..].to_vec()
+struct PreTurnSummaryObserver<'a, 'b> {
+    summarizer: &'a ModelSummarizer<'b>,
+    pricing: Option<leveler_model::ModelPricing>,
+    reasoning_effort: Option<leveler_model::ReasoningEffort>,
+    request: &'a leveler_model::ModelRequest,
 }
+#[async_trait::async_trait]
+impl leveler_agent_core::ModelRoundObserver for PreTurnSummaryObserver<'_, '_> {
+    type Error = crate::AgentError;
+    fn on_event(&mut self, _: leveler_agent_core::AgentEvent) {}
+    async fn before_attempt(&mut self) -> Result<(), Self::Error> {
+        let host = self.summarizer;
+        let progress = crate::coding::turn::persisted_budget_progress(
+            host.engine.stores.events.as_ref(),
+            host.session_id,
+            &host.budget_scope,
+        )
+        .await
+        .map_err(|error| leveler_engine::PortError::Persistence(error.to_string()))?
+        .unwrap_or_default();
+        let progress = crate::coding::turn::reconcile_model_spend(
+            progress,
+            host.engine.stores.model_requests.as_ref(),
+            host.session_id,
+            &host.budget_scope,
+        )
+        .await
+        .map_err(|error| leveler_engine::PortError::Persistence(error.to_string()))?;
+        if !crate::executor::auxiliary_budget_available(
+            host.limits,
+            &progress,
+            self.request,
+            self.pricing.as_ref(),
+        ) {
+            return Err(crate::AgentError::AuxiliaryBudgetUnavailable);
+        }
+        Ok(())
+    }
+    async fn on_attempt(
+        &mut self,
+        attempt: leveler_model::ModelAttempt,
+    ) -> Result<(), Self::Error> {
+        let host = self.summarizer;
+        let mut record = crate::executor::model_attempt_record(
+            &attempt,
+            host.model,
+            crate::ModelCallKind::Compaction,
+            self.reasoning_effort,
+        )
+        .priced(self.pricing.as_ref());
+        record.budget_scope = Some(host.budget_scope.clone());
+        host.engine
+            .stores
+            .model_requests
+            .insert(&leveler_engine::storage_model_request(
+                &record,
+                host.session_id,
+            ))
+            .await
+            .map_err(|error| leveler_engine::PortError::Persistence(error.to_string()))?;
+        let progress = crate::coding::turn::persisted_budget_progress(
+            host.engine.stores.events.as_ref(),
+            host.session_id,
+            &host.budget_scope,
+        )
+        .await
+        .map_err(|error| leveler_engine::PortError::Persistence(error.to_string()))?
+        .unwrap_or_default();
+        let mut progress = crate::coding::turn::reconcile_model_spend(
+            progress,
+            host.engine.stores.model_requests.as_ref(),
+            host.session_id,
+            &host.budget_scope,
+        )
+        .await
+        .map_err(|error| leveler_engine::PortError::Persistence(error.to_string()))?;
+        progress.cumulative_duration_ms = progress
+            .cumulative_duration_ms
+            .saturating_add(attempt.latency_ms);
+        EventLog::new(host.engine.stores.events.as_ref(), host.session_id.clone())
+            .append(
+                None,
+                EngineEvent::ProgressUpdated { ledger: progress },
+                &mut |_| {},
+            )
+            .await
+            .map_err(|error| leveler_engine::PortError::Persistence(error.to_string()))?;
+        if host.limits.max_cost_usd_micros.is_some() && record.cost_usd_micros.is_none() {
+            return Err(crate::AgentError::Model(leveler_model::ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "summary attempt has no auditable cost under active cap",
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl CodingRuntime {
     async fn resume_lineage(
         &self,
@@ -670,27 +843,66 @@ impl CodingRuntime {
         strict: Option<&str>,
         checkpoint_scope: Option<&crate::coding::checkpoint::GoalCheckpointScope>,
     ) -> Result<leveler_engine::RawTranscript, EngineError> {
-        let checkpoint_ordinal = if let Some(scope) = checkpoint_scope {
-            crate::coding::checkpoint::checkpoint_transcript_ordinal(
-                &self.engine.stores,
-                session_id,
-                scope,
-            )
-            .await?
-        } else {
-            None
-        };
-        self.engine
-            .load_request_transcript(session_id, checkpoint_ordinal, strict)
-            .await
+        // Serialized bytes include reasoning the provider projection can omit.
+        // Only the projected request can prove history needs folding, so load
+        // all rows before applying the model's resolved context policy.
+        let _ = checkpoint_scope;
+        match strict {
+            Some(what) => {
+                leveler_engine::RawTranscript::load_strict(
+                    self.engine.stores.messages.as_ref(),
+                    session_id,
+                    what,
+                )
+                .await
+            }
+            None => {
+                leveler_engine::RawTranscript::load_lossy(
+                    self.engine.stores.messages.as_ref(),
+                    session_id,
+                )
+                .await
+            }
+        }
     }
 
+    async fn resolved_context_policy(
+        &self,
+    ) -> Result<crate::coding::policy::ResolvedExecutionPolicy, EngineError> {
+        let profile = self
+            .factory
+            .runtime
+            .profile(&self.factory.model)
+            .await
+            .map_err(|error| EngineError::Config(format!("cannot read model profile: {error}")))?;
+        Ok(crate::coding::policy::resolve_execution_policy(
+            &profile,
+            crate::coding::policy::ExecutionRole::Main,
+            &TurnProfile::Chat {
+                continuation: crate::ContinuationPolicy::UntilTerminal,
+                limits: crate::StepLimits::default(),
+            },
+            self.factory.overrides.as_ref(),
+        ))
+    }
+
+    async fn context_threshold(&self) -> Result<u64, EngineError> {
+        let policy = self.resolved_context_policy().await?.context_policy;
+        Ok(if policy.folding_enabled() {
+            u64::from(policy.pressure_threshold)
+        } else {
+            u64::MAX
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn assembled_prior(
         &self,
         log: &EventLog<'_>,
         session_id: &SessionId,
         raw: leveler_engine::RawTranscript,
         objective: Option<&str>,
+        continuing: bool,
         checkpoint_scope: Option<&crate::coding::checkpoint::GoalCheckpointScope>,
         workspace: Option<&dyn crate::coding::checkpoint::WorkspaceFacts>,
         summarizer: &dyn leveler_engine::ContextSummarizer,
@@ -719,12 +931,49 @@ impl CodingRuntime {
                 objective,
             ));
         }
+        let policy = self.resolved_context_policy().await?;
+        // Build the executor once: its tool surface and its control context are
+        // exactly what the request that follows this load will carry, so the
+        // pressure figure here is the SAME projection the drive will take — the
+        // state measured and the state sent cannot diverge.
+        let executor = self
+            .factory
+            .build(
+                TurnProfile::Chat {
+                    continuation: ContinuationPolicy::UntilTerminal,
+                    limits: StepLimits::default(),
+                },
+                None,
+            )
+            .await?;
+        let tools = executor.request_tool_definitions();
+        let request = objective.unwrap_or_default();
+        let procedure_request = request.to_string();
+        let control = executor.measurement_control_context(request, &procedure_request, continuing);
+        let measure = |messages: &[Message]| {
+            leveler_model::RequestProjection::project_with_control_context(
+                messages,
+                &tools,
+                policy.reasoning_replay,
+                policy.reasoning_retention,
+                &control,
+            )
+            .estimated_tokens()
+        };
         let context = raw
-            .assemble(
+            .assemble_measured(
                 log,
                 Some(summarizer),
                 objective,
-                leveler_context::PRE_REQUEST_COMPACT_THRESHOLD,
+                if policy.context_policy.folding_enabled() {
+                    u64::from(policy.context_policy.pressure_threshold)
+                } else {
+                    u64::MAX
+                },
+                policy.context_policy.hard_capacity(),
+                policy.context_policy.retention.keep_recent_messages,
+                policy.context_policy.retention.keep_recent_tokens,
+                &measure,
             )
             .await?;
         if context.compacted {
@@ -750,7 +999,28 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         scope: &crate::coding::checkpoint::GoalCheckpointScope,
     ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
-        let threshold = leveler_context::PRE_REQUEST_COMPACT_THRESHOLD;
+        let policy = self.resolved_context_policy().await?;
+        let threshold = self.context_threshold().await?;
+        let tools = self
+            .factory
+            .build(
+                TurnProfile::Chat {
+                    continuation: ContinuationPolicy::UntilTerminal,
+                    limits: StepLimits::default(),
+                },
+                None,
+            )
+            .await?
+            .request_tool_definitions();
+        let measure = |messages: &[Message]| {
+            leveler_model::RequestProjection::project(
+                messages,
+                &tools,
+                policy.reasoning_replay,
+                policy.reasoning_retention,
+            )
+            .estimated_tokens()
+        };
         let Some(task) = self
             .engine
             .stores
@@ -770,21 +1040,23 @@ impl CodingRuntime {
             raw,
         )
         .await?
-            && leveler_context::estimate_tokens(&prior) <= threshold
+            && measure(&prior) <= threshold
         {
             return Ok(Some(prior));
         }
-        if leveler_context::estimate_tokens(&raw.messages) <= threshold {
+        if measure(&raw.messages) <= threshold {
             return Ok(None);
         }
-        let summary = summarizer.summarize(&raw.messages).await;
+        let Some(summary) = summarizer.summarize(&raw.messages).await? else {
+            return Ok(None);
+        };
         match crate::coding::checkpoint::create_goal_checkpoint(
             &self.engine,
             session_id,
             scope,
             leveler_lifecycle::CheckpointReason::ContextCompaction,
             workspace,
-            crate::coding::checkpoint::SemanticRecap::briefing(summary.as_deref()),
+            crate::coding::checkpoint::SemanticRecap::briefing(Some(&summary)),
         )
         .await
         {
@@ -799,15 +1071,15 @@ impl CodingRuntime {
                     &raw.messages,
                     raw.messages
                         .len()
-                        .saturating_sub(leveler_context::COMPACT_KEEP_RECENT),
+                        .saturating_sub(policy.context_policy.retention.keep_recent_messages),
                 );
                 let mut prior = Vec::with_capacity(1 + raw.messages.len() - tail_start);
-                prior.push(leveler_model::Message {
-                    role: leveler_model::Role::User,
-                    content: vec![leveler_model::ContentPart::Text {
-                        text: record.payload.context_block(),
-                    }],
-                });
+                prior.push(leveler_model::Message::user(
+                    record.payload.context_block(),
+                    TranscriptOrigin::RuntimeNotice {
+                        notice: RuntimeNoticeKind::GoalCheckpoint,
+                    },
+                ));
                 prior.extend_from_slice(&raw.messages[tail_start..]);
                 Ok(Some(prior))
             }
@@ -1053,23 +1325,21 @@ impl CodingRuntime {
                 finish_finalization_phase(FINALIZATION_CONTINUATION_CHECKPOINT, started);
             }
             if let Some(error) = checkpoint_failure.as_ref() {
-                // A continuation without its checkpoint is not safely
-                // resumable. Make that the authoritative terminal truth
-                // rather than logging a best-effort failure and claiming the
-                // work window closed correctly.
-                terminal.outcome = TaskOutcome::Failed;
+                // A checkpoint is a derived projection. Its failure does not
+                // erase the committed transcript or settle the user's goal.
+                // Pause explicitly; resume can rebuild from canonical history.
+                terminal.outcome = TaskOutcome::Interrupted;
                 terminal.reason = Some(format!("continuation checkpoint failed: {error}"));
                 // A checkpoint failure is not a provider failure: do not carry
                 // a stale provider error beside a different reason.
                 terminal.failure = None;
-                terminal.stop = None;
-                terminal.status = SessionStatus::Failed;
-                terminal.state = AgentState::Failed;
+                terminal.status = SessionStatus::Interrupted;
+                terminal.state = AgentState::Execute;
                 if let Some(goal) = terminal.goal.as_mut() {
-                    goal.settle = true;
+                    goal.settle = false;
                 }
                 terminal.warnings.clear();
-                goal_continues = false;
+                goal_continues = true;
             }
         }
         if let Some(started) = resolution_phase {
@@ -1163,7 +1433,29 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
-        self.run_task(session_id, spec, false, observer, cancellation)
+        self.run_with_content(
+            session_id,
+            spec,
+            vec![ContentPart::Text {
+                text: spec.runtime.goal.clone(),
+            }],
+            observer,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Run a goal whose initiating message includes attachments. Content changes
+    /// the input representation, never the Goal profile or lifecycle owner.
+    pub async fn run_with_content(
+        &self,
+        session_id: &SessionId,
+        spec: &TaskSpec,
+        content: Vec<ContentPart>,
+        observer: &mut (dyn FnMut(EngineEvent) + Send),
+        cancellation: CancellationToken,
+    ) -> Result<TaskReport, EngineError> {
+        self.run_task(session_id, spec, false, content, observer, cancellation)
             .await
     }
 
@@ -1187,8 +1479,17 @@ impl CodingRuntime {
             &self.factory.model,
         )
         .map_err(EngineError::Config)?;
-        self.run_task(session_id, spec, true, observer, cancellation)
-            .await
+        self.run_task(
+            session_id,
+            spec,
+            true,
+            vec![ContentPart::Text {
+                text: spec.runtime.goal.clone(),
+            }],
+            observer,
+            cancellation,
+        )
+        .await
     }
 
     async fn run_task(
@@ -1196,6 +1497,7 @@ impl CodingRuntime {
         session_id: &SessionId,
         spec: &TaskSpec,
         develop: bool,
+        content: Vec<ContentPart>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -1264,7 +1566,7 @@ impl CodingRuntime {
                     .await
             }
             (false, ExecutionKind::Direct) => {
-                self.run_direct(&log, &runner, spec, &goal, observer, cancellation)
+                self.run_direct(&log, &runner, spec, &goal, content, observer, cancellation)
                     .await
             }
             (false, ExecutionKind::Parallel) => Err(EngineError::Config(
@@ -1340,20 +1642,8 @@ impl CodingRuntime {
                 leveler_model::ContentPart::Text { text } => Some(text.as_str()),
                 _ => None,
             })
-            .next();
-        let prior = self
-            .assembled_prior(
-                &log,
-                session_id,
-                raw,
-                objective_hint,
-                None,
-                Some(&GitWorkspace::new(&spec.coding.repository)),
-                &self.context_summarizer(&cancellation),
-                &cancellation,
-                observer,
-            )
-            .await?;
+            .next()
+            .map(str::to_string);
         let runner = TurnRunner {
             stores: &self.engine.stores,
             token: token.clone(),
@@ -1364,10 +1654,11 @@ impl CodingRuntime {
             lost_child_voice: Some(self.lost_child_voice(session_id)),
         };
         let prior_epoch_open = self.prior_epoch_open(session_id).await?;
-        let initiating_message = Message {
-            role: Role::User,
-            content: content.clone(),
-        };
+        let initiating_message = Message::from_parts(
+            Role::User,
+            content.clone(),
+            Some(TranscriptOrigin::UserInput),
+        );
         let terminal_cancellation = cancellation.clone();
         let result = async {
             let recorded = runner
@@ -1382,11 +1673,35 @@ impl CodingRuntime {
                     },
                     observer,
                     cancellation.clone(),
-                    |ports| {
+                    |ports| async {
+                        let prior = self
+                            .assembled_prior(
+                                &log,
+                                session_id,
+                                raw,
+                                objective_hint.as_deref(),
+                                false,
+                                None,
+                                Some(&GitWorkspace::new(&spec.coding.repository)),
+                                &self.context_summarizer(
+                                    session_id,
+                                    &ports.budget_scope,
+                                    spec.runtime.limits,
+                                    &cancellation,
+                                ),
+                                &cancellation,
+                                &mut |_| {},
+                            )
+                            .await
+                            .map_err(crate::coding::turn::seed_failure)?;
                         drive_turn(
                             &self.factory,
                             chat_profile(spec),
-                            TurnInput::Content { prior, content },
+                            TurnInput::Content {
+                                prior,
+                                content,
+                                origin: TranscriptOrigin::UserInput,
+                            },
                             prior_epoch_open,
                             session_id.clone(),
                             self.engine.stores.events.clone(),
@@ -1397,6 +1712,7 @@ impl CodingRuntime {
                             ports,
                             cancellation.clone(),
                         )
+                        .await
                     },
                 )
                 .await?;
@@ -1404,6 +1720,7 @@ impl CodingRuntime {
                 &log,
                 &runner,
                 spec,
+                recorded.turn_id.as_str(),
                 recorded.outcome,
                 self.factory.independent_review,
                 observer,
@@ -1630,19 +1947,47 @@ impl CodingRuntime {
         // pre-checkpoint full-history path below.
         // Same rules as chat: a checkpoint's block when one is fresh, else the
         // snapshot merged with the post-snapshot rows, folded if still oversized.
-        let prior = self
+        let prior_result = async {
+            let scope = lineage.goal_id.as_ref().map(|id| id.as_str()).unwrap_or(lineage.root_turn_id.as_str());
+            let scoped = crate::coding::turn::persisted_budget_progress(self.engine.stores.events.as_ref(), session_id, scope).await?;
+            let latest = crate::coding::turn::last_persisted_progress(self.engine.stores.events.as_ref(), session_id).await?.unwrap_or_default();
+            if scoped.is_none() && latest.budget_scope.is_none()
+                && (latest.cumulative_model_tokens > 0 || latest.cumulative_cost_usd_micros > 0)
+                && (spec.runtime.limits.max_model_tokens.is_some() || spec.runtime.limits.max_cost_usd_micros.is_some()) {
+                return Err(EngineError::Config("cannot reconstruct capped legacy task budget: request scope attribution is unavailable".into()));
+            }
+            self
             .assembled_prior(
                 &log,
                 session_id,
                 raw,
                 Some(lineage.objective.text()),
+                true,
                 checkpoint_scope.as_ref(),
                 Some(&GitWorkspace::new(&spec.coding.repository)),
-                &self.context_summarizer(&cancellation),
+                &self.context_summarizer(session_id, lineage.goal_id.as_ref().map(|id| id.as_str()).unwrap_or(lineage.root_turn_id.as_str()), spec.runtime.limits, &cancellation),
                 &cancellation,
                 observer,
             )
-            .await?;
+            .await
+        }.await;
+        let prior = match prior_result {
+            Ok(prior) => prior,
+            Err(error) => {
+                let result = Err(error);
+                self.finish_from_result(
+                    &token,
+                    session_id,
+                    &result,
+                    lineage.goal_id.as_ref(),
+                    Some(&spec.coding.repository),
+                    observer,
+                    &cancellation,
+                )
+                .await?;
+                return result;
+            }
+        };
         let runner = TurnRunner {
             stores: &self.engine.stores,
             token: token.clone(),
@@ -1846,6 +2191,11 @@ impl CodingRuntime {
             ResumeTurnKind::Chat => TurnKind::Chat,
             ResumeTurnKind::Goal => TurnKind::User,
         };
+        let budget_scope = lineage
+            .goal_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| lineage.root_turn_id.to_string());
         let start = leveler_engine::TurnStart::Continue {
             message: instruction.clone(),
             objective: lineage.objective.clone(),
@@ -1885,6 +2235,7 @@ impl CodingRuntime {
             log,
             runner,
             spec,
+            &budget_scope,
             recorded.outcome,
             self.factory.independent_review,
             observer,
@@ -1928,6 +2279,7 @@ impl CodingRuntime {
                 log,
                 runner,
                 spec,
+                goal_id.as_str(),
                 DEVELOP_ANALYZE,
                 ANALYZE_HEADLINE,
                 analyze_brief(&goal),
@@ -1952,10 +2304,16 @@ impl CodingRuntime {
                     runner,
                     spec,
                     goal_id,
-                    coding_task(&goal, &work_order),
+                    Message::user(
+                        coding_task(&goal, &work_order),
+                        TranscriptOrigin::RuntimeNotice {
+                            notice: RuntimeNoticeKind::DevelopTask,
+                        },
+                    ),
                     // Develop owns its own Review stage; the closure reviewer
                     // would read the same diff a second time on the same bill.
                     IndependentReviewPolicy::Off,
+                    true,
                     observer,
                     cancellation.clone(),
                 )
@@ -1983,6 +2341,7 @@ impl CodingRuntime {
                     log,
                     runner,
                     spec,
+                    goal_id.as_str(),
                     DEVELOP_REVIEW,
                     REVIEW_HEADLINE,
                     brief,
@@ -1997,6 +2356,9 @@ impl CodingRuntime {
             match progress.advance(decision) {
                 DevelopStep::Stop(DevelopTerminal::ReviewPassed) => return Ok(report),
                 DevelopStep::Stop(terminal) => {
+                    report.outcome = TaskOutcome::Interrupted;
+                    report.stop_reason = StopReason::Stalled;
+                    report.stop_detail = Some(develop_stop_warning(&terminal));
                     report
                         .completion_warnings
                         .push(develop_stop_warning(&terminal));
@@ -2014,6 +2376,7 @@ impl CodingRuntime {
                             log,
                             runner,
                             spec,
+                            goal_id.as_str(),
                             DEVELOP_ANALYZE,
                             REANALYZE_HEADLINE,
                             reanalyze_brief(&goal, &work_order, &feedback),
@@ -2024,6 +2387,10 @@ impl CodingRuntime {
                         )
                         .await?
                     else {
+                        report.outcome = TaskOutcome::Interrupted;
+                        report.stop_reason = StopReason::Stalled;
+                        report.stop_detail =
+                            Some("develop: re-analysis produced no work order".to_string());
                         report.completion_warnings.push(
                             "develop: stopped before Review passed — re-analysis produced no \
                              work order"
@@ -2049,6 +2416,7 @@ impl CodingRuntime {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
+        budget_scope: &str,
         nickname: &'static str,
         headline: &str,
         brief: String,
@@ -2065,11 +2433,13 @@ impl CodingRuntime {
         log.append(None, stage("launching", nickname.to_string()), observer)
             .await?;
         // Elapsed is the parent's spent wall time; these stages run at the
-        // edges of the turn rather than as its tail, so they start from zero.
+        // edges of the turn; run_harness_child derives their task residual
+        // from durable scoped spend rather than opening a new budget.
         match run_harness_child(
             runner,
             &self.factory,
             goal_profile(spec),
+            budget_scope,
             nickname,
             headline.to_string(),
             brief,
@@ -2115,6 +2485,7 @@ impl CodingRuntime {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         goal_id: &leveler_core::GoalId,
+        content: Vec<ContentPart>,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
@@ -2123,8 +2494,9 @@ impl CodingRuntime {
             runner,
             spec,
             goal_id,
-            spec.runtime.goal.clone(),
+            Message::from_parts(Role::User, content, Some(TranscriptOrigin::UserInput)),
             self.factory.independent_review,
+            false,
             observer,
             cancellation,
         )
@@ -2144,31 +2516,37 @@ impl CodingRuntime {
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
         goal_id: &leveler_core::GoalId,
-        task: String,
+        task: Message,
         review_policy: IndependentReviewPolicy,
+        continues_task_budget: bool,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
         // Multi-turn Goal: inject bounded session history so follow-ups can
         // resolve deictic references ("刚才那个超时").
+        let objective_text = content_objective_text(&task.content);
         let prior = self
             .bounded_session_history(
                 log,
                 &runner.session_id,
                 goal_id,
-                &task,
+                &objective_text,
                 Some(&spec.coding.repository),
+                spec.runtime.limits,
                 &cancellation,
                 observer,
             )
             .await?;
-        let prior_epoch_open = self.prior_epoch_open(&runner.session_id).await?;
+        let prior_epoch_open =
+            continues_task_budget || self.prior_epoch_open(&runner.session_id).await?;
         let recorded = runner
             .run_turn(
                 TurnKind::User,
                 leveler_engine::TurnStart::Anchored {
-                    message: Message::text(Role::User, task.clone()),
-                    objective: leveler_lifecycle::ObjectiveAnchor::from_session_goal(task.clone()),
+                    message: task.clone(),
+                    objective: leveler_lifecycle::ObjectiveAnchor::from_session_goal(
+                        objective_text.clone(),
+                    ),
                     goal_id: Some(goal_id.clone()),
                 },
                 observer,
@@ -2178,7 +2556,12 @@ impl CodingRuntime {
                         &self.factory,
                         goal_profile(spec),
                         TurnInput::Goal {
-                            goal: task,
+                            goal: objective_text,
+                            origin: task
+                                .origin
+                                .clone()
+                                .expect("coding turn message records its origin"),
+                            content: task.content,
                             prior,
                             goal_id: goal_id.clone(),
                         },
@@ -2202,6 +2585,7 @@ impl CodingRuntime {
             log,
             runner,
             spec,
+            goal_id.as_str(),
             recorded.outcome,
             review_policy,
             observer,
@@ -2219,10 +2603,10 @@ impl CodingRuntime {
         goal_id: &leveler_core::GoalId,
         goal: &str,
         repo: Option<&std::path::Path>,
+        limits: StepLimits,
         cancellation: &CancellationToken,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<Vec<leveler_model::Message>, EngineError> {
-        const GOAL_HISTORY_MAX: usize = 24;
         let scope = crate::coding::checkpoint::latest_goal_checkpoint_scope(
             &self.engine.stores,
             session_id,
@@ -2248,7 +2632,7 @@ impl CodingRuntime {
                     repo.map(GitWorkspace::new)
                         .as_ref()
                         .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
-                    &self.context_summarizer(cancellation),
+                    &self.context_summarizer(session_id, goal_id.as_str(), limits, cancellation),
                     cancellation,
                     observer,
                     scope,
@@ -2257,15 +2641,19 @@ impl CodingRuntime {
         {
             return Ok(prior);
         }
-        let context = raw
-            .assemble(
-                log,
-                None,
-                Some(goal),
-                u64::from(crate::coding::policy::CHAT_CONTEXT_BUDGET),
-            )
-            .await?;
-        Ok(bound_goal_history(context.prior, GOAL_HISTORY_MAX))
+        self.assembled_prior(
+            log,
+            session_id,
+            raw,
+            Some(goal),
+            true,
+            None,
+            None,
+            &self.context_summarizer(session_id, goal_id.as_str(), limits, cancellation),
+            cancellation,
+            observer,
+        )
+        .await
     }
 
     /// Settle the configured required review before the terminal boundary.
@@ -2277,6 +2665,7 @@ impl CodingRuntime {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
+        budget_scope: &str,
         modified_files: &[String],
         execution_duration_ms: u64,
         // The policy in force for THIS conclusion. Normally the factory's, but
@@ -2325,6 +2714,7 @@ impl CodingRuntime {
             runner,
             &self.factory,
             goal_profile(spec),
+            budget_scope,
             "reviewer",
             // Unchanged: the closure reviewer has always announced itself with
             // its brief, and nothing in this change is about that path.
@@ -2376,6 +2766,7 @@ impl CodingRuntime {
         log: &EventLog<'_>,
         runner: &TurnRunner<'_>,
         spec: &TaskSpec,
+        budget_scope: &str,
         outcome: crate::AgentOutcome,
         review_policy: IndependentReviewPolicy,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
@@ -2406,6 +2797,7 @@ impl CodingRuntime {
                 log,
                 runner,
                 spec,
+                budget_scope,
                 &task_report.modified_files,
                 task_report.execution_duration_ms,
                 review_policy,
@@ -2437,41 +2829,26 @@ impl CodingRuntime {
         Ok(task_report)
     }
 
-    /// Best-effort model handoff briefing for a pre-request fold: only called
-    /// when the raw history exceeds the compact threshold, and any failure
-    /// degrades to the bare-breadcrumb fold (never blocks the turn).
-    /// The handoff-briefing producer [`leveler_engine::RawTranscript::assemble`] calls
-    /// only when the merged context is still over the fold threshold.
+    /// Produce a tracked handoff briefing when the projected request exceeds
+    /// its resolved context threshold. Rejected summaries preserve history;
+    /// request or accounting failures propagate to the durable turn.
     pub fn context_summarizer<'a>(
         &'a self,
+        session_id: &'a SessionId,
+        budget_scope: &str,
+        limits: StepLimits,
         cancellation: &'a CancellationToken,
     ) -> ModelSummarizer<'a> {
         ModelSummarizer {
             runtime: self.factory.runtime.as_ref(),
             model: &self.factory.model,
             cancellation,
+            engine: &self.engine,
+            session_id,
+            limits,
+            budget_scope: budget_scope.to_string(),
+            overrides: self.factory.overrides.as_ref(),
         }
-    }
-
-    pub async fn summarize_if_over(
-        &self,
-        raw: &[leveler_model::Message],
-        cancellation: &CancellationToken,
-    ) -> Option<String> {
-        if leveler_context::estimate_tokens(raw) <= leveler_context::PRE_REQUEST_COMPACT_THRESHOLD {
-            return None;
-        }
-        crate::summarize_with_model(
-            self.factory.runtime.as_ref(),
-            &self.factory.model,
-            None,
-            raw,
-            leveler_context::COMPACT_KEEP_RECENT,
-            0,
-            cancellation,
-        )
-        .await
-        .map(|summary| summary.text)
     }
 }
 
@@ -2489,6 +2866,7 @@ async fn run_harness_child(
     runner: &TurnRunner<'_>,
     factory: &ExecutorFactory,
     profile: TurnProfile,
+    budget_scope: &str,
     // What this child is FOR, in the user's vocabulary: `reviewer` for the
     // closure review, `analyze` / `review` for the Develop workflow's reading
     // stages. It names the child in events and in the parent's rollup.
@@ -2512,11 +2890,43 @@ async fn run_harness_child(
     observer: &mut (dyn FnMut(EngineEvent) + Send),
     cancellation: CancellationToken,
 ) -> Result<HarnessChildOutcome, ReviewRunError> {
-    let executor = factory
+    let profile_for_budget = profile.clone();
+    let mut executor = factory
         .build(profile, None)
         .await
         .map_err(ReviewRunError::Launch)?
-        .with_execution_fence(runner.ownership_fence());
+        .with_execution_fence(runner.ownership_fence())
+        .with_budget_scope(budget_scope.to_string())
+        .with_model_request_store(
+            runner.stores.model_requests.clone(),
+            runner.session_id.clone(),
+        );
+    let prior_progress = crate::coding::turn::persisted_budget_progress(
+        runner.stores.events.as_ref(),
+        &runner.session_id,
+        budget_scope,
+    )
+    .await
+    .map_err(ReviewRunError::Launch)?
+    .unwrap_or_default();
+    let prior_progress = crate::coding::turn::reconcile_model_spend(
+        prior_progress,
+        runner.stores.model_requests.as_ref(),
+        &runner.session_id,
+        budget_scope,
+    )
+    .await
+    .map_err(ReviewRunError::Launch)?;
+    executor = executor.with_residual_budget(&prior_progress, parent_elapsed);
+    if prior_progress.has_unpriced_model_attempt
+        && crate::coding::factory::profile_step_limits(&profile_for_budget)
+            .max_cost_usd_micros
+            .is_some()
+    {
+        return Err(ReviewRunError::Launch(EngineError::Config(
+            "cannot run reviewer under cost cap after an unpriced attempt".into(),
+        )));
+    }
     let id = format!("{nickname}-{}", leveler_core::RequestId::generate());
     let (profile_id, profile_role, read_only) = crate::child_profile_trace("reviewer");
     let (profile_id_trace, profile_role_trace, read_only_trace) =
@@ -2541,14 +2951,19 @@ async fn run_harness_child(
         .await
         .map_err(ReviewRunError::Launch)?;
     let settlement = async {
-        // The reviewer's model calls arrive as progress events; the engine's
-        // own sink is the only thing that can make them rows. Collect here,
-        // write below — the child drains its channel after it finishes.
-        let mut child_records: Vec<crate::ModelRequestRecord> = Vec::new();
+        // Child requests are already durable before progress arrives. Fold
+        // those same facts live; no second insertion or request buffer.
+        let mut progress = prior_progress.clone();
+        let child_started = std::time::Instant::now();
         let result = {
             let mut forward = |event: crate::AgentEvent| {
                 if let crate::AgentEvent::SubAgentModelRequest { record } = &event {
-                    child_records.push((**record).clone());
+                    progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
+                    progress.absorb_request_spend(
+                        record.usage.total(),
+                        record.estimated_tokens.unwrap_or(0),
+                        record.cost_usd_micros.unwrap_or(0),
+                    );
                 }
                 observer(EngineEvent::from(event))
             };
@@ -2557,7 +2972,7 @@ async fn run_harness_child(
                     id.clone(),
                     brief,
                     files,
-                    parent_elapsed,
+                    std::time::Duration::ZERO,
                     model,
                     &mut forward,
                     cancellation,
@@ -2568,28 +2983,10 @@ async fn run_harness_child(
         // and commands fold in from its ledger, and its TOKENS AND COST fold in
         // from the very records being written down here — the same authority
         // the bill reconciles against, never a second summary of it.
-        let mut progress = crate::coding::turn::last_persisted_progress(
-            runner.stores.events.as_ref(),
-            &runner.session_id,
-        )
-        .await?
-        .unwrap_or_default();
-        for record in &child_records {
-            runner
-                .stores
-                .model_requests
-                .insert(&leveler_engine::storage_model_request(
-                    record,
-                    &runner.session_id,
-                ))
-                .await?;
-            progress.absorb_request_spend(
-                record.usage.total(),
-                0,
-                record.cost_usd_micros.unwrap_or(0),
-            );
-        }
         progress.absorb_child_work(&result.progress);
+        progress.cumulative_duration_ms = progress
+            .cumulative_duration_ms
+            .saturating_add(child_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
         runner
             .log
             .append(
@@ -2797,9 +3194,9 @@ async fn review_diff(repo: &std::path::Path, files: &[String]) -> Option<String>
                 .args(&files)
                 .output()
                 .ok()?;
-            out.status.success().then(|| {
-                String::from_utf8_lossy(&out.stdout).into_owned()
-            })
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
         };
         let diff = run(&["diff"]).unwrap_or_default();
         let untracked: Vec<String> = run(&["status", "--porcelain"])
@@ -2824,7 +3221,7 @@ async fn review_diff(repo: &std::path::Path, files: &[String]) -> Option<String>
             }
         }
         if !untracked.is_empty() {
-            out.push_str("\nNEW (untracked) files — each is entirely part of the change; read it directly:\n");
+            out.push_str("\nNEW (untracked) files, each entirely part of the change:\n");
             for path in untracked {
                 out.push_str(&format!("- {path}\n"));
             }
@@ -2838,12 +3235,9 @@ async fn review_diff(repo: &std::path::Path, files: &[String]) -> Option<String>
 
 /// The brief handed to a harness-launched reviewer.
 ///
-/// It names the task, the changed files, and — when derivable — the actual
-/// unified diff, with a bounded conclusion contract. The reviewer is read-only
-/// and must reach its own conclusions from the code, not from the implementing
-/// agent's account of what it did; but it must judge THE CHANGE, not re-derive
-/// it: briefs that only listed file paths sent every recent reviewer into
-/// whole-repository exploration and round-budget death with zero findings.
+/// It names the task and the change (the diff when git can produce one, otherwise
+/// the file list). How far to read, and whether to run anything, is the reviewer's
+/// decision. The seat is already read-only.
 fn review_brief(goal: &str, files: &[String], diff: Option<&str>) -> String {
     // A wide diff is exactly the case that triggers review; listing hundreds of
     // paths would spend the reviewer's context before it reads anything.
@@ -2863,30 +3257,14 @@ fn review_brief(goal: &str, files: &[String], diff: Option<&str>) -> String {
     let change = match diff {
         Some(diff) => format!(
             "The change, as a unified diff of the changed file(s):\n\
-             ```diff\n{diff}\n```\n\n\
-             Judge THIS diff — do not survey the rest of the repository. Read a \
-             changed file or its direct callers only where the diff's context is \
-             not enough to judge correctness."
+             ```diff\n{diff}\n```"
         ),
-        None => format!(
-            "Files changed:\n{listed}{more}\n\n\
-             Start from the change itself: if git is available, run \
-             `git diff -- <file>` on the changed files first; only read beyond \
-             the change where its context is not enough to judge correctness. \
-             Do not survey the rest of the repository."
-        ),
+        None => format!("Files changed:\n{listed}{more}"),
     };
     format!(
         "Independently review the change that was just made for this task.\n\n\
          Task: {goal}\n\n\
-         {change}\n\n\
-         Report each concrete defect the moment you confirm it with one \
-         report_finding call — correctness, security, concurrency and error \
-         paths first — naming the file and the specific problem. Your round \
-         budget is small and fixed: when every hunk is judged, conclude \
-         immediately with a short final verdict — the defects found, or an \
-         explicit \"no blocking defects\". Do not re-run builds or tests; do \
-         not invent findings."
+         {change}\n"
     )
 }
 
@@ -2903,9 +3281,9 @@ pub(crate) fn direct_non_success_outcome(stop: crate::StopReason) -> Option<Task
         S::BudgetExhausted | S::TurnLimitReached => Some(TaskOutcome::BudgetLimited),
         // The model said the goal cannot be reached as stated.
         S::Blocked => Some(TaskOutcome::Blocked),
-        // Every action refused for several rounds, or a goal that went quiet
-        // through every nudge: never success.
-        S::Incomplete | S::Stalled => Some(TaskOutcome::Failed),
+        // A stalled work window leaves its goal owed and explicitly resumable.
+        S::Stalled => Some(TaskOutcome::Interrupted),
+        S::Incomplete => Some(TaskOutcome::Failed),
     }
 }
 #[cfg(test)]
@@ -2927,13 +3305,15 @@ mod review_brief_tests {
         );
         assert!(brief.contains("```diff"), "{brief}");
         assert!(brief.contains("-old\n+new"), "{brief}");
-        assert!(brief.contains("Judge THIS diff"), "{brief}");
-        assert!(
-            brief.contains("do not survey the rest of the repository"),
-            "{brief}"
-        );
-        assert!(brief.contains("no blocking defects"), "{brief}");
-        assert!(brief.contains("report_finding"), "{brief}");
+        assert!(brief.contains("Task: add --json"), "{brief}");
+        for banned in [
+            "do not survey",
+            "Do not re-run",
+            "the moment you confirm",
+            "conclude immediately",
+        ] {
+            assert!(!brief.contains(banned), "{banned} in {brief}");
+        }
     }
 
     #[test]
@@ -2941,9 +3321,9 @@ mod review_brief_tests {
         let files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
         let brief = review_brief("add --json", &files, None);
         assert!(brief.contains("- src/a.rs"), "{brief}");
-        assert!(brief.contains("git diff -- <file>"), "{brief}");
-        assert!(brief.contains("Do not survey the rest"), "{brief}");
-        assert!(brief.contains("no blocking defects"), "{brief}");
+        assert!(brief.contains("- src/b.rs"), "{brief}");
+        assert!(!brief.contains("git diff -- <file>"), "{brief}");
+        assert!(!brief.contains("Do not survey"), "{brief}");
     }
 
     #[tokio::test]
@@ -3065,7 +3445,7 @@ mod terminal_mapping_tests {
         );
         assert_eq!(
             direct_non_success_outcome(crate::StopReason::Stalled),
-            Some(TaskOutcome::Failed)
+            Some(TaskOutcome::Interrupted)
         );
         assert_eq!(
             direct_non_success_outcome(crate::StopReason::BudgetExhausted),
@@ -3167,70 +3547,6 @@ mod session_review_tests {
 }
 
 #[cfg(test)]
-mod goal_history_tests {
-    use super::bound_goal_history;
-    use leveler_model::{ContentPart, Message, Role};
-
-    fn long_prior(n: usize) -> Vec<Message> {
-        (0..n)
-            .map(|i| Message {
-                role: if i % 2 == 0 {
-                    Role::User
-                } else {
-                    Role::Assistant
-                },
-                content: vec![ContentPart::Text {
-                    text: format!("message {i}"),
-                }],
-            })
-            .collect()
-    }
-
-    #[test]
-    fn bound_goal_history_keeps_tail() {
-        let raw = long_prior(10);
-        let bound = bound_goal_history(raw.clone(), 4);
-        assert_eq!(bound.len(), 4);
-        assert_eq!(
-            bound.last().unwrap().text_content(),
-            raw.last().unwrap().text_content()
-        );
-    }
-
-    /// A count bound can land on a tool result. Goal history is prepended to a
-    /// fresh System + User, so a leading result would be the orphan DeepSeek
-    /// rejects with "role 'tool' must follow 'tool_calls'".
-    #[test]
-    fn bound_goal_history_never_starts_on_an_orphan_result() {
-        let call = Message {
-            role: Role::Assistant,
-            content: vec![ContentPart::ToolCall {
-                call: leveler_model::ToolCall {
-                    id: leveler_core::ToolCallId::new("c1"),
-                    name: "read_file".into(),
-                    arguments: serde_json::json!({}),
-                },
-            }],
-        };
-        let result = Message {
-            role: Role::Tool,
-            content: vec![ContentPart::ToolResult {
-                result: leveler_model::ToolResultContent {
-                    call_id: leveler_core::ToolCallId::new("c1"),
-                    content: "ok".into(),
-                    is_error: false,
-                },
-            }],
-        };
-        // `max = 1` would slice exactly the result.
-        let raw = vec![Message::text(Role::User, "task"), call, result];
-        let bound = bound_goal_history(raw, 1);
-        assert_ne!(bound[0].role, Role::Tool, "tail began on a tool result");
-        assert_eq!(bound[0].role, Role::Assistant);
-    }
-}
-
-#[cfg(test)]
 mod seed_tests {
     use super::*;
     use leveler_lifecycle::{PlanOrigin, PlanStep};
@@ -3277,7 +3593,7 @@ mod seed_tests {
     }
 
     #[test]
-    fn coding_mutation_normalizes_answered_into_completion_projection() {
+    fn coding_mutation_preserves_the_answered_declaration() {
         let mut report = TaskReport::new(
             TaskOutcome::Completed,
             "done".to_string(),
@@ -3285,7 +3601,7 @@ mod seed_tests {
             StopReason::Answered,
             1,
         );
-        assert_eq!(task_terminal_stop(&report), StopReason::Completed);
+        assert_eq!(task_terminal_stop(&report), StopReason::Answered);
 
         report.modified_files.clear();
         assert_eq!(task_terminal_stop(&report), StopReason::Answered);

@@ -40,9 +40,10 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a public HTTP(S) URL and return text content (docs, raw files). \
-         Blocks private/link-local/metadata addresses (SSRF protection). \
-         Prefer this over shell curl. Does not require a search API key."
+        "Fetch a public HTTP or HTTPS URL and return its text. Refuses private, \
+         link-local, and metadata addresses. Fails when network is denied for \
+         this turn. Does not use a search API key. Optional `max_bytes` caps \
+         the returned body."
     }
 
     fn input_schema(&self) -> serde_json::Value {

@@ -93,10 +93,52 @@ fn default_true() -> bool {
     true
 }
 
+/// `memory:` — whether durable project memory is part of this project at all.
+///
+/// This is the ONE user-visible switch for the memory capability. It is
+/// deliberately separate from `work_profile`: economy is a cost/surface
+/// decision, not a privacy decision, and it used to be the only way to stop
+/// memory. Default is ON because that is the behaviour every existing session
+/// already had (memory was admitted for every non-economy turn), so an absent
+/// block cannot silently change what a user's memory store does.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MemoryConfig {
+    /// When false: no turn is admitted to memory extraction, no background
+    /// provider request runs, no memory catalog/recall reaches the model, and
+    /// the memory tools are not exposed. Existing memory data is NOT deleted.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `rules:` — deterministic delivery policy for project-rule documents.
+///
+/// Rule documents are authority-bearing, so their DELIVERY is decided by the
+/// runtime, never by a model. This block names which sections must always be
+/// present in full (heading substrings, matched case-insensitively) and the
+/// per-document delivery budget. Everything else stays indexed and retrievable
+/// verbatim through `read_project_rules`, so nothing loses authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RulesConfig {
+    /// Heading or section-id substrings always delivered first, in document
+    /// order. An empty list means document order only.
+    #[serde(default)]
+    pub always_delivered: Vec<String>,
+    /// Per-document delivery budget in bytes. `None` uses the loader's
+    /// built-in default.
+    #[serde(default)]
+    pub budget_bytes: Option<usize>,
+}
+
 /// The parsed `.leveler/config.yaml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ProjectConfig {
-    /// Default model reference (e.g. `deepseek/deepseek-v4-pro`).
+    /// Default model reference (e.g. `deepseek/deepseek-flash`).
     #[serde(default)]
     pub model: Option<String>,
     /// Default permission profile (`request_approval` | `assisted` | `full_access`).
@@ -111,6 +153,12 @@ pub struct ProjectConfig {
     /// Multi-agent delegation settings.
     #[serde(default)]
     pub agents: AgentsConfig,
+    /// Durable project memory. Absent = enabled (the historical behaviour).
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    /// Deterministic project-rule delivery policy.
+    #[serde(default)]
+    pub rules: RulesConfig,
     /// Extra ignore globs.
     #[serde(default)]
     pub ignore: Vec<String>,
@@ -225,6 +273,34 @@ ignore:
             always.agents.independent_review,
             IndependentReview::Required
         );
+    }
+
+    #[test]
+    fn memory_is_enabled_by_default_and_can_be_switched_off() {
+        // An absent block keeps the behaviour every existing session had.
+        let cfg: ProjectConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.memory.enabled);
+        let default = ProjectConfig::default();
+        assert!(default.memory.enabled);
+
+        // An explicit block wins.
+        let off: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: false\n").unwrap();
+        assert!(!off.memory.enabled);
+        let on: ProjectConfig = serde_yaml::from_str("memory:\n  enabled: true\n").unwrap();
+        assert!(on.memory.enabled);
+    }
+
+    #[test]
+    fn rules_delivery_policy_is_optional_and_deterministic() {
+        let cfg: ProjectConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.rules.always_delivered.is_empty());
+        assert_eq!(cfg.rules.budget_bytes, None);
+        let cfg: ProjectConfig = serde_yaml::from_str(
+            "rules:\n  always_delivered:\n    - 架构门禁\n  budget_bytes: 16000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.rules.always_delivered, vec!["架构门禁".to_string()]);
+        assert_eq!(cfg.rules.budget_bytes, Some(16000));
     }
 
     #[test]

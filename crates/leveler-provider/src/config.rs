@@ -32,8 +32,6 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub timeouts: Timeouts,
-    #[serde(default)]
-    pub retry: RetryConfig,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -46,7 +44,6 @@ impl std::fmt::Debug for ProviderConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("headers", &self.headers)
             .field("timeouts", &self.timeouts)
-            .field("retry", &self.retry)
             .finish()
     }
 }
@@ -78,28 +75,6 @@ mod default_timeout_tests {
         let timeouts = Timeouts::default();
         assert_eq!(timeouts.request_seconds, 120);
         assert_eq!(timeouts.idle_stream_seconds, 60);
-        assert_eq!(RetryConfig::default().max_attempts, 2);
-    }
-}
-
-/// Retry/backoff configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetryConfig {
-    pub max_attempts: u32,
-    pub initial_backoff_ms: u64,
-    pub max_backoff_ms: u64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            // One fast retry for a provably pre-delivery failure. Deeper
-            // recovery belongs to the logical round, so the two layers do not
-            // multiply into a large HTTP-attempt count.
-            max_attempts: 2,
-            initial_backoff_ms: 500,
-            max_backoff_ms: 10_000,
-        }
     }
 }
 
@@ -128,6 +103,8 @@ pub enum ConfigError {
     },
     #[error("config file {path} has invalid reasoning config: {reason}")]
     InvalidReasoning { path: String, reason: String },
+    #[error("config file {path} has invalid model limits: {reason}")]
+    InvalidLimits { path: String, reason: String },
 }
 
 /// Expand `${VAR}` and `${VAR:-default}` references in a string using a lookup
@@ -291,7 +268,6 @@ mod tests {
             api_key: Some("   ".into()),
             headers: Default::default(),
             timeouts: Default::default(),
-            retry: Default::default(),
         };
         // Whitespace-only inline is treated as absent; no env name → keyless.
         assert_eq!(resolve_api_key(&cfg).unwrap(), None);
@@ -315,16 +291,11 @@ timeouts:
   connect_seconds: 5
   request_seconds: 30
   idle_stream_seconds: 10
-retry:
-  max_attempts: 2
-  initial_backoff_ms: 100
-  max_backoff_ms: 1000
 "#;
         let cfg: ProviderConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.id, "deepseek");
         assert_eq!(cfg.protocol, ProtocolKind::OpenAiChat);
         assert_eq!(cfg.timeouts.connect_seconds, 5);
-        assert_eq!(cfg.retry.max_attempts, 2);
     }
 
     #[test]
@@ -359,7 +330,6 @@ mod debug_redaction_tests {
             api_key: Some("sk-super-secret-value".into()),
             headers: Default::default(),
             timeouts: Timeouts::default(),
-            retry: RetryConfig::default(),
         };
         let debug = format!("{config:?}");
         assert!(

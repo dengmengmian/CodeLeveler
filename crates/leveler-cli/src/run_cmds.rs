@@ -40,7 +40,7 @@ pub(crate) async fn cmd_run(
         .with_work_profile(work_profile)
         .with_collaboration(collaboration)
         .with_model_step_ceiling(max_model_steps);
-    if let Some(overrides) = parent_reasoning_override(std::env::var(PARENT_REASONING_ENV).ok())? {
+    if let Some(overrides) = eval_env_overrides()? {
         app = app.with_execution_overrides(overrides);
     }
     let model_ref = resolve_model(&app, model)?;
@@ -81,22 +81,14 @@ pub(crate) async fn cmd_run(
         )
         .await;
 
-    // Ship on success; direct runs with edits are verification-gated by the app.
+    // Shipping eligibility is not evidence that formatting, builds or tests passed.
     if ship.any()
         && output == OutputFormat::Text
         && let Ok(outcome) = &result
         && outcome.stop_reason == StopReason::Completed
         && !outcome.modified_files.is_empty()
     {
-        ship_changes_and_print(
-            &app,
-            &model_ref,
-            &task,
-            &outcome.modified_files,
-            true,
-            &ship,
-        )
-        .await;
+        ship_changes_and_print(&app, &model_ref, &task, &outcome.modified_files, &ship).await;
     }
 
     finish(result, &session_id.to_string(), output)
@@ -1795,19 +1787,11 @@ async fn ship_changes_and_print(
     model: &leveler_model::ModelRef,
     goal: &str,
     modified: &[String],
-    verified: bool,
     ship: &leveler_app::ShipOptions,
 ) {
     println!("{}", Line::heading("Shipping changes"));
     match app
-        .ship_changes(
-            goal,
-            modified,
-            verified,
-            model,
-            ship,
-            CancellationToken::new(),
-        )
+        .ship_changes(goal, modified, model, ship, CancellationToken::new())
         .await
     {
         Ok(out) => {
@@ -2909,9 +2893,103 @@ fn parent_reasoning_override(
     }))
 }
 
+/// MA-PE ablation seam, EVAL ONLY: `LEVELER_EVAL_POST_EDIT_ACTION_THROUGHPUT`
+/// adds the generic independent-action guidance to the top-level run. Its value
+/// selects WHEN the guidance becomes visible: `1`/`true`/`on`/`post_edit`
+/// activates it only after the run's first effective mutation (the experiment
+/// arm); `always` keeps it in the system prompt from round 1 (debug only).
+/// Unset leaves the run untouched; a value other than the accepted switches is
+/// refused rather than silently ignored.
+const POST_EDIT_THROUGHPUT_ENV: &str = "LEVELER_EVAL_POST_EDIT_ACTION_THROUGHPUT";
+
+fn post_edit_action_throughput_override(
+    raw: Option<String>,
+) -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mode = match raw.as_str() {
+        "1" | "true" | "on" | "post_edit" => {
+            leveler_agent::coding::PostEditThroughputMode::PostEdit
+        }
+        "always" => leveler_agent::coding::PostEditThroughputMode::Always,
+        other => anyhow::bail!(
+            "{POST_EDIT_THROUGHPUT_ENV}: expected 1/true/on/post_edit/always, got {other:?}"
+        ),
+    };
+    Ok(Some(leveler_agent::coding::ExecutionOverrides {
+        post_edit_action_throughput: Some(mode),
+        ..Default::default()
+    }))
+}
+
+/// Reasoning-retention ablation seam, EVAL ONLY:
+/// `LEVELER_EVAL_REASONING_RETENTION` projects historical assistant
+/// `Reasoning` parts out of the provider request without touching the durable
+/// transcript. Accepted values: `all` (explicit baseline), `none`, and
+/// `last_<N>` (keep the N most recent reasoning-bearing assistant turns).
+/// Unset leaves production behaviour (`All`) untouched; an unknown value is
+/// refused rather than silently ignored.
+const REASONING_RETENTION_ENV: &str = "LEVELER_EVAL_REASONING_RETENTION";
+
+fn reasoning_retention_override(
+    raw: Option<String>,
+) -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let policy = match raw.as_str() {
+        "all" => leveler_agent::coding::ReasoningRetention::All,
+        "none" => leveler_agent::coding::ReasoningRetention::None,
+        other => match other.strip_prefix("last_") {
+            Some(n) => {
+                let keep: usize = n.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "{REASONING_RETENTION_ENV}: expected all/none/last_<N>, got {other:?}"
+                    )
+                })?;
+                leveler_agent::coding::ReasoningRetention::LastTurns(keep)
+            }
+            None => anyhow::bail!(
+                "{REASONING_RETENTION_ENV}: expected all/none/last_<N>, got {other:?}"
+            ),
+        },
+    };
+    Ok(Some(leveler_agent::coding::ExecutionOverrides {
+        reasoning_retention: Some(policy),
+        ..Default::default()
+    }))
+}
+
+/// Read every eval-only override seam and fold them into ONE override set for
+/// `with_execution_overrides` (which replaces, so the seams must be merged
+/// here rather than applied one after another). `None` when no seam is set.
+fn eval_env_overrides() -> anyhow::Result<Option<leveler_agent::coding::ExecutionOverrides>> {
+    let mut merged = leveler_agent::coding::ExecutionOverrides::default();
+    let mut any = false;
+    if let Some(o) = parent_reasoning_override(std::env::var(PARENT_REASONING_ENV).ok())? {
+        merged.main_reasoning_effort = o.main_reasoning_effort;
+        any = true;
+    }
+    if let Some(o) =
+        post_edit_action_throughput_override(std::env::var(POST_EDIT_THROUGHPUT_ENV).ok())?
+    {
+        merged.post_edit_action_throughput = o.post_edit_action_throughput;
+        any = true;
+    }
+    if let Some(o) = reasoning_retention_override(std::env::var(REASONING_RETENTION_ENV).ok())? {
+        merged.reasoning_retention = o.reasoning_retention;
+        any = true;
+    }
+    Ok(any.then_some(merged))
+}
+
 #[cfg(test)]
 mod parent_reasoning_tests {
-    use super::parent_reasoning_override;
+    use super::{
+        parent_reasoning_override, post_edit_action_throughput_override,
+        reasoning_retention_override,
+    };
     use leveler_model::ReasoningEffort;
 
     #[test]
@@ -2937,6 +3015,94 @@ mod parent_reasoning_tests {
     #[test]
     fn an_unknown_level_is_refused() {
         assert!(parent_reasoning_override(Some("hihg".into())).is_err());
+    }
+
+    #[test]
+    fn the_post_edit_knob_is_unset_unless_the_eval_seam_asks_for_it() {
+        assert!(
+            post_edit_action_throughput_override(None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_post_edit_knob_flips_only_that_input() {
+        for raw in ["1", "true", "on", "post_edit"] {
+            let o = post_edit_action_throughput_override(Some(raw.into()))
+                .unwrap()
+                .expect("override");
+            assert_eq!(
+                o.post_edit_action_throughput,
+                Some(leveler_agent::coding::PostEditThroughputMode::PostEdit)
+            );
+            assert_eq!(
+                o,
+                leveler_agent::coding::ExecutionOverrides {
+                    post_edit_action_throughput: Some(
+                        leveler_agent::coding::PostEditThroughputMode::PostEdit
+                    ),
+                    ..Default::default()
+                },
+                "only the post-edit knob may change"
+            );
+        }
+        let always = post_edit_action_throughput_override(Some("always".into()))
+            .unwrap()
+            .expect("override");
+        assert_eq!(
+            always.post_edit_action_throughput,
+            Some(leveler_agent::coding::PostEditThroughputMode::Always)
+        );
+    }
+
+    #[test]
+    fn an_unknown_post_edit_value_is_refused() {
+        let err = post_edit_action_throughput_override(Some("maybe".into())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected 1/true/on/post_edit/always"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_reasoning_retention_seam_is_unset_unless_asked_for() {
+        assert!(reasoning_retention_override(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn each_reasoning_retention_arm_flips_only_that_input() {
+        use leveler_agent::coding::{ExecutionOverrides, ReasoningRetention};
+        for (raw, expected) in [
+            ("all", ReasoningRetention::All),
+            ("none", ReasoningRetention::None),
+            ("last_3", ReasoningRetention::LastTurns(3)),
+            ("last_0", ReasoningRetention::LastTurns(0)),
+        ] {
+            let o = reasoning_retention_override(Some(raw.into()))
+                .unwrap()
+                .expect("override");
+            assert_eq!(o.reasoning_retention, Some(expected), "{raw}");
+            assert_eq!(
+                o,
+                ExecutionOverrides {
+                    reasoning_retention: Some(expected),
+                    ..Default::default()
+                },
+                "only the retention knob may change ({raw})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_reasoning_retention_value_is_refused() {
+        for raw in ["last_three", "last_", "keep3", ""] {
+            assert!(
+                reasoning_retention_override(Some(raw.into())).is_err(),
+                "{raw:?} must be refused"
+            );
+        }
     }
 }
 

@@ -367,6 +367,22 @@ pub enum EngineEvent {
         kind: String,
         detail: String,
     },
+    /// The harness wrote a message into the model-visible conversation.
+    ///
+    /// Persisted so a later reader can tell a model-chosen round from a
+    /// harness-injected one without re-deriving it from prose. `kind` is a
+    /// stable key chosen by the harness; `role` is the role the injected
+    /// message carries; `model_step` is the 1-based step it precedes. Never
+    /// carries the message text, so it is safe to project.
+    RuntimeInjection {
+        kind: String,
+        role: String,
+        model_step: u32,
+        /// True when the injection buys a model round that would not
+        /// otherwise happen (closeout nudge, provider-response repair).
+        #[serde(default)]
+        forces_continuation: bool,
+    },
     /// Ownership provenance for a child's write scope (`ownership_granted` /
     /// `ownership_denied`). Persisted so an offline audit can tell an
     /// authorized write from a bypass. `detail` carries paths → LocalOnly.
@@ -750,6 +766,9 @@ impl EngineEvent {
             | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
+            // Harness round-attribution fact: persisted locally for eval and
+            // audit; no remote peer needs it, so it stays local.
+            | EngineEvent::RuntimeInjection { .. }
             // Carries the checkpoint payload (paths, plan wording) — local.
             | EngineEvent::GoalCheckpointCreated { .. }
             | EngineEvent::RequirementReady { .. }
@@ -910,6 +929,7 @@ impl EngineEvent {
             | EngineEvent::DelegationStage { .. }
             | EngineEvent::ReviewStage { .. }
             | EngineEvent::EvidenceLedgerUpdated { .. }
+            | EngineEvent::RuntimeInjection { .. }
             // Local control state. It says nothing a remote peer needs and
             // deny-by-default is the right answer for it.
             | EngineEvent::WindowStateUpdated { .. }

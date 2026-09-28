@@ -101,28 +101,18 @@ impl Tool for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a program with an explicit argument array (no shell) in the \
-         workspace: {\"program\": \"cargo\", \"args\": [\"test\"]}. There is no \
-         `cmd` field — a whole shell command line goes to shell_command. \
-         Returns exit code, stdout and stderr. Use for formatters, \
-         builds, and tests. The result starts with `exit: N`; `exit: 0` means \
-         the program succeeded. Judge pass/fail from that exit code — do not \
-         pipe the command through `grep`/`tail`, which discards the real exit \
-         code and can hide a failure. Write temporary files inside the \
-         workspace or under `$TMPDIR`; the system `/tmp` is not writable in \
-         the sandbox. For npm/yarn/pnpm package scripts, call the package \
-         manager script form such as npm run test -- args; do not use npx run \
-         for package scripts. In a Node project, prefer the repo-local binary \
-         at node_modules/.bin/<tool> (e.g. node_modules/.bin/vitest, \
-         node_modules/.bin/tsc) over npx: npx and a fresh npm/pnpm/yarn install \
-         fetch from the network and fail offline (and may rewrite lockfiles). \
-         Do not run a dependency install unless the task requires it. \
-         Set background=true for long-running processes; then use \
-         get_task/wait_task/kill_task with the returned task_id. Background \
-         processes stop when the goal finishes by default. Only when the user \
-         explicitly asks the process to remain running after task completion, \
-         set background_lifetime=runtime; it remains owned by this runtime and \
-         can still be inspected or stopped."
+        "Run a program with an argument array and no shell, for example \
+         {\"program\": \"cargo\", \"args\": [\"test\"]}. There is no `cmd` \
+         field; a shell command line is `shell_command`. Returns `exit: N`, \
+         stdout, and stderr. `exit: 0` \
+         means the program succeeded. A pipe is not available in this argv \
+         form. Temporary files written to the system `/tmp` are not writable \
+         in the sandbox; the workspace and `$TMPDIR` are. `background` true \
+         starts a long-running process and returns a task id for \
+         `get_task`, `wait_task`, and `kill_task`. Background processes stop \
+         when the goal finishes unless `background_lifetime` is `runtime`, \
+         which keeps the process owned by this runtime until it exits or is \
+         killed. Default timeout 120s for a foreground run."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -271,7 +261,7 @@ mod hang_guard_tests {
         // anti-pattern is refused by the `#`-comment guard instead. Either way
         // the shell bypass is caught before spawn.
         #[cfg(not(windows))]
-        assert!(out.content.contains("background=true"), "{out:?}");
+        assert!(out.content.contains("job-control"), "{out:?}");
         #[cfg(windows)]
         assert!(out.content.contains("comment"), "{out:?}");
         assert!(
@@ -398,30 +388,10 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::tools::command_execution::{
-        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
-        sandbox_denial_hint, truncate_or_spill,
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, resolve_timeout, truncate_or_spill,
     };
     #[allow(unused_imports)]
     use std::time::Duration;
-
-    /// Late-bound ownership depends on this: a child that has claimed NOTHING
-    /// yet gets `Some(vec![])`, and an empty allowlist must deny every command
-    /// write (the violation path restores the snapshot), never read as "no
-    /// constraint". `None` alone means unconstrained.
-    #[test]
-    fn an_empty_command_allowlist_allows_no_path() {
-        let allow: Vec<String> = Vec::new();
-        for modified in ["src/main.rs", "a.txt", "nested/deep/file.rs"] {
-            assert!(
-                !allow.iter().any(|a| path_allows(a, modified)),
-                "{modified} must fall outside an empty allowlist"
-            );
-        }
-        // And a non-empty one still covers its own subtree.
-        let allowed = "src/output";
-        assert!(path_allows(allowed, "src/output/json.rs"));
-        assert!(!path_allows(allowed, "src/input.rs"));
-    }
 
     // ── R004 F3: workspace read boundary for shell/argv (T4) ────────────────
 
@@ -560,88 +530,16 @@ mod tests {
         );
     }
 
-    /// Only a failure to reach the network is read as needing the network; a
-    /// failing test, a compile error or a write denial is the command's own.
     #[test]
-    fn only_network_failures_read_as_needing_the_network() {
-        for reached in [
-            "curl: (6) Could not resolve host: example.com",
-            "curl: (7) Failed to connect to 127.0.0.1 port 80 after 0 ms: Couldn't connect to server",
-            "Error: getaddrinfo ENOTFOUND registry.npmjs.org",
-            "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com",
-            "urllib.error.URLError: <urlopen error [Errno 8] nodename nor servname provided, or not known>",
-            "internal/config/config.go:6:2: github.com/spf13/viper@v1.21.0: Get \"https://goproxy.cn/github.com/spf13/viper/@v/v1.21.0.zip\": proxyconnect tcp: dial tcp 127.0.0.1:7898: connect: operation not permitted",
-            "go: github.com/x/y@v1.0.0: Get \"https://proxy.golang.org/x\": dial tcp: lookup proxy.golang.org: no such host",
-            // macOS denies a loopback listener too: a test's local server.
-            "panic: httptest: failed to listen on a port: listen tcp6 [::1]:0: bind: operation not permitted",
-            "Error: listen EPERM: operation not permitted 127.0.0.1",
-            // Linux: a fresh network namespace has loopback down and no route,
-            // so even 127.0.0.1 is refused rather than timed out.
-            "connect ECONNREFUSED 127.0.0.1:44363",
-            "ConnectionRefusedError: [Errno 111] Connection refused",
-        ] {
-            assert!(
-                crate::tools::command_execution::network_failure_in(reached),
-                "{reached}"
-            );
-        }
-        for own in [
-            "exit: 101\n--- stdout ---\ntest tests::adds ... FAILED\nassertion failed: left == right",
-            "error[E0425]: cannot find value `x` in this scope",
-            "mkdir /Users/x/.config: operation not permitted",
-            "cannot create .git/x: Read-only file system",
-        ] {
-            assert!(
-                !crate::tools::command_execution::network_failure_in(own),
-                "{own}"
-            );
-        }
-    }
-
-    #[test]
-    fn sandbox_denial_gets_a_hint_only_when_relevant() {
-        let denied = "exit: 1\n--- stderr ---\nmkdir /Users/x/.config: operation not permitted\n";
-        // sandboxed + failed + OS write-denial → hint.
-        let hint = sandbox_denial_hint(true, false, denied).expect("hint");
-        // The denied command carries its own one-round retry; steering it
-        // back through a separate `request_permissions` spends a round trip
-        // on the same approval prompt.
-        assert!(hint.contains("escalate"), "{hint}");
-        assert!(!hint.contains("request_permissions"), "{hint}");
-        assert!(hint.contains("[recoverable]"));
-        assert!(
-            sandbox_denial_hint(true, false, "cannot create .git/x: Read-only file system")
-                .is_some()
-        );
-        assert!(sandbox_denial_hint(true, false, "mkdir: Permission denied").is_some());
-        // not sandboxed → no hint (real failure, no sandbox to blame).
-        assert!(sandbox_denial_hint(false, false, denied).is_none());
-        // succeeded → no hint.
-        assert!(sandbox_denial_hint(true, true, denied).is_none());
-        // failed for an unrelated reason → no hint.
-        assert!(sandbox_denial_hint(true, false, "exit: 1\ncompile error").is_none());
-    }
-
-    #[test]
-    fn description_warns_against_npx_run_for_package_scripts() {
+    fn description_does_not_steer_package_managers() {
         let tool = RunCommandTool::new(crate::tools::test_commands());
         let description = tool.description();
-
-        assert!(description.contains("npm/yarn/pnpm package scripts"));
-        assert!(description.contains("npm run test -- args"));
-        assert!(description.contains("do not use npx run"));
-    }
-
-    #[test]
-    fn description_steers_node_projects_to_the_local_binary() {
-        let tool = RunCommandTool::new(crate::tools::test_commands());
-        let description = tool.description();
-        // The dogfood friction: the model reaches for npx / a fresh install,
-        // which fails offline and rewrites lockfiles. Steer it to the local
-        // binary and away from installs.
-        assert!(description.contains("node_modules/.bin/"));
-        assert!(description.contains("fail offline"));
-        assert!(description.contains("Do not run a dependency install"));
+        for coaching in ["npx", "node_modules/.bin", "dependency install", "npm run"] {
+            assert!(
+                !description.contains(coaching),
+                "run_command states argv, not which program to choose ({coaching})"
+            );
+        }
     }
 
     /// SH-E2 RC-1: the model must read the command's own exit code instead of
@@ -654,11 +552,11 @@ mod tests {
         let description = tool.description();
 
         assert!(description.contains("exit: 0"));
-        assert!(description.contains("do not"));
-        assert!(description.contains("grep"));
-        assert!(description.contains("discards the real exit"));
+        assert!(description.contains("stdout"));
+        assert!(description.contains("stderr"));
         assert!(description.contains("$TMPDIR"));
         assert!(description.contains("/tmp"));
+        assert!(description.contains("background"));
     }
 
     #[test]
@@ -1051,7 +949,7 @@ mod tests {
                 "{program}: {}",
                 out.content
             );
-            assert!(out.content.contains("escalate"), "{}", out.content);
+            assert!(!out.content.contains("retry THIS EXACT"), "{}", out.content);
         }
     }
 
@@ -1299,8 +1197,7 @@ mod snapshot_tests {
     use crate::tool::Tool;
     #[allow(unused_imports)]
     use crate::tools::command_execution::{
-        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
-        sandbox_denial_hint, truncate_or_spill,
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, resolve_timeout, truncate_or_spill,
     };
     use leveler_execution::PermissionProfile;
     #[cfg(unix)]
@@ -1683,7 +1580,7 @@ mod snapshot_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn out_of_scope_command_mutations_are_rolled_back() {
+    async fn out_of_scope_command_mutations_are_prevented() {
         let dir = scratch_repo();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "original\n").unwrap();
@@ -1706,19 +1603,21 @@ mod snapshot_tests {
 
         assert!(out.is_error, "scope violation must fail the tool call");
         assert!(
-            out.content.contains("outside allowed paths"),
+            out.content.contains("Operation not permitted")
+                || out.content.contains("Permission denied")
+                || out.content.contains("Read-only file system"),
             "{}",
             out.content
         );
         assert!(
             !dir.path().join("outside.txt").exists(),
-            "violation must be rolled back"
+            "unauthorized file must never be created"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn command_file_budget_violation_is_rolled_back() {
+    async fn command_file_budget_violation_preserves_observed_changes() {
         let dir = scratch_repo();
         std::fs::write(dir.path().join("base.txt"), "original\n").unwrap();
         run(dir.path(), &["add", "-A"]);
@@ -1736,8 +1635,14 @@ mod snapshot_tests {
 
         assert!(out.is_error, "budget violation must fail the tool call");
         assert!(out.content.contains("file budget"), "{}", out.content);
-        assert!(!dir.path().join("a.txt").exists());
-        assert!(!dir.path().join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "b\n"
+        );
     }
 }
 
@@ -1747,8 +1652,7 @@ mod command_gate_tests {
     use crate::tool::ToolContext;
     #[allow(unused_imports)]
     use crate::tools::command_execution::{
-        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
-        sandbox_denial_hint, truncate_or_spill,
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, resolve_timeout, truncate_or_spill,
     };
     use leveler_execution::PermissionProfile;
     #[allow(unused_imports)]
@@ -1825,8 +1729,7 @@ mod contract_tests {
     use crate::tool::Tool;
     #[allow(unused_imports)]
     use crate::tools::command_execution::{
-        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, path_allows, resolve_timeout,
-        sandbox_denial_hint, truncate_or_spill,
+        DEFAULT_TIMEOUT_SECS, MAX_OUTPUT, MAX_TIMEOUT_SECS, resolve_timeout, truncate_or_spill,
     };
     #[allow(unused_imports)]
     use std::time::Duration;

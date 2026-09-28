@@ -31,13 +31,12 @@ impl Application {
         &self,
         goal: &str,
         modified_files: &[String],
-        verified: bool,
         model: &ModelRef,
         options: &ShipOptions,
         cancellation: CancellationToken,
     ) -> Result<WorkflowOutcome, AppError> {
         let title = commit_title(goal);
-        let body = commit_body(goal, modified_files, verified);
+        let body = commit_body(goal, modified_files);
 
         // Any VCS action implies a dedicated branch unless the user chose one.
         let branch = options
@@ -81,7 +80,7 @@ fn commit_title(goal: &str) -> String {
     title
 }
 
-fn commit_body(goal: &str, modified_files: &[String], verified: bool) -> String {
+fn commit_body(goal: &str, modified_files: &[String]) -> String {
     let mut s = String::new();
     s.push_str(goal.trim());
     s.push_str("\n\n");
@@ -92,11 +91,7 @@ fn commit_body(goal: &str, modified_files: &[String], verified: bool) -> String 
         }
         s.push('\n');
     }
-    s.push_str(if verified {
-        "Verification: passed (format/build/test).\n"
-    } else {
-        "Verification: not run.\n"
-    });
+    s.push_str("Verification: unknown (no independent verification evidence attached).\n");
     s
 }
 
@@ -131,9 +126,10 @@ mod tests {
 
     #[test]
     fn body_lists_files_and_verification() {
-        let b = commit_body("goal", &["a.rs".into()], true);
+        let b = commit_body("goal", &["a.rs".into()]);
         assert!(b.contains("- a.rs"));
-        assert!(b.contains("Verification: passed"));
+        assert!(!b.contains("Verification: passed"));
+        assert!(b.contains("Verification: unknown"));
     }
 
     #[test]

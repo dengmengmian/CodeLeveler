@@ -25,9 +25,10 @@ pub use checkpoint::{
     latest_session_goal_checkpoint_scope, project_goal_checkpoint, resume_prior_from_checkpoint,
 };
 pub use factory::{ExecutorFactory, TurnProfile, profile_enables_goal_mode};
+pub use leveler_model::ReasoningRetention;
 pub use policy::{
     CHAT_CONTEXT_BUDGET, ExecutionOverrides, ExecutionRole, IndependentReviewPolicy,
-    ResolvedExecutionPolicy, resolve_execution_policy, resolve_tool_limits,
+    PostEditThroughputMode, ResolvedExecutionPolicy, resolve_execution_policy, resolve_tool_limits,
 };
 pub use run::{CodingRuntime, CodingTaskSpec, RuntimeTaskSpec, TaskReport, TaskSpec, mode_str};
 pub use turn::TurnInput;

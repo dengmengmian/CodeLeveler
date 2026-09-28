@@ -23,12 +23,15 @@ struct TaskIdInput {
     task_id: String,
 }
 
-/// Default wait interval. Long enough that a model is not forced into
-/// sub-second polling; short enough that the AgentLoop recovers control.
-const WAIT_DEFAULT_SECS: u64 = 30;
-/// Hard cap. A caller may ask for more; we still return running status
-/// rather than owning the AgentLoop for minutes.
-const WAIT_MAX_SECS: u64 = 120;
+/// Default wait bound. `wait_task` waits for the task to reach a terminal
+/// status, and this is the ceiling on how long one call blocks. It is long on
+/// purpose: a bounded probe that returned "still running" every few seconds
+/// made one model round per interval, so a single long command cost dozens of
+/// rounds. A caller that wants a short probe passes `timeout_seconds`.
+const WAIT_DEFAULT_SECS: u64 = 600;
+/// Hard cap. A caller may ask for more; the tool still returns the running
+/// status rather than owning the AgentLoop for longer than this.
+const WAIT_MAX_SECS: u64 = 600;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitInput {
@@ -37,8 +40,9 @@ struct WaitInput {
     /// the prior result; omit to use the task's default incremental cursor.
     #[serde(default)]
     cursor: Option<u64>,
-    /// Seconds to wait before returning current status (default 30, max 120).
-    /// Expiry does not cancel the background task.
+    /// Seconds to wait for the task to finish before returning its current
+    /// status (default 600, max 600). Expiry does not cancel the background
+    /// task, and a caller wanting a short probe passes a small value here.
     #[serde(default)]
     timeout_seconds: Option<u64>,
 }
@@ -140,17 +144,17 @@ impl Tool for GetTaskTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: ToolContext,
+        context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
         let reg = &self.tasks;
-        match reg.get(input.task_id.trim()).await {
-            Some(snap) => Ok(ToolOutput::ok(format_snap(&snap))),
-            None => Ok(ToolOutput::error(format!(
-                "unknown task_id `{}`",
-                input.task_id
-            ))),
+        match reg
+            .get_owned(input.task_id.trim(), context.session_scope())
+            .await
+        {
+            Ok(snap) => Ok(ToolOutput::ok(format_snap(&snap))),
+            Err(error) => Ok(ToolOutput::error(error)),
         }
     }
 }
@@ -172,11 +176,13 @@ impl Tool for WaitTaskTool {
     }
 
     fn description(&self) -> &'static str {
-        "Observe a background task: return when new output arrives, its status changes, \
-         or the bounded interval expires (default 30s, max 120s). \
+        "Wait for a background task started with run_command(background=true) to finish. \
+         Returns as soon as the task reaches a terminal status (exited/killed), when the \
+         bounded interval expires, or when the run is cancelled. \
          Returns bounded new log and next_cursor; pass cursor to keep an independent \
          reader position. Without cursor, repeated calls use a shared incremental position. \
-         Unchanged running tasks return one status line. get_task reads the full retained log."
+         timeout_seconds defaults to 600s (max 600s); expiry returns the current running \
+         status without cancelling the task. get_task reads the full retained log."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -208,8 +214,32 @@ impl Tool for WaitTaskTool {
             .tool_output_budget
             .saturating_sub(512)
             .min(16 * 1024);
+        // Wait for a TERMINAL status transition, not for the next log line: one
+        // `wait_task` costs one model round, so returning while the task is
+        // still running turns a long command into a poll loop. `wait` registers
+        // its wakeup before re-checking the status and is cancelled by the
+        // parent token, so this blocks without spinning and without owning the
+        // task. Only once the wait has resolved is the log delta read.
+        if let Err(e) = reg
+            .wait_owned(
+                &task_id,
+                context.session_scope(),
+                Some(timeout),
+                &cancellation,
+            )
+            .await
+        {
+            return Ok(ToolOutput::error(e));
+        }
         let wait_result = reg
-            .observe(&task_id, input.cursor, log_budget, timeout, &cancellation)
+            .observe_owned(
+                &task_id,
+                context.session_scope(),
+                input.cursor,
+                log_budget,
+                std::time::Duration::ZERO,
+                &cancellation,
+            )
             .await;
         match wait_result {
             Ok(observation) => {
@@ -239,11 +269,16 @@ impl Tool for WaitTaskTool {
                     })));
                 }
                 // The task is terminal, so the runtime already settled it when
-                // the process exited: diffed the workspace and, under a write
-                // allowlist, restored what the task was not allowed to touch.
+                // entire process group exited and its admitted namespace was diffed.
                 // This reads that result — it does not produce it.
                 let settlement = observation.settlement;
-                let report = reg.take_settlement(&task_id).await;
+                let report = match reg
+                    .take_settlement_owned(&task_id, context.session_scope())
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(error) => return Ok(ToolOutput::error(error)),
+                };
 
                 let mut text = format_wait_delta(&snap, log, gap, next_cursor, pending);
                 let mut diagnostic = String::new();
@@ -279,7 +314,7 @@ impl Tool for WaitTaskTool {
                         .as_ref()
                         .map(|s| s.modified.clone())
                         .unwrap_or_default(),
-                    "workspace_snapshot": report.as_ref().map(|s| s.snapshot.0.clone()),
+                    "workspace_snapshot": report.as_ref().and_then(|s| s.snapshot.as_ref()).map(|id| id.0.clone()),
                     "next_cursor": next_cursor,
                     "log_remaining": pending,
                 })))
@@ -320,12 +355,15 @@ impl Tool for KillTaskTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: ToolContext,
+        context: ToolContext,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
         let reg = &self.tasks;
-        match reg.kill(input.task_id.trim()).await {
+        match reg
+            .kill_owned(input.task_id.trim(), context.session_scope())
+            .await
+        {
             Ok(snap) => Ok(ToolOutput::ok(format_snap(&snap))),
             Err(e) => Ok(ToolOutput::error(e)),
         }
@@ -347,9 +385,8 @@ mod tests {
 
     #[test]
     fn wait_task_is_workspace_write_risk() {
-        // wait_task can roll the whole workspace back to a snapshot when a
-        // background task violates its write allowlist — that is a mutation,
-        // not a Safe read (and Safe implies auto-replay on crash recovery).
+        // Waiting observes a previously admitted write process and consumes
+        // its settlement exactly once; it is not an auto-replayable read.
         let reg = Arc::new(BackgroundTaskRegistry::new());
         assert_eq!(
             WaitTaskTool::new(reg.clone()).risk(),
@@ -455,13 +492,16 @@ mod tests {
         );
     }
 
+    /// `wait_task` waits for a TERMINAL status transition, not for output. A
+    /// chatty long command used to return control on every log line, which cost
+    /// one model round per line; the wait must stay pending while the task is
+    /// still running and deliver the accumulated output once it exits.
     #[tokio::test]
-    async fn wait_delivers_output_arriving_during_the_wait() {
+    async fn wait_does_not_return_on_output_while_the_task_still_runs() {
         let dir = scratch_repo();
         let (ctx, reg, commands) = ctx_with_reg(dir.path());
-        // A filesystem handshake makes output arrive only AFTER wait started.
         let start = RunCommandTool::new(commands).execute(
-            serde_json::json!({"program":"sh", "args":["-c", "while [ ! -f release ]; do sleep 0.02; done; printf 'new-output\\n'; sleep 30"], "background":true}),
+            serde_json::json!({"program":"sh", "args":["-c", "printf 'early-output\\n'; sleep 2; printf 'final-output\\n'"], "background":true}),
             ctx.clone(), CancellationToken::new(),
         ).await.unwrap();
         let id = start
@@ -470,41 +510,160 @@ mod tests {
             .find_map(|l| l.strip_prefix("task_id: "))
             .unwrap()
             .to_string();
-        let wait_tool = WaitTaskTool::new(reg.clone());
-        let wait = wait_tool.execute(
-            serde_json::json!({"task_id":id,"timeout_seconds":10}),
+        let waiter = WaitTaskTool::new(reg.clone());
+        let wait = waiter.execute(
+            serde_json::json!({"task_id":id}),
             ctx,
             CancellationToken::new(),
         );
         tokio::pin!(wait);
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(wait.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        let cancel = CancellationToken::new();
-        let completion = reg.wait(&id, Some(Duration::from_secs(10)), &cancel);
-        tokio::pin!(completion);
-        std::fs::write(dir.path().join("release"), "go").unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), &mut wait).await;
-        let completion_woke = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(std::future::Future::poll(completion.as_mut(), cx).is_ready())
-        })
-        .await;
-        let _ = reg.kill(&id).await;
-        let output = result
-            .expect("new output must wake wait before process exit or the polling interval")
-            .unwrap();
-        assert!(output.content.contains("new-output"), "{}", output.content);
+        // The task prints immediately and keeps running. One second in, the
+        // wait must still be pending: output arrival alone must not satisfy it,
+        // or the model is handed a "still running" result to poll again.
         assert!(
-            output.content.contains("status: running"),
+            tokio::time::timeout(Duration::from_millis(1000), &mut wait)
+                .await
+                .is_err(),
+            "wait_task returned while the task was still running"
+        );
+        let output = tokio::time::timeout(Duration::from_secs(10), &mut wait)
+            .await
+            .expect("terminal status must wake the wait")
+            .unwrap();
+        assert!(
+            output.content.contains("status: exited"),
             "{}",
             output.content
         );
         assert!(
-            !completion_woke,
-            "output arrival must not masquerade as process completion"
+            output.content.contains("early-output"),
+            "{}",
+            output.content
         );
+        assert!(
+            output.content.contains("final-output"),
+            "{}",
+            output.content
+        );
+        assert_eq!(output.metadata["exit_code"], 0);
+    }
+
+    /// The `wait_task` contract, one test per terminal outcome. These are the
+    /// cases the model must be able to rely on in ONE call: success and failure
+    /// wake the wait from the process's own exit, cancellation wakes it from the
+    /// parent's token, and expiry returns the running status without touching
+    /// the task.
+    #[tokio::test]
+    async fn wait_task_success_returns_the_terminal_status() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let id = spawn_background(&commands, &ctx, "printf 'ok\\n'").await;
+        let out = WaitTaskTool::new(reg)
+            .execute(
+                serde_json::json!({"task_id": id}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("status: exited"), "{}", out.content);
+        assert_eq!(out.metadata["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn wait_task_failure_returns_the_terminal_error() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let id = spawn_background(&commands, &ctx, "exit 7").await;
+        let out = WaitTaskTool::new(reg)
+            .execute(
+                serde_json::json!({"task_id": id}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_error,
+            "a non-zero exit must be an error: {}",
+            out.content
+        );
+        assert_eq!(out.metadata["exit_code"], 7);
+    }
+
+    #[tokio::test]
+    async fn wait_task_cancel_interrupts_the_wait_without_killing_the_task() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let id = spawn_background(&commands, &ctx, "sleep 30").await;
+        let cancel = CancellationToken::new();
+        let waiter = WaitTaskTool::new(reg.clone());
+        let wait = waiter.execute(
+            serde_json::json!({"task_id": id.clone()}),
+            ctx,
+            cancel.clone(),
+        );
+        tokio::pin!(wait);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        let out = tokio::time::timeout(Duration::from_secs(5), &mut wait)
+            .await
+            .expect("parent cancellation must interrupt wait_task")
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("cancelled"), "{}", out.content);
+        let snap = reg.get(&id).await.expect("task retained");
+        assert_eq!(
+            snap.status,
+            BackgroundTaskStatus::Running,
+            "wait_task cancellation must not kill the task"
+        );
+        let _ = reg.kill(&id).await;
+    }
+
+    #[tokio::test]
+    async fn wait_task_timeout_returns_running_without_killing() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let id = spawn_background(&commands, &ctx, "sleep 30").await;
+        let out = WaitTaskTool::new(reg.clone())
+            .execute(
+                serde_json::json!({"task_id": id.clone(), "timeout_seconds": 1}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("status: running"), "{}", out.content);
+        let snap = reg.get(&id).await.expect("task retained");
+        assert_eq!(snap.status, BackgroundTaskStatus::Running);
+        let _ = reg.kill(&id).await;
+    }
+
+    /// Spawn one background shell command into the shared registry and return
+    /// its task id; the wait contract tests all start the same way.
+    async fn spawn_background(
+        commands: &Arc<crate::tools::CommandExecution>,
+        ctx: &ToolContext,
+        script: &str,
+    ) -> String {
+        let start = RunCommandTool::new(commands.clone())
+            .execute(
+                serde_json::json!({"program": "sh", "args": ["-c", script], "background": true}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!start.is_error, "spawn: {}", start.content);
+        start
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("task id")
+            .to_string()
     }
 
     #[tokio::test]
@@ -660,14 +819,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_settlement_diagnostics_do_not_displace_delivered_log() {
+    async fn failed_scoped_commands_do_not_displace_delivered_log() {
         let dir = scratch_repo();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
         let (mut ctx, reg, commands) = ctx_with_reg(dir.path());
         ctx.policy.tool_output_budget = crate::registry::MIN_TOOL_OUTPUT;
         let ctx = ctx.with_command_write_constraints(Some(vec!["src".into()]), None, Vec::new());
         let start = RunCommandTool::new(commands)
             .execute(
-                serde_json::json!({"program":"sh", "args":["-c", "for i in 1 2 3 4 5 6; do touch outside-$i-$(printf '%0190d' 0); done; printf '%02000dZ' 0"], "background":true}),
+                serde_json::json!({"program":"sh", "args":["-c", "for i in 1 2 3 4 5 6; do touch outside-$i-$(printf '%0190d' 0) 2>/dev/null; done; printf '%02000dZ' 0; exit 1"], "background":true}),
                 ctx.clone(), CancellationToken::new(),
             ).await.unwrap();
         assert!(!start.is_error, "{}", start.content);
@@ -875,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_restores_out_of_allowlist_mutations() {
+    async fn wait_preserves_owned_edits_and_reports_denied_foreign_write() {
         let dir = scratch_repo();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "original\n").unwrap();
@@ -890,7 +1050,7 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "program": "sh",
-                    "args": ["-c", "echo bad > outside.txt && echo ok > src/lib.rs"],
+                    "args": ["-c", "echo ok > src/lib.rs; echo bad > outside.txt"],
                     "background": true,
                 }),
                 constrained.clone(),
@@ -917,20 +1077,22 @@ mod tests {
 
         assert!(wait.is_error, "allowlist violation must fail wait");
         assert!(
-            wait.content.contains("outside allowed paths"),
+            wait.content.contains("Operation not permitted")
+                || wait.content.contains("Permission denied")
+                || wait.content.contains("Read-only file system"),
             "expected scope message: {}",
             wait.content
         );
         assert!(
             !dir.path().join("outside.txt").exists(),
-            "out-of-allowlist create must be restored"
+            "out-of-scope create must never occur"
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/lib.rs"))
                 .unwrap()
                 .trim(),
-            "original",
-            "restore rolls back the whole snapshot, including in-scope edits"
+            "ok",
+            "owned edits must survive a later denied write"
         );
         let modified = wait
             .metadata
@@ -939,8 +1101,8 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(
-            modified.is_empty(),
-            "restored violations clear modified_files: {modified:?}"
+            modified == vec![serde_json::json!("src/lib.rs")],
+            "settlement contains only owned writes: {modified:?}"
         );
         let reread = WaitTaskTool::new(reg)
             .execute(
@@ -951,7 +1113,7 @@ mod tests {
             .await
             .unwrap();
         assert!(reread.is_error, "reading must not consume terminal failure");
-        assert!(reread.content.contains("outside allowed paths"));
+        assert_ne!(reread.metadata["exit_code"], serde_json::json!(0));
         assert!(reread.metadata["workspace_snapshot"].is_null());
     }
 
@@ -1016,5 +1178,262 @@ mod tests {
             })
             .unwrap_or_default();
         assert_eq!(modified, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn execution_boundary_refuses_foreign_owned_file_before_mutation() {
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("owned")).unwrap();
+        std::fs::write(dir.path().join("foreign.txt"), "unchanged").unwrap();
+        let (ctx, _, commands) = ctx_with_reg(dir.path());
+        let ctx = ctx
+            .with_command_write_constraints(Some(vec!["owned".into()]), None, Vec::new())
+            .with_foreign_owned_paths(vec!["foreign.txt".into()]);
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "printf corrupted > foreign.txt".into()],
+                None,
+                Some(5),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_error,
+            "unauthorized write must fail: {}",
+            out.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foreign.txt")).unwrap(),
+            "unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_tools_reject_another_session_and_allow_the_creator() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let owner = ctx.clone().with_session_scope("owner");
+        let stranger = ctx.with_session_scope("stranger");
+        let id = spawn_background(&commands, &owner, "sleep 30").await;
+        let input = serde_json::json!({"task_id": id});
+        let get = GetTaskTool::new(reg.clone())
+            .execute(input.clone(), stranger.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let kill = KillTaskTool::new(reg.clone())
+            .execute(input.clone(), stranger, CancellationToken::new())
+            .await
+            .unwrap();
+        let still_running = reg.get(&id).await.unwrap().status;
+        let _ = reg.kill(&id).await;
+        assert!(get.is_error, "foreign task log must not be disclosed");
+        assert!(kill.is_error, "foreign task must not be signalled");
+        assert_eq!(still_running, BackgroundTaskStatus::Running);
+        let own = GetTaskTool::new(reg)
+            .execute(input, owner, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!own.is_error, "the same session may operate across turns");
+    }
+
+    #[tokio::test]
+    async fn parent_excludes_foreign_paths_and_symlink_aliases_before_write() {
+        let dir = scratch_repo();
+        std::fs::create_dir_all(dir.path().join("owned")).unwrap();
+        std::fs::create_dir_all(dir.path().join("foreign")).unwrap();
+        std::fs::write(dir.path().join("foreign/keep"), "original").unwrap();
+        std::os::unix::fs::symlink("../foreign", dir.path().join("owned/alias")).unwrap();
+        let (ctx, _, commands) = ctx_with_reg(dir.path());
+        let ctx = ctx.with_foreign_owned_paths(vec!["foreign".into()]);
+        for path in ["foreign/keep", "owned/alias/keep"] {
+            let out = commands
+                .run_foreground(
+                    "sh",
+                    vec!["-c".into(), format!("printf changed > {path}")],
+                    None,
+                    Some(5),
+                    ctx.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(out.is_error, "{path}: {}", out.content);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("foreign/keep")).unwrap(),
+                "original"
+            );
+        }
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "printf own > owned/new".into()],
+                None,
+                Some(5),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.metadata["modified_files"],
+            serde_json::json!(["owned/new"])
+        );
+        assert!(
+            out.metadata["workspace_snapshot"].is_null(),
+            "a scoped accounting tree must never be exposed as a full rollback snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_write_scope_keeps_background_read_capability() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let ctx = ctx.with_command_write_constraints(Some(Vec::new()), None, Vec::new());
+        let id = spawn_background(&commands, &ctx, "printf observed").await;
+        let snap = reg
+            .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(snap.exit_code, Some(0));
+        assert!(snap.log.contains("observed"));
+    }
+
+    #[tokio::test]
+    async fn scoped_execution_rejects_hardlinks_to_other_owners() {
+        let dir = scratch_repo();
+        std::fs::create_dir(dir.path().join("owned")).unwrap();
+        std::fs::write(dir.path().join("foreign"), "original").unwrap();
+        std::fs::hard_link(dir.path().join("foreign"), dir.path().join("owned/alias")).unwrap();
+        let (ctx, _, commands) = ctx_with_reg(dir.path());
+        let ctx = ctx.with_command_write_constraints(Some(vec!["owned".into()]), None, Vec::new());
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "printf changed > owned/alias".into()],
+                None,
+                Some(5),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foreign")).unwrap(),
+            "original",
+            "an allowed path must not alias a foreign inode: {out:?}"
+        );
+        assert!(out.is_err() || out.unwrap().is_error);
+    }
+
+    #[tokio::test]
+    async fn scoped_command_cannot_create_a_foreign_hardlink_then_write_it() {
+        let dir = scratch_repo();
+        std::fs::create_dir(dir.path().join("owned")).unwrap();
+        std::fs::write(dir.path().join("foreign"), "original").unwrap();
+        let (ctx, _, commands) = ctx_with_reg(dir.path());
+        let ctx = ctx.with_command_write_constraints(Some(vec!["owned".into()]), None, Vec::new());
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec![
+                    "-c".into(),
+                    "ln foreign owned/alias && printf changed > owned/alias".into(),
+                ],
+                None,
+                Some(5),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the process must actually run under the sandbox");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foreign")).unwrap(),
+            "original",
+            "runtime link creation must not acquire foreign write authority: {out:?}"
+        );
+        assert!(out.is_error, "the OS must reject the hardlink: {out:?}");
+        assert_eq!(
+            out.metadata["execution_status"], "completed",
+            "spawn failure is not evidence of a denied link"
+        );
+        assert_ne!(out.metadata["exit_code"], 0);
+        assert!(
+            !dir.path().join("owned/alias").exists(),
+            "the alias must never be created"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            out.content.contains("ln:") && out.content.contains("Operation not permitted"),
+            "expected Seatbelt to deny link creation: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hardlinks_entirely_within_owned_scope_remain_writable() {
+        let dir = scratch_repo();
+        std::fs::create_dir(dir.path().join("owned")).unwrap();
+        std::fs::write(dir.path().join("owned/source"), "original").unwrap();
+        std::fs::hard_link(
+            dir.path().join("owned/source"),
+            dir.path().join("owned/alias"),
+        )
+        .unwrap();
+        let (ctx, _, commands) = ctx_with_reg(dir.path());
+        let ctx = ctx.with_command_write_constraints(Some(vec!["owned".into()]), None, Vec::new());
+        let out = commands
+            .run_foreground(
+                "sh",
+                vec!["-c".into(), "printf changed > owned/alias".into()],
+                None,
+                Some(5),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(out.is_ok(), "all inode names are owned: {out:?}");
+        assert!(!out.unwrap().is_error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("owned/source")).unwrap(),
+            "changed"
+        );
+    }
+    #[tokio::test]
+    async fn foreign_wait_cannot_consume_the_owners_log_or_settlement() {
+        let dir = scratch_repo();
+        let (ctx, reg, commands) = ctx_with_reg(dir.path());
+        let owner = ctx.clone().with_session_scope("owner");
+        let id = spawn_background(
+            &commands,
+            &owner,
+            "printf private-log; printf changed > own.txt",
+        )
+        .await;
+        reg.wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .unwrap();
+        let waiter = WaitTaskTool::new(reg);
+        let args = serde_json::json!({"task_id":id});
+        let foreign = waiter
+            .execute(
+                args.clone(),
+                ctx.with_session_scope("foreign"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(foreign.is_error);
+        assert!(!foreign.content.contains("private-log"));
+        let own = waiter
+            .execute(args, owner, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(own.content.contains("private-log"));
+        assert_eq!(
+            own.metadata["modified_files"],
+            serde_json::json!(["own.txt"])
+        );
     }
 }

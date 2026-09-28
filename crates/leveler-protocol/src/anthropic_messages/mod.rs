@@ -5,10 +5,8 @@
 //! tool results are `tool_result` blocks inside a `user` message, and auth is
 //! `x-api-key` + `anthropic-version` rather than a bearer token.
 //!
-//! Note: thinking / `output_config.effort` *encoding* is a capability gap
-//! (2026-08-18). A request without those fields is valid; thinking *deltas*
-//! on the way back are still surfaced as `ReasoningDelta`. Do not invent a
-//! default effort here — there is no built-in Claude profile yet.
+//! Thinking modes are explicit profile capabilities. Signed and redacted
+//! blocks survive both decode paths and are replayed without modification.
 
 mod stream;
 mod wire;
@@ -20,7 +18,7 @@ use leveler_core::{RequestId, ToolCallId};
 use leveler_model::{
     ContentPart, EncodedRequest, FinishReason, ImageSource, Message, ModelError, ModelErrorKind,
     ModelEvent, ModelEventStream, ModelRequest, ModelResponse, ProtocolAdapter, ProtocolContext,
-    ProtocolError, ProtocolKind, RawByteStream, Role, TokenUsage, ToolCall, ToolChoice,
+    ProtocolError, ProtocolKind, RawByteStream, Role, ToolCall, ToolChoice,
 };
 
 use crate::sse::SseDecoder;
@@ -57,7 +55,11 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
         context: &ProtocolContext,
         stream: bool,
     ) -> Result<EncodedRequest, ProtocolError> {
-        let (system, messages) = convert_messages(&request.messages);
+        // Authenticated thinking blocks are replayed verbatim by the shared
+        // projection; plain reasoning has no signature and is omitted.
+        let projection =
+            leveler_model::RequestProjection::for_request(request, context.reasoning_replay);
+        let (system, messages) = convert_messages(&projection);
 
         let tools = request
             .tools
@@ -69,6 +71,43 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
             })
             .collect();
 
+        let thinking = match context.reasoning.style {
+            leveler_model::ReasoningStyle::None => None,
+            leveler_model::ReasoningStyle::AdaptiveThinking => {
+                Some(serde_json::json!({"type":"adaptive"}))
+            }
+            leveler_model::ReasoningStyle::BudgetedThinking { budget_tokens } => {
+                if budget_tokens < 1024
+                    || budget_tokens >= request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS)
+                {
+                    return Err(ProtocolError::Encode(
+                        "thinking budget must be at least 1024 and below max_output_tokens".into(),
+                    ));
+                }
+                Some(serde_json::json!({"type":"enabled", "budget_tokens":budget_tokens}))
+            }
+            _ => {
+                return Err(ProtocolError::Encode(
+                    "thinking style is not supported by the Messages protocol".into(),
+                ));
+            }
+        };
+        if thinking.is_some() && request.tool_choice.forces_tool_call() {
+            return Err(ProtocolError::Encode(
+                "forced tool choice is incompatible with thinking".into(),
+            ));
+        }
+        if thinking.is_some()
+            && request.reasoning_effort == Some(leveler_model::ReasoningEffort::Minimal)
+        {
+            return Err(ProtocolError::Encode(
+                "Messages thinking does not support minimal effort".into(),
+            ));
+        }
+        let output_config = thinking
+            .as_ref()
+            .and(request.reasoning_effort)
+            .map(|effort| serde_json::json!({"effort":effort.as_wire()}));
         let req = MessagesRequest {
             model: context.model_id.clone(),
             max_tokens: request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -83,6 +122,8 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
                 .flatten(),
             stop_sequences: request.stop.clone(),
             stream,
+            thinking,
+            output_config,
         };
 
         let body = serde_json::to_value(&req)
@@ -116,8 +157,22 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
         let mut content = Vec::new();
         for block in resp.content {
             match block {
-                RespBlock::Thinking { thinking } if !thinking.is_empty() => {
-                    content.push(ContentPart::Reasoning { text: thinking });
+                RespBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    if signature.is_empty() {
+                        return Err(ProtocolError::Decode(
+                            "thinking block is missing its replay signature".into(),
+                        ));
+                    }
+                    content.push(ContentPart::SignedReasoning {
+                        text: thinking,
+                        signature,
+                    });
+                }
+                RespBlock::RedactedThinking { data } => {
+                    content.push(ContentPart::RedactedReasoning { data })
                 }
                 RespBlock::Text { text } if !text.is_empty() => {
                     content.push(ContentPart::Text { text });
@@ -146,23 +201,12 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
             .map(map_stop_reason)
             .unwrap_or(FinishReason::Stop);
 
-        let usage = resp
-            .usage
-            .map(|u| TokenUsage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                cached_input_tokens: u.cache_read_input_tokens,
-                // Anthropic bills thinking tokens inside `output_tokens` but
-                // reports no reasoning breakdown, so the split is unknown.
-                // Counting the thinking block's bytes would be an estimate
-                // dressed as a provider fact.
-                reasoning_tokens: None,
-            })
-            .unwrap_or_default();
+        let usage = resp.usage.map(|u| u.canonical()).unwrap_or_default();
 
         Ok(ModelResponse {
             request_id: request_id_from(&resp.id),
             message: Message {
+                origin: None,
                 role: Role::Assistant,
                 content,
             },
@@ -228,37 +272,27 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
 }
 
 /// Split unified messages into Anthropic's `system` field plus `user`/`assistant`
-/// messages. The LEADING run of `Role::System` messages is hoisted to `system`;
-/// `Role::Tool` results become `tool_result` blocks inside a `user` message.
-///
-/// A `Role::System` message that appears later is conversation, not prefix: the
-/// drive loop appends standing constraints (nested `AGENTS.md` rules, per-turn
-/// memory recall) at the tail exactly so the provider's cached prefix survives.
-/// Hoisting those would rewrite the prefix on every discovery and re-bill the
-/// whole transcript, so they stay in place as `user` turns.
-fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ReqMessage>) {
+/// messages. Current control is encoded on the system channel. A leftover
+/// `Role::System` row stays on that channel too (it must not become a user
+/// turn) but that wire choice does not assign it contract authority — the
+/// projection's segment authority is unchanged. Tool results become
+/// `tool_result` blocks inside a user message.
+fn convert_messages(
+    projection: &leveler_model::RequestProjection,
+) -> (Option<String>, Vec<ReqMessage>) {
     let mut system_parts = Vec::new();
+    let control = projection.control_text();
+    if !control.is_empty() {
+        system_parts.push(control);
+    }
     let mut out = Vec::new();
-    let mut prefix_open = true;
 
-    for msg in messages {
-        if msg.role != Role::System {
-            prefix_open = false;
-        }
+    for msg in projection.messages() {
         match msg.role {
-            Role::System if prefix_open => {
-                let text = collect_text(&msg.content);
-                if !text.is_empty() {
-                    system_parts.push(text);
-                }
-            }
             Role::System => {
                 let text = collect_text(&msg.content);
                 if !text.is_empty() {
-                    out.push(ReqMessage {
-                        role: "user".to_string(),
-                        content: vec![ReqBlock::Text { text }],
-                    });
+                    system_parts.push(text);
                 }
             }
             Role::Tool => {
@@ -286,6 +320,15 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ReqMessage>) {
                         ContentPart::Text { text } if !text.is_empty() => {
                             blocks.push(ReqBlock::Text { text: text.clone() });
                         }
+                        ContentPart::SignedReasoning { text, signature } => {
+                            blocks.push(ReqBlock::Thinking {
+                                thinking: text.clone(),
+                                signature: signature.clone(),
+                            })
+                        }
+                        ContentPart::RedactedReasoning { data } => {
+                            blocks.push(ReqBlock::RedactedThinking { data: data.clone() })
+                        }
                         ContentPart::ToolCall { call } => blocks.push(ReqBlock::ToolUse {
                             id: call.id.to_string(),
                             name: call.name.clone(),
@@ -294,7 +337,9 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ReqMessage>) {
                         ContentPart::Image { source } => blocks.push(ReqBlock::Image {
                             source: image_source(source),
                         }),
-                        // Reasoning parts are not replayed upstream.
+                        // Reasoning is a projection decision, never content
+                        // here: the contract resolved `Never` for this route, so
+                        // it cannot appear at all. The arm stays defensive.
                         _ => {}
                     }
                 }
@@ -372,7 +417,7 @@ mod tests {
             parallel_tool_calls: true,
             supports_temperature: true,
             thinking_supports_forced_tool_choice: true,
-            passback_reasoning_content: false,
+            reasoning_replay: leveler_model::ReasoningReplayContract::NONE,
         }
     }
 
@@ -410,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn encode_does_not_send_thinking_or_effort_yet() {
-        // Capability gap: output_config.effort / thinking are not encoded.
+    fn undeclared_thinking_capability_does_not_emit_control_fields() {
+        // No thinking control is invented for an undeclared capability.
         let mut req = user_req("hi");
         req.reasoning_effort = Some(ReasoningEffort::High);
         let enc = AnthropicMessagesAdapter::new()
@@ -440,14 +485,8 @@ mod tests {
         assert_eq!(enc.body["messages"][0]["role"], "user");
     }
 
-    /// The drive loop appends standing constraints (nested `AGENTS.md`
-    /// rules, per-turn memory recall) as `Role::System` messages at the TAIL,
-    /// precisely so the cached prefix survives. Hoisting those into the
-    /// top-level `system` field would rewrite the prefix on every discovery
-    /// and re-bill the whole transcript. Only the leading system block is a
-    /// prefix; a later one is conversation.
     #[test]
-    fn only_the_leading_system_block_is_hoisted() {
+    fn legacy_system_messages_never_become_user_turns() {
         let req = ModelRequest::new(
             ModelRef::new("anthropic", "claude-sonnet-5"),
             vec![
@@ -462,24 +501,259 @@ mod tests {
             .encode_request(&req, &ctx(), false)
             .unwrap();
         assert_eq!(
-            enc.body["system"], "base instructions\n\nskill injection",
-            "the leading system run is the cacheable prefix"
+            enc.body["system"],
+            "base instructions\n\nskill injection\n\nProject rules:\n--- from src/AGENTS.md ---",
+            "legacy control text keeps system authority"
         );
         let messages = enc.body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 3, "{:#?}", messages);
-        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages.len(), 2, "{:#?}", messages);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn control_context_has_system_authority_in_both_encoders() {
+        let mut req = ModelRequest::new(
+            ModelRef::new("test", "model"),
+            vec![Message::text(Role::User, "read src/a.rs")],
+        );
+        req.control_context
+            .push(leveler_model::PromptSegment::stable(
+                "base",
+                "base instructions",
+            ));
+        req.control_context
+            .push(leveler_model::PromptSegment::variable(
+                "rules",
+                "Project rules: no unwrap",
+            ));
+        let anthropic = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap()
+            .body;
+        let openai = crate::OpenAiChatAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap()
+            .body;
         assert_eq!(
-            messages[2]["content"][0]["text"], "Project rules:\n--- from src/AGENTS.md ---",
-            "a mid-transcript system message stays in place, as a user turn"
+            anthropic["system"],
+            "base instructions\n\nProject rules: no unwrap"
+        );
+        assert_eq!(openai["messages"][0]["role"], "system");
+        assert_eq!(openai["messages"][0]["content"], anthropic["system"]);
+        assert_eq!(anthropic["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            anthropic["messages"][0]["content"][0]["text"],
+            "read src/a.rs"
+        );
+        assert_eq!(openai["messages"][1]["content"], "read src/a.rs");
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    /// Providers change the wire shape of control. They do not reorder
+    /// segments or rewrite authority.
+    #[test]
+    fn encoders_preserve_segment_order_and_authority() {
+        use leveler_model::{PromptAuthority, PromptSource, SegmentLifecycle};
+        let mut req = ModelRequest::new(
+            ModelRef::new("test", "model"),
+            vec![Message::text(Role::User, "do the task")],
+        );
+        let classes = [
+            (
+                "base",
+                PromptSource::BasePrompt,
+                PromptAuthority::CoreContract,
+                "core contract",
+            ),
+            (
+                "project_rules",
+                PromptSource::ProjectRules {
+                    paths: vec!["AGENTS.md".into()],
+                },
+                PromptAuthority::ProjectInstruction,
+                "Project rules:\nuse the project style",
+            ),
+            (
+                "selected_skills",
+                PromptSource::Skill {
+                    names: vec!["demo".into()],
+                },
+                PromptAuthority::UserSelectedProcedure,
+                "follow the demo procedure",
+            ),
+            (
+                "execution_state",
+                PromptSource::ExecutionState,
+                PromptAuthority::RuntimeFact,
+                "cwd: /repo",
+            ),
+            (
+                "memory_recall",
+                PromptSource::MemoryRecall {
+                    ids: vec!["mem-1".into()],
+                },
+                PromptAuthority::AdvisoryContext,
+                "recalled note",
+            ),
+        ];
+        for (name, source, authority, text) in classes {
+            req.control_context
+                .push(leveler_model::PromptSegment::control(
+                    name,
+                    source,
+                    authority,
+                    SegmentLifecycle::Turn,
+                    false,
+                    text,
+                ));
+        }
+        let before = req.control_context.provenance();
+        let anthropic = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap()
+            .body;
+        let openai = crate::OpenAiChatAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap()
+            .body;
+        let projection = leveler_model::RequestProjection::for_request(
+            &req,
+            leveler_model::ReasoningReplayContract::NONE,
+        );
+        assert_eq!(projection.control_context().provenance(), before);
+        let wire = projection.control_text();
+        assert_eq!(anthropic["system"], wire);
+        assert_eq!(openai["messages"][0]["role"], "system");
+        assert_eq!(openai["messages"][0]["content"], wire);
+        for text in [
+            "core contract",
+            "Project rules:\nuse the project style",
+            "follow the demo procedure",
+            "cwd: /repo",
+            "recalled note",
+        ] {
+            let at = wire.find(text).expect(text);
+            assert!(wire.find("core contract").unwrap() <= at);
+        }
+        let encoded = anthropic.to_string() + &openai.to_string();
+        assert!(!encoded.contains("\"authority\""));
+        assert!(!encoded.contains("core_contract"));
+        assert_eq!(
+            before.iter().map(|item| item.authority).collect::<Vec<_>>(),
+            vec![
+                PromptAuthority::CoreContract,
+                PromptAuthority::ProjectInstruction,
+                PromptAuthority::UserSelectedProcedure,
+                PromptAuthority::RuntimeFact,
+                PromptAuthority::AdvisoryContext,
+            ]
         );
     }
 
-    /// Two adjacent user turns are legal for Anthropic, but a tail rule that
-    /// lands next to a tool result must not be merged into that result's
-    /// block list — the pairing of tool_use and tool_result is what the API
-    /// validates.
+    /// OpenAI and Anthropic may spell the user transport role. They do not
+    /// change whether that row is user intent.
     #[test]
-    fn a_tail_rule_after_a_tool_result_is_its_own_turn() {
+    fn encoders_do_not_change_harness_user_authority() {
+        use leveler_model::{
+            PromptAuthority, PromptSource, ProtocolRepairKind, RuntimeNoticeKind, TranscriptOrigin,
+        };
+        let messages = vec![
+            Message::user_input("the real request"),
+            Message::user(
+                "child finished",
+                TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ChildSettlement,
+                },
+            ),
+            Message::user(
+                "repair the call",
+                TranscriptOrigin::ProtocolRepair {
+                    repair: ProtocolRepairKind::InvalidToolJson,
+                },
+            ),
+            Message::user(
+                "resolve the goal",
+                TranscriptOrigin::ProtocolRepair {
+                    repair: ProtocolRepairKind::GoalUnresolved,
+                },
+            ),
+            Message::user(
+                "【旁问 / btw】这是主任务之外的旁问。回答需要时可以使用只读工具。\n\n不要修改工作区，不要推进或改变主任务。\n\nwhat changed?",
+                TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::SideQuestion,
+                },
+            ),
+            Message::text(Role::User, "legacy unknown"),
+        ];
+        let req = ModelRequest::new(ModelRef::new("test", "model"), messages);
+        let projection = leveler_model::RequestProjection::for_request(
+            &req,
+            leveler_model::ReasoningReplayContract::NONE,
+        );
+        let before = projection.transcript_authority();
+        let anthropic = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap()
+            .body;
+        let openai = crate::OpenAiChatAdapter::new()
+            .encode_request(&req, &ctx(), false)
+            .unwrap()
+            .body;
+        let after = leveler_model::RequestProjection::for_request(
+            &req,
+            leveler_model::ReasoningReplayContract::NONE,
+        )
+        .transcript_authority();
+        assert_eq!(before, after);
+        assert_eq!(
+            before.iter().map(|item| item.authority).collect::<Vec<_>>(),
+            vec![
+                PromptAuthority::UserIntent,
+                PromptAuthority::AdvisoryContext,
+                PromptAuthority::CoreContract,
+                PromptAuthority::CoreContract,
+                PromptAuthority::CoreContract,
+                PromptAuthority::Unclassified,
+            ]
+        );
+        assert!(before.iter().any(|item| {
+            item.source
+                == PromptSource::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ChildSettlement,
+                }
+                && item.authority != PromptAuthority::UserIntent
+        }));
+        let side = before
+            .iter()
+            .find(|item| {
+                item.source
+                    == PromptSource::RuntimeNotice {
+                        notice: RuntimeNoticeKind::SideQuestion,
+                    }
+            })
+            .expect("side question");
+        assert_ne!(side.authority, PromptAuthority::RuntimeFact);
+        assert_eq!(side.authority, PromptAuthority::CoreContract);
+        assert!(!side.authority_mismatch);
+        assert_ne!(side.authority, PromptAuthority::UserIntent);
+        let wire = anthropic.to_string() + &openai.to_string();
+        assert!(!wire.contains("\"origin\""));
+        assert!(!wire.contains("user_input"));
+        assert!(!wire.contains("protocol_repair"));
+        assert!(!wire.contains("user_intent"));
+        assert!(!wire.contains("side_question"));
+        assert!(wire.contains("the real request"));
+        assert!(wire.contains("child finished"));
+        assert!(wire.contains("可以使用只读工具"));
+        assert!(!wire.contains("不要调用任何工具"));
+        assert!(wire.contains("不要修改工作区"));
+        assert!(wire.contains("不要推进或改变主任务"));
+    }
+
+    /// Extracting legacy system text leaves the tool exchange intact.
+    #[test]
+    fn a_tail_rule_after_a_tool_result_keeps_system_authority() {
         let call = ToolCall {
             id: ToolCallId::new("c1"),
             name: "read_file".into(),
@@ -491,10 +765,12 @@ mod tests {
                 Message::text(Role::System, "base"),
                 Message::text(Role::User, "go"),
                 Message {
+                    origin: None,
                     role: Role::Assistant,
                     content: vec![ContentPart::ToolCall { call }],
                 },
                 Message {
+                    origin: None,
                     role: Role::Tool,
                     content: vec![ContentPart::ToolResult {
                         result: leveler_model::ToolResultContent {
@@ -511,15 +787,14 @@ mod tests {
             .encode_request(&req, &ctx(), false)
             .unwrap();
         let messages = enc.body["messages"].as_array().unwrap();
-        assert_eq!(enc.body["system"], "base");
-        assert_eq!(messages.len(), 4, "{:#?}", messages);
+        assert_eq!(enc.body["system"], "base\n\nProject rules:\nno unwrap");
+        assert_eq!(messages.len(), 3, "{:#?}", messages);
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(
             messages[2]["content"].as_array().unwrap().len(),
             1,
             "the rule must not join the tool_result block list"
         );
-        assert_eq!(messages[3]["content"][0]["type"], "text");
     }
 
     /// A multi-call round: every `tool_use` of one assistant turn is answered
@@ -532,6 +807,7 @@ mod tests {
             vec![
                 Message::text(Role::User, "go"),
                 Message {
+                    origin: None,
                     role: Role::Assistant,
                     content: calls
                         .iter()
@@ -545,6 +821,7 @@ mod tests {
                         .collect(),
                 },
                 Message {
+                    origin: None,
                     role: Role::Tool,
                     content: calls
                         .iter()
@@ -583,6 +860,7 @@ mod tests {
         let req = ModelRequest::new(
             ModelRef::new("anthropic", "claude-sonnet-5"),
             vec![Message {
+                origin: None,
                 role: Role::Tool,
                 content: vec![ContentPart::ToolResult {
                     result: leveler_model::ToolResultContent {
@@ -607,6 +885,7 @@ mod tests {
         let req = ModelRequest::new(
             ModelRef::new("anthropic", "claude-sonnet-5"),
             vec![Message {
+                origin: None,
                 role: Role::Assistant,
                 content: vec![ContentPart::ToolCall {
                     call: ToolCall {
@@ -675,7 +954,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.request_id.as_str(), "msg_1");
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
-        assert_eq!(resp.usage.input_tokens, 5);
+        assert_eq!(resp.usage.input_tokens, 8);
         assert_eq!(resp.usage.cached_input_tokens, 3);
         assert!(
             resp.message
@@ -695,5 +974,99 @@ mod tests {
         assert_eq!(call.name, "grep");
         assert_eq!(call.id.as_str(), "tu_9");
         assert_eq!(call.arguments["q"], "x");
+    }
+}
+
+#[cfg(test)]
+mod thinking_contract_tests {
+    use super::*;
+    fn context() -> ProtocolContext {
+        ProtocolContext {
+            base_url: "http://unused".into(),
+            model_id: "configured-model".into(),
+            api_key: None,
+            extra_headers: vec![],
+            reasoning: Default::default(),
+            parallel_tool_calls: true,
+            supports_temperature: false,
+            thinking_supports_forced_tool_choice: false,
+            reasoning_replay: leveler_model::ReasoningReplayContract::resolve(
+                ProtocolKind::AnthropicMessages,
+                &Default::default(),
+            ),
+        }
+    }
+    #[test]
+    fn signed_and_redacted_thinking_roundtrips_verbatim_and_in_order() {
+        let content = serde_json::json!([
+            {"type":"thinking","thinking":"","signature":"opaque-signature"},
+            {"type":"text","text":"first"},
+            {"type":"redacted_thinking","data":"opaque-redaction"},
+            {"type":"tool_use","id":"c","name":"read","input":{}}
+        ]);
+        let adapter = AnthropicMessagesAdapter::new();
+        let response = adapter
+            .decode_response(
+                &serde_json::to_vec(
+                    &serde_json::json!({"content":content,"stop_reason":"tool_use"}),
+                )
+                .unwrap(),
+                &context(),
+            )
+            .unwrap();
+        let request = ModelRequest::new(
+            leveler_model::ModelRef::new("p", "m"),
+            vec![response.message],
+        );
+        let wire = adapter.encode_request(&request, &context(), false).unwrap();
+        assert_eq!(
+            wire.body["messages"][0]["content"], content,
+            "signed blocks, including empty thinking, are protocol history"
+        );
+    }
+    #[test]
+    fn budgeted_thinking_validates_budget_and_forced_choice() {
+        let mut context = context();
+        context.reasoning.style = leveler_model::ReasoningStyle::BudgetedThinking {
+            budget_tokens: 1024,
+        };
+        let mut request = ModelRequest::new(
+            leveler_model::ModelRef::new("p", "m"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        request.max_output_tokens = Some(2048);
+        let adapter = AnthropicMessagesAdapter::new();
+        let wire = adapter.encode_request(&request, &context, false).unwrap();
+        assert_eq!(
+            wire.body["thinking"],
+            serde_json::json!({"type":"enabled","budget_tokens":1024})
+        );
+        request.max_output_tokens = Some(1024);
+        assert!(adapter.encode_request(&request, &context, false).is_err());
+        request.max_output_tokens = Some(2048);
+        request.tool_choice = ToolChoice::Required;
+        assert!(adapter.encode_request(&request, &context, false).is_err());
+    }
+    #[test]
+    fn adaptive_thinking_uses_declared_capability_and_effort() {
+        let reasoning = serde_json::from_value(
+            serde_json::json!({"style":"adaptive_thinking","supported_efforts":["high"]}),
+        );
+        assert!(
+            reasoning.is_ok(),
+            "adaptive thinking must be a declared protocol capability"
+        );
+        let mut context = context();
+        context.reasoning = reasoning.unwrap();
+        let mut request = ModelRequest::new(
+            leveler_model::ModelRef::new("p", "m"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        request.reasoning_effort = Some(leveler_model::ReasoningEffort::High);
+        let wire = AnthropicMessagesAdapter::new()
+            .encode_request(&request, &context, false)
+            .unwrap();
+        assert_eq!(wire.body["thinking"]["type"], "adaptive");
+        assert_eq!(wire.body["output_config"]["effort"], "high");
     }
 }

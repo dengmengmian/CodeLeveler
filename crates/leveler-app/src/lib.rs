@@ -139,6 +139,47 @@ pub struct LoadedConfig {
     /// `[browser].default`: the browser the browser capability drives. `None`
     /// uses the host's CDP automation default.
     pub browser_default: Option<leveler_browser::BrowserProduct>,
+    /// `[assist].prompt_suggestions`: the idle prompt-suggestion affordance.
+    pub assist_prompt_suggestions: bool,
+    /// `[assist].away_summary`: the idle "welcome back" recap affordance.
+    pub assist_away_summary: bool,
+}
+
+/// The ONE decision about whether durable project memory is part of this
+/// project at all.
+///
+/// Memory used to be gated implicitly by `work_profile` alone (economy turns
+/// carried none), which made a privacy decision a side effect of a cost mode.
+/// This type is the single owner: the user's `memory.enabled` switch decides
+/// whether the capability exists, and `work_profile` still decides whether the
+/// economy surface withholds it. Every memory consumer — tool exposure, the
+/// prompt index, per-turn recall, and the background extractor — reads this,
+/// so the four cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPolicy {
+    enabled: bool,
+}
+
+impl MemoryPolicy {
+    /// Resolve from the project's `.leveler/config.yaml`.
+    pub fn from_project(config: &leveler_project::ProjectConfig) -> Self {
+        Self {
+            enabled: config.memory.enabled,
+        }
+    }
+
+    /// Whether the user wants memory enabled for this project.
+    pub fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Whether memory reaches the model under `profile`.
+    ///
+    /// A disabled project never exposes memory; an economy turn withholds the
+    /// capability surface even when the project has it enabled.
+    pub fn exposes(self, profile: WorkProfile) -> bool {
+        self.enabled && profile != WorkProfile::Economy
+    }
 }
 
 /// Stable digest of the configuration sources a repository runtime loads.
@@ -190,6 +231,34 @@ pub fn runtime_config_fingerprint(layout: &Layout) -> std::io::Result<String> {
         }
     }
     Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod memory_policy_tests {
+    use super::{MemoryPolicy, WorkProfile};
+    use leveler_project::{MemoryConfig, ProjectConfig};
+
+    #[test]
+    fn a_disabled_project_never_exposes_memory() {
+        let policy = MemoryPolicy::from_project(&ProjectConfig {
+            memory: MemoryConfig { enabled: false },
+            ..ProjectConfig::default()
+        });
+        assert!(!policy.enabled());
+        assert!(!policy.exposes(WorkProfile::Balanced));
+        assert!(!policy.exposes(WorkProfile::Economy));
+    }
+
+    #[test]
+    fn an_enabled_project_still_withholds_memory_from_economy() {
+        let policy = MemoryPolicy::from_project(&ProjectConfig {
+            memory: MemoryConfig { enabled: true },
+            ..ProjectConfig::default()
+        });
+        assert!(policy.enabled());
+        assert!(policy.exposes(WorkProfile::Balanced));
+        assert!(!policy.exposes(WorkProfile::Economy));
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +320,8 @@ impl Default for LoadedConfig {
             agents_delegation: true,
             agents_independent_review: leveler_project::IndependentReview::default(),
             browser_default: None,
+            assist_prompt_suggestions: true,
+            assist_away_summary: true,
         }
     }
 }
@@ -289,6 +360,10 @@ pub struct Application {
     execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
     /// Product work profile (economy / balanced).
     work_profile: WorkProfile,
+    /// Whether durable project memory is part of this project. Resolved once at
+    /// assembly from `.leveler/config.yaml`; a config change is a new process
+    /// generation, so the value is immutable for this Application's lifetime.
+    memory: MemoryPolicy,
     /// Collaboration mode (chat / plan / goal).
     collaboration: CollaborationMode,
     /// Model-step safety ceiling for this application's top-level runs, from
@@ -448,6 +523,8 @@ impl Application {
             agents_delegation: global.agents_delegation,
             agents_independent_review: global.agents_independent_review,
             browser_default: global.browser_default,
+            assist_prompt_suggestions: global.assist_prompt_suggestions,
+            assist_away_summary: global.assist_away_summary,
         })
     }
 
@@ -530,6 +607,9 @@ impl Application {
             config.browser_default,
         ));
         let (memory_events, _) = tokio::sync::broadcast::channel(128);
+        let memory = MemoryPolicy::from_project(
+            &leveler_project::ProjectConfig::load(&layout.repo_root).unwrap_or_default(),
+        );
         Ok(Self {
             layout,
             config,
@@ -541,6 +621,7 @@ impl Application {
             memory_events,
             execution_overrides: None,
             work_profile: WorkProfile::Balanced,
+            memory,
             collaboration: CollaborationMode::Chat,
             model_step_ceiling: None,
             environment,
@@ -693,6 +774,13 @@ impl Application {
     }
 
     fn ensure_memory_consolidator(&self, db: &Database) -> Result<(), AppError> {
+        // A disabled project runs no memory worker at all: no inbox admission
+        // (the SQL trigger checks the session flag), no claim, no provider
+        // request. Existing memory data is untouched and becomes usable again
+        // when the user re-enables the switch (which restarts the process).
+        if !self.memory.enabled() {
+            return Ok(());
+        }
         if self.memory_consolidator.get().is_some() {
             return Ok(());
         }
@@ -722,6 +810,28 @@ impl Application {
         }
     }
 
+    /// Stamp this session's memory-admission flag from the project policy.
+    ///
+    /// Must run before the turn row is inserted: admission is a SQL trigger on
+    /// that insert, so the column has to be current by then. A no-op when the
+    /// value already matches.
+    async fn sync_session_memory_policy(
+        &self,
+        db: &Database,
+        session_id: &leveler_core::SessionId,
+    ) {
+        if let Err(error) = SessionRepository::new(db)
+            .set_memory_enabled(session_id, self.memory.enabled())
+            .await
+        {
+            // Admission fails closed only when the write fails: the column
+            // keeps its previous value, which is the last policy actually
+            // recorded for this session. Surfacing the error is a diagnostic,
+            // not a reason to abort the turn.
+            tracing::warn!(%error, "could not persist the session memory policy");
+        }
+    }
+
     pub fn subscribe_memory_events(
         &self,
     ) -> tokio::sync::broadcast::Receiver<memory_consolidator::MemoryConsolidationEvent> {
@@ -736,6 +846,21 @@ impl Application {
     /// The parsed `.leveler/config.yaml` for the repo (defaults if absent).
     pub fn project_config(&self) -> leveler_project::ProjectConfig {
         leveler_project::ProjectConfig::load(&self.layout.repo_root).unwrap_or_default()
+    }
+
+    /// The single memory-capability decision for this project.
+    pub fn memory_policy(&self) -> MemoryPolicy {
+        self.memory
+    }
+
+    /// Whether an idle assist affordance is switched on.
+    pub(crate) fn assist_enabled(&self, kind: crate::prompt_assist::AssistKind) -> bool {
+        match kind {
+            crate::prompt_assist::AssistKind::PromptSuggestion => {
+                self.config.assist_prompt_suggestions
+            }
+            crate::prompt_assist::AssistKind::AwaySummary => self.config.assist_away_summary,
+        }
     }
 
     pub(crate) fn top_level_limits(&self) -> leveler_agent::StepLimits {
@@ -758,6 +883,94 @@ impl Application {
             *guard = Some(leveler_tools::mcp::connect_all(&self.config.mcp_servers).await);
         }
         guard.clone().unwrap_or_default()
+    }
+
+    /// Compose one turn's model-visible tool surface from what this host can
+    /// actually do.
+    ///
+    /// The SINGLE owner of tool-surface composition: the coding engine and the
+    /// read-only `/btw` side surface both come through here, so the two cannot
+    /// drift into different answers about what tools exist. Harness controls
+    /// and MCP tools are attached by the caller that wants them — they steer a
+    /// harness or live in another process, so they are not part of the
+    /// capability composition.
+    #[allow(clippy::too_many_arguments)]
+    async fn compose_tool_surface(
+        &self,
+        model: &ModelRef,
+        mode: PermissionProfile,
+        sandbox: bool,
+        work_profile: WorkProfile,
+        read_only: bool,
+        session_scope: Option<&str>,
+    ) -> Result<(CapabilityPacks, ToolContext, leveler_tools::ToolRegistry), AppError> {
+        let workspace = Workspace::new(&self.layout.repo_root)?;
+        // The ablation seam (`leveler eval ablate`): overrides reach BOTH
+        // consumers — the executor factory's resolver and the tool-context
+        // limits — so a run differs from control in exactly the flipped knob.
+        // Every execution path (direct, orchestrated, bare) funnels through
+        // here.
+        let max_files =
+            leveler_agent::coding::resolve_tool_limits(self.execution_overrides.as_ref());
+        let artifact_store = std::sync::Arc::new(leveler_execution::ArtifactStore::new(
+            self.layout.state_dir.join("artifacts"),
+        ));
+        // Reuse the process-lived registry so background servers/watchers
+        // survive across turns. A fresh per-engine registry was dropped when the
+        // turn's engine went out of scope, and its KillOnDrop killed every
+        // background process (and the next turn's registry no longer knew the
+        // task id) — the "服务活不过一个回合" bug.
+        let capabilities = leveler_tools::Capabilities::in_process(self.environment.clone())
+            .with_background_tasks(self.background_tasks.clone())
+            .with_artifact_store(artifact_store)
+            .with_memory_root(self.layout.memory_dir())
+            .with_browser(self.browser.clone())
+            .with_search_api_key(search_api_key(self.environment.as_ref()));
+        let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
+            .with_policy_limits(max_files)
+            .with_sandbox(sandbox)
+            .with_deny_env(provider_secret_env_names(&self.config.providers))
+            .with_read_only(read_only);
+        // The permission profile this turn authorizes under is the SESSION's
+        // live cell, not the value captured here: a user who switches profile
+        // while this turn runs must be obeyed by it and by every agent it has
+        // already delegated to, at their next authorization decision.
+        let tool_context =
+            tool_context.with_permission_profile(self.permission_profile_for(session_scope, mode));
+        let tool_context = match session_scope {
+            Some(scope) => tool_context.with_session_scope(scope),
+            None => tool_context,
+        };
+        // The model-visible surface is composed here, from what this host can
+        // actually do — never from a guess about the task or the model.
+        // ONE answer for the whole memory surface. `exposed` decided the tools;
+        // the index, the recall root and the prompt guidance used to bypass it
+        // entirely, so an Economy turn carried every memory body while the
+        // tools were unregistered — two owners for one capability.
+        let exposed = self.exposed_capabilities(work_profile, model).await;
+        let registry = model_surface(exposed, &capabilities);
+        Ok((exposed, tool_context, registry))
+    }
+
+    /// The read-only tool surface a `/btw` side question may use.
+    ///
+    /// Same composition owner as a normal turn, physically narrowed to the
+    /// observe-class tools: no mutating tool and no harness control
+    /// (`update_plan`, delegation, permissions) is present, so a side question
+    /// cannot change the workspace or steer the main task. The returned
+    /// [`ToolContext`] additionally carries the read-only overlay.
+    pub async fn side_question_tools(
+        &self,
+        model: &ModelRef,
+        mode: PermissionProfile,
+        sandbox: bool,
+        work_profile: WorkProfile,
+        session_scope: Option<&str>,
+    ) -> Result<(leveler_tools::ToolRegistry, ToolContext), AppError> {
+        let (_exposed, tool_context, registry) = self
+            .compose_tool_surface(model, mode, sandbox, work_profile, true, session_scope)
+            .await?;
+        Ok((registry.read_only_subset(), tool_context))
     }
 
     /// Build the Coding harness for `model`, rooted at the repository. Uses this Application's work profile
@@ -832,11 +1045,16 @@ impl Application {
     /// A user's decision about cost and scope, never an inference about the
     /// task. `Economy` asks for none of them — the primitives and the protocol
     /// only — which is why a machine with a browser runtime installed still
-    /// shows an Economy turn zero browser tools.
-    fn capability_selection(work_profile: WorkProfile) -> CapabilityPacks {
+    /// shows an Economy turn zero browser tools. Memory additionally honours
+    /// the project's own `memory.enabled` switch: a disabled project asks for
+    /// no memory surface regardless of profile.
+    fn capability_selection(work_profile: WorkProfile, memory: MemoryPolicy) -> CapabilityPacks {
         match work_profile {
             WorkProfile::Economy => CapabilityPacks::NONE,
-            WorkProfile::Balanced => CapabilityPacks::ALL,
+            WorkProfile::Balanced => CapabilityPacks {
+                memory: memory.exposes(work_profile),
+                ..CapabilityPacks::ALL
+            },
         }
     }
 
@@ -849,7 +1067,7 @@ impl Application {
         work_profile: WorkProfile,
         model: &leveler_model::ModelRef,
     ) -> CapabilityPacks {
-        Self::capability_selection(work_profile)
+        Self::capability_selection(work_profile, self.memory)
             .intersect(self.capability_availability(model).await)
     }
 
@@ -866,55 +1084,13 @@ impl Application {
         read_only: bool,
         session_scope: Option<&str>,
     ) -> Result<leveler_agent::coding::CodingRuntime, AppError> {
-        let workspace = Workspace::new(&self.layout.repo_root)?;
-        // The ablation seam (`leveler eval ablate`): overrides reach BOTH
-        // consumers — the executor factory's resolver and the tool-context
-        // limits — so a run differs from control in exactly the flipped knob.
-        // Every execution path (direct, orchestrated, bare) funnels through
-        // here.
-        let max_files =
-            leveler_agent::coding::resolve_tool_limits(self.execution_overrides.as_ref());
-        let artifact_store = std::sync::Arc::new(leveler_execution::ArtifactStore::new(
-            self.layout.state_dir.join("artifacts"),
-        ));
-        // Reuse the process-lived registry so background servers/watchers
-        // survive across turns. A fresh per-engine registry was dropped when the
-        // turn's engine went out of scope, and its KillOnDrop killed every
-        // background process (and the next turn's registry no longer knew the
-        // task id) — the "服务活不过一个回合" bug.
-        let bg = self.background_tasks.clone();
-        // The capability handles this host owns. They reach the TOOLS at
-        // construction (below) and the RUNTIME through its own fields — never
-        // through the tool context, which carries authority and nothing else.
-        let capabilities = leveler_tools::Capabilities::in_process(self.environment.clone())
-            .with_background_tasks(bg.clone())
-            .with_artifact_store(artifact_store)
-            .with_memory_root(self.layout.memory_dir())
-            .with_browser(self.browser.clone())
-            .with_search_api_key(search_api_key(self.environment.as_ref()));
-        let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
-            .with_policy_limits(max_files)
-            .with_sandbox(sandbox)
-            .with_deny_env(provider_secret_env_names(&self.config.providers))
-            .with_read_only(read_only);
-        // The permission profile this turn authorizes under is the SESSION's
-        // live cell, not the value captured here: a user who switches profile
-        // while this turn runs must be obeyed by it and by every agent it has
-        // already delegated to, at their next authorization decision.
-        let tool_context =
-            tool_context.with_permission_profile(self.permission_profile_for(session_scope, mode));
-        let tool_context = match session_scope {
-            Some(scope) => tool_context.with_session_scope(scope),
-            None => tool_context,
-        };
-        // The model-visible surface is composed here, from what this host can
-        // actually do — never from a guess about the task or the model.
         // ONE answer for the whole memory surface. `exposed` decided the tools;
         // the index, the recall root and the prompt guidance used to bypass it
         // entirely, so an Economy turn carried every memory body while the
         // tools were unregistered — two owners for one capability.
-        let exposed = self.exposed_capabilities(work_profile, model).await;
-        let mut registry = model_surface(exposed, &capabilities);
+        let (exposed, tool_context, mut registry) = self
+            .compose_tool_surface(model, mode, sandbox, work_profile, read_only, session_scope)
+            .await?;
         // Harness controls are not a capability the host can turn off: they
         // steer the harness, so the harness registers them.
         leveler_agent::register_harness_controls(&mut registry);
@@ -956,7 +1132,7 @@ impl Application {
                 memory_catalog,
                 memory_expose: exposed.memory,
                 memory_root: exposed.memory.then(|| self.layout.memory_dir()),
-                background_tasks: bg,
+                background_tasks: self.background_tasks.clone(),
                 permission_rules,
                 permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,
@@ -1277,7 +1453,6 @@ mod merge_tests {
             api_key: None,
             headers: Default::default(),
             timeouts: Default::default(),
-            retry: Default::default(),
         }
     }
 

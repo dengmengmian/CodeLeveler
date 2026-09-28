@@ -35,6 +35,7 @@ impl ScriptedModel {
             input_tokens: 120 + u64::from(turn) * 40,
             output_tokens: 20,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             reasoning_tokens: Some(12),
         };
         let (content, finish_reason) = match turn {
@@ -68,6 +69,7 @@ impl ScriptedModel {
         ModelResponse {
             request_id: RequestId::generate(),
             message: Message {
+                origin: None,
                 role: Role::Assistant,
                 content,
             },

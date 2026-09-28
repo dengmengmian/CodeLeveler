@@ -1,4 +1,4 @@
-//! HTTP transport: sends encoded requests with retry/backoff and maps every
+//! HTTP transport: sends one physical request and maps every
 //! failure onto a normalized [`ModelError`].
 
 use std::time::Duration;
@@ -7,8 +7,6 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use leveler_model::{DeliveryState, ModelError, ModelErrorKind, ProtocolContext, RawByteStream};
-
-use crate::config::RetryConfig;
 
 /// Map a `reqwest` transport error to a normalized model error, including what
 /// the transport can prove about delivery.
@@ -65,119 +63,63 @@ fn build_request(
     builder
 }
 
-/// Send a request, retrying on retryable failures with exponential backoff.
-/// Returns the successful (2xx) response, or a normalized error.
-pub(crate) async fn send_with_retry(
+/// One physical attempt. Retry admission and durable attempt facts belong to
+/// the caller; transport must never hide another potentially billed request.
+pub(crate) async fn send_once(
     client: &reqwest::Client,
     url: &str,
     body: &serde_json::Value,
     context: &ProtocolContext,
-    retry: &RetryConfig,
     budget: RequestBudget,
     cancellation: &CancellationToken,
 ) -> Result<reqwest::Response, ModelError> {
-    let max_attempts = retry.max_attempts.max(1);
-    let mut backoff = Duration::from_millis(retry.initial_backoff_ms);
-    let max_backoff = Duration::from_millis(retry.max_backoff_ms);
-    let mut last_error: Option<ModelError> = None;
-
-    for attempt in 1..=max_attempts {
-        if cancellation.is_cancelled() {
-            return Err(ModelError::cancelled());
-        }
-
-        // Every attempt, and every backoff before one, spends the SAME
-        // budget: a retry that started its own fresh clock would let a
-        // caller's deadline be exceeded by the number of attempts.
-        let Some(per_request_timeout) = budget.remaining() else {
-            return Err(deadline_exceeded(last_error));
-        };
-        let request = build_request(client, url, body, context, per_request_timeout);
-        let send = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ModelError::cancelled()),
-            result = request.send() => result,
-        };
-
-        match send {
-            Ok(response) => {
-                let status = response.status();
-                if status.is_success() {
-                    return Ok(response);
-                }
-                let code = status.as_u16();
-                let retry_after = parse_retry_after(response.headers());
-                let header_request_id = request_id_from_headers(response.headers());
-                let text = response.text().await.unwrap_or_default();
-                let detail = parse_provider_error(&text);
-                // Prefer the provider's own explanation over the raw envelope;
-                // fall back to the bounded body so an unknown shape still says
-                // something. `from_status` sanitizes whatever it receives.
-                let reason = detail
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| truncate(&text, 500));
-                let mut err = ModelError::from_status(code, reason);
-                if let Some(code) = detail.code {
-                    err = err.with_provider_code(code);
-                }
-                if let Some(id) = header_request_id.or(detail.request_id) {
-                    err = err.with_request_id(id);
-                }
-                if let Some(ms) = retry_after {
-                    err = err.with_retry_after_ms(ms);
-                }
-                if !err.is_safe_to_retry() {
-                    return Err(err);
-                }
-                if attempt == max_attempts {
-                    return Err(exhausted(err));
-                }
-                last_error = Some(err);
-            }
-            Err(e) => {
-                let err = map_reqwest_error(&e);
-                if !err.is_safe_to_retry() {
-                    return Err(err);
-                }
-                if attempt == max_attempts {
-                    return Err(exhausted(err));
-                }
-                last_error = Some(err);
-            }
-        }
-
-        // Backoff before the next attempt, cancellable. A provider-advertised
-        // Retry-After overrides the exponential schedule — retrying a rate
-        // limit sooner than told just burns the next attempt on another 429.
-        let wait = last_error
-            .as_ref()
-            .and_then(|e| e.retry_after_ms)
-            .map(|ms| Duration::from_millis(ms).min(MAX_RETRY_AFTER))
-            .unwrap_or(backoff);
-        // Sleeping past the caller's deadline would burn the remainder of its
-        // budget on waiting rather than on an answer.
-        if budget.remaining_after(wait).is_none() {
-            return Err(deadline_exceeded(last_error));
-        }
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(ModelError::cancelled()),
-            _ = tokio::time::sleep(wait) => {}
-        }
-        backoff = (backoff * 2).min(max_backoff);
+    let per_request_timeout = budget.remaining().ok_or_else(|| {
+        ModelError::new(
+            ModelErrorKind::Timeout,
+            "request deadline elapsed before sending",
+        )
+        .with_delivery_state(DeliveryState::NotSent)
+    })?;
+    let request = build_request(client, url, body, context, per_request_timeout);
+    let response = tokio::select! {
+        biased;
+        _=cancellation.cancelled()=>return Err(ModelError::cancelled()),
+        result=request.send()=>result.map_err(|error|map_reqwest_error(&error))?,
+    };
+    if response.status().is_success() {
+        return Ok(response);
     }
-
-    Err(last_error
-        .unwrap_or_else(|| ModelError::new(ModelErrorKind::Other, "request failed with no error")))
+    let code = response.status().as_u16();
+    let retry_after = parse_retry_after(response.headers());
+    let header_request_id = request_id_from_headers(response.headers());
+    let text = tokio::select! {
+        biased;
+        _=cancellation.cancelled()=>return Err(ModelError::cancelled()),
+        result=response.text()=>result.map_err(|error|map_reqwest_error(&error))?,
+    };
+    let detail = parse_provider_error(&text);
+    let reason = detail
+        .message
+        .clone()
+        .unwrap_or_else(|| truncate(&text, 500));
+    let mut error = ModelError::from_status(code, reason);
+    if let Some(code) = detail.code {
+        error = error.with_provider_code(code);
+    }
+    if let Some(id) = header_request_id.or(detail.request_id) {
+        error = error.with_request_id(id);
+    }
+    if let Some(ms) = retry_after {
+        error = error.with_retry_after_ms(ms);
+    }
+    Err(error)
 }
 
 /// What a single provider call may spend: the caller's remaining deadline when
 /// it set one, otherwise the provider's configured per-request default.
 ///
-/// The distinction matters at the retry loop: a `Deadline` shrinks with every
-/// attempt and every backoff, while a `PerRequest` default applies afresh to
-/// each attempt exactly as it always has.
+/// A caller deadline is measured from its original clock, while the provider
+/// default bounds only this physical request.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RequestBudget {
     /// No caller budget: each attempt gets the provider's configured timeout.
@@ -197,35 +139,7 @@ impl RequestBudget {
             }
         }
     }
-
-    /// Whether anything would still be left after waiting `wait`.
-    fn remaining_after(&self, wait: Duration) -> Option<Duration> {
-        match self {
-            Self::PerRequest(_) => Some(wait),
-            Self::Deadline(deadline) => {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                left.checked_sub(wait).filter(|rest| !rest.is_zero())
-            }
-        }
-    }
 }
-
-/// The caller's budget ran out. Carries the last provider error when there was
-/// one, so a deadline reached mid-retry still explains what was failing.
-fn deadline_exceeded(last_error: Option<ModelError>) -> ModelError {
-    let mut error = last_error.unwrap_or_else(|| {
-        ModelError::new(
-            ModelErrorKind::Timeout,
-            "request deadline elapsed before a response",
-        )
-    });
-    error.provider_retries_exhausted = true;
-    error
-}
-
-/// Hard cap on a provider-advertised wait so a hostile/buggy `Retry-After`
-/// cannot park the turn for minutes.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 /// Structured fields a provider's error response carried.
 ///
@@ -298,17 +212,6 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .map(|secs| secs.saturating_mul(1000))
 }
 
-/// Provider-level retries own the FAST retry budget for request-start
-/// failures. Once they are exhausted, the error is flagged so a diagnostic
-/// can tell the two budgets apart; the logical retry lifecycle above keeps
-/// its own, independent budget. `retryable` stays kind-derived: destroying it
-/// here silently made every request-start timeout terminal for the whole goal
-/// (R006 R6-P3 — a continuation window died on one timeout).
-fn exhausted(mut error: ModelError) -> ModelError {
-    error.provider_retries_exhausted = true;
-    error
-}
-
 /// Convert a successful streaming response into a raw byte stream with
 /// normalized errors.
 pub(crate) fn response_to_byte_stream(response: reqwest::Response) -> RawByteStream {
@@ -344,7 +247,7 @@ mod tests {
             parallel_tool_calls: true,
             supports_temperature: true,
             thinking_supports_forced_tool_choice: true,
-            passback_reasoning_content: false,
+            reasoning_replay: leveler_model::ReasoningReplayContract::NONE,
         }
     }
 
@@ -420,27 +323,9 @@ mod tests {
         );
     }
 
-    /// Past the deadline nothing starts, and a wait that would cross it is
-    /// refused rather than slept through.
     #[test]
-    fn an_elapsed_deadline_permits_neither_a_request_nor_a_backoff() {
+    fn an_elapsed_deadline_permits_no_request() {
         let spent = RequestBudget::Deadline(Instant::now() - Duration::from_secs(1));
-        assert!(spent.remaining().is_none(), "no attempt may start");
-
-        let short = RequestBudget::Deadline(Instant::now() + Duration::from_millis(30));
-        assert!(
-            short.remaining_after(Duration::from_millis(100)).is_none(),
-            "a backoff longer than the remaining budget must not be waited out"
-        );
-        assert!(
-            short.remaining_after(Duration::from_millis(5)).is_some(),
-            "a backoff that still leaves budget is fine"
-        );
-        assert!(
-            RequestBudget::PerRequest(None)
-                .remaining_after(Duration::from_secs(3600))
-                .is_some(),
-            "without a caller deadline the backoff schedule is unchanged"
-        );
+        assert!(spent.remaining().is_none());
     }
 }

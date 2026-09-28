@@ -2805,7 +2805,7 @@ mod tests {
     fn english_locale_covers_recap_and_unsupported_delegation() {
         let recap = TranscriptItem::Recap(RecapBlock {
             summary: Some("Implemented".into()),
-            next_step: "Run the app".into(),
+            next_step: Some("Run the app".into()),
         });
         let recap = item_render(
             &recap,

@@ -14,6 +14,30 @@
 # the per-command scratch and the tool cache: no nested sandbox, no daemon or
 # control-plane socket, no write to the user's home.
 #
+# ── Rule delivery ────────────────────────────────────────────────────────────
+# AGENTS.md is far larger than one prompt can carry in full. `rules:` names the
+# sections the runtime delivers in full on EVERY turn (substring match against
+# the section heading or id); everything else is filled in document order to
+# `budget_bytes`. Sections that do not fit stay authoritative and are not
+# listed by title. `read_project_rules` with no arguments lists every source
+# and section id; the same tool with source and section returns that text.
+# Nothing loses authority: only verbatim presence is budgeted.
+rules:
+  always_delivered:
+    - 核心原则
+    - 架构门禁
+    - 架构决策检查
+    - 执行边界
+    - 测试与验证
+    - 输出规范
+    - 错误处理原则
+    - 完成定义
+    - unsafe
+    - 命令执行规则
+    - 可直接执行
+    - 必须先确认
+  budget_bytes: 16000
+#
 # Layer 2 — `cargo test --workspace --all-features --locked --no-fail-fast`
 # (what CI runs). It additionally contains tests that require host capabilities
 # the sandbox deliberately does not grant. macOS seatbelt and Linux bubblewrap

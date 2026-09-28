@@ -104,6 +104,21 @@ pub trait ModelRequestStore: Send + Sync {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ModelRequestRecord>, StorageError>;
+
+    /// Attempts belonging to exactly one goal/root-turn budget; excludes
+    /// unrelated auxiliary calls and legacy records without scope attribution.
+    async fn load_for_budget_scope(
+        &self,
+        session_id: &SessionId,
+        scope: &str,
+    ) -> Result<Vec<ModelRequestRecord>, StorageError> {
+        Ok(self
+            .load_for_session(session_id)
+            .await?
+            .into_iter()
+            .filter(|record| record.budget_scope.as_deref() == Some(scope))
+            .collect())
+    }
 }
 
 /// The production SQLite adapters.

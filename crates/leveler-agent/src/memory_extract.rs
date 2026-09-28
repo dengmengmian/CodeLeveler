@@ -32,7 +32,8 @@ use leveler_memory::{
     parse_semantic_candidates, validate_semantic_candidate,
 };
 use leveler_model::{
-    Message, ModelRef, ModelRequest, ModelRuntime, ReasoningEffort, Role, TransportPolicy,
+    FinishReason, Message, ModelRef, ModelRequest, ModelRuntime, ReasoningEffort, Role, TokenUsage,
+    TransportPolicy,
 };
 
 /// Upper bound on the user text handed to the extractor. A turn's memory is
@@ -160,6 +161,34 @@ pub fn validate_batch_candidates(
         .collect()
 }
 
+/// The mechanical facts of ONE memory-extraction provider call, for the
+/// unified model-call ledger.
+///
+/// It carries no user text and no candidate body: only counts, tokens, timing
+/// and whether the call succeeded. A memory-extraction request is a real
+/// provider call made on the runtime's own account, so it is recorded under
+/// its own lane rather than being invisible in the cost of a session.
+#[derive(Debug, Clone)]
+pub struct ExtractionCall {
+    /// The model the request named.
+    pub model: ModelRef,
+    /// How many source turns were represented by this one request.
+    pub source_turn_count: usize,
+    /// Total user-authored characters sent as source text.
+    pub source_input_chars: usize,
+    /// Provider-reported usage. `None` when the call never produced a
+    /// response (a timeout or transport error), so no usage was measured.
+    pub usage: Option<TokenUsage>,
+    pub latency_ms: u64,
+    pub provider_request_id: Option<String>,
+    pub finish_reason: Option<FinishReason>,
+    /// The effort actually put on the wire. Always `Low` for extraction, but
+    /// recorded so a drift to a stronger reasoning policy is visible.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// `Some` when the call failed.
+    pub error: Option<String>,
+}
+
 /// Extract durable project facts from the user's own sentence.
 ///
 /// Implementations must be side-effect free and must never touch a memory
@@ -195,6 +224,21 @@ pub trait SemanticExtractor: Send + Sync {
             );
         }
         Ok(batch)
+    }
+
+    /// [`Self::extract_batch`] plus the mechanical record of the provider call
+    /// it made. The default returns `None` because a deterministic or fake
+    /// extractor makes no provider request; only a real model call has
+    /// something for the ledger.
+    async fn extract_batch_recorded(
+        &self,
+        source_turns: &[BatchSourceTurn],
+        cancellation: &CancellationToken,
+    ) -> (
+        Result<Vec<BatchSemanticCandidate>, ExtractionError>,
+        Option<ExtractionCall>,
+    ) {
+        (self.extract_batch(source_turns, cancellation).await, None)
     }
 }
 
@@ -233,6 +277,21 @@ impl ModelSemanticExtractor {
         self.max_output_tokens = max_output_tokens;
         self.batch_max_output_tokens = max_output_tokens.min(MAX_OUTPUT_TOKENS);
         self
+    }
+
+    /// The effort this extractor will put on the wire: the requested low
+    /// effort, remapped onto what the model actually supports. The adapter
+    /// deliberately does not remap, so resolution happens here; a model whose
+    /// profile cannot be read keeps the requested value rather than silently
+    /// dropping the knob.
+    async fn resolved_effort(&self, requested: ReasoningEffort) -> Option<ReasoningEffort> {
+        match self.runtime.profile(&self.model).await {
+            Ok(profile) => {
+                leveler_model::resolve_reasoning_effort(Some(requested), &profile.reasoning)
+                    .effective
+            }
+            Err(_) => Some(requested),
+        }
     }
 
     /// The exact request this extractor sends, or `None` for an empty message.
@@ -334,9 +393,10 @@ impl SemanticExtractor for ModelSemanticExtractor {
         user_message: &str,
         cancellation: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, ExtractionError> {
-        let Some(request) = self.build_request(user_message) else {
+        let Some(mut request) = self.build_request(user_message) else {
             return Ok(Vec::new());
         };
+        request.reasoning_effort = self.resolved_effort(ReasoningEffort::Low).await;
         // The child token means a cancelled turn stops the extraction too, but
         // the timeout is this call's own bound and never the turn's.
         let call_token = cancellation.child_token();
@@ -355,16 +415,82 @@ impl SemanticExtractor for ModelSemanticExtractor {
         source_turns: &[BatchSourceTurn],
         cancellation: &CancellationToken,
     ) -> Result<Vec<BatchSemanticCandidate>, ExtractionError> {
-        let Some(request) = self.build_batch_request(source_turns)? else {
-            return Ok(Vec::new());
+        self.extract_batch_recorded(source_turns, cancellation)
+            .await
+            .0
+    }
+
+    async fn extract_batch_recorded(
+        &self,
+        source_turns: &[BatchSourceTurn],
+        cancellation: &CancellationToken,
+    ) -> (
+        Result<Vec<BatchSemanticCandidate>, ExtractionError>,
+        Option<ExtractionCall>,
+    ) {
+        let source_turn_count = source_turns.len();
+        let source_input_chars = source_turns
+            .iter()
+            .map(|turn| turn.user_text.chars().count())
+            .sum::<usize>();
+        let mut request = match self.build_batch_request(source_turns) {
+            Ok(Some(request)) => request,
+            // Nothing to send: not a provider call, so nothing is recorded.
+            Ok(None) => return (Ok(Vec::new()), None),
+            Err(error) => return (Err(error), None),
         };
+        let effort = self.resolved_effort(ReasoningEffort::Low).await;
+        request.reasoning_effort = effort;
+        let record = |usage: Option<TokenUsage>,
+                      latency_ms: u64,
+                      provider_request_id: Option<String>,
+                      finish_reason: Option<FinishReason>,
+                      error: Option<String>| ExtractionCall {
+            model: self.model.clone(),
+            source_turn_count,
+            source_input_chars,
+            usage,
+            latency_ms,
+            provider_request_id,
+            finish_reason,
+            reasoning_effort: effort,
+            error,
+        };
+        let started = std::time::Instant::now();
         let call = self.runtime.generate(request, cancellation.child_token());
-        let response = match tokio::time::timeout(self.timeout, call).await {
-            Err(_) => return Err(ExtractionError::Timeout),
-            Ok(Err(error)) => return Err(ExtractionError::Model(error.to_string())),
-            Ok(Ok(response)) => response,
+        let elapsed = |started: std::time::Instant| {
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
         };
-        parse_batch_semantic_candidates(&response.message.text_content())
+        match tokio::time::timeout(self.timeout, call).await {
+            Err(_) => (
+                Err(ExtractionError::Timeout),
+                Some(record(
+                    None,
+                    elapsed(started),
+                    None,
+                    None,
+                    Some("timeout".into()),
+                )),
+            ),
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                (
+                    Err(ExtractionError::Model(message.clone())),
+                    Some(record(None, elapsed(started), None, None, Some(message))),
+                )
+            }
+            Ok(Ok(response)) => {
+                let parsed = parse_batch_semantic_candidates(&response.message.text_content());
+                let call = record(
+                    Some(response.usage),
+                    elapsed(started),
+                    Some(response.request_id.to_string()),
+                    Some(response.finish_reason),
+                    parsed.as_ref().err().map(|error| error.to_string()),
+                );
+                (parsed, Some(call))
+            }
+        }
     }
 }
 
@@ -701,7 +827,12 @@ mod tests {
         }
 
         async fn profile(&self, _model: &ModelRef) -> Result<ModelProfile, ModelError> {
-            unimplemented!()
+            // A fake runtime has no registry profile; the extractor keeps the
+            // requested effort rather than remapping it.
+            Err(ModelError::new(
+                ModelErrorKind::ProviderUnavailable,
+                "no profile in tests",
+            ))
         }
     }
 
@@ -776,6 +907,38 @@ mod tests {
         );
         assert!(request.max_output_tokens.is_some_and(|m| m <= 2048));
         assert!(request.deadline.is_some(), "the call is bounded");
+    }
+
+    #[tokio::test]
+    async fn batch_extraction_records_low_effort_and_usage_without_user_text() {
+        let runtime = Arc::new(FakeRuntime::answering(&batch_candidate_json(
+            "turn-1",
+            "模型就 Pro",
+        )));
+        let (result, call) = extractor(runtime.clone())
+            .extract_batch_recorded(
+                &[source_turn("turn-1", "模型就 Pro")],
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(result.expect("extraction succeeds").len(), 1);
+        let call = call.expect("a provider call is recorded");
+        // The ledger carries the lane's own low effort, never the coding
+        // turn's, and no user text at all.
+        assert_eq!(call.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(call.source_turn_count, 1);
+        assert_eq!(call.source_input_chars, "模型就 Pro".chars().count());
+        assert!(call.error.is_none());
+        assert!(call.usage.is_some());
+        // The request on the wire is bounded and deterministic.
+        let request = &runtime.requests()[0];
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(request.temperature, Some(0.0));
+        assert!(
+            request
+                .max_output_tokens
+                .is_some_and(|max| max <= MAX_OUTPUT_TOKENS)
+        );
     }
 
     #[tokio::test]

@@ -461,6 +461,7 @@ mod tests {
                 id: SessionId::new(id),
                 goal: format!("goal {id}"),
                 status: "idle".to_string(),
+                declaration: None,
                 model: "mock/m".to_string(),
                 updated_at: updated_at.to_string(),
                 repository: None,

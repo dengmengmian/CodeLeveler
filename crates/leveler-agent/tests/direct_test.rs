@@ -96,6 +96,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -1824,14 +1825,12 @@ async fn direct_spends_no_extra_model_call_on_acceptance() {
 
 /// A goal the model lets go quiet ends where the model stopped. The runtime
 /// records the stall; it does not open a second turn on the model's behalf —
-/// the `update_goal` scripted for a fifth response is never reached.
+/// the queued completion is reached only after an explicit resume.
 #[tokio::test]
 async fn a_stalled_goal_ends_after_one_turn() {
     let h = harness(vec![
         text("still working 1"),
         text("still working 2"),
-        text("still working 3"),
-        text("still working 4"),
         tool_call(
             "g1",
             "update_goal",
@@ -1850,12 +1849,21 @@ async fn a_stalled_goal_ends_after_one_turn() {
 
     // The goal was never resolved, and nothing re-drove it.
     assert_eq!(report.stop_reason, StopReason::Stalled);
+    assert_eq!(report.outcome, TaskOutcome::Interrupted);
+    assert_eq!(GoalStore::unfinished(&h.db).await.unwrap().len(), 1);
     let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
     assert_eq!(
         turns.len(),
         1,
         "the runtime must not open a second turn on the model's behalf: {turns:?}"
     );
+    let resumed = h
+        .engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("the unresolved goal remains resumable");
+    assert_eq!(resumed.outcome, TaskOutcome::Completed);
+    assert!(GoalStore::unfinished(&h.db).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2368,6 +2376,7 @@ async fn ceilinged_reviewer_is_bounded_and_keeps_partial_findings() {
     responses.push(ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![
                 ContentPart::Text {
@@ -2933,6 +2942,7 @@ async fn a_harness_launched_review_is_accounted_and_folded_into_the_session() {
 fn with_usage(mut response: ModelResponse, input: u64, cached: u64, output: u64) -> ModelResponse {
     response.usage = TokenUsage {
         input_tokens: input,
+        cache_creation_input_tokens: 0,
         cached_input_tokens: cached,
         reasoning_tokens: None,
         output_tokens: output,
@@ -3045,10 +3055,11 @@ async fn runtime_spend_admission_reconciles_with_the_durable_ledger() {
         durable.total, ledger.cumulative_cost_usd_micros,
     );
     assert_eq!(
-        durable.total.rows_without_cost, 0,
-        "a priced model leaves no unpriced row: {:?}",
+        durable.total.rows_without_cost, 1,
+        "the missing usage remains unpriced even when the model has pricing: {:?}",
         durable.total
     );
+    assert!(ledger.has_unpriced_model_attempt);
     assert!(
         ledger.cumulative_estimated_model_tokens > 0,
         "the first round reports no usage at all; the estimate standing in for \
@@ -3256,4 +3267,311 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
         after_first.cumulative_model_tokens,
         after_second.cumulative_model_tokens
     );
+}
+
+#[tokio::test]
+async fn harness_reviewer_uses_parent_residual_token_budget() {
+    let responses = vec![
+        with_usage(
+            tool_call(
+                "edit",
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/auth.rs\n+pub fn login() {}\n*** End Patch"
+                }),
+            ),
+            49_980,
+            0,
+            20,
+        ),
+        with_usage(
+            tool_call(
+                "done",
+                "update_goal",
+                serde_json::json!({
+                    "status": "complete", "summary": "added login"
+                }),
+            ),
+            99_980,
+            0,
+            20,
+        ),
+        with_usage(
+            tool_call(
+                "inspect",
+                "read_file",
+                serde_json::json!({"path": "src/auth.rs"}),
+            ),
+            59_980,
+            0,
+            20,
+        ),
+        with_usage(
+            text("This response must not be requested after the shared budget is spent."),
+            30,
+            0,
+            20,
+        ),
+    ];
+    let mut h = harness(responses).await;
+    h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
+    let mut s = spec(&h);
+    s.runtime.limits.max_model_tokens = Some(200_000);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let mut seen = Vec::new();
+    h.engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.requests.lock().unwrap().len(),
+        3,
+        "reviewer must stop after consuming the remaining 50,000 tokens, rather than receive a fresh 200,000-token cap"
+    );
+    let rows = leveler_storage::ModelRequestRepository::new(&h.db)
+        .load_for_session(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "every actual request must be durable exactly once"
+    );
+    assert_eq!(rows.iter().filter(|r| r.agent_id.is_some()).count(), 1);
+    let ledger = seen
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            EngineEvent::ProgressUpdated { ledger } => Some(ledger),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(ledger.cumulative_model_tokens, 210_000);
+}
+
+#[tokio::test]
+async fn a_multimodal_goal_requires_resolution_and_keeps_its_original_wal_content() {
+    let h = harness(vec![
+        text("I looked at the image."),
+        text("The image has been inspected."),
+        tool_call(
+            "finish",
+            "update_goal",
+            serde_json::json!({"status":"complete","summary":"implemented the pictured change"}),
+        ),
+    ])
+    .await;
+    let s = spec(&h);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let content = vec![
+        ContentPart::Text {
+            text: s.runtime.goal.clone(),
+        },
+        ContentPart::Image {
+            source: leveler_model::ImageSource::Url {
+                url: "https://example.invalid/task.png".into(),
+            },
+        },
+    ];
+    let report = h
+        .engine
+        .run_with_content(
+            &session,
+            &s,
+            content.clone(),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.stop_reason,
+        StopReason::Stalled,
+        "an image cannot turn a Goal into an ordinary answered chat"
+    );
+    assert_eq!(report.outcome, TaskOutcome::Interrupted);
+    let goals = GoalStore::unfinished(&h.db).await.unwrap();
+    assert_eq!(goals.len(), 1);
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    assert_eq!(turns[0].kind, "user");
+    let continuation =
+        leveler_engine::decode_turn_continuation(turns[0].payload.as_deref().unwrap()).unwrap();
+    assert_eq!(continuation.goal_id.as_ref(), Some(&goals[0].id));
+    assert_eq!(continuation.initiating_message.unwrap().content, content);
+    {
+        let requests = h.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "update_goal")
+        );
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .any(|message| message.role == Role::User && message.content == content)
+        );
+    }
+    let resumed = h
+        .engine
+        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(resumed.stop_reason, StopReason::Completed);
+    assert!(GoalStore::unfinished(&h.db).await.unwrap().is_empty());
+    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    let continuation =
+        leveler_engine::decode_turn_continuation(turns[1].payload.as_deref().unwrap()).unwrap();
+    assert_eq!(continuation.goal_id.as_ref(), Some(&goals[0].id));
+}
+
+struct FailingCheckpointWrites {
+    db: Database,
+    fail: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl leveler_storage::GoalCheckpointStore for FailingCheckpointWrites {
+    async fn create(
+        &self,
+        new: leveler_storage::NewGoalCheckpoint,
+        now: leveler_core::Timestamp,
+    ) -> Result<leveler_storage::GoalCheckpointRecord, leveler_storage::StorageError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(leveler_storage::StorageError::InvalidData(
+                "checkpoint disk unavailable".into(),
+            ));
+        }
+        leveler_storage::GoalCheckpointStore::create(&self.db, new, now).await
+    }
+    async fn get(
+        &self,
+        id: &leveler_core::GoalCheckpointId,
+    ) -> Result<Option<leveler_storage::GoalCheckpointRecord>, leveler_storage::StorageError> {
+        leveler_storage::GoalCheckpointStore::get(&self.db, id).await
+    }
+    async fn latest_for_goal(
+        &self,
+        id: &leveler_core::GoalId,
+    ) -> Result<Option<leveler_storage::GoalCheckpointRecord>, leveler_storage::StorageError> {
+        leveler_storage::GoalCheckpointStore::latest_for_goal(&self.db, id).await
+    }
+    async fn for_goal(
+        &self,
+        id: &leveler_core::GoalId,
+    ) -> Result<Vec<leveler_storage::GoalCheckpointRecord>, leveler_storage::StorageError> {
+        leveler_storage::GoalCheckpointStore::for_goal(&self.db, id).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_continuation_checkpoint_preserves_owed_goal_and_live_services_for_resume() {
+    let mut h = harness(vec![
+        text("Still inspecting."),
+        text("Work remains."),
+        tool_call(
+            "finish",
+            "update_goal",
+            serde_json::json!({"status":"complete","summary":"finished after storage recovered"}),
+        ),
+    ])
+    .await;
+    let s = spec(&h);
+    let session = h.engine.create_task(&s).await.unwrap();
+    let checkpoints = Arc::new(FailingCheckpointWrites {
+        db: h.db.clone(),
+        fail: std::sync::atomic::AtomicBool::new(true),
+    });
+    h.engine.engine.stores.goal_checkpoints = checkpoints.clone();
+    h.engine.factory.tool_context = h
+        .engine
+        .factory
+        .tool_context
+        .clone()
+        .with_session_scope(session.as_str());
+    let tasks = h.engine.factory.background_tasks.clone();
+    let bg = tasks
+        .spawn_owned(
+            leveler_execution::ProcessRequest::new(
+                "sleep",
+                vec!["30".into()],
+                h.dir.path().to_path_buf(),
+            ),
+            None,
+            Some(session.as_str()),
+        )
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    let result = h
+        .engine
+        .run(
+            &session,
+            &s,
+            &mut |event| seen.push(event),
+            CancellationToken::new(),
+        )
+        .await;
+    let retained = tasks
+        .active_snapshots_for_scope(session.as_str())
+        .await
+        .iter()
+        .any(|task| task.id == bg);
+    // Always reap the test process before assertions, including the red run.
+    tasks.kill(&bg).await.unwrap();
+    tasks
+        .wait(
+            &bg,
+            Some(std::time::Duration::from_secs(5)),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "checkpoint failure remains visible to the caller"
+    );
+    let row = SessionRepository::new(&h.db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        SessionRepository::new(&h.db)
+            .execution(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .3,
+        Some(TaskOutcome::Interrupted)
+    );
+    assert_eq!(row.status, leveler_lifecycle::SessionStatus::Interrupted);
+    assert_eq!(row.state, leveler_lifecycle::AgentState::Execute);
+    assert!(
+        retained,
+        "a failed derived checkpoint must not reap the owed goal's service"
+    );
+    assert_eq!(GoalStore::unfinished(&h.db).await.unwrap().len(), 1);
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, EngineEvent::GoalCheckpointCreated { .. }))
+    );
+    assert!(seen.iter().any(|event| matches!(event, EngineEvent::TaskFinished { outcome: TaskOutcome::Interrupted, reason: Some(reason), .. } if reason.contains("checkpoint disk unavailable"))));
+    checkpoints
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let resumed = h
+        .engine
+        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(resumed.stop_reason, StopReason::Completed);
+    assert!(GoalStore::unfinished(&h.db).await.unwrap().is_empty());
 }

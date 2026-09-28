@@ -25,6 +25,10 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
     pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,6 +41,13 @@ pub struct ReqMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReqBlock {
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
     Text {
         text: String,
     },
@@ -103,6 +114,11 @@ pub enum RespBlock {
     Thinking {
         #[serde(default)]
         thinking: String,
+        #[serde(default)]
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
     },
     /// Forward-compatible catch-all (e.g. `redacted_thinking`).
     #[serde(other)]
@@ -118,6 +134,8 @@ pub struct Usage {
     /// Prompt-cache hits (Anthropic's spelling).
     #[serde(default)]
     pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +168,9 @@ pub struct StreamContentBlockDelta {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockDelta {
+    SignatureDelta {
+        signature: String,
+    },
     TextDelta {
         #[serde(default)]
         text: String,
@@ -178,4 +199,19 @@ pub struct StreamMessageDelta {
 pub struct MessageDeltaBody {
     #[serde(default)]
     pub stop_reason: Option<String>,
+}
+
+impl Usage {
+    pub fn canonical(self) -> leveler_model::TokenUsage {
+        leveler_model::TokenUsage {
+            input_tokens: self
+                .input_tokens
+                .saturating_add(self.cache_read_input_tokens)
+                .saturating_add(self.cache_creation_input_tokens),
+            output_tokens: self.output_tokens,
+            cached_input_tokens: self.cache_read_input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            reasoning_tokens: None,
+        }
+    }
 }

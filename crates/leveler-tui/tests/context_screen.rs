@@ -60,6 +60,7 @@ fn snapshot() -> ContextAccounting {
         token_count_kind: TokenCountKind::Estimated,
         pressure: ContextPressure::Warning,
         categories,
+        reasoning_projection: None,
         last_compaction: Some(CompactionRecord {
             before_tokens: 142_600,
             after_tokens: 53_400,

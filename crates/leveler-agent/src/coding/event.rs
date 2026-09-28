@@ -44,6 +44,11 @@ impl From<AgentEvent> for EngineEvent {
                 applied_diff,
                 exit_code,
                 stop,
+                // The engine event is the durable/UI projection; it already
+                // carries the exit code and the stop reason. The structured
+                // execution status is consumed by the CLI's JSONL stream (the
+                // benchmark's telemetry), which reads `AgentEvent` directly.
+                execution_status: _,
             } => EngineEvent::ToolCallFinished {
                 call_id: id,
                 name,
@@ -125,6 +130,17 @@ impl From<AgentEvent> for EngineEvent {
             }
             A::PlanUpdated { steps } => EngineEvent::PlanUpdated { steps },
             A::GoalIntercepted { kind, detail } => EngineEvent::GoalIntercepted { kind, detail },
+            A::RuntimeInjection {
+                kind,
+                role,
+                model_step,
+                forces_continuation,
+            } => EngineEvent::RuntimeInjection {
+                kind,
+                role,
+                model_step,
+                forces_continuation,
+            },
             A::DelegationStage { action, detail } => {
                 EngineEvent::DelegationStage { action, detail }
             }

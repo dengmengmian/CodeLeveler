@@ -1136,6 +1136,7 @@ mod tests {
                     id: SessionId::new("s1"),
                     goal: "g".to_string(),
                     status: "done".to_string(),
+                    declaration: None,
                     model: "openai/gpt-4o".to_string(),
                     updated_at: "now".to_string(),
                     repository: None,

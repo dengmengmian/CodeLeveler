@@ -44,10 +44,10 @@ impl Tool for DiagnosticsTool {
     }
 
     fn description(&self) -> &'static str {
-        "Report compiler/linter diagnostics (errors, warnings) for a single file \
-         via its language server. Use after editing to see problems without a full \
-         build. Requires a language server for the file's language to be installed; \
-         degrades to a clear message when none is available."
+        "Return language-server diagnostics for one file: errors and warnings, \
+         with location. Requires a language server for that file's language. \
+         An unrecognized language, a missing server, or a server that fails to \
+         start is reported in the result; no diagnostics are invented."
     }
 
     fn input_schema(&self) -> serde_json::Value {

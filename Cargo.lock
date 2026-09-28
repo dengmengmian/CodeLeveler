@@ -1777,6 +1777,7 @@ dependencies = [
  "leveler-lifecycle",
  "leveler-memory",
  "leveler-model",
+ "leveler-project",
  "leveler-provider",
  "leveler-skills",
  "leveler-storage",

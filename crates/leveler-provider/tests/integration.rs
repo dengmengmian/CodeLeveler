@@ -9,7 +9,7 @@ use leveler_model::{
     ProtocolKind, Role,
 };
 use leveler_provider::{
-    ModelConfigFile, ProviderConfig, ProviderRegistry, RegistryInputs, RetryConfig, Timeouts,
+    ModelConfigFile, ProviderConfig, ProviderRegistry, RegistryInputs, Timeouts,
 };
 use leveler_test_support::{MockResponse, MockServer};
 
@@ -25,11 +25,6 @@ fn provider_config(base_url: String) -> ProviderConfig {
             connect_seconds: 5,
             request_seconds: 30,
             idle_stream_seconds: 10,
-        },
-        retry: RetryConfig {
-            max_attempts: 3,
-            initial_backoff_ms: 5,
-            max_backoff_ms: 20,
         },
     }
 }
@@ -60,7 +55,6 @@ fn model_config() -> ModelConfigFile {
             context_quality: None,
             reasoning: Default::default(),
             compatibility: Default::default(),
-            instructions: None,
             pricing: None,
         },
         policy: None,
@@ -180,33 +174,18 @@ async fn stream_interrupted_is_reported() {
 }
 
 #[tokio::test]
-async fn retries_on_429_then_succeeds() {
+async fn nonstream_rate_limit_is_one_physical_attempt() {
     let server = MockServer::start(vec![
         MockResponse::too_many_requests(),
-        MockResponse::sse(&[r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#]),
+        MockResponse::too_many_requests(),
     ])
     .await;
-    let reg = registry(&server);
-
-    let stream = reg
-        .stream(request(), CancellationToken::new())
+    let error = registry(&server)
+        .generate(request(), CancellationToken::new())
         .await
-        .unwrap();
-    let events = collect(stream).await;
-
-    let text: String = events
-        .iter()
-        .filter_map(|e| match e {
-            ModelEvent::TextDelta { delta } => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(text, "ok");
-    assert_eq!(
-        server.request_count(),
-        2,
-        "should have retried once after 429"
-    );
+        .unwrap_err();
+    assert_eq!(error.kind, leveler_model::ModelErrorKind::RateLimit);
+    assert_eq!(server.request_count(), 1);
 }
 
 #[tokio::test]
@@ -284,24 +263,28 @@ async fn a_secret_in_a_provider_error_body_is_redacted() {
     assert!(err.message.contains("[redacted]"), "{}", err.message);
 }
 
-/// A gateway failure the model never saw is transient: it is retried.
+/// Transient failures remain retryable facts for the caller's observed loop.
 #[tokio::test]
-async fn transient_gateway_503_is_retried_then_succeeds() {
+async fn transient_gateway_failure_is_reported_before_any_retry() {
     let server = MockServer::start(vec![
         MockResponse::Status {
             code: 503,
             body: r#"{"error":{"message":"down"}}"#.into(),
         },
-        MockResponse::sse(&[r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#]),
+        MockResponse::too_many_requests(),
     ])
     .await;
-    let reg = registry(&server);
-    let stream = reg
+    let error = registry(&server)
         .stream(request(), CancellationToken::new())
         .await
-        .expect("503 is transient");
-    let _ = collect(stream).await;
-    assert_eq!(server.request_count(), 2, "503 is transient and is retried");
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind,
+        leveler_model::ModelErrorKind::ProviderUnavailable
+    );
+    assert!(error.is_safe_to_retry());
+    assert_eq!(server.request_count(), 1);
 }
 
 /// A 504 may mean the upstream started: not a safe replay, so no auto retry.
@@ -325,7 +308,7 @@ async fn gateway_timeout_504_is_not_auto_retried() {
 }
 
 /// A connect failure provably did no provider-side work: `NotSent`, safe to
-/// retry. The transport still bounds its own attempts.
+/// retry by the observed caller; transport itself sends only once.
 #[tokio::test]
 async fn a_connect_failure_is_not_sent_and_safe_to_retry() {
     // Nothing listens on port 1: the connection is refused before any byte.
@@ -346,7 +329,7 @@ async fn a_connect_failure_is_not_sent_and_safe_to_retry() {
 }
 
 #[tokio::test]
-async fn exhausted_provider_retries_are_terminal_for_outer_layers() {
+async fn one_runtime_call_is_one_physical_attempt() {
     let server = MockServer::start(vec![
         MockResponse::too_many_requests(),
         MockResponse::too_many_requests(),
@@ -361,17 +344,15 @@ async fn exhausted_provider_retries_are_terminal_for_outer_layers() {
         .err()
         .expect("the exhausted provider must fail");
 
-    assert_eq!(server.request_count(), 3);
-    // R006 R6-P3: a 429 stays `Safe` to retry (an explicit "come back later") —
-    // the exhausted fast budget is signalled separately so the outer logical
-    // retry is not silently forbidden to retry at all.
+    assert_eq!(server.request_count(), 1);
+    // Rate-limit facts stay retryable; the outer observer owns the next send.
     assert!(
         err.is_safe_to_retry(),
         "a rate limit must survive provider exhaustion as Safe: {err:?}"
     );
     assert!(
-        err.provider_retries_exhausted,
-        "the exhausted fast budget must be flagged as diagnostic"
+        !err.provider_retries_exhausted,
+        "transport has no hidden retry budget"
     );
 }
 
@@ -437,38 +418,21 @@ async fn cancellation_stops_before_request() {
 }
 
 #[tokio::test]
-async fn rate_limit_retry_honors_retry_after_header() {
-    // The provider says "wait 1s". The configured backoff is 5ms — if the
-    // header is ignored, the retry lands almost immediately.
+async fn rate_limit_preserves_retry_after_for_the_observed_caller() {
     let server = MockServer::start(vec![
         MockResponse::too_many_requests_retry_after(1),
         MockResponse::sse(&[r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#]),
     ])
     .await;
     let reg = registry(&server);
-
-    let started = std::time::Instant::now();
-    let stream = reg
+    let error = reg
         .stream(request(), CancellationToken::new())
         .await
+        .err()
         .unwrap();
-    let events = collect(stream).await;
-    let elapsed = started.elapsed();
-
-    let text: String = events
-        .iter()
-        .filter_map(|e| match e {
-            ModelEvent::TextDelta { delta } => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(text, "ok", "the retry after the advertised delay succeeds");
-    assert_eq!(server.request_count(), 2);
-    assert!(
-        elapsed >= std::time::Duration::from_millis(900),
-        "the retry must wait out Retry-After (~1s), not the 5ms backoff; \
-         elapsed: {elapsed:?}"
-    );
+    assert_eq!(server.request_count(), 1);
+    assert_eq!(error.retry_after_ms, Some(1000));
+    assert!(error.is_safe_to_retry());
 }
 
 /// `[DONE]` is the OpenAI SSE protocol's explicit end-of-stream marker. A
@@ -542,11 +506,6 @@ fn impatient_config(base_url: String) -> ProviderConfig {
             connect_seconds: 5,
             request_seconds: 30,
             idle_stream_seconds: 1,
-        },
-        retry: RetryConfig {
-            max_attempts: 1,
-            initial_backoff_ms: 5,
-            max_backoff_ms: 20,
         },
         ..provider_config(base_url)
     }
@@ -649,6 +608,7 @@ async fn the_two_policies_do_not_share_a_watchdog() {
 
 fn tool_call_message(ids: &[&str]) -> leveler_model::Message {
     leveler_model::Message {
+        origin: None,
         role: Role::Assistant,
         content: ids
             .iter()
@@ -665,6 +625,7 @@ fn tool_call_message(ids: &[&str]) -> leveler_model::Message {
 
 fn tool_result_message(ids: &[&str]) -> leveler_model::Message {
     leveler_model::Message {
+        origin: None,
         role: Role::Tool,
         content: ids
             .iter()
@@ -786,4 +747,67 @@ async fn a_multi_call_round_reaches_the_wire_paired() {
     assert_eq!(call_ids, ["call_a", "call_b"]);
     assert_eq!(messages[2]["tool_call_id"], "call_a");
     assert_eq!(messages[3]["tool_call_id"], "call_b");
+}
+
+/// Return headers and retain an unfinished body until the test releases it.
+async fn stalled_body_registry() -> (
+    ProviderRegistry,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 65536];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        let _ = ready_tx.send(());
+        let _ = stop_rx.await;
+    });
+    let registry = ProviderRegistry::build(RegistryInputs {
+        providers: vec![(provider_config(format!("http://{address}")), None)],
+        models: vec![model_config()],
+    })
+    .unwrap();
+    (registry, ready_rx, stop_tx)
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_nonstream_response_body() {
+    let (registry, ready, _stop) = stalled_body_registry().await;
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    let call = tokio::spawn(async move { registry.generate(request(), token).await });
+    ready.await.unwrap();
+    cancellation.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), call).await;
+    assert!(
+        matches!(result, Ok(Ok(Err(e))) if e.kind == leveler_model::ModelErrorKind::Cancelled),
+        "cancel must wake body read"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_provider_stream_body() {
+    let (registry, ready, _stop) = stalled_body_registry().await;
+    let cancellation = CancellationToken::new();
+    let mut stream = registry
+        .stream(request(), cancellation.clone())
+        .await
+        .unwrap();
+    ready.await.unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ModelEvent::MessageStarted { .. }))
+    ));
+    cancellation.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next()).await;
+    assert!(
+        matches!(result, Ok(Some(Err(e))) if e.kind == leveler_model::ModelErrorKind::Cancelled),
+        "cancel must wake provider stream read"
+    );
 }

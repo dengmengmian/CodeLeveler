@@ -81,6 +81,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {

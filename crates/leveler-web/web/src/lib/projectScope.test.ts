@@ -26,7 +26,7 @@ describe('project scope', () => {
   it('maps only persisted SessionStatus strings, never invented wait states', () => {
     expect(sessionStatusCue('running')).toEqual({ kind: 'running', label: 'Running' });
     expect(sessionStatusCue('failed')).toEqual({ kind: 'failed', label: 'Failed' });
-    expect(sessionStatusCue('completed')).toEqual({ kind: 'completed', label: 'Completed' });
+    expect(sessionStatusCue('completed')).toEqual({ kind: 'completed', label: '已结束' });
     expect(sessionStatusCue('blocked')).toEqual({ kind: 'blocked', label: 'Blocked' });
     expect(sessionStatusCue('interrupted')).toEqual({ kind: 'interrupted', label: 'Interrupted' });
     expect(sessionStatusCue('incomplete')).toEqual({ kind: 'incomplete', label: 'Incomplete' });
@@ -35,4 +35,12 @@ describe('project scope', () => {
     expect(sessionStatusCue('waiting_approval').kind).toBe('idle');
     expect(sessionStatusCue('idle').kind).toBe('idle');
   });
+});
+
+it('shows the durable declaration separately from lifecycle and preserves legacy uncertainty', () => {
+  expect(sessionStatusCue('completed', 'answered').label).toBe('已回答');
+  expect(sessionStatusCue('completed', 'completed').label).toBe('声明完成');
+  expect(sessionStatusCue('completed', null).label).toBe('已结束');
+  expect(sessionStatusCue('running', 'completed').label).toBe('Running');
+  expect(sessionStatusCue('failed', 'answered').label).toBe('Failed');
 });

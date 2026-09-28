@@ -6,15 +6,24 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::StopReason;
-use leveler_agent::coding::ExecutionOverrides;
+use leveler_agent::coding::{ExecutionOverrides, PostEditThroughputMode};
 use leveler_app::Application;
 use leveler_execution::PermissionProfile;
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_project::Layout;
 
-use crate::cli::{AdoptionMicroCommand, EvalCommand};
+use crate::cli::EvalCommand;
 use crate::common::resolve_model;
 use crate::output::Line;
+
+fn load_eval_cases(path: &std::path::Path) -> anyhow::Result<Vec<leveler_eval::EvaluationCase>> {
+    let cases = leveler_eval::EvaluationCase::load_dir(path)
+        .map_err(|e| anyhow::anyhow!("loading cases: {e}"))?;
+    if cases.is_empty() {
+        anyhow::bail!("no eval cases found");
+    }
+    Ok(cases)
+}
 
 pub(crate) async fn cmd_eval(
     layout: Layout,
@@ -24,39 +33,16 @@ pub(crate) async fn cmd_eval(
     match command {
         EvalCommand::Run {
             model,
-            provider,
-            suite,
-            experiment,
-            mode,
-            output,
             cases,
             direct,
             no_verify_gate,
             repetitions,
             json_out,
         } => {
-            if let Some(suite) = suite {
-                let experiment = experiment
-                    .ok_or_else(|| anyhow::anyhow!("--experiment is required with --suite"))?;
-                return run_framework(
-                    &layout,
-                    suite,
-                    experiment,
-                    model,
-                    provider,
-                    repetitions,
-                    output,
-                    mode,
-                );
-            }
             let app = Application::assemble(layout)?;
             let model_ref = resolve_model(&app, model)?;
             let cases_dir = cases.clone();
-            let cases = leveler_eval::EvaluationCase::load_dir(&cases)
-                .map_err(|e| anyhow::anyhow!("loading cases: {e}"))?;
-            if cases.is_empty() {
-                anyhow::bail!("no eval cases found");
-            }
+            let cases = load_eval_cases(&cases)?;
             let mode = if no_verify_gate {
                 "direct-no-verify-gate"
             } else {
@@ -106,8 +92,7 @@ pub(crate) async fn cmd_eval(
             let a = resolve_model(&app, Some(model_a))?;
             let b = resolve_model(&app, Some(model_b))?;
             let cases_dir = cases.clone();
-            let cases = leveler_eval::EvaluationCase::load_dir(&cases)
-                .map_err(|e| anyhow::anyhow!("loading cases: {e}"))?;
+            let cases = load_eval_cases(&cases)?;
             let checkpoint = json_out.as_deref().map(checkpoint_path);
             let cp = checkpoint.as_deref();
             let report_a =
@@ -165,11 +150,7 @@ pub(crate) async fn cmd_eval(
             let app = Application::assemble(layout)?;
             let model_ref = resolve_model(&app, model)?;
             let cases_dir = cases.clone();
-            let cases = leveler_eval::EvaluationCase::load_dir(&cases)
-                .map_err(|e| anyhow::anyhow!("loading cases: {e}"))?;
-            if cases.is_empty() {
-                anyhow::bail!("no eval cases found");
-            }
+            let cases = load_eval_cases(&cases)?;
             let (ablated_overrides, before, after) = ablation_overrides(&knob)?;
             // Eval always uses the direct tool loop; --direct is a no-op compat flag.
             let mode = "direct";
@@ -269,193 +250,13 @@ pub(crate) async fn cmd_eval(
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        EvalCommand::Quick {
-            model,
-            repetitions,
-            json_out,
-        } => {
-            let app = Application::assemble(layout)?;
-            let model_ref = resolve_model(&app, model)?;
-            run_tier(
-                &config_dir,
-                &model_ref,
-                "quick",
-                &["evals/cases/smoke"],
-                repetitions,
-                json_out,
-            )
-            .await
-        }
-        EvalCommand::Daily {
-            model,
-            repetitions,
-            json_out,
-        } => {
-            let app = Application::assemble(layout)?;
-            let model_ref = resolve_model(&app, model)?;
-            run_tier(
-                &config_dir,
-                &model_ref,
-                "daily",
-                // Synthetic recovery scenarios join the daily gate; the heavy
-                // real-repo scenarios stay in `release`.
-                &[
-                    "evals/cases/core",
-                    "evals/cases/hard",
-                    "evals/cases/scenarios/debugging",
-                ],
-                repetitions,
-                json_out,
-            )
-            .await
-        }
-        EvalCommand::Release {
-            model,
-            repetitions,
-            json_out,
-        } => {
-            let app = Application::assemble(layout)?;
-            let model_ref = resolve_model(&app, model)?;
-            run_tier(
-                &config_dir,
-                &model_ref,
-                "release",
-                &[
-                    "evals/cases/smoke",
-                    "evals/cases/core",
-                    "evals/cases/hard",
-                    "evals/cases/scenarios",
-                ],
-                repetitions,
-                json_out,
-            )
-            .await
-        }
         EvalCommand::Trend { history, out } => run_trend(&history, out),
-        EvalCommand::AdoptionMicro(cmd) => run_adoption_micro(&layout, cmd),
-    }
-}
-
-/// Observer-only framework entry: `evals/runner/run.py`.
-fn run_framework(
-    layout: &Layout,
-    suite: String,
-    experiment: String,
-    model: Option<String>,
-    provider: Option<String>,
-    runs: u32,
-    output: Option<std::path::PathBuf>,
-    mode: Option<String>,
-) -> anyhow::Result<std::process::ExitCode> {
-    let script = layout.repo_root.join("evals/runner/run.py");
-    if !script.is_file() {
-        anyhow::bail!(
-            "eval runner not found at {} (run from the CodeLeveler repo)",
-            script.display()
-        );
-    }
-    let mut cmd = std::process::Command::new("python3");
-    cmd.arg(&script)
-        .arg("--suite")
-        .arg(suite)
-        .arg("--experiment")
-        .arg(experiment)
-        .arg("--runs")
-        .arg(runs.to_string());
-    if let Some(model) = model {
-        cmd.arg("--model").arg(model);
-    }
-    if let Some(provider) = provider {
-        cmd.arg("--provider").arg(provider);
-    }
-    if let Some(output) = output {
-        cmd.arg("--output").arg(output);
-    }
-    if let Some(mode) = mode {
-        cmd.arg("--mode").arg(mode);
-    }
-    cmd.current_dir(&layout.repo_root);
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to spawn python3 eval runner: {e}"))?;
-    Ok(if status.success() {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
-    })
-}
-
-/// Observer-only: shells to `evals/suites/adoption/runner/run.py`. No product
-/// runtime flags, no eval_mode, no forced spawn.
-fn run_adoption_micro(
-    layout: &Layout,
-    command: AdoptionMicroCommand,
-) -> anyhow::Result<std::process::ExitCode> {
-    let script = layout.repo_root.join("evals/suites/adoption/runner/run.py");
-    if !script.is_file() {
-        anyhow::bail!(
-            "adoption micro runner not found at {} (run from the CodeLeveler repo)",
-            script.display()
-        );
-    }
-    let mut cmd = std::process::Command::new("python3");
-    cmd.arg(&script);
-    match command {
-        AdoptionMicroCommand::Run {
-            model,
-            provider,
-            task,
-            shape,
-            repetitions,
-            json_out,
-            md_out,
-        } => {
-            cmd.arg("run");
-            if let Some(model) = model {
-                cmd.arg("--model").arg(model);
-            }
-            if let Some(provider) = provider {
-                cmd.arg("--provider").arg(provider);
-            }
-            if let Some(task) = task {
-                cmd.arg("--task").arg(task);
-            }
-            if let Some(shape) = shape {
-                cmd.arg("--shape").arg(shape);
-            }
-            cmd.arg("--repetitions").arg(repetitions.to_string());
-            cmd.arg("--config-dir").arg(&layout.config_dir);
-            if let Some(path) = json_out {
-                cmd.arg("--json-out").arg(path);
-            }
-            if let Some(path) = md_out {
-                cmd.arg("--md-out").arg(path);
-            }
-        }
-        AdoptionMicroCommand::Report { batch, md, csv } => {
-            cmd.arg("report").arg("--batch").arg(batch);
-            if let Some(path) = md {
-                cmd.arg("--md").arg(path);
-            }
-            if let Some(path) = csv {
-                cmd.arg("--csv").arg(path);
-            }
-        }
-    }
-    cmd.current_dir(&layout.repo_root);
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to spawn python3 adoption runner: {e}"))?;
-    if status.success() {
-        Ok(std::process::ExitCode::SUCCESS)
-    } else {
-        Ok(std::process::ExitCode::FAILURE)
     }
 }
 
 /// Build the version-over-version trend from a directory of run baselines.
-/// Reuses the existing `--json-out` artifacts — no new result path — so history
-/// is just "keep pointing `--json-out` at `evals/history/<version>.json`".
+/// Reuses the existing `--json-out` artifacts rather than introducing another
+/// result format.
 fn run_trend(
     history: &std::path::Path,
     out: Option<std::path::PathBuf>,
@@ -488,7 +289,8 @@ fn run_trend(
     if points.is_empty() {
         anyhow::bail!(
             "no run baselines with a quality score in {} \
-             (write some with `leveler eval quick --json-out {}/<version>.json`)",
+             (write some with `leveler eval run --cases <DIR> --json-out \
+              {}/<version>.json`)",
             history.display(),
             history.display()
         );
@@ -526,69 +328,6 @@ fn run_trend(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// Shared driver for the three tiered gates (spec §2). A tier is just a fixed
-/// set of case directories run against one model — no new runner,
-/// no new result path. Cases from all dirs are concatenated; a missing dir is a
-/// hard error so a mistyped tier can't silently shrink coverage.
-async fn run_tier(
-    config_dir: &std::path::Path,
-    model_ref: &ModelRef,
-    tier: &str,
-    dirs: &[&str],
-    repetitions: u32,
-    json_out: Option<std::path::PathBuf>,
-) -> anyhow::Result<std::process::ExitCode> {
-    let mut cases = Vec::new();
-    for dir in dirs {
-        let loaded = leveler_eval::EvaluationCase::load_dir(std::path::Path::new(dir))
-            .map_err(|e| anyhow::anyhow!("loading {dir}: {e}"))?;
-        cases.extend(loaded);
-    }
-    if cases.is_empty() {
-        anyhow::bail!(
-            "tier `{tier}` found no cases in [{}] — pass `--cases` or run from a tree that has them",
-            dirs.join(", ")
-        );
-    }
-    println!(
-        "  tier: {tier} ({} cases across {})",
-        cases.len(),
-        dirs.join(", ")
-    );
-    println!("  mode: direct");
-    let checkpoint = json_out.as_deref().map(checkpoint_path);
-    let report = run_eval(
-        config_dir,
-        model_ref,
-        &cases,
-        false,
-        false,
-        repetitions,
-        None,
-        checkpoint.as_deref(),
-    )
-    .await;
-    print_eval_report(&report);
-    if let Some(path) = json_out {
-        let doc = leveler_eval::BaselineDocument::from_run(
-            baseline_meta(
-                std::path::Path::new(&dirs.join(",")),
-                &format!("tier-{tier}"),
-                repetitions,
-                std::slice::from_ref(model_ref),
-                &cases,
-            ),
-            report.clone(),
-        );
-        write_baseline(&path, &doc)?;
-    }
-    Ok(if report.passed_count() == report.total() {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
-    })
-}
-
 /// Flip one boolean policy knob in place; returns `(before, after)` for the
 /// run banner. The knob names mirror the `configs/policies/*.yaml` fields.
 /// Build the ablated arm's overrides for one knob: exactly one resolver input
@@ -597,11 +336,36 @@ async fn run_tier(
 ///
 /// Resolve an ablation knob into an override pair.
 ///
-/// The list is empty. Every knob this seam once carried named a harness
-/// behaviour that has since been deleted rather than measured, and a knob that
-/// resolves to "no change" would make an experiment report noise as a result.
+/// A knob must name a resolver input the ablated arm actually flips. The two
+/// legacy names never do: that harness behaviour was deleted rather than
+/// measured, and a knob that resolves to "no change" would make an experiment
+/// report noise as a result. `investigation_batching` is a live knob.
 fn ablation_overrides(knob: &str) -> anyhow::Result<(ExecutionOverrides, bool, bool)> {
     match knob {
+        // The independent-observation batching soft policy. Control is
+        // production (guidance absent); ablated adds it. Nothing else changes —
+        // same model, same reasoning effort, same tool schemas, same runtime:
+        // the parallel read-only batch itself is not touched.
+        "investigation_batching" => Ok((
+            ExecutionOverrides {
+                investigation_batching: Some(true),
+                ..ExecutionOverrides::default()
+            },
+            false,
+            true,
+        )),
+        // The post-edit action-throughput soft policy. Control is production
+        // (guidance absent); ablated activates it only after the run's first
+        // effective mutation, so pre-edit behavior is byte-identical. Same
+        // model, same reasoning effort, same tool schemas, same runtime.
+        "post_edit_action_throughput" => Ok((
+            ExecutionOverrides {
+                post_edit_action_throughput: Some(PostEditThroughputMode::PostEdit),
+                ..ExecutionOverrides::default()
+            },
+            false,
+            true,
+        )),
         // Both mechanisms were removed: plan enforcement and the identical-call
         // loop guard were harness behaviour aimed at the model's reasoning, not
         // rails the runtime needs (`docs/ARCHITECTURE.md` §1.1). An experiment
@@ -674,6 +438,54 @@ fn git_head_sha() -> Option<String> {
 fn scrub_command_env(command: &mut std::process::Command) {
     command.env_clear();
     command.envs(leveler_core::scrubbed_environment());
+}
+
+/// Bytes persisted per acceptance stream. The tail carries the assertion message
+/// that stopped the script; the head names what ran. The middle is dropped, so
+/// an acceptance script that forgets to redirect a full test suite cannot grow
+/// the artifact without bound.
+const EXPECT_OUTPUT_TAIL_BYTES: usize = 4 * 1024;
+const EXPECT_OUTPUT_HEAD_BYTES: usize = 1024;
+
+/// Bound one captured stream. `None` when nothing was written, so a passing or
+/// silent command adds no field. Truncation keeps a head and a tail with an
+/// explicit marker naming how much was omitted.
+fn bounded_expect_output(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= EXPECT_OUTPUT_TAIL_BYTES {
+        return Some(trimmed.to_string());
+    }
+    let head_end = floor_char_boundary(trimmed, EXPECT_OUTPUT_HEAD_BYTES);
+    let tail_start = ceil_char_boundary(
+        trimmed,
+        trimmed.len() - (EXPECT_OUTPUT_TAIL_BYTES - EXPECT_OUTPUT_HEAD_BYTES),
+    );
+    Some(format!(
+        "{}\n…[{} bytes omitted]…\n{}",
+        &trimmed[..head_end],
+        tail_start - head_end,
+        &trimmed[tail_start..]
+    ))
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut at = index.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut at = index.min(text.len());
+    while at < text.len() && !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
 }
 
 /// Run every case against one model in an isolated temp repo.
@@ -1110,6 +922,21 @@ async fn run_eval_case(
         narrow_reads: 0,
         verification_driven_impact_discovery: false,
         missed_impact_paths: Vec::new(),
+        read_only_calls: 0,
+        multi_read_rounds: 0,
+        rounds_with_read_only: 0,
+        per_round_read_only: Vec::new(),
+        max_read_only_calls_per_round: 0,
+        verification_failures: 0,
+        recovery_rounds: 0,
+        runtime_injected_rounds: 0,
+        runtime_forced_continuations: 0,
+        runtime_injection_kinds: Vec::new(),
+        goal_interceptions: Vec::new(),
+        model_time_ms: 0,
+        model_time_before_first_edit_ms: None,
+        reasoning_tokens_before_first_edit: None,
+        peak_input_tokens: 0,
     };
 
     // Materialize the workspace. Two modes:
@@ -1175,10 +1002,10 @@ async fn run_eval_case(
         }
         // Drop the clone's origin. It points at the pristine fixture inside
         // this repository, and a run that reads it can diff its way to the
-        // injected defect, or walk up to `evals/` and read the case file with
+        // injected defect, or walk up to the source suite and read case metadata with
         // its hidden relevant/impact/distractor paths. Observed: an N6 run
         // followed exactly that path (`git remote -v` → `git -C <src> show` →
-        // `ls .../evals/`). `read_file` refuses paths outside the workspace;
+        // listing the suite source). `read_file` refuses paths outside the workspace;
         // `shell_command` does not, so the breadcrumb has to go rather than
         // the guard being trusted to hold.
         let _ = git(&["remote", "remove", "origin"]);
@@ -1330,7 +1157,18 @@ async fn run_eval_case(
     // requests. `rounds` is 0 on the error paths above (the outcome that carries
     // it never came back), so fall back to the request count — otherwise a failed
     // run reports zero effort, which is simply false.
-    let (input_tokens, output_tokens, reasoning_tokens, observed_rounds) =
+    // Model-time ledger, per main-agent round. `None` on an empty ledger so a
+    // run that never edited reports no "before first edit" number rather than a
+    // measured zero.
+    #[derive(Default, Clone, Copy)]
+    struct RoundLedger {
+        model_time_ms: u64,
+        peak_input_tokens: u64,
+        model_time_before_first_edit_ms: Option<u64>,
+        reasoning_tokens_before_first_edit: Option<u64>,
+    }
+
+    let (input_tokens, output_tokens, reasoning_tokens, observed_rounds, ledger) =
         if let Some(session_id) = &session_id {
             match app.open_database().await {
                 Ok(db) => leveler_storage::ModelRequestRepository::new(&db)
@@ -1353,13 +1191,57 @@ async fn run_eval_case(
                             .try_fold(0u64, |total, value| {
                                 value.map(|value| total.saturating_add(value))
                             });
-                        (input, output, reasoning, requests)
+
+                        // The batch analysis reads the MAIN agent's rounds only:
+                        // a child's rounds are a different lifecycle, and an
+                        // advisory call is not a round the model drove.
+                        let main_rounds: Vec<&leveler_storage::ModelRequestRecord> = records
+                            .iter()
+                            .filter(|r| {
+                                r.kind == leveler_storage::ModelCallKind::Round
+                                    && r.agent_id.is_none()
+                            })
+                            .collect();
+                        let model_time_ms = main_rounds
+                            .iter()
+                            .map(|r| r.latency_ms.unwrap_or(0))
+                            .fold(0u64, u64::saturating_add);
+                        let peak_input_tokens = main_rounds
+                            .iter()
+                            .map(|r| r.input_tokens)
+                            .max()
+                            .unwrap_or(0);
+                        let before = collector.first_edit_round().map(|first| {
+                            let upto = (first as usize).min(main_rounds.len());
+                            let window = &main_rounds[..upto];
+                            let time = window
+                                .iter()
+                                .map(|r| r.latency_ms.unwrap_or(0))
+                                .fold(0u64, u64::saturating_add);
+                            // A window with any unreported breakdown yields
+                            // `None`: an understated reasoning figure is worse
+                            // than an absent one.
+                            let reasoning = window
+                                .iter()
+                                .map(|r| r.reasoning_tokens)
+                                .try_fold(0u64, |total, value| {
+                                    value.map(|value| total.saturating_add(value))
+                                });
+                            (time, reasoning)
+                        });
+                        let ledger = RoundLedger {
+                            model_time_ms,
+                            peak_input_tokens,
+                            model_time_before_first_edit_ms: before.map(|(time, _)| time),
+                            reasoning_tokens_before_first_edit: before.and_then(|(_, rt)| rt),
+                        };
+                        (input, output, reasoning, requests, ledger)
                     })
                     .unwrap_or_default(),
-                Err(_) => (0, 0, None, 0),
+                Err(_) => (0, 0, None, 0, RoundLedger::default()),
             }
         } else {
-            (0, 0, None, 0)
+            (0, 0, None, 0, RoundLedger::default())
         };
 
     let rounds = if rounds > 0 { rounds } else { observed_rounds };
@@ -1372,17 +1254,36 @@ async fn run_eval_case(
         Err(_) => None,
     };
 
-    // Evaluate the expectation independently (verification-driven, ).
-    let (expect_passed, verification_exit_code) = {
+    // Evaluate the expectation independently. The command is opaque, so the
+    // exit code alone cannot say WHY it failed: persist the bounded streams and
+    // a one-line digest next to the boolean. `command.output()` already buffers
+    // both streams, so capturing them costs no extra memory and truncation keeps
+    // the artifact bounded.
+    let mut expect_evidence = leveler_eval::VerificationEvidence {
+        program: case.expect.program.clone(),
+        args: case.expect.args.clone(),
+        passed: false,
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        error: None,
+    };
+    let expect_passed = {
         let mut command = Proc::new(&case.expect.program);
         command.args(&case.expect.args).current_dir(&dir);
         scrub_command_env(&mut command);
-        let out = command.output();
-        match out {
-            Ok(o) => (o.status.success(), o.status.code()),
+        match command.output() {
+            Ok(o) => {
+                expect_evidence.passed = o.status.success();
+                expect_evidence.exit_code = o.status.code();
+                expect_evidence.stdout = bounded_expect_output(&o.stdout);
+                expect_evidence.stderr = bounded_expect_output(&o.stderr);
+                expect_evidence.passed
+            }
             Err(e) => {
                 note = format!("expect spawn failed: {e}");
-                (false, None)
+                expect_evidence.error = Some(e.to_string());
+                false
             }
         }
     };
@@ -1432,12 +1333,7 @@ async fn run_eval_case(
         failure_source: (!(completed && expect_passed))
             .then_some(leveler_eval::FailureSource::Auto),
         note,
-        verification_evidence: Some(leveler_eval::VerificationEvidence {
-            program: case.expect.program.clone(),
-            args: case.expect.args.clone(),
-            passed: expect_passed,
-            exit_code: verification_exit_code,
-        }),
+        verification_evidence: Some(expect_evidence),
         tool_calls: signals.tool_calls,
         loop_guard_trips: signals.loop_guard_trips,
         verification_ran: signals.verification_ran,
@@ -1467,6 +1363,21 @@ async fn run_eval_case(
         narrow_reads: signals.narrow_reads,
         verification_driven_impact_discovery: signals.verification_driven_impact_discovery,
         missed_impact_paths,
+        read_only_calls: signals.read_only_calls,
+        multi_read_rounds: signals.multi_read_rounds,
+        rounds_with_read_only: signals.rounds_with_read_only,
+        per_round_read_only: signals.per_round_read_only,
+        max_read_only_calls_per_round: signals.max_read_only_calls_per_round,
+        verification_failures: signals.verification_failures,
+        recovery_rounds: signals.recovery_rounds,
+        runtime_injected_rounds: signals.runtime_injected_rounds,
+        runtime_forced_continuations: signals.runtime_forced_continuations,
+        runtime_injection_kinds: signals.runtime_injection_kinds,
+        goal_interceptions: signals.goal_interceptions,
+        model_time_ms: ledger.model_time_ms,
+        model_time_before_first_edit_ms: ledger.model_time_before_first_edit_ms,
+        reasoning_tokens_before_first_edit: ledger.reasoning_tokens_before_first_edit,
+        peak_input_tokens: ledger.peak_input_tokens,
     }
 }
 
@@ -1532,6 +1443,26 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
             category,
             termination
         );
+        // Why the acceptance failed, whenever it did. The RC gate consumes the
+        // same fact from `verification_evidence`; a run with no expect failure
+        // prints nothing extra, so a clean report stays compact.
+        if !c.expect_passed
+            && let Some(evidence) = &c.verification_evidence
+        {
+            let code = evidence
+                .exit_code
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "no exit code".to_string());
+            let reason = evidence
+                .failure_reason()
+                .unwrap_or_else(|| "no diagnostic output".to_string());
+            println!(
+                "      {} expect {}: {}",
+                console::style("└").dim(),
+                code,
+                reason
+            );
+        }
     }
     println!(
         "  {} {}/{} passed ({:.0}% completion, {:.0}% completion accuracy), avg {:.1} steps",
@@ -1571,6 +1502,16 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
         report.avg_tool_calls(),
         report.loop_rate() * 100.0,
         report.validation_rate() * 100.0,
+    );
+    // Harness-intervention attribution: how much of `avg rounds` was the
+    // harness putting a message in front of the model, and how many rounds it
+    // bought outright. Printed always — a zero here is a fact, not missing data.
+    println!(
+        "  {} avg {:.1} harness-injected rounds · {} forced continuation(s) · {} goal interception(s)",
+        console::style("→").bold(),
+        report.avg_runtime_injected_rounds(),
+        report.runtime_forced_continuations(),
+        report.goal_interceptions(),
     );
     // Runtime transparency: TTFF / silent gap from real event timestamps.
     // Never print fabricated zeros when no case recorded feedback.
@@ -1633,8 +1574,27 @@ fn print_eval_report(report: &leveler_eval::EvalReport) {
 }
 
 #[cfg(test)]
+mod case_loading_tests {
+    #[test]
+    fn an_empty_cases_directory_is_not_a_successful_eval_input() {
+        let root =
+            std::env::temp_dir().join(format!("leveler-empty-eval-cases-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).expect("empty cases directory");
+
+        let error = super::load_eval_cases(&root)
+            .expect_err("an empty case set cannot establish eval success")
+            .to_string();
+        assert!(error.contains("no eval cases found"), "{error}");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(test)]
 mod ablation_tests {
     use leveler_agent::StopReason;
+    use leveler_agent::coding::PostEditThroughputMode;
     use leveler_eval::TerminationClass;
 
     /// An experiment that ablates a mechanism which no longer exists would run
@@ -1658,6 +1618,27 @@ mod ablation_tests {
             .expect_err("unknown knob")
             .to_string();
         assert!(err.contains("no ablatable knob remains"), "{err}");
+    }
+
+    /// The live knobs each flip exactly their own resolver input, so an
+    /// ablation measures the guidance and not an accidental second change.
+    #[test]
+    fn each_live_knob_flips_only_its_own_input() {
+        let (ov, before, after) =
+            super::ablation_overrides("post_edit_action_throughput").expect("live knob");
+        assert_eq!(
+            ov.post_edit_action_throughput,
+            Some(PostEditThroughputMode::PostEdit)
+        );
+        assert!(!ov.investigation_batching.unwrap_or(false));
+        assert!(!before && after);
+
+        let (ov, _, _) = super::ablation_overrides("investigation_batching").expect("live knob");
+        assert_eq!(ov.investigation_batching, Some(true));
+        assert_eq!(
+            ov.post_edit_action_throughput, None,
+            "the pre-edit knob does not also arm the post-edit one"
+        );
     }
 
     #[test]
@@ -1956,5 +1937,71 @@ mod attribution_provenance_tests {
         assert!(status.status.success(), "git status must still work");
 
         std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(test)]
+mod expect_output_tests {
+    //! The acceptance command is opaque; its exit code alone cannot say why it
+    //! failed. The harness now persists bounded streams, so triage is a read,
+    //! not a `KEEP_WORKSPACE` + `bash -x` re-run. These pin the bound and the
+    //! UTF-8 safety of truncation.
+
+    use super::{EXPECT_OUTPUT_HEAD_BYTES, EXPECT_OUTPUT_TAIL_BYTES, bounded_expect_output};
+
+    #[test]
+    fn silent_output_is_no_field() {
+        assert_eq!(bounded_expect_output(b""), None);
+        assert_eq!(bounded_expect_output(b"   \n\t\n"), None);
+    }
+
+    #[test]
+    fn short_output_is_kept_verbatim_without_trailing_newline() {
+        assert_eq!(
+            bounded_expect_output(b"changed outside the package: a.go\n"),
+            Some("changed outside the package: a.go".to_string())
+        );
+    }
+
+    #[test]
+    fn long_output_keeps_the_head_and_the_tail_with_an_explicit_marker() {
+        let head = "H".repeat(EXPECT_OUTPUT_HEAD_BYTES);
+        let tail = "T"
+            .repeat(EXPECT_OUTPUT_TAIL_BYTES - EXPECT_OUTPUT_HEAD_BYTES)
+            .to_string();
+        let middle = "M".repeat(50_000);
+        let bounded = bounded_expect_output(format!("{head}{middle}{tail}").as_bytes()).unwrap();
+        assert!(bounded.starts_with(&head), "head must survive");
+        assert!(bounded.ends_with(&tail), "tail must survive");
+        assert!(
+            bounded.contains("bytes omitted"),
+            "the omission must be named"
+        );
+    }
+
+    #[test]
+    fn truncation_never_splits_a_utf8_codepoint() {
+        // A run of multibyte chars straddling both cut points must not panic
+        // and must round-trip as valid UTF-8.
+        let text = "é".repeat(20_000);
+        let bounded = bounded_expect_output(text.as_bytes()).unwrap();
+        assert!(bounded.contains("bytes omitted"));
+        // Already a `String`; reaching here without a panic is the assertion.
+        assert!(bounded.chars().all(|c| c == 'é'
+            || c == '…'
+            || c == '['
+            || c == ']'
+            || c.is_ascii_digit()
+            || c == ' '
+            || c == '\n'
+            || c == 'b'
+            || c == 'y'
+            || c == 't'
+            || c == 'e'
+            || c == 's'
+            || c == 'o'
+            || c == 'm'
+            || c == 'i'
+            || c == 'd'));
     }
 }

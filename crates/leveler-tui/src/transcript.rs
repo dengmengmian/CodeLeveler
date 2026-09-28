@@ -194,7 +194,7 @@ pub struct FailureBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecapBlock {
     pub summary: Option<String>,
-    pub next_step: String,
+    pub next_step: Option<String>,
 }
 
 /// A durable goal recap (long-goal P3): the HISTORY presentation of one
@@ -527,8 +527,8 @@ impl TranscriptState {
         }));
     }
 
-    /// Return a handoff only when a successful `update_goal` explicitly
-    /// supplied a concrete `next_step`. Freeform assistant prose is never used.
+    /// Return a recap when a successful terminal `update_goal` supplied a
+    /// summary or concrete next step. Freeform assistant prose is never used.
     pub fn latest_turn_handoff(&self) -> Option<RecapBlock> {
         for item in self.items.iter().rev() {
             match item {
@@ -550,12 +550,15 @@ impl TranscriptState {
                             .get("next_step")
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_string)
-                            .and_then(|text| compact_summary(text, 160))?;
+                            .and_then(|text| compact_summary(text, 160));
                         let summary = value
                             .get("summary")
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_string)
                             .and_then(|text| compact_summary(text, 320));
+                        if summary.is_none() && next_step.is_none() {
+                            continue;
+                        }
                         return Some(RecapBlock { summary, next_step });
                     }
                 }

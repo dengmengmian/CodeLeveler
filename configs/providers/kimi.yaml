@@ -11,7 +11,3 @@ timeouts:
   connect_seconds: 20
   request_seconds: 600
   idle_stream_seconds: 180
-retry:
-  max_attempts: 3
-  initial_backoff_ms: 500
-  max_backoff_ms: 10000

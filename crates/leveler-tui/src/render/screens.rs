@@ -196,9 +196,7 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
 
 fn session_status_dot(status: &str, theme: &Theme) -> (&'static str, ratatui::style::Color) {
     let s = status.to_ascii_lowercase();
-    if s.contains("complet") || s.contains("verif") || s == "done" {
-        ("●", theme.status.success)
-    } else if s.contains("fail") || s.contains("error") {
+    if s.contains("fail") || s.contains("error") {
         ("●", theme.status.error)
     } else if s.contains("interrupt") || s.contains("cancel") {
         ("●", theme.status.warning)
@@ -235,13 +233,22 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
             "  "
         };
         let (dot, color) = session_status_dot(&s.status, theme);
+        let status = if s.status == "completed" {
+            match s.declaration {
+                Some(leveler_client_protocol::UiTaskDeclaration::Answered) => "已回答",
+                Some(leveler_client_protocol::UiTaskDeclaration::Completed) => "声明完成",
+                None => "已结束",
+            }
+        } else {
+            &s.status
+        };
         let goal = truncate_display(&s.goal, 40);
         lines.push(Line::from(vec![
             Span::styled(cursor, Style::default().fg(theme.accent.primary)),
             Span::styled(format!("{dot} "), Style::default().fg(color)),
             Span::raw(format!("{goal}  ")),
             Span::styled(
-                format!("[{}] ", s.status),
+                format!("[{status}] "),
                 Style::default().fg(theme.text.secondary),
             ),
             Span::styled(s.model.clone(), Style::default().fg(theme.text.secondary)),

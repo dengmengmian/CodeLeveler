@@ -79,7 +79,6 @@ fn model_profile(model_id: &str) -> ModelProfile {
             default_effort: Some(ReasoningEffort::Low),
         },
         compatibility: Default::default(),
-        instructions: None,
         pricing: Some(ModelPricing {
             input_usd_per_mtok: 0.1389,
             output_usd_per_mtok: 0.2778,
@@ -111,7 +110,6 @@ async fn real_model_semantic_extraction_probe() {
         api_key: Some(api_key.clone()),
         headers: Default::default(),
         timeouts: Default::default(),
-        retry: Default::default(),
     };
     let registry = ProviderRegistry::build(RegistryInputs {
         providers: vec![(provider, Some(api_key))],
@@ -303,7 +301,6 @@ fn real_registry() -> Option<(Arc<RecordingRuntime>, ModelRef)> {
         api_key: Some(api_key.clone()),
         headers: Default::default(),
         timeouts: Default::default(),
-        retry: Default::default(),
     };
     let registry = ProviderRegistry::build(RegistryInputs {
         providers: vec![(provider, Some(api_key))],

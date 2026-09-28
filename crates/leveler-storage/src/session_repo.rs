@@ -144,6 +144,25 @@ impl<'a> SessionRepository<'a> {
         Ok(())
     }
 
+    /// Persist whether this session may admit turns to memory extraction.
+    ///
+    /// Called at the start of every turn from the project's `memory.enabled`
+    /// switch, so a config change is reflected before the turn row is inserted
+    /// and the admission trigger reads it. `updated_at` is deliberately not
+    /// touched: this is a policy snapshot, not session activity.
+    pub async fn set_memory_enabled(
+        &self,
+        id: &SessionId,
+        enabled: bool,
+    ) -> Result<(), StorageError> {
+        sqlx::query("UPDATE sessions SET memory_enabled = ?2 WHERE id = ?1")
+            .bind(id.as_str())
+            .bind(i64::from(enabled))
+            .execute(self.db.pool())
+            .await?;
+        Ok(())
+    }
+
     /// Fetch one session by id.
     pub async fn get(&self, id: &SessionId) -> Result<Option<SessionRecord>, StorageError> {
         let row = sqlx::query_as::<_, SessionRow>(
@@ -350,7 +369,7 @@ mod tests {
         let record = SessionRecord::new(
             "/repo",
             "fix bug",
-            "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-flash",
             leveler_core::now(),
         )
         .with_axes("goal", "balanced");

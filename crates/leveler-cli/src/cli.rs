@@ -574,33 +574,12 @@ fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 #[derive(Debug, Subcommand)]
 pub enum EvalCommand {
     /// Run all cases with one model and report metrics.
-    ///
-    /// Capability path: `--cases evals/cases/smoke` (default).
-    /// Framework path: `--suite adoption --experiment m3-baseline`.
     Run {
         /// Model reference.
         #[arg(long)]
         model: Option<String>,
-        /// Provider prefix for framework runs (`provider/model` when model has no `/`).
+        /// Directory of eval case YAML files.
         #[arg(long)]
-        provider: Option<String>,
-        /// Eval framework suite (`adoption` | `capability` | `safety` | `multi_agent`).
-        #[arg(long)]
-        suite: Option<String>,
-        /// Experiment id under `evals/configs/<suite>/` (requires `--suite`).
-        #[arg(long)]
-        experiment: Option<String>,
-        /// Experiment arm for `--suite multi_agent`.
-        /// MA-VALUE-001: `single` | `multi` (`agents.delegation`).
-        /// MA-VALUE-REVIEWER-PILOT: `self` | `reviewer` (`agents.independent_review`).
-        /// Isolated home only. Does not change spawn runtime or reviewer permissions.
-        #[arg(long)]
-        mode: Option<String>,
-        /// Report directory for framework runs (`evals/reports/<suite>/<experiment>`).
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
-        #[arg(long, default_value = "evals/cases/smoke")]
         cases: PathBuf,
         /// Accepted for backward compatibility; eval always uses the direct
         /// tool loop (the multi-phase orchestrate path was removed).
@@ -624,8 +603,8 @@ pub enum EvalCommand {
         model_a: String,
         /// Second model.
         model_b: String,
-        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
-        #[arg(long, default_value = "evals/cases/hard")]
+        /// Directory of eval case YAML files.
+        #[arg(long)]
         cases: PathBuf,
         /// Repeat every case for each model under the same conditions.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -634,48 +613,13 @@ pub enum EvalCommand {
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
     },
-    /// Quick tier (spec §2, L1): the fast pre-commit gate — `evals/cases/smoke`.
-    /// Aim: under 5 minutes, core loop + tools + a simple edit.
-    Quick {
-        /// Model reference.
-        #[arg(long)]
-        model: Option<String>,
-        /// Repeat every case to expose run-to-run variance.
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-        repetitions: u32,
-        /// Write a durable JSON baseline (report + score + meta) to this path.
-        #[arg(long, value_name = "PATH")]
-        json_out: Option<PathBuf>,
-    },
-    /// Daily tier (spec §2, L2): the regression gate — `evals/cases/core` + `evals/cases/hard`.
-    /// Broader debug/feature/refactor/multi-file coverage.
-    Daily {
-        /// Model reference.
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-        repetitions: u32,
-        #[arg(long, value_name = "PATH")]
-        json_out: Option<PathBuf>,
-    },
-    /// Release tier (spec §2, L3): the full gate over the default case directories.
-    Release {
-        /// Model reference.
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-        repetitions: u32,
-        #[arg(long, value_name = "PATH")]
-        json_out: Option<PathBuf>,
-    },
     /// Version-over-version trend: read a directory of run baselines and render
-    /// a Markdown quality-trend table + regression flags (spec §6).
+    /// a Markdown quality-trend table + regression flags.
     Trend {
-        /// Directory of baseline JSON files written by `--json-out`
-        /// (e.g. `evals/history`).
-        #[arg(long, default_value = "evals/history")]
+        /// Directory of baseline JSON files written by `--json-out`.
+        #[arg(long)]
         history: PathBuf,
-        /// Write the report here (e.g. `evals/REGRESSION_REPORT.md`).
+        /// Write the report here.
         /// Without it, the report prints to stdout.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
@@ -684,14 +628,16 @@ pub enum EvalCommand {
     /// (control) vs flipped (ablated) — and report what the knob is worth.
     /// Run once per model to measure whether the mechanism helps or hurts it.
     Ablate {
-        /// The resolver input to flip: explicit_plan,
-        /// repeated_read_guard / progress_guards (legacy require_* names accepted).
+        /// The resolver input to flip: `investigation_batching` or
+        /// `post_edit_action_throughput` (current).
+        /// Legacy `explicit_plan` / `repeated_read_guard` names are refused
+        /// because those mechanisms no longer exist.
         knob: String,
         /// Model reference.
         #[arg(long)]
         model: Option<String>,
-        /// Directory of eval case YAML files (`evals/cases/smoke`, `evals/cases/hard`, …).
-        #[arg(long, default_value = "evals/cases/hard")]
+        /// Directory of eval case YAML files.
+        #[arg(long)]
         cases: PathBuf,
         /// Accepted for backward compatibility; eval always uses the direct
         /// tool loop.
@@ -703,48 +649,6 @@ pub enum EvalCommand {
         /// Write a durable JSON baseline (both reports + meta) to this path.
         #[arg(long, value_name = "PATH")]
         json_out: Option<PathBuf>,
-    },
-    /// Minute-scale delegation-adoption observer. Does not change product
-    /// spawn/claim/ownership/settlement behaviour. KEEP is a first-class outcome.
-    #[command(subcommand)]
-    AdoptionMicro(AdoptionMicroCommand),
-}
-
-/// `leveler eval adoption-micro` — EventLog observer over `evals/suites/adoption`.
-#[derive(Debug, Subcommand)]
-pub enum AdoptionMicroCommand {
-    /// Run the decision benchmark (isolated LEVELER_HOME).
-    Run {
-        /// Model id, or name when `--provider` is set.
-        #[arg(long)]
-        model: Option<String>,
-        /// Provider prefix; combined as `provider/model` when model has no `/`.
-        #[arg(long)]
-        provider: Option<String>,
-        /// Single task id (default: the full 15-task suite).
-        #[arg(long)]
-        task: Option<String>,
-        /// Filter catalog shape: parallel | boundary | single.
-        #[arg(long)]
-        shape: Option<String>,
-        /// Repeat every selected task.
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-        repetitions: u32,
-        /// Unified batch JSON (full schema + compact records).
-        #[arg(long, value_name = "PATH")]
-        json_out: Option<PathBuf>,
-        /// Markdown report path.
-        #[arg(long, value_name = "PATH")]
-        md_out: Option<PathBuf>,
-    },
-    /// Render a Markdown report from a batch.json produced by `run`.
-    Report {
-        #[arg(long)]
-        batch: PathBuf,
-        #[arg(long)]
-        md: Option<PathBuf>,
-        #[arg(long)]
-        csv: Option<PathBuf>,
     },
 }
 
@@ -826,7 +730,7 @@ pub enum ModelsCommand {
     List,
     /// Show a model's profile (capabilities, limits, reasoning).
     Show {
-        /// Model reference, e.g. `deepseek/deepseek-v4-pro`.
+        /// Model reference, e.g. `deepseek/deepseek-flash`.
         model: String,
     },
 }
@@ -841,7 +745,7 @@ pub struct ModelCommand {
 pub enum ModelSubcommand {
     /// Send a basic text + streaming probe to the model.
     Probe {
-        /// Model reference, e.g. `deepseek/deepseek-v4-pro`.
+        /// Model reference, e.g. `deepseek/deepseek-flash`.
         model: String,
     },
 }
@@ -1076,12 +980,12 @@ mod tests {
             "--model",
             "deepseek/v4",
             "--cases",
-            "evals/cases/smoke",
+            "/tmp/dogfood/cases",
             "--direct",
             "--repetitions",
             "3",
             "--json-out",
-            "evals/baselines/run.json",
+            "/tmp/dogfood/run.json",
         ]);
         match cli.command {
             Some(Command::Eval(EvalCommand::Run {
@@ -1091,20 +995,15 @@ mod tests {
                 no_verify_gate,
                 repetitions,
                 json_out,
-                suite,
-                experiment,
-                ..
             })) => {
-                assert!(suite.is_none());
-                assert!(experiment.is_none());
                 assert!(!no_verify_gate, "the ablation is opt-in");
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
-                assert_eq!(cases, PathBuf::from("evals/cases/smoke"));
+                assert_eq!(cases, PathBuf::from("/tmp/dogfood/cases"));
                 assert!(direct);
                 assert_eq!(repetitions, 3);
                 assert_eq!(
                     json_out.as_deref(),
-                    Some(std::path::Path::new("evals/baselines/run.json"))
+                    Some(std::path::Path::new("/tmp/dogfood/run.json"))
                 );
             }
             other => panic!("expected Eval Run, got {other:?}"),
@@ -1119,6 +1018,8 @@ mod tests {
             "compare",
             "model-a",
             "model-b",
+            "--cases",
+            "/tmp/dogfood/cases",
             "--repetitions",
             "2",
             "--json-out",
@@ -1134,7 +1035,7 @@ mod tests {
             })) => {
                 assert_eq!(model_a, "model-a");
                 assert_eq!(model_b, "model-b");
-                assert_eq!(cases, PathBuf::from("evals/cases/hard"));
+                assert_eq!(cases, PathBuf::from("/tmp/dogfood/cases"));
                 assert_eq!(repetitions, 2);
                 assert_eq!(json_out.as_deref(), Some(std::path::Path::new("out.json")));
             }
@@ -1143,126 +1044,36 @@ mod tests {
     }
 
     #[test]
-    fn eval_run_parses_suite_experiment_runs_and_output() {
-        let cli = parse(&[
-            "leveler",
-            "eval",
-            "run",
-            "--suite",
-            "adoption",
-            "--experiment",
-            "m3-baseline",
-            "--provider",
-            "deepseek",
-            "--model",
-            "deepseek-v4-flash",
-            "--runs",
-            "3",
-            "--output",
-            "evals/reports/adoption/m3-baseline",
-        ]);
-        match cli.command {
-            Some(Command::Eval(EvalCommand::Run {
-                suite,
-                experiment,
-                provider,
-                model,
-                repetitions,
-                output,
-                ..
-            })) => {
-                assert_eq!(suite.as_deref(), Some("adoption"));
-                assert_eq!(experiment.as_deref(), Some("m3-baseline"));
-                assert_eq!(provider.as_deref(), Some("deepseek"));
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
-                assert_eq!(repetitions, 3);
-                assert_eq!(
-                    output.as_deref(),
-                    Some(std::path::Path::new("evals/reports/adoption/m3-baseline"))
-                );
-            }
-            other => panic!("expected Eval Run suite mode, got {other:?}"),
-        }
+    fn eval_case_commands_require_explicit_cases() {
+        assert!(Cli::try_parse_from(["leveler", "eval", "run"]).is_err());
+        assert!(Cli::try_parse_from(["leveler", "eval", "compare", "model-a", "model-b"]).is_err());
+        assert!(
+            Cli::try_parse_from(["leveler", "eval", "ablate", "investigation_batching"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["leveler", "eval", "trend"]).is_err());
     }
 
     #[test]
-    fn eval_run_parses_multi_agent_mode() {
-        let cli = parse(&[
-            "leveler",
-            "eval",
-            "run",
-            "--suite",
-            "multi_agent",
-            "--experiment",
-            "MA-VALUE-001",
-            "--mode",
-            "single",
-        ]);
-        match cli.command {
-            Some(Command::Eval(EvalCommand::Run {
-                suite,
-                experiment,
-                mode,
-                ..
-            })) => {
-                assert_eq!(suite.as_deref(), Some("multi_agent"));
-                assert_eq!(experiment.as_deref(), Some("MA-VALUE-001"));
-                assert_eq!(mode.as_deref(), Some("single"));
-            }
-            other => panic!("expected Eval Run multi_agent mode, got {other:?}"),
+    fn repository_owned_eval_entrypoints_are_removed() {
+        for command in ["quick", "daily", "release", "adoption-micro"] {
+            assert!(
+                Cli::try_parse_from(["leveler", "eval", command]).is_err(),
+                "{command} must not remain as a built-in eval entrypoint"
+            );
         }
-    }
-
-    #[test]
-    fn eval_adoption_micro_run_parses_model_task_provider() {
-        let cli = parse(&[
-            "leveler",
-            "eval",
-            "adoption-micro",
-            "run",
-            "--provider",
-            "deepseek",
-            "--model",
-            "deepseek-v4-flash",
-            "--task",
-            "a01-independent-modules",
-            "--shape",
-            "parallel",
-            "--repetitions",
-            "2",
-        ]);
-        match cli.command {
-            Some(Command::Eval(EvalCommand::AdoptionMicro(AdoptionMicroCommand::Run {
-                model,
-                provider,
-                task,
-                shape,
-                repetitions,
-                json_out,
-                md_out,
-            }))) => {
-                assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
-                assert_eq!(provider.as_deref(), Some("deepseek"));
-                assert_eq!(task.as_deref(), Some("a01-independent-modules"));
-                assert_eq!(shape.as_deref(), Some("parallel"));
-                assert_eq!(repetitions, 2);
-                assert!(json_out.is_none());
-                assert!(md_out.is_none());
-            }
-            other => panic!("expected AdoptionMicro Run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn eval_run_defaults_to_smoke_suite() {
-        let cli = parse(&["leveler", "eval", "run"]);
-        match cli.command {
-            Some(Command::Eval(EvalCommand::Run { cases, direct, .. })) => {
-                assert_eq!(cases, PathBuf::from("evals/cases/smoke"));
-                assert!(!direct);
-            }
-            other => panic!("expected Eval Run, got {other:?}"),
-        }
+        assert!(
+            Cli::try_parse_from([
+                "leveler",
+                "eval",
+                "run",
+                "--suite",
+                "adoption",
+                "--experiment",
+                "baseline",
+            ])
+            .is_err(),
+            "framework runs belong to the external dogfood project"
+        );
     }
 
     #[test]

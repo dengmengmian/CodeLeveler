@@ -32,14 +32,14 @@ pub use executor::host::{PriorlyAdmitted, reconcile};
 pub use executor::{
     AbortedFacts, AdvisoryKind, AdvisorySpend, AgentError, AgentEvent, AgentOutcome,
     CompactionCheckpoint, ContinuationPolicy, DriveAborted, Executor, NoopSink, SteeringSource,
-    StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy, closeout,
+    StepLimits, SubAgentExecutionPolicies, SubAgentExecutionPolicy, TurnPolicy,
+    auxiliary_budget_available, closeout,
 };
 pub use leveler_agent_core::{
     BudgetDimension, BudgetExhaustion, DEFAULT_MODEL_STEP_CEILING, ModelStepLimits,
 };
 pub use leveler_context::{
-    COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages,
-    estimate_tokens, summarize_with_model,
+    COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages, estimate_tokens,
 };
 pub use leveler_engine::{
     ChildToolEvent, EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord, PortError,
@@ -56,7 +56,7 @@ pub use leveler_lifecycle::{
 };
 pub use memory_extract::{
     BatchCandidateRejection, BatchCandidateValidation, BatchSemanticCandidate, BatchSourceTurn,
-    DEFAULT_EXTRACTION_MAX_TOKENS, DEFAULT_EXTRACTION_TIMEOUT, ExtractionError,
+    DEFAULT_EXTRACTION_MAX_TOKENS, DEFAULT_EXTRACTION_TIMEOUT, ExtractionCall, ExtractionError,
     MAX_BATCH_INPUT_CHARS, MAX_BATCH_TURNS, MAX_CANDIDATES, MAX_EXTRACTOR_INPUT_CHARS,
     MAX_OUTPUT_TOKENS, ModelSemanticExtractor, SemanticExtractor, batch_extraction_system_prompt,
     extraction_system_prompt, validate_batch_candidates,
@@ -64,3 +64,6 @@ pub use memory_extract::{
 pub use sub_agent::{ChildResult, ChildStatus, RUNTIME_NOTICE_HEADERS, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};
 pub use update_plan::{UpdatePlanTool, register_harness_controls};
+
+/// Recover the task budget before a host-initiated paid auxiliary request.
+pub use coding::turn::load_auxiliary_budget_progress;

@@ -83,6 +83,7 @@ fn batch(calls: Vec<(&str, serde_json::Value)>) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: calls
                 .into_iter()

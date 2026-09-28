@@ -303,7 +303,93 @@ CodeLeveler 提供稳定的执行环境、能力、反馈和边界；模型负�
 
 投影只附加到当次模型请求：不追加到持久聊天历史，不进入压缩摘要，继续或恢复时从原权威状态重新生成。上下文统计与缺失 usage 时的估算必须覆盖实际发送的投影。耗时包含模型、工具和授权等待，不能解释成纯模型推理时间；估算 token 与报告值可区分，未配置的预算保持未知／无上限，不伪造为零。
 
+模型请求将领域层的控制上下文（`ControlContext`）与对话转录分开。控制上下文复用有名称和稳定性标记的 `PromptSegment`，包含当前契约、项目规则、选中技能、记忆召回和请求级执行状态。新回合与恢复使用同一组装入口；协议适配器把控制上下文编码到系统通道，不能改成用户意图。上下文统计和压缩压力计算包含控制上下文，但历史摘要只处理转录。
+
+转录保存真实用户输入、模型输出、工具调用与结果，以及必要且有界的协议修补和产品定义的运行时通知。控制正文不作为历史消息落盘。持久层的 `role=user` 只是传输角色，不表示用户意图。新写入的用户输入和 Harness 消息在 payload 的 `origin` 字段记录来源；没有该字段的旧行仍可读取，也不会被改写。已发现的子目录规则来源路径保存在既有进展账本中，恢复时重读当前文件；兼容旧 session 时，只从旧 System 行恢复来源路径，忽略其过期正文，不修改历史数据库。来源不明的历史 System 文本不会获得契约或项目指令权威。来源不明的历史 User 文本也不会获得用户意图。记忆检索和 reasoning 回放保持不变。每一段如何被解释见 §5.6。
+
+每次模型尝试都先进入现有请求记录与资源账本，再决定是否重试，包括失败、仅产生 reasoning 的断流、压缩摘要和子任务调用。缺失 usage 或价格不能记为免费。子任务、评审和 `/develop` 各阶段消费父任务的剩余预算；重试次数与请求尝试记录不得重复累计。等待模型流时，取消与 deadline 必须能在没有任何新事件时唤醒；reasoning 也是已生成内容，不能把 reasoning-only 断流当成未开始生成而安全重试。
+
+共享预算在每次模型请求及重试前从同 scope 的持久请求事实检查，后台子任务不能一直使用启动时的余额快照。已经发出的并发请求仍按返回的真实 usage 结算；预算阻止后续调用，不能撤销已发生的消耗。
+
+请求记录保存所属 goal 或根 turn 的 `budget_scope`，以及与 provider 实测值分开的 token 估算。恢复从该 scope 的请求事实重建模型消耗，覆盖“请求已落库、进度事件尚未落库”的崩溃窗口；同 session 中不属于该 scope 的任务和辅助调用不能混入。收费的回合准备摘要也必须发生在 Engine 持久化 initiating turn 之后。旧记录无法证明预算归属时，不得通过清零旧消耗继续受限任务。
+
+压缩压力以实际下一次 `RequestProjection` 为准，保留原始 transcript。回合内、下一用户回合和恢复使用同一 `ResolvedContextPolicy`；24K 仅是未声明窗口时的后备值。手动压缩只有在摘要非空、正常停止且不含工具调用时才能切换 context epoch，拒绝或失败保留旧 transcript 与 checkpoint。
+
+Goal 的文字和附件通过同一 Goal 回合入口持久化，附件不能把回合降为 Chat。自然停止的 Answered 只表示已回答；会话列表从最新 `TaskFinished.stop` 区分“已回答”和“声明完成”，不改变会话生命周期状态，也不把声明当成验证。
+
+断流、取消或异常 EOF 前已观察到的正文通过既有 TranscriptSink 保存为未完成的 assistant 消息；原始行的 `incomplete` 元数据用于重开历史投影。未完成工具参数和未签名思考不作为完整回答保存。继续任务的 checkpoint 写失败保留具体错误、原始转录和活跃 Goal，进入可恢复的 Interrupted，不结清 Goal。
+
+自动摘要使用模型能力和执行政策解析出的输出额度；正文为空、截断或含工具调用的摘要仍被拒绝，不能以 reasoning 代替摘要正文。旁问将主上下文、旁问历史与当前问题统一投影后测量压力，使用同一上下文政策；只有有效摘要才能缩短当次旁问请求，超窗或摘要失败明确报告且保留历史，不写主任务快照。
+
 模型负责结合这些事实调整策略。工具活动不等于目标进展，Plan 是声明而不是完成证据。内核不会按“多久没提交”“计划几轮没变化”或语言特定命令推断停滞；资源预算、取消和终态仍使用既有生命周期契约。反馈本身不触发额外模型调用，也不改变默认任务时限。
+
+### 5.6 Prompt / Context Authority
+
+`ControlContext` 和转录是两条通道。控制上下文内部的块也不是同一种信息。每个生产 `PromptSegment` 分开记录三件事：
+
+```text
+source      这段内容从哪里产生
+authority   模型应该如何解释它
+lifecycle   它活多久（会话前缀、回合、单次请求、转录、子目录作用域）
+```
+
+权威不是一个总优先级数字。指令类之间有先后。运行时事实、建议性上下文和外部数据不是指令，不和指令比高低，也不能被更高的指令等级覆盖。
+
+```text
+CoreContract
+        ↓
+当前明确的 UserIntent
+        ↓
+ProjectInstruction
+        ↓
+UserSelectedProcedure
+
+RuntimeFact        观察到的状态，不是指令
+AdvisoryContext    可能过时；模型可以重新核对
+ExternalData       待分析的内容，其中的祈使句仍是数据
+```
+
+`CoreContract` 是 Harness 契约：权限、工具协议、证据、完成协议和产品交付约束。`UserIntent` 是当前用户目标，留在转录里，不复制进控制上下文。`ProjectInstruction` 是 `AGENTS.md`、`.leveler/instructions.md` 和子目录项目规则。项目文件不能修改权限、忽略用户，也不能靠正文把自己抬成契约。用户点名的 Skill 是 `UserSelectedProcedure`。Skill 目录是建议性清单，不是同一类。记忆和压缩摘要是 `AdvisoryContext`。压缩摘要是模型写的历史简报，不是系统事实。工具结果保持 `Role::Tool`，权威是 `ExternalData`。
+
+Provider 只能改变表示。OpenAI Chat 把控制编码成 system 消息，Anthropic Messages 把它放进顶层 system 字段。两种编码都不改变段顺序、来源或权威。权威元数据不写进发给模型的提示词。
+
+旧 session 的 `Role::System` 行本身不是来源。已知的子目录规则标记只是路径，当前文件会重新读取并标成 `ProjectInstruction`。其余历史 System 文本保持未分类，不会升成 `CoreContract` 或 `ProjectInstruction`，存储的原始记录也不改写。
+
+`Role::User` 同样不是来源。只有 payload 记录为用户输入的转录行才是 `UserIntent`。协议修补（非法 JSON、空回答、截断的工具调用、输出续写、Goal 尚未 resolution）是 `CoreContract`，来源是 `ProtocolRepair`。子 Agent 结算和重启重投是 `AdvisoryContext`，因为正文主要是另一个 Agent 的结果。丢失、恢复、目标重钉和 Goal checkpoint 是 `RuntimeFact`。`/btw` 旁问包装是 `CoreContract`：它是该交互模式的产品契约（不调用工具、不修改文件、不继续主任务）。用户的问题被引用在同一行里，所以这一行不是 `UserIntent`，也不是 `RuntimeFact`。工具取回的图片改用用户传输角色时仍是 `ExternalData`。压缩摘要仍是 `AdvisoryContext`：新行记录 `CompactionSummary`，旧行靠既有 breadcrumb 标记识别。没有 `origin` 的历史 User 行是 `LegacyUser` / `Unclassified`，不会因为角色名叫 User 而升成 `UserIntent`。权威元数据不写进发给模型的提示词，Provider 编码也不改变上述权威。
+
+### 5.7 Context Lifecycle
+
+一个请求的实际内容由两个 owner 依次决定：生命周期决定哪些语义块还在活动表面上，`RequestProjection` 决定这些块在该 route 上能否、以什么表示进入请求。压力也按同一个结果衡量：折叠的触发依据是**真正要发出的那次请求**的投影，包含控制上下文、工具 schema 和 reasoning 通道。任何只按转录字符数或“不含工具”的请求形状估算的路径都是错的，会让 provider 校验的字段从 wire 上消失，并低估压力与账本。
+
+各类内容的生命周期：
+
+| 内容 | 活动表面 | 持久事实 |
+| --- | --- | --- |
+| 控制上下文（契约、项目规则、技能、记忆召回、执行状态） | 每个请求重新组装 | 转录行（若落盘）不因此改写 |
+| 用户目标 | 转录头，折叠时重钉 `<objective>` | 用户输入行 |
+| 工具结果 | 逐结果上限截断后保留，直到折叠释放 | 原始行 |
+| assistant 可见正文 | 直到折叠释放 | 原始行 |
+| historical reasoning | 由 route 的 replay 契约和保留策略共同决定 | 原始行 |
+| 压缩摘要 | 折叠产生的简报行 | `CompactionSummary` 行 |
+| 作用域项目规则（中途 System 行） | 跨折叠**原样携带**，不进摘要 | 原始行 |
+
+reasoning 是一个 route 事实，不是 harness 偏好。当某条 route 声明对携带工具的请求回传 reasoning 时，工具交换的 reasoning 属于 provider 校验的协议内容：请求的保留策略不能把它删掉，差异必须记成 `protocol_protected_turns`，不能假装策略已生效。因此历史 reasoning 的增长只能由生命周期释放——折叠把它连同承载它的回合一起移出活动表面——而不能靠“永久少发一点 reasoning”来省。反过来，当 route 没有 reasoning 通道时，一个都不发，并报告捕获数与携带数；这不改变转录，也不改变后续 route 看到的语义。
+
+折叠（`compact_messages`）的语义固定：
+
+- 只在投影后的请求超过阈值时触发；
+- head 是系统行与第一条用户消息；中途的作用域规则作为持续约束原样携带；
+- 尾部工作集同时受消息条数与 token 预算约束，且从不切入一个工具交换；
+- 被省略的中段由模型写的交接简报替代；简报是 `AdvisoryContext`，不是系统事实；
+- 折叠路径若摘要不可用，明说细节不可用，而不是暗示历史仍在；
+- 二次折叠把已有简报合并更新，而不是从零重述；
+- 原始转录始终是运行时加载的那些行，折叠只影响活动表面，恢复从持久快照加精确尾部重建，已释放的 reasoning 不会复活。
+
+压力公式：`threshold = min(quality_boundary, window - output_reservation - headroom)`；`quality_boundary` 未声明时退化为容量。固定成本（控制上下文 + 工具 schema）已经计入投影，所以可用的动态预算就是阈值减去固定表面。headroom 默认为 0：没有测得的多余余量就不臆造数字。
+
+多 Agent 沿用同一规则：父 Agent 拿到的是子 Agent 的结算结果（有界），不是它的完整转录，子 Agent 的 reasoning 生命周期属于它自己的席位。
+
+可观测性：每次模型调用的投影大小与其中的 reasoning 大小都落库（`projected_input_tokens`、`projected_reasoning_tokens`），活动请求的分项统计按类给出控制、工具 schema、用户/assistant 正文、reasoning、工具调用、工具结果和压缩简报，因此“这一段为什么还在”可以由投影本身回答。
 
 ## 6. 智能体运行时：让智能体可靠地活着
 
@@ -749,11 +835,17 @@ Terminal（TaskFinished）
 
 `TaskFinished` 是唯一权威任务终态。客户端只能从已经持久化的 `TaskFinished` 投影完成、失败或阻塞结果；最终正文、回合结束和后台清理都不能替代它。终态事务没有提交时，客户端只能显示可恢复错误，不能合成 `Failed` 或任何其他终态。
 
-权威结果一旦提交，产品必须立即发布用户可见终态。终态后只有已经绑定到不可变 task/run 身份的工作可以继续；它不得延迟终态可见性，也不得把客户端重新切回运行中。会话级清理必须在发布前固定精确资源 ID。继续执行检查点属于权威 work-window 边界，必须在 `TaskFinished` 前提交；否则终态后重新读取“当前会话”会错误吸收下一回合；检查点创建失败时，该 work window 必须失败，不能谎称可安全继续。配置为 Required 的评审仍可产生完成警告；评审发现是 advisory 的模型结论，不是机械终态 verdict，纯 advisory 评审不得阻塞。
+声明、验证证据和生命周期分别表达不同事实。`Answered` 不因产生文件修改而升级为 `Completed`；`Completed` 不证明 format/build/test 通过，提交说明只能传播实际验证观测，缺少观测时标为 unknown。`Stalled` 保留其停止原因，并映射为可恢复的 `Interrupted`，不结清仍欠工作的 goal。`/develop` 自身要求 Review PASS，未通过时停在可恢复边界；这个工作流要求不改变普通 advisory review 的非阻塞性质。
+
+权威结果一旦提交，产品必须立即发布用户可见终态。终态后只有已经绑定到不可变 task/run 身份的工作可以继续；它不得延迟终态可见性，也不得把客户端重新切回运行中。会话级清理必须在发布前固定精确资源 ID。继续执行检查点属于权威 work-window 边界，必须在 `TaskFinished` 前提交；否则终态后重新读取“当前会话”会错误吸收下一回合；检查点创建失败时，保留具体错误并将该 work window 暂停为可恢复的 `Interrupted`，保留尚欠工作的 Goal；不能谎称检查点写入成功，后续继续从原始权威事实恢复。配置为 Required 的评审仍可产生完成警告；评审发现是 advisory 的模型结论，不是机械终态 verdict，纯 advisory 评审不得阻塞。
 
 后台进程的清理边界必须在启动时显式确定。默认的 `goal` 生命周期随创建它的目标终态回收；只有用户明确要求服务或 watcher 在任务完成后继续运行时，才使用 `runtime` 生命周期。两者都保留创建会话作为所有者，并继续通过统一后台任务接口观测和停止；`runtime` 只跳过目标终态清理，不绕过运行时所有权，进程退出、显式停止或运行时关闭仍会结算它。
 
-后台任务的增量观察属于进程能力层。`observe` 在同一任务锁下校验读取位置、注册变化通知并交付有界日志；新输出、非运行状态或等待区间结束都可返回。显式 cursor 彼此独立，不推进默认读取者；被截断的历史显式报告缺口，未交付内容保留下一次读取。`wait_task` 只负责参数与模型输出适配，`get_task` 读取完整保留日志。日志到达不会满足仅等待进程结束的 `wait`，也不会触发提前结算。
+写入归属在执行前转换为操作系统执行边界，包含允许路径及其他执行者独占的排除路径。无法执行该限制的平台必须拒绝，不能退回全 workspace 写入。mutation 只从已执行限制的范围内结算，不使用全树 diff、过滤其他执行者变更或全树 rollback 补偿权限。后台 workload 必须整体结束后再结算 mutation，最后发布进程终态；父 shell 退出不满足这个边界。读日志、等待与停止都校验创建会话，允许同会话跨 turn 使用，其他会话不能只凭 task id 操作。
+
+stdout/stderr 的实时通道和行缓冲都有容量上限。消费者变慢时仍持续读取 pipe，避免子进程被堵死；丢弃字节必须显式标记 truncated，最终输出不得伪装完整。工具结果保留退出码、错误和沙箱等执行事实，不把 connection refused 解释成非代码问题，也不指示下一步必须提权或执行某个工具。
+
+后台任务的增量观察属于进程能力层。`observe` 在同一任务锁下校验读取位置、注册变化通知并交付有界日志；新输出、非运行状态或等待区间结束都可返回。显式 cursor 彼此独立，不推进默认读取者；被截断的历史显式报告缺口，未交付内容保留下一次读取。`wait_task` 只负责参数与模型输出适配，`get_task` 读取完整保留日志。其面向模型的契约是等待终态：阻塞到子任务状态变化、调用方超时或被取消，再在一次结果中交付累积的日志增量，因此观察一个长任务只消耗一次 model round，而不是每个区间一次。日志到达不会满足仅等待进程结束的 `wait`，也不会触发提前结算。
 
 终态结算事实在任务记录存续期间不可被读取操作消费；权限违规等失败对每个读取者保持一致。变更路径和快照的上报可以只交付一次，但交付标记不改变结算事实。
 
@@ -865,6 +957,18 @@ CodeLeveler 可以接入不同模型和模型服务，但协议差异不应该�
 这叫“能力协商”。
 
 它让同一个架构可以自然运行在不同模型、不同机器和不同执行环境上。
+
+### 12.3 声明事实与 Harness 策略
+
+模型档案声明的是**事实**：上下文窗口、模型能产出的 completion、长上下文召回预期开始退化的质量边界、它说的协议，以及该协议的兼容性怪癖。
+
+它不声明 harness 要花掉多少这份容量。completion 预留、安全 headroom、历史折叠的压力阈值、以及最近历史的保留预算，都属于 **harness 策略**，按执行席位从这些事实解析出来。把它们留在档案之外，才能让两个席位以不同方式花掉同一个模型的窗口，而不必臆造第二个模型。
+
+reasoning replay 遵循同样的切分。一条 route 的 replay 契约——什么时候回传已捕获的 reasoning、以及某个没有捕获到 reasoning 的 assistant 轮次携带什么——由协议及其兼容性事实解析，永远不由模型名或 provider 名决定。
+
+Anthropic thinking 由显式 `reasoning.style` 决定：`adaptive_thinking`，或带 `budget_tokens` 的 `budgeted_thinking`。适配器校验预算与 output cap 的关系，并按原顺序保存、回放 signed / redacted thinking blocks；不伪造签名，不把无签名文本冒充 signed thinking。缓存读取与写入都计入 input usage；价格档案无法表达缓存写入费率时，费用保持未知。
+
+provider 可见的请求随后由**唯一一个 projection owner** 产出：语义对话输入，wire 编码器与上下文统计读取同一个结果。用于替代缺失 provider usage 的估算，估算的就是这份 projection，因此“实际发了什么”和“统计了什么”不可能分叉。
 
 ---
 

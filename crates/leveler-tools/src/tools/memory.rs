@@ -227,20 +227,14 @@ impl Tool for RememberTool {
     }
 
     fn description(&self) -> &'static str {
-        "Propose a durable project memory (title + body + kind). Use it when \
-         the user states a lasting preference, a decision or project \
-         convention, or a non-obvious fact worth carrying into later sessions. \
-         This is a PROPOSAL: a reachable human must approve it in every \
-         permission profile, full access included, and the approval prompt IS \
-         the user's consent — so propose rather than asking in prose. If the \
-         user already saved it themselves with `/remember`, do not propose it \
-         again. Pick `kind` deliberately: `preference` is injected into every \
-         future turn, while `decision` and `note` are retrieved when relevant, \
-         which is the right choice for most facts. This does NOT overwrite: \
-         re-proposing an existing title with different content stores a second \
-         entry, so correct a superseded memory with `forget` on the old id \
-         first. Not for one-off trivia, secrets, raw transcripts, or anything \
-         already in the code, git history, lockfiles, or AGENTS.md."
+        "Propose a durable project memory: `title`, `body`, and `kind` \
+         (`preference`, `decision`, or `note`). Every permission profile, \
+         including full access, requires a person to approve the proposal \
+         before it becomes active. With nobody to ask, the proposal may stay \
+         pending. `preference` is injected into later turns. `decision` and \
+         `note` are retrieved by relevance or title. A proposal does not \
+         replace an existing entry; a second title match is a second entry. \
+         `forget` archives an id. Secrets are not a valid body."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -297,11 +291,9 @@ impl Tool for ForgetTool {
     }
 
     fn description(&self) -> &'static str {
-        "Archive a durable memory by id (soft-delete; retained for audit). Use it \
-         when a stored memory is contradicted by the current code — the file, \
-         function, or flag it names is gone, or it was never right — and as the \
-         first half of correcting a superseded one (forget the old id, then \
-         `remember` the corrected version). Requires user approval."
+        "Archive a durable memory by id. The entry is retained for audit and \
+         is no longer active. Requires user approval. Archiving does not write \
+         a replacement; a replacement is a separate `remember` proposal."
     }
 
     fn input_schema(&self) -> serde_json::Value {

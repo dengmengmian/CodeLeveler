@@ -108,6 +108,7 @@ pub async fn dispatch_calls(
         });
     }
     Ok(Message {
+        origin: None,
         role: Role::Tool,
         content: results,
     })

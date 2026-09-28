@@ -58,6 +58,9 @@ impl FilesystemIntent {
             | crate::WriteScope::WorkspaceWithGit { root } => Self::WorkspaceWrite {
                 write_root: root.clone(),
             },
+            crate::WriteScope::ScopedWorkspace { root, .. } => Self::ReadOnly {
+                read_roots: vec![root.clone()],
+            },
             crate::WriteScope::None => Self::ReadOnly {
                 read_roots: vec![cwd.to_path_buf()],
             },

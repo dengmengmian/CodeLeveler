@@ -20,6 +20,122 @@ use crate::AppError;
 const DEFAULT_BEFORE: u32 = 20;
 const DEFAULT_AFTER: u32 = 80;
 
+/// Record one auxiliary, session-attributed model call in the model-call
+/// ledger.
+///
+/// Prompt suggestions, away summaries, semantic recaps and `/btw` answers are
+/// real provider calls the runtime makes on the user's behalf. Without this
+/// they were invisible in a session's cost, so "why did that take five
+/// minutes?" had no lane to read. Records only the shape of the exchange:
+/// tokens, timing, finish reason — never prompt or response text.
+///
+/// A failed row is recorded too (with `error_kind`), because a call that cost
+/// a round trip and failed still cost the user time.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_auxiliary_call(
+    app: &crate::Application,
+    db: &Database,
+    session_id: &SessionId,
+    kind: leveler_storage::ModelCallKind,
+    provider: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    outcome: &Result<leveler_model::ModelResponse, leveler_model::ModelError>,
+    latency_ms: u64,
+    budget_scope: Option<&str>,
+    estimated_tokens: Option<u64>,
+) -> Result<(), leveler_storage::StorageError> {
+    let (usage, finish_reason, provider_request_id, error_kind) = match outcome {
+        Ok(response) => (
+            response.usage,
+            serde_json::to_value(response.finish_reason)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned)),
+            Some(response.request_id.to_string()),
+            None,
+        ),
+        Err(error) => (
+            leveler_model::TokenUsage::default(),
+            None,
+            None,
+            Some(auxiliary_error_kind(error)),
+        ),
+    };
+    use leveler_model::ModelRuntime;
+    let profile = app
+        .registry
+        .profile(&leveler_model::ModelRef::new(provider, model))
+        .await
+        .ok();
+    let not_sent = outcome
+        .as_ref()
+        .is_err_and(|error| error.delivery_state == leveler_model::DeliveryState::NotSent);
+    let cost_usd_micros = if not_sent {
+        Some(0)
+    } else {
+        profile
+            .as_ref()
+            .and_then(|p| p.pricing.as_ref())
+            .filter(|_| usage.total() > 0)
+            .and_then(|p| p.cost_for_usage(&usage))
+    };
+    let estimated_tokens = if not_sent || usage.total() > 0 {
+        None
+    } else {
+        estimated_tokens.map(|input| {
+            input.saturating_add(
+                outcome
+                    .as_ref()
+                    .ok()
+                    .map(|response| {
+                        leveler_model::estimate_tokens(std::slice::from_ref(&response.message))
+                    })
+                    .unwrap_or(0),
+            )
+        })
+    };
+    let record = leveler_storage::ModelRequestRecord {
+        budget_scope: budget_scope.map(str::to_string),
+        estimated_tokens,
+        id: leveler_core::EventId::generate().into_inner(),
+        provider_request_id,
+        session_id: session_id.clone(),
+        provider: provider.to_string(),
+        model: profile
+            .as_ref()
+            .map(|p| p.model_id.clone())
+            .unwrap_or_else(|| model.to_string()),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: (usage.total() > 0).then_some(usage.cached_input_tokens),
+        reasoning_tokens: usage.reasoning_tokens,
+        projected_input_tokens: None,
+        projected_reasoning_tokens: None,
+        cost_usd_micros,
+        agent_id: None,
+        finish_reason,
+        error_kind,
+        latency_ms: Some(latency_ms),
+        attempt_ms: None,
+        connect_ms: None,
+        ttft_ms: None,
+        max_event_gap_ms: None,
+        retry_count: 0,
+        kind,
+        created_at: leveler_core::now(),
+        reasoning_effort: reasoning_effort.map(ToOwned::to_owned),
+    };
+    leveler_storage::ModelRequestRepository::new(db)
+        .insert(&record)
+        .await
+}
+
+/// A stable class for an auxiliary call failure: never the provider's raw
+/// message, which can carry request details.
+fn auxiliary_error_kind(error: &leveler_model::ModelError) -> String {
+    format!("{:?}", error.kind).to_ascii_lowercase()
+}
+
 /// Query a session's durable observation. `center_seq = None` uses the latest
 /// sequence. Window sizes are capped at [`OBSERVABILITY_WINDOW_MAX`].
 pub async fn query_observability(
@@ -778,6 +894,10 @@ fn request_view(r: &leveler_storage::ModelRequestRecord) -> UiRequestObservation
         retry_count: r.retry_count,
         cached_input_tokens: r.cached_input_tokens,
         reasoning_tokens: r.reasoning_tokens,
+        // Recorded, not inferred: the runtime's own estimate for this call, or
+        // `None` for an auxiliary call that never projected one.
+        projected_input_tokens: r.projected_input_tokens,
+        projected_reasoning_tokens: r.projected_reasoning_tokens,
         cost_usd_micros: r.cost_usd_micros,
         agent_id: r.agent_id.clone(),
         created_at: r.created_at.to_rfc3339(),
@@ -799,6 +919,8 @@ fn lane(name: &str, rows: &[&leveler_storage::ModelRequestRecord]) -> UiLaneAcco
         output_tokens: rows.iter().map(|r| r.output_tokens).sum(),
         cached_input_tokens: sum_opt(|r| r.cached_input_tokens),
         reasoning_tokens: sum_opt(|r| r.reasoning_tokens),
+        projected_input_tokens: sum_opt(|r| r.projected_input_tokens),
+        projected_reasoning_tokens: sum_opt(|r| r.projected_reasoning_tokens),
         cost_usd_micros: sum_opt(|r| r.cost_usd_micros),
     }
 }
@@ -972,6 +1094,8 @@ mod tests {
         )
         .await;
         db.insert(&ModelRequestRecord {
+            budget_scope: None,
+            estimated_tokens: None,
             id: "req-1".into(),
             provider_request_id: None,
             session_id: sid.clone(),
@@ -982,9 +1106,15 @@ mod tests {
             finish_reason: Some("stop".into()),
             error_kind: None,
             latency_ms: Some(7100),
+            attempt_ms: Some(7000),
+            connect_ms: Some(120),
+            ttft_ms: Some(340),
+            max_event_gap_ms: Some(900),
             retry_count: 0,
             kind: leveler_storage::ModelCallKind::Round,
             cached_input_tokens: None,
+            projected_input_tokens: None,
+            projected_reasoning_tokens: None,
             cost_usd_micros: None,
             agent_id: None,
             created_at: now(),
@@ -1620,6 +1750,8 @@ mod accounting_tests {
         sid: &SessionId,
     ) -> ModelRequestRecord {
         ModelRequestRecord {
+            budget_scope: None,
+            estimated_tokens: None,
             id: id.into(),
             provider_request_id: None,
             session_id: sid.clone(),
@@ -1630,9 +1762,15 @@ mod accounting_tests {
             finish_reason: Some("stop".into()),
             error_kind: None,
             latency_ms: Some(4200),
+            attempt_ms: Some(4200),
+            connect_ms: Some(90),
+            ttft_ms: Some(210),
+            max_event_gap_ms: Some(400),
             retry_count: 0,
             kind: leveler_storage::ModelCallKind::Round,
             cached_input_tokens: cached,
+            projected_input_tokens: None,
+            projected_reasoning_tokens: None,
             cost_usd_micros: cost,
             agent_id: agent.map(str::to_string),
             created_at: now(),
@@ -1687,6 +1825,37 @@ mod accounting_tests {
             .expect("per-request view");
         assert_eq!(r1.reasoning_tokens, Some(10));
         assert_eq!(r1.output_tokens, 50);
+    }
+
+    /// The projected pair sits beside the provider's own prompt count, so the
+    /// ledger — not an offline recount — answers "how big was the request,
+    /// and how much of it was replayed reasoning?".
+    #[tokio::test]
+    async fn the_session_reports_projected_input_and_reasoning() {
+        let (db, sid) = seeded().await;
+        let mut measured = req("r9", None, 66_282, Some(51_000), 40, None, None, &sid);
+        measured.projected_input_tokens = Some(65_900);
+        measured.projected_reasoning_tokens = Some(17_100);
+        db.insert(&measured).await.unwrap();
+        let loaded = query_observability(&db, &sid, None, 0, 80).await.unwrap();
+        let r9 = loaded
+            .requests
+            .iter()
+            .find(|r| r.id == "r9")
+            .expect("per-request view");
+        assert_eq!(r9.projected_input_tokens, Some(65_900));
+        assert_eq!(r9.projected_reasoning_tokens, Some(17_100));
+        assert_eq!(r9.uncached_input_tokens(), Some(66_282 - 51_000));
+        let main = loaded
+            .session
+            .lanes
+            .iter()
+            .find(|l| l.lane == "main")
+            .unwrap();
+        // The seeded rows projected nothing, so the lane sum is this row's
+        // number — an unmeasured column never contributes a zero.
+        assert_eq!(main.projected_input_tokens, Some(65_900));
+        assert_eq!(main.projected_reasoning_tokens, Some(17_100));
     }
 
     #[tokio::test]

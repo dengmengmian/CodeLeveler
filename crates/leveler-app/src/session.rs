@@ -86,6 +86,10 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             applied_diff,
             exit_code,
             stop,
+            // The durable engine event does not carry the execution status; the
+            // reverse projection stays honest with `None` rather than inventing
+            // a status the log never recorded.
+            execution_status: None,
         },
         // A delegated agent's canonical events are durable FACTS for recovery,
         // not a second UI stream: the parent already surfaces child work as
@@ -142,6 +146,17 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
         EngineEvent::GoalIntercepted { kind, detail } => {
             AgentEvent::GoalIntercepted { kind, detail }
         }
+        EngineEvent::RuntimeInjection {
+            kind,
+            role,
+            model_step,
+            forces_continuation,
+        } => AgentEvent::RuntimeInjection {
+            kind,
+            role,
+            model_step,
+            forces_continuation,
+        },
         EngineEvent::DelegationStage { action, detail } => {
             AgentEvent::DelegationStage { action, detail }
         }
@@ -249,6 +264,10 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
         EngineError::Storage(e) => AppError::Storage(e),
         EngineError::Serde(e) => AppError::Serde(e.to_string()),
         EngineError::Config(m) | EngineError::Corrupt(m) => AppError::Engine(m),
+        // A context that cannot fit the model's hard capacity is a harness
+        // decision with a machine-readable cause; keep the "context management
+        // failure" label rather than flattening it into a bare sentence.
+        error @ EngineError::ContextManagementFailure(_) => AppError::Engine(error.to_string()),
         EngineError::UnclosedTerminalBoundary(m) => AppError::UnclosedTerminalBoundary(m),
         EngineError::TerminalCommitFailed(m) => AppError::TerminalCommitFailed(m),
         // Pass the diagnostic through verbatim rather than flattening it back
@@ -624,15 +643,18 @@ impl Application {
         &self,
         repo: &SessionRepository<'_>,
         session_id: &leveler_core::SessionId,
-    ) -> Result<(leveler_agent::WorkProfile, bool), AppError> {
+    ) -> Result<
+        (
+            leveler_agent::WorkProfile,
+            leveler_lifecycle::CollaborationMode,
+        ),
+        AppError,
+    > {
         let Some(record) = repo.get(session_id).await? else {
-            return Ok((self.work_profile(), false));
+            return Ok((self.work_profile(), self.collaboration()));
         };
         let (work_profile, collaboration) = crate::axes_from_session_record(&record);
-        Ok((
-            work_profile,
-            collaboration == leveler_lifecycle::CollaborationMode::Plan,
-        ))
+        Ok((work_profile, collaboration))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -657,9 +679,11 @@ impl Application {
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
         self.ensure_memory_consolidator(&db)?;
+        self.sync_session_memory_policy(&db, session_id).await;
         let repo = SessionRepository::new(&db);
         // Product axes SoT is the session row (SetProductAxes / create defaults).
-        let (work_profile, read_only) = self.turn_axes(&repo, session_id).await?;
+        let (work_profile, collaboration) = self.turn_axes(&repo, session_id).await?;
+        let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
 
         let engine = self
             .engine_for_with_profile(
@@ -718,8 +742,10 @@ impl Application {
     ) -> Result<AgentOutcome, AppError> {
         let db = self.open_database().await?;
         self.ensure_memory_consolidator(&db)?;
+        self.sync_session_memory_policy(&db, session_id).await;
         let repo = SessionRepository::new(&db);
-        let (work_profile, read_only) = self.turn_axes(&repo, session_id).await?;
+        let (work_profile, collaboration) = self.turn_axes(&repo, session_id).await?;
+        let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
         let engine = self
             .engine_for_with_profile(
                 model,
@@ -739,9 +765,15 @@ impl Application {
         // the layer with a client to notify.
         let _ = ();
         let spec = self.direct_spec(goal, mode, sandbox);
-        let result = engine
-            .chat(session_id, &spec, content, observer, cancellation)
-            .await;
+        let result = if collaboration == leveler_lifecycle::CollaborationMode::Goal {
+            engine
+                .run_with_content(session_id, &spec, content, observer, cancellation)
+                .await
+        } else {
+            engine
+                .chat(session_id, &spec, content, observer, cancellation)
+                .await
+        };
         self.notify_memory_consolidator();
         match result {
             Ok(report) => report_to_result(report),
@@ -1078,7 +1110,7 @@ mod turn_axes_tests {
             WorkProfile::Economy,
             "the session row is the single authority for a turn's tool surface"
         );
-        assert!(!read_only, "chat collaboration is not a read-only overlay");
+        assert_eq!(read_only, leveler_lifecycle::CollaborationMode::Chat);
     }
 
     #[tokio::test]
@@ -1093,12 +1125,12 @@ mod turn_axes_tests {
         let db = app.open_database().await.unwrap();
         let repo = SessionRepository::new(&db);
         let (_, read_only) = app.turn_axes(&repo, &id).await.unwrap();
-        assert!(read_only);
+        assert_eq!(read_only, leveler_lifecycle::CollaborationMode::Plan);
     }
 
     /// A session id with no row is not a licence to invent axes: the
-    /// create-time default is the only thing left to use, and it must not
-    /// silently become a read-only overlay.
+    /// create-time defaults supply both axes, including the collaboration
+    /// mode; no second mutable copy is consulted.
     #[tokio::test]
     async fn a_missing_row_falls_back_to_the_create_time_default() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1110,6 +1142,6 @@ mod turn_axes_tests {
             .await
             .unwrap();
         assert_eq!(work_profile, WorkProfile::Economy);
-        assert!(!read_only);
+        assert_eq!(read_only, leveler_lifecycle::CollaborationMode::Chat);
     }
 }

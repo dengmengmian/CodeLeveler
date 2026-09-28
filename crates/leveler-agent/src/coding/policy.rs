@@ -7,7 +7,7 @@
 //! is pure and deterministic: min-composition for concurrency, a precedence
 //! chain for reasoning effort, and no runtime auto-tuning in v1.
 
-use leveler_model::{ModelProfile, ReasoningEffort};
+use leveler_model::{ModelProfile, ReasoningEffort, ReasoningRetention};
 
 use crate::coding::factory::TurnProfile;
 
@@ -55,6 +55,25 @@ pub enum IndependentReviewPolicy {
     Required,
 }
 
+/// When the post-edit action-throughput guidance is visible to the model.
+///
+/// The experiment holds pre-edit behavior fixed by keeping the guidance out of
+/// the transcript until the runtime has mechanically confirmed the drive's
+/// first effective mutation. `Always` reproduces the previous experiment's
+/// arm (guidance in the system prompt from round 1) and exists for debugging
+/// only — it is never a formal A/B arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PostEditThroughputMode {
+    /// Production: the guidance is never present.
+    #[default]
+    Off,
+    /// Inject the guidance once the first effective mutation of this drive is
+    /// committed (the post-edit-only experiment arm).
+    PostEdit,
+    /// The guidance is in the system prompt from the first round.
+    Always,
+}
+
 /// eval-only injection seam for single-variable ablation. Production assembly
 /// never constructs one; every `None` inherits the resolved default. The
 /// executor's progress-guard rail (`repeated_read_guard`, kept under that name
@@ -74,6 +93,182 @@ pub struct ExecutionOverrides {
     /// (`ContextSnapshot`), not only when it diverges from the transcript.
     /// Context-cost attribution reads those rows; production never sets it.
     pub context_trace: Option<bool>,
+    /// Experiment knob: add the generic independent-observation batching
+    /// guidance to the system prompt. `None` (production) leaves the prompt
+    /// byte-identical to today; the eval seam may turn it on to measure whether
+    /// the model uses the parallel read-only batch it already has.
+    pub investigation_batching: Option<bool>,
+    /// Experiment knob: when the generic post-edit action-throughput guidance
+    /// becomes visible. `None` (production) leaves the prompt byte-identical;
+    /// the eval seam turns on exactly this one variable.
+    pub post_edit_action_throughput: Option<PostEditThroughputMode>,
+    /// Experiment knob: how much historical assistant reasoning is re-sent to
+    /// the provider. `None` (production) means [`ReasoningRetention::All`],
+    /// byte-identical to the pre-experiment behaviour. The eval seam turns on
+    /// exactly this one variable; the durable transcript is never changed.
+    pub reasoning_retention: Option<ReasoningRetention>,
+    /// Harness context policy: extra pressure headroom beyond the completion
+    /// reservation. `None` means none declared — there is no measured extra
+    /// margin to claim, so nothing is invented.
+    pub context_headroom_tokens: Option<u32>,
+}
+
+/// The harness's context policy for one executor seat: how much of a model's
+/// declared capacity to spend, and what to reserve.
+///
+/// Ownership: [`leveler_model::ModelLimits`] declares FACTS (window, completion
+/// capability, quality boundary). This type decides how the harness USES them —
+/// the completion reservation, the safety headroom, the pressure threshold, the
+/// retention budget. None of those belong on a model profile, because they are
+/// not facts about the model; two harnesses may spend the same model's window
+/// differently. The split is also why a "headroom" constant is not invented:
+/// `headroom: 0` means exactly "no measured extra margin beyond the completion".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedContextPolicy {
+    /// The model's declared window (exact fact); `0` = unknown.
+    pub context_window: u32,
+    /// The quality boundary (where recall is expected to degrade); `0` = not
+    /// declared, in which case only capacity bounds the threshold.
+    pub quality_boundary: u32,
+    /// The completion this harness reserves per request — the effective
+    /// request cap, not the model's maximum capability. A request that asks for
+    /// less must not be measured against a reservation it will never use.
+    pub output_reservation: u32,
+    /// Extra safety margin on top of the reservation; `0` = none declared.
+    pub headroom: u32,
+    /// The pressure threshold: `min(quality_boundary, capacity)` where
+    /// `capacity = window - output_reservation - headroom`. `0` = folding
+    /// disabled (no window declared).
+    pub pressure_threshold: u32,
+    /// How much recent history stays verbatim across a fold.
+    pub retention: ContextRetentionPolicy,
+}
+
+/// The recent-history budget a fold keeps verbatim.
+///
+/// Deliberately its own concept rather than "half the threshold": the two
+/// answer different questions ("when do I fold?" vs "what do I keep?") and
+/// must be tunable apart. The values are UNCHANGED from the pre-policy
+/// behaviour, which is why they carry no claim of being measured — see the
+/// report's `REQUIRES EXPERIMENT` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextRetentionPolicy {
+    /// Tail bound in messages (the count half of the pair).
+    pub keep_recent_messages: usize,
+    /// Tail bound in estimated tokens (the budget half).
+    pub keep_recent_tokens: u64,
+}
+
+impl ContextRetentionPolicy {
+    /// The production retention: the working set is bounded by BOTH a message
+    /// count and a token budget, because a single huge tool output inside the
+    /// newest messages defeats a count-only bound.
+    fn from_threshold(pressure_threshold: u32) -> Self {
+        Self {
+            keep_recent_messages: leveler_context::COMPACT_KEEP_RECENT,
+            keep_recent_tokens: u64::from(pressure_threshold) / RETENTION_TAIL_DIVISOR,
+        }
+    }
+}
+
+/// Fraction of the pressure threshold retained verbatim. Pre-existing value,
+/// kept for behavioural compatibility; changing it is an experiment, not a
+/// refactor.
+const RETENTION_TAIL_DIVISOR: u64 = 2;
+
+impl Default for ResolvedContextPolicy {
+    fn default() -> Self {
+        Self {
+            context_window: 0,
+            quality_boundary: 0,
+            output_reservation: 0,
+            headroom: 0,
+            pressure_threshold: 0,
+            retention: ContextRetentionPolicy::from_threshold(0),
+        }
+    }
+}
+
+impl ResolvedContextPolicy {
+    /// Derive the harness policy from a model's declared facts.
+    ///
+    /// `output_reservation` is the EFFECTIVE per-request completion cap — what
+    /// this executor will actually ask for, not the model's theoretical
+    /// maximum — so a seat that caps its output lower gets a correspondingly
+    /// larger prompt budget.
+    pub fn resolve(
+        limits: &leveler_model::ModelLimits,
+        output_reservation: u32,
+        headroom: u32,
+    ) -> Self {
+        let window = limits.context_window;
+        let reservation = if output_reservation > 0 {
+            output_reservation
+        } else {
+            limits.max_output_tokens
+        };
+        if window == 0 {
+            // No declared window: there is nothing to bound, and `0` keeps its
+            // established meaning of "folding disabled" rather than inventing
+            // a threshold.
+            return Self {
+                context_window: 0,
+                quality_boundary: limits.reliable_context,
+                output_reservation: reservation,
+                headroom,
+                pressure_threshold: 0,
+                retention: ContextRetentionPolicy::from_threshold(0),
+            };
+        }
+        let capacity = window.saturating_sub(reservation).saturating_sub(headroom);
+        let quality = if limits.reliable_context == 0 {
+            capacity
+        } else {
+            limits.reliable_context
+        };
+        // Floor at one token: a reservation plus headroom that exhausts the
+        // window is a misdeclaration, and the honest failure is to fold
+        // immediately (visible in the ledger) rather than to silently stop
+        // folding and let the request overflow.
+        let pressure_threshold = quality.min(capacity).max(1);
+        Self {
+            context_window: window,
+            quality_boundary: limits.reliable_context,
+            output_reservation: reservation,
+            headroom,
+            pressure_threshold,
+            retention: ContextRetentionPolicy::from_threshold(pressure_threshold),
+        }
+    }
+
+    /// Whether folding is enabled at all.
+    pub fn folding_enabled(&self) -> bool {
+        self.pressure_threshold > 0
+    }
+
+    /// The largest projected input this harness will legally SEND: the declared
+    /// window with the completion reservation and safety headroom removed.
+    ///
+    /// This is the SECOND bound, and it answers a different question than
+    /// [`Self::pressure_threshold`]. The threshold is where recall is expected
+    /// to degrade — folding there is a quality choice that may be abandoned.
+    /// The capacity is where a request can no longer be sent at all — folding
+    /// there is required to make the next request legal. When the model
+    /// declares a quality boundary below its usable window the two differ, and
+    /// the gap between them is exactly the room a failed fold may continue in.
+    ///
+    /// `None` when no window is declared: with no hard limit there is no
+    /// request compaction is obliged to make legal, so nothing here may claim
+    /// one.
+    pub fn hard_capacity(&self) -> Option<u64> {
+        (self.context_window > 0).then(|| {
+            u64::from(
+                self.context_window
+                    .saturating_sub(self.output_reservation)
+                    .saturating_sub(self.headroom),
+            )
+        })
+    }
 }
 
 /// The interactive-chat fold threshold. Chat holds a conservative window;
@@ -87,12 +282,13 @@ pub const CHAT_CONTEXT_BUDGET: u32 = crate::PRE_REQUEST_COMPACT_THRESHOLD as u32
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedExecutionPolicy {
     pub max_output_tokens: u32,
-    /// The model's declared context window (exact fact). Used for accounting
-    /// (`/context`), never to refuse a request.
-    pub context_window: u32,
-    /// Fold threshold in estimated tokens; `0` disables folding. Governs when
-    /// held context is compacted — never how much may be read.
-    pub context_budget: u32,
+    /// How the harness spends this model's declared capacity: window, quality
+    /// boundary, completion reservation, headroom, fold threshold and the
+    /// retention budget, resolved once here.
+    pub context_policy: ResolvedContextPolicy,
+    /// This route's resolved reasoning-replay contract, passed to the kernel so
+    /// the projection it applies is the same one the adapter encodes.
+    pub reasoning_replay: leveler_model::ReasoningReplayContract,
     pub max_parallel_tools: usize,
     pub max_files_per_step: usize,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -100,6 +296,13 @@ pub struct ResolvedExecutionPolicy {
     pub max_tool_output_bytes: usize,
     /// Persist the model context every round (eval measurement seam).
     pub context_trace: bool,
+    /// The independent-observation batching soft policy is in the prompt.
+    pub investigation_batching: bool,
+    /// When the independent-action (post-edit throughput) soft policy is visible.
+    pub post_edit_action_throughput: PostEditThroughputMode,
+    /// How much historical assistant reasoning the provider request carries.
+    /// Production resolves to [`ReasoningRetention::All`].
+    pub reasoning_retention: ReasoningRetention,
 }
 
 /// min over concurrency caps where `0` means "no opinion / unlimited".
@@ -143,12 +346,24 @@ pub fn resolve_execution_policy(
     };
     let max_parallel_tools = min_nonzero(&[role_parallel, o.max_parallel_tools.unwrap_or(0)]);
 
+    // The context policy is resolved from the model's declared facts and the
+    // harness's reservation/headroom choices. `resolved_output_cap` is what
+    // this seat will actually ask the provider for, so a seat that caps its
+    // output lower gets the capacity back as prompt budget.
+    let resolved_output_cap = profile.limits.max_output_tokens;
+    let context_policy = ResolvedContextPolicy::resolve(
+        &profile.limits,
+        resolved_output_cap,
+        o.context_headroom_tokens.unwrap_or(0),
+    );
+
     ResolvedExecutionPolicy {
         max_output_tokens: profile.limits.max_output_tokens,
-        context_window: profile.limits.context_window,
-        // `reliable_context` is a model QUALITY declaration (recall degrades
-        // past it), not a hard cap: the policy chooses to fold there.
-        context_budget: profile.limits.reliable_context,
+        context_policy,
+        reasoning_replay: leveler_model::ReasoningReplayContract::resolve(
+            profile.protocol,
+            &profile.compatibility,
+        ),
         max_parallel_tools,
         max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
         // Safety rail: only the eval seam may lower it.
@@ -171,6 +386,12 @@ pub fn resolve_execution_policy(
                 leveler_tools::registry::MAX_TOOL_OUTPUT,
             ),
         context_trace: o.context_trace.unwrap_or(false),
+        investigation_batching: o.investigation_batching.unwrap_or(false),
+        post_edit_action_throughput: o
+            .post_edit_action_throughput
+            .unwrap_or(PostEditThroughputMode::Off),
+        // Production default is All: the request projection is a no-op.
+        reasoning_retention: o.reasoning_retention.unwrap_or(ReasoningRetention::All),
     }
 }
 
@@ -179,7 +400,7 @@ mod tests {
     use super::*;
     use crate::coding::factory::TurnProfile;
     use crate::{ContinuationPolicy, StepLimits};
-    use leveler_model::{ModelProfile, ReasoningEffort};
+    use leveler_model::{ModelProfile, ReasoningEffort, ReasoningRetention};
 
     fn profile() -> ModelProfile {
         serde_json::from_value(serde_json::json!({
@@ -210,6 +431,146 @@ mod tests {
         }
     }
 
+    /// The fold threshold is derived from the model's declared facts, not
+    /// copied from `reliable_context`: a quality bound declared above
+    /// `context_window - max_output_tokens` must not authorize a request that
+    /// leaves no room for its own completion.
+    #[test]
+    fn fold_budget_reserves_the_declared_completion() {
+        let mut p = profile();
+        p.limits.context_window = 1_048_576;
+        p.limits.reliable_context = 786_432;
+        p.limits.max_output_tokens = 393_216;
+        let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(
+            resolved.context_policy.pressure_threshold, 655_360,
+            "the completion reservation must cap the quality bound"
+        );
+        // A quality bound below capacity is left alone.
+        p.limits.reliable_context = 400_000;
+        let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(resolved.context_policy.pressure_threshold, 400_000);
+    }
+
+    /// The prompt budget reserves exactly the completion envelope the executor
+    /// will put on the request (`ResolvedExecutionPolicy::max_output_tokens`,
+    /// which the drive passes to `Agent::with_max_output_tokens`). Reserving a
+    /// different number — the model's theoretical maximum while requesting less
+    /// — would fold early for room the request never asks for.
+    #[test]
+    fn the_reservation_is_the_request_envelope_the_executor_asks_for() {
+        let mut p = profile();
+        p.limits.context_window = 1_048_576;
+        p.limits.reliable_context = 786_432;
+        p.limits.max_output_tokens = 393_216;
+        let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(resolved.max_output_tokens, 393_216);
+        assert_eq!(
+            resolved.context_policy.output_reservation, resolved.max_output_tokens,
+            "the reservation must be the cap this request actually carries"
+        );
+        assert_eq!(
+            resolved.context_policy.pressure_threshold, 655_360,
+            "capacity (window − reservation) caps the quality bound"
+        );
+    }
+
+    /// The pressure threshold, the reservation and the retention budget are
+    /// separate policy fields, and each is derived from the model's facts plus
+    /// the harness's choices.
+    #[test]
+    fn context_policy_separates_capacity_quality_reservation_and_retention() {
+        use super::{ContextRetentionPolicy, ResolvedContextPolicy};
+        let limits = |window, quality, output| leveler_model::ModelLimits {
+            context_window: window,
+            reliable_context: quality,
+            max_output_tokens: output,
+            max_tool_schema_bytes: 32_768,
+            max_parallel_tool_calls: 1,
+            max_tool_output_bytes: None,
+        };
+
+        // Capacity binds: the quality bound sits above the usable window.
+        let policy = ResolvedContextPolicy::resolve(&limits(1_048_576, 786_432, 393_216), 0, 0);
+        assert_eq!(policy.quality_boundary, 786_432);
+        assert_eq!(policy.output_reservation, 393_216);
+        assert_eq!(policy.headroom, 0);
+        assert_eq!(policy.pressure_threshold, 655_360);
+        assert_eq!(policy.retention.keep_recent_tokens, 327_680);
+        assert_eq!(
+            policy.retention.keep_recent_messages,
+            leveler_context::COMPACT_KEEP_RECENT
+        );
+
+        // A request that asks for LESS completion reserves less, so the prompt
+        // budget grows: the reservation is the effective one, not the model's
+        // maximum capability.
+        let smaller =
+            ResolvedContextPolicy::resolve(&limits(1_048_576, 786_432, 393_216), 32_768, 0);
+        assert_eq!(smaller.output_reservation, 32_768);
+        assert_eq!(smaller.pressure_threshold, 786_432, "quality binds now");
+
+        // Quality binds when it sits below capacity…
+        let quality = ResolvedContextPolicy::resolve(&limits(128_000, 64_000, 8_192), 0, 0);
+        assert_eq!(quality.pressure_threshold, 64_000);
+        // …and headroom only ever lowers it.
+        let headroom = ResolvedContextPolicy::resolve(&limits(128_000, 64_000, 8_192), 0, 65_536);
+        assert_eq!(headroom.headroom, 65_536);
+        assert_eq!(headroom.pressure_threshold, 54_272);
+
+        // An undeclared window keeps folding disabled (`0`), and an undeclared
+        // quality bound is not invented.
+        let unknown = ResolvedContextPolicy::resolve(&limits(0, 0, 0), 0, 0);
+        assert!(!unknown.folding_enabled());
+        assert_eq!(unknown.quality_boundary, 0);
+        assert_eq!(
+            ResolvedContextPolicy::resolve(&limits(128_000, 0, 8_192), 0, 0).pressure_threshold,
+            119_808,
+            "no quality declaration → capacity is the whole bound"
+        );
+
+        // A reservation plus headroom that exhausts the window is a
+        // misdeclaration; the honest failure is to fold immediately (visible)
+        // rather than to stop folding (silent overflow).
+        let exhausted = ResolvedContextPolicy::resolve(&limits(8_192, 4_096, 8_191), 0, 8_192);
+        assert_eq!(exhausted.pressure_threshold, 1);
+        assert!(exhausted.folding_enabled());
+
+        // The retention budget is its own field, not a fraction re-derived at
+        // the call site: a policy with a different threshold keeps the same
+        // shape of relationship but a different number.
+        let other = ResolvedContextPolicy::resolve(&limits(64_000, 32_000, 4_000), 0, 0);
+        assert_eq!(other.pressure_threshold, 32_000);
+        assert_eq!(other.retention.keep_recent_tokens, 16_000);
+        assert_eq!(
+            other.retention,
+            ContextRetentionPolicy {
+                keep_recent_messages: leveler_context::COMPACT_KEEP_RECENT,
+                keep_recent_tokens: 16_000,
+            }
+        );
+    }
+
+    /// The route's replay contract travels with the resolved policy, so the
+    /// kernel applies the same contract the adapter encodes.
+    #[test]
+    fn resolution_carries_the_route_replay_contract() {
+        let p = profile();
+        let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(
+            resolved.reasoning_replay,
+            leveler_model::ReasoningReplayContract::NONE
+        );
+        let mut passback = profile();
+        passback.compatibility = serde_json::from_value(serde_json::json!({
+            "reasoning_replay_scope": "when_tools_present",
+            "reasoning_content_key_required": true
+        }))
+        .unwrap();
+        let resolved = resolve_execution_policy(&passback, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(resolved.reasoning_replay.arm_name(), "when_tools+empty");
+    }
+
     /// Migration contract: for a main seat with no overrides, resolution must
     /// equal what the retired `default_policy()` produced through the old
     #[test]
@@ -226,6 +587,82 @@ mod tests {
         assert!(
             resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o)).context_trace
         );
+    }
+
+    /// The batching soft policy is an experiment: production runs never carry
+    /// it, and the eval seam can turn it on without touching anything else.
+    #[test]
+    fn investigation_batching_is_off_unless_the_eval_seam_asks_for_it() {
+        let p = profile();
+        assert!(
+            !resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None)
+                .investigation_batching,
+            "production never adds the batching guidance"
+        );
+        let o = ExecutionOverrides {
+            investigation_batching: Some(true),
+            ..ExecutionOverrides::default()
+        };
+        let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o));
+        assert!(resolved.investigation_batching);
+        assert!(!resolved.context_trace, "the knob flips one variable only");
+        assert_eq!(
+            resolved.max_parallel_tools, 4,
+            "the batch width is untouched"
+        );
+    }
+
+    /// The post-edit throughput knob is an experiment: production runs never
+    /// carry its guidance, and the eval seam can turn it on without touching
+    /// any other resolver input.
+    #[test]
+    fn post_edit_action_throughput_is_off_unless_the_eval_seam_asks_for_it() {
+        let p = profile();
+        assert_eq!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None)
+                .post_edit_action_throughput,
+            PostEditThroughputMode::Off,
+            "production never adds the post-edit batching guidance"
+        );
+        let o = ExecutionOverrides {
+            post_edit_action_throughput: Some(PostEditThroughputMode::PostEdit),
+            ..ExecutionOverrides::default()
+        };
+        let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o));
+        assert_eq!(
+            resolved.post_edit_action_throughput,
+            PostEditThroughputMode::PostEdit
+        );
+        assert!(
+            !resolved.investigation_batching,
+            "the post-edit knob does not also flip the pre-edit one"
+        );
+        assert!(!resolved.context_trace, "the knob flips one variable only");
+    }
+
+    /// The retention policy is an experiment: production resolves to `All`
+    /// (no projection), and the eval seam can select a window without
+    /// touching any other resolver input.
+    #[test]
+    fn reasoning_retention_defaults_to_all_and_only_the_seam_changes_it() {
+        let p = profile();
+        assert_eq!(
+            resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None)
+                .reasoning_retention,
+            ReasoningRetention::All,
+            "production carries every historical reasoning block"
+        );
+        let o = ExecutionOverrides {
+            reasoning_retention: Some(ReasoningRetention::LastTurns(3)),
+            ..ExecutionOverrides::default()
+        };
+        let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&o));
+        assert_eq!(
+            resolved.reasoning_retention,
+            ReasoningRetention::LastTurns(3)
+        );
+        assert_eq!(resolved.reasoning_effort, None, "effort is untouched");
+        assert_eq!(resolved.max_parallel_tools, 4, "batch width is untouched");
     }
 
     #[test]

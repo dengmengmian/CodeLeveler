@@ -6,14 +6,15 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_model::{
     CompactionRecord, ContextAccounting, Message, ModelPricing, ModelRef, ModelRequest,
-    ModelRuntime, ReasoningEffort, ToolChoice,
+    ModelRuntime, ReasoningEffort, ReasoningReplayContract, ReasoningRetention, RequestProjection,
+    ToolChoice,
 };
 
 use crate::error::AgentCoreError;
 use crate::event::AgentEvent;
 use crate::harness::{AgentHarness, Flow, LoopContext};
 use crate::limits::{ModelStepAdmission, ModelStepLimits};
-use crate::model_round::run_model_round;
+use crate::model_round::{ModelRoundObserver, run_model_round_observed};
 use crate::stop::StopReason;
 use crate::usage::estimate_tokens;
 
@@ -27,6 +28,15 @@ pub struct Agent {
     reasoning_effort: Option<ReasoningEffort>,
     pricing: Option<ModelPricing>,
     limits: ModelStepLimits,
+    /// How much historical assistant reasoning this run re-sends to the
+    /// provider. Production default is [`ReasoningRetention::All`] (no
+    /// projection). The policy is applied when each request is assembled and
+    /// never mutates the durable transcript.
+    reasoning_retention: ReasoningRetention,
+    /// The route's resolved reasoning-replay contract. It is a MODEL/route fact
+    /// the host resolved; the kernel only applies it when it projects each
+    /// request, and never learns a provider name from it.
+    reasoning_replay: ReasoningReplayContract,
     /// The model's declared context window (exact fact), when the host knows it.
     context_window: Option<u32>,
     /// The fold threshold (`reliable_context`), when the host knows it.
@@ -46,6 +56,8 @@ impl Agent {
             reasoning_effort: None,
             pricing: None,
             limits: ModelStepLimits::default(),
+            reasoning_retention: ReasoningRetention::All,
+            reasoning_replay: ReasoningReplayContract::NONE,
             context_window: None,
             compact_at: None,
             compaction: Arc::new(Mutex::new(None)),
@@ -66,6 +78,22 @@ impl Agent {
 
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Set the historical-reasoning retention policy for this run. `All` is the
+    /// production default and performs no projection.
+    pub fn with_reasoning_retention(mut self, retention: ReasoningRetention) -> Self {
+        self.reasoning_retention = retention;
+        self
+    }
+
+    /// Set the route's resolved reasoning-replay contract (which turns carry
+    /// captured reasoning, and what a turn that captured none carries).
+    /// Resolved by the host from the model profile; the kernel applies it but
+    /// never interprets it.
+    pub fn with_reasoning_replay(mut self, contract: ReasoningReplayContract) -> Self {
+        self.reasoning_replay = contract;
         self
     }
 
@@ -226,42 +254,75 @@ impl Agent {
                 Flow::Stop(stop) => return Ok(stop),
             }
 
+            // The provider request is a PROJECTION of the durable transcript,
+            // computed once here by the projection owner: the retention arm
+            // says how much historical reasoning is requested, the route
+            // contract says what this provider's protocol does with it. The
+            // projection travels on the request, so the wire encoder and the
+            // accounting below read one decision instead of deriving two.
+            // `messages` itself is never touched, so persistence, telemetry
+            // and re-analysis still see the full reasoning.
             let mut request = ModelRequest::new(self.model.clone(), messages.clone());
-            request.messages.extend(harness.request_context(&ctx));
+            request.control_context = harness.request_context(&ctx);
             request.tools = harness.tool_definitions();
+            request.projection = Some(RequestProjection::project_with_control_context(
+                &request.messages,
+                &request.tools,
+                self.reasoning_replay,
+                self.reasoning_retention,
+                &request.control_context,
+            ));
             request.tool_choice = ToolChoice::Auto;
             request.max_output_tokens = self.max_output_tokens;
             request.reasoning_effort = self.reasoning_effort;
 
-            // Publish the accounting of the EXACT request about to be sent,
-            // before it is sent. This is the runtime's single source of truth
-            // for "what is my context made of"; the TUI only renders it.
-            let accounting = ContextAccounting::compute(
-                self.model.clone(),
-                &request.messages,
-                &request.tools,
-                self.context_window,
-                self.compact_at,
-                self.compaction.lock().ok().and_then(|g| *g),
-            );
+            // Publish the accounting of the EXACT request about to be sent —
+            // its projection, not a second reading of the transcript. This is
+            // the runtime's single source of truth for "what is my context
+            // made of"; the TUI only renders it.
+            let accounting = {
+                let projection = request
+                    .projection
+                    .as_ref()
+                    .expect("the projection was just set");
+                ContextAccounting::compute(
+                    self.model.clone(),
+                    projection,
+                    self.context_window,
+                    self.compact_at,
+                    self.compaction.lock().ok().and_then(|g| *g),
+                )
+            };
             harness.on_event(AgentEvent::ContextUsage(accounting));
 
-            let estimated_request_tokens = estimate_tokens(&request.messages);
+            let estimated_request_tokens = request
+                .projection
+                .as_ref()
+                .map(|p| p.estimated_tokens())
+                .unwrap_or_else(|| estimate_tokens(&request.messages));
 
-            let mut on_event = |event| harness.on_event(event);
-            let round = run_model_round(
+            let cancellation = ctx.cancellation().clone();
+            let round = run_model_round_observed(
                 self.runtime.as_ref(),
                 request,
-                ctx.cancellation(),
-                &mut on_event,
+                &cancellation,
+                &mut KernelObserver {
+                    harness,
+                    ctx: &mut ctx,
+                    pricing: self.pricing.as_ref(),
+                    limits: &self.limits,
+                },
             )
             .await;
             let mut round = match round {
                 Ok(round) => round,
-                // The deadline timer cancelled the stream: re-enter at the
-                // step top, where admission reports the duration budget.
-                Err(AgentCoreError::Cancelled) if ctx.deadline_expired() => continue,
-                Err(error) => match harness
+                Err(KernelRoundError::Host(error)) => return Err(error),
+                Err(KernelRoundError::Core(AgentCoreError::Cancelled))
+                    if ctx.deadline_expired() =>
+                {
+                    continue;
+                }
+                Err(KernelRoundError::Core(error)) => match harness
                     .on_model_error(&mut ctx, error, &mut messages)
                     .await?
                 {
@@ -269,23 +330,16 @@ impl Agent {
                     Flow::Stop(stop) => return Ok(stop),
                 },
             };
-
-            // Fold this model step's spend once, here, against the usage the
-            // provider reported — cached share included. A zero-usage gateway
-            // must not disable the token budget, so the transcript estimate
-            // stands in (request + response, mirroring what is billed).
-            round.cost_usd_micros = self.pricing.as_ref().map(|p| {
-                p.cost_usd_micros_cached(
-                    round.usage.input_tokens,
-                    round.usage.cached_input_tokens,
-                    round.usage.output_tokens,
-                )
-            });
+            // Answer-local statistics remain distinct from the per-attempt
+            // task spend already folded by the observer.
+            round.cost_usd_micros = self
+                .pricing
+                .as_ref()
+                .and_then(|p| p.cost_for_usage(&round.usage));
             round.estimated_tokens = (round.usage.total() == 0).then(|| {
                 estimated_request_tokens
                     .saturating_add(estimate_tokens(std::slice::from_ref(&round.message)))
             });
-            ctx.record_spend(round.usage, round.cost_usd_micros, round.estimated_tokens);
 
             match harness.on_response(&mut ctx, &round, &mut messages).await? {
                 Flow::Continue => {}
@@ -324,6 +378,74 @@ impl Agent {
                 Flow::Stop(stop) => return Ok(stop),
             }
         }
+    }
+}
+
+enum KernelRoundError<E> {
+    Core(AgentCoreError),
+    Host(E),
+}
+impl<E> From<AgentCoreError> for KernelRoundError<E> {
+    fn from(error: AgentCoreError) -> Self {
+        Self::Core(error)
+    }
+}
+struct KernelObserver<'a, H> {
+    harness: &'a mut H,
+    ctx: &'a mut LoopContext,
+    pricing: Option<&'a ModelPricing>,
+    limits: &'a ModelStepLimits,
+}
+#[async_trait::async_trait]
+impl<H: AgentHarness> ModelRoundObserver for KernelObserver<'_, H> {
+    type Error = KernelRoundError<H::Error>;
+    async fn before_attempt(&mut self) -> Result<(), Self::Error> {
+        self.harness
+            .before_model_attempt(self.ctx)
+            .await
+            .map_err(KernelRoundError::Host)
+    }
+    fn on_event(&mut self, event: AgentEvent) {
+        self.harness.on_event(event);
+    }
+    async fn on_attempt(
+        &mut self,
+        mut attempt: leveler_model::ModelAttempt,
+    ) -> Result<(), Self::Error> {
+        if attempt.cost_usd_micros.is_none() {
+            attempt.cost_usd_micros = attempt.usage.and_then(|usage| {
+                self.pricing
+                    .and_then(|pricing| pricing.cost_for_usage(&usage))
+            });
+        }
+        self.ctx.record_spend(
+            attempt.usage.unwrap_or_default(),
+            attempt.cost_usd_micros,
+            attempt.estimated_tokens,
+        );
+        self.harness
+            .on_model_attempt(self.ctx, &attempt)
+            .await
+            .map_err(KernelRoundError::Host)?;
+        if self.limits.max_cost_usd_micros.is_some() && attempt.cost_usd_micros.is_none() {
+            return Err(AgentCoreError::InvalidLimits("provider usage is unavailable; the configured cost budget cannot admit further model calls".into()).into());
+        }
+        if attempt.error.is_some()
+            && (self
+                .limits
+                .max_model_tokens
+                .is_some_and(|cap| self.ctx.model_tokens_spent() >= cap)
+                || self
+                    .limits
+                    .max_cost_usd_micros
+                    .is_some_and(|cap| self.ctx.cost_spent_micros() >= cap))
+        {
+            return Err(AgentCoreError::InvalidLimits(
+                "model budget exhausted by a failed attempt; retry refused".into(),
+            )
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -401,6 +523,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
                 reasoning_tokens: None,
             },
         }
@@ -410,6 +533,7 @@ mod tests {
         ModelResponse {
             request_id: RequestId::generate(),
             message: Message {
+                origin: None,
                 role: Role::Assistant,
                 content: vec![ContentPart::ToolCall {
                     call: ToolCall {
@@ -429,6 +553,7 @@ mod tests {
         ModelResponse {
             request_id: RequestId::generate(),
             message: Message {
+                origin: None,
                 role: Role::Assistant,
                 content: vec![
                     ContentPart::ToolCall {
@@ -482,23 +607,34 @@ mod tests {
 
     #[tokio::test]
     async fn request_observations_are_fresh_and_count_against_unreported_usage() {
-        struct Observed(BasicHarness<Echo>, u64);
+        struct Observed(BasicHarness<Echo>, u64, Vec<u64>);
         #[async_trait]
         impl AgentHarness for Observed {
             type Stop = crate::stop::LoopStop;
             type Error = AgentCoreError;
+            fn on_event(&mut self, event: AgentEvent) {
+                if let AgentEvent::ContextUsage(accounting) = event {
+                    self.2.push(accounting.used_tokens);
+                }
+            }
             fn tool_definitions(&self) -> Vec<ToolDefinition> {
                 self.0.tool_definitions()
             }
-            fn request_context(&self, ctx: &LoopContext) -> Vec<Message> {
-                vec![Message::text(
-                    Role::System,
-                    format!(
-                        "observation step={} {}",
-                        ctx.model_steps(),
-                        "state ".repeat(100)
-                    ),
-                )]
+            fn request_context(&self, ctx: &LoopContext) -> leveler_model::ControlContext {
+                leveler_model::ControlContext {
+                    blocks: vec![leveler_model::PromptSegment::control(
+                        "execution_state",
+                        leveler_model::PromptSource::ExecutionState,
+                        leveler_model::PromptAuthority::RuntimeFact,
+                        leveler_model::SegmentLifecycle::RequestEphemeral,
+                        false,
+                        format!(
+                            "observation step={} {}",
+                            ctx.model_steps(),
+                            "state ".repeat(100)
+                        ),
+                    )],
+                }
             }
             async fn execute_calls(
                 &mut self,
@@ -521,7 +657,7 @@ mod tests {
         let first = call("echo", serde_json::json!({"text":"a"}));
         let first_message = first.message.clone();
         let (agent, model) = agent(Scripted::new(vec![first, text("done")]));
-        let mut harness = Observed(BasicHarness::new(Echo), 0);
+        let mut harness = Observed(BasicHarness::new(Echo), 0, Vec::new());
         let stop = agent
             .run(
                 vec![Message::text(Role::User, "go")],
@@ -533,16 +669,43 @@ mod tests {
         let requests = model.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         for (i, request) in requests.iter().enumerate() {
-            let observations: Vec<_> = request
-                .messages
-                .iter()
-                .filter(|m| m.text_content().starts_with("observation step="))
-                .collect();
+            assert!(
+                !request
+                    .messages
+                    .iter()
+                    .any(|m| m.text_content().starts_with("observation step=")),
+                "host control context must never become a conversation message"
+            );
+            let observations = &request.control_context.blocks;
             assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].name, "execution_state");
+            assert!(!observations[0].stable);
             assert!(
                 observations[0]
-                    .text_content()
+                    .text
                     .starts_with(&format!("observation step={}", i + 1))
+            );
+            let without_control = RequestProjection::project(
+                &request.messages,
+                &request.tools,
+                ReasoningReplayContract::NONE,
+                ReasoningRetention::All,
+            );
+            assert!(
+                request.projection.as_ref().unwrap().estimated_tokens()
+                    > without_control.estimated_tokens(),
+                "context accounting must include host control blocks"
+            );
+            let accounting_without_control = ContextAccounting::compute(
+                request.model.clone(),
+                &without_control,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                harness.2[i] > accounting_without_control.used_tokens,
+                "published context usage must include host control blocks"
             );
         }
         assert!(
@@ -553,9 +716,160 @@ mod tests {
         );
         assert_eq!(
             harness.1,
-            estimate_tokens(&requests[0].messages) + estimate_tokens(&[first_message]),
-            "missing provider usage must still bill the entire request projection"
+            requests[0]
+                .projection
+                .as_ref()
+                .expect("the kernel projects every request")
+                .estimated_tokens()
+                + estimate_tokens(&[first_message]),
+            "missing provider usage must still bill the entire request projection, \
+             tool schemas included"
         );
+    }
+
+    /// The retention policy is a REQUEST projection, and on a route that
+    /// replays captured reasoning the provider requires every retained turn's
+    /// reasoning, so the arm is reported as protocol-protected rather than
+    /// applied. The transcript handed back to the caller keeps every block.
+    #[tokio::test]
+    async fn reasoning_retention_projects_the_request_without_touching_the_transcript() {
+        fn reasoning_turn(i: usize) -> Message {
+            Message {
+                origin: None,
+                role: Role::Assistant,
+                content: vec![
+                    ContentPart::Reasoning {
+                        text: format!("r{i}"),
+                    },
+                    ContentPart::Text {
+                        text: format!("t{i}"),
+                    },
+                ],
+            }
+        }
+        fn tool_turn(i: usize) -> Message {
+            Message {
+                origin: None,
+                role: Role::Tool,
+                content: vec![ContentPart::ToolResult {
+                    result: leveler_model::ToolResultContent {
+                        call_id: ToolCallId::new(format!("c{i}")),
+                        content: format!("o{i}"),
+                        is_error: false,
+                    },
+                }],
+            }
+        }
+        fn transcript() -> Vec<Message> {
+            let mut messages = vec![Message::text(Role::User, "go")];
+            for i in 1..=5 {
+                messages.push(reasoning_turn(i));
+                messages.push(tool_turn(i));
+            }
+            messages
+        }
+        /// Reasoning the provider actually receives, read from the request's
+        /// projection — the one owner of that decision.
+        fn projected_reasoning(request: &ModelRequest) -> Vec<String> {
+            request
+                .projection
+                .as_ref()
+                .expect("the kernel projects every request")
+                .messages()
+                .iter()
+                .filter_map(|m| match &m.reasoning {
+                    leveler_model::ProjectedReasoning::Captured(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Reasoning the request still carries as its semantic source: the
+        /// kernel never rewrites the conversation it was given.
+        fn source_reasoning(request: &ModelRequest) -> usize {
+            request
+                .messages
+                .iter()
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .filter(|p| matches!(p, ContentPart::Reasoning { .. }))
+                        .count()
+                })
+                .sum()
+        }
+        fn assistant_texts(request: &ModelRequest) -> Vec<String> {
+            request
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .map(|m| m.text_content())
+                .collect()
+        }
+
+        // A route that replays captured reasoning requires all of it, so the
+        // arm's window is reported as protocol-protected, never applied.
+        for (policy, expected, protected) in [
+            (ReasoningRetention::All, 5, 0),
+            (ReasoningRetention::LastTurns(3), 5, 2),
+            (ReasoningRetention::None, 5, 5),
+        ] {
+            let (agent, model) = agent(Scripted::new(vec![text("done")]));
+            let agent = agent
+                .with_reasoning_replay(leveler_model::ReasoningReplayContract::raw_field(
+                    leveler_model::ReasoningReplayScope::Always,
+                    leveler_model::MissingReasoningReplay::Omit,
+                ))
+                .with_reasoning_retention(policy);
+            let mut harness = BasicHarness::new(Echo);
+            let stop = agent
+                .run(transcript(), &mut harness, CancellationToken::new())
+                .await
+                .unwrap();
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{policy:?}");
+            assert_eq!(
+                projected_reasoning(&requests[0]).len(),
+                expected,
+                "{policy:?}: every retained turn's reasoning is replayed"
+            );
+            assert_eq!(
+                requests[0]
+                    .projection
+                    .as_ref()
+                    .expect("the kernel projects every request")
+                    .summary()
+                    .protocol_protected_turns,
+                protected,
+                "{policy:?}: the arm's difference is reported, not absorbed"
+            );
+            assert_eq!(
+                source_reasoning(&requests[0]),
+                5,
+                "{policy:?}: the request's semantic source is never rewritten"
+            );
+            assert_eq!(
+                assistant_texts(&requests[0]),
+                vec!["t1", "t2", "t3", "t4", "t5"],
+                "{policy:?} must keep every assistant text"
+            );
+            // The transcript handed back to the caller is untouched: the
+            // policy only ever projects the provider request.
+            let visible_reasoning: usize = stop
+                .messages
+                .iter()
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .filter(|p| matches!(p, ContentPart::Reasoning { .. }))
+                        .count()
+                })
+                .sum();
+            assert_eq!(
+                visible_reasoning, 5,
+                "{policy:?} must not mutate the transcript"
+            );
+        }
     }
 
     /// §A: one logical model request plus the tool batch it produced is exactly
@@ -695,6 +1009,32 @@ mod tests {
         assert_eq!(stop.model_steps, 1);
     }
 
+    #[tokio::test]
+    async fn missing_usage_is_not_a_free_call_under_a_cost_cap() {
+        let mut response = text("answer");
+        response.usage = TokenUsage::default();
+        let (agent, model) = agent(Scripted::new(vec![response]));
+        let agent = agent
+            .with_pricing(Some(ModelPricing {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                cached_input_usd_per_mtok: None,
+            }))
+            .with_limits(ModelStepLimits {
+                max_cost_usd_micros: Some(1000),
+                ..Default::default()
+            });
+        let error = agent
+            .run(
+                vec![Message::text(Role::User, "go")],
+                &mut BasicHarness::new(Echo),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentCoreError::InvalidLimits(_)));
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
     #[tokio::test]
     async fn a_cost_cap_without_pricing_is_refused_before_any_model_call() {
         let (agent, model) = agent(Scripted::new(vec![text("x")]));

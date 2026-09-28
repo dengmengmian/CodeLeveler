@@ -23,6 +23,11 @@ pub enum MockResponse {
     /// headers, no bytes — the shape of a non-streaming provider whose model
     /// is still thinking.
     SilentThenJson { silent_ms: u64, body: String },
+    /// Accept the connection, read the whole request, and then answer nothing
+    /// at all — no status line, no headers, no bytes, and no close. This is the
+    /// shape of an upstream that received the request and never responded, which
+    /// the client can only classify from its own read-idle timeout.
+    NeverResponds,
     /// A non-2xx status with a JSON body.
     Status { code: u16, body: String },
     /// A non-2xx status with a JSON body and extra response headers.
@@ -227,6 +232,12 @@ async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result
             stream.write_all(header.as_bytes()).await?;
             stream.write_all(body.as_bytes()).await?;
             stream.flush().await?;
+        }
+        MockResponse::NeverResponds => {
+            // Hold the connection open and never write: only the client's own
+            // read-idle timeout can end this. Returning here would close the
+            // socket and surface as a truncated response instead of a timeout.
+            std::future::pending::<()>().await
         }
         MockResponse::Status { code, body } => {
             let reason = reason_phrase(code);

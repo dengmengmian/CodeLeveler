@@ -1,0 +1,24 @@
+-- Record what the runtime projected the request would cost.
+--
+-- The runtime already project the provider-visible request (semantic content
+-- plus the protocol's reasoning channel plus the tool schemas) through one
+-- projection owner, and the context accounting prices exactly that projection
+-- with the one shared estimator. Without a column, the only durable prompt
+-- figure was the provider's own `input_tokens`, so "why was this round 80k?"
+-- could only be answered by re-reading the session and re-counting offline —
+-- and the gap between the estimate and the provider's number was not
+-- observable at all.
+--
+--   projected_input_tokens  NULL = no projection was measured for this call
+--                           (an auxiliary call such as a compaction summary, a
+--                           row written before this migration, or a sub-agent
+--                           record that carried none).
+--                           Some(n) = the runtime's own estimate of the request
+--                           it sent, under the same estimator every pressure
+--                           figure uses.
+--
+-- The provider's `input_tokens` remains authoritative for cost and for
+-- pressure; this column is the estimate that sits beside it, never a
+-- replacement. Old rows stay NULL rather than being backfilled with a number
+-- nobody measured.
+ALTER TABLE model_requests ADD COLUMN projected_input_tokens INTEGER;

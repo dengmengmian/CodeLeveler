@@ -306,10 +306,9 @@ pub struct EventBridge {
     /// post-terminal timing/cleanup events can never move the client back to a
     /// busy state, and the interactive wrapper knows not to emit a duplicate.
     terminal_published: bool,
-    /// Releases host admission ownership at the same boundary that publishes
-    /// the durable terminal. This runs after the client event is enqueued, so
-    /// no newly admitted turn can overtake the preceding terminal projection.
-    on_terminal: Option<Box<dyn FnOnce() + Send>>,
+    /// The host publishes the durable terminal while holding its admission
+    /// lock, then releases that admission before consumers can observe it.
+    terminal_publisher: Option<Box<dyn FnOnce(RuntimeEvent) + Send>>,
 }
 
 /// The wire spelling of the runtime's four-way child reading.
@@ -428,12 +427,15 @@ impl EventBridge {
             recent_assistant_texts: std::collections::VecDeque::new(),
             child_roles: HashMap::new(),
             terminal_published: false,
-            on_terminal: None,
+            terminal_publisher: None,
         }
     }
 
-    pub fn with_terminal_callback(mut self, callback: impl FnOnce() + Send + 'static) -> Self {
-        self.on_terminal = Some(Box::new(callback));
+    pub fn with_terminal_publisher(
+        mut self,
+        publisher: impl FnOnce(RuntimeEvent) + Send + 'static,
+    ) -> Self {
+        self.terminal_publisher = Some(Box::new(publisher));
         self
     }
 
@@ -779,7 +781,6 @@ impl EventBridge {
                     AdvisoryKind::CloseoutNudge(reason) => match reason {
                         CloseoutReason::GoalUnresolved => "催办:未调用 update_goal,再询一轮",
                         CloseoutReason::EmptyAnswer => "催办:上轮回答为空,再询一轮",
-                        CloseoutReason::PlanUnreconciled => "催办:计划未收口,再询一轮",
                     },
                 };
                 let _ = self.events.send(RuntimeEvent::AgentActivity {
@@ -991,11 +992,11 @@ impl EventBridge {
             } => {
                 if !self.terminal_published {
                     self.terminal_published = true;
-                    let _ = self.events.send(task_finished_event(
-                        outcome, reason, failure, stop, warnings,
-                    ));
-                    if let Some(callback) = self.on_terminal.take() {
-                        callback();
+                    let event = task_finished_event(outcome, reason, failure, stop, warnings);
+                    if let Some(publish) = self.terminal_publisher.take() {
+                        publish(event);
+                    } else {
+                        let _ = self.events.send(event);
                     }
                 }
             }
@@ -1016,6 +1017,7 @@ impl EventBridge {
             EngineEvent::TaskStarted { .. }
             | EngineEvent::TurnStarted { .. }
             | EngineEvent::TurnFinished { .. }
+            | EngineEvent::RuntimeInjection { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }
@@ -1371,6 +1373,7 @@ mod bridge_tests {
                 applied_diff: None,
                 exit_code: None,
                 stop: Some(leveler_execution::CommandStop::Unconfirmed),
+                execution_status: Some(leveler_execution::ToolExecutionStatus::CancelUnconfirmed),
             },
         );
         let events = drain(&mut rx);
@@ -1426,6 +1429,7 @@ mod bridge_tests {
             leveler_agent::AgentEvent::ToolResult {
                 exit_code: None,
                 stop: None,
+                execution_status: None,
                 id: "p".into(),
                 name: "apply_patch".into(),
                 is_error: false,
@@ -1438,6 +1442,7 @@ mod bridge_tests {
             leveler_agent::AgentEvent::ToolResult {
                 exit_code: None,
                 stop: None,
+                execution_status: None,
                 id: "g".into(),
                 name: "grep".into(),
                 is_error: false,
@@ -1729,6 +1734,7 @@ mod bridge_tests {
             leveler_agent::AgentEvent::ToolResult {
                 exit_code: None,
                 stop: None,
+                execution_status: None,
                 id: "x".into(),
                 name: "grep".into(),
                 is_error: true,
@@ -2223,7 +2229,8 @@ mod projection_equivalence {
         let mut callback_rx = tx.subscribe();
         let terminal_was_visible = Arc::new(AtomicBool::new(false));
         let observed = terminal_was_visible.clone();
-        let mut bridge = EventBridge::new(tx).with_terminal_callback(move || {
+        let mut bridge = EventBridge::new(tx.clone()).with_terminal_publisher(move |event| {
+            let _ = tx.send(event);
             observed.store(
                 matches!(callback_rx.try_recv(), Ok(RuntimeEvent::TurnCompleted)),
                 Ordering::SeqCst,

@@ -158,11 +158,48 @@ impl Executor {
     pub(crate) async fn admit(
         &self,
         call: ToolCall,
-        ctx: ToolContext,
+        mut ctx: ToolContext,
         parallel: bool,
         session_approved: &mut HashSet<String>,
         cancellation: &CancellationToken,
     ) -> Result<AdmittedCall, AdmitError> {
+        if self.registry.runs_command(&call.name) || self.registry.mutates_files(&call.name) {
+            let lease = tokio::select! {
+                lease = ctx.execution.command_gate.clone().lock_owned() => lease,
+                _ = cancellation.cancelled() => return Err(AdmitError::Fatal(AgentError::Cancelled)),
+            };
+            ctx = ctx.with_command_lease(lease);
+            // Ownership may have changed while this command waited for the gate.
+            ctx.policy.command_write_allowlist =
+                self.effective_write_allowlist().map(std::sync::Arc::new);
+            let owner = self.agent_id.as_deref().unwrap_or("parent");
+            let mut foreign = self.ownership.paths_owned_by_others(owner);
+            if let Some(tasks) = &self.background_tasks {
+                let background_foreign = tasks
+                    .foreign_write_paths(ctx.session_scope(), ctx.writer_scope())
+                    .await;
+                if !self.registry.runs_command(&call.name)
+                    && self.registry.mutates_files(&call.name)
+                    && (background_foreign
+                        .iter()
+                        .any(|path| path == "." || path.is_empty())
+                        || crate::sub_agent::scopes_overlap(
+                            &crate::authorization::mutation_targets(&call),
+                            &background_foreign,
+                        ))
+                {
+                    return Err(AdmitError::Refused {
+                        call,
+                        reason: "a live background writer retains ownership of this path"
+                            .to_string(),
+                    });
+                }
+                foreign.extend(background_foreign);
+            }
+            foreign.sort();
+            foreign.dedup();
+            ctx = ctx.with_foreign_owned_paths(foreign);
+        }
         // A delegated agent's call has no canonical event of its own — the
         // parent loop announced nothing for it — so record one, attributed,
         // on the same queue the barrier drains. Without this a worker child
@@ -251,6 +288,16 @@ impl Executor {
         // the one post-approval widening, and it lands in the frozen policy —
         // not in a flag a tool could read back.
         if call_needs_host_escape(&call) {
+            if matches!(
+                resolved.write,
+                WriteScope::None | WriteScope::ScopedWorkspace { .. }
+            ) {
+                return Err(AdmitError::Refused {
+                    call,
+                    reason: "host opener cannot preserve the command's structural write scope"
+                        .to_string(),
+                });
+            }
             resolved.write = WriteScope::Unrestricted;
         }
         let ctx = ctx.with_resolved_policy(resolved.clone());
@@ -763,7 +810,7 @@ impl Executor {
         admitted: &AdmittedCall,
         modified_files: &mut Vec<String>,
         cancellation: &CancellationToken,
-        output: Option<tokio::sync::mpsc::UnboundedSender<leveler_execution::OutputChunk>>,
+        output: Option<tokio::sync::mpsc::Sender<leveler_execution::OutputChunk>>,
     ) -> (
         String,
         bool,
@@ -773,7 +820,7 @@ impl Executor {
         Vec<String>,
         Vec<Vec<String>>,
         Option<String>,
-        (Option<i32>, Option<leveler_execution::CommandStop>),
+        super::dispatch::CommandFacts,
     ) {
         let (content, is_error, metadata) = self.dispatch_raw(admitted, cancellation, output).await;
         // The call's own modified paths, BEFORE merging into the epoch set:
@@ -816,7 +863,7 @@ impl Executor {
         &self,
         admitted: &AdmittedCall,
         cancellation: &CancellationToken,
-        output: Option<tokio::sync::mpsc::UnboundedSender<leveler_execution::OutputChunk>>,
+        output: Option<tokio::sync::mpsc::Sender<leveler_execution::OutputChunk>>,
     ) -> (String, bool, serde_json::Value) {
         let call = &admitted.call;
         // The tool runs under the policy admission froze — the one place the
@@ -847,22 +894,28 @@ impl Executor {
         let outcome = match executed {
             Ok(output) => (output.content, output.is_error, output.metadata),
             // A stopped command reports HOW it stopped, so a client shows
-            // "stopped" only when the process tree is proven gone.
-            Err(ToolError::Process(
-                e @ (leveler_execution::ProcessError::Cancelled
-                | leveler_execution::ProcessError::CancelUnconfirmed),
-            )) => {
-                let stop = match e {
+            // "stopped" only when the process tree is proven gone. Every process
+            // failure also carries the machine-readable execution status, so a
+            // consumer can tell "the tool could not run" from "the command ran
+            // and exited non-zero" without parsing the message.
+            Err(ToolError::Process(e)) => {
+                let status = e.execution_status();
+                let stop = match &e {
                     leveler_execution::ProcessError::Cancelled => {
-                        leveler_execution::CommandStop::Confirmed
+                        Some(leveler_execution::CommandStop::Confirmed)
                     }
-                    _ => leveler_execution::CommandStop::Unconfirmed,
+                    leveler_execution::ProcessError::CancelUnconfirmed => {
+                        Some(leveler_execution::CommandStop::Unconfirmed)
+                    }
+                    _ => None,
                 };
-                (
-                    format!("tool error: {e}"),
-                    true,
-                    serde_json::json!({ "stop": stop }),
-                )
+                let metadata = match stop {
+                    Some(stop) => {
+                        serde_json::json!({ "execution_status": status, "stop": stop })
+                    }
+                    None => serde_json::json!({ "execution_status": status }),
+                };
+                (format!("tool error: {e}"), true, metadata)
             }
             Err(ToolError::NotFound(name)) if name == "task" => (
                 "tool error: unsupported tool `task`; use `spawn_agent` for delegation".to_string(),
@@ -895,6 +948,16 @@ impl Executor {
                 );
             }
             (sanitized, is_error, metadata)
+        };
+        // Untrusted-content boundary: origin/authority marker on output that
+        // came from outside the runtime. Applied once, right after secret
+        // sanitization and before the value reaches the model or the UI; it
+        // wraps the body, it never rewrites it. Errors are host-generated
+        // explanations, so only successful external content is marked.
+        let outcome = {
+            let (content, is_error, metadata) = outcome;
+            let content = super::dispatch::mark_external_content(&call.name, content, is_error);
+            (content, is_error, metadata)
         };
 
         // Close a delegated call's canonical record here, not in `dispatch`:
@@ -1304,6 +1367,43 @@ mod authorize_tests {
             approver.asks(),
             0,
             "a structural denial must never be turned into an approval prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_opener_cannot_widen_a_childs_owned_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let session =
+            leveler_execution::SharedPermissionProfile::new(PermissionProfile::FullAccess);
+        let main = executor_sharing(
+            dir.path(),
+            &session,
+            Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce)),
+        );
+        let child = main
+            .child_for_role_on(crate::sub_agent::AgentRole::Default, Vec::new(), None)
+            .with_agent_id("opener");
+        child
+            .ownership
+            .try_claim("opener", &["owned".to_string()])
+            .unwrap();
+        let call = ToolCall {
+            id: ToolCallId::new("open-owned"),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"program":"open", "args":["owned"]}),
+        };
+        let result = child
+            .admit(
+                call,
+                child.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AdmitError::Refused { .. })),
+            "host escape must preserve structural scope"
         );
     }
 

@@ -159,7 +159,6 @@ mod key_preflight_tests {
             protocol: leveler_model::ProtocolKind::OpenAiChat,
             headers: Default::default(),
             timeouts: Default::default(),
-            retry: Default::default(),
         }
     }
 

@@ -51,22 +51,16 @@ impl Tool for ShellCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a shell command string in the workspace. Prefer \
-         this when you have a full command line (e.g. `git pull --rebase`, \
-         `cargo test -q`). For structured argv without a shell, use `run_command`. \
-         The result starts with `exit: N`; `exit: 0` means the command succeeded. \
-         Judge pass/fail from that exit code — do not pipe the command through \
-         `grep`/`tail`, which discards the real exit code and can hide a failure. \
-         Write temporary files inside the workspace or under `$TMPDIR`; the \
-         system `/tmp` is not writable in the sandbox. \
-         Same sandbox as `run_command`: system/toolchain reads allowed, other \
-         user directories outside the workspace and readonly roots refused, \
-         writes confined to the workspace (plus temp/toolchain caches) unless \
-         full-access. \
-         Default timeout 120s. Do NOT start long-lived servers here with `&` or \
-         nohup — they are refused and hang the turn if forced. Use `run_command` \
-         with background=true for dev servers, then curl/get_task in a separate call. \
-         Do not put real commands after `#` comments."
+        "Run one shell command string (`cmd`) in the workspace. `run_command` \
+         is the argv form and does not start a shell. The result starts with \
+         `exit: N`; `exit: 0` means the command succeeded. A pipe such as \
+         `grep` or `tail` replaces that exit code with the pipe's. Temporary \
+         files written to the system `/tmp` are not writable in the sandbox; \
+         the workspace and `$TMPDIR` are. Reads of system and toolchain paths \
+         are allowed. Writes outside the workspace, other user directories, \
+         and readonly roots are refused unless the mode is full access. \
+         Default timeout 120s. `&` and nohup are refused. A `#` comment does \
+         not hide a following command from the shell."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -140,7 +134,7 @@ mod tests {
         let description = tool.description();
 
         assert!(description.contains("exit: 0"));
-        assert!(description.contains("discards the real exit"));
+        assert!(description.contains("replaces that exit code"));
         assert!(description.contains("$TMPDIR"));
         assert!(description.contains("/tmp"));
     }
@@ -186,7 +180,7 @@ mod tests {
         // Unix refuses via the job-control (`&`) guard (`background=true`
         // guidance); Windows refuses the same string via the `#`-comment guard.
         #[cfg(not(windows))]
-        assert!(out.content.contains("background=true"), "{out:?}");
+        assert!(out.content.contains("job-control"), "{out:?}");
         #[cfg(windows)]
         assert!(out.content.contains("comment"), "{out:?}");
         assert!(

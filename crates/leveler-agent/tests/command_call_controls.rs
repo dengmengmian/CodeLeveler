@@ -68,6 +68,7 @@ fn shell(id: &str, cmd: &str) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -295,9 +296,28 @@ async fn a_running_command_streams_output_and_reports_its_exit_code() {
             is_error,
             exit_code,
             stop,
+            execution_status,
+            preview,
             ..
-        } => (*is_error, *exit_code, *stop),
+        } => (
+            *is_error,
+            *exit_code,
+            *stop,
+            *execution_status,
+            preview.clone(),
+        ),
         _ => unreachable!(),
     };
-    assert_eq!(facts, (true, Some(3), None));
+    // C2: the model-visible signal is unchanged (`is_error`), and the runtime now
+    // also states that the RUNNER completed the call - the command's non-zero
+    // exit is a command outcome, not a tool that could not run.
+    assert!(facts.0, "the model still sees a failed command");
+    assert_eq!(facts.1, Some(3));
+    assert_eq!(facts.2, None);
+    assert_eq!(
+        facts.3,
+        Some(leveler_execution::ToolExecutionStatus::Completed)
+    );
+    assert!(facts.4.contains("exit: 3"), "{}", facts.4);
+    assert!(facts.4.contains("oops"), "{}", facts.4);
 }

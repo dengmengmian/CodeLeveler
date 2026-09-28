@@ -97,6 +97,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -390,6 +391,9 @@ async fn an_undecided_review_is_not_a_pass() {
         .run_develop(&session, &spec, &mut |_| {}, CancellationToken::new())
         .await
         .unwrap();
+
+    assert_eq!(report.outcome, TaskOutcome::Interrupted);
+    assert_eq!(report.stop_reason, leveler_agent::StopReason::Stalled);
 
     assert!(
         report

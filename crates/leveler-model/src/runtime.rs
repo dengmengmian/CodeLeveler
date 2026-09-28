@@ -48,6 +48,7 @@ pub fn stream_from_response(response: ModelResponse) -> ModelEventStream {
     events.push(Ok(ModelEvent::MessageStarted {
         request_id: response.request_id,
     }));
+    let canonical_content = response.message.content.clone();
     for part in response.message.content {
         match part {
             crate::message::ContentPart::Text { text } => {
@@ -56,6 +57,21 @@ pub fn stream_from_response(response: ModelResponse) -> ModelEventStream {
             crate::message::ContentPart::Reasoning { text } => {
                 events.push(Ok(ModelEvent::ReasoningDelta { delta: text }));
             }
+            crate::message::ContentPart::SignedReasoning { text, signature } => {
+                if !text.is_empty() {
+                    events.push(Ok(ModelEvent::ReasoningDelta { delta: text }));
+                }
+                if !signature.is_empty() {
+                    events.push(Ok(ModelEvent::ReasoningMetadata {
+                        bytes: signature.len(),
+                    }));
+                }
+            }
+            crate::message::ContentPart::RedactedReasoning { data } => {
+                if !data.is_empty() {
+                    events.push(Ok(ModelEvent::ReasoningMetadata { bytes: data.len() }));
+                }
+            }
             crate::message::ContentPart::ToolCall { call } => {
                 events.push(Ok(ModelEvent::ToolCallCompleted { call }));
             }
@@ -63,6 +79,9 @@ pub fn stream_from_response(response: ModelResponse) -> ModelEventStream {
             _ => {}
         }
     }
+    events.push(Ok(ModelEvent::MessageContent {
+        content: canonical_content,
+    }));
     if response.usage != crate::event::TokenUsage::default() {
         events.push(Ok(ModelEvent::UsageUpdated {
             usage: response.usage,
@@ -92,6 +111,7 @@ mod stream_from_response_tests {
         let response = ModelResponse {
             request_id: RequestId::generate(),
             message: Message {
+                origin: None,
                 role: Role::Assistant,
                 content: vec![
                     ContentPart::Text { text: "hi".into() },
@@ -118,16 +138,17 @@ mod stream_from_response_tests {
             matches!(&events[2], ModelEvent::ToolCallCompleted { call } if call.name == "read_file")
         );
         assert!(matches!(
-            &events[3],
+            &events[4],
             ModelEvent::UsageUpdated { usage } if usage.input_tokens == 10
         ));
         assert!(matches!(
-            events[4],
+            events[5],
             ModelEvent::MessageCompleted {
                 finish_reason: FinishReason::ToolCalls
             }
         ));
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
+        assert!(matches!(&events[3], ModelEvent::MessageContent { content } if content.len() == 2));
     }
 
     #[test]
@@ -139,7 +160,11 @@ mod stream_from_response_tests {
             usage: TokenUsage::default(),
         };
         let events = collect(stream_from_response(response));
-        assert_eq!(events.len(), 3, "started + delta + completed: {events:?}");
+        assert_eq!(
+            events.len(),
+            4,
+            "started + delta + canonical content + completed: {events:?}"
+        );
         assert!(
             !events
                 .iter()

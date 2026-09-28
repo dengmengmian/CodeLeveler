@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_context::{load_scoped_rules, render_instructions};
+use leveler_context::{FoldRequirement, load_scoped_rules, render_instructions};
 use leveler_lifecycle::{
     EvidenceLedger, FindingKind, ObjectiveAnchor, PlanState, ProgressCaps, TurnPhase,
 };
 use leveler_model::{
-    CompactionRecord, ContentPart, FinishReason, Message, ModelError, Role, ToolCall,
-    ToolResultContent,
+    CompactionRecord, ContentPart, ControlContext, FinishReason, Message, ModelError,
+    PromptAuthority, PromptSegment, PromptSource, ProtocolRepairKind, Role, RuntimeNoticeKind,
+    SegmentLifecycle, ToolCall, ToolResultContent, TranscriptOrigin,
+    scoped_rule_paths_in_legacy_system,
 };
 use leveler_tools::ToolRegistry;
 
@@ -31,21 +33,20 @@ use crate::authorization::{collect_scoped_paths_from_call, push_unique_path};
 use crate::injected_tools::{
     CLAIM_WRITE_SCOPE_TOOL, GrantScope, PermissionRequestOutcome, REPORT_FINDING_TOOL,
     REQUEST_PERMISSIONS_TOOL, SPAWN_AGENT_TOOL, TurnPermissionGrants, UPDATE_GOAL_TOOL,
-    advertise_escalation, apply_turn_grants, ask_user_tool_definition,
-    claim_write_scope_tool_definition, escalation_action, escalation_missing_axis_message,
-    is_escalatable_tool, is_user_input_tool, parse_escalation, parse_permission_request,
-    permission_already_denied_message, report_finding_tool_definition,
+    advertise_escalation, apply_turn_grants, claim_write_scope_tool_definition, escalation_action,
+    escalation_missing_axis_message, is_escalatable_tool, is_user_input_tool, parse_escalation,
+    parse_permission_request, permission_already_denied_message, report_finding_tool_definition,
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::{finalization_nudge, goal_resolve_nudge};
+use crate::nudges::goal_resolve_nudge;
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
     multi_agent_steer_hint, new_delegated_agent_id, scopes_overlap, settlement_notice,
     should_inject_delegation_hint,
 };
 use async_trait::async_trait;
-use leveler_context::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
+use leveler_context::compact_messages;
 
 use leveler_agent_core::{
     Agent, AgentCoreError, AgentHarness, BudgetDimension, BudgetExhaustion, Flow, LoopContext,
@@ -74,23 +75,19 @@ struct BackgroundChild {
 /// spawned children must not keep running as orphans. Every NORMAL exit drains
 /// (settles) children first, so this abort is strictly the crash path.
 ///
-/// Review 必改②: an aborted child never reaches a settle fold, so its write
-/// ownership must be released HERE too — otherwise a mid-round `return Err`
-/// (model decode/length/content-filter/fatal-admission) leaves the registry
-/// holding a claim for a child that no longer exists.
+/// A dropped future cannot prove its background processes are gone. Scope
+/// release belongs to the explicit asynchronous settlement path.
 #[derive(Default)]
 struct BackgroundChildren {
     children: Vec<BackgroundChild>,
-    ownership: Option<Arc<crate::ownership::OwnershipRegistry>>,
 }
 
 impl Drop for BackgroundChildren {
     fn drop(&mut self) {
         for child in &self.children {
             child.handle.abort();
-            if let Some(ownership) = &self.ownership {
-                ownership.release_all(&child.id);
-            }
+            // Aborting cannot prove background processes settled; retain the
+            // ownership registry's lease until async settlement or recovery.
         }
     }
 }
@@ -142,6 +139,8 @@ pub(crate) struct Drive<'a> {
     objective: ObjectiveAnchor,
     /// The tool table every request advertises.
     tools: Vec<ToolDefinition>,
+    /// Turn control and discovered scoped context, never conversation rows.
+    control_context: ControlContext,
     modified_files: Vec<String>,
     /// Model steps this drive has started. Reported on abort so an
     /// interrupted/failed turn records what it actually spent. A mechanical
@@ -155,14 +154,7 @@ pub(crate) struct Drive<'a> {
     epoch_estimated_at_start: u64,
     epoch_duration_at_start: std::time::Duration,
     model_step_note_sent: bool,
-    /// Set after the one deterministic goal-mode reminder that turns an
-    /// initial read-only investigation into delivery work.
-    delivery_convergence_nudged: bool,
     plan_state: PlanState,
-    /// True after an actually dispatched non-plan tool call until the model
-    /// successfully publishes another full plan table. This is freshness only:
-    /// the final table may truthfully retain open steps.
-    plan_needs_reconciliation: bool,
     /// Set whenever the model-visible messages gain something the durable
     /// transcript does not — a transient nudge, a fold.
     context_diverged: bool,
@@ -175,17 +167,11 @@ pub(crate) struct Drive<'a> {
     bg_progress_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     /// Accumulated elevations from approved request_permissions this turn.
     turn_grants: TurnPermissionGrants,
-    /// Consecutive search calls with no intervening action.
-    /// Sources of scoped AGENTS.md rules already appended to the transcript.
-    injected_rule_sources: Vec<String>,
     /// The most recent non-empty assistant text.
     last_text: String,
     /// Finalization is a one-way lifecycle boundary for this drive. Keeping
     /// the latch here prevents multiple exit helpers from publishing it twice.
     finalization_started: bool,
-    /// Set once the wall-clock finalization request has been put in front of
-    /// the model, so a run that ignores it is not told again every round.
-    finalization_requested_sent: bool,
     ledger: EvidenceLedger,
     closeout_budget: CloseoutBudget,
     decode_retries: u32,
@@ -194,38 +180,157 @@ pub(crate) struct Drive<'a> {
     commands_run: u32,
     /// Human reason + structured dimension when a step limit trips mid-round.
     budget_exceeded: Option<(String, BudgetExhaustion)>,
-    /// Provider-reported total for the round just finished, which the
-    /// compaction threshold prefers over its own estimate.
-    last_model_call_usage_total: u64,
     /// Shared record of the most recent compaction fold. Written here when the
     /// harness folds; read by the kernel when it builds the accounting
     /// snapshot. One handle, two views of the same fact.
     compaction: Arc<std::sync::Mutex<Option<CompactionRecord>>>,
+    /// What the kernel projected the CURRENT round's request to cost, taken
+    /// from the accounting snapshot it published for that exact request.
+    /// Stamped onto the round's ledger row so the estimate sits beside the
+    /// provider's own prompt count instead of being recomputed offline.
+    last_projected_input_tokens: Option<u64>,
+    /// Of that projection, how much was the historical-reasoning channel —
+    /// priced over the SAME projection, so it can never claim reasoning the
+    /// provider did not receive.
+    last_projected_reasoning_tokens: Option<u64>,
+}
+
+struct CompactionObserver<'a, 'b> {
+    drive: &'a mut Drive<'b>,
+    rt: &'a mut LoopContext,
+    reasoning_effort: Option<leveler_model::ReasoningEffort>,
+    request: &'a leveler_model::ModelRequest,
+}
+#[async_trait]
+impl leveler_agent_core::ModelRoundObserver for CompactionObserver<'_, '_> {
+    type Error = AgentError;
+    fn on_event(&mut self, _: leveler_agent_core::AgentEvent) {}
+    async fn before_attempt(&mut self) -> Result<(), AgentError> {
+        if let Some(progress) = self.drive.executor.shared_model_progress().await? {
+            let limits = super::StepLimits {
+                max_duration: None,
+                ..self.drive.executor.task_model_limits
+            };
+            if !super::auxiliary_budget_available(
+                limits,
+                &progress,
+                self.request,
+                self.drive.executor.pricing.as_ref(),
+            ) {
+                return Err(AgentError::AuxiliaryBudgetUnavailable);
+            }
+        }
+        if !super::auxiliary_budget_available(
+            self.drive.executor.step_limits,
+            &self.drive.progress,
+            self.request,
+            self.drive.executor.pricing.as_ref(),
+        ) {
+            return Err(AgentError::AuxiliaryBudgetUnavailable);
+        }
+        Ok(())
+    }
+    async fn on_attempt(&mut self, attempt: leveler_model::ModelAttempt) -> Result<(), AgentError> {
+        let record = super::model_attempt_record(
+            &attempt,
+            &self.drive.executor.model,
+            crate::ModelCallKind::Compaction,
+            self.reasoning_effort,
+        )
+        .priced(self.drive.executor.pricing.as_ref());
+        self.drive
+            .record_request(self.rt, record, attempt.estimated_tokens)
+            .await?;
+        self.drive.flush_epoch(self.rt);
+        if self
+            .drive
+            .executor
+            .step_limits
+            .max_cost_usd_micros
+            .is_some()
+            && self.drive.progress.has_unpriced_model_attempt
+        {
+            return Err(AgentError::Model(leveler_model::ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "summary attempt has no auditable cost under active cap",
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Why a fold is being attempted is classified once, from the policy's TWO
+/// bounds, by [`leveler_context::FoldRequirement`]. The drive, chat and resume
+/// all share that contract; this wrapper only supplies the drive's resolved
+/// policy as facts.
+fn fold_requirement(
+    policy: &crate::coding::policy::ResolvedContextPolicy,
+    projected_tokens: u64,
+) -> FoldRequirement {
+    FoldRequirement::classify(
+        projected_tokens,
+        u64::from(policy.pressure_threshold),
+        policy.hard_capacity(),
+    )
+}
+
+/// A stable class for a compaction summary failure: never the provider's raw
+/// diagnostic, which may carry internal detail.
+fn compaction_failure_class(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::Model(error) if error.kind == leveler_model::ModelErrorKind::Timeout => {
+            "timeout"
+        }
+        AgentError::Model(_) => "provider",
+        AgentError::Cancelled => "timeout",
+        _ => "other",
+    }
+}
+
+/// Record, in one structured line, that a briefing was not produced and what
+/// the runtime did about it. No model-visible text: this is observability, not
+/// a prompt, and a failed summary must not become instruction.
+fn log_compaction_summary_failure(
+    requirement: FoldRequirement,
+    failure: &'static str,
+    projected_tokens: u64,
+    context_policy: &crate::coding::policy::ResolvedContextPolicy,
+    continued_without_compaction: bool,
+) {
+    tracing::warn!(
+        operation = "compaction",
+        trigger = ?requirement,
+        failure,
+        continued_without_compaction,
+        projected_tokens,
+        quality_threshold = context_policy.pressure_threshold,
+        hard_capacity = ?context_policy.hard_capacity(),
+        "context compaction summary was not produced"
+    );
 }
 
 impl Executor {
-    /// Run the CodeLeveler coding harness over the generic agent kernel.
-    ///
-    /// The transcript, the objective, the observer and the durable sink go in;
-    /// the kernel drives model↔tool rounds until the model resolves the goal,
-    /// this harness stops it, or a mechanical limit fires.
-    pub(crate) async fn drive(
-        &self,
-        mut messages: Vec<Message>,
-        objective: ObjectiveAnchor,
-        observer: &mut (dyn FnMut(AgentEvent) + Send),
-        sink: &mut dyn TranscriptSink,
-        cancellation: CancellationToken,
-        aborted: &mut AbortedFacts,
-    ) -> Result<AgentOutcome, DriveAborted> {
+    pub(crate) fn request_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = self.registry.definitions();
-        // Primary name, plus legacy ask_user for older models and prompts.
-        tools.push(request_user_input_tool_definition());
-        tools.push(ask_user_tool_definition());
+        // A child clarifier is unattended. Only the top-level turn can ask
+        // the user. `ask_user` remains a parser alias of this tool.
+        if self.depth == 0 {
+            tools.push(request_user_input_tool_definition());
+        }
         // Nothing to request under 完全访问 — the elevation it asks for is
         // already granted, so advertising it only invites a pointless round
         // trip and an interruption the user explicitly opted out of.
-        if self.tool_context.policy.mode() != leveler_execution::PermissionProfile::FullAccess {
+        // A child advertises it only when it holds a tool the grant can
+        // change. A read-only child has no such tool.
+        let permission_changes_a_tool = self.depth == 0
+            || tools.iter().any(|tool| {
+                is_escalatable_tool(&tool.name)
+                    || matches!(tool.name.as_str(), "web_fetch" | "web_search")
+                    || tool.name.starts_with("browser_")
+            });
+        if self.tool_context.policy.mode() != leveler_execution::PermissionProfile::FullAccess
+            && permission_changes_a_tool
+        {
             tools.push(request_permissions_tool_definition());
             // Same reason, applied to the command tools: a denied command can
             // carry its own one-shot elevation on the retry instead of
@@ -252,6 +357,47 @@ impl Executor {
             tools.push(update_goal_tool_definition());
         }
 
+        tools
+    }
+
+    /// Run the CodeLeveler coding harness over the generic agent kernel.
+    ///
+    /// The transcript, the objective, the observer and the durable sink go in;
+    /// the kernel drives model↔tool rounds until the model resolves the goal,
+    /// this harness stops it, or a mechanical limit fires.
+    pub(crate) async fn drive(
+        &self,
+        mut messages: Vec<Message>,
+        mut control_context: ControlContext,
+        objective: ObjectiveAnchor,
+        observer: &mut (dyn FnMut(AgentEvent) + Send),
+        sink: &mut dyn TranscriptSink,
+        cancellation: CancellationToken,
+        aborted: &mut AbortedFacts,
+    ) -> Result<AgentOutcome, DriveAborted> {
+        let tools = self.request_tool_definitions();
+        // Legacy sessions contain System rows. Recover only their source
+        // identities to reload applicable files, never their stale contents.
+        let mut scoped_paths = Vec::new();
+        for source in &self.seeded_progress.scoped_rule_sources {
+            push_unique_path(&mut scoped_paths, source);
+        }
+        for message in &messages {
+            for part in &message.content {
+                if let ContentPart::ToolCall { call } = part {
+                    collect_scoped_paths_from_call(call, &mut scoped_paths);
+                }
+            }
+            if message.role == Role::System {
+                // The stored body is not an instruction. A scoped-rule marker
+                // is only a path; the current file is re-read later.
+                for source in scoped_rule_paths_in_legacy_system(&message.text_content()) {
+                    push_unique_path(&mut scoped_paths, &source);
+                }
+            }
+        }
+        messages.retain(|message| message.role != Role::System);
+
         let mut progress = self
             .seeded_progress
             .clone()
@@ -266,7 +412,7 @@ impl Executor {
         // Product steer: top-level runs see keep-vs-delegate once. Parallel
         // keywords are not required — ordinary implementation goals must still
         // evaluate bounded Worker work.
-        let mut context_diverged = false;
+        let context_diverged = false;
         if should_inject_delegation_hint(self.policy.allow_delegation, self.depth)
             && !messages.iter().any(|m| {
                 m.role == Role::User
@@ -274,8 +420,18 @@ impl Executor {
                         .contains(crate::sub_agent::MULTI_AGENT_HINT_HEADER)
             })
         {
-            messages.push(Message::text(Role::User, multi_agent_steer_hint()));
-            context_diverged = true;
+            control_context.blocks.push(PromptSegment::control(
+                "multi_agent_hint",
+                PromptSource::DelegationHint,
+                PromptAuthority::CoreContract,
+                SegmentLifecycle::SessionPrefix,
+                true,
+                multi_agent_steer_hint(),
+            ));
+            observer(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::MultiAgentHint,
+                1,
+            ));
         }
 
         // MA-RT-3 C10: children that durably SETTLED while the previous
@@ -285,23 +441,31 @@ impl Executor {
         // ledger here is the once-per-restart mark (a crash before it lands
         // re-delivers again, which repeats a note but never repeats state).
         if self.depth == 0 && !self.restart_settled_children.is_empty() {
-            let note = Message::text(
-                Role::User,
+            let note = Message::user(
                 crate::sub_agent::settled_children_redelivery_note(&self.restart_settled_children),
+                TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ChildRedelivery,
+                },
             );
             observer(AgentEvent::ProgressUpdated {
                 ledger: progress.clone(),
             });
             sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
+            observer(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::ChildRecovery,
+                1,
+            ));
         }
         // In-process children did not survive a restart: tell the model
         // truthfully which delegations were lost, release their scopes, and
         // clear the durable record.
         if self.depth == 0 && !progress.outstanding_children.is_empty() {
-            let note = Message::text(
-                Role::User,
+            let note = Message::user(
                 lost_children_note(&progress.outstanding_children),
+                TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ChildLost,
+                },
             );
             progress.outstanding_children.clear();
             observer(AgentEvent::ProgressUpdated {
@@ -311,6 +475,10 @@ impl Executor {
             // cleared, so the note is the only remaining truth.
             sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
+            observer(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::ChildRecovery,
+                1,
+            ));
         }
 
         let (bg_progress_tx, bg_progress_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
@@ -331,9 +499,10 @@ impl Executor {
             observer,
             sink,
             tools,
+            control_context,
             modified_files: Vec::new(),
             model_steps: 0,
-            scoped_paths: Vec::new(),
+            scoped_paths,
             progress_caps: ProgressCaps::default(),
             epoch_model_steps_at_start: progress.cumulative_model_steps,
             epoch_tokens_at_start: progress.cumulative_model_tokens,
@@ -343,14 +512,11 @@ impl Executor {
             ),
             commands_run: progress.cumulative_commands,
             model_step_note_sent: false,
-            delivery_convergence_nudged: false,
             plan_state: self.seeded_plan.clone(),
-            plan_needs_reconciliation: false,
             context_diverged,
             session_approved: HashSet::new(),
             background_children: BackgroundChildren {
                 children: Vec::new(),
-                ownership: Some(self.ownership.clone()),
             },
             resumed_children_launched: false,
             run_agents_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -359,10 +525,8 @@ impl Executor {
             bg_progress_tx,
             bg_progress_rx,
             turn_grants: TurnPermissionGrants::default(),
-            injected_rule_sources: Vec::new(),
             last_text: String::new(),
             finalization_started: false,
-            finalization_requested_sent: false,
             ledger: seeded_ledger,
             // Unified closeout nudge budget shared by every quiet-round
             // mechanism (goal resolution, empty answer).
@@ -371,7 +535,8 @@ impl Executor {
             length_continuations: 0,
             continued_text: String::new(),
             budget_exceeded: None,
-            last_model_call_usage_total: 0,
+            last_projected_input_tokens: None,
+            last_projected_reasoning_tokens: None,
             compaction: compaction_record.clone(),
             progress,
             objective,
@@ -428,16 +593,49 @@ impl Executor {
             .with_pricing(self.pricing)
             .with_max_output_tokens(Some(self.max_output_tokens))
             .with_reasoning_effort(self.policy.reasoning_effort)
-            .with_context_window(self.policy.context_window)
-            .with_compact_at(self.policy.context_budget)
+            .with_context_window(self.policy.context_policy.context_window)
+            .with_reasoning_replay(self.policy.reasoning_replay)
+            .with_compact_at(self.policy.context_policy.pressure_threshold)
+            .with_reasoning_retention(self.policy.reasoning_retention)
             .with_compaction_record(compaction_record.clone());
-        let result = agent.run(messages, &mut harness, cancellation).await;
+        let mut result = agent.run(messages, &mut harness, cancellation).await;
         if result.is_err() {
             // Every normal exit drains its children; an error exit must too.
             // Aborting instead cannot stop a write already inside a blocking
             // section, and releasing a scope on abort lets that write land
             // after the scope is gone.
-            harness.stop_background_children().await;
+            if let Err(error) = harness.stop_background_children().await {
+                result = Err(error);
+            }
+        }
+        if let Err(AgentError::BudgetExhausted(exhaustion)) = result {
+            if self.depth == 0
+                && let (Some((store, session)), Some(scope)) =
+                    (&self.model_request_store, &self.budget_scope)
+            {
+                harness.progress = crate::coding::turn::reconcile_model_spend(
+                    harness.progress.clone(),
+                    store.as_ref(),
+                    session,
+                    scope,
+                )
+                .await
+                .map_err(|error| AgentError::Persistence(error.to_string()))?;
+            }
+            harness.enter_finalization();
+            let detail = exhaustion.stop_detail();
+            (harness.observer)(AgentEvent::ProgressUpdated {
+                ledger: harness.progress.clone(),
+            });
+            (harness.observer)(AgentEvent::Finished(detail.clone()));
+            result = Ok(AgentOutcome::drive_budget_exhausted(
+                detail,
+                harness.model_steps,
+                harness.modified_files.clone(),
+                exhaustion,
+                &harness.progress,
+                &harness.objective,
+            ));
         }
         // An abort still leaves the loop's proven facts behind: the rounds it
         // started and the files it confirmed it changed. Report them so a
@@ -470,7 +668,15 @@ impl<'a> Drive<'a> {
                     .reasoning_tokens
                     .map(|value| value.min(u32::MAX as u64) as u32),
             },
-            Kernel::ContextUsage(accounting) => AgentEvent::ContextUsage { accounting },
+            Kernel::ContextUsage(accounting) => {
+                // The one place the estimate is captured: it describes the
+                // request this round is about to send, so the ledger row for
+                // that round can carry it.
+                self.last_projected_input_tokens = Some(accounting.used_tokens);
+                self.last_projected_reasoning_tokens =
+                    Some(accounting.projected_reasoning_tokens());
+                AgentEvent::ContextUsage { accounting }
+            }
             Kernel::ModelRetrying {
                 attempt,
                 max_attempts,
@@ -506,6 +712,7 @@ impl<'a> Drive<'a> {
         (self.observer)(AgentEvent::ToolResult {
             exit_code: None,
             stop: None,
+            execution_status: None,
             id: call.id.as_str().to_string(),
             name: call.name.clone(),
             is_error: true,
@@ -544,7 +751,8 @@ impl<'a> Drive<'a> {
     }
 
     /// Persist a model call the kernel already folded into the run's spend.
-    async fn persist_request(&mut self, record: ModelRequestRecord) -> Result<(), AgentError> {
+    async fn persist_request(&mut self, mut record: ModelRequestRecord) -> Result<(), AgentError> {
+        record.budget_scope.clone_from(&self.executor.budget_scope);
         Ok(self.sink.record_model_request(&record).await?)
     }
 
@@ -558,24 +766,35 @@ impl<'a> Drive<'a> {
         record: ModelRequestRecord,
         estimate: Option<u64>,
     ) -> Result<(), AgentError> {
+        self.progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
         rt.record_spend(record.usage, record.cost_usd_micros, estimate);
         self.persist_request(record).await
     }
 
-    /// A child runs as an owned `'static` future, so it cannot borrow this
-    /// sink; its model-call records ride the progress channel instead and are
-    /// written down here, by the one holder of durable storage. They are not
-    /// forwarded to the observer: the live progress line already carries the
-    /// child's running totals, and this event exists for the ledger, not the
-    /// screen.
+    /// Children persist invocation facts before publishing this live spend
+    /// notification. Hosts without a shared store retain the sink route;
+    /// durable hosts fold the already-written fact without inserting twice.
     async fn forward_child_event(
         &mut self,
         rt: &mut LoopContext,
         event: AgentEvent,
     ) -> Result<(), AgentError> {
         if let AgentEvent::SubAgentModelRequest { record } = event {
+            self.progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
             // Already priced by the child against its own model.
-            self.record_request(rt, *record, None).await
+            if self.executor.model_request_store.is_some() {
+                rt.record_spend(
+                    record.usage,
+                    record.cost_usd_micros,
+                    record.estimated_tokens,
+                );
+                Ok(())
+            } else {
+                {
+                    let estimate = record.estimated_tokens;
+                    self.record_request(rt, *record, estimate).await
+                }
+            }
         } else {
             (self.observer)(event);
             Ok(())
@@ -602,9 +821,6 @@ impl<'a> Drive<'a> {
             }
         }
         for child in settled {
-            if !self.plan_state.is_empty() {
-                self.plan_needs_reconciliation = true;
-            }
             let BackgroundChild {
                 id,
                 nickname,
@@ -614,6 +830,7 @@ impl<'a> Drive<'a> {
                 ..
             } = child;
             let result = join_settlement(handle.await);
+            self.executor.release_child_scope(&id).await?;
             let (content, _ok) = fold_child_settlement(
                 &mut self.progress,
                 &mut self.commands_run,
@@ -626,9 +843,6 @@ impl<'a> Drive<'a> {
                 &result,
             );
             clear_outstanding_child(&mut self.progress, &id);
-            // Terminal release: the child's exclusive claims end with it,
-            // whatever its terminal state (idempotent).
-            self.executor.ownership.release_all(&id);
             if let Some(host) = &self.executor.steering {
                 host.child_ended(&id);
             }
@@ -636,9 +850,11 @@ impl<'a> Drive<'a> {
             // settled: a crash between the two must not leave the parent
             // holding a result the log still calls unfinished.
             self.settlements_durable().await?;
-            let notice = Message::text(
-                Role::User,
+            let notice = Message::user(
                 settlement_notice(&nickname, &id, role, &scope, &content),
+                TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ChildSettlement,
+                },
             );
             // Persist the notice NOW. The next ContextSnapshot is a whole
             // model round away, and outstanding_children was just cleared — a
@@ -646,6 +862,10 @@ impl<'a> Drive<'a> {
             // with no lost-note either.
             self.sink.append(std::slice::from_ref(&notice)).await?;
             messages.push(notice);
+            (self.observer)(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::ChildSettlement,
+                rt.model_steps().saturating_add(1),
+            ));
             self.flush_epoch(rt);
         }
         Ok(())
@@ -666,6 +886,13 @@ impl<'a> Drive<'a> {
         let share_n = executor.resumed_children.len() as u32;
         let mut launched = Vec::new();
         for (share_of, child) in executor.resumed_children.iter().enumerate() {
+            let ownership_gate = executor
+                .tool_context
+                .execution
+                .command_gate
+                .clone()
+                .lock_owned()
+                .await;
             executor
                 .ownership
                 .register_owner(&child.id, &format!("{} ({})", child.nickname, child.id));
@@ -677,6 +904,15 @@ impl<'a> Drive<'a> {
             {
                 Some(model) => executor.pinned_model_refusal(&model).await,
                 None => None,
+            };
+            let model_refusal = if !executor
+                .background_write_conflicts(&child.spec.files)
+                .await
+                .is_empty()
+            {
+                Some("its write scope is held by a live background command".to_string())
+            } else {
+                model_refusal
             };
             let refusal = match model_refusal {
                 Some(refusal) => Some(refusal),
@@ -692,11 +928,12 @@ impl<'a> Drive<'a> {
                     }),
                 None => None,
             };
+            drop(ownership_gate);
             if let Some(refusal) = refusal {
                 // Stale authority is never resurrected, and a child that cannot
                 // hold its scope or run on its model cannot continue. Settle it
                 // now, truthfully.
-                executor.ownership.release_all(&child.id);
+                executor.release_child_scope(&child.id).await?;
                 let result = super::handlers::SubAgentRunResult {
                     result: crate::sub_agent::ChildResult::new(false, "", refusal),
                     stop: leveler_lifecycle::ChildStop::Failed,
@@ -717,8 +954,7 @@ impl<'a> Drive<'a> {
                     &result,
                 );
                 self.settlements_durable().await?;
-                let notice = Message::text(
-                    Role::User,
+                let notice = Message::user(
                     settlement_notice(
                         &child.nickname,
                         &child.id,
@@ -726,9 +962,16 @@ impl<'a> Drive<'a> {
                         &child.spec.files,
                         &content,
                     ),
+                    TranscriptOrigin::RuntimeNotice {
+                        notice: RuntimeNoticeKind::ChildSettlement,
+                    },
                 );
                 self.sink.append(std::slice::from_ref(&notice)).await?;
                 messages.push(notice);
+                (self.observer)(AgentEvent::runtime_injection(
+                    crate::executor::RuntimeInjectionKind::ChildSettlement,
+                    rt.model_steps().saturating_add(1),
+                ));
                 continue;
             }
             let residual = residual_step_limits(
@@ -780,12 +1023,18 @@ impl<'a> Drive<'a> {
             ledger: self.progress.clone(),
         });
         if !launched.is_empty() {
-            let note = Message::text(
-                Role::User,
+            let note = Message::user(
                 crate::sub_agent::resumed_children_note(&launched),
+                TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ChildResumed,
+                },
             );
             self.sink.append(std::slice::from_ref(&note)).await?;
             messages.push(note);
+            (self.observer)(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::ChildRecovery,
+                rt.model_steps().saturating_add(1),
+            ));
         }
         Ok(())
     }
@@ -794,16 +1043,21 @@ impl<'a> Drive<'a> {
     /// stop, and settle it like any other exit. Its scope is released only
     /// after it has stopped. Best effort on the durable side — the run is
     /// already failing, and that original error is what the caller gets.
-    async fn stop_background_children(&mut self) {
+    async fn stop_background_children(&mut self) -> Result<(), AgentError> {
         if self.background_children.children.is_empty() {
-            return;
+            return Ok(());
         }
+        let mut settlement_error = None;
         for child in &self.background_children.children {
             child.token.cancel();
         }
         let children = std::mem::take(&mut self.background_children.children);
         for child in children {
             let result = join_settlement(child.handle.await);
+            if let Err(error) = self.executor.release_child_scope(&child.id).await {
+                settlement_error = Some(error);
+                continue;
+            }
             fold_child_settlement(
                 &mut self.progress,
                 &mut self.commands_run,
@@ -816,7 +1070,6 @@ impl<'a> Drive<'a> {
                 &result,
             );
             clear_outstanding_child(&mut self.progress, &child.id);
-            self.executor.ownership.release_all(&child.id);
             if let Some(host) = &self.executor.steering {
                 host.child_ended(&child.id);
             }
@@ -824,8 +1077,10 @@ impl<'a> Drive<'a> {
         while let Ok(event) = self.bg_progress_rx.try_recv() {
             match event {
                 AgentEvent::SubAgentModelRequest { record } => {
-                    if let Err(error) = self.persist_request(*record).await {
-                        tracing::warn!(%error, "could not record a stopped child's model call");
+                    if self.executor.model_request_store.is_none()
+                        && let Err(error) = self.persist_request(*record).await
+                    {
+                        settlement_error = Some(error);
                     }
                 }
                 other => (self.observer)(other),
@@ -834,8 +1089,10 @@ impl<'a> Drive<'a> {
         (self.observer)(AgentEvent::ProgressUpdated {
             ledger: self.progress.clone(),
         });
-        if let Err(error) = self.settlements_durable().await {
-            tracing::warn!(%error, "stopped children's terminals may not be durable");
+        self.settlements_durable().await?;
+        match settlement_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -947,11 +1204,57 @@ impl AgentHarness for Drive<'_> {
         self.forward_kernel_event(event);
     }
 
+    async fn before_model_attempt(&mut self, rt: &mut LoopContext) -> Result<(), AgentError> {
+        let input = self.last_projected_input_tokens.ok_or_else(|| {
+            AgentError::InvalidBudget(
+                "model request has no authoritative projection for admission".into(),
+            )
+        })?;
+        let output = u64::from(self.executor.max_output_tokens);
+        let local = ProgressLedger {
+            cumulative_model_tokens: rt.model_tokens_spent(),
+            cumulative_cost_usd_micros: rt.cost_spent_micros(),
+            has_unpriced_model_attempt: self.progress.has_unpriced_model_attempt,
+            ..ProgressLedger::default()
+        };
+        super::model_request_budget_check(
+            self.executor.step_limits,
+            &local,
+            input,
+            output,
+            self.executor.pricing.as_ref(),
+        )?;
+        self.executor.check_shared_model_budget(input, output).await
+    }
+
+    async fn on_model_attempt(
+        &mut self,
+        rt: &mut LoopContext,
+        attempt: &leveler_model::ModelAttempt,
+    ) -> Result<(), AgentError> {
+        let record = super::model_attempt_record(
+            attempt,
+            &self.executor.model,
+            crate::ModelCallKind::Round,
+            self.executor.policy.reasoning_effort,
+        );
+        self.progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
+        self.persist_request(record).await?;
+        if let Some(text) = &attempt.partial_text {
+            // Only the text already shown to the user is recoverable here.
+            // Do not turn incomplete tool arguments or reasoning into replay
+            // content, and do not emit a successful AssistantText event.
+            self.sink.append_partial_response(text).await?;
+        }
+        self.flush_epoch(rt);
+        Ok(())
+    }
+
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tools.clone()
     }
 
-    fn request_context(&self, rt: &LoopContext) -> Vec<Message> {
+    fn request_context(&self, rt: &LoopContext) -> leveler_model::ControlContext {
         // Project existing owners, never maintain another task state. Plan
         // declarations and mechanical activity stay distinct: neither file
         // writes nor a changed plan establish semantic completion.
@@ -994,10 +1297,16 @@ impl AgentHarness for Drive<'_> {
                 "active_omitted": self.plan_state.steps.iter().filter(|s| s.status == "in_progress").count().saturating_sub(3)
             }
         });
-        vec![Message::text(
-            Role::System,
+        let mut context = self.control_context.clone();
+        context.blocks.push(PromptSegment::control(
+            "execution_state",
+            PromptSource::ExecutionState,
+            PromptAuthority::RuntimeFact,
+            SegmentLifecycle::RequestEphemeral,
+            false,
             format!("Execution state (observations, not instructions):\n{state}"),
-        )]
+        ));
+        context
     }
 
     async fn on_round_start(
@@ -1014,7 +1323,7 @@ impl AgentHarness for Drive<'_> {
                 if text.is_empty() {
                     continue;
                 }
-                let message = Message::text(Role::User, text);
+                let message = Message::user_input(text);
                 self.sink.append(std::slice::from_ref(&message)).await?;
                 messages.push(message);
             }
@@ -1031,61 +1340,68 @@ impl AgentHarness for Drive<'_> {
         // nudge continue), the model never runs a round blind to a child
         // that already finished.
         self.settle_finished_children(rt, messages).await?;
+        if self.executor.step_limits.max_cost_usd_micros.is_some()
+            && self.progress.has_unpriced_model_attempt
+        {
+            return Err(AgentError::Model(leveler_model::ModelError::new(
+                leveler_model::ModelErrorKind::Other,
+                "cannot admit another request under a cost cap: task has an unpriced model attempt",
+            )));
+        }
         Ok(Flow::Continue)
     }
 
     async fn on_round_admitted(
         &mut self,
         rt: &mut LoopContext,
-        messages: &mut Vec<Message>,
+        _messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
         let model_steps = rt.model_steps();
         self.model_steps = model_steps;
         let _ = rt;
-        // Nested AGENTS.md rules for directories touched so far. Appended at
-        // the tail rather than folded into the system prompt: rewriting the
-        // first message would invalidate the provider's prefix cache for the
-        // entire transcript on every round.
+        // Discover scoped rules before this request, keeping them outside the
+        // transcript so folding history cannot remove current constraints.
         let fresh = load_scoped_rules(
             self.executor.tool_context.execution.workspace.root(),
             &self.scoped_paths,
-            &self.injected_rule_sources,
+            &self
+                .control_context
+                .blocks
+                .iter()
+                .filter_map(|segment| {
+                    segment
+                        .name
+                        .strip_prefix("scoped_rules:")
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>(),
         );
         if !fresh.is_empty() {
-            self.injected_rule_sources
-                .extend(fresh.iter().map(|r| r.source.clone()));
-            let rules = Message::text(
-                Role::System,
-                format!("Project rules:\n{}", render_instructions(&fresh)),
-            );
-            // Durable like every other injected message: a standing
-            // constraint the model saw must survive in the transcript, not
-            // only in a snapshot (the seed drops stale System rows on the
-            // next turn, so this never duplicates the system prompt).
-            self.sink.append(std::slice::from_ref(&rules)).await?;
-            messages.push(rules);
-        }
-
-        // The wall clock is near its bound: tell the model ONCE to stop
-        // expanding and return what it has, rather than let the hard deadline
-        // cut off an in-flight round with nothing but partial work. This is a
-        // request, not a stop: the kernel's deadline still ends the run if the
-        // model keeps working, and it is never issued again after this round.
-        //
-        // The transcript check makes it once across activations too: a resumed
-        // child's saved transcript already holds the request, and repeating it
-        // would buy nothing.
-        if !self.finalization_requested_sent && rt.finalization_requested() {
-            self.finalization_requested_sent = true;
-            let text = finalization_nudge();
-            if !messages
-                .iter()
-                .any(|m| m.role == Role::User && m.text_content() == text)
-            {
-                let nudge = Message::text(Role::User, text);
-                self.sink.append(std::slice::from_ref(&nudge)).await?;
-                messages.push(nudge);
+            for rule in &fresh {
+                push_unique_path(&mut self.progress.scoped_rule_sources, &rule.source);
             }
+            (self.observer)(AgentEvent::ProgressUpdated {
+                ledger: self.progress.clone(),
+            });
+            for rule in &fresh {
+                self.control_context.blocks.push(PromptSegment::control(
+                    format!("scoped_rules:{}", rule.source),
+                    PromptSource::ScopedRule {
+                        path: rule.source.clone(),
+                    },
+                    PromptAuthority::ProjectInstruction,
+                    SegmentLifecycle::Scoped,
+                    false,
+                    format!(
+                        "Project rules:\n{}",
+                        render_instructions(std::slice::from_ref(rule))
+                    ),
+                ));
+            }
+            (self.observer)(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::ScopedRules,
+                model_steps,
+            ));
         }
 
         // Once the model-step safety ceiling is nearly reached, the model is
@@ -1102,9 +1418,18 @@ impl AgentHarness for Drive<'_> {
             && let Some(note) =
                 model_step_note(rt.model_steps(), ceiling, self.model_step_note_sent)
         {
-            let note = Message::text(Role::User, note);
-            self.sink.append(std::slice::from_ref(&note)).await?;
-            messages.push(note);
+            self.control_context.blocks.push(PromptSegment::control(
+                "model_step_ceiling",
+                PromptSource::ModelStepCeiling,
+                PromptAuthority::RuntimeFact,
+                SegmentLifecycle::Turn,
+                false,
+                note,
+            ));
+            (self.observer)(AgentEvent::runtime_injection(
+                crate::executor::RuntimeInjectionKind::ModelStepCeiling,
+                model_steps,
+            ));
             self.model_step_note_sent = true;
         }
         Ok(Flow::Continue)
@@ -1124,8 +1449,7 @@ impl AgentHarness for Drive<'_> {
                     && !cancellation.is_cancelled() =>
             {
                 self.decode_retries += 1;
-                let feedback = Message::text(
-                    Role::User,
+                let feedback = Message::user(
                     format!(
                         "你上一次的工具调用参数不是合法 JSON:{}。请重新发起同一个工具调用,\
                              确保 arguments 是严格合法的 JSON——字符串里的反斜杠写成 `\\\\`、\
@@ -1133,9 +1457,16 @@ impl AgentHarness for Drive<'_> {
                              或改用 write_file / apply_patch 之类不必在命令里塞长文本的工具。",
                         e.message
                     ),
+                    TranscriptOrigin::ProtocolRepair {
+                        repair: ProtocolRepairKind::InvalidToolJson,
+                    },
                 );
                 self.sink.append(std::slice::from_ref(&feedback)).await?;
                 messages.push(feedback);
+                (self.observer)(AgentEvent::runtime_injection(
+                    crate::executor::RuntimeInjectionKind::ProtocolRepair,
+                    rt.model_steps().saturating_add(1),
+                ));
                 return Ok(Flow::NextRound);
             }
             other => Err(other.into()),
@@ -1151,31 +1482,6 @@ impl AgentHarness for Drive<'_> {
         let model_steps = rt.model_steps();
         let cancellation = rt.cancellation().clone();
         let has_next_model_step = rt.has_next_model_step();
-        // Priced once, by the kernel, against the usage the provider reported
-        // — cached share included, because charging every input token at the
-        // uncached rate overstated a session's cost by roughly 4x at a 90% hit
-        // rate. The same priced record is what admission folded and what the
-        // ledger stores.
-        self.persist_request(ModelRequestRecord {
-            provider_request_id: Some(round_result.request_id.clone()),
-            provider: self.executor.model.provider.clone(),
-            model: self.executor.model.model.clone(),
-            usage: round_result.usage,
-            finish_reason: round_result.finish_reason,
-            latency_ms: round_result.latency_ms,
-            retry_count: round_result.retry_count,
-            kind: crate::ModelCallKind::Round,
-            agent_id: None,
-            cost_usd_micros: round_result.cost_usd_micros,
-            // The round's request carried exactly this effort (the agent is
-            // built `with_reasoning_effort(self.policy.reasoning_effort)`).
-            reasoning_effort: self
-                .executor
-                .policy
-                .reasoning_effort
-                .map(|effort| effort.as_wire().to_string()),
-        })
-        .await?;
         // Cost can cross the limit on the response that tips it; stop after
         // this round's tools (if any) rather than allowing another model call.
         if let Some(max) = self.executor.step_limits.max_cost_usd_micros
@@ -1193,8 +1499,6 @@ impl AgentHarness for Drive<'_> {
         // resume see the same ledger (event log is SoT, not in-memory only).
         self.flush_epoch(rt);
 
-        self.decode_retries = 0;
-        self.last_model_call_usage_total = round_result.usage.total();
         let assistant = round_result.message.clone();
         let text = assistant.text_content();
         let calls = round_result.tool_calls();
@@ -1217,14 +1521,20 @@ impl AgentHarness for Drive<'_> {
                         )));
                     }
                     self.length_continuations += 1;
-                    let feedback = Message::text(
-                        Role::User,
+                    let feedback = Message::user(
                         "Your output hit the token limit while emitting a tool call — the \
                              call was NOT executed. Re-issue it smaller: split a large patch \
                              into several apply_patch calls, or shorten the arguments.",
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::TruncatedToolCall,
+                        },
                     );
                     self.sink.append(std::slice::from_ref(&feedback)).await?;
                     messages.push(feedback);
+                    (self.observer)(AgentEvent::runtime_injection(
+                        crate::executor::RuntimeInjectionKind::ProtocolRepair,
+                        model_steps.saturating_add(1),
+                    ));
                     return Ok(Flow::NextRound);
                 }
                 if text.trim().is_empty()
@@ -1241,10 +1551,16 @@ impl AgentHarness for Drive<'_> {
                 self.last_text = self.continued_text.clone();
                 self.sink.append(std::slice::from_ref(&assistant)).await?;
                 messages.push(assistant);
-                messages.push(Message::text(
-                        Role::User,
-                        "Continue exactly from the cutoff. Do not repeat prior text. Complete every open list, code block, sentence, and conclusion.",
-                    ));
+                messages.push(Message::user(
+                    "Continue exactly from the cutoff. Do not repeat prior text. Complete every open list, code block, sentence, and conclusion.",
+                    TranscriptOrigin::ProtocolRepair {
+                        repair: ProtocolRepairKind::LengthContinuation,
+                    },
+                ));
+                (self.observer)(AgentEvent::runtime_injection(
+                    crate::executor::RuntimeInjectionKind::LengthContinuation,
+                    model_steps.saturating_add(1),
+                ));
                 self.context_diverged = true;
                 return Ok(Flow::NextRound);
             }
@@ -1269,14 +1585,20 @@ impl AgentHarness for Drive<'_> {
                     && !cancellation.is_cancelled()
                 {
                     self.decode_retries += 1;
-                    let feedback = Message::text(
-                        Role::User,
+                    let feedback = Message::user(
                         "Your last response declared a tool call but no complete call \
                              arrived (it was likely cut off in transit). Re-issue the tool \
                              call in full.",
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::MissingToolCall,
+                        },
                     );
                     self.sink.append(std::slice::from_ref(&feedback)).await?;
                     messages.push(feedback);
+                    (self.observer)(AgentEvent::runtime_injection(
+                        crate::executor::RuntimeInjectionKind::ProtocolRepair,
+                        model_steps.saturating_add(1),
+                    ));
                     return Ok(Flow::NextRound);
                 }
                 return Err(AgentError::Model(ModelError::new(
@@ -1295,6 +1617,7 @@ impl AgentHarness for Drive<'_> {
             FinishReason::Stop | FinishReason::ToolCalls => {}
         }
 
+        self.decode_retries = 0;
         if !text.trim().is_empty() {
             if self.continued_text.is_empty() {
                 self.last_text = text.clone();
@@ -1377,7 +1700,6 @@ impl AgentHarness for Drive<'_> {
                 can_continue: has_next_model_step,
                 budget_remaining: self.closeout_budget.remaining(),
                 human_boundary_seen: self.progress.human_boundary_seen(),
-                plan_needs_reconciliation: self.plan_needs_reconciliation,
             });
             // Whether the harness accepted the quiet round or bought itself
             // another model call is the difference between "the model is
@@ -1398,21 +1720,18 @@ impl AgentHarness for Drive<'_> {
                     kind: AdvisoryKind::CloseoutNudge(reason),
                 });
                 let nudge = match reason {
-                    CloseoutReason::GoalUnresolved => {
-                        Message::text(Role::User, goal_resolve_nudge())
-                    }
-                    CloseoutReason::EmptyAnswer => Message::text(
-                        Role::User,
+                    CloseoutReason::GoalUnresolved => Message::user(
+                        goal_resolve_nudge(),
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::GoalUnresolved,
+                        },
+                    ),
+                    CloseoutReason::EmptyAnswer => Message::user(
                         "Your last message was empty. Reply with the actual answer to the \
                              request — do not send an empty message.",
-                    ),
-                    CloseoutReason::PlanUnreconciled => Message::text(
-                        Role::User,
-                        "Real tool work happened after your latest plan declaration. Before \
-                             finishing, call update_plan with the complete final step table. \
-                             Report statuses truthfully: leave unfinished work pending or \
-                             in_progress; do not mark it completed merely to close the turn. \
-                             Then provide the final answer.",
+                        TranscriptOrigin::ProtocolRepair {
+                            repair: ProtocolRepairKind::EmptyAnswer,
+                        },
                     ),
                 };
                 // Persist BOTH the quiet-round assistant text and the nudge:
@@ -1421,6 +1740,10 @@ impl AgentHarness for Drive<'_> {
                 // different conversation than the one it actually had.
                 self.sink.append(&[assistant, nudge.clone()]).await?;
                 messages.push(nudge);
+                (self.observer)(AgentEvent::runtime_injection(
+                    crate::executor::RuntimeInjectionKind::CloseoutNudge(reason),
+                    model_steps.saturating_add(1),
+                ));
                 return Ok(Flow::NextRound);
             }
             self.sink.append(&[assistant]).await?;
@@ -1466,14 +1789,6 @@ impl AgentHarness for Drive<'_> {
                         Some(stalled_detail(
                             reason,
                             "目标模式结束但未调用 update_goal(complete/blocked)",
-                        )),
-                    )
-                } else if action == CloseoutAction::Stall(CloseoutReason::PlanUnreconciled) {
-                    (
-                        StopReason::Incomplete,
-                        Some(stalled_detail(
-                            CloseoutReason::PlanUnreconciled,
-                            "explicit plan was not reconciled after the last tool work",
                         )),
                     )
                 } else {
@@ -1540,11 +1855,6 @@ impl AgentHarness for Drive<'_> {
         // round is still committed (results + spend) before Cancelled
         // surfaces — completed tools' side effects are already on disk.
         let mut cancelled_mid_batch = false;
-        // A plan emitted in the same assistant response as actual work cannot
-        // reconcile that work: the model generated it before seeing any of
-        // this batch's tool results. Only a work-free batch may clear an
-        // existing freshness obligation.
-        let mut actual_work_admitted_this_batch = false;
         // Ids/names survive the consuming loop below so calls the cancel
         // cut short can still be refused in place (transcript pairing).
         let call_snapshot: Vec<ToolCall> = calls.clone();
@@ -1606,6 +1916,7 @@ impl AgentHarness for Drive<'_> {
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
                     stop: None,
+                    execution_status: None,
                     id: call.id.as_str().to_string(),
                     name: REPORT_FINDING_TOOL.to_string(),
                     is_error: !ok,
@@ -1663,10 +1974,9 @@ impl AgentHarness for Drive<'_> {
                     );
                     self.drain_background_children(rt, messages).await?;
                     let feedback = format!(
-                        "Cannot complete: delegated sub-agent(s) {} were still \
-                             running. They have now settled — their notices are above. \
-                             Inspect and integrate their results (judge any findings), \
-                             re-verify, then call update_goal again.",
+                        "update_goal(complete) was not accepted: delegated sub-agent(s) {} \
+                             were still running. They have now settled. Their notices are above. \
+                             A Goal is still resolved only through update_goal(complete|blocked).",
                         waiting.join(", ")
                     );
                     (self.observer)(AgentEvent::GoalIntercepted {
@@ -1676,34 +1986,7 @@ impl AgentHarness for Drive<'_> {
                     (self.observer)(AgentEvent::ToolResult {
                         exit_code: None,
                         stop: None,
-                        id: call.id.as_str().to_string(),
-                        name: UPDATE_GOAL_TOOL.to_string(),
-                        is_error: true,
-                        preview: preview(&feedback),
-                        applied_diff: None,
-                    });
-                    results[index] = Some(ContentPart::ToolResult {
-                        result: ToolResultContent {
-                            call_id: call.id,
-                            content: feedback,
-                            is_error: true,
-                        },
-                    });
-                    continue;
-                }
-                if self.plan_needs_reconciliation {
-                    let feedback = "Cannot resolve the goal yet: real tool work happened after \
-                         the latest plan declaration. Call update_plan with the complete final \
-                         table first. Keep unfinished steps pending or in_progress; do not mark \
-                         them completed merely to close the goal. Then call update_goal again."
-                        .to_string();
-                    (self.observer)(AgentEvent::GoalIntercepted {
-                        kind: "plan_unreconciled".to_string(),
-                        detail: "tool work occurred after the latest plan update".to_string(),
-                    });
-                    (self.observer)(AgentEvent::ToolResult {
-                        exit_code: None,
-                        stop: None,
+                        execution_status: None,
                         id: call.id.as_str().to_string(),
                         name: UPDATE_GOAL_TOOL.to_string(),
                         is_error: true,
@@ -1731,9 +2014,17 @@ impl AgentHarness for Drive<'_> {
                                 .map(|s| format!("\"{s}\""))
                                 .unwrap_or_else(|| "no status".to_string())
                         );
+                        // Persisted like every other refusal: a rejected
+                        // resolution is a fact resume/UI/eval must be able to
+                        // count by reason, not only read from a tool result.
+                        (self.observer)(AgentEvent::GoalIntercepted {
+                            kind: "invalid_status".to_string(),
+                            detail: other.unwrap_or("no status").to_string(),
+                        });
                         (self.observer)(AgentEvent::ToolResult {
                             exit_code: None,
                             stop: None,
+                            execution_status: None,
                             id: call.id.as_str().to_string(),
                             name: UPDATE_GOAL_TOOL.to_string(),
                             is_error: true,
@@ -1767,6 +2058,7 @@ impl AgentHarness for Drive<'_> {
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
                     stop: None,
+                    execution_status: None,
                     id: call.id.as_str().to_string(),
                     name: UPDATE_GOAL_TOOL.to_string(),
                     is_error: false,
@@ -1810,6 +2102,7 @@ impl AgentHarness for Drive<'_> {
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
                     stop: None,
+                    execution_status: None,
                     id: call.id.as_str().to_string(),
                     name: call.name.clone(),
                     // The answer IS the result. It is short, user-written, and
@@ -1919,6 +2212,7 @@ impl AgentHarness for Drive<'_> {
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
                     stop: None,
+                    execution_status: None,
                     id: call.id.as_str().to_string(),
                     name: call.name.clone(),
                     is_error: false,
@@ -1946,6 +2240,14 @@ impl AgentHarness for Drive<'_> {
             // against the shared registry. Atomic; a denial is an honest
             // coordination result (is_error=false) the child works around.
             if call.name == CLAIM_WRITE_SCOPE_TOOL {
+                let _ownership_gate = self
+                    .executor
+                    .tool_context
+                    .execution
+                    .command_gate
+                    .clone()
+                    .lock_owned()
+                    .await;
                 // Durable lifecycle FIRST: an ownership transition that
                 // decides what a child may mutate has to be
                 // reconstructable from the event log like any other tool
@@ -1977,6 +2279,17 @@ impl AgentHarness for Drive<'_> {
                              for spawned children."
                             .to_string(),
                         true,
+                    )
+                } else if !self
+                    .executor
+                    .background_write_conflicts(&paths)
+                    .await
+                    .is_empty()
+                {
+                    (
+                        "not granted — a live background command still holds this write scope"
+                            .to_string(),
+                        false,
                     )
                 } else if let Some(outside) = {
                     let roots = &self.executor.write_roots;
@@ -2038,6 +2351,7 @@ impl AgentHarness for Drive<'_> {
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
                     stop: None,
+                    execution_status: None,
                     id: call.id.as_str().to_string(),
                     name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
                     is_error,
@@ -2159,7 +2473,17 @@ impl AgentHarness for Drive<'_> {
                 let fresh = load_scoped_rules(
                     self.executor.tool_context.execution.workspace.root(),
                     &target_paths,
-                    &self.injected_rule_sources,
+                    &self
+                        .control_context
+                        .blocks
+                        .iter()
+                        .filter_map(|segment| {
+                            segment
+                                .name
+                                .strip_prefix("scoped_rules:")
+                                .map(str::to_string)
+                        })
+                        .collect::<Vec<_>>(),
                 );
                 if !fresh.is_empty() {
                     self.scoped_paths = target_paths;
@@ -2477,12 +2801,6 @@ impl AgentHarness for Drive<'_> {
                 .await
             {
                 Ok(admitted) if parallel => {
-                    if admitted.call.name != "update_plan" && !self.plan_state.is_empty() {
-                        self.plan_needs_reconciliation = true;
-                    }
-                    if admitted.call.name != "update_plan" {
-                        actual_work_admitted_this_batch = true;
-                    }
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
@@ -2490,12 +2808,6 @@ impl AgentHarness for Drive<'_> {
                     continue;
                 }
                 Ok(admitted) => {
-                    if admitted.call.name != "update_plan" && !self.plan_state.is_empty() {
-                        self.plan_needs_reconciliation = true;
-                    }
-                    if admitted.call.name != "update_plan" {
-                        actual_work_admitted_this_batch = true;
-                    }
                     if self.executor.registry.runs_command(&admitted.call.name) {
                         self.commands_run += 1;
                     }
@@ -2525,7 +2837,7 @@ impl AgentHarness for Drive<'_> {
                         let call_id = admitted.call.id.as_str().to_string();
                         let (output_tx, mut output_rx) =
                             if self.executor.registry.runs_command(&admitted.call.name) {
-                                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                                let (tx, rx) = tokio::sync::mpsc::channel(64);
                                 (Some(tx), Some(rx))
                             } else {
                                 (None, None)
@@ -2593,7 +2905,7 @@ impl AgentHarness for Drive<'_> {
                         // A stopped command's result is only "cancelled"; the
                         // output the user already watched is what tells the
                         // model how far it got.
-                        if result.8.1.is_some()
+                        if result.8.stop.is_some()
                             && let Some(tail) = lines.stopped_tail()
                         {
                             result.0.push_str(&format!(
@@ -2637,7 +2949,7 @@ impl AgentHarness for Drive<'_> {
                         Vec::new(),
                         Vec::new(),
                         None,
-                        (None, None),
+                        super::dispatch::CommandFacts::default(),
                         call,
                     )
                 }
@@ -2668,9 +2980,6 @@ impl AgentHarness for Drive<'_> {
                 match PlanState::from_model_explicit(steps) {
                     Ok(next) => {
                         self.plan_state = next;
-                        if !actual_work_admitted_this_batch {
-                            self.plan_needs_reconciliation = false;
-                        }
                         (self.observer)(AgentEvent::PlanUpdated {
                             steps: self.plan_state.steps.clone(),
                         });
@@ -2683,8 +2992,9 @@ impl AgentHarness for Drive<'_> {
             }
 
             (self.observer)(AgentEvent::ToolResult {
-                exit_code: command_facts.0,
-                stop: command_facts.1,
+                exit_code: command_facts.exit_code,
+                stop: command_facts.stop,
+                execution_status: command_facts.execution_status,
                 id: call.id.as_str().to_string(),
                 name: call.name.clone(),
                 is_error,
@@ -2792,10 +3102,11 @@ impl AgentHarness for Drive<'_> {
                 if let Some(part) = extract_image(&metadata) {
                     pending_images.push(part);
                 }
-                let (exit_code, stop) = super::dispatch::extract_command_facts(&metadata);
+                let facts = super::dispatch::extract_command_facts(&metadata);
                 (self.observer)(AgentEvent::ToolResult {
-                    exit_code,
-                    stop,
+                    exit_code: facts.exit_code,
+                    stop: facts.stop,
+                    execution_status: facts.execution_status,
                     id: job.admitted.call.id.as_str().to_string(),
                     name: job.admitted.call.name.clone(),
                     is_error,
@@ -2916,6 +3227,14 @@ impl AgentHarness for Drive<'_> {
                 if agent_name.is_some() && agent_registry.is_none() {
                     agent_registry = Some(self.executor.load_agent_registry());
                 }
+                let _ownership_gate = self
+                    .executor
+                    .tool_context
+                    .execution
+                    .command_gate
+                    .clone()
+                    .lock_owned()
+                    .await;
                 // Capability negotiation: the requested agent/profile/role +
                 // scope against the contract. Honest denial, never a silent
                 // downgrade.
@@ -2943,6 +3262,13 @@ impl AgentHarness for Drive<'_> {
                     Some("Sub-agents may not spawn their own sub-agents.".to_string())
                 } else if task.is_empty() {
                     Some("spawn_agent requires a non-empty task.".to_string())
+                } else if !self
+                    .executor
+                    .background_write_conflicts(&files)
+                    .await
+                    .is_empty()
+                {
+                    Some("Worker scope overlaps a live background command; settle that command before transferring ownership.".to_string())
                 } else if let Err(msg) = &admission {
                     Some(msg.clone())
                 } else if admission
@@ -2995,6 +3321,7 @@ impl AgentHarness for Drive<'_> {
                     (self.observer)(AgentEvent::ToolResult {
                         exit_code: None,
                         stop: None,
+                        execution_status: None,
                         id: call.id.as_str().to_string(),
                         name: SPAWN_AGENT_TOOL.to_string(),
                         is_error: true,
@@ -3035,10 +3362,11 @@ impl AgentHarness for Drive<'_> {
                     // earlier spawns claim before later ones are admitted.
                     if let Err(rejection) = self.executor.ownership.try_claim(&id, &files) {
                         let msg = rejection.for_model();
-                        self.executor.ownership.release_all(&id);
+                        self.executor.release_child_scope(&id).await?;
                         (self.observer)(AgentEvent::ToolResult {
                             exit_code: None,
                             stop: None,
+                            execution_status: None,
                             id: call.id.as_str().to_string(),
                             name: SPAWN_AGENT_TOOL.to_string(),
                             is_error: true,
@@ -3089,9 +3417,6 @@ impl AgentHarness for Drive<'_> {
                     read_only,
                     spec: Some(spec.clone()),
                 });
-                if !self.plan_state.is_empty() {
-                    self.plan_needs_reconciliation = true;
-                }
                 accepted.push((
                     index, call.id, role, files, task, id, nickname, spec, brief, background, token,
                 ));
@@ -3179,8 +3504,7 @@ impl AgentHarness for Drive<'_> {
                     };
                     let content = format!(
                         "[sub-agent {nickname} ({id}, role={})] started in the \
-                             background.{scope_line} You will be told when it settles — \
-                             continue useful work; do not poll.",
+                             background.{scope_line} The runtime reports when it settles.",
                         role.label()
                     );
                     // The immediate acknowledgment is model-visible, so it
@@ -3189,6 +3513,7 @@ impl AgentHarness for Drive<'_> {
                     (self.observer)(AgentEvent::ToolResult {
                         exit_code: None,
                         stop: None,
+                        execution_status: None,
                         id: call_id.as_str().to_string(),
                         name: SPAWN_AGENT_TOOL.to_string(),
                         is_error: false,
@@ -3251,7 +3576,7 @@ impl AgentHarness for Drive<'_> {
                         }
                     }
                     Some((index, call_id, id, nickname, role, result)) = futs.next() => {
-                        self.executor.ownership.release_all(&id);
+                        self.executor.release_child_scope(&id).await?;
                         if let Some(host) = &self.executor.steering {
                             host.child_ended(&id);
                         }
@@ -3321,6 +3646,7 @@ impl AgentHarness for Drive<'_> {
             .collect();
 
         let tool_message = Message {
+            origin: None,
             role: Role::Tool,
             content: results,
         };
@@ -3435,30 +3761,15 @@ impl AgentHarness for Drive<'_> {
         // parts live in a user message, not a tool result, for OpenAI-style
         // providers).
         if !pending_images.is_empty() {
-            let image_message = Message {
-                role: Role::User,
-                content: pending_images,
-            };
+            let image_message = Message::from_parts(
+                Role::User,
+                pending_images,
+                Some(TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::LoadedImage,
+                }),
+            );
             messages.push(image_message.clone());
             self.sink.append(&[image_message]).await?;
-        }
-
-        if has_next_model_step
-            && should_inject_delivery_convergence_nudge(
-                self.executor.policy.goal_mode,
-                self.delivery_convergence_nudged,
-                model_steps,
-                !self.modified_files.is_empty(),
-                !call_snapshot.is_empty(),
-            )
-        {
-            let nudge = Message::text(
-                Role::User,
-                "DELIVERY CONVERGENCE: If the objective asks for workspace edits and the source reads above reveal a concrete requested edit, the next tool call must make that edit. Do not inspect more files, git state, test-runner configuration, temporary/probe/audit artifacts, or run exploratory probes first. Write the requested test/change, then use its result to discover remaining edge cases. If the objective is genuinely read-only analysis, ignore this message.",
-            );
-            self.sink.append(std::slice::from_ref(&nudge)).await?;
-            messages.push(nudge);
-            self.delivery_convergence_nudged = true;
         }
 
         // Auto-compaction (spec §53): when the context size exceeds the
@@ -3468,21 +3779,36 @@ impl AgentHarness for Drive<'_> {
         // gateways don't report streaming usage, and without a fallback
         // compaction would silently never fire. The persisted transcript
         // (sink) is untouched — only what we resend shrinks.
-        let context_tokens = self
-            .last_model_call_usage_total
-            .max(estimate_tokens(messages));
+        let context_tokens = leveler_model::RequestProjection::project_with_control_context(
+            messages,
+            &self.tools,
+            self.executor.policy.reasoning_replay,
+            self.executor.policy.reasoning_retention,
+            &self.request_context(rt),
+        )
+        .estimated_tokens();
         // Fold when the last request's estimate crossed the budget. One
         // threshold, one action: the runtime does not read the model's
         // re-reads as evidence that it "deserves" a bigger window.
-        let over_budget = self.executor.policy.context_budget > 0
-            && context_tokens > u64::from(self.executor.policy.context_budget);
+        let context_policy = self.executor.policy.context_policy;
+        let over_budget = context_policy.folding_enabled()
+            && context_tokens > u64::from(context_policy.pressure_threshold);
         if has_next_model_step && over_budget {
             let before = messages.len();
+            // TWO bounds, two meanings. `pressure_threshold` says recall is
+            // expected to degrade; `hard_capacity` says the request can no
+            // longer be sent. A fold below the hard bound is a quality choice
+            // and may be abandoned; above it, a fold is required to send
+            // anything at all, so its failure must be explicit.
+            let requirement = fold_requirement(&context_policy, context_tokens);
             // Cap the retained working set at half the live budget so a
             // huge recent tool output can't keep the fold over the window;
             // the other half leaves room for the head, summary, and next
             // response. (current_budget > 0 is guaranteed by the decision.)
-            let keep_recent_tokens = u64::from(self.executor.policy.context_budget) / 2;
+            // The retention budget is a POLICY field, not a fraction of the
+            // threshold re-derived here: the two answer different questions.
+            let keep_recent_tokens = context_policy.retention.keep_recent_tokens;
+            let keep_recent_messages = context_policy.retention.keep_recent_messages;
             // Name this extra round trip so the UI shows "compacting…" instead
             // of a bare "waiting for model" during the summary call.
             (self.observer)(AgentEvent::AdvisoryStarted {
@@ -3498,46 +3824,109 @@ impl AgentHarness for Drive<'_> {
                         leveler_execution::LifecycleEvent::PreCompact,
                         &format!(
                             r#"{{"context_tokens":{context_tokens},"budget":{}}}"#,
-                            self.executor.policy.context_budget
+                            context_policy.pressure_threshold
                         ),
                         &cancellation,
                     )
                     .await;
             }
-            let summarized = self
-                .executor
-                .summarize_for_compaction(
-                    messages,
-                    COMPACT_KEEP_RECENT,
-                    keep_recent_tokens,
-                    &cancellation,
-                )
-                .await;
-            // A fold's summarization is a provider call, and until it was
-            // recorded a session that folded reported fewer tokens than it
-            // spent — precisely in the lane a fold is the cost of.
-            if let Some(summarized) = &summarized {
-                self.record_request(
-                    rt,
-                    ModelRequestRecord {
-                        provider_request_id: Some(summarized.request_id.to_string()),
-                        provider: self.executor.model.provider.clone(),
-                        model: self.executor.model.model.clone(),
-                        usage: summarized.usage,
-                        finish_reason: summarized.finish_reason,
-                        latency_ms: summarized.latency_ms,
-                        retry_count: 0,
-                        kind: crate::ModelCallKind::Compaction,
-                        agent_id: None,
-                        cost_usd_micros: None,
-                        reasoning_effort: None,
+            let runtime = self.executor.runtime.clone();
+            let request = leveler_context::summary_request(
+                runtime.as_ref(),
+                &self.executor.model,
+                crate::ModelCallKind::Compaction.default_reasoning_effort(),
+                messages,
+                keep_recent_messages,
+                keep_recent_tokens,
+                self.executor.max_output_tokens,
+            )
+            .await;
+            // A briefing is advisory. Whether its absence is fatal depends on
+            // WHY the fold was attempted, not on the error: over the quality
+            // boundary the uncompacted history is still legal to send, so the
+            // task continues; over the hard capacity it is not.
+            let mut summary: Option<String> = None;
+            let mut summary_failure: Option<&'static str> = None;
+            if let Some(request) = request {
+                if !super::auxiliary_budget_available(
+                    self.executor.step_limits,
+                    &self.progress,
+                    &request,
+                    self.executor.pricing.as_ref(),
+                ) {
+                    summary_failure = Some("no_budget");
+                } else {
+                    let remaining = self.executor.step_limits.max_duration.map(|duration| {
+                        duration.saturating_sub(
+                            self.epoch_duration_at_start
+                                .saturating_add(rt.run_started().elapsed()),
+                        )
+                    });
+                    let reasoning_effort = request.reasoning_effort;
+                    match super::run_auxiliary_round(
+                        runtime.as_ref(),
+                        request.clone(),
+                        &cancellation,
+                        &mut CompactionObserver {
+                            drive: self,
+                            rt,
+                            reasoning_effort,
+                            request: &request,
+                        },
+                        remaining,
+                    )
+                    .await
+                    {
+                        Ok(round) => {
+                            summary =
+                                leveler_context::accepted_summary(&leveler_model::ModelResponse {
+                                    request_id: leveler_core::RequestId::new(round.request_id),
+                                    message: round.message,
+                                    usage: round.usage,
+                                    finish_reason: round.finish_reason,
+                                });
+                            if summary.is_none() {
+                                summary_failure = Some("rejected");
+                            }
+                        }
+                        Err(AgentError::AuxiliaryBudgetUnavailable) => {
+                            summary_failure = Some("no_budget");
+                        }
+                        // The harness cancelled the AUXILIARY child token when
+                        // its deadline elapsed; the task's own token is still
+                        // live. A real task cancellation is NOT this case and
+                        // propagates below.
+                        Err(AgentError::Cancelled) if !cancellation.is_cancelled() => {
+                            summary_failure = Some("timeout");
+                        }
+                        Err(error) => {
+                            if cancellation.is_cancelled() {
+                                return Err(error);
+                            }
+                            summary_failure = Some(compaction_failure_class(&error));
+                        }
                     }
-                    .priced(self.executor.pricing.as_ref()),
-                    None,
-                )
-                .await?;
+                }
+            } else {
+                summary_failure = Some("no_request");
             }
-            let mut summary = summarized.map(|s| s.text);
+            if let Some(failure) = summary_failure {
+                log_compaction_summary_failure(
+                    requirement,
+                    failure,
+                    context_tokens,
+                    &context_policy,
+                    requirement == FoldRequirement::Soft,
+                );
+                if requirement == FoldRequirement::Soft {
+                    // The uncompacted history is still legal to send. A
+                    // briefing nobody could produce must not cost the task.
+                    return Ok(Flow::Continue);
+                }
+                // Hard-required: fall through and fold MECHANICALLY (no model
+                // briefing). The capacity check below proves the result is
+                // sendable before the fold is committed.
+            }
             // Long-goal P3: before old context is folded away, the host
             // cuts a durable checkpoint and hands back its context block
             // — the fold's summary becomes persisted truth. If the
@@ -3558,19 +3947,53 @@ impl AgentHarness for Drive<'_> {
                     }
                 }
             }
-            if fold_permitted {
-                *messages = compact_messages(
+            // Build the fold as a CANDIDATE. The live transcript, the
+            // divergence flag, and the fold record stay untouched until the
+            // capacity gate below has proven the candidate sendable: a fold
+            // that cannot fit must leave no state behind, so the failure path
+            // is validate-before-commit, never mutate-then-fail. (This is the
+            // same ordering `assemble_measured` uses for the engine entry.)
+            let candidate = fold_permitted.then(|| {
+                compact_messages(
                     messages,
-                    COMPACT_KEEP_RECENT,
+                    keep_recent_messages,
                     keep_recent_tokens,
                     summary.as_deref(),
                     Some(self.objective.text()),
-                );
+                )
+            });
+            // Record the fold as estimated tokens so the accounting can show
+            // `before → after → reclaimed` without the TUI deriving it from a
+            // second transcript. With no candidate this measures the unchanged
+            // history, which is what the gate must judge when the checkpoint
+            // port refused the fold.
+            let after_tokens = leveler_model::RequestProjection::project_with_control_context(
+                candidate.as_deref().unwrap_or(&messages[..]),
+                &self.tools,
+                self.executor.policy.reasoning_replay,
+                self.executor.policy.reasoning_retention,
+                &self.request_context(rt),
+            )
+            .estimated_tokens();
+            // Hard-required: a legal context is mandatory. If neither the model
+            // briefing nor the mechanical fold brought the request under the
+            // model's hard capacity, fail explicitly BEFORE the fold is
+            // committed. The same gate covers a checkpoint port that refused
+            // the fold: then the candidate is the unchanged context and it is
+            // still over capacity.
+            if requirement == FoldRequirement::HardRequired
+                && let Some(capacity) = context_policy.hard_capacity()
+                && after_tokens > capacity
+            {
+                return Err(AgentError::ContextManagementFailure(format!(
+                    "compaction could not fit the request into the model's hard context \
+                     capacity: projected {after_tokens} tokens, capacity {capacity}"
+                )));
+            }
+            // The candidate cleared the gate (or no gate applied): commit it.
+            if let Some(folded) = candidate {
+                *messages = folded;
                 self.context_diverged = true;
-                // Record the fold as estimated tokens so the accounting can
-                // show `before → after → reclaimed` without the TUI deriving
-                // it from a second transcript.
-                let after_tokens = estimate_tokens(messages);
                 if let Ok(mut slot) = self.compaction.lock() {
                     *slot = Some(CompactionRecord {
                         before_tokens: context_tokens,
@@ -3750,16 +4173,6 @@ impl AgentHarness for Drive<'_> {
     }
 }
 
-fn should_inject_delivery_convergence_nudge(
-    goal_mode: bool,
-    already_sent: bool,
-    round: u32,
-    has_modified_files: bool,
-    had_tool_calls: bool,
-) -> bool {
-    goal_mode && !already_sent && round == 1 && !has_modified_files && had_tool_calls
-}
-
 /// Roll one settled child into the parent epoch: spend absorb, modified-file
 /// merge, typed-finding adoption at Acknowledged (receipt is not judgment),
 /// Worker-incomplete goal debt, the parent-facing content, and the
@@ -3903,7 +4316,7 @@ fn pin_parent_batch_work(
 /// again after the concurrency semaphore is acquired (see `run_one_sub_agent`)
 /// so a child that waited behind others cannot keep a pre-queue residual that
 /// already exceeds the parent deadline.
-fn residual_step_limits(
+pub(crate) fn residual_step_limits(
     parent: super::StepLimits,
     commands_run: u32,
     model_tokens_spent: u64,
@@ -4116,27 +4529,6 @@ fn sync_epoch_progress(
 mod residual_budget_tests {
     use super::*;
 
-    #[test]
-    fn delivery_convergence_nudge_fires_once_after_the_first_read_only_goal_round() {
-        assert!(should_inject_delivery_convergence_nudge(
-            true, false, 1, false, true
-        ));
-        assert!(!should_inject_delivery_convergence_nudge(
-            false, false, 1, false, true
-        ));
-        assert!(!should_inject_delivery_convergence_nudge(
-            true, true, 1, false, true
-        ));
-        assert!(!should_inject_delivery_convergence_nudge(
-            true, false, 2, false, true
-        ));
-        assert!(!should_inject_delivery_convergence_nudge(
-            true, false, 1, true, true
-        ));
-        assert!(!should_inject_delivery_convergence_nudge(
-            true, false, 1, false, false
-        ));
-    }
     use crate::executor::StepLimits;
     use std::time::{Duration, Instant};
 
@@ -4352,5 +4744,105 @@ mod residual_budget_tests {
             1,
         );
         assert_eq!(child.finalization_grace, None);
+    }
+}
+
+#[cfg(test)]
+mod fold_requirement_tests {
+    use super::{FoldRequirement, compaction_failure_class, fold_requirement};
+    use crate::AgentError;
+    use crate::coding::policy::ResolvedContextPolicy as P;
+    use leveler_model::{ModelError, ModelErrorKind};
+
+    /// A model that declares no separate quality boundary: the threshold IS the
+    /// capacity, so every fold is required and there is no soft zone to fall
+    /// back into.
+    fn no_quality_gap() -> P {
+        P {
+            context_window: 32_768,
+            quality_boundary: 0,
+            output_reservation: 1_024,
+            headroom: 0,
+            pressure_threshold: 32_768 - 1_024,
+            retention: P::default().retention,
+        }
+    }
+
+    /// A model whose reliable context is well below its usable window: the gap
+    /// between the two bounds is the room a failed fold may continue in.
+    fn quality_gap() -> P {
+        P {
+            context_window: 131_072,
+            quality_boundary: 65_536,
+            output_reservation: 8_192,
+            headroom: 0,
+            pressure_threshold: 65_536,
+            retention: P::default().retention,
+        }
+    }
+
+    #[test]
+    fn below_the_hard_capacity_is_quality_pressure() {
+        let policy = quality_gap();
+        // Over the quality boundary, comfortably under the 122 880 capacity.
+        assert_eq!(fold_requirement(&policy, 80_000), FoldRequirement::Soft);
+    }
+
+    #[test]
+    fn beyond_the_hard_capacity_is_required() {
+        let policy = quality_gap();
+        assert_eq!(
+            fold_requirement(&policy, 130_000),
+            FoldRequirement::HardRequired
+        );
+    }
+
+    /// When the threshold equals the capacity there is no soft zone: crossing
+    /// the threshold already means the request cannot be sent.
+    #[test]
+    fn a_threshold_at_capacity_leaves_no_soft_zone() {
+        let policy = no_quality_gap();
+        let capacity = policy.hard_capacity().unwrap();
+        assert_eq!(
+            fold_requirement(&policy, capacity + 1),
+            FoldRequirement::HardRequired
+        );
+    }
+
+    /// With no declared window there is no hard limit to enforce: nothing may
+    /// claim a capacity the model never stated.
+    #[test]
+    fn an_unknown_window_never_claims_a_hard_requirement() {
+        let policy = P {
+            context_window: 0,
+            pressure_threshold: 1_000,
+            retention: P::default().retention,
+            ..P::default()
+        };
+        assert_eq!(policy.hard_capacity(), None);
+        assert_eq!(fold_requirement(&policy, 10_000_000), FoldRequirement::Soft);
+    }
+
+    #[test]
+    fn failure_classes_are_stable_and_never_leak_provider_text() {
+        assert_eq!(
+            compaction_failure_class(&AgentError::Model(ModelError::new(
+                ModelErrorKind::Timeout,
+                "read timed out at https://internal.example"
+            ))),
+            "timeout"
+        );
+        assert_eq!(
+            compaction_failure_class(&AgentError::Model(ModelError::new(
+                ModelErrorKind::ProviderUnavailable,
+                "529 overloaded"
+            ))),
+            "provider"
+        );
+        assert_eq!(compaction_failure_class(&AgentError::Cancelled), "timeout");
+        assert_eq!(
+            compaction_failure_class(&AgentError::Persistence("db down".into())),
+            "other"
+        );
     }
 }

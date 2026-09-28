@@ -1073,7 +1073,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     let handoff = state.transcript.latest_turn_handoff();
     let suggestion = handoff
         .as_ref()
-        .map(|handoff| handoff.next_step.clone())
+        .and_then(|handoff| handoff.next_step.clone())
         .or_else(|| {
             (status == TurnEndStatus::Incomplete).then(|| state.t().suggestion_continue.to_string())
         });

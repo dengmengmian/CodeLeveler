@@ -42,6 +42,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_summary_preserves_declaration_and_accepts_legacy_rows() {
+        let legacy = serde_json::json!({"id":"s", "goal":"g", "status":"completed", "model":"m", "updated_at":"now"});
+        let row: UiSessionSummary = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(
+            serde_json::to_value(row)
+                .unwrap()
+                .get("declaration")
+                .is_none()
+        );
+        for declaration in ["answered", "completed"] {
+            let mut wire = legacy.clone();
+            wire["declaration"] = declaration.into();
+            let row: UiSessionSummary = serde_json::from_value(wire).unwrap();
+            assert_eq!(
+                serde_json::to_value(row).unwrap()["declaration"],
+                declaration
+            );
+        }
+    }
+
+    #[test]
     fn message_id_roundtrips_as_str() {
         let id = MessageId::new("msg-42");
         assert_eq!(id.as_str(), "msg-42");
@@ -378,6 +399,16 @@ pub struct UiUserShell {
     pub output_truncated: bool,
 }
 
+/// A task's own terminal declaration, projected from its durable TaskFinished stop.
+/// This is not verification evidence and does not replace session lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum UiTaskDeclaration {
+    Answered,
+    Completed,
+}
+
 /// A one-line session summary for the Sessions screen (spec §52).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -385,6 +416,9 @@ pub struct UiSessionSummary {
     pub id: SessionId,
     pub goal: String,
     pub status: String,
+    /// Latest durable task declaration; absent for legacy or non-declaration endings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<UiTaskDeclaration>,
     pub model: String,
     pub updated_at: String,
     /// Repository root the session belongs to. Filled by the runtime that

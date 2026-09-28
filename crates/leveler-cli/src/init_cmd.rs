@@ -173,7 +173,14 @@ mod tests {
         assert_eq!(profile["parallel_tool_calls"].as_bool(), Some(true));
         assert_eq!(profile["supports_temperature"].as_bool(), Some(true));
         assert_eq!(profile["max_parallel_tool_calls"].as_integer(), Some(0));
-        assert_eq!(profile["passback_reasoning_content"].as_bool(), Some(true));
+        assert_eq!(
+            profile["reasoning_replay_scope"].as_str(),
+            Some("when_tools_present")
+        );
+        assert_eq!(
+            profile["reasoning_content_key_required"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]

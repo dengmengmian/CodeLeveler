@@ -2242,6 +2242,17 @@
         "pressure": {
           "$ref": "#/definitions/ContextPressure"
         },
+        "reasoning_projection": {
+          "description": "What the request projection did with the requested reasoning-retention arm: which turns carried reasoning, and how many the route contract had to keep against the request. Present on every snapshot computed from a projection, so an overridden treatment is visible rather than assumed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningProjectionSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "token_count_kind": {
           "$ref": "#/definitions/TokenCountKind"
         },
@@ -2582,6 +2593,25 @@
       "description": "Identifies a single assistant/user message in the transcript.\n\nA protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message.",
       "type": "string"
     },
+    "MissingReasoningReplay": {
+      "description": "What a replayed assistant turn carries when it captured no reasoning.\n\nOrthogonal to [`ReasoningReplayScope`]: \"should reasoning be replayed?\" and \"what does an empty turn carry?\" are different requirements, and providers differ on each of them independently.",
+      "oneOf": [
+        {
+          "description": "Send nothing. A turn that produced no reasoning carries no field.",
+          "type": "string",
+          "enum": [
+            "omit"
+          ]
+        },
+        {
+          "description": "Send the empty string. Some endpoints validate the key's presence on a replayed assistant turn independently of what the turn captured (measured: DeepSeek rejects a tool-bearing history whose assistant turn omits the key, and accepts an empty value on a turn that captured none).",
+          "type": "string",
+          "enum": [
+            "empty_string"
+          ]
+        }
+      ]
+    },
     "ModelRef": {
       "description": "A provider + model pair. The rest of the system routes on this, never on a bare model-name string.",
       "type": "object",
@@ -2640,6 +2670,134 @@
         "done",
         "failed",
         "skipped"
+      ]
+    },
+    "ReasoningProjectionSummary": {
+      "description": "What the projection did with the requested retention arm, in facts rather than in a claim.\n\nAn experiment that asked for `None` and got every retained turn's reasoning anyway must not be recorded as `None`: [`Self::protocol_protected_turns`] is exactly how many turns the provider contract kept that the requested arm would have dropped.",
+      "type": "object",
+      "required": [
+        "captured_turns",
+        "carried_turns",
+        "contract",
+        "protocol_protected_turns",
+        "requested"
+      ],
+      "properties": {
+        "captured_turns": {
+          "description": "Assistant turns in the request that captured reasoning.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "carried_turns": {
+          "description": "Of those, how many carry the channel on the wire.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "contract": {
+          "description": "The route contract the projection ran under.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningReplayContract"
+            }
+          ]
+        },
+        "protocol_protected_turns": {
+          "description": "Turns the requested arm would have dropped but the provider contract requires. A route that replays captured reasoning requires the full reasoning of every retained assistant turn, so this is the arm's difference from `All`. Non-zero ⇒ the requested treatment was NOT fully applied, and the request's reasoning cost cannot be reduced by the arm: the lever is the context lifecycle, which removes whole turns.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "requested": {
+          "description": "The arm the caller requested.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningRetention"
+            }
+          ]
+        }
+      }
+    },
+    "ReasoningReplayContract": {
+      "description": "The resolved reasoning-replay contract for one route.",
+      "type": "object",
+      "required": [
+        "missing",
+        "scope"
+      ],
+      "properties": {
+        "missing": {
+          "$ref": "#/definitions/MissingReasoningReplay"
+        },
+        "scope": {
+          "$ref": "#/definitions/ReasoningReplayScope"
+        },
+        "signed_blocks": {
+          "description": "Whether authenticated/opaque reasoning blocks are a replay channel.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "ReasoningReplayScope": {
+      "description": "When captured reasoning is carried back to a provider on historical assistant turns.\n\nThis is a ROUTE fact, not a harness preference: it is resolved from the protocol the route speaks and the route's declared compatibility. A provider that validates the field and a provider that has no field at all both have to be expressible without naming either of them.",
+      "oneOf": [
+        {
+          "description": "The route has no channel for historical reasoning. Captured reasoning stays in the durable transcript and never reaches this provider.\n\nThis is the default: a route carries nothing until it declares otherwise, so no route inherits another's requirement.",
+          "type": "string",
+          "enum": [
+            "never"
+          ]
+        },
+        {
+          "description": "Carried only on requests that expose tools — the scope a provider that validates reasoning on tool rounds defines its requirement in.",
+          "type": "string",
+          "enum": [
+            "when_tools_present"
+          ]
+        },
+        {
+          "description": "Carried on every request that spans the history.",
+          "type": "string",
+          "enum": [
+            "always"
+          ]
+        }
+      ]
+    },
+    "ReasoningRetention": {
+      "description": "How much historical assistant reasoning one request carries.\n\nThis is the REQUESTED arm. The protocol-safe effective view is produced by [`crate::RequestProjection::project`], which reports any difference.\n\n[`ReasoningRetention::All`] is the production default and is byte-identical to carrying every reasoning block.",
+      "oneOf": [
+        {
+          "description": "Every historical reasoning block is carried.",
+          "type": "string",
+          "enum": [
+            "all"
+          ]
+        },
+        {
+          "description": "Only the `n` most recent reasoning-bearing assistant turns keep their reasoning; earlier ones keep text and tool calls.",
+          "type": "object",
+          "required": [
+            "last_turns"
+          ],
+          "properties": {
+            "last_turns": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "No historical reasoning is carried.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
       ]
     },
     "RuntimeEvent": {
@@ -5754,6 +5912,24 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "projected_input_tokens": {
+          "description": "Summed over the lane's rows that recorded a runtime projection estimate; `None` when none did (an unmeasured figure is not a zero).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "projected_reasoning_tokens": {
+          "description": "Of the projected input, the historical-reasoning slice the route carried back. A slice of `projected_input_tokens`, not of `reasoning_tokens` (which is output-side). `None` = no projection was recorded.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "reasoning_tokens": {
           "type": [
             "integer",
@@ -6246,6 +6422,24 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "projected_input_tokens": {
+          "description": "What the runtime projected this call's prompt would cost, priced over the provider-visible request. Beside `input_tokens`, never instead of it — the pair is what makes an estimate error readable. `None` = no projection was recorded for this call.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "projected_reasoning_tokens": {
+          "description": "Of that projected input, the historical-reasoning slice the wire carried. A slice of `projected_input_tokens`; `None` = not recorded.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
         "provider": {
           "type": "string"
         },
@@ -6647,6 +6841,17 @@
         "updated_at"
       ],
       "properties": {
+        "declaration": {
+          "description": "Latest durable task declaration; absent for legacy or non-declaration endings.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiTaskDeclaration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "goal": {
           "type": "string"
         },
@@ -6688,6 +6893,14 @@
           "$ref": "#/definitions/UiAgentSource"
         }
       }
+    },
+    "UiTaskDeclaration": {
+      "description": "A task's own terminal declaration, projected from its durable TaskFinished stop. This is not verification evidence and does not replace session lifecycle.",
+      "type": "string",
+      "enum": [
+        "answered",
+        "completed"
+      ]
     },
     "UiToolAggregate": {
       "description": "Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration.",

@@ -21,7 +21,7 @@ use leveler_protocol::{AnthropicMessagesAdapter, OpenAiChatAdapter};
 
 use crate::catalog::ModelConfigFile;
 use crate::config::ProviderConfig;
-use crate::transport::{RequestBudget, response_to_byte_stream, send_with_retry};
+use crate::transport::{RequestBudget, response_to_byte_stream, send_once};
 
 /// A fully-wired provider: config, resolved API key, HTTP client, adapter.
 struct Provider {
@@ -167,7 +167,12 @@ impl ProviderRegistry {
             thinking_supports_forced_tool_choice: profile
                 .compatibility
                 .thinking_supports_forced_tool_choice,
-            passback_reasoning_content: profile.compatibility.passback_reasoning_content,
+            // The route's protocol and declared compatibility resolve the
+            // replay contract once, here; nothing downstream re-decides it.
+            reasoning_replay: leveler_model::ReasoningReplayContract::resolve(
+                profile.protocol,
+                &profile.compatibility,
+            ),
         }
     }
 
@@ -213,7 +218,10 @@ impl ModelRuntime for ProviderRegistry {
             let encoded = provider
                 .adapter
                 .encode_request(&request, &context, true)
-                .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()))?;
+                .map_err(|e| {
+                    ModelError::new(ModelErrorKind::InvalidRequest, e.to_string())
+                        .with_delivery_state(leveler_model::DeliveryState::NotSent)
+                })?;
             // Apply protocol-supplied headers (e.g. Anthropic's `x-api-key` /
             // `anthropic-version`); the transport only reads `context.extra_headers`.
             context
@@ -221,12 +229,11 @@ impl ModelRuntime for ProviderRegistry {
                 .extend(encoded.headers.iter().cloned());
             let url = Self::endpoint(&context.base_url, &encoded.path);
 
-            let response = send_with_retry(
+            let response = send_once(
                 provider.client_for(request.transport),
                 &url,
                 &encoded.body,
                 &context,
-                &provider.config.retry,
                 // Streaming relies on the client's idle read timeout, but a caller
                 // that set a deadline still owns the clock for its own request.
                 request
@@ -248,7 +255,7 @@ impl ModelRuntime for ProviderRegistry {
             let started =
                 futures::stream::once(async move { Ok(ModelEvent::MessageStarted { request_id }) });
             let stream: ModelEventStream = Box::pin(started.chain(decoded));
-            Ok(stream)
+            Ok(cancellable_stream(stream, cancellation, request.deadline))
         }
         .await;
         out.map_err(|error: ModelError| error.with_provider(provider_id).with_model(model_id))
@@ -270,7 +277,7 @@ impl ModelRuntime for ProviderRegistry {
             let encoded = provider
                 .adapter
                 .encode_request(&request, &context, false)
-                .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()))?;
+                .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()).with_delivery_state(leveler_model::DeliveryState::NotSent))?;
             // Apply protocol-supplied headers (see `stream`); the transport only
             // reads `context.extra_headers`.
             context
@@ -278,12 +285,11 @@ impl ModelRuntime for ProviderRegistry {
                 .extend(encoded.headers.iter().cloned());
             let url = Self::endpoint(&context.base_url, &encoded.path);
 
-            let response = send_with_retry(
+            let response = send_once(
                 provider.client_for(request.transport),
                 &url,
                 &encoded.body,
                 &context,
-                &provider.config.retry,
                 // The caller's deadline wins over the generic default when it has
                 // one — including when it is LONGER. A completion gate that budgets
                 // 180s was previously cut at the 120s default and restarted from
@@ -300,10 +306,11 @@ impl ModelRuntime for ProviderRegistry {
             )
             .await?;
 
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| crate::transport::map_reqwest_error(&e))?;
+            let body = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(ModelError::cancelled()),
+                result = response.bytes() => result.map_err(|e| crate::transport::map_reqwest_error(&e))?,
+            };
 
             let mut decoded = provider
                 .adapter
@@ -432,7 +439,6 @@ mod adapter_tests {
             api_key: None,
             headers: Default::default(),
             timeouts: Default::default(),
-            retry: Default::default(),
         }
     }
 
@@ -531,4 +537,27 @@ mod limits_tests {
             Err(RegistryError::InvalidLimits { .. })
         ));
     }
+}
+
+/// The returned stream owns cancellation after the HTTP headers have arrived.
+fn cancellable_stream(
+    stream: ModelEventStream,
+    cancellation: CancellationToken,
+    deadline: Option<std::time::Instant>,
+) -> ModelEventStream {
+    Box::pin(futures::stream::unfold(
+        Some((stream, cancellation)),
+        move |state| async move {
+            let (mut stream, cancellation) = state?;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Some((Err(ModelError::cancelled()), None)),
+                _ = async { match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending().await,
+                }} => Some((Err(ModelError::new(ModelErrorKind::Timeout, "model request deadline elapsed")), None)),
+                event = stream.next() => event.map(|event| (event, Some((stream, cancellation)))),
+            }
+        },
+    ))
 }

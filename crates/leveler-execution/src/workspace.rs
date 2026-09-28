@@ -242,6 +242,34 @@ impl Workspace {
                 Some(root.as_path())
             }
             WriteScope::Unrestricted => None,
+            WriteScope::ScopedWorkspace {
+                root,
+                allowed,
+                excluded,
+            } => {
+                if cfg!(not(unix)) {
+                    return Err(WorkspaceError::OutsideWorkspace(
+                        "this host cannot verify scoped inode write authority".into(),
+                    ));
+                }
+                let path = self.resolve_bounded(input, Some(root), PathAccess::Write)?;
+                if !allowed.iter().any(|p| path.starts_with(p))
+                    || excluded.iter().any(|p| path.starts_with(p))
+                {
+                    return Err(WorkspaceError::no_write_scope(&path));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if std::fs::metadata(&path)
+                        .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() > 1)
+                    {
+                        crate::command::validate_scoped_hardlinks(root, allowed, excluded)
+                            .map_err(|error| WorkspaceError::OutsideWorkspace(error.to_string()))?;
+                    }
+                }
+                return Ok(path);
+            }
         };
         self.resolve_bounded(input, bound, PathAccess::Write)
     }
@@ -1053,5 +1081,21 @@ mod scope_split_tests {
         );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&other).ok();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn scoped_file_tools_reject_a_hardlinked_write_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("owned")).unwrap();
+        std::fs::write(dir.path().join("foreign"), "original").unwrap();
+        std::fs::hard_link(dir.path().join("foreign"), dir.path().join("owned/alias")).unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let root = ws.root().to_path_buf();
+        let scope = WriteScope::ScopedWorkspace {
+            allowed: vec![root.join("owned")],
+            root,
+            excluded: Vec::new(),
+        };
+        assert!(ws.resolve_for_write("owned/alias", &scope).is_err());
     }
 }

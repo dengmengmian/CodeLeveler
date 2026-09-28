@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 
 use leveler_core::ToolCallId;
-use leveler_model::{FinishReason, ModelError, ModelErrorKind, ModelEvent, TokenUsage, ToolCall};
+use leveler_model::{
+    ContentPart, FinishReason, ModelError, ModelErrorKind, ModelEvent, TokenUsage, ToolCall,
+};
 
 use super::wire::{
     BlockDelta, RespBlock, StreamContentBlockDelta, StreamContentBlockStart, StreamMessageDelta,
@@ -38,6 +40,7 @@ struct BlockState {
     tool: Option<(String, String)>,
     /// Accumulated `input_json_delta` fragments for a `tool_use` block.
     json: String,
+    content: Option<ContentPart>,
 }
 
 /// Stateful assembler consuming decoded Anthropic events and emitting unified
@@ -52,6 +55,7 @@ pub struct AnthropicStreamAssembler {
     input_tokens: u64,
     output_tokens: u64,
     cache_read: u64,
+    cache_creation: u64,
     completed: bool,
 }
 
@@ -66,6 +70,7 @@ impl Default for AnthropicStreamAssembler {
             input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
+            cache_creation: 0,
             completed: false,
         }
     }
@@ -97,10 +102,15 @@ impl AnthropicStreamAssembler {
             "message_start" => match serde_json::from_str::<StreamMessageStart>(data) {
                 Ok(m) => {
                     if let Some(u) = m.message.usage {
-                        self.input_tokens = u.input_tokens;
+                        self.input_tokens = u
+                            .input_tokens
+                            .saturating_add(u.cache_read_input_tokens)
+                            .saturating_add(u.cache_creation_input_tokens);
+                        self.output_tokens = u.output_tokens;
+                        self.cache_creation = u.cache_creation_input_tokens;
                         self.cache_read = u.cache_read_input_tokens;
                     }
-                    Vec::new()
+                    vec![self.usage_event()]
                 }
                 Err(e) => vec![decode_error(e)],
             },
@@ -130,6 +140,7 @@ impl AnthropicStreamAssembler {
                             BlockState {
                                 tool: Some((id.clone(), name.clone())),
                                 json: String::new(),
+                                content: None,
                             },
                         );
                         vec![ModelEvent::ToolCallStarted {
@@ -138,9 +149,45 @@ impl AnthropicStreamAssembler {
                             name: (!name.is_empty()).then_some(name),
                         }]
                     }
-                    _ => {
-                        self.blocks.insert(s.index, BlockState::default());
-                        Vec::new()
+                    other => {
+                        let content = match other {
+                            RespBlock::Text { text } => Some(ContentPart::Text { text }),
+                            RespBlock::Thinking {
+                                thinking,
+                                signature,
+                            } => Some(ContentPart::SignedReasoning {
+                                text: thinking,
+                                signature,
+                            }),
+                            RespBlock::RedactedThinking { data } => {
+                                Some(ContentPart::RedactedReasoning { data })
+                            }
+                            _ => None,
+                        };
+                        let events = match &content {
+                            Some(ContentPart::Text { text }) if !text.is_empty() => {
+                                vec![ModelEvent::TextDelta {
+                                    delta: text.clone(),
+                                }]
+                            }
+                            Some(ContentPart::SignedReasoning { text, .. }) if !text.is_empty() => {
+                                vec![ModelEvent::ReasoningDelta {
+                                    delta: text.clone(),
+                                }]
+                            }
+                            Some(ContentPart::RedactedReasoning { data }) if !data.is_empty() => {
+                                vec![ModelEvent::ReasoningMetadata { bytes: data.len() }]
+                            }
+                            _ => Vec::new(),
+                        };
+                        self.blocks.insert(
+                            s.index,
+                            BlockState {
+                                content,
+                                ..BlockState::default()
+                            },
+                        );
+                        events
                     }
                 },
                 Err(e) => vec![decode_error(e)],
@@ -148,10 +195,52 @@ impl AnthropicStreamAssembler {
             "content_block_delta" => match serde_json::from_str::<StreamContentBlockDelta>(data) {
                 Ok(d) => match d.delta {
                     BlockDelta::TextDelta { text } if !text.is_empty() => {
+                        if let Some(BlockState {
+                            content: Some(ContentPart::Text { text: accumulated }),
+                            ..
+                        }) = self.blocks.get_mut(&d.index)
+                        {
+                            accumulated.push_str(&text);
+                        }
                         vec![ModelEvent::TextDelta { delta: text }]
                     }
                     BlockDelta::ThinkingDelta { thinking } if !thinking.is_empty() => {
+                        if let Some(BlockState {
+                            content: Some(ContentPart::SignedReasoning { text, .. }),
+                            ..
+                        }) = self.blocks.get_mut(&d.index)
+                        {
+                            text.push_str(&thinking);
+                        }
                         vec![ModelEvent::ReasoningDelta { delta: thinking }]
+                    }
+                    BlockDelta::SignatureDelta { signature } => {
+                        if let Some(BlockState {
+                            content:
+                                Some(ContentPart::SignedReasoning {
+                                    signature: accumulated,
+                                    ..
+                                }),
+                            ..
+                        }) = self.blocks.get_mut(&d.index)
+                        {
+                            if accumulated.len().saturating_add(signature.len())
+                                > MAX_TOOL_ARGUMENT_BYTES
+                            {
+                                self.tool_arguments_overflowed = true;
+                                return vec![stream_limit_error(
+                                    "thinking signature exceeded retention limit".into(),
+                                )];
+                            }
+                            accumulated.push_str(&signature);
+                        }
+                        if signature.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![ModelEvent::ReasoningMetadata {
+                                bytes: signature.len(),
+                            }]
+                        }
                     }
                     BlockDelta::InputJsonDelta { partial_json } => {
                         if self.tool_arguments_overflowed {
@@ -188,11 +277,10 @@ impl AnthropicStreamAssembler {
                     if let Some(u) = m.usage {
                         self.output_tokens = u.output_tokens;
                     }
-                    let reason = m
-                        .delta
-                        .stop_reason
-                        .unwrap_or_else(|| "end_turn".to_string());
-                    self.finalize(&reason)
+                    match m.delta.stop_reason {
+                        Some(reason) => self.finalize(&reason),
+                        None => vec![self.usage_event()],
+                    }
                 }
                 Err(e) => vec![decode_error(e)],
             },
@@ -209,16 +297,7 @@ impl AnthropicStreamAssembler {
             return Vec::new();
         }
         self.completed = true;
-        let mut events = vec![ModelEvent::UsageUpdated {
-            usage: TokenUsage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                cached_input_tokens: self.cache_read,
-                // See the non-streaming path: no provider-reported reasoning
-                // breakdown exists in this protocol.
-                reasoning_tokens: None,
-            },
-        }];
+        let mut events = vec![self.usage_event()];
 
         // Once the response crossed the global argument budget, do not turn any
         // partially retained data into executable calls. The decode error was
@@ -231,7 +310,18 @@ impl AnthropicStreamAssembler {
             return events;
         }
 
+        let mut content = Vec::new();
         for (index, block) in std::mem::take(&mut self.blocks) {
+            if let Some(part) = block.content {
+                if matches!(&part, ContentPart::SignedReasoning { signature, .. } if signature.is_empty())
+                {
+                    events.push(stream_limit_error(
+                        "thinking block is missing its replay signature".into(),
+                    ));
+                    return events;
+                }
+                content.push(part);
+            }
             let Some((id, name)) = block.tool else {
                 continue;
             };
@@ -251,13 +341,13 @@ impl AnthropicStreamAssembler {
                     } else {
                         id
                     };
-                    events.push(ModelEvent::ToolCallCompleted {
-                        call: ToolCall {
-                            id: ToolCallId::new(id),
-                            name,
-                            arguments,
-                        },
-                    });
+                    let call = ToolCall {
+                        id: ToolCallId::new(id),
+                        name,
+                        arguments,
+                    };
+                    content.push(ContentPart::ToolCall { call: call.clone() });
+                    events.push(ModelEvent::ToolCallCompleted { call });
                 }
                 Err(e) => {
                     let error = if reason == "max_tokens" {
@@ -280,10 +370,25 @@ impl AnthropicStreamAssembler {
             }
         }
 
+        events.push(ModelEvent::MessageContent { content });
         events.push(ModelEvent::MessageCompleted {
             finish_reason: map_stop_reason(reason),
         });
         events
+    }
+
+    fn usage_event(&self) -> ModelEvent {
+        ModelEvent::UsageUpdated {
+            usage: TokenUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                cached_input_tokens: self.cache_read,
+                cache_creation_input_tokens: self.cache_creation,
+                // See the non-streaming path: no provider-reported reasoning
+                // breakdown exists in this protocol.
+                reasoning_tokens: None,
+            },
+        }
     }
 
     /// Whether a terminal `MessageCompleted` has already been emitted.
@@ -311,6 +416,83 @@ fn stream_limit_error(message: String) -> ModelEvent {
 mod tests {
     use super::*;
 
+    #[test]
+    fn signed_stream_preserves_empty_thinking_signature_and_block_order() {
+        let mut a = AnthropicStreamAssembler::new();
+        let start = a.on_event("message_start", r#"{"message":{"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}}}"#);
+        assert!(
+            matches!(&start[0], ModelEvent::UsageUpdated { usage } if usage.input_tokens == 60 && usage.cache_creation_input_tokens == 30)
+        );
+        a.on_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        );
+        a.on_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"signature_delta","signature":"opaque-"}}"#,
+        );
+        a.on_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"signature_delta","signature":"signature"}}"#,
+        );
+        a.on_event(
+            "content_block_start",
+            r#"{"index":1,"content_block":{"type":"text","text":""}}"#,
+        );
+        a.on_event(
+            "content_block_delta",
+            r#"{"index":1,"delta":{"type":"text_delta","text":"answer"}}"#,
+        );
+        a.on_event(
+            "content_block_start",
+            r#"{"index":2,"content_block":{"type":"redacted_thinking","data":"opaque-redaction"}}"#,
+        );
+        let events = a.on_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+        );
+        let content = events
+            .iter()
+            .find_map(|event| match event {
+                ModelEvent::MessageContent { content } => Some(content),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            content,
+            &vec![
+                ContentPart::SignedReasoning {
+                    text: String::new(),
+                    signature: "opaque-signature".into()
+                },
+                ContentPart::Text {
+                    text: "answer".into()
+                },
+                ContentPart::RedactedReasoning {
+                    data: "opaque-redaction".into()
+                },
+            ]
+        );
+    }
+    #[test]
+    fn missing_thinking_signature_is_not_a_replayable_success() {
+        let mut a = AnthropicStreamAssembler::new();
+        a.on_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"thinking","thinking":"thought"}}"#,
+        );
+        let events = a.on_event("message_delta", r#"{"delta":{"stop_reason":"end_turn"}}"#);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::Error { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::MessageCompleted { .. }))
+        );
+    }
     #[test]
     fn text_deltas_are_emitted() {
         let mut a = AnthropicStreamAssembler::new();
@@ -391,7 +573,7 @@ mod tests {
         let ModelEvent::UsageUpdated { usage } = &evs[usage_at] else {
             unreachable!()
         };
-        assert_eq!(usage.input_tokens, 85);
+        assert_eq!(usage.input_tokens, 149);
         assert_eq!(usage.output_tokens, 32);
         assert_eq!(usage.cached_input_tokens, 64);
     }

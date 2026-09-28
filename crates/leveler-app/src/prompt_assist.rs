@@ -33,6 +33,11 @@ pub(crate) async fn generate(
     kind: AssistKind,
     cancellation: CancellationToken,
 ) -> Option<GeneratedAssist> {
+    // A switched-off affordance makes no model call at all: the user's
+    // `[assist]` setting is the authority, not the UI's idle timer.
+    if !app.assist_enabled(kind) {
+        return None;
+    }
     let db = app.open_database().await.ok()?;
     let raw = leveler_engine::RawTranscript::load_lossy(&db, session_id)
         .await
@@ -71,16 +76,46 @@ pub(crate) async fn generate(
         ),
     };
     let prompt = format!("{instruction}\n\nContext:\n{context}");
-    let mut request = ModelRequest::new(model, vec![Message::text(Role::User, prompt)]);
+    let mut request = ModelRequest::new(model.clone(), vec![Message::text(Role::User, prompt)]);
     request.tool_choice = ToolChoice::None;
     request.max_output_tokens = Some(max_output_tokens);
     request.temperature = Some(0.2);
+    // An idle UI affordance is a small bounded task: it asks for the lowest
+    // useful effort rather than inheriting a coding model's configured Max.
+    request.reasoning_effort = Some(leveler_model::ReasoningEffort::Low);
 
-    let response =
+    let started = std::time::Instant::now();
+    let outcome =
         tokio::time::timeout(ASSIST_TIMEOUT, app.registry.generate(request, cancellation))
             .await
-            .ok()?
-            .ok()?;
+            .map_err(|_| {
+                leveler_model::ModelError::new(
+                    leveler_model::ModelErrorKind::Timeout,
+                    "assist timed out",
+                )
+            })
+            .and_then(|result| result);
+    let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let kind = match kind {
+        AssistKind::PromptSuggestion => leveler_storage::ModelCallKind::PromptSuggestion,
+        AssistKind::AwaySummary => leveler_storage::ModelCallKind::AwaySummary,
+    };
+    crate::observability::record_auxiliary_call(
+        app,
+        &db,
+        session_id,
+        kind,
+        &model.provider,
+        &model.model,
+        Some("low"),
+        &outcome,
+        latency_ms,
+        None,
+        None,
+    )
+    .await
+    .ok()?;
+    let response = outcome.ok()?;
     let text = normalize_prediction(&response.message.text_content(), max_chars)?;
     Some(GeneratedAssist {
         text,

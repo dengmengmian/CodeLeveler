@@ -1,3 +1,5 @@
+import type { UiTaskDeclaration } from '../types/protocol';
+
 // Project → Sessions: one selected repository path owns the session list.
 // Identity is the canonical repo path. Not a ProjectId.
 
@@ -28,7 +30,7 @@ export type SessionStatusKind =
   | 'incomplete'
   | 'idle';
 
-export function sessionStatusCue(status: string): {
+export function sessionStatusCue(status: string, declaration?: UiTaskDeclaration | null): {
   kind: SessionStatusKind;
   label: string;
 } {
@@ -38,7 +40,7 @@ export function sessionStatusCue(status: string): {
     case 'failed':
       return { kind: 'failed', label: 'Failed' };
     case 'completed':
-      return { kind: 'completed', label: 'Completed' };
+      return { kind: 'completed', label: declaration === 'answered' ? '已回答' : declaration === 'completed' ? '声明完成' : '已结束' };
     case 'blocked':
       return { kind: 'blocked', label: 'Blocked' };
     case 'interrupted':

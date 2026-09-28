@@ -217,12 +217,13 @@ function WorkspaceGroup({
                     state.current.pendingClarifications.length > 0);
                 const cue = liveWait
                   ? { kind: 'waiting' as const, label: 'Waiting' }
-                  : sessionStatusCue(s.status);
+                  : sessionStatusCue(s.status, s.declaration);
                 const showStatus =
                   cue.kind === 'running' ||
                   cue.kind === 'waiting' ||
                   cue.kind === 'failed' ||
-                  cue.kind === 'blocked';
+                  cue.kind === 'blocked' ||
+                  cue.kind === 'completed';
                 return (
                   <button
                     key={s.id}

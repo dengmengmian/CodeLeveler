@@ -100,6 +100,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
         request_id: RequestId::generate(),
         message: Message {
+            origin: None,
             role: Role::Assistant,
             content: vec![ContentPart::ToolCall {
                 call: ToolCall {
@@ -244,6 +245,7 @@ async fn run_chat_turn(
                     TurnInput::Content {
                         prior: Vec::new(),
                         content: vec![ContentPart::Text { text: text.into() }],
+                        origin: leveler_model::TranscriptOrigin::UserInput,
                     },
                     true,
                     h.session.clone(),

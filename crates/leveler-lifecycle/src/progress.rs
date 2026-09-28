@@ -48,6 +48,12 @@ impl Default for ProgressCaps {
 /// Cross-round progress bookkeeping for one drive (and optionally continue).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProgressLedger {
+    /// Goal/root-turn whose request facts own these budget totals.
+    #[serde(default)]
+    pub budget_scope: Option<String>,
+    /// A request in this task epoch had no auditable price. A cost cap cannot admit more spend.
+    #[serde(default)]
+    pub has_unpriced_model_attempt: bool,
     pub round: u32,
     pub last_progress_round: u32,
     pub no_progress_streak: u32,
@@ -67,9 +73,9 @@ pub struct ProgressLedger {
     /// Model tokens spent across continues/resumes of this task epoch.
     ///
     /// This is the number a token budget admits on. It is the durable
-    /// `model_requests` total for this session PLUS
-    /// [`Self::cumulative_estimated_model_tokens`] — subtract that and what
-    /// remains must equal the ledger exactly.
+    /// reported `model_requests` total for this budget scope PLUS
+    /// [`Self::cumulative_estimated_model_tokens`]. Resume rebuilds both from
+    /// invocation facts, so an interrupted progress flush cannot lose spend.
     #[serde(default)]
     pub cumulative_model_tokens: u64,
     /// The share of [`Self::cumulative_model_tokens`] that no provider
@@ -77,10 +83,9 @@ pub struct ProgressLedger {
     ///
     /// A gateway that returns zero usage must not silently switch the token
     /// budget off, so the loop bills a transcript estimate instead. That
-    /// estimate is an admission input, not an accounting fact, and it has no
-    /// durable row behind it. Carried separately so the two can never be
-    /// confused for one another: the ledger stays reconcilable, and a caller
-    /// that needs the audited figure subtracts this.
+    /// estimate is an admission input stored separately on the request row,
+    /// never provider-reported usage. Subtract it to recover the observed
+    /// token total without turning missing usage into a free call.
     #[serde(default)]
     pub cumulative_estimated_model_tokens: u64,
     /// `run_command` / `shell_command` executions across the epoch.
@@ -99,6 +104,10 @@ pub struct ProgressLedger {
     /// Keeps continue/resume from double-counting re-edits of the same file.
     #[serde(default)]
     pub cumulative_modified_paths: Vec<String>,
+    /// Scoped rule files discovered in this task epoch. Only source paths
+    /// survive recovery; their current contents are reloaded by the harness.
+    #[serde(default)]
+    pub scoped_rule_sources: Vec<String>,
     /// V2 background children still running when this snapshot was taken, as
     /// `id|nickname|role|scope` records. In-process children do not survive a
     /// restart: a resumed run reads this, tells the model truthfully which
@@ -210,6 +219,7 @@ impl ProgressLedger {
     /// its rounds, while its rows also carry the folds and advisory calls it
     /// made. Spend has one path in, and it is the record.
     pub fn absorb_child_work(&mut self, child: &ProgressLedger) {
+        self.has_unpriced_model_attempt |= child.has_unpriced_model_attempt;
         self.cumulative_model_steps = self
             .cumulative_model_steps
             .saturating_add(child.cumulative_model_steps);

@@ -3180,6 +3180,7 @@ fn summary(id: &str, goal: &str) -> leveler_client_protocol::UiSessionSummary {
         id: SessionId::new(id),
         goal: goal.into(),
         status: "completed".into(),
+        declaration: None,
         model: "deepseek/v3".into(),
         updated_at: "2026-07-08".into(),
         repository: None,
@@ -4452,7 +4453,7 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
     assert!(matches!(
         s.transcript.items().last(),
         Some(TranscriptItem::Recap(block))
-            if block.next_step == "提交当前改动"
+            if block.next_step.as_deref() == Some("提交当前改动")
     ));
     assert_eq!(s.prompt_suggestion.as_deref(), Some("提交当前改动"));
     assert!(s.composer.is_empty());

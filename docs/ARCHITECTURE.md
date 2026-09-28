@@ -302,7 +302,94 @@ Each model request receives a read-only projection of authoritative execution st
 
 The projection is attached only to the current request. It is not appended to durable conversation history or compaction summaries; continuation and recovery regenerate it from the existing owners. Context accounting and estimates for missing provider usage cover the projection actually sent. Elapsed time includes model calls, tools and approval waits, not just inference. Estimated tokens remain distinguishable, and absent limits are not reported as zero.
 
+Model requests separate the Harness's `ControlContext` from the conversation transcript. Control reuses named `PromptSegment` blocks with stability markers, carrying current contracts, project rules, selected skills, memory recall and request-local execution state. Fresh turns and recovery share one assembly entry point. Protocol adapters encode control through their system channel, never as user intent. Accounting and compaction pressure include control, but history summaries only consume the transcript.
+
+The transcript holds actual user input, assistant output, tool calls and results, bounded protocol repairs and product-defined runtime notices. Control bodies are not persisted as conversation rows. A stored `role=user` is only the transport role. New user input and harness rows record `origin` on the message payload. Rows written before that field still load, and they are not rewritten. Discovered scoped-rule source paths live in the existing progress ledger; recovery reloads current files. Legacy sessions recover source paths from old System rows and discard their stale bodies without modifying the historical database. Unknown historical system text is not given contract or project-instruction authority. Unknown historical user text is not given user-intent authority. Memory retrieval and reasoning replay are unchanged. How each block may be interpreted is defined in §5.6.
+
+Every model attempt enters the existing request records and resource ledger before retry decisions, including failed attempts, reasoning-only interrupted streams, compaction summaries, and child calls. Missing usage or pricing does not mean free execution. Children, reviewers, and `/develop` stages consume the parent's residual budget; attempt records must not double-count retries. Cancellation and deadlines wake a silent model stream. Reasoning is generated content, so an interrupted reasoning-only stream is not eligible for a retry justified by no generation having started.
+
+Shared budget admission checks durable request facts for the same scope before each model request and retry; background children do not keep spending against their launch-time snapshot. Concurrent requests already sent settle with their actual reported usage. Admission blocks subsequent calls; it cannot undo spend already incurred.
+
+Request records retain their goal or root-turn `budget_scope`, with token estimates separate from observed provider usage. Recovery reconstructs model spend from that scope’s request facts, including attempts persisted before a progress event. Tasks and auxiliary calls outside that scope do not contribute, even in the same session. Paid turn-preparation summaries run after the Engine durably records the initiating turn. Legacy records with unprovable attribution must not reset previous spend to continue a capped task.
+
+Compaction pressure measures the actual next `RequestProjection` while retaining the raw transcript. In-turn, pre-turn, and resume paths share `ResolvedContextPolicy`; 24K is only a fallback for an undeclared window. Manual compaction may cut a context epoch only after a nonempty summary ends normally without tool calls. Rejection or failure preserves the previous transcript and checkpoints.
+
+Goal text and attachments enter the same durable Goal turn; media cannot downgrade it to Chat. A natural Answered stop means that the model answered. Session lists project the latest `TaskFinished.stop` as answered or declared complete without changing session lifecycle or treating a declaration as verification.
+
+Observed response text before a stream error, cancellation, or unexpected EOF is saved through the existing TranscriptSink as an incomplete assistant message. Host-owned `incomplete` metadata on that raw row supplies the reopened history projection. Unfinished tool arguments and unsigned reasoning are not committed as complete responses. A continuation checkpoint write failure preserves the concrete error, transcript, and active Goal and pauses as recoverable Interrupted rather than settling the Goal.
+
+Automatic summaries use the completion allowance resolved from model capabilities and execution policy. Empty, truncated, or tool-bearing summaries remain rejected; reasoning cannot substitute for the briefing body. Side questions measure one projection containing main context, side history, and the current question under the same context policy. Only an accepted summary may shorten that side request. Oversized or failed summary requests report failure while preserving history and never persist a main-task snapshot.
+
+
 The model owns strategy changes based on these facts. Tool activity does not establish goal progress; a Plan remains a declaration, not completion evidence. The kernel does not infer stagnation from missing commits, unchanged plan steps, or language-specific commands. Existing resource budgets, cancellation and terminal authority remain in force. Feedback neither adds model calls nor changes the default task deadline.
+
+### 5.6 Prompt / Context Authority
+
+`ControlContext` and the transcript are different channels. Inside control, blocks are still not the same kind of information. Each production `PromptSegment` records three separate facts:
+
+```text
+source      where the block was produced
+authority   how the model should interpret it
+lifecycle   how long it lives (session prefix, turn, one request, transcript, scoped)
+```
+
+Authority is not a single priority number. Instruction classes outrank each other. Facts, advisory context and external data are not instructions, so they are not ordered against instructions and are not overridden by a higher instruction rank.
+
+```text
+CoreContract
+        ↓
+explicit UserIntent
+        ↓
+ProjectInstruction
+        ↓
+UserSelectedProcedure
+
+RuntimeFact        observed state, not an instruction
+AdvisoryContext    may be stale; the model may re-check
+ExternalData       content to analyze, including imperatives inside it
+```
+
+`CoreContract` is the harness contract: permissions, tool protocol, evidence, completion, and product delivery. `UserIntent` is the current user objective and stays in the transcript, so it is not copied into control. `ProjectInstruction` is `AGENTS.md`, `.leveler/instructions.md`, and scoped repository rules. A project file cannot change permissions, ignore the user, or raise its own authority by what it says. A skill the user names is `UserSelectedProcedure`. The skill catalog is advisory, not the same class. Memory and a compaction summary are `AdvisoryContext`. A compaction summary is a model-written briefing of elided history, not a system fact. Tool results stay `Role::Tool`; their authority is `ExternalData`.
+
+Providers may change representation. OpenAI Chat sends control as a system message. Anthropic Messages sends it as the top-level system field. Neither encoding reorders segments or changes source or authority. Authority metadata is not serialized into the prompt.
+
+An old session's `Role::System` row is not a source. Known scoped-rule markers are paths; the current file is re-read and classified as `ProjectInstruction`. Any other historical system text stays unclassified. It is not promoted to `CoreContract` or `ProjectInstruction`, and the stored row is not rewritten.
+
+`Role::User` is not a source either. Only a transcript row recorded as user input is `UserIntent`. Protocol repairs (invalid JSON, an empty answer, a truncated or missing tool call, output continuation, an unresolved goal) are `CoreContract` with source `ProtocolRepair`. A child settlement or restart redelivery is `AdvisoryContext`, because the body is mainly another agent's result. Lost children, child recovery, an objective pin, and a goal checkpoint are `RuntimeFact`. A `/btw` side-question frame is `CoreContract`: it is that mode's product contract (no tools, no file edits, do not continue the main task). The person's question is quoted inside the same row, so the row is not `UserIntent` and it is not a `RuntimeFact`. Image bytes moved onto the user transport stay `ExternalData`. A compaction summary stays `AdvisoryContext`: new rows record `CompactionSummary`, and an old row is still recognized by its breadcrumb marker. A historical user row with no `origin` is `LegacyUser` / `Unclassified`. It is not promoted to `UserIntent` because the role is named user. Authority metadata is not written into the model prompt, and provider encoding does not change it.
+
+### 5.7 Context Lifecycle
+
+Two owners decide what one request contains, in order: the lifecycle decides which semantic blocks are still in the active surface, and `RequestProjection` decides whether and how those blocks enter the request on this route. Pressure is measured from the same result: a fold is triggered by the projection of **the request that is about to be sent**, including control context, tool schemas and the reasoning channel. Any path that estimates a request from transcript characters, or from a request shape without tools, is wrong: it drops a field the provider validates from the wire and understates both pressure and the ledger.
+
+How each kind of content lives:
+
+| Content | Active surface | Durable fact |
+| --- | --- | --- |
+| Control context (contract, project rules, skills, memory recall, execution state) | reassembled per request | persisted rows, if any, are not rewritten |
+| User objective | transcript head, re-pinned as `<objective>` on a fold | the user-input row |
+| Tool results | retained after the per-result cap, until a fold releases them | the original row |
+| Assistant visible text | until a fold releases it | the original row |
+| Historical reasoning | decided by the route's replay contract together with the retention policy | the original row |
+| Compaction summary | the briefing row a fold produced | the `CompactionSummary` row |
+| Scoped project rules (mid-transcript system rows) | **carried verbatim** across folds, never summarized | the original rows |
+
+Reasoning is a route fact, not a harness preference. When a route declares that it replays captured reasoning on tool-bearing requests, the tool exchange's reasoning is protocol content the provider validates: the requested retention policy cannot drop it, and the difference is recorded as `protocol_protected_turns` rather than being reported as an arm that took effect. The way old reasoning stops being re-sent is therefore the lifecycle releasing it — a fold moves it out of the active surface together with the rounds that carried it — not a standing policy that sends less of it. Conversely, a route with no reasoning channel sends none of it and reports captured versus carried; that changes neither the transcript nor the meaning later routes see.
+
+What a fold (`compact_messages`) does is fixed:
+
+- it runs only when the projected request is over the threshold;
+- the head is the system rows and the first user message; mid-transcript scoped rules are carried verbatim as standing constraints;
+- the tail working set is bounded by both a message count and a token budget, and never cuts into a tool exchange;
+- the elided middle is replaced by a model-written handoff briefing; the briefing is `AdvisoryContext`, not a system fact;
+- when no summary is available the fold says the detail is unavailable instead of implying the history survived;
+- a second fold merges and updates the existing briefing rather than restating it from scratch;
+- the raw transcript stays exactly the rows the runtime loaded; only the active surface shrinks, and resume rebuilds it from the persisted snapshot plus the exact tail, so released reasoning does not come back.
+
+The pressure formula: `threshold = min(quality_boundary, window - output_reservation - headroom)`, where an undeclared `quality_boundary` falls back to capacity. The fixed cost (control context plus tool schemas) is inside the projection, so the available dynamic budget is the threshold minus the fixed surface. Headroom defaults to 0: with no measured extra margin, no number is invented.
+
+Multiple agents follow the same rule: a parent receives a child's settlement (bounded), not its transcript, and a child's reasoning lifecycle belongs to that seat.
+
+Observability: every model call records its projected size and how much of it was reasoning (`projected_input_tokens`, `projected_reasoning_tokens`), and the live request's breakdown separates control, tool schemas, user/assistant text, reasoning, tool calls, tool results and compaction briefings — so "why is this segment still here?" is answered by the projection itself.
 
 ## 6. Agent Runtime: Keeping Agents Alive Reliably
 
@@ -758,11 +845,17 @@ Terminal (TaskFinished)
 
 `TaskFinished` is the only authoritative task terminal. Clients project completed, failed, or blocked results only from a persisted `TaskFinished`; final prose, turn completion, and background cleanup cannot substitute for it. If the terminal transaction did not commit, a client may surface only a recoverable error, never synthesize `Failed` or any other terminal.
 
-Once the authoritative result is committed, the Product must publish the user-visible terminal immediately. Only work already detached to an immutable task/run identity may continue afterward; it must not delay terminal visibility or move a client back into a running state. Session-scoped cleanup must snapshot its exact resource ids before publication. A continuation checkpoint belongs to the authoritative window boundary and is committed before `TaskFinished`, because letting it re-read “current session” afterward could absorb the next turn; failure to create that checkpoint fails the window instead of claiming it is safely resumable. A review configured as required may still produce completion warnings. Findings remain advisory model conclusions, not mechanical terminal verdicts; an advisory review must not block.
+Declarations, verification evidence, and lifecycle describe separate facts. File mutations do not promote `Answered` to `Completed`; `Completed` does not establish that formatting, builds, or tests passed. Shipping descriptions report observed verification only, or unknown when no evidence is attached. `Stalled` retains its stop reason and maps to resumable `Interrupted`, leaving outstanding goals unsettled. `/develop` requires its own Review PASS and otherwise stops at a resumable boundary; this workflow contract does not make ordinary advisory reviews blocking.
+
+Once the authoritative result is committed, the Product must publish the user-visible terminal immediately. Only work already detached to an immutable task/run identity may continue afterward; it must not delay terminal visibility or move a client back into a running state. Session-scoped cleanup must snapshot its exact resource ids before publication. A continuation checkpoint belongs to the authoritative window boundary and is committed before `TaskFinished`, because letting it re-read “current session” afterward could absorb the next turn; failure to create that checkpoint preserves the concrete error and pauses the window as recoverable `Interrupted`, retaining the owed Goal. It must not claim a successful checkpoint; a later resume rebuilds from canonical facts. A review configured as required may still produce completion warnings. Findings remain advisory model conclusions, not mechanical terminal verdicts; an advisory review must not block.
 
 A background process chooses its cleanup boundary explicitly when it starts. The default `goal` lifetime is reaped when its creating goal reaches a terminal state. Only an explicit user request for a server or watcher to remain alive after task completion selects the `runtime` lifetime. Both retain the creating session as owner and remain observable and stoppable through the same background-task interface; `runtime` skips only goal-terminal cleanup and is still settled on process exit, explicit stop, or runtime shutdown.
 
-Incremental background-task observation belongs to the process capability. `observe` validates reader positions, registers change notifications and delivers bounded output under the same task lock. New output, a non-running status, or the bounded wait interval can return control. Explicit cursors are independent and do not advance the default reader; truncated history reports a gap and undelivered bytes remain available. `wait_task` only adapts arguments and model-facing output; `get_task` reads the full retained log. Output arrival never satisfies completion-only `wait` or causes early settlement.
+Write ownership becomes an operating-system execution boundary before dispatch, including allowed paths and paths exclusively owned by other executors. Unsupported enforcement fails closed instead of granting workspace-wide writes. Mutation settlement observes only the enforced scope; whole-tree diffs, filtering other executors' changes, and whole-tree rollback are not permission enforcement. A background workload ends in this order: the entire workload exits, mutations settle, then its terminal state is published. Parent-shell exit is insufficient. Log access, waiting, and stopping require the creating session; later turns in that session may operate the task, but a task id alone grants no cross-session access.
+
+Live stdout/stderr channels and line buffers have capacity limits. Pipes remain drained when a consumer falls behind, and dropped bytes explicitly mark output as truncated. Tool results retain exit codes, errors, and sandbox facts; they do not interpret connection refusal as a non-code problem or prescribe escalation or another tool call.
+
+Incremental background-task observation belongs to the process capability. `observe` validates reader positions, registers change notifications and delivers bounded output under the same task lock. New output, a non-running status, or the bounded wait interval can return control. Explicit cursors are independent and do not advance the default reader; truncated history reports a gap and undelivered bytes remain available. `wait_task` only adapts arguments and model-facing output; `get_task` reads the full retained log. Its model-facing contract is a terminal wait: it blocks for a status change, the caller's timeout or cancellation, then delivers the accumulated delta in one result, so observing a long task costs one model round rather than one per interval. Output arrival never satisfies completion-only `wait` or causes early settlement.
 
 Terminal settlement facts remain immutable for the lifetime of the task record: reading must not consume a permission violation or make another reader see success. Mutation paths and snapshots may be reported once, but the delivery marker does not change the settlement facts.
 
@@ -882,6 +975,18 @@ Available Capability
 This is capability negotiation.
 
 It lets the same architecture work across different models, machines, and execution environments.
+
+### 12.3 Declared Facts vs Harness Policy
+
+A model profile declares FACTS: the context window, the completion the model can produce, the quality boundary past which long-context recall is expected to degrade, the protocol it speaks, and that protocol's compatibility quirks.
+
+It does not declare how much of that capacity the harness spends. The completion reservation, the safety headroom, the pressure threshold at which old history is folded, and the recent-tail retention budget are HARNESS POLICY, resolved per seat from those facts. Keeping them out of the profile is what lets two seats spend one model's window differently without inventing a second model.
+
+Replay obeys the same split. A route's reasoning-replay contract — when captured reasoning is carried back, and what an assistant turn that captured none carries — is resolved from the protocol and its compatibility facts, never from a model or provider name.
+
+Anthropic thinking is selected by declared `reasoning.style`: `adaptive_thinking` or `budgeted_thinking` with explicit `budget_tokens`. The adapter validates the budget against the output cap and preserves signed and redacted thinking blocks in their original order. It does not fabricate a signature or replay unsigned text as signed thinking. Cache reads and writes are normalized into total input usage; cache-write cost remains unknown when the pricing profile cannot express its tariff.
+
+The provider-visible request is then produced by ONE projection owner: the semantic conversation goes in, and the wire encoder and the context accounting both read the same result. An estimate standing in for a missing provider usage figure is an estimate of that projection, so "what was sent" and "what was counted" cannot diverge.
 
 ---
 

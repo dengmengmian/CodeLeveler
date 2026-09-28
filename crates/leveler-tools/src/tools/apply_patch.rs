@@ -20,7 +20,7 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 /// The exact grammar, with an example. A structured edit format has to be
 /// stated precisely or it is not a contract; unified diff is accepted as a
 /// compatibility adapter.
-const DESCRIPTION: &str = r#"Edit workspace files. Prefer this exact format:
+const DESCRIPTION: &str = r#"Edit workspace files with this patch document:
 
 *** Begin Patch
 <one or more file sections>
@@ -47,9 +47,9 @@ hunk is located inside that scope:
 To append new lines at the end of a file, use a hunk with only '+' lines and no
 context (no '@@', no ' '/'-' lines).
 Unified diff is also accepted for simple add/update/delete patches (`--- a/file`,
-`+++ b/file`, `@@ -1,3 +1,3 @@`). Do NOT use search/replace or merge-conflict
-markers ('=======', '<<<<<<<', '>>>>>>>'). Do NOT wrap the patch in markdown
-code fences (```). Paths are relative to the workspace root.
+`+++ b/file`, `@@ -1,3 +1,3 @@`). Search/replace blocks and merge-conflict
+markers ('=======', '<<<<<<<', '>>>>>>>') are not a patch. A markdown code
+fence is not part of the patch. Paths are relative to the workspace root.
 
 Example (add a function after an existing one):
 

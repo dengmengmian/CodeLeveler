@@ -19,11 +19,9 @@ reasoning:
   default_effort: max
 limits:
   context_window: 1048576
-  # Product-side folding budget, not a vendor quality claim.
+  # Quality bound: where long-context recall is expected to degrade. The
+  # effective fold threshold also reserves `max_output_tokens`.
   reliable_context: 786432
   max_output_tokens: 131072
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 1
-compatibility:
-  synthesize_tool_call_ids: true
-  drop_unsupported_fields: true

@@ -43,7 +43,7 @@ pub use limits::{
     ModelStepAdmission, ModelStepAdmissionInput, ModelStepLimits, SpentBefore,
     admit_next_model_step,
 };
-pub use model_round::{ModelRound, run_model_round};
+pub use model_round::{ModelRound, ModelRoundObserver, run_model_round, run_model_round_observed};
 pub use stop::{LoopStop, StopReason};
 pub use tool_runtime::{ToolOutcome, ToolRuntime, ToolRuntimeError, dispatch_calls};
 pub use usage::{UsageProjection, estimate_tokens};

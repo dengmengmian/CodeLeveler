@@ -10,16 +10,24 @@
 #   2. Global config: `~/.leveler/config.toml` (or `$LEVELER_HOME/config.toml`).
 #   3. Merge: repo WINS on id collision; global fills the gaps. `default_model`
 #      always comes from the global config.
-#   4. The selected model's `reliable_context` is the auto-compaction threshold
-#      (transcript is folded once its tokens exceed it).
+#   4. The auto-compaction threshold is decided by the HARNESS from the model's
+#      declared limits: `min(reliable_context, context_window
+#      - effective_request_output - context_headroom_tokens)`. `reliable_context`
+#      alone is a quality bound, not a capacity, and never authorizes a request
+#      that leaves no room for its own completion. The harness's headroom is an
+#      execution-policy knob (`ExecutionOverrides::context_headroom_tokens`),
+#      not a model fact.
 #
 # Most users need NOTHING here — just `~/.leveler/config.toml`:
 #
-#     default_model = "deepseek/deepseek-v4-pro"
+#     default_model = "deepseek/deepseek-flash"
+#     [assist]                      # idle UI affordances that spend a model call
+#     prompt_suggestions = true     #   predict the next user message while idle
+#     away_summary = true           #   one-line "welcome back" recap
 #     [providers.deepseek]
 #     base_url = "https://api.deepseek.com"
 #     api_key_env = "DEEPSEEK_API_KEY"
-#     [models."deepseek-v4-pro"]
+#     [models."deepseek-flash"]
 #     provider = "deepseek"
 #     context_window = 1048576      # official: 1M
 #     reliable_context = 786432     # optional explicit compaction threshold
@@ -33,8 +41,8 @@
 #     reasoning = true              # model can reason (drives UI rendering)
 #     reasoning_style = "thinking_flag"   # HOW to ask for it — see below
 #     reasoning_effort = "max"      # CodeLeveler default (provider default is high)
-#     # pricing is USD/MTok (CNY list price ÷ ~7.2; input = cache-miss):
-#     # pricing = { input_usd_per_mtok = 0.4167, output_usd_per_mtok = 0.8333 }
+#     # pricing is USD/MTok (DeepSeek off-peak; input = cache-miss):
+#     # pricing = { input_usd_per_mtok = 0.15, output_usd_per_mtok = 0.6 }
 #
 # Kimi Code (K3 / K2.8) — OpenAI-compatible, docs:
 # https://www.kimi.com/code/docs/kimi-code/models
@@ -68,8 +76,8 @@
 #     vision = true
 #     supports_temperature = false
 #
-# Use the file bundle below when you need advanced provider retry/timeouts,
-# compatibility quirk flags, or per-model instructions.
+# Use the file bundle below when you need advanced provider timeouts or
+# compatibility quirk flags.
 #
 # ══════════════════════════════════════════════════════════════════════════════
 # configs/providers/<id>.yaml — an upstream API endpoint
@@ -87,17 +95,13 @@ timeouts:
   connect_seconds: 20
   request_seconds: 600
   idle_stream_seconds: 120
-retry:
-  max_attempts: 3
-  initial_backoff_ms: 500
-  max_backoff_ms: 10000
 
 # ══════════════════════════════════════════════════════════════════════════════
 # configs/models/<id>.yaml — a concrete model (facts only)
 # ══════════════════════════════════════════════════════════════════════════════
-id: deepseek-v4-pro          # model id → referenced as `deepseek/deepseek-v4-pro`
+id: deepseek-flash           # model id → referenced as `deepseek/deepseek-flash`
 provider: deepseek           # must match a provider id above
-model_id: deepseek-v4-pro    # provider-side model name
+model_id: deepseek-flash     # provider-side model name
 protocol: openai_chat
 # NOTE: the `policy:` key is RETIRED (model tiers are gone). A leftover
 # `policy: ...` line is a hard config error — execution configuration is
@@ -130,6 +134,3 @@ limits:
   max_parallel_tool_calls: 0  # provider supports parallel calls; no published hard cap
 # Pricing is omitted because DeepSeek peak/off-peak and cache rates are
 # dynamic; a static USD/MTok value would produce false cost accounting.
-compatibility:
-  synthesize_tool_call_ids: true   # provider omits tool-call ids → synthesize them
-  drop_unsupported_fields: true

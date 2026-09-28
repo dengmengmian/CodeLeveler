@@ -40,8 +40,7 @@ impl Tool for ListFilesTool {
         "List the direct children of one directory, relative to the workspace \
          root (or any absolute path — reads are not confined to the workspace). \
          Directories are shown with a trailing `/`; dotfiles are included. This \
-         does not recurse — use `find_files` to search the tree and `grep` to \
-         search file contents."
+         does not recurse and does not search file contents."
     }
 
     fn input_schema(&self) -> serde_json::Value {

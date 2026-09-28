@@ -49,10 +49,10 @@ impl Tool for BlastRadiusTool {
     }
 
     fn description(&self) -> &'static str {
-        "Estimate the impact of changing a symbol: the files and functions that \
-         (transitively) reference it, grouped by hop distance. Precise via a \
-         language server (an ESTIMATE — static references miss dynamic dispatch). \
-         Use before a refactor; use find_references for just the direct sites."
+        "Report files and functions that reference a symbol, including transitive \
+         references, grouped by hop distance. Uses a language server. Static \
+         references miss dynamic dispatch, so the result is an estimate. \
+         `max_depth` limits the hops (default and maximum are enforced)."
     }
 
     fn input_schema(&self) -> serde_json::Value {

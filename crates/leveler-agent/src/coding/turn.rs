@@ -15,7 +15,7 @@ use leveler_engine::{
     TurnFailure, TurnPorts,
 };
 use leveler_lifecycle::{EvidenceLedger, ObjectiveAnchor, PlanState, ProgressLedger};
-use leveler_model::{ContentPart, Message, Role};
+use leveler_model::{ContentPart, Message, TranscriptOrigin};
 use leveler_storage::EventStore;
 
 use crate::coding::checkpoint::{CodingCheckpointContext, CodingCompactionCheckpoint};
@@ -29,6 +29,10 @@ pub enum TurnInput {
     /// bounded session history so multi-turn Goal can refer to earlier turns.
     Goal {
         goal: String,
+        /// Original user content, preserved in both WAL and transcript.
+        content: Vec<ContentPart>,
+        /// Recorded on the transcript row. Not inferred from `Role::User`.
+        origin: TranscriptOrigin,
         prior: Vec<Message>,
         goal_id: leveler_core::GoalId,
     },
@@ -55,6 +59,8 @@ pub enum TurnInput {
     Content {
         prior: Vec<Message>,
         content: Vec<ContentPart>,
+        /// Recorded on the transcript row. Not inferred from `Role::User`.
+        origin: TranscriptOrigin,
     },
 }
 
@@ -117,6 +123,8 @@ pub async fn drive_turn(
         turn_id,
         emitter,
         mut sink,
+        model_requests,
+        budget_scope,
         finished_children,
         resumed_children,
         lost_children,
@@ -186,6 +194,8 @@ pub async fn drive_turn(
         // Side-effect barrier: tool dispatch waits until the announcing
         // canonical events are durable in this turn's event log.
         .with_event_barrier(barrier)
+        .with_model_request_store(model_requests.clone(), session_id.clone())
+        .with_budget_scope(budget_scope.clone())
         // Ownership fence: after the barriers, before dispatch, the host
         // re-proves this runtime still owns the task. Inherited by delegated
         // child executors.
@@ -245,6 +255,29 @@ pub async fn drive_turn(
         }
     }
 
+    let inherited = executor.seeded_progress_for_budget();
+    let scoped_progress = persisted_budget_progress(events.as_ref(), &session_id, &budget_scope)
+        .await
+        .map_err(seed_failure)?;
+    if resumes_task_epoch
+        && scoped_progress.is_none()
+        && inherited.budget_scope.is_none()
+        && (inherited.cumulative_model_tokens > 0 || inherited.cumulative_cost_usd_micros > 0)
+        && (executor.budget_limits().max_model_tokens.is_some()
+            || executor.budget_limits().max_cost_usd_micros.is_some())
+    {
+        return Err(seed_failure(EngineError::Config("cannot reconstruct capped legacy task budget: request scope attribution is unavailable".into())));
+    }
+    let progress = reconcile_model_spend(
+        scoped_progress.unwrap_or_else(|| inherited.clone()),
+        model_requests.as_ref(),
+        &session_id,
+        &budget_scope,
+    )
+    .await
+    .map_err(seed_failure)?;
+    executor = executor.with_seeded_progress(progress);
+
     let resumable = crate::coding::child_session::load_resumable_children(
         events.as_ref(),
         &session_id,
@@ -271,29 +304,23 @@ pub async fn drive_turn(
     let result = match input {
         TurnInput::Goal {
             goal,
+            content,
+            origin,
             prior,
             goal_id: _,
         } => {
             let objective = leveler_lifecycle::ObjectiveAnchor::from_session_goal(goal.as_str());
-            if prior.is_empty() {
-                executor
-                    .with_objective(objective)
-                    .run_tracked(&goal, &mut forward, &mut sink, cancellation.clone())
-                    .await
-            } else {
-                // Multi-turn Goal: carry bounded history so deictic follow-ups
-                // ("刚才那个") resolve against prior work.
-                executor
-                    .with_objective(objective)
-                    .run_conversation_tracked(
-                        prior,
-                        vec![ContentPart::Text { text: goal }],
-                        &mut forward,
-                        &mut sink,
-                        cancellation.clone(),
-                    )
-                    .await
-            }
+            executor
+                .with_objective(objective)
+                .run_conversation_tracked(
+                    prior,
+                    content,
+                    origin,
+                    &mut forward,
+                    &mut sink,
+                    cancellation.clone(),
+                )
+                .await
         }
         TurnInput::Resume {
             mut prior,
@@ -307,6 +334,7 @@ pub async fn drive_turn(
             // turn's user input, and the transcript must match what the user
             // sent (the engine's write-ahead payload already names it for
             // crash recovery).
+            let continuation_request = instruction.as_ref().map(Message::text_content);
             if let Some(message) = instruction {
                 if let Err(error) =
                     TranscriptSink::append(&mut sink, std::slice::from_ref(&message)).await
@@ -314,26 +342,25 @@ pub async fn drive_turn(
                     return Err(unstarted_failure(AgentError::from(error)));
                 }
                 prior.push(message);
-                // The continuation message is the user's live instruction, and
-                // the goal-resolution contract asks for proof the user may have
-                // just withheld (`继续，但是先不要跑测试`). State the priority once
-                // so a later goal nudge cannot silently outrank the person. The
-                // note is transient: it is re-derived from the instruction on
-                // every continuation.
-                prior.push(Message::text(
-                    Role::System,
-                    "You are continuing an interrupted task. The user's continuation message \
-                     above is part of the objective and a binding constraint for this work \
-                     window; honor it as stated, even where the resolution contract would \
-                     otherwise ask for more.",
-                ));
+                // Resume rebuilds its control contract separately. The user's
+                // continuation remains the only new conversation message.
             }
             executor
                 .with_objective(objective)
-                .resume_tracked(prior, &mut forward, &mut sink, cancellation.clone())
+                .resume_tracked_with_instruction(
+                    prior,
+                    continuation_request.as_deref(),
+                    &mut forward,
+                    &mut sink,
+                    cancellation.clone(),
+                )
                 .await
         }
-        TurnInput::Content { prior, content } => {
+        TurnInput::Content {
+            prior,
+            content,
+            origin,
+        } => {
             let text = content_objective_text(&content);
             let objective = if is_goal_profile {
                 leveler_lifecycle::ObjectiveAnchor::from_session_goal(text)
@@ -345,6 +372,7 @@ pub async fn drive_turn(
                 .run_conversation_tracked(
                     prior,
                     content,
+                    origin,
                     &mut forward,
                     &mut sink,
                     cancellation.clone(),
@@ -372,6 +400,37 @@ struct CodingTurnSeeds {
     progress: Option<ProgressLedger>,
 }
 
+/// Rebuild model spend from durable invocation facts after a crash. Other
+/// mechanical counters remain owned by their existing progress events.
+pub(crate) async fn reconcile_model_spend(
+    mut progress: ProgressLedger,
+    store: &dyn leveler_storage::ModelRequestStore,
+    session_id: &SessionId,
+    scope: &str,
+) -> Result<ProgressLedger, EngineError> {
+    if progress.budget_scope.as_deref() != Some(scope) {
+        progress = ProgressLedger::default();
+    }
+    progress.budget_scope = Some(scope.to_string());
+    let records = store.load_for_budget_scope(session_id, scope).await?;
+    if records.is_empty() {
+        return Ok(progress);
+    }
+    progress.cumulative_model_tokens = 0;
+    progress.cumulative_estimated_model_tokens = 0;
+    progress.cumulative_cost_usd_micros = 0;
+    progress.has_unpriced_model_attempt = false;
+    for record in records {
+        progress.absorb_request_spend(
+            record.input_tokens.saturating_add(record.output_tokens),
+            record.estimated_tokens.unwrap_or(0),
+            record.cost_usd_micros.unwrap_or(0),
+        );
+        progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
+    }
+    Ok(progress)
+}
+
 async fn load_coding_seeds(
     events: &dyn EventStore,
     session_id: &SessionId,
@@ -384,7 +443,7 @@ async fn load_coding_seeds(
     })
 }
 
-fn seed_failure(error: EngineError) -> TurnFailure {
+pub(crate) fn seed_failure(error: EngineError) -> TurnFailure {
     TurnFailure {
         cancelled: false,
         stale_ownership: matches!(
@@ -479,6 +538,94 @@ async fn persisted_ledger(
             _ => None,
         },
     )
+}
+
+/// Rebuild the most recently scoped task budget for a host auxiliary call.
+/// Context-epoch resets carry no scope and do not erase task resource spend.
+pub async fn load_auxiliary_budget_progress(
+    turns: &dyn leveler_storage::TurnStore,
+    events: &dyn EventStore,
+    requests: &dyn leveler_storage::ModelRequestStore,
+    session: &SessionId,
+) -> Result<ProgressLedger, EngineError> {
+    let turns = turns.list_for_session(session).await?;
+    let Some(turn) = turns.last() else {
+        return Ok(ProgressLedger::default());
+    };
+    let continuation = turn
+        .payload
+        .as_deref()
+        .map(leveler_engine::decode_turn_continuation)
+        .transpose()?;
+    let scope = continuation
+        .as_ref()
+        .and_then(|c| c.goal_id.as_ref().map(ToString::to_string))
+        .or_else(|| {
+            continuation
+                .as_ref()
+                .and_then(|c| c.root_turn_id.as_ref().map(ToString::to_string))
+        })
+        .unwrap_or_else(|| turn.id.to_string());
+    let progress = persisted_budget_progress(events, session, &scope).await?;
+    if progress.is_none() {
+        // A new scoped row cannot replace known legacy spend from this same
+        // lineage. Unrelated older chats must not donate their debt, either.
+        let lineage: Vec<_> = turns
+            .iter()
+            .filter(|candidate| {
+                candidate.id == turn.id
+                    || candidate.id == scope
+                    || candidate
+                        .payload
+                        .as_deref()
+                        .and_then(|payload| leveler_engine::decode_turn_continuation(payload).ok())
+                        .is_some_and(|c| {
+                            c.goal_id.as_ref().is_some_and(|id| id.as_str() == scope)
+                                || c.root_turn_id
+                                    .as_ref()
+                                    .is_some_and(|id| id.as_str() == scope)
+                        })
+            })
+            .map(|turn| turn.id.as_str())
+            .collect();
+        for row in events.load(session).await? {
+            if row.event_type == "progress_updated"
+                && row
+                    .turn_id
+                    .as_deref()
+                    .is_some_and(|id| lineage.contains(&id))
+                && let EngineEvent::ProgressUpdated { ledger } =
+                    EngineEvent::from_payload(&row.payload)?
+                && ledger.budget_scope.is_none()
+                && (ledger.cumulative_model_tokens > 0
+                    || ledger.cumulative_cost_usd_micros > 0
+                    || ledger.cumulative_estimated_model_tokens > 0
+                    || ledger.has_unpriced_model_attempt
+                    || ledger.cumulative_duration_ms > 0)
+            {
+                return Err(EngineError::Config("cannot reconstruct legacy task budget: request scope attribution is unavailable".into()));
+            }
+        }
+    }
+    let progress = progress.unwrap_or_default();
+    reconcile_model_spend(progress, requests, session, &scope).await
+}
+
+pub(crate) async fn persisted_budget_progress(
+    events: &dyn EventStore,
+    session_id: &SessionId,
+    scope: &str,
+) -> Result<Option<ProgressLedger>, EngineError> {
+    for row in events.load(session_id).await?.into_iter().rev() {
+        if row.event_type == "progress_updated"
+            && let EngineEvent::ProgressUpdated { ledger } =
+                EngineEvent::from_payload(&row.payload)?
+            && ledger.budget_scope.as_deref() == Some(scope)
+        {
+            return Ok(Some(ledger));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) async fn last_persisted_progress(

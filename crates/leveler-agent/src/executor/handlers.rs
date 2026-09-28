@@ -405,8 +405,8 @@ impl Executor {
     ///
     /// The caller owns the `SubAgentStarted` / `SubAgentFinished` pair, exactly
     /// as `drive.rs` does for the model-facing entrance; the transient
-    /// progress/activity events are forwarded into `observer` when the child
-    /// returns.
+    /// progress/activity events are forwarded while the child runs; each
+    /// invocation is persisted by its sink before it can issue another.
     pub async fn run_reviewer_child(
         &self,
         id: String,
@@ -436,25 +436,30 @@ impl Executor {
         let reviewer_rounds = crate::sub_agent::ChildProfile::resolve(AgentRole::Reviewer)
             .max_rounds()
             .unwrap_or(0);
-        let result = self
-            .run_one_sub_agent_on(
-                id,
-                AgentRole::Reviewer,
-                leveler_lifecycle::ChildSpawnSpec {
-                    files,
-                    max_rounds: reviewer_rounds,
-                    model,
-                    ..Default::default()
-                },
-                None,
-                brief,
-                Arc::new(tokio::sync::Semaphore::new(1)),
-                progress_tx,
-                self.step_limits,
-                cancellation,
-                parent_wall,
-            )
-            .await;
+        let run = self.run_one_sub_agent_on(
+            id,
+            AgentRole::Reviewer,
+            leveler_lifecycle::ChildSpawnSpec {
+                files,
+                max_rounds: reviewer_rounds,
+                model,
+                ..Default::default()
+            },
+            None,
+            brief,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            progress_tx,
+            self.step_limits,
+            cancellation,
+            parent_wall,
+        );
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                Some(event) = progress_rx.recv() => observer(event),
+            }
+        };
         // The sender was moved into the call, so the channel is closed by now
         // and this drains what the child emitted while it ran.
         while let Ok(event) = progress_rx.try_recv() {
@@ -771,10 +776,11 @@ async fn run_prepared_sub_agent(
         _ => {}
     };
     let mut sink = SubAgentProgressSink::new(id, progress, child.event_barrier.clone());
+    sink.model_request_store = child.model_request_store.clone();
     // Box the recursive future (agent → spawn_agent → agent) so its size is
     // finite.
     let hook_token = cancellation.clone();
-    let outcome = match start {
+    let mut outcome = match start {
         ChildStart::Task(task) => {
             Box::pin(child.run(&task, &mut capture, &mut sink, cancellation)).await
         }
@@ -790,6 +796,19 @@ async fn run_prepared_sub_agent(
             }
         }
     };
+    if let Some(tasks) = &child.background_tasks
+        && let Err(error) = tasks
+            .settle_writer(
+                child.tool_context.session_scope(),
+                child.tool_context.writer_scope(),
+            )
+            .await
+    {
+        outcome = Err(leveler_engine::PortError::Persistence(format!(
+            "child background processes did not settle: {error}"
+        ))
+        .into());
+    }
     if hook_runner.has_lifecycle() {
         let ok = outcome.is_ok();
         hook_runner

@@ -35,9 +35,7 @@ enum StepStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct PlanItem {
-    /// The step text: a compact action + object (+ essential intent) that
-    /// stays scannable in a checklist rendered beside the running turn. Not a
-    /// paragraph of background, and not a bare category verb either.
+    /// Step text.
     step: String,
     /// One of `pending`, `in_progress`, `completed`.
     status: StepStatus,
@@ -77,42 +75,17 @@ impl Tool for UpdatePlanTool {
     }
 
     fn description(&self) -> &'static str {
-        "Record or update your task plan as a checklist: your declared plan and \
-         progress. Provide an optional explanation and a list of plan items, each \
-         with a `step` and a `status` (pending | in_progress | completed). At most \
-         one step may be in_progress at a time. It has no side effects on the \
-         workspace, and the plan shows exactly what you declare: nothing advances \
-         it for you.\n\n\
-         `in_progress` is the step you are working on now. `completed` means its \
-         outcome is true, as shown by a result you have already read — not that \
-         you attempted it or moved on to other work. A failed, denied or \
-         timed-out action completes nothing: the step stays in_progress \
-         while you retry or reach its outcome another way; if the step's goal \
-         itself changes, rewrite the step instead of completing it. The list order \
-         is the intended order, not a rule: a later step whose outcome is already \
-         true may be completed while an earlier one is still open.\n\n\
-         Call this again when your work moves on to another step, and when the \
-         plan itself changes: a step is no longer needed, the work splits \
-         differently, or a new fact adds a step. Send the whole list every \
-         time. After the last real tool work, send the whole final table before \
-         finishing. This is a freshness rule, not an all-completed rule: leave \
-         unfinished steps pending or in_progress.\n\n\
-         Keep each step at a readable density: the action, the object it acts \
-         on, and — only when it clarifies acceptance — the intent. A step that \
-         reads `fix the Windows subprocess fixture timing` is right; `fix \
-         Windows` is too thin to navigate by, and a full sentence of background, \
-         cwd, repository boilerplate or step-by-step implementation detail is \
-         too heavy for a checklist that stays on screen. There is no character \
-         limit: cut whatever does not help a reader tell this step apart from \
-         the next.\n\n\
-         Do NOT call this between the tool calls inside one step: a step that \
-         needs a read, two edits and a test run stays in_progress for all of \
-         them. One call per real step transition is right; one per tool call is \
-         waste.\n\n\
-         Statuses reflect your own judgement of the work, nothing else. If you \
-         finished several steps in one stretch, mark them all completed in one \
-         call. If you are unsure whether a step is done, leave it as it is — \
-         never mark a step completed to make the checklist look current."
+        "Replace the task checklist with the list in this call. No workspace \
+         side effect: the stored plan is exactly the items sent, and nothing \
+         else advances a status.\n\n\
+         Arguments: optional `explanation` (a note stored with this update) and \
+         `plan` (the ordered items). Each item has `step` (text) and `status` \
+         (`pending`, `in_progress`, or `completed`). The list must contain at \
+         least one item. At most one item may be `in_progress`; more than one \
+         is an error and the previous plan is left unchanged. Each call \
+         replaces the whole list.\n\n\
+         `pending` is not done. `in_progress` is the current item. `completed` \
+         is done. The tool does not check those claims."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -250,36 +223,28 @@ mod tests {
         assert!(out.content.contains("[ ] run tests"));
     }
 
-    /// The tool description is the model's only always-present copy of the
-    /// contract. "Use this to track progress" produced plans that were created
-    /// once and never updated again.
+    /// The description states what the call records. It does not say when to
+    /// call the tool.
     #[test]
-    fn the_description_says_when_to_call_again() {
+    fn the_description_states_the_record_and_not_when_to_call() {
         let d = UpdatePlanTool.description();
-        assert!(d.contains("Call this again"), "{d}");
+        assert!(d.contains("replaces the whole list"), "{d}");
+        assert!(d.contains("pending"), "{d}");
+        assert!(d.contains("in_progress"), "{d}");
+        assert!(d.contains("completed"), "{d}");
         assert!(
-            d.contains("at the \n         transition") || d.contains("transition"),
+            d.contains("at most one") || d.contains("At most one"),
             "{d}"
         );
-        assert!(d.contains("Do NOT call this between the tool calls"), "{d}");
-        assert!(
-            d.contains("never mark a step completed to make the checklist look current"),
-            "{d}"
-        );
-    }
-
-    /// The plan is permanent chrome, so the contract has to name a density:
-    /// action + object + essential intent. Without it the model wrote either
-    /// full task sentences or one-word category labels, and both read badly in
-    /// a dock that stays on screen for the whole turn.
-    #[test]
-    fn the_description_names_a_readable_step_density() {
-        let d = UpdatePlanTool.description();
-        assert!(d.contains("readable density"), "{d}");
-        assert!(d.contains("action, the object it acts"), "{d}");
-        assert!(d.contains("too thin to navigate by"), "{d}");
-        assert!(d.contains("too heavy for a checklist"), "{d}");
-        assert!(d.contains("There is no character limit"), "{d}");
+        for coaching in [
+            "Call this again",
+            "Do NOT call this between",
+            "After the last real tool",
+            "readable density",
+            "too thin to navigate",
+        ] {
+            assert!(!d.contains(coaching), "{coaching} still coaches: {d}");
+        }
     }
 
     /// The declared schema is what the provider validates. `update_plan` is the

@@ -1,0 +1,22 @@
+-- Record how much of the projected prompt was the historical-reasoning channel.
+--
+-- The runtime projects one provider-visible request and prices it with the one
+-- shared estimator; the reasoning channel is its own accounting category. This
+-- column durably carries that category for the model call, so "of this round's
+-- 66k input, how much was replayed thinking?" is answered from the ledger
+-- instead of by re-reading the session and re-counting offline.
+--
+--   projected_reasoning_tokens  NULL = no projection was measured for this
+--                               call (an auxiliary call such as a compaction
+--                               summary, or a row written before this
+--                               migration).
+--                               Some(0) = the request was projected and the
+--                               route carries no reasoning channel (or none was
+--                               in the active context).
+--                               Some(n) = the runtime's own estimate of the
+--                               replayed reasoning inside the request it sent.
+--
+-- A slice of the INPUT, and therefore a different figure from
+-- `reasoning_tokens`, which is a subset of the provider's OUTPUT. Old rows
+-- stay NULL rather than being backfilled with a number nobody measured.
+ALTER TABLE model_requests ADD COLUMN projected_reasoning_tokens INTEGER;

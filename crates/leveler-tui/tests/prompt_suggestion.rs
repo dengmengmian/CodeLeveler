@@ -110,6 +110,144 @@ fn a0_opening_an_idle_session_requests_an_initial_prediction() {
     )));
 }
 
+fn reopened_with_history() -> AppState {
+    let mut s = opened();
+    let mut session = snapshot();
+    session.messages.push(leveler_client_protocol::UiMessage {
+        id: MessageId::new("previous-answer"),
+        role: leveler_client_protocol::UiRole::Assistant,
+        text: "已创建 PR。".into(),
+        ordinal: None,
+        kind: None,
+        images: 0,
+    });
+    let effects = reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session }),
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Send(ClientCommand::QuerySessionHistory { .. })
+    )));
+    assert_eq!(prediction_requests(&effects), 0);
+    assert!(s.history_query.is_some());
+    s
+}
+
+fn prediction_requests(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::Send(ClientCommand::RequestPromptSuggestion { .. })
+            )
+        })
+        .count()
+}
+
+fn history_response(s: &AppState, empty: bool) -> RuntimeEvent {
+    RuntimeEvent::SessionHistoryLoaded {
+        query_id: s.history_query.clone(),
+        session_id: s.session_id.clone(),
+        omitted_turns: 0,
+        entries: if empty {
+            Vec::new()
+        } else {
+            vec![leveler_client_protocol::UiHistoryEntry {
+                turn_elapsed_ms: 0,
+                turn_start: false,
+                event: RuntimeEvent::TurnAnswered,
+            }]
+        },
+    }
+}
+
+#[test]
+fn restored_history_requests_one_prediction_even_when_entries_are_empty() {
+    for empty in [false, true] {
+        let mut s = reopened_with_history();
+        let response = history_response(&s, empty);
+        let effects = reduce(&mut s, Action::Runtime(response.clone()));
+        assert_eq!(prediction_requests(&effects), 1, "empty={empty}");
+        assert!(s.composer.is_empty());
+        assert_eq!(
+            prediction_requests(&reduce(&mut s, Action::Runtime(response))),
+            0
+        );
+
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::PromptSuggestion {
+                text: "PR 链接发一下".into(),
+            }),
+        );
+        assert!(composer_row(&frame(&mut s, 100, 24)).contains("Tab: PR 链接发一下"));
+        assert!(reduce(&mut s, key(KeyCode::Tab)).is_empty());
+        assert_eq!(s.composer.canonical_text(), "PR 链接发一下");
+    }
+}
+
+#[test]
+fn restored_history_does_not_request_a_prediction_after_input_or_while_busy() {
+    for guard in [
+        "draft",
+        "erased",
+        "busy",
+        "attachment",
+        "suggestion",
+        "error",
+    ] {
+        let mut s = reopened_with_history();
+        let response = history_response(&s, true);
+        match guard {
+            "draft" => typed(&mut s, "别的问题"),
+            "erased" => {
+                typed(&mut s, "x");
+                reduce(&mut s, key(KeyCode::Backspace));
+            }
+            "busy" => {
+                reduce(&mut s, Action::Runtime(busy()));
+            }
+            "attachment" => s.pending_attachments.push(image_attachment()),
+            "suggestion" => suggestion::offer(&mut s, NEXT_STEP),
+            "error" => s.status = RuntimeStatus::Error,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            prediction_requests(&reduce(&mut s, Action::Runtime(response))),
+            0,
+            "{guard}"
+        );
+    }
+}
+
+#[test]
+fn restored_history_requires_the_current_session_and_outstanding_query() {
+    for mismatch in ["session", "query", "missing-query"] {
+        let mut s = reopened_with_history();
+        let mut response = history_response(&s, true);
+        if let RuntimeEvent::SessionHistoryLoaded {
+            session_id,
+            query_id,
+            ..
+        } = &mut response
+        {
+            match mismatch {
+                "session" => *session_id = SessionId::new("other"),
+                "query" => *query_id = Some(leveler_client_protocol::CommandId::generate()),
+                "missing-query" => *query_id = None,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            prediction_requests(&reduce(&mut s, Action::Runtime(response))),
+            0,
+            "{mismatch}"
+        );
+    }
+}
+
 fn key(code: KeyCode) -> Action {
     Action::Key(KeyEvent::new(code, KeyModifiers::empty()))
 }
@@ -186,11 +324,15 @@ fn image_attachment() -> leveler_client_protocol::AttachmentRef {
 
 /// Complete a turn whose `update_goal` carried `status` and `next_step`.
 fn goal_turn(s: &mut AppState, status: &str, next_step: Option<&str>) {
-    let id = ToolCallId::new("goal");
     let mut args = serde_json::json!({ "status": status, "summary": "阶段一已经完成。" });
     if let Some(step) = next_step {
         args["next_step"] = serde_json::Value::String(step.to_string());
     }
+    goal_turn_with_args(s, args, true);
+}
+
+fn goal_turn_with_args(s: &mut AppState, args: serde_json::Value, ok: bool) {
+    let id = ToolCallId::new("goal");
     reduce(
         s,
         Action::Runtime(RuntimeEvent::ToolCallStarted {
@@ -206,7 +348,7 @@ fn goal_turn(s: &mut AppState, status: &str, next_step: Option<&str>) {
             exit_code: None,
             stop: None,
             id,
-            ok: true,
+            ok,
             preview: "目标已更新".into(),
             duration_ms: 10,
             applied_diff: None,
@@ -338,6 +480,88 @@ fn with_suggestion() -> AppState {
 }
 
 // ---- A. where the suggestion comes from ------------------------------------
+
+#[test]
+fn summary_only_recap_is_visible_without_a_next_step_or_ghost() {
+    for status in ["complete", "blocked"] {
+        for next_step in [
+            None,
+            Some(serde_json::json!("  \n  ")),
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(42)),
+        ] {
+            let mut s = opened();
+            let mut args = serde_json::json!({ "status": status, "summary": "阶段一已经完成。" });
+            if let Some(step) = &next_step {
+                args["next_step"] = step.clone();
+            }
+            goal_turn_with_args(&mut s, args, true);
+
+            assert!(
+                matches!(
+                    s.transcript.items().last(),
+                    Some(TranscriptItem::Recap(block))
+                        if block.summary.as_deref() == Some("阶段一已经完成。")
+                ),
+                "summary must produce a recap for {status} with {next_step:?}"
+            );
+            assert_eq!(s.prompt_suggestion, None);
+            assert!(s.composer.is_empty());
+            let text = frame(&mut s, 100, 24);
+            assert!(text.contains("回顾: 阶段一已经完成。"), "{text}");
+            assert!(!text.contains("下一步"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn next_step_only_recap_keeps_the_real_next_step_and_ghost() {
+    let mut s = opened();
+    goal_turn_with_args(
+        &mut s,
+        serde_json::json!({ "status": "complete", "next_step": NEXT_STEP }),
+        true,
+    );
+    assert!(matches!(
+        s.transcript.items().last(),
+        Some(TranscriptItem::Recap(_))
+    ));
+    assert_eq!(s.prompt_suggestion.as_deref(), Some(NEXT_STEP));
+    let text = frame(&mut s, 100, 24);
+    assert!(text.contains("回顾: 下一步："), "{text}");
+    assert!(text.contains(NEXT_STEP), "{text}");
+}
+
+#[test]
+fn recap_requires_nonempty_structured_content_and_a_successful_terminal_goal() {
+    for (args, ok) in [
+        (serde_json::json!({ "status": "complete" }), true),
+        (
+            serde_json::json!({ "status": "complete", "summary": "  \n ", "next_step": " " }),
+            true,
+        ),
+        (
+            serde_json::json!({ "status": "active", "summary": "仍在进行。" }),
+            true,
+        ),
+        (
+            serde_json::json!({ "status": "complete", "summary": "实现已完成。" }),
+            false,
+        ),
+    ] {
+        let mut s = opened();
+        goal_turn_with_args(&mut s, args, ok);
+        assert!(
+            !s.transcript
+                .items()
+                .iter()
+                .any(|item| matches!(item, TranscriptItem::Recap(_)))
+        );
+        assert_eq!(s.prompt_suggestion, None);
+        let text = frame(&mut s, 100, 24);
+        assert!(!text.contains("回顾:"), "{text}");
+    }
+}
 
 #[test]
 fn a1_complete_goal_with_next_step_offers_a_ghost_and_leaves_the_buffer_empty() {
@@ -537,6 +761,13 @@ fn a5_cancelled_and_failed_turns_offer_nothing() {
     assert_eq!(
         s.prompt_suggestion, None,
         "a cancelled turn hands nothing on"
+    );
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Recap(_))),
+        "a cancelled turn must not show a recap"
     );
 
     let mut s = opened();

@@ -22,9 +22,7 @@ use leveler_model::{Message, Role};
 use leveler_storage::{EngineStores, MessageStore, ModelRequestStore};
 
 use crate::log::EventLog;
-use crate::ports::{
-    EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord, PortError, TranscriptSink,
-};
+use crate::ports::{EventBarrier, ExecutionFence, ModelRequestRecord, PortError, TranscriptSink};
 use crate::recorders::{EventEmitter, RecordingApprover, RecordingClarifier};
 use crate::{EngineError, EngineEvent, TurnKind, TurnOutcome};
 
@@ -230,6 +228,11 @@ pub struct TurnPorts {
     pub emitter: EventEmitter,
     /// Persists the transcript and the model-call rows for this turn.
     pub sink: TurnSink,
+    /// The same request store, shared with owned child attempts so they can
+    /// persist each attempt before retrying without borrowing the parent sink.
+    pub model_requests: Arc<dyn ModelRequestStore>,
+    /// The goal or root turn whose residual budget the execution consumes.
+    pub budget_scope: String,
     /// Durable child terminal facts observed after ghost reconciliation. Their
     /// domain meaning belongs to the harness.
     pub finished_children: Vec<crate::log::FinishedChildFact>,
@@ -308,6 +311,22 @@ pub struct TurnSink {
     token: leveler_core::OwnershipToken,
     session_id: SessionId,
     turn_id: TurnId,
+    budget_scope: String,
+}
+
+impl TurnSink {
+    async fn append_payloads(&self, payloads: &[String]) -> Result<(), PortError> {
+        self.messages
+            .append_in_turn_owned(
+                &self.token,
+                &self.session_id,
+                &self.turn_id,
+                payloads,
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|e| PortError::Persistence(e.to_string()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -318,21 +337,26 @@ impl TranscriptSink for TurnSink {
             .map(serde_json::to_string)
             .collect::<Result<_, _>>()
             .map_err(|e| PortError::Persistence(e.to_string()))?;
-        self.messages
-            .append_in_turn_owned(
-                &self.token,
-                &self.session_id,
-                &self.turn_id,
-                &payloads,
-                leveler_core::now(),
-            )
-            .await
-            .map_err(|e| PortError::Persistence(e.to_string()))
+        self.append_payloads(&payloads).await
+    }
+
+    async fn append_partial_response(&mut self, text: &str) -> Result<(), PortError> {
+        let message = Message::interrupted_response(text);
+        let mut payload =
+            serde_json::to_value(message).map_err(|e| PortError::Persistence(e.to_string()))?;
+        // Host-only transcript metadata, ignored by model wire projections.
+        // History uses the typed boolean, never a substring in model output.
+        payload["incomplete"] = serde_json::Value::Bool(true);
+        self.append_payloads(&[payload.to_string()]).await
     }
 
     async fn record_model_request(&mut self, record: &ModelRequestRecord) -> Result<(), PortError> {
+        let mut row = storage_model_request(record, &self.session_id);
+        if row.budget_scope.is_none() {
+            row.budget_scope = Some(self.budget_scope.clone());
+        }
         self.model_requests
-            .insert(&storage_model_request(record, &self.session_id))
+            .insert(&row)
             .await
             .map_err(|error| PortError::Persistence(error.to_string()))
     }
@@ -350,6 +374,8 @@ pub fn storage_model_request(
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned));
     leveler_storage::ModelRequestRecord {
+        budget_scope: record.budget_scope.clone(),
+        estimated_tokens: record.estimated_tokens,
         // The engine owns the row's identity; the provider's id rides
         // along as a diagnostic. Two calls that report the same id are
         // two rows, not a persistence failure that ends the turn.
@@ -360,24 +386,24 @@ pub fn storage_model_request(
         model: record.model.clone(),
         input_tokens: record.usage.input_tokens,
         output_tokens: record.usage.output_tokens,
-        // Recorded, not inferred: `Some(0)` is a provider that
-        // reported no cache hit, and the `None` this never writes is
-        // reserved for rows from before the column existed.
-        cached_input_tokens: Some(record.usage.cached_input_tokens),
+        // An attempt with no usage measurement does not establish zero cache use.
+        cached_input_tokens: (record.usage.total() > 0).then_some(record.usage.cached_input_tokens),
         // Likewise recorded, never inferred: `None` here means the provider
         // reported no reasoning breakdown on this call.
         reasoning_tokens: record.usage.reasoning_tokens,
         cost_usd_micros: record.cost_usd_micros,
+        projected_input_tokens: record.projected_input_tokens,
+        projected_reasoning_tokens: record.projected_reasoning_tokens,
         agent_id: record.agent_id.clone(),
         finish_reason,
-        error_kind: None,
+        error_kind: record.error_kind.clone(),
         latency_ms: Some(record.latency_ms),
+        attempt_ms: record.attempt_ms,
+        connect_ms: record.connect_ms,
+        ttft_ms: record.ttft_ms,
+        max_event_gap_ms: record.max_event_gap_ms,
         retry_count: record.retry_count,
-        kind: match record.kind {
-            ModelCallKind::Round => leveler_storage::ModelCallKind::Round,
-            ModelCallKind::Compaction => leveler_storage::ModelCallKind::Compaction,
-            ModelCallKind::Advisory => leveler_storage::ModelCallKind::Advisory,
-        },
+        kind: leveler_storage::ModelCallKind::from_stored(record.kind.as_str()),
         created_at: leveler_core::now(),
         reasoning_effort: record.reasoning_effort.clone(),
     }
@@ -465,6 +491,25 @@ impl TurnRunner<'_> {
         F: FnOnce(TurnPorts) -> Fut,
         Fut: std::future::Future<Output = Result<TurnFacts<T>, TurnFailure>>,
     {
+        let budget_scope = match &start {
+            TurnStart::Anchored { goal_id, .. } => goal_id.as_ref().map(ToString::to_string),
+            TurnStart::Continue {
+                root_turn_id,
+                goal_id,
+                ..
+            }
+            | TurnStart::InternalLineage {
+                root_turn_id,
+                goal_id,
+                ..
+            } => Some(
+                goal_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| root_turn_id.to_string()),
+            ),
+            _ => None,
+        };
         let payload = match (&kind, start) {
             (TurnKind::User | TurnKind::Chat, TurnStart::Fresh(message)) => {
                 Some(TurnInitiationPayload::encode(message)?)
@@ -559,6 +604,7 @@ impl TurnRunner<'_> {
             )
             .await?;
         let turn_id = TurnId::new(turn.id.clone());
+        let budget_scope = budget_scope.unwrap_or_else(|| turn_id.to_string());
         self.log
             .append(
                 Some(&turn_id),
@@ -644,6 +690,7 @@ impl TurnRunner<'_> {
         let (events, mut rx, pump_state) =
             EventEmitter::channel(EVENT_BUFFER_CAPACITY, cancellation.clone());
         let sink = TurnSink {
+            budget_scope: budget_scope.clone(),
             messages: self.stores.messages.clone(),
             model_requests: self.stores.model_requests.clone(),
             token: self.token.clone(),
@@ -658,6 +705,8 @@ impl TurnRunner<'_> {
                 turn_id: turn_id.clone(),
                 emitter: events.clone(),
                 sink,
+                model_requests: self.stores.model_requests.clone(),
+                budget_scope,
                 finished_children,
                 resumed_children,
                 lost_children,

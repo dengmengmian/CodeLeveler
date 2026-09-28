@@ -35,7 +35,7 @@ pub fn resolve_develop_model(
     ModelRef::parse(raw).ok_or_else(|| {
         format!(
             "develop.model `{raw}` is not a `provider/model` reference \
-             (for example `deepseek/deepseek-v4-pro`)"
+             (for example `deepseek/deepseek-flash`)"
         )
     })
 }

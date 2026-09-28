@@ -40,9 +40,10 @@ impl Tool for ReadSymbolTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the DEFINITION body of a symbol (function/type/class/etc) by name, \
-         without loading the whole file. Precise via a language server when \
-         available. Prefer this over read_file when you only need one symbol."
+        "Return the definition text of a named symbol (function, type, class, or \
+         similar) and the file and line where it was found. Uses a language \
+         server when one is available; otherwise scans source files. The result \
+         says when no definition is found. The returned block is capped."
     }
 
     fn input_schema(&self) -> serde_json::Value {

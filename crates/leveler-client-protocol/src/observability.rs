@@ -43,7 +43,9 @@ impl ObservationClass {
 /// Classify a tool name for observatory presentation. Unknown → [`ObservationClass::Tool`].
 pub fn classify_tool(name: &str) -> ObservationClass {
     match name {
-        "read_file" | "list_files" | "read_symbol" | "view_image" => ObservationClass::Read,
+        "read_file" | "list_files" | "read_symbol" | "read_project_rules" | "view_image" => {
+            ObservationClass::Read
+        }
         "grep" | "find_files" | "find_symbol" | "find_references" | "blast_radius" => {
             ObservationClass::Search
         }
@@ -149,8 +151,28 @@ pub struct UiLaneAccounting {
     pub cached_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
+    /// Summed over the lane's rows that recorded a runtime projection
+    /// estimate; `None` when none did (an unmeasured figure is not a zero).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_input_tokens: Option<u64>,
+    /// Of the projected input, the historical-reasoning slice the route carried
+    /// back. A slice of `projected_input_tokens`, not of `reasoning_tokens`
+    /// (which is output-side). `None` = no projection was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_reasoning_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
+}
+
+impl UiLaneAccounting {
+    /// Prompt tokens billed at the uncached rate: reported input minus the part
+    /// the provider served from cache. `None` when no row recorded a cache
+    /// figure — an unmeasured split is not a zero, and subtracting an unknown
+    /// would fabricate one.
+    pub fn uncached_input_tokens(&self) -> Option<u64> {
+        self.cached_input_tokens
+            .map(|cached| self.input_tokens.saturating_sub(cached))
+    }
 }
 
 /// One durable model-request row (no prompt/body).
@@ -175,12 +197,32 @@ pub struct UiRequestObservation {
     /// reported a breakdown. `None` = not reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
+    /// What the runtime projected this call's prompt would cost, priced over
+    /// the provider-visible request. Beside `input_tokens`, never instead of
+    /// it — the pair is what makes an estimate error readable. `None` = no
+    /// projection was recorded for this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_input_tokens: Option<u64>,
+    /// Of that projected input, the historical-reasoning slice the wire
+    /// carried. A slice of `projected_input_tokens`; `None` = not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_reasoning_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
     /// The sub-agent that made the call; absent for the root session's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     pub created_at: String,
+}
+
+impl UiRequestObservation {
+    /// Prompt tokens billed at the uncached rate, when the cache split was
+    /// reported. Saturating, so a provider that reports more cached tokens than
+    /// input tokens yields zero rather than a negative number.
+    pub fn uncached_input_tokens(&self) -> Option<u64> {
+        self.cached_input_tokens
+            .map(|cached| self.input_tokens.saturating_sub(cached))
+    }
 }
 
 /// Per-tool aggregate for the **whole session**, independent of the event

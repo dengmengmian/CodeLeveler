@@ -181,6 +181,7 @@ impl ChatStreamAssembler {
                     input_tokens: usage.prompt_tokens,
                     output_tokens: usage.completion_tokens,
                     cached_input_tokens: usage.cached_input_tokens(),
+                    cache_creation_input_tokens: 0,
                     reasoning_tokens: usage.reasoning_tokens(),
                 },
             });
@@ -470,6 +471,7 @@ mod tests {
                     input_tokens: 12,
                     output_tokens: 3,
                     cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
                     reasoning_tokens: None,
                 }
             }]

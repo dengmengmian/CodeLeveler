@@ -87,6 +87,8 @@ export interface ContextAccounting {
   last_compaction?: CompactionRecord | null;
   model: ModelRef;
   pressure: ContextPressure;
+  /** What the request projection did with the requested reasoning-retention arm: which turns carried reasoning, and how many the route contract had to keep against the request. Present on every snapshot computed from a projection, so an overridden treatment is visible rather than assumed. */
+  reasoning_projection?: ReasoningProjectionSummary | null;
   token_count_kind: TokenCountKind;
   /** Estimated input tokens of this request — the sum of the top-level categories, by construction. */
   used_tokens: number;
@@ -185,6 +187,13 @@ export type FinalizationStage =
 /** Identifies a single assistant/user message in the transcript. A protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message. */
 export type MessageId = string;
 
+/** What a replayed assistant turn carries when it captured no reasoning. Orthogonal to [`ReasoningReplayScope`]: "should reasoning be replayed?" and "what does an empty turn carry?" are different requirements, and providers differ on each of them independently. */
+export type MissingReasoningReplay =
+  /** Send nothing. A turn that produced no reasoning carries no field. */
+  | 'omit'
+  /** Send the empty string. Some endpoints validate the key's presence on a replayed assistant turn independently of what the turn captured (measured: DeepSeek rejects a tool-bearing history whose assistant turn omits the key, and accepts an empty value on a turn that captured none). */
+  | 'empty_string';
+
 /** A provider + model pair. The rest of the system routes on this, never on a bare model-name string. */
 export interface ModelRef {
   model: string;
@@ -201,6 +210,46 @@ export type PermissionProfile = 'request_approval' | 'assisted' | 'full_access';
 
 /** The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`). */
 export type PlanStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+
+/** What the projection did with the requested retention arm, in facts rather than in a claim. An experiment that asked for `None` and got every retained turn's reasoning anyway must not be recorded as `None`: [`Self::protocol_protected_turns`] is exactly how many turns the provider contract kept that the requested arm would have dropped. */
+export interface ReasoningProjectionSummary {
+  /** Assistant turns in the request that captured reasoning. */
+  captured_turns: number;
+  /** Of those, how many carry the channel on the wire. */
+  carried_turns: number;
+  /** The route contract the projection ran under. */
+  contract: ReasoningReplayContract;
+  /** Turns the requested arm would have dropped but the provider contract requires. A route that replays captured reasoning requires the full reasoning of every retained assistant turn, so this is the arm's difference from `All`. Non-zero ⇒ the requested treatment was NOT fully applied, and the request's reasoning cost cannot be reduced by the arm: the lever is the context lifecycle, which removes whole turns. */
+  protocol_protected_turns: number;
+  /** The arm the caller requested. */
+  requested: ReasoningRetention;
+}
+
+/** The resolved reasoning-replay contract for one route. */
+export interface ReasoningReplayContract {
+  missing: MissingReasoningReplay;
+  scope: ReasoningReplayScope;
+  /** Whether authenticated/opaque reasoning blocks are a replay channel. */
+  signed_blocks?: boolean;
+}
+
+/** When captured reasoning is carried back to a provider on historical assistant turns. This is a ROUTE fact, not a harness preference: it is resolved from the protocol the route speaks and the route's declared compatibility. A provider that validates the field and a provider that has no field at all both have to be expressible without naming either of them. */
+export type ReasoningReplayScope =
+  /** The route has no channel for historical reasoning. Captured reasoning stays in the durable transcript and never reaches this provider. This is the default: a route carries nothing until it declares otherwise, so no route inherits another's requirement. */
+  | 'never'
+  /** Carried only on requests that expose tools — the scope a provider that validates reasoning on tool rounds defines its requirement in. */
+  | 'when_tools_present'
+  /** Carried on every request that spans the history. */
+  | 'always';
+
+/** How much historical assistant reasoning one request carries. This is the REQUESTED arm. The protocol-safe effective view is produced by [`crate::RequestProjection::project`], which reports any difference. [`ReasoningRetention::All`] is the production default and is byte-identical to carrying every reasoning block. */
+export type ReasoningRetention =
+  /** Every historical reasoning block is carried. */
+  | 'all'
+  /** Only the `n` most recent reasoning-bearing assistant turns keep their reasoning; earlier ones keep text and tool calls. */
+  | { last_turns: number }
+  /** No historical reasoning is carried. */
+  | 'none';
 
 /** Why a runtime is being asked to retire. Typed rather than a string because the updater will reuse this exact lifecycle: install an artifact, ask the running runtime to retire, verify the replacement's identity. Only the reason differs. */
 export type RestartReason =
@@ -719,6 +768,10 @@ export interface UiLaneAccounting {
   input_tokens: number;
   lane: string;
   output_tokens: number;
+  /** Summed over the lane's rows that recorded a runtime projection estimate; `None` when none did (an unmeasured figure is not a zero). */
+  projected_input_tokens?: number | null;
+  /** Of the projected input, the historical-reasoning slice the route carried back. A slice of `projected_input_tokens`, not of `reasoning_tokens` (which is output-side). `None` = no projection was recorded. */
+  projected_reasoning_tokens?: number | null;
   reasoning_tokens?: number | null;
   requests: number;
 }
@@ -852,6 +905,10 @@ export interface UiRequestObservation {
   latency_ms?: number | null;
   model: string;
   output_tokens: number;
+  /** What the runtime projected this call's prompt would cost, priced over the provider-visible request. Beside `input_tokens`, never instead of it — the pair is what makes an estimate error readable. `None` = no projection was recorded for this call. */
+  projected_input_tokens?: number | null;
+  /** Of that projected input, the historical-reasoning slice the wire carried. A slice of `projected_input_tokens`; `None` = not recorded. */
+  projected_reasoning_tokens?: number | null;
   provider: string;
   /** Subset of `output_tokens` spent on reasoning, when the provider reported a breakdown. `None` = not reported. */
   reasoning_tokens?: number | null;
@@ -942,6 +999,8 @@ export interface UiSessionSnapshot {
 
 /** A one-line session summary for the Sessions screen (spec §52). */
 export interface UiSessionSummary {
+  /** Latest durable task declaration; absent for legacy or non-declaration endings. */
+  declaration?: UiTaskDeclaration | null;
   goal: string;
   id: SessionId;
   model: string;
@@ -956,6 +1015,9 @@ export interface UiShadowedAgent {
   location?: string | null;
   source: UiAgentSource;
 }
+
+/** A task's own terminal declaration, projected from its durable TaskFinished stop. This is not verification evidence and does not replace session lifecycle. */
+export type UiTaskDeclaration = 'answered' | 'completed';
 
 /** Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration. */
 export interface UiToolAggregate {

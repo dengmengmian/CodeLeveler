@@ -19,6 +19,7 @@ leveler-execution = { workspace = true }
 leveler-engine = { workspace = true }
 leveler-storage = { workspace = true }
 leveler-context = { workspace = true }
+leveler-project = { workspace = true }
 leveler-skills = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

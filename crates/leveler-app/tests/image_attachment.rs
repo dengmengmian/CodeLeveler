@@ -158,3 +158,186 @@ async fn an_image_whose_bytes_are_gone_fails_the_turn() {
         "the failure must name the attachment: {message}"
     );
 }
+
+/// Real app ingress must retain Goal authority even when the user sends media.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
+    use leveler_agent::CollaborationMode;
+    use leveler_model::{ContentPart, ImageSource};
+    use leveler_storage::{GoalCheckpointStore, GoalStore, TurnRepository};
+    use leveler_test_support::{MockResponse, MockServer};
+
+    isolate_global_config();
+    let quiet = || {
+        MockResponse::Sse {
+        body: "data: {\"choices\":[{\"delta\":{\"content\":\"I have examined the image.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+    }
+    };
+    let completed = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+        "index":0,"id":"finish-goal","function":{"name":"update_goal",
+        "arguments":serde_json::json!({"status":"complete","summary":"image task complete"}).to_string()}
+    }]},"finish_reason":"tool_calls"}]}).to_string();
+    let server = MockServer::start(vec![
+        quiet(),
+        quiet(),
+        MockResponse::Sse {
+            body: format!("data: {completed}\n\ndata: [DONE]\n\n"),
+        },
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("configs/providers")).unwrap();
+    std::fs::create_dir_all(root.join("configs/models")).unwrap();
+    std::fs::write(
+        root.join("configs/providers/mock.yaml"),
+        format!(
+            "id: mock\nprotocol: openai_chat\nbase_url: {}\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("configs/models/seeing.yaml"),
+        model_yaml("seeing", true),
+    )
+    .unwrap();
+    let app = Arc::new(
+        Application::assemble(Layout::from_parts(
+            root.to_path_buf(),
+            root.join("configs"),
+            root.join("state"),
+        ))
+        .unwrap()
+        .with_collaboration(CollaborationMode::Goal),
+    );
+    let model = ModelRef::new("mock", "seeing");
+    let session = app
+        .create_session(&model, "inspect the supplied image")
+        .await
+        .unwrap();
+    let client = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        model,
+        PermissionProfile::Assisted,
+        false,
+    ));
+    let mut rx = client.subscribe();
+    client.send(ClientCommand::AddAttachmentData {
+        session_id: session.clone(), name: "pixel.png".into(),
+        data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC".into(),
+    }).await.unwrap();
+    let attachment = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await.unwrap() {
+                RuntimeEvent::AttachmentAdded { attachment } => break attachment,
+                RuntimeEvent::AttachmentProcessingFailed { error } => panic!("{error}"),
+                RuntimeEvent::Notification {
+                    level: NotificationLevel::Error,
+                    message,
+                } => panic!("{message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "inspect the supplied image".into(),
+            attachments: vec![attachment],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match rx.recv().await.unwrap() {
+                RuntimeEvent::TurnIncomplete { .. } => break,
+                RuntimeEvent::TurnAnswered | RuntimeEvent::TurnCompleted => {
+                    panic!("Goal text alone cannot resolve the task")
+                }
+                RuntimeEvent::Notification {
+                    level: NotificationLevel::Error,
+                    message,
+                } => panic!("{message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let db = app.open_database().await.unwrap();
+    let goals = GoalStore::unfinished(&db).await.unwrap();
+    assert_eq!(goals.len(), 1);
+    assert!(
+        !GoalCheckpointStore::for_goal(&db, &goals[0].id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let turns = TurnRepository::new(&db).list(&session).await.unwrap();
+    assert_eq!(turns.len(), 1);
+    let continuation =
+        leveler_engine::decode_turn_continuation(turns[0].payload.as_deref().unwrap()).unwrap();
+    assert_eq!(continuation.goal_id.as_ref(), Some(&goals[0].id));
+    let original = continuation.initiating_message.unwrap();
+    let image_url = original
+        .content
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::Image {
+                source: ImageSource::Base64 { media_type, data },
+            } => Some(format!("data:{media_type};base64,{data}")),
+            _ => None,
+        })
+        .expect("WAL must contain original image bytes");
+    let requests = server.request_bodies().await;
+    assert_eq!(requests.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+    assert!(
+        first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "update_goal")
+    );
+    assert!(first["messages"].as_array().unwrap().iter().any(|message| {
+        message["content"].as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part["image_url"]["url"] == image_url)
+        })
+    }));
+    client
+        .send(ClientCommand::ResumeTask {
+            session_id: session.clone(),
+            content: "继续".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match rx.recv().await.unwrap() {
+                RuntimeEvent::TurnCompleted => break,
+                RuntimeEvent::TurnAnswered | RuntimeEvent::TurnIncomplete { .. } => {
+                    panic!("explicit update_goal must resolve the resumed goal")
+                }
+                RuntimeEvent::Notification {
+                    level: NotificationLevel::Error,
+                    message,
+                } => panic!("{message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(GoalStore::unfinished(&db).await.unwrap().is_empty());
+    let turns = TurnRepository::new(&db).list(&session).await.unwrap();
+    assert_eq!(turns.len(), 2);
+    let resumed =
+        leveler_engine::decode_turn_continuation(turns[1].payload.as_deref().unwrap()).unwrap();
+    assert_eq!(resumed.goal_id.as_ref(), Some(&goals[0].id));
+    assert_eq!(server.request_count(), 3);
+}

@@ -14,13 +14,16 @@ pub mod rules;
 pub mod symbols;
 
 pub use compaction::{
-    ACTIVE_OBJECTIVE_MARKER, COMPACT_KEEP_RECENT, CompactionSummary, PRE_REQUEST_COMPACT_THRESHOLD,
-    compact_messages, estimate_tokens, round_boundary, summarize_with_model,
+    ACTIVE_OBJECTIVE_MARKER, COMPACT_KEEP_RECENT, FoldRequirement, PRE_REQUEST_COMPACT_THRESHOLD,
+    accepted_summary, compact_messages, estimate_tokens, round_boundary, summary_request,
 };
 pub use context::{ContextCompiler, ContextPackage, estimate_text_tokens};
 pub use guard::{ContentFingerprint, FileStateTracker};
 pub use repo_map::RepositoryMap;
 pub use rules::{
-    ProjectInstruction, load_rules, load_rules_for_paths, load_scoped_rules, render_instructions,
+    MAX_RULE_BYTES, ProjectInstruction, READ_PROJECT_RULES_TOOL, RuleDelivery, RuleDeliveryPolicy,
+    RuleSection, deliver_document, deliver_sections, deliver_sections_with_policy, load_rules,
+    load_rules_for_delivery, load_rules_for_paths, load_scoped_rules, render_instructions,
+    render_instructions_with, split_rule_sections,
 };
 pub use symbols::{defines, extract_symbols};

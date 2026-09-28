@@ -11,7 +11,7 @@
 //! Run:
 //! ```text
 //! cargo run -p leveler-app --example tui_smoke --release -- \
-//!   deepseek/deepseek-v4-pro short:"你好" long:"用 list_files/read_file 勘察" \
+//!   deepseek/deepseek-flash short:"你好" long:"用 list_files/read_file 勘察" \
 //!   goal:"检查仓库根目录并完成"
 //! ```
 //!
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     {
         args.remove(0)
     } else {
-        env::var("LEVELER_DEFAULT_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4-pro".into())
+        env::var("LEVELER_DEFAULT_MODEL").unwrap_or_else(|_| "deepseek/deepseek-flash".into())
     };
     let model = ModelRef::parse(&model_arg).expect("provider/model");
 

@@ -73,6 +73,81 @@ impl WorkspaceSnapshot {
         Ok(Some(SnapshotId(sha.trim().to_string())))
     }
 
+    /// Capture only the namespace this execution may mutate. The temporary
+    /// index starts empty, so another owner's files never enter this snapshot.
+    pub async fn capture_for_scope(
+        root: &Path,
+        scope: &crate::WriteScope,
+    ) -> Result<Option<SnapshotId>, SnapshotError> {
+        let crate::WriteScope::ScopedWorkspace {
+            allowed, excluded, ..
+        } = scope
+        else {
+            return if matches!(scope, crate::WriteScope::None) {
+                Ok(None)
+            } else {
+                Self::capture(root).await
+            };
+        };
+        let Some(git_dir) = git_dir(root).await else {
+            return Ok(None);
+        };
+        let index = git_dir.join(temp_index_path().file_name().expect("index filename"));
+        let result = async {
+            git(root, &["read-tree", "--empty"], Some(&index)).await?;
+            let mut paths = Vec::new();
+            for path in allowed {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| SnapshotError::Git("scope escapes workspace".into()))?;
+                if relative
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(SnapshotError::Git("scope contains parent traversal".into()));
+                }
+                if path.exists() {
+                    paths.push(if relative.as_os_str().is_empty() {
+                        ".".to_string()
+                    } else {
+                        format!(":(literal){}", relative.display())
+                    });
+                }
+            }
+            if !paths.is_empty() {
+                for path in excluded {
+                    let relative = path.strip_prefix(root).map_err(|_| {
+                        SnapshotError::Git("scope exclusion escapes workspace".into())
+                    })?;
+                    paths.push(format!(":(exclude,literal){}", relative.display()));
+                }
+                let mut args = vec!["add", "-A", "--"];
+                args.extend(paths.iter().map(String::as_str));
+                git(root, &args, Some(&index)).await?;
+            }
+            Ok(Some(SnapshotId(
+                git(root, &["write-tree"], Some(&index))
+                    .await?
+                    .trim()
+                    .to_string(),
+            )))
+        }
+        .await;
+        let _ = std::fs::remove_file(&index);
+        result
+    }
+
+    pub async fn changed_since_for_scope(
+        root: &Path,
+        id: &SnapshotId,
+        scope: &crate::WriteScope,
+    ) -> Result<Vec<String>, SnapshotError> {
+        let Some(now) = Self::capture_for_scope(root, scope).await? else {
+            return Err(SnapshotError::Git("workspace snapshot unavailable".into()));
+        };
+        Self::changed_between(root, id, &now).await
+    }
+
     /// Restore the working tree to `id`: rewrite every file in the snapshot
     /// and delete files that did not exist in it. The repository's real index
     /// and HEAD are left untouched.
@@ -218,7 +293,15 @@ impl WorkspaceSnapshot {
                 "workspace is no longer a git repository".to_string(),
             ));
         };
-        if now == *id {
+        Self::changed_between(root, id, &now).await
+    }
+
+    async fn changed_between(
+        root: &Path,
+        id: &SnapshotId,
+        now: &SnapshotId,
+    ) -> Result<Vec<String>, SnapshotError> {
+        if now == id {
             return Ok(Vec::new());
         }
         let out = git(
@@ -618,6 +701,35 @@ mod tests {
         assert_eq!(
             captured, None,
             "a subdir of an enclosing repo must degrade to transcript-only              checkpoints, never snapshot the outer repository"
+        );
+    }
+    #[tokio::test]
+    async fn scoped_accounting_never_attributes_another_owners_concurrent_write() {
+        let dir = leveler_test_support::git::scratch_repo();
+        std::fs::create_dir(dir.path().join("owned")).unwrap();
+        std::fs::write(dir.path().join("owned/before"), "original").unwrap();
+        std::fs::write(dir.path().join("foreign"), "original").unwrap();
+        let root = dir.path().to_path_buf();
+        let scope = crate::WriteScope::ScopedWorkspace {
+            allowed: vec![root.join("owned")],
+            root: root.clone(),
+            excluded: Vec::new(),
+        };
+        let baseline = WorkspaceSnapshot::capture_for_scope(&root, &scope)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(root.join("owned/before"), "own write").unwrap();
+        std::fs::write(root.join("foreign"), "other owner's write").unwrap();
+        assert_eq!(
+            WorkspaceSnapshot::changed_since_for_scope(&root, &baseline, &scope)
+                .await
+                .unwrap(),
+            vec!["owned/before"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("foreign")).unwrap(),
+            "other owner's write"
         );
     }
 }

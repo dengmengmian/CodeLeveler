@@ -28,12 +28,16 @@ limits:
   max_tool_schema_bytes: 32768
   max_parallel_tool_calls: 0
 compatibility:
-  synthesize_tool_call_ids: true
-  drop_unsupported_fields: true
   # DeepSeek rejects a forced tool_choice while thinking (HTTP 400), and
   # thinking is its server-side default — the adapter must explicitly disable
   # thinking on forced-choice requests. Measured 2026-08-07.
   thinking_supports_forced_tool_choice: false
-  # Tool-enabled requests must echo `reasoning_content` on every historical
-  # assistant message (captured text, or "" when none).
-  passback_reasoning_content: true
+  # A tool-bearing request must replay the FULL `reasoning_content` of every
+  # historical assistant turn still in the active context — not only tool-call
+  # turns; stripping or truncating a retained turn's reasoning is not legal.
+  # The scope is `when_tools_present`: tool-free requests keep the legacy wire.
+  # The legal lever is the context lifecycle, which removes whole old turns.
+  reasoning_replay_scope: when_tools_present
+  # DeepSeek validates the key's presence on a replayed assistant turn that
+  # produced no reasoning; the empty string satisfies it (measured 2026-08-07).
+  reasoning_content_key_required: true

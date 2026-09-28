@@ -109,6 +109,19 @@ impl UserShellStore {
         }
     }
 
+    pub fn mark_output_truncated(&self, session_id: &SessionId, id: &UserShellId) {
+        if let Some(active) = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(session_id)
+            .and_then(|s| s.active.as_mut())
+            .filter(|a| &a.id == id)
+        {
+            active.tail.truncated = true;
+        }
+    }
+
     /// Move the active execution to history with its terminal facts. Returns
     /// the total runtime. A stale id (already finished) is a no-op `None`.
     pub fn finish(

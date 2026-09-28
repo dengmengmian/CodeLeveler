@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_model::{
-    FinishReason, Message, ModelError, ModelErrorKind, TokenUsage, ToolCall, ToolDefinition,
+    ControlContext, FinishReason, Message, ModelError, ModelErrorKind, TokenUsage, ToolCall,
+    ToolDefinition,
 };
 
 use crate::error::AgentCoreError;
@@ -291,8 +292,8 @@ pub trait AgentHarness: Send {
     /// messages these projections are neither replayed as history nor folded
     /// into summaries. The host derives them from its authoritative state;
     /// the kernel accounts for the exact request including this context.
-    fn request_context(&self, _ctx: &LoopContext) -> Vec<Message> {
-        Vec::new()
+    fn request_context(&self, _ctx: &LoopContext) -> ControlContext {
+        ControlContext::default()
     }
 
     /// Round top, before admission. Inject anything that must reach the model
@@ -326,6 +327,23 @@ pub trait AgentHarness: Send {
         _messages: &mut Vec<Message>,
     ) -> Result<Flow<Self::Stop>, Self::Error> {
         Err(error.into())
+    }
+
+    /// Refresh host-owned shared admission before each physical attempt.
+    /// Retries call this again after backoff; concurrent work may have spent
+    /// budget since the logical round was first admitted.
+    async fn before_model_attempt(&mut self, _ctx: &mut LoopContext) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// A physical invocation finished. The kernel has folded its known spend;
+    /// persist it before allowing another attempt, including failure outcomes.
+    async fn on_model_attempt(
+        &mut self,
+        _ctx: &mut LoopContext,
+        _attempt: &leveler_model::ModelAttempt,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     /// The model answered. `Continue` lets the loop append the assistant

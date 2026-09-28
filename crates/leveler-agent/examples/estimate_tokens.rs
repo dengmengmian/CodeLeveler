@@ -26,6 +26,7 @@ fn main() {
         };
         if let Some(tool) = v["tool_result"].as_str() {
             messages.push(Message {
+                origin: None,
                 role,
                 content: vec![ContentPart::ToolResult {
                     result: ToolResultContent {

@@ -10,7 +10,7 @@
 //!
 //! Example `~/.leveler/config.toml`:
 //! ```toml
-//! default_model = "deepseek/deepseek-v4-pro"
+//! default_model = "deepseek/deepseek-flash"
 //! lang = "zh"                 # optional UI language: zh | en (LEVELER_LANG overrides)
 //!
 //! [ui]
@@ -32,7 +32,7 @@
 //! api_key_env = "DEEPSEEK_API_KEY"
 //! # api_key = "sk-..."        # optional plaintext; preferred over api_key_env
 //!
-//! [models."deepseek-v4-pro"]
+//! [models."deepseek-flash"]
 //! provider = "deepseek"
 //! context_window = 131072
 //! max_output_tokens = 16384   # optional; default 8192
@@ -94,6 +94,9 @@ pub struct GlobalConfig {
     /// The `/develop` workflow's settings.
     #[serde(default)]
     develop: GlobalDevelop,
+    /// Idle UI affordances that spend a model call on the user's behalf.
+    #[serde(default)]
+    assist: GlobalAssist,
     /// Self-update preferences.
     #[serde(default)]
     update: GlobalUpdate,
@@ -143,6 +146,31 @@ impl Default for GlobalUpdate {
 
 fn default_check_interval_hours() -> u64 {
     1
+}
+
+/// `[assist]`. The two idle, automatic model calls the UI makes on the user's
+/// behalf. Both are pure UX; turning one off removes the call entirely and
+/// never changes a turn's work. Explicit `/btw`, `/compact` and recap commands
+/// the user types are NOT controlled here — they run only because the user
+/// asked for them.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalAssist {
+    /// Predict the user's likely next message while they are idle.
+    #[serde(default = "default_true")]
+    prompt_suggestions: bool,
+    /// A one-line "welcome back" recap after an idle period.
+    #[serde(default = "default_true")]
+    away_summary: bool,
+}
+
+impl Default for GlobalAssist {
+    fn default() -> Self {
+        Self {
+            prompt_suggestions: true,
+            away_summary: true,
+        }
+    }
 }
 
 /// `[develop]`. One key: which model reads the code.
@@ -259,9 +287,6 @@ struct GlobalProvider {
     /// contributor to R006's window-boundary timeout, R6-P3).
     #[serde(default)]
     timeouts: Option<leveler_provider::Timeouts>,
-    /// Provider-level retry budget/backoff.
-    #[serde(default)]
-    retry: Option<leveler_provider::RetryConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,14 +315,21 @@ struct GlobalModel {
     vision: bool,
     #[serde(default)]
     reasoning: bool,
-    /// How to ask this model to reason: `none` (default), `openai_effort`, or
-    /// `thinking_flag` (DeepSeek/GLM). Unset means we send no reasoning field.
+    /// How to request reasoning, including explicit adaptive or budgeted
+    /// thinking on Messages routes. Unset sends no reasoning field.
     #[serde(default)]
     reasoning_style: ReasoningStyle,
     /// Native efforts this model accepts. Omitted → inferred as `[reasoning_effort]`
     /// when that field is set.
     #[serde(default)]
     supported_efforts: Vec<ReasoningEffort>,
+    /// RETIRED. Per-model system prompts were removed; every model shares the
+    /// one CodeLeveler base prompt (`crates/leveler-agent/prompts/base.md`).
+    /// The field exists only so an old config still parses: it is never read,
+    /// and [`GlobalConfig::retired_model_instructions`] lets `doctor` say so
+    /// instead of ignoring it silently.
+    #[serde(default)]
+    instructions: Option<toml::Value>,
     /// CodeLeveler default: `minimal` | `low` | `medium` | `high` | `xhigh` | `max`.
     /// This is **not** the provider default. A knob-style model must set it.
     #[serde(default)]
@@ -331,10 +363,6 @@ struct GlobalModel {
     /// false there. Defaults to true.
     #[serde(default = "default_true")]
     supports_temperature: bool,
-    #[serde(default)]
-    synthesize_tool_call_ids: bool,
-    #[serde(default)]
-    drop_unsupported_fields: bool,
     /// Whether the provider accepts a forced `tool_choice` (`required` /
     /// named function) while thinking mode is active. DeepSeek rejects that
     /// combination (HTTP 400 "Thinking mode does not support this
@@ -342,11 +370,22 @@ struct GlobalModel {
     /// thinking on exactly those requests. Defaults to true.
     #[serde(default = "default_true")]
     thinking_supports_forced_tool_choice: bool,
-    /// Whether assistant tool-call messages must echo `reasoning_content`
-    /// back (DeepSeek thinking-mode contract: an unrecognized tool-call id is
-    /// rejected unless the key is present). Defaults to false.
+    /// Whether, and in which request shapes, historical assistant reasoning
+    /// is replayed to this provider. `never` (the default), `when_tools_present`
+    /// or `always`. The pre-existing boolean spelling
+    /// `passback_reasoning_content` is accepted and maps `true` to
+    /// `when_tools_present`.
+    #[serde(
+        default,
+        alias = "passback_reasoning_content",
+        deserialize_with = "leveler_model::profile::deserialize_reasoning_replay_scope"
+    )]
+    reasoning_replay_scope: leveler_model::ReasoningReplayScope,
+    /// Whether a replayed assistant turn must carry the `reasoning_content`
+    /// key even when it captured no reasoning (DeepSeek validates the key's
+    /// presence on such a turn). Defaults to false.
     #[serde(default)]
-    passback_reasoning_content: bool,
+    reasoning_content_key_required: bool,
 }
 
 impl GlobalModel {
@@ -393,6 +432,9 @@ pub struct GlobalBundle {
     pub agents_independent_review: leveler_project::IndependentReview,
     /// `[browser].default`, parsed after validation rejects unrecognised values.
     pub browser_default: Option<leveler_browser::BrowserProduct>,
+    /// Idle automatic affordances the user may switch off.
+    pub assist_prompt_suggestions: bool,
+    pub assist_away_summary: bool,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -630,7 +672,7 @@ pub fn render_init_config_with_profile(
     model["structured_output"] = value(profile.capabilities.structured_output);
     model["vision"] = value(profile.capabilities.vision);
     model["reasoning"] = value(profile.capabilities.reasoning);
-    model["reasoning_style"] = value(reasoning_style_name(profile.reasoning.style));
+    model["reasoning_style"] = value(reasoning_style_value(profile.reasoning.style));
     let mut efforts = toml_edit::Array::new();
     for effort in &profile.reasoning.supported_efforts {
         efforts.push(effort.as_wire());
@@ -647,12 +689,12 @@ pub fn render_init_config_with_profile(
     if let Some(limit) = profile.limits.max_tool_output_bytes {
         model["max_tool_output_bytes"] = value(limit as i64);
     }
-    model["synthesize_tool_call_ids"] = value(profile.compatibility.synthesize_tool_call_ids);
-    model["drop_unsupported_fields"] = value(profile.compatibility.drop_unsupported_fields);
     model["supports_temperature"] = value(profile.compatibility.supports_temperature);
     model["thinking_supports_forced_tool_choice"] =
         value(profile.compatibility.thinking_supports_forced_tool_choice);
-    model["passback_reasoning_content"] = value(profile.compatibility.passback_reasoning_content);
+    model["reasoning_replay_scope"] = value(profile.compatibility.reasoning_replay_scope.as_str());
+    model["reasoning_content_key_required"] =
+        value(profile.compatibility.reasoning_content_key_required);
     annotate_generated_config(&mut doc);
     format!(
         "# CodeLeveler global config — created by `leveler login`.\n\
@@ -831,16 +873,6 @@ const MODEL_SETTING_COMMENTS: &[(&str, &str, &str)] = &[
         "Maximum bytes returned to the model for one tool result.",
     ),
     (
-        "synthesize_tool_call_ids",
-        "是否为缺少 ID 的工具调用生成 ID。",
-        "Whether to synthesize missing tool-call IDs.",
-    ),
-    (
-        "drop_unsupported_fields",
-        "是否移除供应商不支持的请求字段。",
-        "Whether to remove request fields unsupported by the provider.",
-    ),
-    (
         "supports_temperature",
         "供应商是否接受 temperature 参数。",
         "Whether the provider accepts the temperature parameter.",
@@ -851,9 +883,14 @@ const MODEL_SETTING_COMMENTS: &[(&str, &str, &str)] = &[
         "Whether reasoning mode supports forced tool choice.",
     ),
     (
-        "passback_reasoning_content",
-        "工具调用后是否回传供应商的推理内容。",
-        "Whether provider reasoning content is passed back after tool calls.",
+        "reasoning_replay_scope",
+        "是否/何时回传历史 assistant 推理内容。",
+        "Whether and when historical assistant reasoning content is replayed.",
+    ),
+    (
+        "reasoning_content_key_required",
+        "无推理的历史轮次是否仍需发送空的 reasoning_content 键。",
+        "Whether a replayed assistant turn with no captured reasoning is sent an empty reasoning_content key.",
     ),
 ];
 
@@ -866,17 +903,43 @@ fn protocol_name(protocol: ProtocolKind) -> &'static str {
     }
 }
 
-fn reasoning_style_name(style: ReasoningStyle) -> &'static str {
+fn reasoning_style_value(style: ReasoningStyle) -> toml_edit::Value {
     match style {
-        ReasoningStyle::None => "none",
-        ReasoningStyle::OpenAiEffort => "open_ai_effort",
-        ReasoningStyle::ThinkingFlag => "thinking_flag",
+        ReasoningStyle::None => "none".into(),
+        ReasoningStyle::OpenAiEffort => "open_ai_effort".into(),
+        ReasoningStyle::ThinkingFlag => "thinking_flag".into(),
+        ReasoningStyle::AdaptiveThinking => "adaptive_thinking".into(),
+        ReasoningStyle::BudgetedThinking { budget_tokens } => {
+            let mut budget = toml_edit::InlineTable::new();
+            budget.insert("budget_tokens", i64::from(budget_tokens).into());
+            let mut style = toml_edit::InlineTable::new();
+            style.insert("budgeted_thinking", budget.into());
+            style.into()
+        }
     }
 }
 
 impl GlobalConfig {
+    /// Model ids whose config still carries the retired `instructions` key.
+    /// Used by `doctor` to warn about a silent misconfiguration.
+    pub fn retired_model_instructions(&self) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|(_, model)| model.instructions.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Expand into provider/model/policy configs with sensible defaults filled.
     pub fn into_bundle(self) -> GlobalBundle {
+        let retired = self.retired_model_instructions();
+        if !retired.is_empty() {
+            tracing::warn!(
+                models = ?retired,
+                "model.instructions is retired and ignored; all models now share the \
+                 CodeLeveler base prompt"
+            );
+        }
         if self.agents.completion_judge_model.is_some()
             || self.agents.completion_judge_timeout_seconds.is_some()
         {
@@ -899,7 +962,6 @@ impl GlobalConfig {
                     .filter(|s| !s.is_empty()),
                 headers: p.headers,
                 timeouts: p.timeouts.unwrap_or_default(),
-                retry: p.retry.unwrap_or_default(),
             })
             .collect();
 
@@ -940,16 +1002,12 @@ impl GlobalConfig {
                         context_quality: None,
                         reasoning,
                         compatibility: CompatibilityConfig {
-                            synthesize_tool_call_ids: m.synthesize_tool_call_ids,
-                            drop_unsupported_fields: m.drop_unsupported_fields,
                             supports_temperature: m.supports_temperature,
                             thinking_supports_forced_tool_choice: m
                                 .thinking_supports_forced_tool_choice,
-                            passback_reasoning_content: m.passback_reasoning_content,
+                            reasoning_replay_scope: m.reasoning_replay_scope,
+                            reasoning_content_key_required: m.reasoning_content_key_required,
                         },
-                        // Global models use the default prompt; a per-model prompt
-                        // is a repo-config concern (configs/models/*.yaml).
-                        instructions: None,
                         pricing: m.pricing,
                     },
                     policy: None,
@@ -989,6 +1047,8 @@ impl GlobalConfig {
                 .default
                 .as_deref()
                 .and_then(leveler_browser::BrowserProduct::parse),
+            assist_prompt_suggestions: self.assist.prompt_suggestions,
+            assist_away_summary: self.assist.away_summary,
         }
     }
 }
@@ -1079,6 +1139,25 @@ fn parse_protocol(s: &str) -> ProtocolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retired per-model `instructions` key must be parsed (old configs
+    /// keep loading) but never change behaviour, and it must be reportable so
+    /// `doctor` can flag the silent misconfiguration.
+    #[test]
+    fn the_retired_instructions_key_is_parsed_ignored_and_reported() {
+        let cfg: GlobalConfig = toml::from_str(
+            "[models.m]\nprovider = \"p\"\ninstructions = \"You are a special snowflake.\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.retired_model_instructions(), vec!["m".to_string()]);
+        let bundle = cfg.into_bundle();
+        assert_eq!(bundle.models.len(), 1);
+        let json = serde_json::to_string(&bundle.models[0].profile).unwrap();
+        assert!(!json.contains("snowflake"), "{json}");
+
+        let clean: GlobalConfig = toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
+        assert!(clean.retired_model_instructions().is_empty());
+    }
 
     /// A fresh install keeps itself current unless the user explicitly opts out.
     #[test]
@@ -1176,6 +1255,30 @@ mod tests {
             assert_eq!(actual.reasoning, expected.reasoning);
             assert_eq!(actual.limits, expected.limits);
             assert_eq!(actual.compatibility, expected.compatibility);
+        }
+    }
+
+    #[test]
+    fn profile_rendering_preserves_explicit_anthropic_thinking_modes() {
+        let mut profile = leveler_provider::builtin_model_profile("deepseek", "deepseek-flash")
+            .unwrap()
+            .unwrap();
+        profile.protocol = ProtocolKind::AnthropicMessages;
+        for style in [
+            ReasoningStyle::AdaptiveThinking,
+            ReasoningStyle::BudgetedThinking {
+                budget_tokens: 2048,
+            },
+        ] {
+            profile.reasoning.style = style;
+            let text = render_init_config_with_profile(
+                "deepseek",
+                "https://example.invalid",
+                "TEST_KEY",
+                &profile,
+            );
+            let bundle = GlobalConfig::from_toml_str(&text).unwrap().into_bundle();
+            assert_eq!(bundle.models[0].profile.reasoning.style, style);
         }
     }
 
@@ -1705,6 +1808,51 @@ provider = "deepseek"
     }
 
     #[test]
+    fn reasoning_replay_scope_defaults_to_never_and_accepts_both_spellings() {
+        let toml = r#"
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+
+[models."legacy-bool"]
+provider = "deepseek"
+passback_reasoning_content = true
+
+[models."explicit-scope"]
+provider = "deepseek"
+reasoning_replay_scope = "always"
+
+[models."legacy"]
+provider = "deepseek"
+"#;
+        let bundle = toml::from_str::<GlobalConfig>(toml).unwrap().into_bundle();
+        let find = |id: &str| {
+            bundle
+                .models
+                .iter()
+                .find(|m| m.profile.id == id)
+                .unwrap()
+                .profile
+                .compatibility
+                .reasoning_replay_scope
+        };
+        assert_eq!(
+            find("legacy-bool"),
+            leveler_model::ReasoningReplayScope::WhenToolsPresent,
+            "the pre-existing boolean keeps its exact meaning"
+        );
+        assert_eq!(
+            find("explicit-scope"),
+            leveler_model::ReasoningReplayScope::Always,
+            "a route may declare the unconditional channel"
+        );
+        assert_eq!(
+            find("legacy"),
+            leveler_model::ReasoningReplayScope::Never,
+            "routes never send the channel unless they declare it"
+        );
+    }
+
+    #[test]
     fn passback_reasoning_content_defaults_false_and_can_be_enabled() {
         let toml = r#"
 [providers.deepseek]
@@ -1726,7 +1874,8 @@ provider = "deepseek"
                 .unwrap()
                 .profile
                 .compatibility
-                .passback_reasoning_content
+                .reasoning_replay_scope
+                == leveler_model::ReasoningReplayScope::WhenToolsPresent
         };
         assert!(
             find("needs-passback"),

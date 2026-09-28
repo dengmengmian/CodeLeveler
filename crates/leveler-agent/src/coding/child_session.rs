@@ -9,7 +9,7 @@
 use leveler_core::SessionId;
 use leveler_engine::{EngineError, EngineEvent, LostChild, MAX_CHILD_RESUMES, ResumedChild};
 use leveler_lifecycle::ChildSpawnSpec;
-use leveler_model::{Message, Role};
+use leveler_model::{Message, RuntimeNoticeKind, TranscriptOrigin};
 use leveler_storage::EventStore;
 
 use crate::child_profile::AgentRole;
@@ -126,7 +126,12 @@ pub(crate) async fn load_resumable_children(
             role,
             spec,
             prior,
-            note: Message::text(Role::User, note),
+            note: Message::user(
+                note,
+                TranscriptOrigin::RuntimeNotice {
+                    notice: RuntimeNoticeKind::ChildRecovery,
+                },
+            ),
         });
     }
     Ok(out)
@@ -207,7 +212,7 @@ fn recovery_note(
         )),
         AgentRole::Default => out.push_str(
             "You hold no write scope now: any scope claimed before the interruption \
-             was released. Call claim_write_scope again before editing.\n",
+             was released. A write is refused until claim_write_scope grants one.\n",
         ),
         _ => {}
     }
@@ -226,10 +231,6 @@ fn recovery_note(
             out.push_str(&format!("- {} {} — {outcome}\n", call.name, call.arguments));
         }
     }
-    out.push_str(
-        "Continue the task from where it stands. Inspect before repeating anything that \
-         may already have happened.",
-    );
     out
 }
 

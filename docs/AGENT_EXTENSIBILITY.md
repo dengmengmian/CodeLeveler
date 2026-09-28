@@ -70,7 +70,7 @@ version: 1                      # required; this build reads version 1 only
 name: security-reviewer         # required; must equal the directory name
 description: Reviews Rust changes for exploitable security issues.
 capability: read_only           # required: read_only | writer | scoped_writer
-model: deepseek/deepseek-v4-pro # optional; omitted = the parent's model
+model: deepseek/deepseek-flash # optional; omitted = the parent's model
 reasoning_effort: high          # optional: minimal|low|medium|high|xhigh|max
 skills: [rust-security]         # optional; installed skill names
 tools: [read_file, grep, git_diff, find_files]   # optional narrowing

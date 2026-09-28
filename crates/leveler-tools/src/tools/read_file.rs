@@ -58,16 +58,15 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 text *file* under the workspace root (prefer paths relative \
-         to that root, e.g. `src/lib.rs`). Paths that are directories must use \
-         `list_files` instead — `read_file` does not list directories. Any \
-         absolute path is readable (reads are not confined to the workspace; \
-         credential files such as `.env` and private keys are refused). \
-         Returns content with 1-based line numbers. `start_line`/`end_line` \
-         return only that inclusive range; omitting both returns the whole \
-         file. A result too large for one call is cut at a line boundary and \
-         names the line to continue from, so any file is readable in windows \
-         regardless of its size."
+        "Read a UTF-8 text file and return it with 1-based line numbers. A \
+         relative path is resolved from the workspace root. An absolute path \
+         is read as given; reads are not confined to the workspace. A `~` \
+         prefix is not home-expanded. Credential files such as `.env` and \
+         private keys are refused. A directory path is an error; this tool \
+         does not list directories. `start_line`/`end_line` return that \
+         inclusive range; omitting both returns the whole file. A result too \
+         large for one call is cut at a line boundary and names the line to \
+         continue from."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -389,7 +388,7 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(
-            out.content.contains("file not found") && out.content.contains("list_files"),
+            out.content.contains("file not found") && !out.content.contains("list_files"),
             "missing file should be recoverable: {}",
             out.content
         );
@@ -397,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_path_tells_model_to_use_list_files() {
+    async fn directory_path_reports_its_type() {
         let dir =
             std::env::temp_dir().join(format!("leveler-read-dir-{}", super::super::test_ordinal()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -413,8 +412,8 @@ mod tests {
             .unwrap();
         assert!(out.is_error, "directory must be a model-facing error");
         assert!(
-            out.content.contains("directory") && out.content.contains("list_files"),
-            "error should redirect to list_files: {}",
+            out.content.contains("directory") && !out.content.contains("list_files"),
+            "error should state the observed file type: {}",
             out.content
         );
         std::fs::remove_dir_all(&dir).ok();

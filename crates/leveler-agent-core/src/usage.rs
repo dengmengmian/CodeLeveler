@@ -5,7 +5,7 @@
 //! happen, so a budget guard and a later ledger answer with the same number.
 //! Nothing here re-derives a token count or re-applies a price table.
 
-use leveler_model::{ContentPart, Message, TokenUsage};
+use leveler_model::TokenUsage;
 
 /// Aggregation of one run's model spend.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -128,68 +128,23 @@ impl UsageProjection {
     }
 }
 
-/// Coarse token estimate over a transcript's textual content. A fallback for
-/// providers/gateways that don't report streaming usage, so token budgets and
-/// compaction still bind on a growing conversation.
+/// Coarse token estimate over a transcript's model-visible content.
 ///
-/// ASCII averages ~4 bytes/token; CJK and other non-ASCII text spends ~1 token
-/// per character (~3 UTF-8 bytes), so those bytes are weighted at 3 bytes/token
-/// — a flat ÷4 under-counts Chinese-heavy transcripts by ~25%.
-pub fn estimate_tokens(messages: &[Message]) -> u64 {
-    // A conservative flat cost (in ASCII byte-equivalents, ÷4 below) for one
-    // image, so a vision turn isn't counted as ~free. Real vision billing is
-    // tile-based and model-specific; ~1000 tokens/image is a safe floor.
-    const IMAGE_BYTE_EQUIV: u64 = 4096;
-    let mut ascii_text: u64 = 0;
-    let mut ascii_tool: u64 = 0;
-    let mut wide_bytes: u64 = 0;
-    let mut flat: u64 = 0;
-    let split = |s: &str| -> (u64, u64) {
-        let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
-        (ascii, s.len() as u64 - ascii)
-    };
-    for part in messages.iter().flat_map(|m| &m.content) {
-        match part {
-            ContentPart::Text { text } => {
-                let (a, w) = split(text);
-                ascii_text += a;
-                wide_bytes += w;
-            }
-            // Tool payloads are JSON/log shaped — brackets, quotes, repeated
-            // keys, hex ids — and tokenize far denser than prose: measured
-            // ~2.5–2.9 bytes/token against DeepSeek-reported usage, where a
-            // flat ÷4 under-counted tool-heavy transcripts by 27–38%.
-            // Weighted at 2.5 so the residual error sits on the safe
-            // (slightly over-estimating) side.
-            ContentPart::ToolCall { call } => {
-                let (a, w) = split(&call.name);
-                ascii_tool += a;
-                wide_bytes += w;
-                let (a, w) = split(&call.arguments.to_string());
-                ascii_tool += a;
-                wide_bytes += w;
-            }
-            ContentPart::ToolResult { result } => {
-                let (a, w) = split(&result.content);
-                ascii_tool += a;
-                wide_bytes += w;
-            }
-            ContentPart::Image { .. } => flat += IMAGE_BYTE_EQUIV / 4,
-            _ => {}
-        }
-    }
-    ascii_text / 4 + ascii_tool * 2 / 5 + wide_bytes / 3 + flat
-}
+/// Re-exported from `leveler-model` (`leveler_model::estimate`), which owns the
+/// one density formula shared by compaction pressure and context accounting.
+/// This crate keeps the name so the kernel's budget fallback reads the same
+/// number everything else does.
+pub use leveler_model::estimate_tokens;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leveler_model::Role;
 
     fn usage(input: u64, cached: u64, output: u64) -> TokenUsage {
         TokenUsage {
             input_tokens: input,
             cached_input_tokens: cached,
+            cache_creation_input_tokens: 0,
             output_tokens: output,
             reasoning_tokens: None,
         }
@@ -267,39 +222,5 @@ mod tests {
         assert_eq!(p.reported_model_tokens(), 0, "nothing was reported");
         assert_eq!(p.admission_model_tokens(), 1_234, "the budget still binds");
         assert_eq!(p.records_without_usage, 1);
-    }
-
-    #[test]
-    fn tool_payloads_are_weighted_denser_than_prose() {
-        let body = "{\"path\":\"src/lib.rs\",\"exit\":0}".repeat(100);
-        let as_text = estimate_tokens(&[Message::text(Role::User, body.clone())]);
-        let as_tool = estimate_tokens(&[Message {
-            role: Role::User,
-            content: vec![ContentPart::ToolResult {
-                result: leveler_model::ToolResultContent {
-                    call_id: leveler_core::ToolCallId::new("c"),
-                    content: body,
-                    is_error: false,
-                },
-            }],
-        }]);
-        assert!(
-            as_tool > as_text * 3 / 2,
-            "tool weighting missing: text={as_text} tool={as_tool}"
-        );
-    }
-
-    #[test]
-    fn images_are_not_free() {
-        use leveler_model::ImageSource;
-        let with_image = vec![Message {
-            role: Role::User,
-            content: vec![ContentPart::Image {
-                source: ImageSource::Url {
-                    url: "https://x/y.png".to_string(),
-                },
-            }],
-        }];
-        assert!(estimate_tokens(&with_image) >= 256);
     }
 }

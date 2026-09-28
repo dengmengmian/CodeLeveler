@@ -25,6 +25,8 @@ enum Fact {
     Event(Box<EngineEvent>),
     /// A user message: its text, and how many images it carried.
     User(String, usize),
+    /// A host-marked incomplete raw response; identity is its transcript row.
+    PartialAssistant(MessageId, String),
 }
 
 /// The latest [`HISTORY_TURNS_MAX`] turns of a session, and how many older
@@ -51,12 +53,18 @@ pub async fn load_session_history(
     {
         return Ok((Vec::new(), 0));
     }
-    let messages: Vec<(Option<Timestamp>, (String, usize))> = MessageRepository::new(db)
+    let messages: Vec<(Option<Timestamp>, Fact)> = MessageRepository::new(db)
         .load_timed(session_id)
         .await
         .map_err(AppError::from)?
         .into_iter()
-        .filter_map(|m| user_text(&m.payload).map(|shown| (parse_time(&m.created_at), shown)))
+        .filter_map(|m| {
+            transcript_fact(
+                &m.payload,
+                MessageId::new(format!("{session_id}-partial-{}", m.ordinal)),
+            )
+            .map(|fact| (parse_time(&m.created_at), fact))
+        })
         .collect();
 
     // Both logs are already ordered; merge them by record time without
@@ -69,12 +77,11 @@ pub async fn load_session_history(
             if !matches!((message_at, at), (Some(m), Some(e)) if *m <= e) {
                 break;
             }
-            let (message_at, (text, images)) = messages.next().expect("peeked");
-            facts.push((message_at, Fact::User(text, images)));
+            facts.push(messages.next().expect("peeked"));
         }
         facts.push((at, Fact::Event(Box::new(event))));
     }
-    facts.extend(messages.map(|(at, (text, images))| (at, Fact::User(text, images))));
+    facts.extend(messages);
 
     // A turn is everything from one TurnStarted to the next.
     //
@@ -133,6 +140,18 @@ fn replay_turn(turn: Vec<(Option<Timestamp>, Fact)>, entries: &mut Vec<UiHistory
                     images,
                 },
             }],
+            Fact::PartialAssistant(id, text) => vec![
+                RuntimeEvent::AssistantMessageStarted {
+                    message_id: id.clone(),
+                },
+                RuntimeEvent::AssistantTextDelta {
+                    message_id: id.clone(),
+                    delta: text,
+                },
+                // Close only this persisted display block. This does not
+                // complete the turn or convert incomplete output into an answer.
+                RuntimeEvent::AssistantMessageCompleted { message_id: id },
+            ],
             Fact::Event(event) => {
                 if let (
                     EngineEvent::ToolCallStarted {
@@ -189,6 +208,26 @@ fn is_live_only(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::ReasoningDelta { .. }
             | RuntimeEvent::Notification { .. }
     )
+}
+
+/// Completed assistant replies are already represented by canonical events.
+/// Interrupted replies have only a raw row: replay that row as its own
+/// display block, leaving the authoritative turn terminal unchanged. The host-owned JSON boolean,
+/// never a phrase in the body, distinguishes this path from normal messages.
+fn transcript_fact(payload: &str, id: MessageId) -> Option<Fact> {
+    if let Some((text, images)) = user_text(payload) {
+        return Some(Fact::User(text, images));
+    }
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if value.get("incomplete").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let message: leveler_model::Message = serde_json::from_value(value).ok()?;
+    if message.role != leveler_model::Role::Assistant {
+        return None;
+    }
+    let text = message.text_content();
+    (!text.is_empty()).then_some(Fact::PartialAssistant(id, text))
 }
 
 /// The text of a message the user sent. Runtime notices and compaction
@@ -291,6 +330,99 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_raw_body_reopens_once_without_promoting_user_markers() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        user(
+            &db,
+            &sid,
+            t0 + ms(1),
+            "[Response interrupted before completion.] user text",
+        )
+        .await;
+        let complete = serde_json::to_string(&leveler_model::Message::text(
+            leveler_model::Role::Assistant,
+            "complete earlier answer",
+        ))
+        .unwrap();
+        MessageRepository::new(&db)
+            .append(&sid, &[complete], t0 + ms(2))
+            .await
+            .unwrap();
+        event(
+            &db,
+            &sid,
+            t0 + ms(2),
+            EngineEvent::AssistantMessage {
+                text: "complete earlier answer".into(),
+            },
+        )
+        .await;
+        let partial = serde_json::json!({"role":"assistant","content":[{"type":"text","text":"observed partial answer"}],"incomplete":true}).to_string();
+        MessageRepository::new(&db)
+            .append(&sid, &[partial], t0 + ms(3))
+            .await
+            .unwrap();
+        event(
+            &db,
+            &sid,
+            t0 + ms(4),
+            EngineEvent::AssistantMessage {
+                text: "later repaired answer".into(),
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(5),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Interrupted,
+                reason: Some("cancelled".into()),
+                failure: None,
+                stop: None,
+                warnings: vec![],
+            },
+        )
+        .await;
+        for _ in 0..2 {
+            let (history, _) = load_session_history(&db, &sid).await.unwrap();
+            let text: Vec<_> = history
+                .iter()
+                .filter_map(|entry| match &entry.event {
+                    RuntimeEvent::AssistantTextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                text,
+                vec![
+                    "complete earlier answer",
+                    "observed partial answer",
+                    "later repaired answer"
+                ],
+                "canonical completion and partial raw body each appear once on reopen"
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|entry| matches!(entry.event, RuntimeEvent::TurnCompleted)),
+                "cancelled history cannot become a completed turn"
+            );
+        }
     }
 
     fn tags(entries: &[UiHistoryEntry]) -> Vec<String> {

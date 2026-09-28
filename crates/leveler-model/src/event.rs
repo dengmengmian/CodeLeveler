@@ -42,6 +42,10 @@ pub struct TokenUsage {
     /// does not report it — never assume "no cache" from a zero here.
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Tokens written to a provider cache, included in input_tokens but with
+    /// separate pricing. Zero when no cache-write usage was reported.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     /// Output tokens the provider attributed to reasoning/thinking. A subset of
     /// `output_tokens`. `None` = the provider did not report a breakdown
     /// (unknown, not zero); `Some(0)` = it reported that none were spent.
@@ -122,6 +126,8 @@ pub enum ModelEvent {
     TextDelta { delta: String },
     /// A chunk of reasoning/thinking text.
     ReasoningDelta { delta: String },
+    /// Received opaque authenticated thinking bytes; payload remains in canonical content.
+    ReasoningMetadata { bytes: usize },
     /// A new tool call slot opened at `index`.
     ToolCallStarted {
         index: usize,
@@ -132,6 +138,9 @@ pub enum ModelEvent {
     ToolCallArgumentsDelta { index: usize, delta: String },
     /// A tool call whose arguments have been fully joined and JSON-parsed.
     ToolCallCompleted { call: ToolCall },
+    /// Canonical ordered content from a block-based protocol. Deltas remain
+    /// presentation only; these blocks preserve authenticated replay metadata.
+    MessageContent { content: Vec<crate::ContentPart> },
     /// Usage figures (may arrive mid-stream or at the end).
     UsageUpdated { usage: TokenUsage },
     /// The message completed for the given reason.
@@ -158,6 +167,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 5,
             cached_input_tokens: 75,
+            cache_creation_input_tokens: 0,
             reasoning_tokens: None,
         };
         assert!((u.cache_hit_rate() - 0.75).abs() < f64::EPSILON);
@@ -171,6 +181,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 5,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             reasoning_tokens: None,
         };
         assert_eq!(u.total(), 15);
@@ -184,6 +195,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 1_000,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             reasoning_tokens: Some(700),
         };
         assert_eq!(u.total(), 1_100, "total must not add reasoning twice");
@@ -199,6 +211,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 1_000,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             reasoning_tokens: None,
         };
         assert_eq!(u.visible_output_tokens(), None);
@@ -213,6 +226,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 40,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             reasoning_tokens: Some(0),
         };
         assert_eq!(u.visible_output_tokens(), Some(40));
@@ -228,6 +242,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 100,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             reasoning_tokens: Some(120),
         };
         assert_eq!(u.visible_output_tokens(), None);

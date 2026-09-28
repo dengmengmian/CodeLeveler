@@ -50,7 +50,7 @@ version: 1                      # 必填；当前构建只读 version 1
 name: security-reviewer         # 必填；必须等于目录名
 description: Reviews Rust changes for exploitable security issues.
 capability: read_only           # 必填：read_only | writer | scoped_writer
-model: deepseek/deepseek-v4-pro # 可选；省略 = 父 Agent 的模型
+model: deepseek/deepseek-flash # 可选；省略 = 父 Agent 的模型
 reasoning_effort: high          # 可选：minimal|low|medium|high|xhigh|max
 skills: [rust-security]         # 可选；已安装的 skill 名
 tools: [read_file, grep, git_diff, find_files]   # 可选，收窄工具集

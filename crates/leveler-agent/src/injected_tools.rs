@@ -1,5 +1,8 @@
-//! Definitions of the executor-injected tools (request_user_input / ask_user,
+//! Definitions of the executor-injected tools (request_user_input,
 //! update_goal, request_permissions, spawn_agent) advertised to the model.
+//!
+//! `ask_user` has no definition: it is a parser alias only, see
+//! [`is_user_input_tool`].
 
 use leveler_model::{ToolCall, ToolDefinition};
 
@@ -25,11 +28,11 @@ fn user_input_input_schema() -> serde_json::Value {
             "options": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Candidate answers for the single-question form."
+                "description": "2-4 mutually exclusive choices, one short line each. Omit for a free-text answer."
             },
             "questions": {
                 "type": "array",
-                "description": "Ask several questions at once. The user answers them in one interaction, one tab each. Use it when the answers depend on each other or belong to the same decision; do not split one question into several.",
+                "description": "Several questions answered in one interaction, one tab each.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -49,11 +52,11 @@ fn user_input_input_schema() -> serde_json::Value {
                         "options": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Candidate answers for single/multi. Put the recommended one first."
+                            "description": "2-4 mutually exclusive choices for single or multi, one short line each."
                         },
                         "allow_other": {
                             "type": "boolean",
-                            "description": "Add a free-text entry ('其他…') after the options. Use it when the options may not cover the user's case."
+                            "description": "Adds a free-text entry after the options."
                         },
                         "min_choices": {
                             "type": "integer",
@@ -72,27 +75,19 @@ fn user_input_input_schema() -> serde_json::Value {
     })
 }
 
-fn user_input_description(primary_name: &str, alias: Option<&str>) -> String {
-    let alias_note = match alias {
-        Some(a) => format!(" (legacy alias: `{a}`)"),
-        None => String::new(),
-    };
+fn user_input_description() -> String {
     format!(
-        "Ask the user a clarifying question and wait for their answer \
-         (`{primary_name}`{alias_note}). Use it at a genuine decision point that is the \
-         user's to make: an ambiguous requirement, a choice between viable approaches, \
-         overwriting existing work, or a destructive/irreversible action. Prefer asking \
-         over guessing at these forks. Do NOT ask about trivial choices you can \
-         reasonably make yourself. For approach/scope choice forks, always pass \
-         `options` with 2–4 mutually exclusive answers (short label + consequence); \
-         put the recommended option first when you have a preference. Do not rely on \
-         open-ended chat prose alone (\"想问一下\", \"waiting for confirmation\") — that \
-         is a fake pause. Omit `options` only for free-form answers (credentials, \
-         names, paths the user must type). \
-         Several related forks can be asked at once: pass `questions` (each with \
-         `header`, `question`, `kind`, and `options`) and give the interaction a \
-         one-line `question` headline. The user answers them in one interaction; do \
-         not ask more than about four at a time. Keep `question` to one short sentence."
+        "Ask the user a question and wait for the answer (`{REQUEST_USER_INPUT_TOOL}`). \
+         The turn pauses until the user responds or the request is cancelled. \
+         Assistant prose does not pause the turn.\n\n\
+         Single question: `question`, plus optional `options` (2–4 mutually \
+         exclusive choices, one short line each). Omit `options` for a free-text \
+         answer such as a credential, a name, or a path.\n\n\
+         Several questions in one interaction: `questions`. Each item requires \
+         `question` and `kind` (`single`, `multi`, or `text`). `single` and \
+         `multi` take `options`. Optional fields: `header` (short tab label), \
+         `allow_other`, `min_choices`, `max_choices`. Optional `question` on the \
+         call is the interaction's one-line headline."
     )
 }
 
@@ -102,41 +97,38 @@ pub(crate) fn is_user_input_tool(name: &str) -> bool {
 }
 
 /// Primary clarification tool definition.
+///
+/// The legacy `ask_user` name is a parser alias only
+/// ([`is_user_input_tool`]): the model-visible surface never advertises it, so
+/// no definition is built for it.
 pub(crate) fn request_user_input_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: REQUEST_USER_INPUT_TOOL.to_string(),
-        description: user_input_description(REQUEST_USER_INPUT_TOOL, Some(ASK_USER_TOOL)),
-        input_schema: user_input_input_schema(),
-    }
-}
-
-/// Legacy `ask_user` definition (compat; same Clarifier path).
-pub(crate) fn ask_user_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: ASK_USER_TOOL.to_string(),
-        description: user_input_description(ASK_USER_TOOL, Some(REQUEST_USER_INPUT_TOOL)),
+        description: user_input_description(),
         input_schema: user_input_input_schema(),
     }
 }
 
 /// The name of the injected goal-resolution tool (goal mode only). The run does
 /// not end when the model goes quiet — it ends only when the model calls this to
-/// mark the objective `complete` (proven, audited) or `blocked` (truly stuck).
+/// mark the objective `complete` (done and truthfully reported) or `blocked`
+/// (truly stuck).
 pub(crate) const UPDATE_GOAL_TOOL: &str = "update_goal";
 
+/// Resolve the current objective. Verification is evidence, not a universal
+/// completion gate: the description asks for a truthful claim about the
+/// current workspace state, not for a named proof tool. Completion semantics,
+/// the objective-as-stated rule, and the tool's shape are unchanged. A plan is
+/// a declaration the model may update freely; the description does not require
+/// a terminal Plan refresh.
 pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: UPDATE_GOAL_TOOL.to_string(),
-        description: "Resolve the current objective. Call this ONLY to end the \
-            task: `complete` when you have PROVEN, against the current workspace \
-            state, that every requirement is done (build/tests run and passed \
-            since your last edit); `blocked` when you are genuinely and \
+    let description = String::from(
+        "Resolve the current objective. Call this ONLY to end the \
+            task: `complete` when every requirement is done, against the \
+            current workspace state; \
+            `blocked` when you are genuinely and \
             repeatedly stuck and cannot make progress. Going silent does NOT end \
-            the task — you must call this. If you declared a plan and performed \
-            real tool work after its latest update, first call update_plan with \
-            the truthful final table; unfinished steps stay pending or \
-            in_progress. You may call update_plan then update_goal in the same \
-            assistant turn. Do not mark complete on unproven or \
+            the task — you must call this. Do not mark complete on unproven or \
             indirect evidence, and do not redefine success down to what already \
             exists. `complete` means the objective AS THE USER STATED IT. If the \
             stated objective cannot be satisfied — it conflicts with something \
@@ -150,19 +142,22 @@ pub(crate) fn update_goal_tool_definition() -> ToolDefinition {
             same rule: when only PART of the stated objective is satisfiable, \
             delivering that part while quietly exempting the rest — with or \
             without a rationalization — is still a false completion. Blocked, \
-            naming which part cannot be satisfied and why."
-            .to_string(),
+            naming which part cannot be satisfied and why.",
+    );
+    ToolDefinition {
+        name: UPDATE_GOAL_TOOL.to_string(),
+        description,
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "status": {
                     "type": "string",
                     "enum": ["complete", "blocked"],
-                    "description": "complete = proven done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what)."
+                    "description": "complete = done, for the objective as stated; blocked = truly stuck, or the stated objective cannot be satisfied as written (say what conflicts with what)."
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Internal audit note only (not shown as a chat row on success). Keep ≤12 words for complete; longer only when blocked. Do not restate the user question or list files you read."
+                    "description": "Concise goal summary shown by the TUI as a recap. Keep ≤12 words for complete; longer only when blocked. Do not restate the user question or list files you read."
                 },
                 "next_step": {
                     "type": "string",
@@ -186,32 +181,32 @@ pub(crate) const SPAWN_AGENT_TOOL: &str = "spawn_agent";
 pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: SPAWN_AGENT_TOOL.to_string(),
-        description: "Delegate a self-contained subtask to a focused sub-agent so it \
-            does not consume this conversation's context. The child shares your model \
-            and workspace but starts a FRESH conversation — put everything it needs \
-            in `task`, and give the delegation a short `title` that names the task \
-            itself. This tool runs the child \
-            IN THE BACKGROUND BY DEFAULT: the call returns immediately with the \
-            child's id, you continue working, and the runtime tells you when it \
-            settles (its truthful result, partial work included). Start independent \
-            delegations together in one assistant message; they run concurrently. \
-            The child starts read-capable and claims a bounded write scope itself \
-            (claim_write_scope) after inspecting the code; the runtime enforces \
-            exclusive ownership and denies conflicts, so you do not pre-plan file \
-            ownership. Keep the work yourself when it is small, tightly coupled, or \
-            needs your in-flight context. Do NOT spawn the whole task as one blob. \
-            agent='<name>' runs a declarative agent from the available-agents list \
-            (project `.leveler/agents/<name>/`, user-level, or built-in): its definition \
-            fixes its capability, tools, write bounds, model and instructions, so do not \
-            also pass a different `role` or `profile`. Optional `profile` selects a \
-            built-in capability contract; omit it for the default child."
+        description: "Start a child agent on a subtask. The child uses this model \
+            and workspace and starts a new conversation: it does not see this one. \
+            `task` is the child's whole instruction. `title` is the short display \
+            name and stays fixed for that child's lifetime.\n\n\
+            Calls in one assistant message run concurrently. Calls in a later \
+            message run after those return. `run_in_background` defaults to true: \
+            the call returns the child's id immediately, and the runtime reports \
+            the child's result, including partial work, when the child settles. \
+            false waits for that result before this call returns.\n\n\
+            The child can read immediately. A write requires claim_write_scope. \
+            The ownership fence denies overlapping claims and refuses this \
+            agent's writes, by editor or by shell, to a path a running child owns.\n\n\
+            `agent` names a declarative agent (project `.leveler/agents/<name>/`, \
+            user-level, or built-in). That definition fixes capability, tools, \
+            write bounds, model, and instructions. A different `role` or `profile` \
+            on the same call is refused. `profile` and `role` are aliases: \
+            explorer is read-only, worker is a scoped writer and requires `files`, \
+            default claims its own write scope. Reviewer cannot be requested. An \
+            unknown agent or role is refused."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "A short, stable title for the delegated task — its identity in the UI, not a copy of `task`. Keep it a scannable line (roughly 3–8 words): the task's subject plus what to do to it. `investigate the two flaky Windows CI tests` is right; a paragraph of instructions or a bare `investigate` is not. Fixed for the child's lifetime; do not change it on a resume."
+                    "description": "Short display name for the delegated task, roughly 3–8 words. Not a copy of `task`. Fixed for the child's lifetime."
                 },
                 "task": { "type": "string", "description": "The complete, self-contained instruction for the sub-agent." },
                 "profile": {
@@ -235,7 +230,7 @@ pub(crate) fn spawn_agent_tool_definition() -> ToolDefinition {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Defaults to true — the call returns immediately with the child's id and you continue useful work; the runtime tells you when it settles. Set false only when your next action depends on this child's result."
+                    "description": "Defaults to true: the call returns the child's id immediately and the runtime reports settlement later. false: this call waits for the child's result."
                 }
             },
             "required": ["task", "title"]
@@ -251,16 +246,12 @@ pub(crate) const CLAIM_WRITE_SCOPE_TOOL: &str = "claim_write_scope";
 pub(crate) fn claim_write_scope_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
-        description: "Claim exclusive write authority over the files or directories \
-            you are about to modify. Use it AFTER reading enough code to know what \
-            this task actually needs to change; before your first claim every \
-            mutation is refused. The grant is exclusive and atomic (all paths or \
-            none); overlapping claims by others are denied while you hold it, and \
-            it is released automatically when you finish. A denial is a coordination \
-            result, not a failure: narrow the scope, work on something else, or \
-            retry after the owner settles. You may claim additional paths later as \
-            you discover them. Re-read a claimed file before your first write to it \
-            if time has passed since you read it."
+        description: "Claim exclusive write authority over the listed files or \
+            directories. Before the first successful claim, mutations are refused. \
+            The grant is exclusive and atomic: every path or none. An overlapping \
+            claim is denied while another child holds it. The grant is released \
+            when this child finishes. A denial does not change the workspace. A \
+            later call can add paths."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -292,11 +283,12 @@ pub(crate) const REPORT_FINDING_TOOL: &str = "report_finding";
 pub(crate) fn report_finding_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: REPORT_FINDING_TOOL.to_string(),
-        description: "Report ONE concrete finding the moment you confirm it \
-            (do not batch them into your final prose). Each finding is recorded \
-            durably and handed to the agent that spawned you even if your run is \
-            cut short. Use one call per finding; keep `summary` specific and \
-            evidence-backed, naming the file/symbol where it applies."
+        description: "Record one finding. Each call stores one finding and the \
+            parent receives the stored findings with this child's result, including \
+            when the run stops early.\n\n\
+            Arguments: `kind` (required: relevant_file, relevant_symbol, \
+            dependency, callsite, risk, test, config, observation, correctness), \
+            `summary` (required text), optional `file`, optional `symbol`."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -713,15 +705,14 @@ pub(crate) fn apply_turn_grants(
 pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: REQUEST_PERMISSIONS_TOOL.to_string(),
-        description: "Ask the user to grant elevated permission for this turn. \
-            Use BEFORE an action that needs network and/or writes outside the \
-            workspace sandbox. Fields: `network` (bool), `filesystem` \
-            (\"workspace\"|\"git\"|\"unrestricted\"), or `full_access` (bool) for both. \
-            Legacy calls with only `action` still mean network-only. On approval, \
-            grants last for the rest of this turn. If the user denies, keep \
-            working with already-available capabilities; do not re-request the \
-            same or a broader permission. If you need the user to run a command \
-            or paste output, call request_user_input instead of asking in prose."
+        description: "Ask for a permission grant that lasts the rest of this turn. \
+            Arguments: `action` (required), optional `reason`, `network` (bool), \
+            `filesystem` (`workspace`, `git`, or `unrestricted`), `full_access` \
+            (bool: network plus unrestricted filesystem). A call that names none \
+            of those three requests network only. `git` allows current-repository \
+            Git metadata writes. `unrestricted` drops command write confinement. \
+            Approval applies the named grant until the turn ends. Denial grants \
+            nothing. This tool is not offered when the mode is already full access."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -745,9 +736,9 @@ pub(crate) fn request_permissions_tool_definition() -> ToolDefinition {
 }
 
 /// Agent plan synchronization contract. The plan is the user's live view of
-/// the work and the seed a resumed turn reads. The runtime enforces only that
-/// the model publishes a fresh final declaration after real tool work; it does
-/// not infer statuses or require every step to be completed.
+/// the work and the seed a resumed turn reads. The runtime records and shows it
+/// but never enforces it: it does not infer statuses, does not require a
+/// terminal refresh, and does not require every step to be completed.
 #[cfg(test)]
 mod plan_sync_contract_tests {
     const BASE_PROMPT: &str = include_str!("../prompts/base.md");
@@ -761,9 +752,13 @@ mod plan_sync_contract_tests {
     }
 
     #[test]
-    fn base_prompt_says_the_plan_moves_with_the_work() {
+    fn base_prompt_says_the_plan_is_a_declaration() {
         let section = plan_section();
-        for needle in ["update_plan", "in_progress"] {
+        for needle in [
+            "update_plan",
+            "declared intent",
+            "not verification evidence",
+        ] {
             assert!(
                 section.contains(needle),
                 "plan section lost `{needle}`:\n{section}"
@@ -771,132 +766,152 @@ mod plan_sync_contract_tests {
         }
     }
 
-    /// Plan truth contract. COMPLETE / FAILURE / REVISE are the semantics the
-    /// transition experiment showed remove plan-ahead errors (a failed or
-    /// abandoned step marked completed); pinned so a rewording cannot drop them.
+    /// A completed step is an observed outcome. The prompt does not script
+    /// when to retry or how to rewrite the list.
     #[test]
-    fn completed_means_the_outcome_is_true() {
+    fn completed_means_an_observed_outcome() {
         let section = plan_section();
-        for needle in ["`completed` only", "outcome is true", "already read"] {
-            assert!(
-                section.contains(needle),
-                "COMPLETE lost `{needle}`:\n{section}"
-            );
-        }
+        assert!(
+            section.contains("Only observed outcomes justify `completed`"),
+            "COMPLETE lost:\n{section}"
+        );
     }
 
     #[test]
-    fn a_failed_action_completes_nothing() {
+    fn a_failed_action_is_not_reported_completed() {
         let section = plan_section();
         assert!(
-            section.contains("failed, denied or timed-out action never completes a step"),
+            section.contains(
+                "failed, denied, abandoned or unfinished work must not be reported as completed"
+            ),
             "FAILURE lost:\n{section}"
         );
         assert!(
-            section.contains("same outcome another way") && section.contains("stays `in_progress`"),
-            "same-objective retry must keep the step in progress:\n{section}"
+            !section.contains("stays `in_progress`"),
+            "the plan contract must not tell the model to retry:\n{section}"
         );
     }
 
     #[test]
-    fn a_changed_objective_is_revised_not_completed() {
+    fn an_abandoned_step_is_not_marked_completed() {
         let section = plan_section();
-        for needle in [
-            "rewrite that step",
-            "never mark an abandoned or replaced step `completed`",
+        assert!(
+            section.contains("abandoned"),
+            "abandoned work must not be reported completed:\n{section}"
+        );
+        assert!(
+            !section.contains("rewrite that step"),
+            "rewriting the plan is the model's decision:\n{section}"
+        );
+    }
+
+    /// Timing rules for when the plan must move are strategy.
+    #[test]
+    fn the_plan_section_does_not_schedule_updates() {
+        let section = plan_section();
+        for banned in [
+            "may trail",
+            "already left behind",
+            "Converge:",
+            "- Close:",
+            "before `update_goal`",
+            "same response as the first tool call",
         ] {
             assert!(
-                section.contains(needle),
-                "REVISE lost `{needle}`:\n{section}"
+                !section.contains(banned),
+                "plan section must not schedule updates (`{banned}`):\n{section}"
             );
         }
-    }
-
-    /// The plan tracks steps, not tool calls: a short trail is accepted, a
-    /// plan left describing a stage the work has already left is not. The
-    /// same-response START rule had no measurable effect and must not return.
-    #[test]
-    fn short_lag_is_accepted_but_the_plan_converges() {
-        let section = plan_section();
-        assert!(
-            section.contains("may trail"),
-            "LAG acceptance lost:\n{section}"
-        );
-        assert!(
-            section.contains("already left behind"),
-            "convergence lost:\n{section}"
-        );
-        assert!(
-            !section.contains("same response as the first tool call"),
-            "the same-response START rule was measured ineffective:\n{section}"
-        );
     }
 
     /// Terminal reconciliation is freshness, never an instruction to turn all
     /// rows green. Both ordinary closeout and goal closeout state the same
     /// contract where the model reads it.
     #[test]
-    fn final_plan_reconciliation_preserves_partial_statuses() {
+    fn plan_completion_gate_is_removed_but_plan_truth_remains() {
         let section = plan_section();
         assert!(
-            section.contains("before `update_goal`")
-                && section.contains("leave unfinished steps `pending` or `in_progress`"),
-            "plan closeout contract is missing or fabricates completion:\n{section}"
+            !section.contains("- Close:") && !section.contains("before `update_goal`"),
+            "the mandatory terminal Plan ceremony must be gone:\n{section}"
+        );
+        assert!(
+            section.contains("Only observed outcomes justify `completed`")
+                && section.contains("must not be reported as completed"),
+            "plan truthfulness rules must remain:\n{section}"
         );
         let def = super::update_goal_tool_definition();
         assert!(
-            def.description.contains("update_plan")
-                && def
-                    .description
-                    .contains("unfinished steps stay pending or in_progress"),
-            "goal closeout contract is missing or fabricates completion: {}",
+            !def.description.contains("update_plan"),
+            "the goal tool must not mandate a terminal Plan refresh: {}",
             def.description
         );
+        for needle in ["AS THE USER STATED IT", "false completion", "`blocked`"] {
+            assert!(
+                def.description.contains(needle),
+                "completion semantics lost `{needle}`"
+            );
+        }
     }
 
     /// The plan is the agent's declared progress. The runtime records, persists
     /// and shows it; it does not observe whether the work is really at the
-    /// declared step, so neither text may present the plan as the live state
-    /// of the work.
+    /// declared step. The declaration framing lives in the prompt section the
+    /// model reads; the tool contract states that the runtime advances nothing
+    /// on its own. Neither text may present the plan as the live state of the
+    /// work.
     #[test]
     fn the_plan_is_described_as_declared_progress() {
         let def = crate::update_plan::UpdatePlanTool;
         let description = leveler_tools::Tool::description(&def);
-        for text in [plan_section(), description] {
-            assert!(
-                text.contains("declare"),
-                "plan must be framed as declared progress:\n{text}"
-            );
+        let section = plan_section();
+        assert!(
+            section.contains("declared intent"),
+            "plan section must frame the plan as a declaration:\n{section}"
+        );
+        assert!(
+            description.contains("nothing else advances"),
+            "the tool contract says the runtime advances nothing:\n{description}"
+        );
+        for text in [section, description] {
             assert!(
                 !text.contains("state of the work"),
                 "plan must not be framed as the live state of the work:\n{text}"
             );
         }
-        assert!(
-            plan_section().contains("nothing updates it for you"),
-            "the runtime does not advance the plan:\n{}",
-            plan_section()
-        );
     }
 
-    /// Plan order is the intended order: completing a later step first is a
-    /// legitimate declaration.
+    /// Order is the model's decision: the contract records the list it is sent
+    /// and makes no later step conditional on an earlier one.
     #[test]
-    fn plan_order_is_intended_not_mandatory() {
+    fn the_plan_contract_imposes_no_order_rule() {
         let def = crate::update_plan::UpdatePlanTool;
         let description = leveler_tools::Tool::description(&def);
-        assert!(
-            description.contains("intended order"),
-            "update_plan must say order is intent, not a rule:\n{description}"
-        );
+        for banned in [
+            "intended order",
+            "completed in order",
+            "sequentially",
+            "one at a time",
+        ] {
+            assert!(
+                !description.contains(banned),
+                "update_plan imposes an order rule (`{banned}`):\n{description}"
+            );
+        }
     }
 
     #[test]
-    fn plan_sync_is_described_as_freshness_not_completion_inference() {
+    fn plan_sync_is_described_without_a_completion_mandate() {
         let section = plan_section();
-        assert!(section.contains("freshness requirement"));
-        assert!(section.contains("not an all-done requirement"));
-        assert!(section.contains("never mark them `completed` merely to close"));
+        assert!(
+            !section.contains("freshness requirement")
+                && !section.contains("Close:")
+                && !section.contains("before `update_goal`"),
+            "the terminal Plan mandate must be gone:\n{section}"
+        );
+        assert!(
+            section.contains("declared intent and status"),
+            "the plan stays a declaration:\n{section}"
+        );
     }
 }
 
@@ -923,17 +938,61 @@ mod scope_fidelity_tests {
         }
     }
 
-    /// Last-edit truth survives the verification-sufficiency wording: an edit
-    /// still invalidates prior verification, so a completion claim stays
-    /// grounded in build/tests run since the last change. VIF changes what the
-    /// model does with sufficient evidence, not this contract.
+    /// Verification productionized after the three-arm experiment: the
+    /// description demands a truthful claim about the current workspace state
+    /// and nothing more. A mandatory proof tool (or a last-edit proof rule)
+    /// here would be a completion gate the harness deliberately does not have.
     #[test]
-    fn update_goal_keeps_the_last_edit_truth() {
+    fn update_goal_does_not_mandate_a_proof_tool() {
         let def = super::update_goal_tool_definition();
-        assert!(
-            def.description.contains("since your last edit"),
-            "completion contract lost the last-edit truth"
-        );
+        for banned in [
+            "PROVEN",
+            "since your last edit",
+            "build/tests",
+            "build and tests",
+        ] {
+            assert!(
+                !def.description.contains(banned),
+                "verification must stay evidence, not a completion gate: `{banned}`"
+            );
+        }
+        for needle in [
+            "AS THE USER STATED IT",
+            "false completion",
+            "`blocked`",
+            "against the current workspace state",
+        ] {
+            assert!(
+                def.description.contains(needle),
+                "completion semantics lost `{needle}`"
+            );
+        }
+    }
+
+    /// With production semantics finalized, there is no Plan close-coaching
+    /// seam left to ablate: the tool description never mandates a terminal
+    /// Plan refresh and always keeps the completion contract.
+    #[test]
+    fn update_goal_never_mandates_a_terminal_plan_refresh() {
+        let def = super::update_goal_tool_definition();
+        for banned in [
+            "first call update_plan",
+            "You may call update_plan then update_goal",
+            "unfinished steps stay pending",
+            "PROVEN",
+        ] {
+            assert!(
+                !def.description.contains(banned),
+                "production must not carry `{banned}`: {}",
+                def.description
+            );
+        }
+        for needle in ["AS THE USER STATED IT", "false completion", "`blocked`"] {
+            assert!(
+                def.description.contains(needle),
+                "completion contract lost `{needle}`"
+            );
+        }
     }
 }
 
@@ -976,17 +1035,21 @@ mod tests {
     fn spawn_agent_advertises_the_background_first_contract() {
         let def = spawn_agent_tool_definition();
         let d = def.description.to_ascii_lowercase();
-        assert!(d.contains("background by default"), "{}", def.description);
-        assert!(d.contains("returns immediately"), "{}", def.description);
+        assert!(d.contains("defaults to true"), "{}", def.description);
+        assert!(
+            d.contains("returns the child's id immediately") || d.contains("returns immediately"),
+            "{}",
+            def.description
+        );
         assert!(d.contains("settle"), "{}", def.description);
         assert!(
-            d.contains("claim") && d.contains("write"),
+            d.contains("claim_write_scope") || (d.contains("claim") && d.contains("write")),
             "the late-bound claim protocol must be model-visible: {}",
             def.description
         );
         assert!(
-            d.contains("keep the work yourself when"),
-            "KEEP guidance must stay: {}",
+            !d.contains("keep the work yourself"),
+            "delegation choice is not a tool instruction: {}",
             def.description
         );
         assert!(
@@ -1001,7 +1064,8 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase();
         assert!(param.contains("defaults to true"), "{param}");
-        assert!(param.contains("next action depends"), "{param}");
+        assert!(param.contains("waits for the child's result"), "{param}");
+        assert!(!param.contains("next action depends"), "{param}");
     }
 
     /// The child's short task title is spawn-time identity, separate from the
@@ -1018,10 +1082,13 @@ mod tests {
         let title = def.input_schema["properties"]["title"]["description"]
             .as_str()
             .unwrap();
-        assert!(title.contains("not a copy of `task`"), "{title}");
+        assert!(
+            title.to_ascii_lowercase().contains("not a copy of `task`"),
+            "{title}"
+        );
         assert!(title.contains("3–8 words"), "{title}");
         assert!(
-            def.description.contains("short `title`"),
+            def.description.contains("short display name"),
             "{}",
             def.description
         );
@@ -1224,28 +1291,22 @@ mod tests {
 
         let primary = request_user_input_tool_definition();
         assert_eq!(primary.name, "request_user_input");
-        assert!(primary.description.contains("ask_user"));
+        assert!(
+            !primary.description.contains("ask_user"),
+            "the legacy name is accepted by the parser and is not advertised"
+        );
         assert!(primary.input_schema["properties"].get("question").is_some());
         assert!(
             primary.description.contains("mutually exclusive")
                 || primary.description.contains("2–4")
                 || primary.description.contains("2-4"),
-            "tool description must require structured choice options: {}",
+            "tool description must state the choice shape: {}",
             primary.description
         );
         assert!(
-            primary.description.contains("fake pause")
-                || primary.description.contains("waiting for confirmation"),
-            "tool description must ban prose-only waiting: {}",
+            primary.description.contains("does not pause"),
+            "prose must not be described as a wait: {}",
             primary.description
-        );
-
-        let legacy = ask_user_tool_definition();
-        assert_eq!(legacy.name, "ask_user");
-        assert!(legacy.description.contains("request_user_input"));
-        assert_eq!(
-            primary.input_schema["required"],
-            legacy.input_schema["required"]
         );
     }
 

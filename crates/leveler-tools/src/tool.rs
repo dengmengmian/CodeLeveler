@@ -43,9 +43,14 @@ pub struct ToolContext {
     /// per-session capability state (e.g. browser pages/refs — §18). `None` for
     /// non-session contexts (eval, one-shot CLI); those share a default scope.
     pub session_scope: Option<Arc<str>>,
+    /// Execution writer within the session. Unlike session identity, this
+    /// ends when a delegated writer releases its exclusive path ownership.
+    pub writer_scope: Option<Arc<str>>,
+    /// The host owns this per-call lease from policy resolution through dispatch.
+    pub command_lease: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
     /// Where a command call sends its live output while it runs. Set per call
     /// by the host that shows it; `None` runs the command without streaming.
-    pub output: Option<tokio::sync::mpsc::UnboundedSender<leveler_execution::OutputChunk>>,
+    pub output: Option<tokio::sync::mpsc::Sender<leveler_execution::OutputChunk>>,
 }
 
 /// Process-wide execution and write-safety infrastructure. Every handle is an
@@ -122,14 +127,8 @@ pub struct ToolPolicy {
     pub command_modified_files_remaining: Option<usize>,
     /// Files already counted against the run budget before this command.
     pub command_previously_modified: Arc<Vec<String>>,
-    /// Paths exclusively owned by ANOTHER agent while this call runs.
-    ///
-    /// A command's workspace changes are attributed by diffing the whole
-    /// workspace around it, which in a shared tree with concurrent children
-    /// also catches a sibling's writes. This call cannot have made those — the
-    /// ownership fence and the write allowlist both refuse them — so they are
-    /// excluded from attribution. Without it, a sibling's authorized write is
-    /// charged here as a violation and rolled back with the rest.
+    /// Paths exclusively owned by another writer. The OS write boundary
+    /// excludes them before spawn, and scoped snapshots never include them.
     pub command_foreign_paths: Arc<Vec<String>>,
     /// Per-model byte budget for a single tool result (the central cap applied
     /// after every tool call). Defaults to [`crate::registry::MAX_TOOL_OUTPUT`];
@@ -191,6 +190,27 @@ impl ToolPolicy {
     pub fn write_scope(&self, workspace_root: &std::path::Path) -> WriteScope {
         if let Some(resolved) = &self.resolved {
             return resolved.write.clone();
+        }
+        // Resource ownership narrows even an elevated permission profile.
+        // The host freezes this boundary before execution; post-hoc diffs are
+        // observations, never a substitute for the sandbox's write authority.
+        if self.read_only || self.has_zero_write_authority() {
+            return WriteScope::None;
+        }
+        if self.command_write_allowlist.is_some() || !self.command_foreign_paths.is_empty() {
+            return WriteScope::ScopedWorkspace {
+                root: workspace_root.to_path_buf(),
+                allowed: self
+                    .command_write_allowlist
+                    .as_ref()
+                    .map(|paths| paths.iter().map(|p| workspace_root.join(p)).collect())
+                    .unwrap_or_else(|| vec![workspace_root.to_path_buf()]),
+                excluded: self
+                    .command_foreign_paths
+                    .iter()
+                    .map(|p| workspace_root.join(p))
+                    .collect(),
+            };
         }
         if self.turn_unrestricted_fs {
             return WriteScope::Unrestricted;
@@ -306,6 +326,8 @@ impl ToolContext {
                 tool_output_budget: crate::registry::MAX_TOOL_OUTPUT,
             },
             session_scope: None,
+            writer_scope: None,
+            command_lease: None,
             output: None,
         }
     }
@@ -342,7 +364,22 @@ impl ToolContext {
         self.session_scope.as_deref().unwrap_or("default")
     }
 
-    /// Force Safe-only tools (collaboration plan / read-only planning).
+    /// Carry the host admission lease through this one call.
+    pub fn with_command_lease(mut self, lease: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        self.command_lease = Some(Arc::new(lease));
+        self
+    }
+
+    pub fn with_writer_scope(mut self, writer: impl Into<Arc<str>>) -> Self {
+        self.writer_scope = Some(writer.into());
+        self
+    }
+
+    pub fn writer_scope(&self) -> &str {
+        self.writer_scope.as_deref().unwrap_or("parent")
+    }
+
+    /// Force Safe-only tools and remove filesystem write authority.
     pub fn with_read_only(mut self, on: bool) -> Self {
         self.policy.read_only = on;
         self
@@ -626,17 +663,15 @@ mod write_scope_tests {
         assert_eq!(c.write_scope(), WriteScope::None);
     }
 
-    /// The read-only OVERLAY (`leveler plan`) is orthogonal: it filters tools
-    /// by risk rather than by write scope, so `has_zero_write_authority` is
-    /// false under it and the scope stays the workspace. Pinned so the adapter
-    /// does not quietly merge two mechanisms.
+    /// A structural read-only overlay must not grant OS write authority even
+    /// if a caller reaches the runner without the ordinary registry filter.
     #[test]
-    fn read_only_overlay_does_not_collapse_into_none() {
+    fn read_only_overlay_carries_no_write_authority() {
         let (mut c, _d) = ctx(PermissionProfile::Assisted);
         c.policy.read_only = true;
-        let root = c.execution.workspace.root().to_path_buf();
+        assert_eq!(c.write_scope(), WriteScope::None);
         let c = c.with_command_write_constraints(Some(Vec::new()), None, Vec::new());
-        assert_eq!(c.write_scope(), WriteScope::Workspace { root });
+        assert_eq!(c.write_scope(), WriteScope::None);
     }
 
     /// Mirrors the predicate it replaces, for the live profile cell too: a

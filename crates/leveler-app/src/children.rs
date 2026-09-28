@@ -191,6 +191,8 @@ mod tests {
 
     async fn usage(db: &Database, sid: &SessionId, agent: &str, input: u64, cost: Option<u64>) {
         db.insert(&ModelRequestRecord {
+            budget_scope: None,
+            estimated_tokens: None,
             id: leveler_core::new_uuid_string(),
             provider_request_id: None,
             session_id: sid.clone(),
@@ -199,11 +201,17 @@ mod tests {
             input_tokens: input,
             output_tokens: 10,
             cached_input_tokens: Some(0),
+            projected_input_tokens: None,
+            projected_reasoning_tokens: None,
             cost_usd_micros: cost,
             agent_id: Some(agent.into()),
             finish_reason: Some("stop".into()),
             error_kind: None,
             latency_ms: Some(1),
+            attempt_ms: None,
+            connect_ms: None,
+            ttft_ms: None,
+            max_event_gap_ms: None,
             retry_count: 0,
             kind: leveler_storage::ModelCallKind::Round,
             created_at: now(),

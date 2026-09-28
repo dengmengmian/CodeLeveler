@@ -185,9 +185,6 @@ fn render_event_text(event: AgentEvent) {
                         "nudge: goal unresolved"
                     }
                     leveler_agent::closeout::CloseoutReason::EmptyAnswer => "nudge: empty answer",
-                    leveler_agent::closeout::CloseoutReason::PlanUnreconciled => {
-                        "nudge: plan unreconciled"
-                    }
                 },
             };
             println!("  {} {label}", console::style("⋯").yellow());
@@ -219,6 +216,20 @@ fn render_event_text(event: AgentEvent) {
             println!(
                 "{} memory {operation} [{id}] {title}",
                 console::style("●").cyan()
+            );
+        }
+        AgentEvent::RuntimeInjection {
+            kind,
+            role,
+            model_step,
+            forces_continuation,
+        } => {
+            // Headless runs print it so a harness-bought round is visible in
+            // a transcript instead of looking like the model's own cadence.
+            let forced = if forces_continuation { " forced" } else { "" };
+            println!(
+                "  {} harness {kind} ({role}, step {model_step}{forced})",
+                console::style("↺").dim()
             );
         }
         AgentEvent::Finished(_) => {}
@@ -293,12 +304,32 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
             name,
             is_error,
             preview,
+            exit_code,
+            stop,
+            execution_status,
             ..
         } => serde_json::json!({
             "type": "tool_result", "id": id, "tool": name, "is_error": is_error, "preview": preview,
+            // The command outcome and the execution outcome, stated by the layer
+            // that ran the process. `is_error` is the model-visible signal and
+            // also covers a non-zero exit and a rejected mutation; these fields
+            // are what let telemetry tell "the tool could not run" from "the
+            // command ran and reported failure". Null for non-command tools.
+            "exit_code": exit_code,
+            "stop": stop,
+            "execution_status": execution_status,
         }),
         AgentEvent::WorkspaceSnapshot { call_id, snapshot } => serde_json::json!({
             "type": "workspace_snapshot", "call_id": call_id, "snapshot": snapshot,
+        }),
+        AgentEvent::RuntimeInjection {
+            kind,
+            role,
+            model_step,
+            forces_continuation,
+        } => serde_json::json!({
+            "type": "runtime_injection", "kind": kind, "role": role,
+            "model_step": model_step, "forces_continuation": forces_continuation,
         }),
         AgentEvent::Finished(text) => serde_json::json!({ "type": "finished", "text": text }),
         AgentEvent::Usage {
@@ -461,5 +492,44 @@ mod jsonl_tests {
         });
         assert_eq!(line["outcome"], "incomplete_no_result");
         assert_eq!(line["stop"], "lost");
+    }
+
+    /// C2: the JSONL stream is the benchmark's telemetry. A command that ran
+    /// and exited non-zero must reach it as `execution_status: completed` with
+    /// its exit code, so a classifier never has to guess from the preview text.
+    #[test]
+    fn a_command_result_line_carries_execution_and_command_outcome() {
+        let line = event_jsonl(AgentEvent::ToolResult {
+            id: "c1".into(),
+            name: "shell_command".into(),
+            is_error: true,
+            preview: "exit: 101\n--- stderr ---\ntest failed".into(),
+            applied_diff: None,
+            exit_code: Some(101),
+            stop: None,
+            execution_status: Some(leveler_execution::ToolExecutionStatus::Completed),
+        });
+        assert_eq!(line["tool"], "shell_command");
+        assert_eq!(line["execution_status"], "completed");
+        assert_eq!(line["exit_code"], 101);
+        assert!(line["stop"].is_null());
+    }
+
+    /// A timeout and a cancellation are execution failures, and the line says
+    /// which one instead of leaving it to prose.
+    #[test]
+    fn a_non_command_result_line_reports_no_execution_status() {
+        let line = event_jsonl(AgentEvent::ToolResult {
+            id: "r1".into(),
+            name: "read_file".into(),
+            is_error: true,
+            preview: "file not found".into(),
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+            execution_status: None,
+        });
+        assert!(line["execution_status"].is_null());
+        assert!(line["exit_code"].is_null());
     }
 }

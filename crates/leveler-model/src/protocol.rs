@@ -32,9 +32,11 @@ pub struct ProtocolContext {
     /// is active. When false, the thinking-flag adapter explicitly disables
     /// thinking on forced-choice requests — see `CompatibilityConfig`.
     pub thinking_supports_forced_tool_choice: bool,
-    /// Whether assistant tool-call messages must echo `reasoning_content`
-    /// back to the provider — see `CompatibilityConfig`.
-    pub passback_reasoning_content: bool,
+    /// The route's resolved reasoning-replay contract: WHEN captured
+    /// reasoning is carried, and WHAT a turn that captured none carries. A
+    /// route's protocol and declared compatibility resolve it once, here, so
+    /// no adapter decides either question for itself.
+    pub reasoning_replay: crate::projection::ReasoningReplayContract,
 }
 
 /// A protocol-layer failure. Kept separate from `ModelError` because a protocol
