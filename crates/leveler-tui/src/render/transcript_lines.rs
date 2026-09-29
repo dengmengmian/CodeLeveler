@@ -6,7 +6,9 @@ use leveler_client_protocol::UiCompletionReport;
 
 use crate::i18n::{Locale, UiText};
 use crate::theme::Theme;
-use crate::transcript::{AssistantBlock, ToolStatus, TranscriptItem, TurnEndBlock, TurnEndStatus};
+use crate::transcript::{
+    AssistantBlock, AssistantKind, ToolStatus, TranscriptItem, TurnEndBlock, TurnEndStatus,
+};
 
 use super::text::wrap;
 
@@ -22,7 +24,12 @@ pub fn assistant_split(
 ) -> (Vec<Line<'static>>, usize) {
     let (lines, stable) = assistant_body(block, theme, wrap_width);
     // Bulleting maps lines 1:1, so the stable boundary is preserved.
-    let bulleted = bulleted(lines, "●", Style::default().fg(theme.accent.primary));
+    let marker = if block.kind == AssistantKind::Final {
+        "◆"
+    } else {
+        "●"
+    };
+    let bulleted = bulleted(lines, marker, Style::default().fg(theme.accent.primary));
     (bulleted, stable)
 }
 
@@ -36,7 +43,7 @@ fn assistant_body(
     theme: &Theme,
     wrap_width: usize,
 ) -> (Vec<Line<'static>>, usize) {
-    // Content is indented two columns under a leading "●" bullet.
+    // Content is indented two columns under its Assistant marker.
     let inner = wrap_width.saturating_sub(2).max(1);
     // Use the cached parse when done, else parse the partial text this frame so
     // formatting appears as it streams (spec §62).
@@ -48,7 +55,13 @@ fn assistant_body(
             &parsed
         }
     };
-    let (mut lines, mut stable) = doc.to_lines_split(inner, theme);
+    let tone = match block.kind {
+        AssistantKind::Final => crate::markdown::AssistantTone::Final,
+        AssistantKind::Progress | AssistantKind::Pending => {
+            crate::markdown::AssistantTone::Progress
+        }
+    };
+    let (mut lines, mut stable) = doc.to_lines_split_with_tone(inner, theme, tone);
     if block.done {
         // A finished message is fully stable.
         stable = lines.len();
@@ -1206,6 +1219,115 @@ mod tests {
             .iter()
             .map(line_text)
             .collect()
+    }
+
+    #[test]
+    fn progress_and_final_use_distinct_markers() {
+        let progress = assistant_render(
+            &block("working", AssistantKind::Progress),
+            &Theme::no_color(),
+            40,
+        );
+        let final_answer =
+            assistant_render(&block("done", AssistantKind::Final), &Theme::no_color(), 40);
+
+        assert!(line_text(&progress[0]).starts_with("● "));
+        assert!(line_text(&final_answer[0]).starts_with("◆ "));
+    }
+
+    #[test]
+    fn final_answer_has_a_distinct_base_tone_without_overriding_markdown_roles() {
+        let theme = Theme::dark();
+        let progress = assistant_render(&block("plain body", AssistantKind::Progress), &theme, 80);
+        let final_answer = assistant_render(
+            &block(
+                "plain body with `cargo test` and [docs](https://example.com)\n\n## Result",
+                AssistantKind::Final,
+            ),
+            &theme,
+            80,
+        );
+
+        let progress_body = progress[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("plain"))
+            .expect("progress body span");
+        let final_body = final_answer[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("plain"))
+            .expect("final body span");
+        let code = final_answer
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("cargo"))
+            .expect("inline code span");
+        let link = final_answer
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("docs"))
+            .expect("link span");
+        let heading = final_answer
+            .iter()
+            .find(|line| line_text(line).contains("Result"))
+            .expect("heading line");
+
+        assert_eq!(progress_body.style.fg, Some(theme.text.primary));
+        assert_eq!(final_body.style.fg, Some(theme.text.final_answer));
+        assert_eq!(code.style.fg, Some(theme.text.code));
+        assert_eq!(link.style.fg, Some(theme.accent.primary));
+        assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(
+            heading
+                .spans
+                .iter()
+                .filter(|span| !span.content.trim().is_empty())
+                .all(|span| span.style.fg == Some(theme.accent.secondary))
+        );
+    }
+
+    #[test]
+    fn streaming_and_completed_final_answers_share_the_same_wrapped_body_tone() {
+        let theme = Theme::light();
+        let text = "A final answer long enough to wrap over several visual rows consistently.";
+        let complete = assistant_render(&block(text, AssistantKind::Final), &theme, 24);
+        let mut streaming = block(text, AssistantKind::Final);
+        streaming.done = false;
+        streaming.rendered = None;
+        let streaming = assistant_render(&streaming, &theme, 24);
+
+        let body_colors = |lines: &[Line<'_>]| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter(|span| {
+                    let text = span.content.as_ref();
+                    !text.trim().is_empty() && text != "◆ " && text != "▌"
+                })
+                .map(|span| span.style.fg)
+                .collect::<Vec<_>>()
+        };
+        assert!(!body_colors(&complete).is_empty());
+        assert_eq!(body_colors(&complete), body_colors(&streaming));
+    }
+
+    #[test]
+    fn no_color_keeps_final_structure_without_adding_color() {
+        let lines = assistant_render(
+            &block("final answer", AssistantKind::Final),
+            &Theme::no_color(),
+            40,
+        );
+
+        assert!(line_text(&lines[0]).starts_with("◆ "));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .all(|span| span.style.fg == Some(ratatui::style::Color::Reset)
+                    || span.style.fg.is_none())
+        );
     }
 
     const LONG_PROGRESS: &str = "全部验证通过：

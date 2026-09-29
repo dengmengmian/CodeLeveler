@@ -94,6 +94,8 @@ pub struct SurfaceColors {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextColors {
     pub primary: Color,
+    /// The base prose color for an assistant's final answer.
+    pub final_answer: Color,
     pub secondary: Color,
     /// Inline code, paths, identifiers, and commands inside prose.
     pub code: Color,
@@ -234,6 +236,7 @@ fn indexed_256_theme(theme: Theme) -> Theme {
         },
         text: TextColors {
             primary: indexed(theme.text.primary),
+            final_answer: indexed(theme.text.final_answer),
             secondary: indexed(theme.text.secondary),
             code: indexed(theme.text.code),
             muted: indexed(theme.text.muted),
@@ -356,6 +359,7 @@ impl Theme {
             },
             text: TextColors {
                 primary: rgb(0xE7E9EC),
+                final_answer: rgb(0xB7D7FA),
                 secondary: rgb(0xB5BAC1),
                 code: rgb(0x79C6D6),
                 muted: rgb(0x858C95),
@@ -414,6 +418,7 @@ impl Theme {
             },
             text: TextColors {
                 primary: rgb(0x20242A),
+                final_answer: rgb(0x254F7A),
                 secondary: rgb(0x4D5560),
                 code: rgb(0x176B78),
                 // Suggested #6F7884 misses 4.5:1 on this canvas; darkened.
@@ -473,6 +478,7 @@ impl Theme {
             },
             text: TextColors {
                 primary: rgb(0xFFFFFF),
+                final_answer: rgb(0xB8DEFF),
                 secondary: rgb(0xE8E8E8),
                 code: rgb(0x80E5FF),
                 muted: rgb(0xC8C8C8),
@@ -550,6 +556,7 @@ impl Theme {
             surface: reset,
             text: TextColors {
                 primary: Color::Reset,
+                final_answer: Color::Reset,
                 secondary: Color::Reset,
                 code: Color::Reset,
                 muted: Color::Reset,
@@ -731,6 +738,7 @@ pub fn preview_theme(theme: &Theme, color: bool) -> String {
     let rows = [
         ("Typography", None),
         ("Primary text", Some(theme.text.primary)),
+        ("Final answer", Some(theme.text.final_answer)),
         ("Secondary text", Some(theme.text.secondary)),
         ("Muted text", Some(theme.text.muted)),
         ("Disabled text", Some(theme.text.disabled)),
@@ -802,6 +810,7 @@ mod tests {
         assert_min(t.primary, s.input, 7.0, "primary/input");
         assert_min(t.primary, s.elevated, 7.0, "primary/elevated");
         assert_min(t.primary, s.selection, 4.5, "primary/selection");
+        assert_min(t.final_answer, s.canvas, 4.5, "final_answer/canvas");
         assert_min(t.secondary, s.canvas, 4.5, "secondary/canvas");
         assert_min(t.code, s.canvas, 4.5, "code/canvas");
         assert_min(t.muted, s.canvas, 4.5, "muted/canvas");
@@ -824,6 +833,7 @@ mod tests {
             assert!(!t.is_monochrome(), "{id}");
             assert_ne!(t.surface.canvas, Color::Reset, "{id} canvas");
             assert_ne!(t.text.primary, Color::Reset, "{id} primary");
+            assert_ne!(t.text.final_answer, Color::Reset, "{id} final answer");
             assert_ne!(t.text.code, Color::Reset, "{id} code");
             assert_ne!(t.text.muted, Color::Reset, "{id} muted");
             assert_ne!(t.accent.primary, Color::Reset, "{id} accent");
@@ -890,6 +900,7 @@ mod tests {
             assert!(t.is_monochrome(), "{id}");
             assert_eq!(t.accent.primary, Color::Reset);
             assert_eq!(t.text.primary, Color::Reset);
+            assert_eq!(t.text.final_answer, Color::Reset);
             assert_eq!(t.text.code, Color::Reset);
             assert_eq!(t.surface.canvas, Color::Reset);
             assert_eq!(t.id, id, "preference id retained under NO_COLOR");
@@ -912,6 +923,7 @@ mod tests {
             theme.surface.canvas,
             theme.surface.input,
             theme.text.primary,
+            theme.text.final_answer,
             theme.text.code,
             theme.text.muted,
             theme.border.focus,
@@ -987,6 +999,7 @@ mod tests {
         for needle in [
             "THEME PREVIEW",
             "Primary text",
+            "Final answer",
             "Secondary text",
             "Muted text",
             "Disabled text",

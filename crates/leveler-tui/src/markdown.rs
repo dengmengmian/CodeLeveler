@@ -19,6 +19,24 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
+/// The Assistant presentation role supplied by the transcript. Markdown only
+/// uses it to select the base prose color; its own semantic roles still win.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AssistantTone {
+    #[default]
+    Progress,
+    Final,
+}
+
+impl AssistantTone {
+    fn base_text(self, theme: &Theme) -> ratatui::style::Color {
+        match self {
+            Self::Progress => theme.text.primary,
+            Self::Final => theme.text.final_answer,
+        }
+    }
+}
+
 /// A parsed markdown document, width-agnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MdDoc {
@@ -291,6 +309,18 @@ impl MdDoc {
         self.to_lines_split(width, theme).0
     }
 
+    /// Lay out Assistant Markdown with the transcript-supplied presentation
+    /// role. This changes only base prose; headings, code, links and other
+    /// Markdown semantics retain their dedicated styles.
+    pub fn to_lines_split_with_tone(
+        &self,
+        width: usize,
+        theme: &Theme,
+        tone: AssistantTone,
+    ) -> (Vec<Line<'static>>, usize) {
+        self.to_lines_split_inner(width, theme, tone)
+    }
+
     /// Flatten parsed Markdown into readable plain text for compact UI chrome.
     /// Syntax markers are discarded rather than leaked as literal `**`/`##`.
     pub fn plain_text(&self) -> String {
@@ -334,6 +364,15 @@ impl MdDoc {
     /// tail (the last, possibly-still-growing block) should stay in the live
     /// region. For an empty doc the split index is 0.
     pub fn to_lines_split(&self, width: usize, theme: &Theme) -> (Vec<Line<'static>>, usize) {
+        self.to_lines_split_inner(width, theme, AssistantTone::Progress)
+    }
+
+    fn to_lines_split_inner(
+        &self,
+        width: usize,
+        theme: &Theme,
+        tone: AssistantTone,
+    ) -> (Vec<Line<'static>>, usize) {
         let width = width.max(1);
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut last_block_start = 0;
@@ -344,7 +383,7 @@ impl MdDoc {
             }
             last_block_start = out.len();
             block_starts.push(last_block_start);
-            render_block(block, width, theme, &mut out);
+            render_block(block, width, theme, tone, &mut out);
         }
         // Within the LAST (still-streaming) block, greedy wrapping normally
         // leaves only the final display line mutable. An unmatched strong
@@ -393,7 +432,13 @@ fn trailing_block_may_be_table(text: &str) -> bool {
 }
 
 /// Render a single markdown block into styled lines.
-fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line<'static>>) {
+fn render_block(
+    block: &MdBlock,
+    width: usize,
+    theme: &Theme,
+    tone: AssistantTone,
+    out: &mut Vec<Line<'static>>,
+) {
     {
         match block {
             MdBlock::Heading { level, spans } => {
@@ -430,7 +475,7 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     spans,
                     width,
                     theme,
-                    Style::default().fg(theme.text.primary),
+                    Style::default().fg(tone.base_text(theme)),
                 ));
             }
             MdBlock::Quote(spans) => {
@@ -456,16 +501,22 @@ fn render_block(block: &MdBlock, width: usize, theme: &Theme, out: &mut Vec<Line
                     };
                     let indent = " ".repeat(marker.width());
                     let inner = width.saturating_sub(marker.width()).max(1);
-                    let wrapped =
-                        wrap_spans(item, inner, theme, Style::default().fg(theme.text.primary));
+                    let wrapped = wrap_spans(
+                        item,
+                        inner,
+                        theme,
+                        Style::default().fg(tone.base_text(theme)),
+                    );
                     for (li, line) in wrapped.into_iter().enumerate() {
                         let lead = if li == 0 {
                             marker.clone()
                         } else {
                             indent.clone()
                         };
-                        let mut spans =
-                            vec![Span::styled(lead, Style::default().fg(theme.text.primary))];
+                        let mut spans = vec![Span::styled(
+                            lead,
+                            Style::default().fg(tone.base_text(theme)),
+                        )];
                         spans.extend(line.spans);
                         out.push(Line::from(spans));
                     }
