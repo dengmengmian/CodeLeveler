@@ -521,6 +521,13 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             },
             false,
         ),
+        (
+            "force_retire",
+            ClientCommand::ForceRetire {
+                reason: leveler_client_protocol::RestartReason::BuildMismatch,
+            },
+            false,
+        ),
     ]
 }
 
