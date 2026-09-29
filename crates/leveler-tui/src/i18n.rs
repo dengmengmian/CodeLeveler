@@ -284,6 +284,7 @@ pub struct UiText {
     /// `/memory`: the listing's own words. `memory_dir=`, entry ids and the
     /// `kind=`/`source=` pairs beside them are Class C (IA §12).
     pub memory_title: &'static str,
+    pub memory_summary: &'static str,
     pub memory_active: &'static str,
     pub memory_archived: &'static str,
     pub memory_pending: &'static str,
@@ -1167,6 +1168,7 @@ static ZH: UiText = UiText {
     tool_output_lines: "{} 行",
     tool_question_count: "{} 个问题",
     memory_title: "项目记忆",
+    memory_summary: "项目记忆 · {active} 条生效 · {pending} 条待确认",
     memory_active: "生效",
     memory_archived: "已归档",
     memory_pending: "待确认",
@@ -1877,6 +1879,7 @@ static EN: UiText = UiText {
     tool_output_lines: "{} lines",
     tool_question_count: "{} questions",
     memory_title: "Memory",
+    memory_summary: "Memory · {active} active · {pending} pending",
     memory_active: "active",
     memory_archived: "archived",
     memory_pending: "pending",

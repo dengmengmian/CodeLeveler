@@ -3796,12 +3796,11 @@ fn ctrl_d_opens_diff_and_requests_it() {
     let mut s = opened();
     let effects = reduce(&mut s, ctrl('d'));
     assert_eq!(s.active_screen, Screen::Diff);
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::RequestDiff {
-            session_id: SessionId::new("s1"),
-        })]
-    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Send(ClientCommand::RequestDiff { session_id, query_id: Some(_) })]
+            if session_id == &SessionId::new("s1")
+    ));
 }
 
 #[test]
@@ -3811,6 +3810,7 @@ fn diff_updated_sets_files_and_nav_clamps() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: UiDiff {
                 files: vec![
                     UiDiffFile {
@@ -3830,6 +3830,42 @@ fn diff_updated_sets_files_and_nav_clamps() {
         }),
     );
     assert_eq!(s.diff.as_ref().unwrap().files.len(), 2);
+}
+
+#[test]
+fn a_requested_diff_is_applied_only_to_its_requesting_client() {
+    use leveler_client_protocol::UiDiff;
+    let mut s = opened();
+    let effects = reduce(&mut s, ctrl('d'));
+    let owned = effects.iter().find_map(|effect| match effect {
+        Effect::Send(ClientCommand::RequestDiff { query_id, .. }) => query_id.clone(),
+        _ => None,
+    });
+    assert!(
+        owned.is_some(),
+        "the TUI must own its diff query: {effects:?}"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: Some(leveler_client_protocol::CommandId::new("web-query")),
+            diff: UiDiff { files: Vec::new() },
+        }),
+    );
+    assert!(
+        s.diff.is_none(),
+        "a foreign response must not replace the diff"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: owned,
+            diff: UiDiff { files: Vec::new() },
+        }),
+    );
+    assert!(s.diff.is_some());
 }
 
 #[test]
@@ -3870,6 +3906,30 @@ fn slash_memory_list_sends_list_memory_with_archived() {
     );
 }
 
+/// Query responses are client-owned. Opening Web may issue `list_memory` on
+/// the same session, but that answer must not appear in this TUI transcript.
+#[test]
+fn an_unowned_memory_listing_does_not_leak_into_the_tui() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::MemoryList {
+            query_id: None,
+            memory_dir: "/web/memory".into(),
+            active: vec![],
+            archived: vec![],
+            pending: vec![],
+        }),
+    );
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::MemoryList(_))),
+        "another client's query response leaked into the TUI"
+    );
+}
+
 #[test]
 fn slash_memory_forget_sends_forget_memory() {
     let mut s = opened();
@@ -3887,9 +3947,12 @@ fn slash_memory_forget_sends_forget_memory() {
 #[test]
 fn memory_list_event_pushes_multiline_transcript_note() {
     let mut s = opened();
+    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
+    s.memory_query = Some(query_id.clone());
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::MemoryList {
+            query_id: Some(query_id),
             memory_dir: "/proj/memory".into(),
             active: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "prefer-ws".into(),
@@ -3907,10 +3970,10 @@ fn memory_list_event_pushes_multiline_transcript_note() {
         }),
     );
     let note = s.transcript.items().iter().find_map(|i| match i {
-        TranscriptItem::Note(t) => Some(t.as_str()),
+        TranscriptItem::MemoryList(block) => Some(block.details.as_str()),
         _ => None,
     });
-    let note = note.expect("MemoryList must push TranscriptItem::Note");
+    let note = note.expect("owned MemoryList must push a memory disclosure");
     assert!(note.contains("memory_dir=/proj/memory"), "{note}");
     assert!(note.contains("[prefer-ws]"), "{note}");
     assert!(note.contains("prefer workspace write"), "{note}");
@@ -6686,12 +6749,15 @@ fn slash_memory_accept_promotes_a_pending_candidate() {
     let mut s = state();
     s.composer.replace("/memory accept rust-anyhow");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::AcceptMemory {
-            session_id: SessionId::new("s1"),
-            id: "rust-anyhow".to_string(),
-        })]
+    assert!(
+        matches!(
+            &effects[..],
+            [
+                Effect::Send(ClientCommand::AcceptMemory { id, .. }),
+                Effect::Send(ClientCommand::ListMemory { query_id: Some(_), include_archived: false, .. })
+            ] if id == "rust-anyhow"
+        ),
+        "{effects:?}"
     );
 }
 
@@ -6709,9 +6775,12 @@ fn slash_memory_accept_without_an_id_explains_itself() {
 #[test]
 fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
     let mut s = state();
+    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
+    s.memory_query = Some(query_id.clone());
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::MemoryList {
+            query_id: Some(query_id),
             memory_dir: "/tmp/mem".into(),
             active: vec![],
             archived: vec![],
@@ -6724,6 +6793,25 @@ fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
             }],
         }),
     );
+    let collapsed = rendered(&mut s, 120, 30);
+    assert!(
+        collapsed.contains("项目记忆 · 0 条生效 · 1 条待确认"),
+        "collapsed listing needs a useful summary:\n{collapsed}"
+    );
+    assert!(
+        !collapsed.contains("memory_dir=/tmp/mem"),
+        "storage internals must stay out of the collapsed transcript:\n{collapsed}"
+    );
+    assert!(
+        !collapsed.contains("use-pnpm"),
+        "entry details belong behind disclosure:\n{collapsed}"
+    );
+    assert_eq!(s.transcript.toggle_last_collapsible(), Some(true));
+    let expanded = rendered(&mut s, 120, 30);
+    assert!(expanded.contains("memory_dir=/tmp/mem"), "{expanded}");
+    assert!(expanded.contains("use-pnpm"), "{expanded}");
+    assert!(expanded.contains("不要默认 npm"), "{expanded}");
+
     let text = format!("{:?}", s.transcript.items());
     // The count and the id are what matter; the word beside them follows the
     // locale (IA §12 Class A).
@@ -6845,9 +6933,12 @@ fn remember_while_busy_is_a_write_not_steering() {
 #[test]
 fn the_listing_marks_a_sensitive_entry_as_withheld() {
     let mut s = state();
+    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
+    s.memory_query = Some(query_id.clone());
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::MemoryList {
+            query_id: Some(query_id),
             memory_dir: "/tmp/mem".into(),
             active: vec![leveler_client_protocol::UiMemoryEntry {
                 id: "legacy".into(),
@@ -6871,12 +6962,15 @@ fn memory_reject_sends_reject_not_forget() {
     let mut s = state();
     s.composer.replace("/memory reject cand-x");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::RejectMemory {
-            session_id: SessionId::new("s1"),
-            id: "cand-x".to_string(),
-        })]
+    assert!(
+        matches!(
+            &effects[..],
+            [
+                Effect::Send(ClientCommand::RejectMemory { id, .. }),
+                Effect::Send(ClientCommand::ListMemory { query_id: Some(_), include_archived: false, .. })
+            ] if id == "cand-x"
+        ),
+        "{effects:?}"
     );
 }
 
@@ -6886,12 +6980,15 @@ fn memory_forget_still_targets_active_entries() {
     let mut s = state();
     s.composer.replace("/memory forget mem-1");
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(
-        effects,
-        vec![Effect::Send(ClientCommand::ForgetMemory {
-            session_id: SessionId::new("s1"),
-            id: "mem-1".to_string(),
-        })]
+    assert!(
+        matches!(
+            &effects[..],
+            [
+                Effect::Send(ClientCommand::ForgetMemory { id, .. }),
+                Effect::Send(ClientCommand::ListMemory { query_id: Some(_), include_archived: true, .. })
+            ] if id == "mem-1"
+        ),
+        "{effects:?}"
     );
 }
 
@@ -8153,6 +8250,7 @@ fn finished_turn_summary(locale: leveler_tui::Locale) -> String {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: leveler_client_protocol::UiDiff {
                 files: vec![leveler_client_protocol::UiDiffFile {
                     path: "src/lib.rs".into(),
@@ -8689,6 +8787,80 @@ fn slash_agents_lists_and_slash_agents_name_inspects() {
 }
 
 #[test]
+fn an_unowned_agent_query_does_not_leak_into_the_tui() {
+    let mut s = opened();
+    typed(&mut s, "/agents");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    let owned = effects.iter().find_map(|effect| match effect {
+        Effect::Send(ClientCommand::ListAgents { query_id, .. }) => query_id.clone(),
+        _ => None,
+    });
+    assert!(owned.is_some(), "the TUI must own its query: {effects:?}");
+
+    let notes_before = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::Note(_)))
+        .count();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentsLoaded {
+            query_id: Some(leveler_client_protocol::CommandId::new("web-query")),
+            agents: vec![agent_entry(
+                "foreign",
+                leveler_client_protocol::UiAgentSource::Project,
+            )],
+            problems: Vec::new(),
+        }),
+    );
+    let notes_after = s
+        .transcript
+        .items()
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::Note(_)))
+        .count();
+    assert_eq!(
+        notes_after, notes_before,
+        "a foreign query must stay silent"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AgentsLoaded {
+            query_id: owned,
+            agents: vec![agent_entry(
+                "owned",
+                leveler_client_protocol::UiAgentSource::Project,
+            )],
+            problems: Vec::new(),
+        }),
+    );
+    assert!(last_note(&s).contains("owned"));
+}
+
+#[test]
+fn an_unowned_unfinished_goals_query_does_not_replace_tui_state() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::UnfinishedGoalsLoaded {
+            query_id: Some(leveler_client_protocol::CommandId::new("web-query")),
+            goals: vec![leveler_client_protocol::UiUnfinishedGoal {
+                goal_id: "g1".into(),
+                objective: "foreign".into(),
+                session_id: "s1".into(),
+                opened_at: "2026-09-29T00:00:00Z".into(),
+                windows_run: 1,
+                ours: true,
+                driving: false,
+            }],
+        }),
+    );
+    assert!(s.unfinished_goals.is_empty());
+}
+
+#[test]
 fn slash_skills_reads_the_local_registry_without_a_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join(".leveler/skills/deploy");
@@ -8723,6 +8895,8 @@ fn slash_skills_reads_the_local_registry_without_a_round_trip() {
 fn the_agents_listing_names_source_class_and_what_is_wrong() {
     use leveler_client_protocol::{UiAgentSource, UiAgentStatus};
     let mut s = opened();
+    let query_id = leveler_client_protocol::CommandId::new("agents-list");
+    s.agents_list_query = Some(query_id.clone());
     let mut invalid = agent_entry("broken", UiAgentSource::Project);
     invalid.status = UiAgentStatus::Invalid;
     invalid.reason = Some("agent.yaml: unknown field `wirte`".into());
@@ -8739,7 +8913,7 @@ fn the_agents_listing_names_source_class_and_what_is_wrong() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AgentsLoaded {
-            query_id: None,
+            query_id: Some(query_id),
             agents: vec![
                 invalid,
                 shadowing,
@@ -8769,6 +8943,8 @@ fn the_agents_listing_names_source_class_and_what_is_wrong() {
 fn an_agent_detail_shows_its_bounds_and_instructions() {
     use leveler_client_protocol::UiAgentSource;
     let mut s = opened();
+    let query_id = leveler_client_protocol::CommandId::new("agent-detail");
+    s.agent_detail_query = Some(query_id.clone());
     let mut entry = agent_entry("frontend-worker", UiAgentSource::Project);
     entry.capability = Some(leveler_client_protocol::UiAgentCapability::ScopedWriter);
     entry.write_roots = vec!["web".into()];
@@ -8777,7 +8953,7 @@ fn an_agent_detail_shows_its_bounds_and_instructions() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AgentLoaded {
-            query_id: None,
+            query_id: Some(query_id),
             name: "frontend-worker".into(),
             agent: Some(leveler_client_protocol::UiAgentDetail {
                 entry,
@@ -8798,10 +8974,12 @@ fn an_agent_detail_shows_its_bounds_and_instructions() {
     ] {
         assert!(note.contains(needle), "missing {needle}: {note}");
     }
+    let missing_query_id = leveler_client_protocol::CommandId::new("missing-agent");
+    s.agent_detail_query = Some(missing_query_id.clone());
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AgentLoaded {
-            query_id: None,
+            query_id: Some(missing_query_id),
             name: "nope".into(),
             agent: None,
             error: Some("Agent \"nope\" not found.".into()),
@@ -9054,9 +9232,12 @@ fn shift_up_walks_back_through_every_user_turn() {
 #[test]
 fn the_memory_listing_speaks_the_sessions_language() {
     let mut s = opened();
+    let query_id = leveler_client_protocol::CommandId::new("tui-memory");
+    s.memory_query = Some(query_id.clone());
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::MemoryList {
+            query_id: Some(query_id),
             memory_dir: "/repo/.leveler/memory".into(),
             active: Vec::new(),
             archived: Vec::new(),
@@ -9068,7 +9249,9 @@ fn the_memory_listing_speaks_the_sessions_language() {
         .items()
         .iter()
         .filter_map(|i| match i {
-            leveler_tui::transcript::TranscriptItem::Note(t) => Some(t.clone()),
+            leveler_tui::transcript::TranscriptItem::MemoryList(block) => {
+                Some(block.details.clone())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()

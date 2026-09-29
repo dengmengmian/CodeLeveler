@@ -877,26 +877,37 @@ fn skills_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
 fn agents_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let name = command.strip_prefix("agents").unwrap_or(command).trim();
     if name.is_empty() || name == "list" {
+        let query_id = leveler_client_protocol::CommandId::generate();
+        state.agents_list_query = Some(query_id.clone());
         return vec![Effect::Send(ClientCommand::ListAgents {
             session_id: state.session_id.clone(),
-            query_id: None,
+            query_id: Some(query_id),
         })];
     }
+    let query_id = leveler_client_protocol::CommandId::generate();
+    state.agent_detail_query = Some(query_id.clone());
     vec![Effect::Send(ClientCommand::GetAgent {
         session_id: state.session_id.clone(),
         name: name.to_string(),
-        query_id: None,
+        query_id: Some(query_id),
     })]
 }
 
 /// `/memory` — list active (+archived); `/memory forget <id>` archives.
+fn memory_list_effect(state: &mut AppState, include_archived: bool) -> Effect {
+    let query_id = leveler_client_protocol::CommandId::generate();
+    state.memory_query = Some(query_id.clone());
+    Effect::Send(ClientCommand::ListMemory {
+        session_id: state.session_id.clone(),
+        query_id: Some(query_id),
+        include_archived,
+    })
+}
+
 fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     let rest = command.strip_prefix("memory").unwrap_or(command).trim();
     if rest.is_empty() || rest == "list" {
-        return vec![Effect::Send(ClientCommand::ListMemory {
-            session_id: state.session_id.clone(),
-            include_archived: true,
-        })];
+        return vec![memory_list_effect(state, true)];
     }
     // Accepting a pending candidate is the user's consent (K36) — the reason
     // the runtime never lets the model do it.
@@ -908,10 +919,13 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             return Vec::new();
         }
-        return vec![Effect::Send(ClientCommand::AcceptMemory {
-            session_id: state.session_id.clone(),
-            id: id.to_string(),
-        })];
+        return vec![
+            Effect::Send(ClientCommand::AcceptMemory {
+                session_id: state.session_id.clone(),
+                id: id.to_string(),
+            }),
+            memory_list_effect(state, false),
+        ];
     }
     // Rejecting a candidate is consent WITHHELD. It is a different operation
     // from forgetting an active entry, and conflating them meant a pending id
@@ -924,10 +938,13 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             return Vec::new();
         }
-        return vec![Effect::Send(ClientCommand::RejectMemory {
-            session_id: state.session_id.clone(),
-            id: id.to_string(),
-        })];
+        return vec![
+            Effect::Send(ClientCommand::RejectMemory {
+                session_id: state.session_id.clone(),
+                id: id.to_string(),
+            }),
+            memory_list_effect(state, false),
+        ];
     }
     if let Some(id) = rest.strip_prefix("forget").map(str::trim) {
         if id.is_empty() {
@@ -937,10 +954,13 @@ fn memory_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             return Vec::new();
         }
-        return vec![Effect::Send(ClientCommand::ForgetMemory {
-            session_id: state.session_id.clone(),
-            id: id.to_string(),
-        })];
+        return vec![
+            Effect::Send(ClientCommand::ForgetMemory {
+                session_id: state.session_id.clone(),
+                id: id.to_string(),
+            }),
+            memory_list_effect(state, true),
+        ];
     }
     state.notification = Some(Notification {
         level: NotificationLevel::Info,

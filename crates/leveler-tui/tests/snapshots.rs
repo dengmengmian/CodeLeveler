@@ -812,6 +812,7 @@ fn renders_plan_chrome_and_diff_screen() {
     reduce(
         &mut state,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: UiDiff {
                 files: vec![UiDiffFile {
                     path: "src/login.rs".into(),

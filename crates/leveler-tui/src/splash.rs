@@ -41,6 +41,7 @@ pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
                 | TranscriptItem::Completion(_)
                 | TranscriptItem::Error(_)
                 | TranscriptItem::Note(_)
+                | TranscriptItem::MemoryList(_)
                 | TranscriptItem::AwaySummary(_)
                 | TranscriptItem::TurnEnd(_)
                 | TranscriptItem::UserShell(_)

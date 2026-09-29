@@ -351,8 +351,8 @@ export type RuntimeEvent =
   | { type: 'tool_call_output'; chunk: string; id: ToolCallId; stream: string }
   /** The execution plan was created or a step's status changed (spec §20). */
   | { type: 'plan_updated'; plan: UiPlan }
-  /** The working-tree diff was (re)computed (spec §21). */
-  | { type: 'diff_updated'; diff: UiDiff }
+  /** The working-tree diff changed or was explicitly requested (spec §21). */
+  | { type: 'diff_updated'; diff: UiDiff; query_id?: CommandId | null }
   /** A conversation checkpoint was created (spec §68). */
   | { type: 'checkpoint_created'; checkpoint: UiCheckpoint }
   /** The list of stored sessions (spec §52). */
@@ -426,7 +426,7 @@ export type RuntimeEvent =
   /** Authoritative replacement of a session's active background projection. Emitted after a lifecycle broadcast lag; history is unaffected. */
   | { type: 'background_tasks_reconciled'; tasks: UiActiveBackgroundTask[] }
   /** Project memory listing (response to [`crate::ClientCommand::ListMemory`]). */
-  | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[] }
+  | { type: 'memory_list'; active: UiMemoryEntry[]; archived: UiMemoryEntry[]; memory_dir: string; pending?: UiMemoryCandidate[]; query_id?: CommandId | null }
   /** The runtime recalled durable project memory into this turn's model context. Emitted ONLY when at least one memory was selected — a search that found nothing is not a recall. Ids/count only, never bodies. */
   | { type: 'memory_recalled'; count: number; ids: string[] }
   /** A durable memory lifecycle change (created / superseded / expired / merged). `operation` is an opaque stable key; `title` is a bounded summary, never the body. */
@@ -1159,7 +1159,7 @@ export type ClientCommand =
   /** Confirm a collaboration-plan proposal and auto-enter goal mode (K24). */
   | { type: 'confirm_plan_to_goal'; content: string; session_id: SessionId }
   /** List project durable memory (active; optional archived) for TUI/CLI. */
-  | { type: 'list_memory'; include_archived?: boolean; session_id: SessionId }
+  | { type: 'list_memory'; include_archived?: boolean; query_id?: CommandId | null; session_id: SessionId }
   /** Archive (forget) one active memory id — user-authoritative (no model). */
   | { type: 'forget_memory'; id: string; session_id: SessionId }
   /** Promote one pending candidate to durable memory. User-authoritative: this IS the consent K36 requires, so it is never model-callable. */
@@ -1168,8 +1168,8 @@ export type ClientCommand =
   | { type: 'reject_memory'; id: string; session_id: SessionId }
   /** Create a durable memory directly. The user's own command IS the authorization, so this never reaches the model and never becomes a pending candidate — it is the deterministic counterpart to the natural-language path, which can only propose. */
   | { type: 'remember_memory'; body: string; kind?: UiMemoryKind | null; session_id: SessionId }
-  /** Recompute and push the working-tree diff. */
-  | { type: 'request_diff'; session_id: SessionId }
+  /** Recompute and return the working-tree diff. */
+  | { type: 'request_diff'; query_id?: CommandId | null; session_id: SessionId }
   /** Summarize and compact the conversation history (spec §28, §53). */
   | { type: 'compact_context'; session_id: SessionId }
   /** Start a fresh conversation: drop the session's stored message history so the next turn carries no prior context (a real "new chat", not a screen clear). */

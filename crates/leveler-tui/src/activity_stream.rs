@@ -211,7 +211,7 @@ pub(crate) fn render_group_rows(
                 let (glyph, color) = if running {
                     ("\u{25cc} ", theme.accent.primary)
                 } else {
-                    ("\u{b7} ", theme.ink(Ink::Subtle))
+                    ("\u{203a} ", theme.ink(Ink::Subtle))
                 };
                 let label = t.parallel_header.replace("{}", &calls.len().to_string());
                 out.push(Line::from(vec![
@@ -3391,6 +3391,10 @@ mod tests {
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         let text = lines.join("\n");
         assert!(text.contains("并行"), "the batch names itself: {text}");
+        assert!(
+            lines[0].starts_with(TOOL_ANCHOR),
+            "a settled batch keeps the same execution anchor as every tool row: {lines:?}"
+        );
         assert_eq!(
             lines.iter().filter(|l| l.contains('\u{251c}')).count(),
             2,

@@ -384,16 +384,33 @@ describe('agent registry commands', () => {
   });
 
   it('agents_loaded / agent_loaded reach state', () => {
-    const { apply, state } = harness();
+    const { bridge, apply, state } = harness();
+    const listId = bridge.listAgents();
     apply({
       type: 'agents_loaded',
+      query_id: listId,
       agents: [{ name: 'explorer', source: 'builtin', status: 'available', structural: true }],
       problems: [{ source: 'project', location: '.leveler/agents/x', error: 'missing agent.yaml' }],
     });
     expect(state.agents.entries.map((e) => e.name)).toEqual(['explorer']);
     expect(state.agents.problems).toHaveLength(1);
-    apply({ type: 'agent_loaded', name: 'nope', error: 'no agent named nope' });
+    const detailId = bridge.getAgent('nope');
+    apply({ type: 'agent_loaded', query_id: detailId, name: 'nope', error: 'no agent named nope' });
     expect(state.agents.detail.nope).toEqual({ agent: null, error: 'no agent named nope' });
+  });
+
+  it('foreign agent query responses do not overwrite this client state', () => {
+    const { bridge, apply, state } = harness();
+    bridge.listAgents();
+    bridge.getAgent('mine');
+    apply({
+      type: 'agents_loaded',
+      query_id: 'another-client',
+      agents: [{ name: 'foreign', source: 'project', status: 'available' }],
+    });
+    apply({ type: 'agent_loaded', query_id: 'another-client', name: 'foreign', error: 'foreign error' });
+    expect(state.agents.entries).toEqual([]);
+    expect(state.agents.detail).toEqual({});
   });
 
   it('a successful mutation refetches the list; a failure keeps the runtime error verbatim', () => {
@@ -407,7 +424,8 @@ describe('agent registry commands', () => {
       queryId: q,
     });
     expect(sent.filter((c) => c.type === 'list_agents')).toHaveLength(0);
-    apply({ type: 'agent_mutated', name: 'security-reviewer', ok: true, query_id: q });
+    const successQuery = bridge.createAgent('project', draft);
+    apply({ type: 'agent_mutated', name: 'security-reviewer', ok: true, query_id: successQuery });
     expect(state.agents.lastMutation?.ok).toBe(true);
     expect(sent[sent.length - 1]).toMatchObject({ type: 'list_agents', session_id: 's1' });
   });
@@ -429,8 +447,19 @@ describe('interaction commands', () => {
   it('openChanges requests a fresh diff then stages Changes', () => {
     const { bridge, sent, state } = harness();
     bridge.openChanges();
-    expect(sent[0]).toMatchObject({ type: 'request_diff', session_id: 's1' });
+    expect(sent[0]).toMatchObject({ type: 'request_diff', session_id: 's1', query_id: expect.any(String) });
     expect(state.stageView).toBe('diff');
+  });
+
+  it('a requested diff is accepted only by its requesting client', () => {
+    const { bridge, apply, sent, state } = harness();
+    bridge.requestDiff();
+    const command = sent[0];
+    const queryId = command.type === 'request_diff' ? command.query_id : null;
+    apply({ type: 'diff_updated', query_id: 'another-client', diff: { files: [] } });
+    expect(state.current?.diff).toBeNull();
+    apply({ type: 'diff_updated', query_id: queryId, diff: { files: [] } });
+    expect(state.current?.diff).toEqual({ files: [] });
   });
 
   it('openMemory lists memory and opens Inspector More', () => {
@@ -557,7 +586,7 @@ describe('query observability', () => {
 });
 
 describe('event closure', () => {
-  it('memory_list reaches state (was silently dropped)', () => {
+  it('an unowned memory_list does not overwrite this client state', () => {
     const { apply, state } = harness();
     apply({
       type: 'memory_list',
@@ -566,7 +595,22 @@ describe('event closure', () => {
       archived: [],
       pending: [{ id: 'p', title: 'q', body: '正文', kind: 'preference', source: 'user_explicit' }],
     });
-    expect(state.current?.memory?.pending).toHaveLength(1);
+    expect(state.current?.memory).toBeNull();
+  });
+
+  it('the matching memory_list reaches the requesting client', () => {
+    const { bridge, apply, state } = harness();
+    const queryId = bridge.listMemory();
+    expect(queryId).toBeTruthy();
+    apply({
+      type: 'memory_list',
+      query_id: queryId,
+      memory_dir: '/m',
+      active: [{ id: 'a', title: 't' }],
+      archived: [],
+      pending: [],
+    });
+    expect(state.current?.memory?.active).toHaveLength(1);
   });
 
   it('sub_agent events reach state', () => {

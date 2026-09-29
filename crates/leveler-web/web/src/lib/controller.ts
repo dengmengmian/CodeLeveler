@@ -43,6 +43,12 @@ export class RuntimeBridge {
   private readonly getState: GetState;
   /** selectSession 后等待的目标会话 id（防止采纳别会话的广播整量） */
   private pendingSessionId: SessionId | null = null;
+  /** Only this client's latest list-memory query may replace its Memory view. */
+  private pendingMemoryQueryId: string | null = null;
+  private pendingAgentListQueryId: string | null = null;
+  private pendingAgentDetailQueryId: string | null = null;
+  private readonly pendingAgentMutationQueryIds = new Set<string>();
+  private pendingDiffQueryId: string | null = null;
   /** `/clear` 已发出、等待宿主返回新会话。新会话 id 由宿主分配，事先不知道，
    *  所以只能标记"下一个 session_opened 就是它"，并在采纳时切换 WS 订阅。 */
   private awaitingNewSession = false;
@@ -221,6 +227,10 @@ export class RuntimeBridge {
         this.dispatch({ type: 'plan', plan: ev.plan });
         break;
       case 'diff_updated':
+        if (ev.query_id) {
+          if (ev.query_id !== this.pendingDiffQueryId) break;
+          this.pendingDiffQueryId = null;
+        }
         this.dispatch({ type: 'diff', diff: ev.diff });
         break;
       case 'checkpoint_created':
@@ -335,6 +345,8 @@ export class RuntimeBridge {
         });
         break;
       case 'memory_list':
+        if (!ev.query_id || ev.query_id !== this.pendingMemoryQueryId) break;
+        this.pendingMemoryQueryId = null;
         this.dispatch({
           type: 'memory_list',
           dir: ev.memory_dir,
@@ -344,9 +356,13 @@ export class RuntimeBridge {
         });
         break;
       case 'agents_loaded':
+        if (!ev.query_id || ev.query_id !== this.pendingAgentListQueryId) break;
+        this.pendingAgentListQueryId = null;
         this.dispatch({ type: 'agents_loaded', entries: ev.agents, problems: ev.problems ?? [] });
         break;
       case 'agent_loaded':
+        if (!ev.query_id || ev.query_id !== this.pendingAgentDetailQueryId) break;
+        this.pendingAgentDetailQueryId = null;
         this.dispatch({
           type: 'agent_loaded',
           name: ev.name,
@@ -355,6 +371,7 @@ export class RuntimeBridge {
         });
         break;
       case 'agent_mutated':
+        if (!ev.query_id || !this.pendingAgentMutationQueryIds.delete(ev.query_id)) break;
         this.dispatch({
           type: 'agent_mutated',
           name: ev.name,
@@ -744,10 +761,18 @@ export class RuntimeBridge {
 
   // ── 项目记忆（用户权威操作：接受/遗忘后刷新列表）───────────────────
 
-  listMemory(): void {
+  listMemory(): string | null {
     const current = this.getState().current;
-    if (!current) return;
-    this.deliver({ type: 'list_memory', session_id: current.id, include_archived: true });
+    if (!current) return null;
+    const queryId = crypto.randomUUID();
+    this.pendingMemoryQueryId = queryId;
+    this.deliver({
+      type: 'list_memory',
+      session_id: current.id,
+      query_id: queryId,
+      include_archived: true,
+    });
+    return queryId;
   }
 
   acceptMemory(id: string): void {
@@ -793,6 +818,7 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return null;
     const queryId = crypto.randomUUID();
+    this.pendingAgentListQueryId = queryId;
     this.dispatch({ type: 'agents_loading' });
     this.deliver({ type: 'list_agents', session_id: current.id, query_id: queryId });
     return queryId;
@@ -802,6 +828,7 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return null;
     const queryId = crypto.randomUUID();
+    this.pendingAgentDetailQueryId = queryId;
     this.deliver({ type: 'get_agent', session_id: current.id, name, query_id: queryId });
     return queryId;
   }
@@ -810,6 +837,7 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return null;
     const queryId = crypto.randomUUID();
+    this.pendingAgentMutationQueryIds.add(queryId);
     this.deliver({ type: 'create_agent', session_id: current.id, scope, draft, query_id: queryId });
     return queryId;
   }
@@ -818,6 +846,7 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return null;
     const queryId = crypto.randomUUID();
+    this.pendingAgentMutationQueryIds.add(queryId);
     this.deliver({ type: 'update_agent', session_id: current.id, scope, draft, query_id: queryId });
     return queryId;
   }
@@ -826,6 +855,7 @@ export class RuntimeBridge {
     const current = this.getState().current;
     if (!current) return null;
     const queryId = crypto.randomUUID();
+    this.pendingAgentMutationQueryIds.add(queryId);
     this.deliver({ type: 'delete_agent', session_id: current.id, scope, name, query_id: queryId });
     return queryId;
   }
@@ -840,7 +870,9 @@ export class RuntimeBridge {
   requestDiff(): void {
     const current = this.getState().current;
     if (!current) return;
-    this.deliver({ type: 'request_diff', session_id: current.id });
+    const queryId = crypto.randomUUID();
+    this.pendingDiffQueryId = queryId;
+    this.deliver({ type: 'request_diff', session_id: current.id, query_id: queryId });
   }
 
   sendBtw(question: string): void {
@@ -962,7 +994,7 @@ export class RuntimeBridge {
       }
       case '/diff': {
         const sid = needSession();
-        if (sid) this.deliver({ type: 'request_diff', session_id: sid });
+        if (sid) this.requestDiff();
         return;
       }
       case '/checkpoint': {

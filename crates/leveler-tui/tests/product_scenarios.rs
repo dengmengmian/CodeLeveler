@@ -238,6 +238,7 @@ fn s01_simple_edit() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: UiDiff {
                 files: vec![UiDiffFile {
                     path: "src/lib.rs".into(),
@@ -313,6 +314,7 @@ fn s02_multifile_and_s04_exploration_heavy() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: UiDiff {
                 files: vec![
                     UiDiffFile {

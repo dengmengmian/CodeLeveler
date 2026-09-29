@@ -286,7 +286,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             state.plan = Some(plan);
         }
-        RuntimeEvent::DiffUpdated { diff } => {
+        RuntimeEvent::DiffUpdated { query_id, diff } => {
+            if let Some(query_id) = query_id {
+                if state.diff_query.as_ref() != Some(&query_id) {
+                    return;
+                }
+                state.diff_query = None;
+            }
             state.turn_diff_files = Some(diff.files.len());
             if state.diff_selected >= diff.files.len() {
                 state.diff_selected = 0;
@@ -560,20 +566,35 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             state.transcript.set_sub_agent_agent_name(&id, agent_name);
         }
-        RuntimeEvent::UnfinishedGoalsLoaded { goals, .. } => {
-            state.unfinished_goals = goals;
-        }
+        // No TUI action issues this query. A response on the shared stream is
+        // therefore necessarily owned by another client.
+        RuntimeEvent::UnfinishedGoalsLoaded { .. } => {}
         RuntimeEvent::AgentsLoaded {
-            agents, problems, ..
+            query_id,
+            agents,
+            problems,
         } => {
+            let ours = query_id.is_some() && query_id == state.agents_list_query;
+            if !ours {
+                return;
+            }
+            state.agents_list_query = None;
             let t = state.t();
             state
                 .transcript
                 .push_note(crate::agents_view::listing_note(&agents, &problems, t));
         }
         RuntimeEvent::AgentLoaded {
-            name, agent, error, ..
+            query_id,
+            name,
+            agent,
+            error,
         } => {
+            let ours = query_id.is_some() && query_id == state.agent_detail_query;
+            if !ours {
+                return;
+            }
+            state.agent_detail_query = None;
             let note = match (agent, error) {
                 (Some(detail), _) => crate::agents_view::detail_note(&detail, state.t()),
                 (None, Some(error)) => error,
@@ -581,24 +602,20 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             };
             state.transcript.push_note(note);
         }
-        // Another client changed the registry; the TUI does not write agents.
-        // A failure is still said, so a user watching this session sees it.
-        RuntimeEvent::AgentMutated {
-            name, ok, error, ..
-        } => {
-            if !ok {
-                state.notification = Some(Notification {
-                    level: NotificationLevel::Error,
-                    message: format!("agent {name}: {}", error.unwrap_or_default()),
-                });
-            }
-        }
+        // The TUI has no agent mutation command. These acknowledgements belong
+        // to the Web form that issued them, despite sharing the session stream.
+        RuntimeEvent::AgentMutated { .. } => {}
         RuntimeEvent::GoalRecapCreated { recap } => {
             // History, never the lower runtime stack. Idempotent on
             // checkpoint_id inside push_goal_recap.
             state.transcript.push_goal_recap(recap);
         }
-        RuntimeEvent::ChildContributionLoaded { detail, .. } => {
+        RuntimeEvent::ChildContributionLoaded { query_id, detail } => {
+            let ours = query_id.is_some() && query_id == state.child_contribution_query;
+            if !ours {
+                return;
+            }
+            state.child_contribution_query = None;
             state.team.apply_detail(detail);
         }
         RuntimeEvent::SubAgentStateChanged {
@@ -653,16 +670,25 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.update_sub_agent_activity(&id, step);
         }
         RuntimeEvent::MemoryList {
+            query_id,
             memory_dir,
             active,
             archived,
             pending,
         } => {
-            // Multi-line list must live in the transcript (status line is 1 row +
-            // Info TTL ~4s). Users need to see every entry and forget ids.
+            let ours = query_id.is_some() && query_id == state.memory_query;
+            if !ours {
+                return;
+            }
+            state.memory_query = None;
+            // Keep the durable summary in the transcript; the storage path and
+            // entry ids stay available behind its disclosure row.
             let t = state.t();
+            let summary = t
+                .memory_summary
+                .replace("{active}", &active.len().to_string())
+                .replace("{pending}", &pending.len().to_string());
             let mut lines = vec![
-                t.memory_title.to_string(),
                 format!("memory_dir={memory_dir}"),
                 format!("{} ({})", t.memory_active, active.len()),
             ];
@@ -719,7 +745,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             } else {
                 t.memory_hint_pending.to_string()
             });
-            state.transcript.push_note(lines.join("\n"));
+            state.transcript.push_memory_list(summary, lines.join("\n"));
             // A listing summary must not overwrite a specific message that
             // just landed ("已保存记忆 [id]…"). The refresh follows the write,
             // and on a one-line status bar it would erase the only
@@ -1623,6 +1649,14 @@ fn apply_session_with(
     state.checkpoints = session.checkpoints.clone();
 
     if switching {
+        state.history_query = None;
+        state.memory_query = None;
+        state.agents_list_query = None;
+        state.agent_detail_query = None;
+        state.child_contribution_query = None;
+        state.diff_query = None;
+        state.context.pending_query_id = None;
+        state.trace.pending_query_id = None;
         state.context_files.clear();
         state.context_tokens = 0;
         state.token_input = 0;

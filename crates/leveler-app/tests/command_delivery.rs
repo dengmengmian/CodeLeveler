@@ -167,6 +167,7 @@ async fn stale_expected_version_is_rejected_body() {
         issued_at: "2026-07-12T00:00:00Z".to_string(),
         command: ClientCommand::RequestDiff {
             session_id: session_id.clone(),
+            query_id: None,
         },
     };
     let err = client.deliver(envelope).await.unwrap_err();
@@ -196,6 +197,7 @@ async fn envelope_command_session_mismatch_is_rejected_body() {
         issued_at: "2026-07-12T00:00:00Z".to_string(),
         command: ClientCommand::RequestDiff {
             session_id: SessionId::new("some-other-session"),
+            query_id: None,
         },
     };
     let err = client.deliver(envelope).await.unwrap_err();
@@ -223,6 +225,7 @@ async fn reused_command_id_with_different_payload_is_rejected_body() {
         issued_at: "2026-07-12T00:00:00Z".to_string(),
         command: ClientCommand::RequestDiff {
             session_id: session_id.clone(),
+            query_id: None,
         },
     };
     client.deliver(first.clone()).await.unwrap();

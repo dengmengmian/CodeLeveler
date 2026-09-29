@@ -551,7 +551,7 @@
       }
     },
     {
-      "description": "The working-tree diff was (re)computed (spec §21).",
+      "description": "The working-tree diff changed or was explicitly requested (spec §21).",
       "type": "object",
       "required": [
         "diff",
@@ -560,6 +560,17 @@
       "properties": {
         "diff": {
           "$ref": "#/definitions/UiDiff"
+        },
+        "query_id": {
+          "description": "Present only for a `RequestDiff` response. `None` is an authoritative state-change broadcast and is accepted by all clients.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "type": {
           "type": "string",
@@ -1674,6 +1685,17 @@
           "items": {
             "$ref": "#/definitions/UiMemoryCandidate"
           }
+        },
+        "query_id": {
+          "description": "Echoes the requesting client's query id. A client must ignore an absent or foreign id so another session subscriber cannot open UI.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "type": {
           "type": "string",
@@ -3479,7 +3501,7 @@
           }
         },
         {
-          "description": "The working-tree diff was (re)computed (spec §21).",
+          "description": "The working-tree diff changed or was explicitly requested (spec §21).",
           "type": "object",
           "required": [
             "diff",
@@ -3488,6 +3510,17 @@
           "properties": {
             "diff": {
               "$ref": "#/definitions/UiDiff"
+            },
+            "query_id": {
+              "description": "Present only for a `RequestDiff` response. `None` is an authoritative state-change broadcast and is accepted by all clients.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -4602,6 +4635,17 @@
               "items": {
                 "$ref": "#/definitions/UiMemoryCandidate"
               }
+            },
+            "query_id": {
+              "description": "Echoes the requesting client's query id. A client must ignore an absent or foreign id so another session subscriber cannot open UI.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",

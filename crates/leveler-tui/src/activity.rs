@@ -570,11 +570,13 @@ pub(crate) fn open(state: &mut AppState, id: ActivityId) -> Vec<crate::action::E
             if already {
                 Vec::new()
             } else {
+                let query_id = leveler_client_protocol::CommandId::generate();
+                state.child_contribution_query = Some(query_id.clone());
                 vec![crate::action::Effect::Send(
                     leveler_client_protocol::ClientCommand::QueryChildContribution {
                         session_id: state.session_id.clone(),
                         child_id,
-                        query_id: Some(leveler_client_protocol::CommandId::generate()),
+                        query_id: Some(query_id),
                     },
                 )]
             }
@@ -1336,6 +1338,40 @@ second line ignored"
                 .any(|e| format!("{e:?}").to_ascii_lowercase().contains("cancel")),
             "open must not cancel: {effects:?}"
         );
+        let owned = effects.iter().find_map(|effect| match effect {
+            crate::action::Effect::Send(
+                leveler_client_protocol::ClientCommand::QueryChildContribution { query_id, .. },
+            ) => query_id.clone(),
+            _ => None,
+        });
+        let detail = leveler_client_protocol::UiChildContribution {
+            child_id: "c-worker".into(),
+            role: "执行 Agent".into(),
+            profile_id: Some("worker".into()),
+            read_only: false,
+            findings: Vec::new(),
+            measured: true,
+        };
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::Runtime(
+                leveler_client_protocol::RuntimeEvent::ChildContributionLoaded {
+                    query_id: Some(leveler_client_protocol::CommandId::new("web-query")),
+                    detail: detail.clone(),
+                },
+            ),
+        );
+        assert!(state.team.children[0].detail.is_none());
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::Runtime(
+                leveler_client_protocol::RuntimeEvent::ChildContributionLoaded {
+                    query_id: owned,
+                    detail,
+                },
+            ),
+        );
+        assert!(state.team.children[0].detail.is_some());
     }
 
     #[test]

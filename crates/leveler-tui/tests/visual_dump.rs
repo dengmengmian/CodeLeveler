@@ -182,6 +182,7 @@ fn visual_inspect() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: leveler_client_protocol::UiDiff {
                 files: (0..8)
                     .map(|i| leveler_client_protocol::UiDiffFile {

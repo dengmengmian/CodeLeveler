@@ -300,6 +300,15 @@ pub struct AppState {
     pub turn_diff_files: Option<usize>,
     /// The session-history query this client is waiting on, if any.
     pub history_query: Option<leveler_client_protocol::CommandId>,
+    /// The `/memory` query owned by this TUI. Foreign/legacy broadcast replies
+    /// are ignored so opening Web cannot inject a listing into the transcript.
+    pub memory_query: Option<leveler_client_protocol::CommandId>,
+    /// Agent-registry queries owned by this TUI. Responses traverse the
+    /// shared session stream and must not render for another client.
+    pub agents_list_query: Option<leveler_client_protocol::CommandId>,
+    pub agent_detail_query: Option<leveler_client_protocol::CommandId>,
+    pub child_contribution_query: Option<leveler_client_protocol::CommandId>,
+    pub diff_query: Option<leveler_client_protocol::CommandId>,
     pub diff: Option<UiDiff>,
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
@@ -563,6 +572,11 @@ impl AppState {
             project_rule_sources: Vec::new(),
             turn_diff_files: None,
             history_query: None,
+            memory_query: None,
+            agents_list_query: None,
+            agent_detail_query: None,
+            child_contribution_query: None,
+            diff_query: None,
             diff: None,
             diff_selected: 0,
             goal_mode_active: false,

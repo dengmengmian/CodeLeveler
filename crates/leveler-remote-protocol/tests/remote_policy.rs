@@ -222,6 +222,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             "list_memory",
             ClientCommand::ListMemory {
                 session_id: session(),
+                query_id: None,
                 include_archived: false,
             },
             false,
@@ -273,6 +274,7 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             "request_diff",
             ClientCommand::RequestDiff {
                 session_id: session(),
+                query_id: None,
             },
             true,
         ),

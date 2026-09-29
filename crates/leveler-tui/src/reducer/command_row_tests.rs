@@ -458,6 +458,7 @@ fn a_turn_end_does_not_repeat_an_earlier_diff() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: UiDiff {
                 files: (0..7).map(|i| file(&format!("f{i}.rs"))).collect(),
             },

@@ -207,6 +207,15 @@ pub struct GoalRecapBlock {
     pub expanded: bool,
 }
 
+/// `/memory` listing: one durable summary row in the conversation, with the
+/// storage path and entries available on demand instead of flooding the turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryListBlock {
+    pub summary: String,
+    pub details: String,
+    pub expanded: bool,
+}
+
 /// A spawned sub-agent (multi-agent delegation), one block per agent, updated
 /// from running → done in place.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -324,9 +333,10 @@ pub enum TranscriptItem {
     Error(String),
     /// A terminal failure, presented once (see [`FailureBlock`]).
     Failure(FailureBlock),
-    /// Multi-line host note (e.g. `/memory` listing). Transcript-visible, not
-    /// a 1-row status notification.
+    /// Multi-line host note. Transcript-visible, not a 1-row status notification.
     Note(String),
+    /// Project-memory management output. Compact by default, click-expandable.
+    MemoryList(MemoryListBlock),
     /// Transient, model-generated recap shown after a post-turn idle window.
     /// Display-only: never persisted or replayed into model context.
     AwaySummary(String),
@@ -448,6 +458,16 @@ impl TranscriptState {
         self.bump();
         self.close_tool_group();
         self.items.push(TranscriptItem::Note(text));
+    }
+
+    pub fn push_memory_list(&mut self, summary: String, details: String) {
+        self.bump();
+        self.close_tool_group();
+        self.items.push(TranscriptItem::MemoryList(MemoryListBlock {
+            summary,
+            details,
+            expanded: false,
+        }));
     }
 
     pub fn push_away_summary(&mut self, text: String) {
@@ -1000,6 +1020,10 @@ impl TranscriptState {
                 block.expanded = !block.expanded;
                 Some(block.expanded)
             }
+            TranscriptItem::MemoryList(block) => {
+                block.expanded = !block.expanded;
+                Some(block.expanded)
+            }
             _ => None,
         };
         if toggled.is_some() {
@@ -1024,6 +1048,10 @@ impl TranscriptState {
                     return Some(block.expanded);
                 }
                 TranscriptItem::Failure(block) => {
+                    block.expanded = !block.expanded;
+                    return Some(block.expanded);
+                }
+                TranscriptItem::MemoryList(block) => {
                     block.expanded = !block.expanded;
                     return Some(block.expanded);
                 }

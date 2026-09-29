@@ -265,6 +265,7 @@ fn send_memory_list(
     events: &tokio::sync::broadcast::Sender<RuntimeEvent>,
     memory_dir: &std::path::Path,
     include_archived: bool,
+    query_id: Option<leveler_core::CommandId>,
 ) {
     let Ok(store) = leveler_memory::MemoryStore::open(memory_dir) else {
         return;
@@ -286,6 +287,7 @@ fn send_memory_list(
         Vec::new()
     };
     let _ = events.send(RuntimeEvent::MemoryList {
+        query_id,
         memory_dir: memory_dir.display().to_string(),
         active,
         archived,
@@ -3194,9 +3196,12 @@ impl InProcessRuntimeClient {
                                 );
                             } else {
                                 let diff = compute_diff(&self.app.layout.repo_root, true);
-                                let _ = self
-                                    .events_for(&session_id)
-                                    .send(RuntimeEvent::DiffUpdated { diff });
+                                let _ =
+                                    self.events_for(&session_id)
+                                        .send(RuntimeEvent::DiffUpdated {
+                                            query_id: None,
+                                            diff,
+                                        });
                             }
                         }
                         None => {
@@ -3601,6 +3606,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::ListMemory {
                 session_id,
                 include_archived,
+                query_id,
             } => {
                 let memory_dir = self.app.layout.memory_dir();
                 let events = self.events_for(&session_id);
@@ -3611,7 +3617,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     });
                     return Ok(());
                 }
-                send_memory_list(&events, &memory_dir, include_archived);
+                send_memory_list(&events, &memory_dir, include_archived, query_id);
                 Ok(())
             }
             ClientCommand::SteerCurrentTurn {
@@ -3650,7 +3656,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             level: leveler_client_protocol::NotificationLevel::Info,
                             message: format!("已采纳记忆 [{}]: {}", entry.id, entry.title),
                         });
-                        send_memory_list(&events, &memory_dir, false);
                     }
                     Err(err) => {
                         let _ = events.send(RuntimeEvent::Notification {
@@ -3672,7 +3677,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             level: leveler_client_protocol::NotificationLevel::Info,
                             message: format!("已拒绝候选 [{id}]，不再重复提示"),
                         });
-                        send_memory_list(&events, &memory_dir, false);
                     }
                     Err(err) => {
                         let _ = events.send(RuntimeEvent::Notification {
@@ -3749,7 +3753,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             level: leveler_client_protocol::NotificationLevel::Info,
                             message: format!("已归档记忆 [{}]: {}", entry.id, entry.title),
                         });
-                        send_memory_list(&events, &memory_dir, true);
                     }
                     Err(err) => {
                         let _ = events.send(RuntimeEvent::Notification {
@@ -3760,12 +3763,15 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
-            ClientCommand::RequestDiff { session_id } => {
+            ClientCommand::RequestDiff {
+                session_id,
+                query_id,
+            } => {
                 let repo = self.app.layout.repo_root.clone();
                 let events = self.events_for(&session_id);
                 tokio::task::spawn_blocking(move || {
                     let diff = compute_diff(&repo, true);
-                    let _ = events.send(RuntimeEvent::DiffUpdated { diff });
+                    let _ = events.send(RuntimeEvent::DiffUpdated { query_id, diff });
                 });
                 Ok(())
             }

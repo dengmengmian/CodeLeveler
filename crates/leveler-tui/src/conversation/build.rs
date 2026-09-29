@@ -251,9 +251,10 @@ fn build_conversation(
                     state.elapsed_secs,
                 ));
             }
-            TranscriptItem::GoalRecap(_) => {
+            TranscriptItem::GoalRecap(_) | TranscriptItem::MemoryList(_) => {
                 // A goal recap's first line is its disclosure row: click
-                // expands the persisted checkpoint's structured sections.
+                // expands the persisted checkpoint's structured sections. A
+                // memory listing uses the same interaction for its details.
                 hits.push((out.len(), idx));
                 out.extend(item_render(item, theme, width, state.tools_expanded, t));
             }

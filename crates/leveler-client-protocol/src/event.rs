@@ -311,8 +311,14 @@ pub enum RuntimeEvent {
     },
     /// The execution plan was created or a step's status changed (spec §20).
     PlanUpdated { plan: UiPlan },
-    /// The working-tree diff was (re)computed (spec §21).
-    DiffUpdated { diff: UiDiff },
+    /// The working-tree diff changed or was explicitly requested (spec §21).
+    DiffUpdated {
+        /// Present only for a `RequestDiff` response. `None` is an
+        /// authoritative state-change broadcast and is accepted by all clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        diff: UiDiff,
+    },
     /// A conversation checkpoint was created (spec §68).
     CheckpointCreated { checkpoint: UiCheckpoint },
     /// The list of stored sessions (spec §52).
@@ -592,6 +598,10 @@ pub enum RuntimeEvent {
     },
     /// Project memory listing (response to [`crate::ClientCommand::ListMemory`]).
     MemoryList {
+        /// Echoes the requesting client's query id. A client must ignore an
+        /// absent or foreign id so another session subscriber cannot open UI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
         memory_dir: String,
         active: Vec<UiMemoryEntry>,
         archived: Vec<UiMemoryEntry>,
@@ -1101,6 +1111,7 @@ mod tests {
     fn diff_updated_roundtrips() {
         roundtrip(
             RuntimeEvent::DiffUpdated {
+                query_id: Some(CommandId::new("q1")),
                 diff: UiDiff {
                     files: vec![UiDiffFile {
                         path: "a.rs".to_string(),

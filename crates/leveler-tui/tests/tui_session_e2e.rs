@@ -273,6 +273,7 @@ fn tui_session_commands_ui_and_logic() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
             diff: UiDiff {
                 files: vec![UiDiffFile {
                     path: "src/main.rs".into(),

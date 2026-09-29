@@ -323,12 +323,10 @@ pub(crate) fn tool_summary_for(name: &str, arguments: &str, t: &crate::i18n::UiT
             if url.is_empty() { s("tab") } else { url }
         }
         "browser_act" => {
-            let element = s("ref");
-            if element.is_empty() {
-                s("key")
-            } else {
-                element
-            }
+            // Snapshot refs (`2e4`) are short-lived model protocol tokens,
+            // not user-facing targets. Key actions still have a meaningful
+            // target; element actions fall back to their semantic verb.
+            s("key")
         }
         "browser_inspect" => s("tab"),
         "update_plan" => s("explanation"),
@@ -1365,6 +1363,15 @@ mod m1_tests {
                 Locale::Zh.text()
             ),
             "Enter"
+        );
+        assert!(
+            tool_summary_for(
+                "browser_act",
+                r#"{"action":"click","ref":"2e4"}"#,
+                Locale::Zh.text()
+            )
+            .is_empty(),
+            "snapshot refs are model-facing protocol tokens, not user-facing targets"
         );
         assert!(
             tool_summary_for("browser_tab", r#"{"action":"snapshot"}"#, Locale::Zh.text())

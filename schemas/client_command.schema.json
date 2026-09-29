@@ -540,6 +540,17 @@
           "default": false,
           "type": "boolean"
         },
+        "query_id": {
+          "description": "Correlates this query-shaped response to the requesting client.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_id": {
           "$ref": "#/definitions/SessionId"
         },
@@ -655,13 +666,24 @@
       }
     },
     {
-      "description": "Recompute and push the working-tree diff.",
+      "description": "Recompute and return the working-tree diff.",
       "type": "object",
       "required": [
         "session_id",
         "type"
       ],
       "properties": {
+        "query_id": {
+          "description": "Correlates the response to the requesting client. Automatic diff updates remain uncorrelated broadcasts.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_id": {
           "$ref": "#/definitions/SessionId"
         },

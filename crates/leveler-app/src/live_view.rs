@@ -110,7 +110,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         RuntimeEvent::ContextUsage { accounting } => {
             view.context_usage = Some(accounting.clone());
         }
-        RuntimeEvent::DiffUpdated { diff } => view.diff = Some(diff.clone()),
+        RuntimeEvent::DiffUpdated { diff, .. } => view.diff = Some(diff.clone()),
         RuntimeEvent::SessionCompleted { report } => {
             view.completion_report = Some(report.clone());
         }

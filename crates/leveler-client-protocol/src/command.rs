@@ -201,6 +201,9 @@ pub enum ClientCommand {
     /// List project durable memory (active; optional archived) for TUI/CLI.
     ListMemory {
         session_id: SessionId,
+        /// Correlates this query-shaped response to the requesting client.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
         /// Include archived (forgotten) entries.
         #[serde(default)]
         include_archived: bool,
@@ -227,8 +230,14 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<UiMemoryKind>,
     },
-    /// Recompute and push the working-tree diff.
-    RequestDiff { session_id: SessionId },
+    /// Recompute and return the working-tree diff.
+    RequestDiff {
+        session_id: SessionId,
+        /// Correlates the response to the requesting client. Automatic diff
+        /// updates remain uncorrelated broadcasts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+    },
     /// Summarize and compact the conversation history (spec §28, §53).
     CompactContext { session_id: SessionId },
     /// Start a fresh conversation: drop the session's stored message history so
@@ -462,7 +471,7 @@ impl ClientCommand {
             | ClientCommand::RejectMemory { session_id, .. }
             | ClientCommand::RememberMemory { session_id, .. }
             | ClientCommand::ForgetMemory { session_id, .. }
-            | ClientCommand::RequestDiff { session_id }
+            | ClientCommand::RequestDiff { session_id, .. }
             | ClientCommand::CompactContext { session_id }
             | ClientCommand::ClearConversation { session_id }
             | ClientCommand::OpenSession { session_id }
@@ -823,6 +832,7 @@ mod tests {
         roundtrip(
             ClientCommand::RequestDiff {
                 session_id: SessionId::new("s1"),
+                query_id: Some(CommandId::new("q1")),
             },
             "request_diff",
         );

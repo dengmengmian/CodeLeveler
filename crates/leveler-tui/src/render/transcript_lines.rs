@@ -157,6 +157,25 @@ pub fn item_render(
                 wrap_width,
             );
         }
+        TranscriptItem::MemoryList(block) => {
+            let marker = if block.expanded { "▾ " } else { "▸ " };
+            push_prefixed(
+                &mut out,
+                marker,
+                &block.summary,
+                Style::default().fg(theme.text.secondary),
+                wrap_width,
+            );
+            if block.expanded {
+                push_prefixed(
+                    &mut out,
+                    "  ",
+                    &block.details,
+                    Style::default().fg(theme.text.secondary),
+                    wrap_width,
+                );
+            }
+        }
         TranscriptItem::AwaySummary(text) => {
             push_prefixed(
                 &mut out,
