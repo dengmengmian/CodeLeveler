@@ -118,6 +118,47 @@ pub(crate) fn compaction_span(
     Some((head_end, tail_start))
 }
 
+/// Budget reserved for the summary breadcrumb a fold leaves behind.
+///
+/// A POLICY budget, not a measurement: the summary text is produced after the
+/// retention budget is chosen, so its size must be reserved up front. The
+/// breadcrumb adds fixed boilerplate plus the model's summary; a few thousand
+/// tokens covers both without starving the verbatim tail. It is counted into
+/// the post-fold request rather than assumed free.
+pub const COMPACTION_SUMMARY_BUDGET_TOKENS: u64 = 2_048;
+
+/// Denominator of the post-fold low-water target. A fold aims to leave the
+/// FOLDABLE part at `dynamic_capacity / LOW_WATER_DIVISOR`, so the request has
+/// room to grow before it re-crosses the same threshold. Conservative by
+/// design: the point is to avoid a fold every round or two, not to tune a
+/// precise constant.
+const LOW_WATER_DIVISOR: u64 = 2;
+
+/// The verbatim tail budget a fold should keep, from the ONE projected-request
+/// accounting.
+///
+/// `non_foldable_projected_tokens` is the projected cost that a fold CANNOT
+/// remove — control context, tool schemas, the task anchor, carried rules —
+/// measured from the same [`leveler_model::RequestProjection`] the wire encoder
+/// serializes. The budget is what remains below the pressure threshold after
+/// that fixed cost, halved for growth headroom, minus the summary's own budget.
+///
+/// `None` means a fold cannot reach low water: the non-foldable base already
+/// meets or exceeds the threshold, so no tail budget — not even zero — brings a
+/// post-fold request below it. Callers still fold (there is history to remove),
+/// but must not expect the threshold to be met and must not spin on it.
+pub fn retention_tail_budget(
+    pressure_threshold: u64,
+    non_foldable_projected_tokens: u64,
+    summary_budget: u64,
+) -> Option<u64> {
+    let dynamic = pressure_threshold.checked_sub(non_foldable_projected_tokens)?;
+    if dynamic == 0 {
+        return None;
+    }
+    Some((dynamic / LOW_WATER_DIVISOR).saturating_sub(summary_budget))
+}
+
 /// What a measured request's pressure means for the context fold, and
 /// therefore what a failed briefing costs the turn.
 ///
@@ -829,6 +870,100 @@ mod fold_requirement_tests {
         assert_eq!(
             FoldRequirement::classify(u64::MAX - 1, 500, None),
             FoldRequirement::Soft
+        );
+    }
+}
+
+#[cfg(test)]
+mod retention_tail_budget_tests {
+    use super::{COMPACTION_SUMMARY_BUDGET_TOKENS, retention_tail_budget};
+
+    fn post_fold(threshold: u64, base: u64, summary: u64, tail: u64) -> u64 {
+        let _ = threshold;
+        base + summary + tail
+    }
+
+    /// A. The RC3 small-context profile: window 131072, reliable_context 24000,
+    /// output reservation larger than the window (so `hard_capacity` is None),
+    /// and a large fixed/non-foldable projected cost. The tail must shrink well
+    /// below the old `threshold / 2`, and a post-fold request must land clearly
+    /// below the threshold so the next rounds can make progress.
+    #[test]
+    fn small_context_with_large_fixed_cost_leaves_low_water_headroom() {
+        let threshold = 24_000;
+        let base = 16_000; // control + tools + task anchor, from the projection
+        let tail = retention_tail_budget(threshold, base, COMPACTION_SUMMARY_BUDGET_TOKENS)
+            .expect("a fold can relieve pressure here");
+
+        assert!(
+            tail < threshold / 2,
+            "tail {tail} must beat the old half-threshold"
+        );
+        let after = post_fold(threshold, base, COMPACTION_SUMMARY_BUDGET_TOKENS, tail);
+        assert!(
+            after < threshold,
+            "post-fold {after} must be below the {threshold} threshold"
+        );
+        // Enough room that a full round of growth cannot immediately re-cross.
+        assert!(
+            threshold - after >= (threshold - base) / 4,
+            "headroom too small: {after}"
+        );
+    }
+
+    /// B. Fixed cost dominates: the tail shrinks automatically instead of
+    /// holding the old `pressure_threshold / 2`.
+    #[test]
+    fn a_fixed_cost_heavy_request_shrinks_the_tail() {
+        let threshold = 24_000;
+        let light = retention_tail_budget(threshold, 8_000, COMPACTION_SUMMARY_BUDGET_TOKENS)
+            .expect("relief");
+        let heavy = retention_tail_budget(threshold, 20_000, COMPACTION_SUMMARY_BUDGET_TOKENS)
+            .expect("still relievable");
+        assert!(
+            heavy < light,
+            "heavier fixed cost must keep less tail: {heavy} vs {light}"
+        );
+        // The old sizing was a flat threshold/2 regardless of fixed cost.
+        assert!(heavy < threshold / 2);
+    }
+
+    /// C. No relief: the non-foldable base alone meets or exceeds the threshold.
+    /// A soft fold must not loop — the caller gets `None` and reports it.
+    #[test]
+    fn a_base_at_or_above_the_threshold_has_no_relief() {
+        assert_eq!(
+            retention_tail_budget(24_000, 24_000, COMPACTION_SUMMARY_BUDGET_TOKENS),
+            None
+        );
+        assert_eq!(
+            retention_tail_budget(24_000, 30_000, COMPACTION_SUMMARY_BUDGET_TOKENS),
+            None
+        );
+        // A summary budget larger than the target yields an empty tail, not a
+        // refusal: folding everything foldable is still relief.
+        assert_eq!(
+            retention_tail_budget(24_000, 20_000, 5_000),
+            Some(0),
+            "an empty tail is relief; only a base at/over the threshold is none"
+        );
+    }
+
+    /// D. A normal 1M-context profile keeps a large tail and does not fold
+    /// earlier than the old policy: the low-water target tracks the dynamic
+    /// capacity, not the raw threshold.
+    #[test]
+    fn a_large_context_model_keeps_a_large_tail() {
+        let threshold = 655_360; // deepseek-flash: min(reliable_context, window - output)
+        let tail = retention_tail_budget(threshold, 16_000, COMPACTION_SUMMARY_BUDGET_TOKENS)
+            .expect("relief");
+        assert!(
+            tail > threshold / 4,
+            "a big window must keep a big tail: {tail}"
+        );
+        assert!(
+            tail <= threshold / 2,
+            "but not more than the old half-threshold: {tail}"
         );
     }
 }

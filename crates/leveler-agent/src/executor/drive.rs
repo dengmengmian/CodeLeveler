@@ -3818,8 +3818,54 @@ impl AgentHarness for Drive<'_> {
             // response. (current_budget > 0 is guaranteed by the decision.)
             // The retention budget is a POLICY field, not a fraction of the
             // threshold re-derived here: the two answer different questions.
-            let keep_recent_tokens = context_policy.retention.keep_recent_tokens;
+            // The retention budget is sized from the SAME projected accounting
+            // the threshold is measured with: the room left below the threshold
+            // after the NON-foldable base (control context, tool schemas, the
+            // task anchor, carried rules), halved for growth headroom, minus the
+            // summary's own budget. A flat `threshold / 2` ignores that fixed
+            // cost, so on a small `reliable_context` profile a fold lands back
+            // on the threshold and re-fires every round or two.
+            let pressure = u64::from(context_policy.pressure_threshold);
+            let summary_budget = leveler_context::COMPACTION_SUMMARY_BUDGET_TOKENS;
             let keep_recent_messages = context_policy.retention.keep_recent_messages;
+            let (tail_budget, non_foldable_projected_tokens) = context_policy
+                .retention_budget_from_projection(messages, |base| {
+                    leveler_model::RequestProjection::project_with_control_context(
+                        base,
+                        &self.tools,
+                        self.executor.policy.reasoning_replay,
+                        self.executor.policy.reasoning_retention,
+                        &self.request_context(rt),
+                    )
+                    .estimated_tokens()
+                });
+            let keep_recent_tokens = match tail_budget {
+                Some(budget) => budget.max(1),
+                None => {
+                    // The non-foldable base already reaches the threshold, so
+                    // this fold cannot reach low water — but it still removes
+                    // foldable history, so it RUNS (down to a one-token tail)
+                    // rather than skipping and overflowing. Reported so an
+                    // operator can see the profile is misdeclared.
+                    tracing::warn!(
+                        operation = "compaction",
+                        pressure_threshold = pressure,
+                        non_foldable_tokens = non_foldable_projected_tokens,
+                        "compaction has no low-water relief"
+                    );
+                    1
+                }
+            };
+            tracing::info!(
+                operation = "compaction",
+                pressure_threshold = pressure,
+                projected_before = context_tokens,
+                non_foldable_tokens = non_foldable_projected_tokens,
+                foldable_tokens = context_tokens.saturating_sub(non_foldable_projected_tokens),
+                summary_budget,
+                recent_tail_budget = keep_recent_tokens,
+                "context fold sized from the projected request"
+            );
             // Name this extra round trip so the UI shows "compacting…" instead
             // of a bare "waiting for model" during the summary call.
             (self.observer)(AgentEvent::AdvisoryStarted {
@@ -4011,6 +4057,18 @@ impl AgentHarness for Drive<'_> {
                         after_tokens,
                     });
                 }
+                tracing::info!(
+                    operation = "compaction",
+                    pressure_threshold = pressure,
+                    projected_before = context_tokens,
+                    non_foldable_tokens = non_foldable_projected_tokens,
+                    foldable_tokens = context_tokens.saturating_sub(non_foldable_projected_tokens),
+                    summary_budget,
+                    recent_tail_budget = keep_recent_tokens,
+                    projected_after = after_tokens,
+                    tokens_freed = context_tokens.saturating_sub(after_tokens),
+                    "context fold committed"
+                );
             }
             if self.executor.hook_runner.has_lifecycle() {
                 self.executor

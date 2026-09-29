@@ -960,6 +960,13 @@ impl CodingRuntime {
             )
             .estimated_tokens()
         };
+        // The retained tail is sized from the same projected accounting the
+        // threshold uses, so a pre-request fold also lands at low water instead
+        // of back on the threshold.
+        let (tail_budget, _non_foldable) = policy
+            .context_policy
+            .retention_budget_from_projection(&raw.messages, measure);
+        let keep_recent_tokens = tail_budget.unwrap_or(1).max(1);
         let context = raw
             .assemble_measured(
                 log,
@@ -972,7 +979,7 @@ impl CodingRuntime {
                 },
                 policy.context_policy.hard_capacity(),
                 policy.context_policy.retention.keep_recent_messages,
-                policy.context_policy.retention.keep_recent_tokens,
+                keep_recent_tokens,
                 &measure,
             )
             .await?;

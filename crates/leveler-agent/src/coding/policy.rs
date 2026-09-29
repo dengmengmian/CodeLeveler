@@ -258,6 +258,46 @@ impl ResolvedContextPolicy {
         self.pressure_threshold > 0
     }
 
+    /// The verbatim tail budget a fold should keep, derived from the ONE
+    /// projected accounting.
+    ///
+    /// `measure_base` projects a slice of messages the same way the request
+    /// will be sent (control context + tool schemas + history), so the
+    /// non-foldable cost is the real projected cost, never a `first
+    /// input_tokens` guess. Returns `(Some(budget) | None, non_foldable)`;
+    /// `None` means a fold cannot relieve pressure (see
+    /// [`leveler_context::retention_tail_budget`]).
+    pub(crate) fn retention_budget_from_projection(
+        &self,
+        messages: &[leveler_model::Message],
+        measure_base: impl Fn(&[leveler_model::Message]) -> u64,
+    ) -> (Option<u64>, u64) {
+        if !self.folding_enabled() {
+            return (None, 0);
+        }
+        // Non-foldable = the task anchor head plus every system message (scoped
+        // rules are carried across a fold), projected with the same tools and
+        // control context the request carries.
+        let head_end = messages
+            .iter()
+            .position(|m| m.role == leveler_model::Role::User)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let base: Vec<leveler_model::Message> = messages
+            .iter()
+            .enumerate()
+            .filter(|(index, m)| *index < head_end || m.role == leveler_model::Role::System)
+            .map(|(_, m)| m.clone())
+            .collect();
+        let non_foldable = measure_base(&base);
+        let budget = leveler_context::retention_tail_budget(
+            u64::from(self.pressure_threshold),
+            non_foldable,
+            leveler_context::COMPACTION_SUMMARY_BUDGET_TOKENS,
+        );
+        (budget, non_foldable)
+    }
+
     /// The largest projected input this harness will legally SEND: the declared
     /// window with the completion reservation and safety headroom removed.
     ///
