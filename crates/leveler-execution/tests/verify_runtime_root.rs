@@ -241,9 +241,21 @@ async fn two_confined_runs_never_share_a_runtime_root() {
 /// The binary itself needs no cargo and starts in milliseconds.
 fn built_test_binary(stem: &str) -> Option<PathBuf> {
     let deps = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    newest_executable(&deps, stem)
+}
+
+/// Newest executable whose file name starts with `{stem}-`.
+///
+/// The build leaves sidecars beside the binary: `.d` dep-info and, under
+/// `split-debuginfo = "packed"` on Linux, a `.dwp` DWARF bundle written after
+/// the binary. Newest-name-match therefore executes the bundle (CI run
+/// 36526610858 spawned `edit_contract-*.dwp` and got `EACCES`). The executable
+/// bit is the property that distinguishes the binary, so a new sidecar does
+/// not need its own exclusion.
+fn newest_executable(deps: &Path, stem: &str) -> Option<PathBuf> {
     let prefix = format!("{stem}-");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(&deps).ok()? {
+    for entry in std::fs::read_dir(deps).ok()? {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -254,11 +266,6 @@ fn built_test_binary(stem: &str) -> Option<PathBuf> {
             Ok(meta) if meta.is_file() => meta,
             _ => continue,
         };
-        // The binary, not something that merely shares its name: the build also
-        // leaves `.d` dep-info beside it and, under `split-debuginfo = "packed"`,
-        // a `.dwp` DWARF bundle, which is written AFTER the binary and so wins
-        // any "newest match" rule. Being executable is the property wanted, and
-        // it does not have to be re-listed when the build adds another sidecar.
         if meta.permissions().mode() & 0o111 == 0 {
             continue;
         }
@@ -270,6 +277,74 @@ fn built_test_binary(stem: &str) -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// CI picked the `.dwp` because it was the newest name match. Plant that
+/// layout here: the bundle and the dep-info are newer than the binary, and
+/// neither is executable.
+#[test]
+fn newest_executable_skips_a_newer_packed_dwarf_bundle() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-bin-pick-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = DirRemove(dir.clone());
+
+    let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let newer = older + std::time::Duration::from_secs(60);
+    let sidecar = newer + std::time::Duration::from_secs(60);
+    write_artifact(&dir.join("edit_contract-old"), 0o755, older);
+    write_artifact(&dir.join("edit_contract-new"), 0o755, newer);
+    write_artifact(&dir.join("edit_contract-new.d"), 0o644, sidecar);
+    write_artifact(&dir.join("edit_contract-new.dwp"), 0o644, sidecar);
+    write_artifact(&dir.join("other-newest"), 0o755, sidecar);
+    std::fs::create_dir(dir.join("edit_contract-dir")).unwrap();
+
+    let dwp_mtime = std::fs::metadata(dir.join("edit_contract-new.dwp"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let bin_mtime = std::fs::metadata(dir.join("edit_contract-new"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        dwp_mtime > bin_mtime,
+        "the fixture must make the sidecar newer than the binary"
+    );
+
+    let picked = newest_executable(&dir, "edit_contract").expect("executable present");
+    assert_eq!(
+        picked.file_name().unwrap(),
+        "edit_contract-new",
+        "a newer non-executable .dwp must not be launched"
+    );
+}
+
+fn write_artifact(path: &Path, mode: u32, modified: std::time::SystemTime) {
+    std::fs::write(path, b"artifact").unwrap();
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+struct DirRemove(PathBuf);
+
+impl Drop for DirRemove {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Test 3 — the representative self-repo target passes under verify confinement.

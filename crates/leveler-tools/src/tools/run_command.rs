@@ -1518,6 +1518,24 @@ mod snapshot_tests {
         );
     }
 
+    /// macOS seatbelt says EPERM ("not permitted"). Linux read-only bind says
+    /// EROFS. `denied` covers the permission-denied spelling. The Linux line
+    /// is the stderr from CI run 36526610858.
+    fn filesystem_boundary_refusal(content: &str) -> bool {
+        content.contains("not permitted")
+            || content.contains("denied")
+            || content.contains("Read-only file system")
+    }
+
+    #[test]
+    fn filesystem_boundary_refusal_accepts_the_linux_read_only_bind_text() {
+        assert!(filesystem_boundary_refusal(
+            "rmdir: failed to remove 'victim': Read-only file system"
+        ));
+        assert!(filesystem_boundary_refusal("Operation not permitted"));
+        assert!(!filesystem_boundary_refusal("No such file or directory"));
+    }
+
     /// PB_B_ORCH_1 root cause. A child that has claimed NOTHING gets an EMPTY
     /// write allowlist — it holds no write authority at all. Enforcing that by
     /// diffing a git snapshot AFTER the command is not enough: git does not
@@ -1554,11 +1572,7 @@ mod snapshot_tests {
         // zero-scope child), not from a tool-layer refusal string: the effect
         // is enforced, whatever program attempts it.
         assert!(
-            out.content.contains("not permitted")
-                || out.content.contains("denied")
-                // A read-only bind reports EROFS, which is the same refusal as
-                // macOS's EPERM and must not be read as a missing denial.
-                || out.content.contains("Read-only file system"),
+            filesystem_boundary_refusal(&out.content),
             "the mutation must fail at the filesystem boundary: {}",
             out.content
         );

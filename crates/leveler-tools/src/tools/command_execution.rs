@@ -766,6 +766,25 @@ mod grant_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// macOS seatbelt says EPERM. Linux read-only bind says EROFS. Both are
+    /// the sandbox refusing the write. The Linux wording is locked with the
+    /// stderr recorded from CI run 36526610858, because this host never emits it.
+    fn sandbox_refusal(content: &str) -> bool {
+        content.contains("request_permissions")
+            || content.contains("Operation not permitted")
+            || content.contains("operation not permitted")
+            || content.contains("Read-only file system")
+    }
+
+    #[test]
+    fn sandbox_refusal_accepts_the_linux_read_only_bind_text() {
+        assert!(sandbox_refusal(
+            "sh: 1: cannot create .git/canary-write: Read-only file system"
+        ));
+        assert!(sandbox_refusal("Operation not permitted"));
+        assert!(!sandbox_refusal("No such file or directory"));
+    }
+
     /// D4 canary: under assisted write_root, agent/shell cannot write into `.git`
     /// (so bare `git pull` fails until the turn gets filesystem elevation).
     #[cfg(unix)]
@@ -797,12 +816,7 @@ mod grant_tests {
         );
         if out.is_error {
             assert!(
-                out.content.contains("request_permissions")
-                    || out.content.contains("Operation not permitted")
-                    || out.content.contains("operation not permitted")
-                    // Linux confines by binding the path read-only, so the OS
-                    // says EROFS where macOS says EPERM. Same refusal.
-                    || out.content.contains("Read-only file system"),
+                sandbox_refusal(&out.content),
                 "failure should surface sandbox/recoverable signal: {}",
                 out.content
             );
