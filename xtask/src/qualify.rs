@@ -302,10 +302,14 @@ fn release_cmd(lab: &Lab, sha: &str, baseline: &str, layers: Option<&str>) -> Co
         "--model".to_string(),
         lab.model.clone(),
     ];
+    // A restricted layer set (the pre-release check) still runs every gate the
+    // full dogfood later REUSES: the reuse key for L2 is the same whether or not
+    // PTY actually ran, so a `--no-pty` pre-release would hand the dogfood L2
+    // evidence with no PTY gates and trip H9. Run L2 whole here so the reused
+    // evidence is complete.
     if let Some(layers) = layers {
         args.push("--layers".to_string());
         args.push(layers.to_string());
-        args.push("--no-pty".to_string());
     }
     CommandSpec::new("python3", args, &lab.root).env("DOGFOOD_ROOT", lab.root.display().to_string())
 }
