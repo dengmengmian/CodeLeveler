@@ -1,0 +1,21 @@
+# cargo-audit configuration for CodeLeveler.
+#
+# One source of truth for the advisories `cargo audit` is told to ignore, so a
+# local run, CI, and the dogfood release lab all reach the same verdict. The
+# inline `--ignore` this replaces lived in the CI workflow only, which is why
+# the lab's plain `cargo audit --no-fetch --quiet` failed on an advisory the
+# project had already adjudicated.
+#
+# Only advisories that would otherwise FAIL the audit belong here. The
+# unmaintained / unsound / yanked warnings cargo-audit prints are left visible:
+# they do not change the exit code, and silence is not the goal.
+[advisories]
+ignore = [
+    # rsa 0.9.10 — Marvin attack (RUSTSEC-2023-0071). No fixed upgrade exists.
+    # It is only an optional, unreachable sqlx-mysql lockfile edge; this
+    # workspace enables sqlite only, so no linked binary contains it:
+    #   $ cargo tree --target all -i rsa      # prints nothing
+    # See the matching entry in deny.toml. Expires 2026-10-01: remove when sqlx
+    # drops the edge or a fix ships.
+    "RUSTSEC-2023-0071",
+]

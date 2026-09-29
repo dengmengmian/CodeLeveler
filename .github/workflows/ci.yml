@@ -210,7 +210,7 @@ jobs:
         with:
           tool: cargo-audit
       - name: cargo-audit
-        # Expires 2026-10-01. rsa is only an unreachable sqlx-mysql lockfile
-        # edge; this workspace enables sqlite only (`cargo tree --target all
-        # -i rsa` is empty). Remove when sqlx drops the edge or a fix ships.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        # Advisories this project has adjudicated live in .cargo/audit.toml, so
+        # CI, a local run, and the dogfood release lab share one source of
+        # truth instead of the ignore existing only in this workflow.
+        run: cargo audit
