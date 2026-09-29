@@ -94,6 +94,10 @@ sudo apt install bubblewrap
 
 不安装时 CodeLeveler 可以启动，但需要 Linux 隔离的命令会直接失败，不会降级成无沙箱执行。运行 `leveler doctor` 可以查看当前机器实际具备的能力。
 
+## 开发
+
+日常入口是 `./dev`。`./dev fmt` 只格式化本任务拥有的 Rust 文件，不会执行 `cargo fmt --all`。发布资格由外部实验室判定：先 `release_check.py`，再 `rc_check.py`。`./dev` 只调用这两支脚本，不另写一套门禁。命令列表见 `./dev help`。
+
 ## 更新
 
 CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时最多每 `check_interval_hours` 检查一次；发现新版本后会下载、校验 SHA-256、替换当前二进制并重启。检查失败不会阻止启动：当前版本正常运行，失败原因写入日志。

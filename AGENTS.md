@@ -2183,6 +2183,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
+日常入口是仓库根的 `./dev`。`./dev fmt` 只格式化本任务拥有的 Rust 文件，不执行 `cargo fmt --all`。发布资格只认实验室的 `release_check.py`，通过后再跑 `rc_check.py`。`./dev` 不另写门禁，也不替模型做判断。
+
 普通开发优先使用 `.cargo/config.toml` 中的窄范围 alias，或直接 `cargo check -p <package>` / `cargo test -p <package> --lib <filter>`。
 
 基本要求：

@@ -33,6 +33,7 @@ members = [
     "crates/leveler-cli",
     "crates/leveler-test-support",
     "services/leveler-relay",
+    "xtask",
 ]
 
 [workspace.package]
@@ -196,3 +197,8 @@ strip = true
 # file and line in every panic and backtrace — and drops the variable-level
 # information only an attached debugger reads.
 debug = "line-tables-only"
+# macOS otherwise uses unpacked split debuginfo: one .rcgu.o per codegen unit,
+# left in deps under a new hash on every rebuild. That single directory reached
+# 737k files, and rustc then stalled in directory lookup. Packed debuginfo is
+# one bundle per output, so deps stays a normal directory.
+split-debuginfo = "packed"

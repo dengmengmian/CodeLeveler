@@ -1,0 +1,4 @@
+#!/bin/sh
+# Thin entry. Policy lives in the xtask crate.
+cd "$(CDPATH= cd -- "$(dirname "$0")" && pwd)" || exit 1
+exec cargo run -q -p xtask -- "$@"

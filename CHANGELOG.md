@@ -4,6 +4,34 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
+## [1.1.0] - 2026-09-29
+
+Reworks how a model request is assembled, folded, and paid for: the control
+context is separated from the transcript, every prompt segment has one source and
+one authority, and every model attempt is recorded in the request ledger.
+
+### Added
+
+- A single request projection that wire encoding and context statistics both read, so the reported input size and the bytes sent cannot disagree
+- Per-attempt request accounting: failures, retries, compaction summaries, and child task calls all land in the request ledger and the resource budget
+
+### Changed
+
+- Every delivered prompt segment carries one source, authority, and lifecycle. A provider may change how a segment is represented on the wire but not its order, source, or authority
+- Context folding pressure follows the actual projected request; directory-scoped project rules survive a fold verbatim
+- Consumption after recovery is rebuilt from a scope's persisted request facts, so a background child cannot keep spending a stale balance snapshot
+- Rule delivery is budgeted against the request, so every rule stays authoritative even when only part of a rule file fits verbatim
+
+### Fixed
+
+- A reduced-context route whose `max_output_tokens` exceeds its own `context_window` reserved the full completion against the window, saturating the usable input capacity to `0` and aborting the run with `context management failure: ... capacity 0` after the first tool batch. A bound of zero is not a bound the model declared, so folding now follows the quality boundary alone
+- The context snapshot produced before a request reaches the caller's observer instead of being dropped
+- A model-spend scope change no longer discards the task epoch's remaining command budget
+- The spend of a completed command is flushed when a batch is cancelled mid-round
+- A child task's rendered spawn brief is persisted and reused on resume
+- `/btw` read-only calls pass through the ToolHost admission pipeline
+- Background task writes are constrained to the OS execution boundary, task mutation settles only after the whole workload ends, and live stdout/stderr channels are capped with an explicit truncation marker
+
 ## [1.0.0] - 2026-09-18
 
 First stable release. From here CodeLeveler follows Semantic Versioning.

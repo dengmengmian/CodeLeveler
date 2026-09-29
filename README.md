@@ -94,6 +94,10 @@ sudo apt install bubblewrap
 
 CodeLeveler can start without it, but commands that require Linux isolation fail closed instead of running unsandboxed. Run `leveler doctor` to inspect the capabilities available on the current machine.
 
+## Development
+
+Daily commands are `./dev`. `./dev fmt` formats only the Rust files owned by the current task and does not run `cargo fmt --all`. Release eligibility is the external lab: `release_check.py`, then `rc_check.py`. `./dev` invokes those scripts and does not replace them. Run `./dev help` for the command list.
+
 ## Updates
 
 CodeLeveler keeps itself on the latest **stable** GitHub release. At start-up it checks at most once per `check_interval_hours`, and when a newer release exists it downloads it, verifies its SHA-256, replaces the running binary, and restarts. A failed check never blocks start-up: the current version runs normally and the reason is logged.

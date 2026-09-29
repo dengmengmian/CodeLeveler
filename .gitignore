@@ -18,6 +18,9 @@
 .leveler/drafts/
 .local-leveler/
 
+# Local developer entry config (may name a machine-specific dogfood lab).
+.dev/
+
 # Local editor / agent scratch
 .omc/
 .pi/

@@ -2,36 +2,56 @@
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-This patch release improves long-running task convergence, background-task
-control, and command safety.
+This release rebuilds how a model request is assembled, folded, and paid for.
+The control context is now separate from the transcript, every delivered prompt
+segment has one source and one authority, and every model attempt is recorded in
+the request ledger.
 Installed stable builds can update automatically, or use `leveler update`
 or `/update`.
 
 ## Changed
 
-- Pasted file references take less space in the TUI composer.
-- The agent runtime no longer imposes a host-owned verification gate on task completion.
+- Prompt construction gives every delivered segment a single source, authority,
+  and lifecycle. Providers may change how a segment is represented on the wire
+  (a system message or a top-level system field) but not its order, source, or
+  authority, and the control context no longer travels as part of the transcript.
+- Wire encoding and context statistics read the same projected request, so the
+  reported input size and the bytes actually sent cannot disagree. Folding
+  pressure follows the projected request, project rules scoped to a directory
+  survive a fold verbatim, and historical reasoning follows the route's replay
+  contract.
+- Every model attempt is recorded in the request ledger and the resource budget,
+  including failures, retries, compaction summaries, and child task calls.
+  Consumption is rebuilt from a scope's persisted request facts on recovery, so a
+  background child can no longer keep spending a stale balance snapshot.
+- Rule delivery is budgeted against the request: every rule stays authoritative
+  even when only part of a rule file fits verbatim.
+- The repository's `./dev` development entry point is documented in the release
+  archives, for local verification and release qualification.
 
 ## Fixed
 
-- Running background tasks now have visible Stop buttons in the TUI list and
-  detail view. Stopping one task does not cancel the whole session. Closing a
-  TUI attached to a daemon still leaves its background tasks running.
-- CLI approval prompts show the operation and reason carried in the request
-  description, with terminal control characters sanitized.
-- The shell preflight treats comments as ending at the newline. Valid multiline
-  scripts are no longer rejected because of commands on later lines, and
-  later background commands and sensitive paths remain checked.
-- Goal-mode runs receive one runtime-owned delivery reminder after an initial
-  read-only round, preventing repeated self-audits from starving requested
-  workspace edits.
-- Redirects to `/dev/null`, `/dev/stdout`, and `/dev/stderr` no longer request
-  unnecessary write elevation. Other absolute device paths remain protected.
-- Repository metadata writes can be persistently approved without granting
-  unrestricted filesystem access, so local Git commits work in assisted mode
-  while writes outside the workspace remain confined.
-- Background-task output identifies each retained stdout and stderr chunk,
-  preserving the source of interleaved logs.
+- A reduced-context route can declare `max_output_tokens` larger than its own
+  `context_window`. Reserving that full completion against the window used to
+  saturate the usable input capacity to `0`, so every request looked over the hard
+  capacity and the run aborted with `context management failure: ... capacity 0`
+  after the first tool batch. A bound of zero is not a bound the model declared,
+  so folding now follows the quality boundary alone. Routes whose reservation
+  fits their window are unchanged.
+- The context snapshot produced before a request reaches the caller's observer
+  instead of being dropped.
+- A model-spend scope change no longer discards the task epoch's remaining
+  command budget.
+- The spend of a completed command is flushed when a batch is cancelled
+  mid-round, instead of being lost with the cancelled round.
+- A child task's rendered spawn brief is persisted on the child spec and reused
+  on resume, so a resumed child sees the brief it started with.
+- `/btw` read-only calls pass through the ToolHost admission pipeline instead of
+  bypassing it.
+- Background task writes are constrained to the OS execution boundary, task
+  mutation settles only after the whole workload ends, and the live stdout and
+  stderr channels are capped with an explicit truncation marker rather than
+  growing without bound.
 
 ## Known limits
 
