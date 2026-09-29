@@ -247,11 +247,6 @@ impl Workspace {
                 allowed,
                 excluded,
             } => {
-                if cfg!(not(unix)) {
-                    return Err(WorkspaceError::OutsideWorkspace(
-                        "this host cannot verify scoped inode write authority".into(),
-                    ));
-                }
                 let path = self.resolve_bounded(input, Some(root), PathAccess::Write)?;
                 if !allowed.iter().any(|p| path.starts_with(p))
                     || excluded.iter().any(|p| path.starts_with(p))

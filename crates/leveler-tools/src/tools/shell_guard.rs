@@ -366,8 +366,11 @@ mod tests {
         }
         #[cfg(windows)]
         {
+            // Windows refuses this by the `#`-comment guard: the refusal names
+            // the swallowed command and says the text never runs.
             assert!(err.contains("comment"), "{err}");
-            assert!(err.contains("split into separate tool calls"), "{err}");
+            assert!(err.contains("swallow"), "{err}");
+            assert!(err.contains("never runs"), "{err}");
         }
     }
 

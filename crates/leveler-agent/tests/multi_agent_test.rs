@@ -307,11 +307,22 @@ async fn multiple_spawns_in_one_round_run_concurrently() {
     assert_eq!(started_n, 2, "both sub-agents should emit Started");
     assert_eq!(finished_n, 2, "both sub-agents should emit Finished");
 
-    // Wall-clock proves concurrency: parent(1) + max(childA, childB)(1) + parent(1)
-    // ≈ 3 × 120ms = 360ms, well under the serial 4 × 120ms = 480ms.
+    // Deterministic concurrency proof: both Started land before either
+    // Finished. Wall-clock is only a hang bound — a loaded Windows runner's
+    // timer granularity can push 3×120ms past a tight threshold.
+    let last_started = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::SubAgentStarted { .. }));
+    let first_finished = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::SubAgentFinished { .. }));
     assert!(
-        elapsed < Duration::from_millis(440),
-        "two spawns should overlap; took {elapsed:?}"
+        matches!((last_started, first_finished), (Some(s), Some(f)) if s < f),
+        "both sub-agents must start before either finishes; took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "two in-process spawns must not hang; took {elapsed:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();

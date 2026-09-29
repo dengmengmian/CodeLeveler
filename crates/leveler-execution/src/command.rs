@@ -1139,11 +1139,10 @@ fn validate_scoped_write_boundary(scope: &WriteScope) -> Result<(), ProcessError
     else {
         return Ok(());
     };
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        return Err(ProcessError::SandboxPolicy(
-            "this host cannot enforce scoped workspace writes".into(),
-        ));
-    }
+    // Windows enforces the same scope with Low-integrity labels on `allowed`
+    // (see `writable_roots_for_scope` + `windows_confine::lease_write_roots`),
+    // so the lexical/traversal/symlink checks below are the shared gate on
+    // every enforcing host; only the two `cfg`-gated extras differ.
     for path in allowed.iter().chain(excluded) {
         let relative = path
             .strip_prefix(root)

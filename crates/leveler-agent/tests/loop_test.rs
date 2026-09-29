@@ -4082,7 +4082,9 @@ async fn previous_output_usage_does_not_trigger_input_compaction() {
         0,
         "last reported usage is not the next request projection"
     );
-    std::fs::remove_dir_all(dir).unwrap();
+    // Cleanup, not an assertion: on Windows a still-open handle makes the
+    // remove fail transiently, and that must not fail the test.
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Records whether the executor fell back to asking a human.
