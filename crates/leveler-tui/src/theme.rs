@@ -359,7 +359,10 @@ impl Theme {
             },
             text: TextColors {
                 primary: rgb(0xE7E9EC),
-                final_answer: rgb(0xB7D7FA),
+                // A restrained grey-blue: clearly not the near-white prose of a
+                // progress line, yet still body text rather than a link or an
+                // accent. 9.8:1 on the canvas, so long answers stay readable.
+                final_answer: rgb(0x9FBFE0),
                 secondary: rgb(0xB5BAC1),
                 code: rgb(0x79C6D6),
                 muted: rgb(0x858C95),
@@ -983,6 +986,31 @@ mod tests {
         for id in ThemeId::FIXED {
             let t = Theme::named(id);
             assert_ne!(t.text.primary, Color::Reset, "{id} body text");
+        }
+    }
+
+    /// The final-answer prose is its own reading role: never a value borrowed
+    /// from ordinary prose, an accent, code, or a status. If a palette edit ever
+    /// collapses it back onto one of those, the final answer stops reading as a
+    /// distinct block of writing and only the marker is left to tell it apart.
+    #[test]
+    fn final_answer_is_an_independent_reading_role() {
+        for id in ThemeId::FIXED {
+            let t = Theme::named(id);
+            for (name, other) in [
+                ("primary", t.text.primary),
+                ("accent.primary", t.accent.primary),
+                ("accent.secondary", t.accent.secondary),
+                ("code", t.text.code),
+                ("status.success", t.status.success),
+                ("status.warning", t.status.warning),
+                ("status.error", t.status.error),
+            ] {
+                assert_ne!(
+                    t.text.final_answer, other,
+                    "{id}: final_answer must not equal {name}"
+                );
+            }
         }
     }
 

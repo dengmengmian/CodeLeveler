@@ -1241,7 +1241,7 @@ mod tests {
         let progress = assistant_render(&block("plain body", AssistantKind::Progress), &theme, 80);
         let final_answer = assistant_render(
             &block(
-                "plain body with `cargo test` and [docs](https://example.com)\n\n## Result",
+                "plain body with `cargo test` and [docs](https://example.com)\n\n## Result\n\n- first push succeeded\n- worktree is clean",
                 AssistantKind::Final,
             ),
             &theme,
@@ -1272,9 +1272,22 @@ mod tests {
             .iter()
             .find(|line| line_text(line).contains("Result"))
             .expect("heading line");
+        let list_item = final_answer
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "first")
+            .expect("list item body span");
+        let list_lead = final_answer
+            .iter()
+            .find(|line| line_text(line).contains("first push"))
+            .and_then(|line| line.spans.iter().find(|span| span.content.as_ref() == "• "))
+            .expect("list item lead span");
 
         assert_eq!(progress_body.style.fg, Some(theme.text.primary));
         assert_eq!(final_body.style.fg, Some(theme.text.final_answer));
+        assert_eq!(list_lead.content.as_ref(), "• ");
+        assert_eq!(list_lead.style.fg, Some(theme.text.final_answer));
+        assert_eq!(list_item.style.fg, Some(theme.text.final_answer));
         assert_eq!(code.style.fg, Some(theme.text.code));
         assert_eq!(link.style.fg, Some(theme.accent.primary));
         assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
