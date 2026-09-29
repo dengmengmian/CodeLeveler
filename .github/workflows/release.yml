@@ -178,7 +178,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: web-dist
-          path: .
+          path: crates/leveler-web/web/dist
 
       - name: Verify the WebUI artifact
         shell: bash
