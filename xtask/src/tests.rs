@@ -321,6 +321,10 @@ fn clean_all_invokes_cargo_clean_and_keeps_unknown_dirs() {
     }));
 }
 
+/// Unix only: creating a symlink on Windows needs a privilege the runner may
+/// not have, and an optional OS capability must be detected, not assumed. The
+/// guard under test reads link metadata, so unix exercises the same code.
+#[cfg(unix)]
 #[test]
 fn clean_unlinks_registered_symlink_without_following_it() {
     let tmp = Tmp::new();
