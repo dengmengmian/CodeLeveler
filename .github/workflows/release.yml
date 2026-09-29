@@ -282,6 +282,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: leveler-*
           path: dist
           merge-multiple: true
 
@@ -350,6 +351,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: leveler-*
           path: dist
           merge-multiple: true
 
