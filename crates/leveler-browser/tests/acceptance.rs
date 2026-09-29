@@ -313,9 +313,16 @@ async fn the_public_internet_is_reachable() {
         outcome.url
     );
     let snap = b.snapshot(&s, None).await.expect("snapshot");
+    // The document title, not the body: example.com belongs to IANA and its
+    // copy changes without notice. On 2026-09-29 they dropped the
+    // `<h1>Example Domain</h1>` heading and added `/s.js`, which rewrites every
+    // `<p>` as one `<span>` per character; the body no longer contains this
+    // string, and its runs arrive split. The title is the part of a real public
+    // page this test is entitled to rely on.
     assert!(
-        snap.text.to_lowercase().contains("example domain"),
-        "the page did not load:\n{}",
+        snap.title.to_lowercase().contains("example domain"),
+        "the page did not load:\ntitle: {}\n{}",
+        snap.title,
         snap.text
     );
     println!("PASS public-internet {product}");
