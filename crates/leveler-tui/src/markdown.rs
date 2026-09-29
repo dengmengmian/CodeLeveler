@@ -8,7 +8,7 @@
 use std::sync::OnceLock;
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -26,15 +26,6 @@ pub enum AssistantTone {
     #[default]
     Progress,
     Final,
-}
-
-impl AssistantTone {
-    fn base_text(self, theme: &Theme) -> ratatui::style::Color {
-        match self {
-            Self::Progress => theme.text.primary,
-            Self::Final => theme.text.final_answer,
-        }
-    }
 }
 
 /// A parsed markdown document, width-agnostic.
@@ -377,13 +368,24 @@ impl MdDoc {
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut last_block_start = 0;
         let mut block_starts = Vec::with_capacity(self.blocks.len());
+        // A final answer's OPENING paragraph is its one-line conclusion, so the
+        // first non-empty `Paragraph` becomes the lead — whether or not a
+        // heading precedes it. This is structural (block type + position), never
+        // text matching: nothing here reads the words.
+        let mut lead_pending = tone == AssistantTone::Final;
         for (i, block) in self.blocks.iter().enumerate() {
             if i > 0 {
                 out.push(Line::from(""));
             }
             last_block_start = out.len();
             block_starts.push(last_block_start);
-            render_block(block, width, theme, tone, &mut out);
+            let lead = lead_pending
+                && matches!(block, MdBlock::Paragraph(spans)
+                    if spans.iter().any(|span| !span.text.trim().is_empty()));
+            if lead {
+                lead_pending = false;
+            }
+            render_block(block, width, theme, tone, lead, &mut out);
         }
         // Within the LAST (still-streaming) block, greedy wrapping normally
         // leaves only the final display line mutable. An unmatched strong
@@ -437,6 +439,8 @@ fn render_block(
     width: usize,
     theme: &Theme,
     tone: AssistantTone,
+    // This paragraph is the final answer's lead (opening conclusion).
+    lead: bool,
     out: &mut Vec<Line<'static>>,
 ) {
     {
@@ -466,16 +470,26 @@ fn render_block(
                     });
                 }
                 heading.extend(spans.iter().cloned());
-                out.extend(wrap_spans(&heading, width, theme, style));
+                out.extend(wrap_spans(&heading, width, theme, style, None));
             }
             MdBlock::Paragraph(spans) => {
-                // Explicit body fg so bare-URL accent always contrasts (do not
-                // rely on terminal default, which can match accent in some themes).
+                // The opening paragraph carries the answer's conclusion and is
+                // the ONLY prose that gets its own ink; every later paragraph is
+                // ordinary body. Explicit fg so a bare-URL accent always
+                // contrasts (never rely on the terminal default).
+                let style = if lead {
+                    Style::default()
+                        .fg(theme.text.final_lead)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text.primary)
+                };
                 out.extend(wrap_spans(
                     spans,
                     width,
                     theme,
-                    Style::default().fg(tone.base_text(theme)),
+                    style,
+                    Some(theme.text.strong),
                 ));
             }
             MdBlock::Quote(spans) => {
@@ -485,6 +499,7 @@ fn render_block(
                     inner,
                     theme,
                     Style::default().fg(theme.text.secondary),
+                    Some(theme.text.strong),
                 ) {
                     let mut spans =
                         vec![Span::styled("▌ ", Style::default().fg(theme.border.normal))];
@@ -493,6 +508,15 @@ fn render_block(
                 }
             }
             MdBlock::List { ordered, items } => {
+                // The marker is the scan point; the item text stays body ink so
+                // a list reads as a list, not as a block of accent color. Only a
+                // final answer lifts its markers — progress lists are unchanged.
+                let marker_color = match tone {
+                    AssistantTone::Final => theme.accent.secondary,
+                    AssistantTone::Progress => theme.text.primary,
+                };
+                let marker_style = Style::default().fg(marker_color);
+                let body_style = Style::default().fg(theme.text.primary);
                 for (n, item) in items.iter().enumerate() {
                     let marker = if *ordered {
                         format!("{}. ", n + 1)
@@ -501,22 +525,15 @@ fn render_block(
                     };
                     let indent = " ".repeat(marker.width());
                     let inner = width.saturating_sub(marker.width()).max(1);
-                    let wrapped = wrap_spans(
-                        item,
-                        inner,
-                        theme,
-                        Style::default().fg(tone.base_text(theme)),
-                    );
+                    let wrapped =
+                        wrap_spans(item, inner, theme, body_style, Some(theme.text.strong));
                     for (li, line) in wrapped.into_iter().enumerate() {
                         let lead = if li == 0 {
                             marker.clone()
                         } else {
                             indent.clone()
                         };
-                        let mut spans = vec![Span::styled(
-                            lead,
-                            Style::default().fg(tone.base_text(theme)),
-                        )];
+                        let mut spans = vec![Span::styled(lead, marker_style)];
                         spans.extend(line.spans);
                         out.push(Line::from(spans));
                     }
@@ -789,7 +806,7 @@ fn table_lines(
             r,
             &colw,
             align,
-            Style::default(),
+            Style::default().fg(theme.text.primary),
             theme,
             border,
         ));
@@ -857,7 +874,8 @@ fn table_lines_stacked(
                     value,
                     width.saturating_sub(2).max(1),
                     theme,
-                    Style::default(),
+                    Style::default().fg(theme.text.primary),
+                    Some(theme.text.strong),
                 ) {
                     let mut spans = vec![Span::raw("  ")];
                     spans.append(&mut vline.spans);
@@ -866,7 +884,13 @@ fn table_lines_stacked(
                 continue;
             }
 
-            let wrapped = wrap_spans(value, width - prefix_width, theme, Style::default());
+            let wrapped = wrap_spans(
+                value,
+                width - prefix_width,
+                theme,
+                Style::default().fg(theme.text.primary),
+                Some(theme.text.strong),
+            );
             for (line_index, mut vline) in wrapped.into_iter().enumerate() {
                 let mut spans = if line_index == 0 {
                     vec![Span::styled(prefix.clone(), label_style)]
@@ -894,7 +918,15 @@ fn render_table_row(
 ) -> Vec<Line<'static>> {
     let empty: Vec<MdSpan> = Vec::new();
     let wrapped: Vec<Vec<Line<'static>>> = (0..colw.len())
-        .map(|c| wrap_spans(cells.get(c).unwrap_or(&empty), colw[c].max(1), theme, base))
+        .map(|c| {
+            wrap_spans(
+                cells.get(c).unwrap_or(&empty),
+                colw[c].max(1),
+                theme,
+                base,
+                Some(theme.text.strong),
+            )
+        })
         .collect();
     let height = wrapped.iter().map(|w| w.len()).max().unwrap_or(1).max(1);
 
@@ -941,11 +973,22 @@ fn render_table_row(
 
 /// Word-wrap styled spans to `width` columns, preserving each span's style and
 /// breaking overlong tokens (e.g. CJK runs) by grapheme.
-fn wrap_spans(spans: &[MdSpan], width: usize, theme: &Theme, base: Style) -> Vec<Line<'static>> {
+fn wrap_spans(
+    spans: &[MdSpan],
+    width: usize,
+    theme: &Theme,
+    base: Style,
+    // Ink for `**strong**` spans, or `None` where bold is structural rather
+    // than emphasis (headings). Code and links still override it.
+    strong: Option<Color>,
+) -> Vec<Line<'static>> {
     let style_of = |s: &MdSpan| {
         let mut style = base;
         if s.bold {
             style = style.add_modifier(Modifier::BOLD);
+            if let Some(fg) = strong {
+                style = style.fg(fg);
+            }
         }
         if s.italic {
             style = style.add_modifier(Modifier::ITALIC);

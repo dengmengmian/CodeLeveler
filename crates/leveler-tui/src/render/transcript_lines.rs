@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn final_answer_has_a_distinct_base_tone_without_overriding_markdown_roles() {
+    fn final_answer_hierarchy_without_overriding_markdown_roles() {
         let theme = Theme::dark();
         let progress = assistant_render(&block("plain body", AssistantKind::Progress), &theme, 80);
         let final_answer = assistant_render(
@@ -1253,11 +1253,11 @@ mod tests {
             .iter()
             .find(|span| span.content.contains("plain"))
             .expect("progress body span");
-        let final_body = final_answer[0]
+        let lead = final_answer[0]
             .spans
             .iter()
             .find(|span| span.content.contains("plain"))
-            .expect("final body span");
+            .expect("final lead span");
         let code = final_answer
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -1277,17 +1277,20 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .find(|span| span.content.as_ref() == "first")
             .expect("list item body span");
-        let list_lead = final_answer
+        let list_marker = final_answer
             .iter()
             .find(|line| line_text(line).contains("first push"))
             .and_then(|line| line.spans.iter().find(|span| span.content.as_ref() == "• "))
-            .expect("list item lead span");
+            .expect("list item marker span");
 
+        // Progress is unchanged: ordinary body ink.
         assert_eq!(progress_body.style.fg, Some(theme.text.primary));
-        assert_eq!(final_body.style.fg, Some(theme.text.final_answer));
-        assert_eq!(list_lead.content.as_ref(), "• ");
-        assert_eq!(list_lead.style.fg, Some(theme.text.final_answer));
-        assert_eq!(list_item.style.fg, Some(theme.text.final_answer));
+        // The opening paragraph is the lead; the list marker is the scan point;
+        // the item text is body.
+        assert_eq!(lead.style.fg, Some(theme.text.final_lead));
+        assert_eq!(list_marker.style.fg, Some(theme.accent.secondary));
+        assert_eq!(list_item.style.fg, Some(theme.text.primary));
+        // Local semantics still win.
         assert_eq!(code.style.fg, Some(theme.text.code));
         assert_eq!(link.style.fg, Some(theme.accent.primary));
         assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
@@ -1298,6 +1301,144 @@ mod tests {
                 .filter(|span| !span.content.trim().is_empty())
                 .all(|span| span.style.fg == Some(theme.accent.secondary))
         );
+    }
+
+    /// The opening paragraph is the conclusion and gets its own ink; every later
+    /// paragraph is ordinary body. This is the internal hierarchy that keeps a
+    /// final answer from reading as one flat block of color.
+    #[test]
+    fn a_final_answer_leads_with_its_first_paragraph_and_bodies_the_rest() {
+        let theme = Theme::dark();
+        let lines = assistant_render(
+            &block("任务已经完成。\n\n这里是详细说明。", AssistantKind::Final),
+            &theme,
+            80,
+        );
+
+        let lead = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("任务"))
+            .expect("lead span");
+        let body = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("详细说明"))
+            .expect("body span");
+
+        assert_eq!(lead.style.fg, Some(theme.text.final_lead));
+        assert!(lead.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(body.style.fg, Some(theme.text.primary));
+        assert_ne!(theme.text.final_lead, theme.text.primary);
+    }
+
+    /// A heading before the opening paragraph is NOT the lead: the heading keeps
+    /// its accent and the first paragraph after it becomes the lead.
+    #[test]
+    fn a_final_heading_does_not_consume_the_lead() {
+        let theme = Theme::dark();
+        let lines = assistant_render(
+            &block(
+                "## 结果\n\n任务已经完成。\n\n详细说明。",
+                AssistantKind::Final,
+            ),
+            &theme,
+            80,
+        );
+        let heading = lines
+            .iter()
+            .find(|line| line_text(line).contains("结果"))
+            .expect("heading line");
+        assert!(
+            heading
+                .spans
+                .iter()
+                .filter(|span| span.content.contains("结果") || span.content.contains('▎'))
+                .all(|span| span.style.fg == Some(theme.accent.secondary))
+        );
+        let lead = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("任务"))
+            .expect("lead span");
+        let body = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("详细说明"))
+            .expect("body span");
+        assert_eq!(lead.style.fg, Some(theme.text.final_lead));
+        assert_eq!(body.style.fg, Some(theme.text.primary));
+    }
+
+    /// A list's marker carries the accent; the item text stays body ink, so a
+    /// list reads as a list rather than a block of blue.
+    #[test]
+    fn a_final_list_marks_with_accent_and_bodies_the_text() {
+        let theme = Theme::dark();
+        let lines = assistant_render(
+            &block("- 第一项\n- 第二项", AssistantKind::Final),
+            &theme,
+            80,
+        );
+        let marker = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "• ")
+            .expect("bullet");
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "第一项")
+            .expect("item text");
+        assert_eq!(marker.style.fg, Some(theme.accent.secondary));
+        assert_eq!(text.style.fg, Some(theme.text.primary));
+    }
+
+    /// `**strong**` is brighter than body — real emphasis, not just a weight.
+    #[test]
+    fn strong_prose_is_brighter_than_body() {
+        let theme = Theme::dark();
+        let lines = assistant_render(
+            &block("这里有 **重要信息** 结束。", AssistantKind::Final),
+            &theme,
+            80,
+        );
+        let strong = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("重要"))
+            .expect("strong span");
+        assert_eq!(strong.style.fg, Some(theme.text.strong));
+        assert!(strong.style.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(theme.text.strong, theme.text.primary);
+    }
+
+    /// A blockquote is the one place a hand-written secondary tone comes from
+    /// structure, not from scanning the words.
+    #[test]
+    fn a_final_blockquote_reads_as_secondary_prose() {
+        let theme = Theme::dark();
+        let lines = assistant_render(&block("> 补充说明", AssistantKind::Final), &theme, 80);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("补充"))
+            .expect("quote span");
+        assert_eq!(text.style.fg, Some(theme.text.secondary));
+    }
+
+    /// Progress lists keep the marker they always had; only a final answer lifts
+    /// its markers.
+    #[test]
+    fn progress_lists_keep_their_body_ink_marker() {
+        let theme = Theme::dark();
+        let lines = assistant_render(&block("- 过程项", AssistantKind::Progress), &theme, 80);
+        let marker = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "• ")
+            .expect("bullet");
+        assert_eq!(marker.style.fg, Some(theme.text.primary));
     }
 
     #[test]
