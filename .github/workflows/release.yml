@@ -386,6 +386,9 @@ jobs:
           SHA: ${{ github.event.inputs.commit }}
         run: |
           set -euo pipefail
+          # An annotated tag needs an author; a fresh runner has no identity.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Both the tag object and its peeled commit: an annotated tag's first
           # line is the tag object, not the commit the release must point at,
           # and a lightweight tag has no peeled line at all.
