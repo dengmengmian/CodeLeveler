@@ -221,16 +221,28 @@ impl ResolvedContextPolicy {
             };
         }
         let capacity = window.saturating_sub(reservation).saturating_sub(headroom);
+        // The quality boundary: where recall is expected to degrade. With no
+        // declaration the usable capacity is the only bound — and when the
+        // reservation has consumed the whole window there is no capacity to
+        // name, so the window itself is the bound.
         let quality = if limits.reliable_context == 0 {
-            capacity
+            if capacity > 0 { capacity } else { window }
         } else {
             limits.reliable_context
         };
-        // Floor at one token: a reservation plus headroom that exhausts the
-        // window is a misdeclaration, and the honest failure is to fold
-        // immediately (visible in the ledger) rather than to silently stop
-        // folding and let the request overflow.
-        let pressure_threshold = quality.min(capacity).max(1);
+        // A reservation plus headroom that exhausts the window leaves no input
+        // capacity. `hard_capacity()` reports `None` for that: a hard bound of
+        // zero would mark every request as over capacity and force a fold that
+        // can never fit, aborting the task. Folding therefore runs on the
+        // quality boundary alone — the behaviour that existed before a capacity
+        // was derived — which is the honest reading of a route whose declared
+        // completion cap exceeds its window (e.g. a reduced-context route that
+        // keeps the model's full output declaration).
+        let pressure_threshold = if capacity > 0 {
+            quality.min(capacity).max(1)
+        } else {
+            quality.max(1)
+        };
         Self {
             context_window: window,
             quality_boundary: limits.reliable_context,
@@ -257,17 +269,16 @@ impl ResolvedContextPolicy {
     /// declares a quality boundary below its usable window the two differ, and
     /// the gap between them is exactly the room a failed fold may continue in.
     ///
-    /// `None` when no window is declared: with no hard limit there is no
-    /// request compaction is obliged to make legal, so nothing here may claim
-    /// one.
+    /// `None` when no window is declared, or when the reservation and headroom
+    /// leave no input room: with no hard limit there is no request compaction
+    /// is obliged to make legal, so nothing here may claim one. A zero would be
+    /// such a claim and would abort every task, so it is never returned.
     pub fn hard_capacity(&self) -> Option<u64> {
-        (self.context_window > 0).then(|| {
-            u64::from(
-                self.context_window
-                    .saturating_sub(self.output_reservation)
-                    .saturating_sub(self.headroom),
-            )
-        })
+        let capacity = self
+            .context_window
+            .saturating_sub(self.output_reservation)
+            .saturating_sub(self.headroom);
+        (self.context_window > 0 && capacity > 0).then_some(u64::from(capacity))
     }
 }
 
@@ -530,11 +541,25 @@ mod tests {
         );
 
         // A reservation plus headroom that exhausts the window is a
-        // misdeclaration; the honest failure is to fold immediately (visible)
-        // rather than to stop folding (silent overflow).
+        // misdeclaration; the harness cannot claim a hard bound it can never
+        // satisfy, so it folds on the quality boundary instead of forcing a
+        // fold that cannot fit (which would abort the task).
         let exhausted = ResolvedContextPolicy::resolve(&limits(8_192, 4_096, 8_191), 0, 8_192);
-        assert_eq!(exhausted.pressure_threshold, 1);
+        assert_eq!(exhausted.pressure_threshold, 4_096);
+        assert_eq!(exhausted.hard_capacity(), None);
         assert!(exhausted.folding_enabled());
+
+        // A reduced-context route that keeps the model's full completion
+        // declaration reserves more output than it has window. The harness
+        // must not derive `hard_capacity() == Some(0)` from that: the zero
+        // marks every request over capacity and aborts the task with a fold
+        // that can never fit. It folds on the quality boundary instead.
+        let over_window = ResolvedContextPolicy::resolve(&limits(131_072, 24_000, 393_216), 0, 0);
+        assert_eq!(over_window.output_reservation, 393_216);
+        assert_eq!(over_window.quality_boundary, 24_000);
+        assert_eq!(over_window.pressure_threshold, 24_000);
+        assert_eq!(over_window.hard_capacity(), None);
+        assert!(over_window.folding_enabled());
 
         // The retention budget is its own field, not a fraction re-derived at
         // the call site: a policy with a different threshold keeps the same
