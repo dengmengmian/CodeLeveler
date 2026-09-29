@@ -799,7 +799,10 @@ mod grant_tests {
             assert!(
                 out.content.contains("request_permissions")
                     || out.content.contains("Operation not permitted")
-                    || out.content.contains("operation not permitted"),
+                    || out.content.contains("operation not permitted")
+                    // Linux confines by binding the path read-only, so the OS
+                    // says EROFS where macOS says EPERM. Same refusal.
+                    || out.content.contains("Read-only file system"),
                 "failure should surface sandbox/recoverable signal: {}",
                 out.content
             );

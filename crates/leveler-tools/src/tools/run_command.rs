@@ -1554,7 +1554,11 @@ mod snapshot_tests {
         // zero-scope child), not from a tool-layer refusal string: the effect
         // is enforced, whatever program attempts it.
         assert!(
-            out.content.contains("not permitted") || out.content.contains("denied"),
+            out.content.contains("not permitted")
+                || out.content.contains("denied")
+                // A read-only bind reports EROFS, which is the same refusal as
+                // macOS's EPERM and must not be read as a missing denial.
+                || out.content.contains("Read-only file system"),
             "the mutation must fail at the filesystem boundary: {}",
             out.content
         );
