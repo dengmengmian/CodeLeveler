@@ -30,6 +30,7 @@
 //! [`EnvSnapshot`], never by mutating the test process's environment, so these
 //! tests stay parallel-safe.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -246,14 +247,21 @@ fn built_test_binary(stem: &str) -> Option<PathBuf> {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // `<stem>-<hash>` (plus `.exe` on Windows), never the `.d` sidecar.
-        if !name.starts_with(&prefix) || name.ends_with(".d") {
+        if !name.starts_with(&prefix) {
             continue;
         }
         let meta = match entry.metadata() {
             Ok(meta) if meta.is_file() => meta,
             _ => continue,
         };
+        // The binary, not something that merely shares its name: the build also
+        // leaves `.d` dep-info beside it and, under `split-debuginfo = "packed"`,
+        // a `.dwp` DWARF bundle, which is written AFTER the binary and so wins
+        // any "newest match" rule. Being executable is the property wanted, and
+        // it does not have to be re-listed when the build adds another sidecar.
+        if meta.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
         let Ok(modified) = meta.modified() else {
             continue;
         };
