@@ -126,6 +126,15 @@ pub enum ClientCommand {
     /// polls for idleness and never kills anything — the runtime owns the
     /// drain, because only it knows what "still working" means.
     ShutdownWhenIdle { reason: RestartReason },
+    /// End this runtime NOW for a generation handover, cancelling the main
+    /// turns it still owns instead of waiting for them to reach a terminal.
+    ///
+    /// The explicit, user-chosen escape from a handover whose drain cannot
+    /// finish — a turn that will never terminate on its own. Distinct from
+    /// `Quit`: this is a version handover, not a user shutdown, so it never
+    /// kills background work. The caller must have settled those first; the
+    /// runtime keeps waiting for them if any remain.
+    ForceRetire { reason: RestartReason },
     /// Cooperatively cancel the running turn (graceful; resumable).
     CancelCurrentTurn { session_id: SessionId },
     /// Escalate a cancel the user has already requested once.
@@ -516,6 +525,7 @@ impl ClientCommand {
             // Retiring the runtime is a process-lifecycle request: it belongs
             // to no session, and it must not be attributed to one.
             | ClientCommand::ShutdownWhenIdle { .. }
+            | ClientCommand::ForceRetire { .. }
             | ClientCommand::Quit => None,
         }
     }

@@ -2058,8 +2058,9 @@ impl InProcessRuntimeClient {
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
-                let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                let mut bridge = EventBridge::new(events.clone())
+                    .with_progress(active.clone(), session_id.clone())
+                    .with_terminal_publisher(move |event| {
                         terminal_active.finish_with(&terminal_admission, || {
                             let _ = terminal_events.send(event);
                         });
@@ -2315,8 +2316,9 @@ impl InProcessRuntimeClient {
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
-                let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                let mut bridge = EventBridge::new(events.clone())
+                    .with_progress(active.clone(), session_id.clone())
+                    .with_terminal_publisher(move |event| {
                         terminal_active.finish_with(&terminal_admission, || {
                             let _ = terminal_events.send(event);
                         });
@@ -2400,8 +2402,9 @@ impl InProcessRuntimeClient {
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
-                let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                let mut bridge = EventBridge::new(events.clone())
+                    .with_progress(active.clone(), session_id.clone())
+                    .with_terminal_publisher(move |event| {
                         terminal_active.finish_with(&terminal_admission, || {
                             let _ = terminal_events.send(event);
                         });
@@ -3093,8 +3096,9 @@ impl InProcessRuntimeClient {
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
-                let mut bridge =
-                    EventBridge::new(events.clone()).with_terminal_publisher(move |event| {
+                let mut bridge = EventBridge::new(events.clone())
+                    .with_progress(active.clone(), session_id.clone())
+                    .with_terminal_publisher(move |event| {
                         terminal_active.finish_with(&terminal_admission, || {
                             let _ = terminal_events.send(event);
                         });
@@ -4380,26 +4384,31 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
                 tracing::info!(?reason, "runtime retiring once work drains");
-                if let Some(token) = self.process_shutdown.clone() {
-                    let active = self.active.clone();
-                    let background = self.app.background_tasks().clone();
-                    tokio::spawn(async move {
-                        // Idle means nothing is still owed: no turn running and
-                        // no background task alive. A turn ending is not
-                        // enough — a background build outliving its turn is
-                        // exactly the work a replacement would destroy. The
-                        // SAME reading `runtime_info` reports, so a client that
-                        // keeps asking sees the drain reach zero.
-                        loop {
-                            if runtime_quiescence(&active, &background).await.quiescent() {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                        tracing::info!("runtime idle; retiring");
-                        token.cancel();
-                    });
-                }
+                spawn_retire_drain(self);
+                Ok(())
+            }
+            ClientCommand::ForceRetire { reason } => {
+                // The explicit escape from a drain that cannot finish. Same
+                // commit point as `ShutdownWhenIdle` — stop admitting work and
+                // arm the drain — plus cancelling the turns this runtime owns
+                // so they reach a terminal now.
+                //
+                // Background work is deliberately NOT cancelled: it is a
+                // user-launched process a handover must not destroy. If any is
+                // alive the drain still waits for it, so a force-retire can
+                // never silently kill `cargo build` or a dev server.
+                self.shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                *self
+                    .retiring_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+                tracing::info!(
+                    ?reason,
+                    "runtime force-retiring; cancelling its own active turns"
+                );
+                self.active.cancel_all();
+                spawn_force_retire_drain(self);
                 Ok(())
             }
             ClientCommand::Quit => {
@@ -4815,6 +4824,54 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
     }
 }
 
+/// Arm the process-retire drain: once nothing is still owed, end the process.
+/// Shared by `ShutdownWhenIdle` and `ForceRetire`, so both reach the same
+/// quiescence reading the client waits on.
+fn spawn_retire_drain(runtime: &InProcessRuntimeClient) {
+    let Some(token) = runtime.process_shutdown.clone() else {
+        return;
+    };
+    let active = runtime.active.clone();
+    let background = runtime.app.background_tasks().clone();
+    tokio::spawn(async move {
+        // Idle means nothing is still owed: no turn running and no background
+        // task alive. A turn ending is not enough — a background build
+        // outliving its turn is exactly the work a replacement would destroy.
+        // The SAME reading `runtime_info` reports, so a client that keeps
+        // asking sees the drain reach zero.
+        loop {
+            if runtime_quiescence(&active, &background).await.quiescent() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        tracing::info!("runtime idle; retiring");
+        token.cancel();
+    });
+}
+
+/// Arm the FORCE-retire drain.
+///
+/// Unlike [`spawn_retire_drain`], this does NOT wait for main turns to reach a
+/// terminal: the user has decided a turn that will never terminate must not
+/// block the update. It DOES still wait for background work — a handover must
+/// never silently destroy a user-launched process. The replacement generation
+/// reconciles the persisted `running` turn left behind (the existing
+/// ended-boot reaper), so nothing is lost that a clean exit would have kept.
+fn spawn_force_retire_drain(runtime: &InProcessRuntimeClient) {
+    let Some(token) = runtime.process_shutdown.clone() else {
+        return;
+    };
+    let background = runtime.app.background_tasks().clone();
+    tokio::spawn(async move {
+        while background.alive_count().await > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        tracing::info!("background work settled; force-retiring");
+        token.cancel();
+    });
+}
+
 #[async_trait]
 impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
     /// Re-assert the effective approval policy for an existing session
@@ -4927,6 +4984,20 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 log_tail: background_log_tail(&task.log),
             })
             .collect();
+        // Name the main turns behind the count the same way, with the facts a
+        // handover needs: which session, how long it has run, and how long
+        // since it last did anything observable. Facts only — no session is
+        // ever marked dead or cancelled from here.
+        let turn_blockers = self
+            .active
+            .snapshots()
+            .into_iter()
+            .map(|turn| leveler_client_protocol::UiTurnBlocker {
+                session_id: turn.session_id,
+                elapsed_ms: turn.elapsed_ms,
+                idle_ms: turn.idle_ms,
+            })
+            .collect();
         Ok(leveler_client_protocol::RuntimeInfo {
             runtime_id,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -4946,6 +5017,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 shutting_down,
                 retiring_reason,
                 blockers,
+                turn_blockers,
             },
         })
     }

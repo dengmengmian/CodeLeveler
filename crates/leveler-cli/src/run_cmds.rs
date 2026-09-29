@@ -449,33 +449,76 @@ fn retiring_status_lang(
         lang.pick("后台任务", "background tasks"),
         health.active_background_tasks,
     );
-    if health.quiescent() || health.blockers.is_empty() {
+    if health.quiescent() || (health.turn_blockers.is_empty() && health.blockers.is_empty()) {
         return text;
     }
-    text.push_str(&format!(
-        "\n\n  {}",
-        lang.pick(
-            "旧版本 CodeLeveler 仍有任务正在执行：",
-            "The previous CodeLeveler version still has running tasks:",
-        )
-    ));
-    for blocker in &health.blockers {
+    // Main turns first: they are what a stale handover is usually stuck on.
+    if !health.turn_blockers.is_empty() {
         text.push_str(&format!(
-            "\n    {}  {}  {}",
-            blocker.task_id,
-            blocker_command_line(&blocker.program, &blocker.args),
-            format_task_age(blocker.elapsed_ms),
+            "\n\n  {}",
+            lang.pick(
+                "旧版本 CodeLeveler 仍有任务正在执行：",
+                "The previous CodeLeveler version still has running tasks:",
+            )
+        ));
+        for blocker in &health.turn_blockers {
+            text.push_str(&format!(
+                "\n    {} {}",
+                lang.pick("会话", "session"),
+                blocker.session_id.as_str(),
+            ));
+            text.push_str(&format!(
+                "\n      {} {} · {} {}{} · {}",
+                lang.pick("已运行", "elapsed"),
+                format_task_age(blocker.elapsed_ms),
+                lang.pick("最后活动", "last activity"),
+                format_task_age(blocker.idle_ms),
+                lang.pick("前", " ago"),
+                turn_status_label(blocker, lang),
+            ));
+        }
+    }
+    if !health.blockers.is_empty() {
+        text.push_str(&format!(
+            "\n\n  {}",
+            lang.pick(
+                "旧版本 CodeLeveler 仍有后台任务在运行：",
+                "The previous CodeLeveler version still has background tasks:",
+            )
+        ));
+        for blocker in &health.blockers {
+            text.push_str(&format!(
+                "\n    {}  {}  {}",
+                blocker.task_id,
+                blocker_command_line(&blocker.program, &blocker.args),
+                format_task_age(blocker.elapsed_ms),
+            ));
+        }
+        text.push_str(&format!(
+            "\n\n  {} leveler background logs <task_id>",
+            lang.pick("查看：", "Inspect:")
+        ));
+        text.push_str(&format!(
+            "\n  {}    leveler background stop <task_id>",
+            lang.pick("停止：", "Stop:   ")
         ));
     }
-    text.push_str(&format!(
-        "\n\n  {} leveler background logs <task_id>",
-        lang.pick("查看：", "Inspect:")
-    ));
-    text.push_str(&format!(
-        "\n  {}    leveler background stop <task_id>",
-        lang.pick("停止：", "Stop:   ")
-    ));
     text
+}
+
+/// Describe a turn's progress for the handover line. "no observable progress"
+/// is a HINT computed from idle time alone — never "dead", never a verdict, and
+/// it never triggers an action by itself.
+#[cfg(unix)]
+fn turn_status_label(
+    blocker: &leveler_client_protocol::UiTurnBlocker,
+    lang: HandoffLang,
+) -> &'static str {
+    if blocker.suspected_stalled_after(leveler_client_protocol::STALE_TURN_WARN_AFTER) {
+        lang.pick("长时间没有可观测进展", "no observable progress")
+    } else {
+        lang.pick("正在执行", "running")
+    }
 }
 
 /// A stable identity for the handoff state, used only to decide whether to
@@ -483,8 +526,20 @@ fn retiring_status_lang(
 /// task's age), so a long wait prints once, not every interval.
 #[cfg(unix)]
 fn handoff_key(health: &leveler_client_protocol::RuntimeHealth) -> String {
+    let turns = health
+        .turn_blockers
+        .iter()
+        .map(|blocker| {
+            format!(
+                "{}:{}",
+                blocker.session_id.as_str(),
+                blocker.suspected_stalled_after(leveler_client_protocol::STALE_TURN_WARN_AFTER)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         health.active_turns,
         health.active_background_tasks,
         health.quiescent(),
@@ -493,7 +548,8 @@ fn handoff_key(health: &leveler_client_protocol::RuntimeHealth) -> String {
             .iter()
             .map(|blocker| blocker.task_id.as_str())
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        turns,
     )
 }
 
@@ -529,13 +585,206 @@ pub(crate) fn format_task_age(elapsed_ms: u64) -> String {
     }
 }
 
+/// How long a cooperative interrupt may take to settle before the wait offers
+/// the explicit force escape. Starts only AFTER the user has asked to
+/// interrupt — it is not a handover timeout.
+#[cfg(unix)]
+const HANDOVER_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// What the user asked the handover to do, read from the terminal.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoverInput {
+    /// Cooperatively cancel the turns that show no observable progress.
+    Interrupt,
+    /// End the old runtime now (only when no background work is at risk).
+    Force,
+}
+
+/// Decide what a raw terminal line means. Anything unrecognized is ignored,
+/// never guessed: a stray keystroke must not interrupt or force anything.
+#[cfg(unix)]
+fn parse_handover_input(line: &str) -> Option<HandoverInput> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "i" | "interrupt" => Some(HandoverInput::Interrupt),
+        "f" | "force" => Some(HandoverInput::Force),
+        _ => None,
+    }
+}
+
+/// Reads handover commands from the terminal, when there is one. In a
+/// non-interactive process (piped stdin, CI, a test) this returns `None`, so
+/// the wait never blocks on input and never forces.
+#[cfg(unix)]
+fn spawn_handover_input() -> Option<tokio::sync::mpsc::UnboundedReceiver<HandoverInput>> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if let Some(action) = parse_handover_input(&line)
+                && tx.send(action).is_err()
+            {
+                break;
+            }
+        }
+    });
+    Some(rx)
+}
+
+/// The sessions whose turns show no observable progress past the product
+/// threshold. The one place "stalled" is decided, so the status text, the
+/// recovery prompt and every test agree.
+#[cfg(unix)]
+fn stalled_turn_sessions(
+    health: &leveler_client_protocol::RuntimeHealth,
+) -> Vec<leveler_core::SessionId> {
+    health
+        .turn_blockers
+        .iter()
+        .filter(|blocker| {
+            blocker.suspected_stalled_after(leveler_client_protocol::STALE_TURN_WARN_AFTER)
+        })
+        .map(|blocker| blocker.session_id.clone())
+        .collect()
+}
+
+/// Whether the explicit force escape may run. Background work is a
+/// user-launched process a handover must never silently destroy, so a force is
+/// offered only when there is none; otherwise the user settles it first via
+/// the existing `leveler background stop` path.
+#[cfg(unix)]
+fn force_handover_allowed(health: &leveler_client_protocol::RuntimeHealth) -> bool {
+    health.active_background_tasks == 0
+}
+
+/// Send the cooperative interrupt for every stalled turn. Nothing is forced:
+/// the runtime cancels gracefully and the wait observes whether it settled.
+#[cfg(unix)]
+async fn request_turn_interrupts(
+    client: &LocalSocketRuntimeClient,
+    sessions: &[leveler_core::SessionId],
+) -> usize {
+    let mut sent = 0;
+    for session_id in sessions {
+        if client
+            .send(leveler_client_protocol::ClientCommand::CancelCurrentTurn {
+                session_id: session_id.clone(),
+            })
+            .await
+            .is_ok()
+        {
+            sent += 1;
+        }
+    }
+    sent
+}
+
+/// Handle one terminal command against the last-known health. Every refusal is
+/// explained to the user rather than silently dropped.
+#[cfg(unix)]
+async fn apply_handover_input(
+    client: &LocalSocketRuntimeClient,
+    input: HandoverInput,
+    health: Option<&leveler_client_protocol::RuntimeHealth>,
+    lang: HandoffLang,
+    grace: Duration,
+    grace_deadline: &mut Option<tokio::time::Instant>,
+) {
+    let Some(health) = health else {
+        eprintln!(
+            "  {}",
+            lang.pick(
+                "暂时读不到旧版本状态，无法执行该操作。",
+                "The previous version's state cannot be read yet; that action is unavailable.",
+            )
+        );
+        return;
+    };
+    match input {
+        HandoverInput::Interrupt => {
+            let stalled = stalled_turn_sessions(health);
+            if stalled.is_empty() {
+                eprintln!(
+                    "  {}",
+                    lang.pick(
+                        "当前没有检测到长时间无进展的任务。",
+                        "No task is currently showing a lack of progress.",
+                    )
+                );
+                return;
+            }
+            if request_turn_interrupts(client, &stalled).await > 0 {
+                *grace_deadline = Some(tokio::time::Instant::now() + grace);
+                eprintln!(
+                    "  {}",
+                    lang.pick(
+                        "已请求中断，等待旧版本正常收尾…",
+                        "Interrupt requested; waiting for the previous version to settle…",
+                    )
+                );
+            } else {
+                eprintln!(
+                    "  {}",
+                    lang.pick(
+                        "中断请求未送达旧版本。",
+                        "The interrupt request could not reach the previous version.",
+                    )
+                );
+            }
+        }
+        HandoverInput::Force => {
+            if !force_handover_allowed(health) {
+                eprintln!(
+                    "  {}",
+                    lang.pick(
+                        "仍有后台任务在运行，不能强制切换；请先按上面的提示停止它们。",
+                        "Background tasks are still running; force handover is unavailable. Stop them first, as shown above.",
+                    )
+                );
+                return;
+            }
+            match client
+                .send(leveler_client_protocol::ClientCommand::ForceRetire {
+                    reason: leveler_client_protocol::RestartReason::BuildMismatch,
+                })
+                .await
+            {
+                Ok(()) => eprintln!(
+                    "  {}",
+                    lang.pick(
+                        "已强制结束旧版本，正在切换…",
+                        "Force-ending the previous version; switching…",
+                    )
+                ),
+                Err(error) => eprintln!(
+                    "  {}{error}",
+                    lang.pick("强制切换失败：", "Force handover failed: ")
+                ),
+            }
+        }
+    }
+}
+
 /// Observe a retiring runtime until it is gone and replaced (or simply gone).
 ///
-/// There is NO deadline here on purpose. The former 10s bail turned "the old
-/// runtime is still working" into "the new TUI cannot start", which is the
-/// deadlock this closes. A generation handover waits for the old runtime's own
-/// drain: it never interrupts the work, never kills the process, and never
-/// starts a second daemon for the same repository.
+/// There is NO deadline on the WAIT itself on purpose: the former 10s bail
+/// turned "the old runtime is still working" into "the new TUI cannot start".
+/// A generation handover waits for the old runtime's own drain, never
+/// interrupts a healthy turn, and never starts a second daemon for the same
+/// repository.
+///
+/// What it adds is an ESCAPE for a drain that cannot finish. A turn that shows
+/// no observable progress runs for a human to see, and — only in an interactive
+/// terminal — the user may cooperatively interrupt it, and, if that does not
+/// settle within the cancel grace, explicitly force the handover. A
+/// non-interactive process only ever waits.
 ///
 /// `observed_pid` is the retiring runtime's pid. It is how the wait tells
 /// "still draining" from "already replaced": a concurrent client's reviver
@@ -552,45 +801,78 @@ async fn observe_retiring_runtime(
     observed_pid: Option<u32>,
     interval: Duration,
 ) {
+    observe_retiring_runtime_with_grace(
+        client,
+        socket_path,
+        observed_pid,
+        interval,
+        HANDOVER_CANCEL_GRACE,
+    )
+    .await;
+}
+
+/// [`observe_retiring_runtime`] with an injectable cancel grace, so a test can
+/// exercise the recovery path without waiting out the product constant.
+#[cfg(unix)]
+async fn observe_retiring_runtime_with_grace(
+    client: &LocalSocketRuntimeClient,
+    socket_path: &Path,
+    observed_pid: Option<u32>,
+    interval: Duration,
+    grace: Duration,
+) {
     let mut last = String::new();
+    // Spawned lazily: a healthy handover never starts a stdin reader, so the
+    // common path cannot steal a keystroke from the TUI that follows.
+    let mut input: Option<tokio::sync::mpsc::UnboundedReceiver<HandoverInput>> = None;
+    let mut grace_deadline: Option<tokio::time::Instant> = None;
+    let mut force_hint_shown = false;
     loop {
-        let (key, status) = match leveler_local_transport::LocalRuntimeService::runtime_info(client)
-            .await
-        {
-            Ok(info) => {
-                if observed_pid.is_some_and(|pid| info.pid != pid) {
-                    // A replacement runtime is already serving this socket:
-                    // the old generation is gone and the handover is done.
-                    return;
+        let (key, status, health) =
+            match leveler_local_transport::LocalRuntimeService::runtime_info(client).await {
+                Ok(info) => {
+                    if observed_pid.is_some_and(|pid| info.pid != pid) {
+                        // A replacement runtime is already serving this socket:
+                        // the old generation is gone and the handover is done.
+                        return;
+                    }
+                    // Dedupe on what actually changed — counts, phase, blocker
+                    // identity, and whether a turn crossed the no-progress
+                    // threshold — never on the rendered age: a running task's age
+                    // grows every poll, and reprinting the whole block every few
+                    // seconds is noise, not news.
+                    (
+                        handoff_key(&info.health),
+                        retiring_status(&info.health),
+                        Some(info.health),
+                    )
                 }
-                // Dedupe on what actually changed — counts, phase, and the
-                // blocker identity — never on the rendered age: a running
-                // task's age grows every poll, and reprinting the whole block
-                // every few seconds is noise, not news.
-                (handoff_key(&info.health), retiring_status(&info.health))
-            }
-            Err(_) => {
-                if tokio::net::UnixStream::connect(socket_path).await.is_err() {
-                    // The request path failed AND the socket no longer answers:
-                    // the previous runtime has released it. Handover complete.
-                    return;
-                }
-                // Still alive but not answering the handshake (an older
-                // generation): say so once, then keep waiting rather than
-                // failing the startup on a runtime we cannot read.
-                let lang = HandoffLang::current();
-                let status = lang
+                Err(_) => {
+                    if tokio::net::UnixStream::connect(socket_path).await.is_err() {
+                        // The request path failed AND the socket no longer answers:
+                        // the previous runtime has released it. Handover complete.
+                        return;
+                    }
+                    // Still alive but not answering the handshake (an older
+                    // generation): say so once, then keep waiting rather than
+                    // failing the startup on a runtime we cannot read.
+                    let lang = HandoffLang::current();
+                    let status = lang
                     .pick(
                         "旧版本 CodeLeveler 未响应握手，暂时无法读取其状态。",
                         "The previous CodeLeveler version does not answer the handshake; its state cannot be read yet.",
                     )
                     .to_string();
-                (status.clone(), status)
-            }
-        };
+                    (status.clone(), status, None)
+                }
+            };
         if key != last {
             let lang = HandoffLang::current();
-            eprintln!(
+            let stalled = health
+                .as_ref()
+                .map(|health| stalled_turn_sessions(health).len())
+                .unwrap_or(0);
+            let mut message = format!(
                 "{}\n  {status}\n  {}",
                 lang.pick("版本更新等待中", "Version update pending"),
                 lang.pick(
@@ -598,9 +880,74 @@ async fn observe_retiring_runtime(
                     "Existing work will not be interrupted; the current version will take over automatically.",
                 ),
             );
+            if stalled > 0 {
+                message.push_str(&format!(
+                    "\n  {}",
+                    lang.pick(
+                        "检测到长时间无进展的任务：输入 i 尝试中断，或继续等待。",
+                        "A task shows no progress: type i to interrupt it, or keep waiting.",
+                    )
+                ));
+            }
+            eprintln!("{message}");
             last = key;
         }
-        tokio::time::sleep(interval).await;
+        // The cooperative grace expired with the turn still there: the
+        // graceful path did not settle, so OFFER (never take) the force escape.
+        if let Some(deadline) = grace_deadline
+            && tokio::time::Instant::now() >= deadline
+        {
+            let still_stalled = health
+                .as_ref()
+                .is_some_and(|health| !stalled_turn_sessions(health).is_empty());
+            if !still_stalled {
+                grace_deadline = None;
+            } else if !force_hint_shown {
+                let lang = HandoffLang::current();
+                eprintln!(
+                    "  {}",
+                    lang.pick(
+                        "中断未生效：输入 f 强制结束旧版本并继续切换。",
+                        "The interrupt did not settle: type f to force-end the previous version and continue.",
+                    )
+                );
+                force_hint_shown = true;
+            }
+        }
+        match input.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    biased;
+                    message = rx.recv() => match message {
+                        Some(input) => {
+                            let lang = HandoffLang::current();
+                            apply_handover_input(
+                                client,
+                                input,
+                                health.as_ref(),
+                                lang,
+                                grace,
+                                &mut grace_deadline,
+                            )
+                            .await;
+                        }
+                        None => input = None,
+                    },
+                    _ = tokio::time::sleep(interval) => {}
+                }
+            }
+            None => {
+                // Recovery is only offered once there is something to recover
+                // from; until then the wait is a plain safe wait.
+                if health
+                    .as_ref()
+                    .is_some_and(|health| !stalled_turn_sessions(health).is_empty())
+                {
+                    input = spawn_handover_input();
+                }
+                tokio::time::sleep(interval).await;
+            }
+        }
     }
 }
 
@@ -3182,7 +3529,7 @@ mod handoff_status_tests {
         let text = retiring_status_lang(&health, HandoffLang::En);
         assert!(text.contains("finishing existing work"), "{text}");
         assert!(
-            text.contains("previous CodeLeveler version still has running tasks"),
+            text.contains("previous CodeLeveler version still has background tasks"),
             "{text}"
         );
         assert!(text.contains("bg-1"), "{text}");
@@ -3258,5 +3605,146 @@ mod handoff_key_tests {
         };
         let none = RuntimeHealth::default();
         assert_ne!(handoff_key(&a), handoff_key(&none));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod handover_recovery_tests {
+    use super::*;
+    use leveler_client_protocol::{RuntimeHealth, UiTurnBlocker};
+
+    fn turn(session: &str, elapsed_ms: u64, idle_ms: u64) -> UiTurnBlocker {
+        UiTurnBlocker {
+            session_id: leveler_core::SessionId::new(session),
+            elapsed_ms,
+            idle_ms,
+        }
+    }
+
+    fn stale_ms() -> u64 {
+        leveler_client_protocol::STALE_TURN_WARN_AFTER.as_millis() as u64
+    }
+
+    /// A) A turn that keeps making observable progress is never labelled
+    /// stalled, however long it has run: only idle time counts.
+    #[test]
+    fn a_long_but_active_turn_is_not_stalled() {
+        let health = RuntimeHealth {
+            active_turns: 1,
+            turn_blockers: vec![turn("s1", 4 * 60 * 60 * 1_000, 1_000)],
+            ..Default::default()
+        };
+        assert!(stalled_turn_sessions(&health).is_empty());
+        assert_eq!(
+            turn_status_label(&health.turn_blockers[0], HandoffLang::En),
+            "running"
+        );
+    }
+
+    /// B) Crossing the no-progress threshold changes the description only —
+    /// and nothing acts on its own. Silence is not an interrupt request.
+    #[test]
+    fn a_quiet_turn_is_described_but_not_acted_on() {
+        let health = RuntimeHealth {
+            active_turns: 1,
+            turn_blockers: vec![turn("s1", 6 * 24 * 3_600_000, stale_ms() + 1)],
+            ..Default::default()
+        };
+        assert_eq!(stalled_turn_sessions(&health).len(), 1);
+        assert_eq!(
+            turn_status_label(&health.turn_blockers[0], HandoffLang::En),
+            "no observable progress"
+        );
+        // No implicit action: only an explicit key ever interrupts or forces.
+        for line in ["", " ", "\n", "y", "yes", "kill", "stop"] {
+            assert_eq!(parse_handover_input(line), None, "{line:?}");
+        }
+    }
+
+    /// The recovery keys are explicit and case-insensitive; nothing else is
+    /// accepted, so a stray keystroke cannot discard work.
+    #[test]
+    fn only_explicit_keys_interrupt_or_force() {
+        for line in ["i", "I", "interrupt", " Interrupt "] {
+            assert_eq!(parse_handover_input(line), Some(HandoverInput::Interrupt));
+        }
+        for line in ["f", "F", "force", " Force "] {
+            assert_eq!(parse_handover_input(line), Some(HandoverInput::Force));
+        }
+        assert_eq!(parse_handover_input("w"), None);
+        assert_eq!(parse_handover_input("wait"), None);
+    }
+
+    /// H) Force is refused while real background work would be destroyed; it
+    /// becomes available only once the user has settled it.
+    #[test]
+    fn force_is_refused_while_background_work_runs() {
+        let busy = RuntimeHealth {
+            active_turns: 1,
+            active_background_tasks: 1,
+            ..Default::default()
+        };
+        assert!(!force_handover_allowed(&busy));
+
+        let settled = RuntimeHealth {
+            active_turns: 1,
+            active_background_tasks: 0,
+            ..Default::default()
+        };
+        assert!(force_handover_allowed(&settled));
+    }
+
+    /// The key restates once when a turn crosses the threshold, but not on
+    /// every poll as its age grows within the same state.
+    #[test]
+    fn the_key_restates_only_when_the_stall_flag_changes() {
+        let below = RuntimeHealth {
+            active_turns: 1,
+            turn_blockers: vec![turn("s1", 10_000, stale_ms() - 1)],
+            ..Default::default()
+        };
+        let at = RuntimeHealth {
+            active_turns: 1,
+            turn_blockers: vec![turn("s1", 20_000, stale_ms() + 1)],
+            ..Default::default()
+        };
+        assert_ne!(handoff_key(&below), handoff_key(&at));
+
+        let later = RuntimeHealth {
+            active_turns: 1,
+            turn_blockers: vec![turn("s1", 90_000, stale_ms() + 60_000)],
+            ..Default::default()
+        };
+        assert_eq!(handoff_key(&at), handoff_key(&later));
+    }
+
+    /// The handover line names the session, its age, its last activity, and
+    /// whether it shows progress — no pid, generation or fingerprint.
+    #[test]
+    fn the_turn_blocker_line_is_specific_and_leaks_nothing_internal() {
+        let health = RuntimeHealth {
+            active_turns: 1,
+            turn_blockers: vec![turn("sess-42", 90_061_000, stale_ms() + 1)],
+            ..Default::default()
+        };
+        let en = retiring_status_lang(&health, HandoffLang::En);
+        assert!(en.contains("sess-42"), "{en}");
+        assert!(en.contains("elapsed"), "{en}");
+        assert!(en.contains("1d 01h"), "{en}");
+        assert!(en.contains("no observable progress"), "{en}");
+        assert!(!en.contains("pgid"), "{en}");
+        assert!(!en.contains("fingerprint"), "{en}");
+        assert!(!en.contains("generation"), "{en}");
+    }
+
+    /// A live turn without stalls adds no recovery prompt to the wait.
+    #[test]
+    fn a_healthy_handover_offers_no_recovery_prompt() {
+        let health = RuntimeHealth {
+            active_turns: 1,
+            turn_blockers: vec![turn("s1", 5_000, 1_000)],
+            ..Default::default()
+        };
+        assert!(stalled_turn_sessions(&health).is_empty());
     }
 }

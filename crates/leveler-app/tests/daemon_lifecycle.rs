@@ -1330,3 +1330,119 @@ async fn explicit_quit_does_not_trigger_idle_eviction() {
     drop(client);
     h.shutdown().await;
 }
+
+/// A live main turn is a NAMED handover blocker, not just a count: the wait can
+/// show which session, how long it has run, and how long since it last did
+/// anything observable.
+#[tokio::test]
+async fn retiring_health_names_the_running_turn_as_a_blocker() {
+    let (base_url, model_stop) = hold_open_model_endpoint().await;
+    let h = harness(&base_url).await;
+    let bootstrap = h
+        .runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "name the blocker".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let session = bootstrap.session.id.clone();
+    h.runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "work forever".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert_turn_running(&h.runtime, &session).await;
+
+    let health = h.runtime.runtime_info().await.unwrap().health;
+    assert!(health.active_turns >= 1, "{health:?}");
+    let blocker = health
+        .turn_blockers
+        .iter()
+        .find(|blocker| blocker.session_id == session)
+        .expect("the running turn is named, not just counted");
+    // Freshly admitted: it has an age, has had observable activity, and is NOT
+    // called stalled — the count is now a fact with a clock, not a verdict.
+    assert!(
+        !blocker.suspected_stalled_after(leveler_client_protocol::STALE_TURN_WARN_AFTER),
+        "{blocker:?}"
+    );
+
+    model_stop.cancel();
+}
+
+/// A plain retirement waits for a live turn; the explicit force escape ends it
+/// even though the turn will never reach a terminal on its own. Background work
+/// is the only thing a force still waits for.
+#[tokio::test]
+async fn force_retire_ends_a_turn_that_plain_retirement_waits_for() {
+    let (base_url, model_stop) = hold_open_model_endpoint().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &base_url);
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let token = CancellationToken::new();
+    let runtime = Arc::new(
+        InProcessRuntimeClient::new(
+            app,
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+        .with_process_shutdown(token.clone()),
+    );
+
+    let bootstrap = runtime
+        .create_session(CreateSessionRequest {
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "never finishes".to_string(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+        })
+        .await
+        .unwrap();
+    let session = bootstrap.session.id.clone();
+    runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "work forever".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert_turn_running(&runtime, &session).await;
+
+    runtime
+        .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle {
+            reason: leveler_client_protocol::RestartReason::BuildMismatch,
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), token.cancelled())
+            .await
+            .is_err(),
+        "a plain retirement must wait for the turn it already owns"
+    );
+
+    runtime
+        .send(leveler_client_protocol::ClientCommand::ForceRetire {
+            reason: leveler_client_protocol::RestartReason::BuildMismatch,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+        .await
+        .expect("force retirement must end a turn that cannot terminate on its own");
+
+    model_stop.cancel();
+}

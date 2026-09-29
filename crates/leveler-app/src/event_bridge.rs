@@ -309,6 +309,15 @@ pub struct EventBridge {
     /// The host publishes the durable terminal while holding its admission
     /// lock, then releases that admission before consumers can observe it.
     terminal_publisher: Option<Box<dyn FnOnce(RuntimeEvent) + Send>>,
+    /// The runtime's active-turn table plus this stream's session: every
+    /// forwarded event stamps observable activity on the running turn. One
+    /// instrumentation point for every engine event rather than one per call
+    /// site, and it can only ever DESCRIBE activity — it never cancels or
+    /// authorizes anything.
+    progress: Option<(
+        std::sync::Arc<crate::active_turns::ActiveTurns>,
+        leveler_core::SessionId,
+    )>,
 }
 
 /// The wire spelling of the runtime's four-way child reading.
@@ -428,7 +437,19 @@ impl EventBridge {
             child_roles: HashMap::new(),
             terminal_published: false,
             terminal_publisher: None,
+            progress: None,
         }
+    }
+
+    /// Stamp observable activity on the turn behind this stream for every
+    /// forwarded event. A no-op once the turn has left the active table.
+    pub(crate) fn with_progress(
+        mut self,
+        active: std::sync::Arc<crate::active_turns::ActiveTurns>,
+        session_id: leveler_core::SessionId,
+    ) -> Self {
+        self.progress = Some((active, session_id));
+        self
     }
 
     pub fn with_terminal_publisher(
@@ -448,6 +469,9 @@ impl EventBridge {
         // epoch may project after it and race a newly admitted turn.
         if self.terminal_published {
             return;
+        }
+        if let Some((active, session_id)) = &self.progress {
+            active.touch(session_id);
         }
         match event {
             EngineEvent::FinalizationStarted { .. } => {

@@ -259,6 +259,25 @@
       }
     },
     {
+      "description": "End this runtime NOW for a generation handover, cancelling the main turns it still owns instead of waiting for them to reach a terminal.\n\nThe explicit, user-chosen escape from a handover whose drain cannot finish — a turn that will never terminate on its own. Distinct from `Quit`: this is a version handover, not a user shutdown, so it never kills background work. The caller must have settled those first; the runtime keeps waiting for them if any remain.",
+      "type": "object",
+      "required": [
+        "reason",
+        "type"
+      ],
+      "properties": {
+        "reason": {
+          "$ref": "#/definitions/RestartReason"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "force_retire"
+          ]
+        }
+      }
+    },
+    {
       "description": "Cooperatively cancel the running turn (graceful; resumable).",
       "type": "object",
       "required": [

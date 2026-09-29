@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use leveler_core::SessionId;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +48,22 @@ struct ActiveTurn {
     generation: u64,
     cancellation: CancellationToken,
     task_cancel: Arc<AtomicBool>,
+    /// When the turn was admitted. Turns the count into an age a handover
+    /// wait can show instead of a bare `1`.
+    started_at: Instant,
+    /// Last observable activity signal for this turn. Advanced by
+    /// [`ActiveTurns::touch`], never inferred from model identity, task
+    /// complexity, or log growth — a turn that is genuinely working keeps
+    /// touching this, and one that never reaches its terminal does not.
+    last_activity_at: Instant,
+}
+
+/// A read-only view of one active turn, copied out without holding the map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveTurnSnapshot {
+    pub(crate) session_id: SessionId,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) idle_ms: u64,
 }
 
 pub(crate) struct ActiveTurns {
@@ -105,12 +122,15 @@ impl ActiveTurns {
         let token = CancellationToken::new();
         let task_cancel = Arc::new(AtomicBool::new(false));
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = Instant::now();
         active.insert(
             session_id.clone(),
             ActiveTurn {
                 generation,
                 cancellation: token.clone(),
                 task_cancel: task_cancel.clone(),
+                started_at: now,
+                last_activity_at: now,
             },
         );
         Ok(TurnLease {
@@ -130,6 +150,41 @@ impl ActiveTurns {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(session_id)
+    }
+
+    /// Record observable progress for a running turn. A no-op when the session
+    /// has no active turn, so an event that arrives after terminal publication
+    /// can never resurrect a stale entry or advance a newer turn's clock.
+    pub(crate) fn touch(&self, session_id: &SessionId) {
+        if let Some(turn) = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(session_id)
+        {
+            turn.last_activity_at = Instant::now();
+        }
+    }
+
+    /// Read-only snapshots of every active turn, oldest first — the facts a
+    /// handover wait shows in place of a bare count. Copies out under one lock
+    /// acquisition; callers never see the map itself.
+    pub(crate) fn snapshots(&self) -> Vec<ActiveTurnSnapshot> {
+        let now = Instant::now();
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out: Vec<ActiveTurnSnapshot> = active
+            .iter()
+            .map(|(session_id, turn)| ActiveTurnSnapshot {
+                session_id: session_id.clone(),
+                elapsed_ms: now.duration_since(turn.started_at).as_millis() as u64,
+                idle_ms: now.duration_since(turn.last_activity_at).as_millis() as u64,
+            })
+            .collect();
+        out.sort_by(|a, b| b.elapsed_ms.cmp(&a.elapsed_ms));
+        out
     }
 
     pub(crate) fn cancel(&self, session_id: &SessionId) -> bool {
@@ -304,5 +359,53 @@ mod tests {
         ));
         assert!(turns.cancel(&session));
         assert!(current.cancellation().is_cancelled());
+    }
+
+    /// The snapshot is the fact a handover shows: an age, and how long since
+    /// the turn last did anything observable. It starts at zero idle and
+    /// disappears with the turn.
+    #[test]
+    fn a_snapshot_reports_age_and_idle_and_lives_only_while_the_turn_does() {
+        let turns = ActiveTurns::default();
+        let session = SessionId::new("s1");
+        let lease = turns.admit(&session).unwrap();
+
+        let snapshot = turns.snapshots();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].session_id, session);
+        assert!(snapshot[0].elapsed_ms <= 50, "{:?}", snapshot[0]);
+        assert!(snapshot[0].idle_ms <= 50, "{:?}", snapshot[0]);
+
+        turns.finish(&lease);
+        assert!(turns.snapshots().is_empty());
+    }
+
+    /// `touch` is the only thing that advances the activity clock, and it can
+    /// never resurrect a turn that has already finished.
+    #[test]
+    fn touch_advances_the_activity_clock_within_a_live_turn_only() {
+        let turns = ActiveTurns::default();
+        let session = SessionId::new("s1");
+        let lease = turns.admit(&session).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let idle_before = turns.snapshots()[0].idle_ms;
+        assert!(idle_before >= 15, "{idle_before}");
+
+        turns.touch(&session);
+        let after = turns.snapshots();
+        assert!(after[0].idle_ms <= 5, "{:?}", after[0]);
+        assert!(
+            after[0].elapsed_ms > after[0].idle_ms,
+            "elapsed keeps running while idle resets: {:?}",
+            after[0]
+        );
+
+        turns.finish(&lease);
+        turns.touch(&session);
+        assert!(
+            turns.snapshots().is_empty(),
+            "a late event must not resurrect a finished turn"
+        );
     }
 }

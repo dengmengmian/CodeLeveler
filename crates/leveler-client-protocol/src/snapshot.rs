@@ -318,6 +318,44 @@ pub struct RuntimeHealth {
     /// an old client still decodes. Read-only: see [`UiBackgroundTaskBlocker`].
     #[serde(default)]
     pub blockers: Vec<UiBackgroundTaskBlocker>,
+    /// The live MAIN turns behind `active_turns`, oldest first. Empty on an
+    /// idle runtime and on every runtime older than this field; additive so an
+    /// old client still decodes. Read-only: see [`UiTurnBlocker`].
+    #[serde(default)]
+    pub turn_blockers: Vec<UiTurnBlocker>,
+}
+
+/// How long a main turn may show no observable activity before a handover
+/// labels it "no observable progress".
+///
+/// This is a HINT threshold, never a verdict: crossing it changes only how the
+/// blocker is described. Nothing here — and nothing downstream of it — may
+/// auto-cancel, auto-kill, or force-retire a turn. A real long task that keeps
+/// emitting events never reaches it.
+pub const STALE_TURN_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// One main turn still running in a runtime, as observed at answer time.
+///
+/// Facts a handover wait can show: which session, how long the turn has run,
+/// and how long since it last did anything observable. Deliberately carries no
+/// generation id, lock state, or other implementation detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiTurnBlocker {
+    pub session_id: SessionId,
+    /// Runtime-observed age at answer time.
+    pub elapsed_ms: u64,
+    /// Time since the last observable activity signal for this turn.
+    pub idle_ms: u64,
+}
+
+impl UiTurnBlocker {
+    /// Whether this turn has shown no observable activity for at least
+    /// `threshold`. A description, not a decision: the caller (a human, via
+    /// the handover UI) decides whether to interrupt or force-retire.
+    pub fn suspected_stalled_after(&self, threshold: std::time::Duration) -> bool {
+        self.idle_ms >= threshold.as_millis() as u64
+    }
 }
 
 impl RuntimeHealth {

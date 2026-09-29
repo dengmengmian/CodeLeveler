@@ -1830,6 +1830,7 @@ mod tests {
                     shutting_down: false,
                     retiring_reason: None,
                     blockers: Vec::new(),
+                    turn_blockers: Vec::new(),
                 },
             })
         }

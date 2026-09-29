@@ -332,6 +332,15 @@ impl RemotePolicy {
                 reason: "a remote client cannot retire the local runtime",
             },
 
+            // Same class, stronger: this one ends the runtime's own turns
+            // instead of waiting for them. A handover recovery is a local
+            // operator action; a remote client has no licence to discard work
+            // it cannot see.
+            ClientCommand::ForceRetire { .. } => RemoteVerdict::Deny {
+                code: DENIED_COMMAND,
+                reason: "a remote client cannot force-retire the local runtime",
+            },
+
             // Shuts down the runtime for every client, local ones included.
             // The local socket transport refuses it too.
             ClientCommand::Quit => RemoteVerdict::Deny {
