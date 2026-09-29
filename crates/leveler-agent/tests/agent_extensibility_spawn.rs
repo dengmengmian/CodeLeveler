@@ -78,12 +78,20 @@ impl ModelRuntime for Rt {
         request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
-        let blob: String = request
-            .messages
-            .iter()
-            .map(|m| m.text_content())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // The provider-visible text: control blocks (standing instructions,
+        // project rules, agent instructions) are a separate surface from the
+        // conversation transcript, so a test reading only `messages` would miss
+        // them.
+        let mut blob: String = request.control_context.text();
+        blob.push('\n');
+        blob.push_str(
+            &request
+                .messages
+                .iter()
+                .map(|m| m.text_content())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         let child = blob.contains(CHILD);
         let n_child = {
             let seen = self.seen.lock().unwrap();

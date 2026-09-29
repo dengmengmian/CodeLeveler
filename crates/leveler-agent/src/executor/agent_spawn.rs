@@ -147,16 +147,19 @@ impl Executor {
                 ));
             }
         }
+        let brief = render_brief(def, &skills);
+        let mut snapshot = def.snapshot();
+        snapshot.brief = Some(brief.clone());
         Ok(SpawnAdmission {
             profile,
             spec: ChildSpawnSpec {
                 model: def.model.as_ref().map(ToString::to_string),
                 tools: def.tools.clone().unwrap_or_default(),
                 max_rounds: def.max_rounds.unwrap_or(0),
-                agent: Some(Box::new(def.snapshot())),
+                agent: Some(Box::new(snapshot)),
                 ..ChildSpawnSpec::default()
             },
-            brief: Some(render_brief(def, &skills)),
+            brief: Some(brief),
         })
     }
 }

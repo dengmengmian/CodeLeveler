@@ -35,7 +35,7 @@ fn model_yaml(id: &str, vision: bool) -> String {
         "id: {id}\nprovider: mock\nmodel_id: mock-model\nprotocol: openai_chat\n\
          capabilities:\n  streaming: true\n  tool_calling: true\n  \
          parallel_tool_calls: false\n  structured_output: true\n  reasoning: false\n  \
-         vision: {vision}\nlimits:\n  context_window: 8192\n  reliable_context: 4096\n  \
+         vision: {vision}\nlimits:\n  context_window: 131072\n  reliable_context: 65536\n  \
          max_output_tokens: 1024\n  max_tool_schema_bytes: 8192\n  \
          max_parallel_tool_calls: 1\ncompatibility:\n  synthesize_tool_call_ids: true\n  \
          drop_unsupported_fields: true\n"

@@ -26,6 +26,9 @@ impl AgentDefinition {
             skills: self.skills.clone(),
             write_roots: self.write_roots.clone(),
             max_duration_secs: self.max_duration_secs,
+            // The rendered brief is set by the spawn path, which has the bound
+            // skill bodies; `snapshot()` alone cannot build it.
+            brief: None,
         }
     }
 }

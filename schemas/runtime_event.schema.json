@@ -2311,6 +2311,25 @@
         "critical"
       ]
     },
+    "ConversationStateOwnership": {
+      "description": "Who owns the conversation state a provider validates against.\n\nToday every supported route is [`Self::ClientManaged`]: the harness resends the full active history. The vocabulary exists so a future route that keeps the state server-side (`previous_response_id`-style) can say so without the kernel assuming client-owned replay state is an eternal property of models.",
+      "oneOf": [
+        {
+          "description": "The client resends the model-visible history on every request.",
+          "type": "string",
+          "enum": [
+            "client_managed"
+          ]
+        },
+        {
+          "description": "The provider keeps the conversation state; the client sends a cursor. No supported route constructs this yet.",
+          "type": "string",
+          "enum": [
+            "provider_managed"
+          ]
+        }
+      ]
+    },
     "FailureCategory": {
       "description": "What kind of failure this is, in product terms. Vendor error codes are not part of this vocabulary — `Moonshot invalid_request_error`, `OpenAI invalid_request_error` and `Anthropic invalid_request_error` are all just [`FailureCategory::InvalidRequest`] here.",
       "oneOf": [
@@ -2628,6 +2647,27 @@
         }
       }
     },
+    "NativeContextCapabilities": {
+      "description": "Provider-native context management the route exposes.\n\nAll fields are `false` for every route supported today: CodeLeveler owns the active-history lifecycle. They are declared (not derived) so a future route can advertise e.g. server-side reasoning pruning without the harness having to branch on its name — the context policy reads these flags. A flag that no route declares is simply not consulted.",
+      "type": "object",
+      "properties": {
+        "native_compaction": {
+          "description": "The provider performs its own history compaction.",
+          "default": false,
+          "type": "boolean"
+        },
+        "reasoning_pruning": {
+          "description": "The provider can prune historical reasoning server-side.",
+          "default": false,
+          "type": "boolean"
+        },
+        "server_state": {
+          "description": "The provider owns conversation state across requests.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
     "NotificationLevel": {
       "description": "Severity for a transient notification .",
       "type": "string",
@@ -2670,6 +2710,25 @@
         "done",
         "failed",
         "skipped"
+      ]
+    },
+    "ReasoningIntegrity": {
+      "description": "How the route requires retained reasoning to be preserved.\n\nOrthogonal to representation: a route may never carry reasoning, carry it as an editable field, or carry it as an opaque block — and separately it either accepts a harness decision to fold/drop a retained turn, or it does not. This is the dimension the context lifecycle consults when it asks \"may I cut this boundary?\": it never asks \"is this model DeepSeek?\".",
+      "oneOf": [
+        {
+          "description": "The route puts no integrity requirement on reasoning it retains.",
+          "type": "string",
+          "enum": [
+            "unconstrained"
+          ]
+        },
+        {
+          "description": "Every assistant turn still in the active history must replay its captured reasoning verbatim. The harness may not truncate, rewrite or silently omit it while the turn remains; only the context lifecycle may remove the whole turn.",
+          "type": "string",
+          "enum": [
+            "retained_exact"
+          ]
+        }
       ]
     },
     "ReasoningProjectionSummary": {
@@ -2720,23 +2779,66 @@
       }
     },
     "ReasoningReplayContract": {
-      "description": "The resolved reasoning-replay contract for one route.",
+      "description": "The resolved reasoning contract for one route.\n\nFour orthogonal dimensions, none of which is a model or provider name:\n\n* [`Self::representation`] — the form captured reasoning takes on the wire; * [`Self::scope`] / [`Self::missing`] — when it is carried, and what an empty replayed turn carries; * [`Self::integrity`] — whether retained reasoning may be changed; * [`Self::state`] / [`Self::native_context`] — who owns the validated state, and what context management the provider offers.\n\nThe context lifecycle reads this contract to decide whether a cut boundary keeps the protocol valid. A provider never gets a branch of its own.",
       "type": "object",
-      "required": [
-        "missing",
-        "scope"
-      ],
       "properties": {
+        "integrity": {
+          "description": "Whether retained reasoning must be replayed verbatim.",
+          "default": "unconstrained",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningIntegrity"
+            }
+          ]
+        },
         "missing": {
-          "$ref": "#/definitions/MissingReasoningReplay"
+          "description": "What an empty replayed turn carries.",
+          "default": "omit",
+          "allOf": [
+            {
+              "$ref": "#/definitions/MissingReasoningReplay"
+            }
+          ]
+        },
+        "native_context": {
+          "description": "Provider-native context management, if any.",
+          "default": {
+            "native_compaction": false,
+            "reasoning_pruning": false,
+            "server_state": false
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/NativeContextCapabilities"
+            }
+          ]
+        },
+        "representation": {
+          "description": "The form captured reasoning takes when replayed.",
+          "default": "none",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningRepresentation"
+            }
+          ]
         },
         "scope": {
-          "$ref": "#/definitions/ReasoningReplayScope"
+          "description": "When captured reasoning is carried.",
+          "default": "never",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningReplayScope"
+            }
+          ]
         },
-        "signed_blocks": {
-          "description": "Whether authenticated/opaque reasoning blocks are a replay channel.",
-          "default": false,
-          "type": "boolean"
+        "state": {
+          "description": "Who owns the validated conversation state.",
+          "default": "client_managed",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConversationStateOwnership"
+            }
+          ]
         }
       }
     },
@@ -2744,7 +2846,7 @@
       "description": "When captured reasoning is carried back to a provider on historical assistant turns.\n\nThis is a ROUTE fact, not a harness preference: it is resolved from the protocol the route speaks and the route's declared compatibility. A provider that validates the field and a provider that has no field at all both have to be expressible without naming either of them.",
       "oneOf": [
         {
-          "description": "The route has no channel for historical reasoning. Captured reasoning stays in the durable transcript and never reaches this provider.\n\nThis is the default: a route carries nothing until it declares otherwise, so no route inherits another's requirement.",
+          "description": "The route has no channel for historical reasoning. Captured reasoning stays in the durable transcript and never reaches this provider.",
           "type": "string",
           "enum": [
             "never"
@@ -2762,6 +2864,32 @@
           "type": "string",
           "enum": [
             "always"
+          ]
+        }
+      ]
+    },
+    "ReasoningRepresentation": {
+      "description": "The FORM in which a route replays captured reasoning to the provider.\n\nOne orthogonal dimension of [`ReasoningReplayContract`]. It answers \"what does the provider expect this evidence to look like?\", which is a different question from [`ReasoningReplayScope`]'s \"when is it carried?\" and from [`ReasoningIntegrity`]'s \"may we change it?\".",
+      "oneOf": [
+        {
+          "description": "The route has no channel for captured reasoning.\n\nThis is the default: a route carries nothing until it declares otherwise, so no route inherits another's requirement.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "A plain assistant message field the harness itself composes from the captured text (today: an OpenAI-Chat-compatible `reasoning_content`).",
+          "type": "string",
+          "enum": [
+            "raw_assistant_field"
+          ]
+        },
+        {
+          "description": "An authenticated/opaque block the provider issued on the way in and expects back verbatim (today: Messages `thinking` / `redacted_thinking`).",
+          "type": "string",
+          "enum": [
+            "signed_block"
           ]
         }
       ]

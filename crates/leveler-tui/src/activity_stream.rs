@@ -1877,7 +1877,11 @@ fn split_placeholder(template: &str) -> (&str, &str) {
 /// The runtime's tag on a command that failed reaching the network inside a
 /// network-blocked sandbox (`leveler_tools::recoverable::NETWORK_PERMISSION_REQUIRED`).
 /// It opens a note addressed to the model; the row states it in the user's words.
-pub(crate) const NETWORK_PERMISSION_REQUIRED: &str = "[network permission required]";
+///
+/// Kept as a literal (not a re-export) because `leveler-tools` is only a
+/// dev-dependency here; the unit test `the_network_permission_tag_is_the_one_
+/// the_runtime_writes` is what keeps it from drifting again.
+pub(crate) const NETWORK_PERMISSION_REQUIRED: &str = "[execution policy] Network access was denied";
 
 /// Whether this call detached a process instead of running one to completion.
 ///
@@ -4082,9 +4086,9 @@ mod tests {
                 &format!(r#"{{"program":"curl","args":["{url}"]}}"#),
                 ToolStatus::Failed,
             );
-            c.preview = Some(
-                "[network permission required] blocked…\n\nexit: 6\n--- stderr ---\ncurl: (6) Could not resolve host".into(),
-            );
+            c.preview = Some(format!(
+                "{NETWORK_PERMISSION_REQUIRED} blocked…\n\nexit: 6\n--- stderr ---\ncurl: (6) Could not resolve host"
+            ));
             c.exit_code = Some(6);
             c
         };
@@ -4105,7 +4109,7 @@ mod tests {
         assert!(
             !lines
                 .iter()
-                .any(|l| l.contains("[network permission required]")),
+                .any(|l| l.contains(NETWORK_PERMISSION_REQUIRED)),
             "{lines:?}"
         );
     }

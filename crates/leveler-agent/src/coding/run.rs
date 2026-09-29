@@ -1660,6 +1660,14 @@ impl CodingRuntime {
             Some(TranscriptOrigin::UserInput),
         );
         let terminal_cancellation = cancellation.clone();
+        // The pre-request context fold appends its `ContextSnapshot` (or
+        // checkpoint) fact to the log from inside the turn, where the engine's
+        // pump owns the caller's observer. Capture those facts and forward them
+        // to the caller after the turn: they are already durable, and the
+        // caller must still learn that its history was folded.
+        let pre_turn_events: Arc<std::sync::Mutex<Vec<EngineEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&pre_turn_events);
         let result = async {
             let recorded = runner
                 .run_turn(
@@ -1690,7 +1698,7 @@ impl CodingRuntime {
                                     &cancellation,
                                 ),
                                 &cancellation,
-                                &mut |_| {},
+                                &mut |event| captured.lock().unwrap().push(event),
                             )
                             .await
                             .map_err(crate::coding::turn::seed_failure)?;
@@ -1716,6 +1724,9 @@ impl CodingRuntime {
                     },
                 )
                 .await?;
+            for event in std::mem::take(&mut *pre_turn_events.lock().unwrap()) {
+                observer(event);
+            }
             self.conclude_direct(
                 &log,
                 &runner,

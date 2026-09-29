@@ -409,7 +409,17 @@ pub(crate) async fn reconcile_model_spend(
     scope: &str,
 ) -> Result<ProgressLedger, EngineError> {
     if progress.budget_scope.as_deref() != Some(scope) {
-        progress = ProgressLedger::default();
+        // Model spend belongs to ONE scope's request facts. A different scope
+        // (a new chat turn is the common case) must not inherit another
+        // scope's model totals, so those are cleared and rebuilt below. The
+        // task-epoch counters that share this ledger — commands run, modified
+        // files, model steps, delegated children — describe the task, not the
+        // budget owner, and a fresh turn must not reset the limits the user
+        // set on it.
+        progress.cumulative_model_tokens = 0;
+        progress.cumulative_estimated_model_tokens = 0;
+        progress.cumulative_cost_usd_micros = 0;
+        progress.has_unpriced_model_attempt = false;
     }
     progress.budget_scope = Some(scope.to_string());
     let records = store.load_for_budget_scope(session_id, scope).await?;

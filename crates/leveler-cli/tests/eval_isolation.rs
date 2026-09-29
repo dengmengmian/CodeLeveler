@@ -70,7 +70,7 @@ provider: mock
 model_id: mock-model
 protocol: openai_chat
 capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: false, vision: false }
-limits: { context_window: 8192, reliable_context: 4096, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }
+limits: { context_window: 131072, reliable_context: 65536, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }
 compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
 "#,
     )

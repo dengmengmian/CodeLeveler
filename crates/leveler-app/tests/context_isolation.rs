@@ -385,7 +385,11 @@ async fn query_context(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_inspection_is_local_and_never_enters_the_conversation() {
-    let (_tmp, server, app, client, session) = harness(vec![text("first"), text("second")]).await;
+    // A window large enough for the harness's fixed surface (tool schemas plus
+    // control) to leave a legal request: at 8192 the surface alone exceeds the
+    // model's hard capacity, so no turn could start.
+    let (_tmp, server, app, client, session) =
+        harness_with_window(vec![text("first"), text("second")], 128_000, 100_000).await;
     let mut rx = client.subscribe();
 
     client
@@ -404,7 +408,7 @@ async fn context_inspection_is_local_and_never_enters_the_conversation() {
         accounting.used_tokens > 0,
         "an assembled request must account for something"
     );
-    assert_eq!(accounting.context_window_tokens, Some(8192));
+    assert_eq!(accounting.context_window_tokens, Some(128_000));
 
     // `/context` produced no model request at all.
     assert_eq!(
@@ -847,8 +851,12 @@ async fn btw_can_call_a_read_only_tool_without_touching_the_main_task() {
         })
         .to_string(),
     };
-    let (tmp, server, app, client, session) =
-        harness(vec![tool_call, side_answer, text("main answer")]).await;
+    let (tmp, server, app, client, session) = harness_with_window(
+        vec![tool_call, side_answer, text("main answer")],
+        128_000,
+        100_000,
+    )
+    .await;
     std::fs::write(tmp.path().join("probe.txt"), "hello-from-probe\n").unwrap();
 
     let db = app.open_database().await.unwrap();

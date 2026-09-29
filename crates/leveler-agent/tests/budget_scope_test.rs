@@ -324,30 +324,41 @@ async fn failed_paid_preparation_keeps_its_bill_and_terminal_turn() {
     let fx = fixture().await;
     add_long_history(&fx).await;
     fx.runtime.fail_summary.store(true, Ordering::SeqCst);
-    assert!(chat(&fx).await.is_err());
+    // A briefing that is PAID but fails is not retried, and it no longer aborts
+    // the turn: the history is hard-required, so the runtime folds it
+    // mechanically (with an explicit "detail unavailable" breadcrumb) and the
+    // task continues. The failed attempt keeps its bill either way.
+    chat(&fx)
+        .await
+        .expect("a failed briefing folds mechanically and the turn continues");
     let turns = TurnRepository::new(&fx.db).list(&fx.session).await.unwrap();
     assert_eq!(
         turns.len(),
         1,
-        "paid preparation must belong to a recoverable turn"
+        "paid preparation must belong to the initiating turn"
     );
-    assert_eq!(turns[0].status, "failed");
+    assert_eq!(
+        turns[0].status, "completed",
+        "the turn is terminal; a failed briefing is not a failed task"
+    );
     let records = ModelRequestRepository::new(&fx.db)
         .load_for_session(&fx.session)
         .await
         .unwrap();
+    let summaries: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind == leveler_storage::ModelCallKind::Compaction)
+        .collect();
     assert_eq!(
-        records.len(),
+        summaries.len(),
         1,
         "reasoning failure must not be blindly retried"
     );
-    assert_eq!(
-        records[0].budget_scope.as_deref(),
-        Some(turns[0].id.as_str())
-    );
-    assert_eq!(records[0].input_tokens + records[0].output_tokens, 35);
-    assert!(records[0].error_kind.is_some());
-    assert!(records[0].cost_usd_micros.is_some());
+    let summary = summaries[0];
+    assert_eq!(summary.budget_scope.as_deref(), Some(turns[0].id.as_str()));
+    assert_eq!(summary.input_tokens + summary.output_tokens, 35);
+    assert!(summary.error_kind.is_some());
+    assert!(summary.cost_usd_micros.is_some());
     let ledger = leveler_agent::load_auxiliary_budget_progress(&fx.db, &fx.db, &fx.db, &fx.session)
         .await
         .unwrap();

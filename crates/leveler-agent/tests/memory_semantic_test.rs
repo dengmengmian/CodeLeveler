@@ -187,11 +187,13 @@ async fn recall_remains_on_the_main_turn_without_triggering_extraction() {
     let events = run_turn(&executor, "模型按之前定的来").await;
 
     assert_eq!(runtime.generate_calls(), 0);
+    let request = &runtime.requests()[0];
     assert!(
-        runtime.requests()[0]
-            .messages
-            .iter()
-            .any(|message| message.text_content().contains("flash"))
+        request.control_context.text().contains("flash")
+            || request
+                .messages
+                .iter()
+                .any(|message| message.text_content().contains("flash"))
     );
     assert!(events.iter().any(|event| matches!(
         event,

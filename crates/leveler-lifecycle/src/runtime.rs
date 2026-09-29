@@ -286,6 +286,12 @@ pub struct ChildAgentSnapshot {
     pub write_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_secs: Option<u64>,
+    /// The child's rendered brief (definition instructions plus bound skill
+    /// content), resolved at spawn. Persisted so a resumed child keeps exactly
+    /// the instructions it started with, even after the definition on disk
+    /// changes; `None` on children recorded before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<String>,
 }
 
 /// Why the loop stopped. Serialized (snake_case) into terminal engine events

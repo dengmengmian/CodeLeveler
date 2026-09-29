@@ -657,7 +657,12 @@ fn the_spawn_tool_advertises_the_agent_parameter() {
     let def = crate::injected_tools::spawn_agent_tool_definition();
     let props = def.input_schema.get("properties").expect("properties");
     assert!(props.get("agent").is_some(), "{:?}", def.input_schema);
-    assert!(def.description.contains("agent='<name>'"));
+    assert!(
+        def.description
+            .contains("`agent` names a declarative agent"),
+        "{}",
+        def.description
+    );
     assert!(
         !def.description.contains(".md"),
         "the single-file format is gone"

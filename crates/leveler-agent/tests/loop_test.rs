@@ -1638,8 +1638,8 @@ async fn configured_token_budget_stops_before_another_model_request() {
         ])),
         requests: requests.clone(),
         usage: TokenUsage {
-            input_tokens: 60,
-            output_tokens: 40,
+            input_tokens: 200_000,
+            output_tokens: 200_000,
             cache_creation_input_tokens: 0,
             cached_input_tokens: 0,
             reasoning_tokens: None,
@@ -1653,7 +1653,10 @@ async fn configured_token_budget_stops_before_another_model_request() {
         0,
     )
     .with_step_limits(leveler_agent::StepLimits {
-        max_model_tokens: Some(100),
+        // Above one request's projection (the fixed tool/control surface) and
+        // below what the first call actually reports, so request one is
+        // admitted and request two is refused.
+        max_model_tokens: Some(100_000),
         ..Default::default()
     });
 
@@ -1680,12 +1683,12 @@ async fn configured_token_budget_stops_before_another_model_request() {
         leveler_agent::BudgetDimension::ModelTokens
     );
     assert!(exhaustion.spent >= exhaustion.cap);
-    assert_eq!(exhaustion.cap, 100);
+    assert_eq!(exhaustion.cap, 100_000);
     assert!(
         outcome
             .stop_detail
             .as_deref()
-            .is_some_and(|d| d.contains("dimension=model_tokens") && d.contains("cap=100")),
+            .is_some_and(|d| d.contains("dimension=model_tokens") && d.contains("cap=100000")),
         "stop_detail must be parseable: {:?}",
         outcome.stop_detail
     );
@@ -1706,8 +1709,8 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
         ])),
         requests: requests.clone(),
         usage: TokenUsage {
-            input_tokens: 10,
-            output_tokens: 10,
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
             cache_creation_input_tokens: 0,
             cached_input_tokens: 0,
             reasoning_tokens: None,
@@ -1726,7 +1729,9 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
         cached_input_usd_per_mtok: None,
     }))
     .with_step_limits(leveler_agent::StepLimits {
-        max_cost_usd_micros: Some(30),
+        // Above one request's projected cost and below what the first call
+        // actually bills, so request one is admitted and request two is not.
+        max_cost_usd_micros: Some(1_000_000),
         ..Default::default()
     });
 
@@ -1750,7 +1755,7 @@ async fn configured_cost_budget_uses_profile_pricing_and_stops_before_next_reque
         .expect("cost budget exhaust must carry structured dimension");
     assert_eq!(exhaustion.dimension, leveler_agent::BudgetDimension::Cost);
     assert!(exhaustion.spent >= exhaustion.cap);
-    assert_eq!(exhaustion.cap, 30);
+    assert_eq!(exhaustion.cap, 1_000_000);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -6235,7 +6240,7 @@ async fn cancel_mid_serial_batch_commits_completed_results_and_spend() {
         .unwrap_or(0);
     assert!(
         max_commands >= 1,
-        "cancel must not drop the completed command's spend; max_commands={max_commands}"
+        "cancel must not drop the completed command's spend; max_commands={max_commands} events={events:?}"
     );
 
     // And its result must be persisted, paired with the assistant tool calls,

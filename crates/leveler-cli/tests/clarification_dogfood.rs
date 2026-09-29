@@ -188,8 +188,8 @@ capabilities:
   reasoning: false
   vision: false
 limits:
-  context_window: 16384
-  reliable_context: 8192
+  context_window: 131072
+  reliable_context: 65536
   max_output_tokens: 2048
   max_tool_schema_bytes: 16384
   max_parallel_tool_calls: 1

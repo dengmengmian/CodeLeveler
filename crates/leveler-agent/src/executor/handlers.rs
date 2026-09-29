@@ -562,10 +562,17 @@ impl Executor {
         cancellation: CancellationToken,
         parent_wall: ParentWallBudget,
     ) -> impl std::future::Future<Output = SubAgentRunResult> + Send + 'static {
-        // The brief is already in the restored transcript's system message;
-        // the definition's files are never read again.
+        // The spawn-time brief is persisted on the durable child spec, so the
+        // definition's files are never read again and an edited definition
+        // cannot change a running child. `None` only for a child recorded
+        // before the brief was persisted (legacy), which then runs without one.
+        let brief = child
+            .spec
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.brief.clone());
         let prepared_child = self
-            .child_for_spec(child.role, &child.spec, None)
+            .child_for_spec(child.role, &child.spec, brief)
             .with_agent_id(child.id.clone());
         run_prepared_sub_agent(
             prepared_child,

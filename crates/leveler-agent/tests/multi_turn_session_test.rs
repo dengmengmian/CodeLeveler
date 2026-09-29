@@ -431,10 +431,13 @@ async fn resume_after_chat_provider_failure_keeps_chat_objective_not_old_running
 }
 
 async fn seed_oversized_login_history(db: &Database, session: &leveler_core::SessionId) {
+    // "Oversized" is measured against the model's resolved policy, not a fixed
+    // constant: the fixture must carry the mock's 64K quality boundary plus the
+    // fixed tool/control surface on top.
     let mut payloads = Vec::new();
     payloads.push(serde_json::to_string(&Message::text(Role::User, "修改登录模块")).unwrap());
     let pad = "login-timeout-path-and-retry-policy ".repeat(40);
-    for i in 0..100 {
+    for i in 0..240 {
         payloads.push(
             serde_json::to_string(&Message::text(Role::Assistant, format!("detail {i} {pad}")))
                 .unwrap(),
@@ -1245,15 +1248,16 @@ fn no_engine_path_hands_a_model_an_unassembled_transcript() {
         );
     }
 
-    // One assembly call per path that supplies prior context: chat and resume
-    // through `assembled_prior`, the goal continuation through
-    // `bounded_session_history` (the same checkpoint-else-assemble, then capped
-    // for injection). A new path added without one moves these two apart.
+    // One assembly call per path that supplies prior context. `chat` and
+    // `resume` call `assembled_prior` directly; the goal continuation calls
+    // `bounded_session_history`, which now delegates to `assembled_prior`
+    // rather than folding the raw transcript itself. Counting the assembly
+    // operations therefore still equals the turn-input paths. A new path
+    // added without one moves these two apart.
     let paths = production.matches("TurnInput::Content {").count()
         + production.matches("TurnInput::Goal {").count()
         + production.matches("TurnInput::Resume {").count();
-    let assemblies = production.matches(".assembled_prior(").count()
-        + production.matches(".bounded_session_history(").count();
+    let assemblies = production.matches(".assembled_prior(").count();
     assert!(
         paths >= 3,
         "chat, resume and the goal continuation should all still exist"
@@ -1334,9 +1338,9 @@ async fn a_bounded_load_after_a_watermarked_snapshot_never_sends_an_orphan_tool_
     let session = h.engine.create_task(&s).await.unwrap();
     let pad = "tool-output-line-with-enough-bytes-to-matter ".repeat(40);
 
-    // 1. A tool-heavy history over the pre-request threshold.
+    // 1. A tool-heavy history over the model's resolved pre-request threshold.
     let mut payloads = vec![serde_json::to_string(&Message::text(Role::User, "ship it")).unwrap()];
-    for i in 0..60 {
+    for i in 0..90 {
         payloads.extend(tool_round_payloads(&format!("early_{i}"), &pad));
     }
     MessageRepository::new(&h.db)

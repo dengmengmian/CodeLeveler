@@ -78,7 +78,7 @@ pub fn is_observe_class_tool(name: &str) -> bool {
 }
 
 /// Holds the available tools and validates arguments before dispatching.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }

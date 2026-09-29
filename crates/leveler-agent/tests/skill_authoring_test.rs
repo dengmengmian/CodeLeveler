@@ -54,14 +54,23 @@ impl ModelRuntime for Script {
             .lock()
             .unwrap()
             .push(request.tools.iter().map(|t| t.name.clone()).collect());
-        self.system_seen.lock().unwrap().push(
-            request
-                .messages
-                .iter()
-                .filter(|m| m.role == Role::System)
-                .map(|m| m.text_content())
-                .collect(),
-        );
+        self.system_seen.lock().unwrap().push({
+            // The skill index and other standing instructions are control-context
+            // segments, separate from the transcript.
+            let mut systems: Vec<String> = Vec::new();
+            let control = request.control_context.text();
+            if !control.is_empty() {
+                systems.push(control);
+            }
+            systems.extend(
+                request
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::System)
+                    .map(|m| m.text_content()),
+            );
+            systems
+        });
         let reply = self
             .replies
             .lock()

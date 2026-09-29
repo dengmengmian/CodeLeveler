@@ -1076,10 +1076,15 @@ impl ModelRuntime for RoutedRuntime {
             .iter()
             .any(|m| m.text_content().contains(&self.child_marker));
         let queue = if is_child {
-            self.child_requests
-                .lock()
-                .unwrap()
-                .push(request.messages.clone());
+            // The child's instructions are a control-context segment, separate
+            // from the transcript; record it alongside so a test asserting on
+            // the child's brief reads what the provider actually saw.
+            let mut recorded = request.messages.clone();
+            let control = request.control_context.text();
+            if !control.is_empty() {
+                recorded.push(Message::text(Role::System, control));
+            }
+            self.child_requests.lock().unwrap().push(recorded);
             self.child_surfaces.lock().unwrap().push((
                 request.tools.iter().map(|t| t.name.clone()).collect(),
                 request.reasoning_effort,
@@ -1590,6 +1595,8 @@ async fn seed_interrupted_agent_child(
     let turn = crashed_turn(db, session, "user").await;
     let turn_id = TurnId::new(turn.id);
     let log = EventLog::new(db, session.clone());
+    let mut snapshot = snapshot;
+    snapshot.brief = Some(brief.to_string());
     log.append(
         Some(&turn_id),
         EngineEvent::SubAgentStarted {
@@ -1693,7 +1700,7 @@ async fn a_restarted_agent_child_keeps_its_spawn_time_definition() {
         let blob: String = messages.iter().map(|m| m.text_content()).collect();
         assert!(
             blob.contains("V1_INSTRUCTIONS_AT_SPAWN"),
-            "spawn-time brief kept"
+            "spawn-time brief kept: {blob}"
         );
         assert!(
             !blob.contains("V2_INSTRUCTIONS_AFTER_EDIT"),

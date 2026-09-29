@@ -273,18 +273,25 @@ mod tests {
     /// completed and the next one in_progress, at the transition" tied the two
     /// together.
     #[test]
-    fn the_description_defines_completed_by_outcome() {
+    fn the_description_defines_the_plan_states_mechanically() {
         let d = UpdatePlanTool.description();
         for needle in [
-            "outcome is true",
-            "already read",
-            "failed, denied or timed-out action completes nothing",
-            "stays in_progress",
-            "rewrite the step instead of completing it",
+            "Replace the task checklist with the list in this call",
+            "No workspace side effect",
+            "Each call replaces the whole list",
+            "`pending` is not done",
+            "The tool does not check those claims",
         ] {
             assert!(d.contains(needle), "lost `{needle}`: {d}");
         }
+        // The de-coached description states the protocol and does not tell the
+        // model when a step may be called completed.
         assert!(!d.contains("the finished step completed"), "{d}");
+        assert!(!d.contains("already read"), "{d}");
+        assert!(
+            !d.contains("rewrite the step instead of completing it"),
+            "{d}"
+        );
     }
 
     #[tokio::test]

@@ -2731,7 +2731,7 @@ mod full_access_is_silent {
             Duration::from_millis(0),
         ));
         let executor = Executor::new(
-            runtime,
+            runtime.clone(),
             Arc::new(default_registry()),
             tool_context,
             ModelRef::new("mock", "m"),
@@ -2759,8 +2759,9 @@ mod full_access_is_silent {
         );
         // `request_permissions` is handled inline (drive.rs) and does not emit a
         // ToolResult event; its outcome lands in the transcript the next round
-        // carries, so assert on that.
-        let transcript = format!("{events:?}");
+        // carries, so assert on what the model was actually shown.
+        let shown = runtime.requests.lock().unwrap();
+        let transcript = format!("{shown:?}");
         assert!(
             transcript.contains("已获授权"),
             "the request must be granted, not refused: {transcript}"
@@ -2874,8 +2875,9 @@ mod steering {
             takes: Mutex::new(0),
         });
 
+        let runtime = runtime_seeing("x");
         let executor = Executor::new(
-            runtime_seeing("x"),
+            runtime.clone(),
             Arc::new(default_registry()),
             tool_context,
             ModelRef::new("mock", "m"),
@@ -2894,7 +2896,13 @@ mod steering {
             .await
             .unwrap();
 
-        let blob = format!("{events:?}");
+        let shown = runtime.requests.lock().unwrap();
+        let blob = shown
+            .iter()
+            .flatten()
+            .map(|message| message.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             blob.contains("STEER_MARKER"),
             "steering text never reached the conversation: {blob}"
@@ -4759,7 +4767,7 @@ async fn goal_completion_is_refused_while_children_are_outstanding() {
             _ => None,
         })
         .expect("first update_goal(complete) must be refused");
-    assert!(refused.contains("Cannot complete"), "{refused}");
+    assert!(refused.contains("was not accepted"), "{refused}");
     assert!(
         events.iter().any(|e| matches!(e,
             AgentEvent::GoalIntercepted { kind, .. } if kind == "outstanding_children")),
@@ -7090,14 +7098,31 @@ impl ModelRuntime for PartlyPricedRuntime {
             .parent_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         {
-            0 => Ok(assistant_with(
-                vec![spawn_call(
-                    "s1",
-                    serde_json::json!({"agent": self.agent, "task": "UNPRICED_CHILD look"}),
-                )],
-                FinishReason::ToolCalls,
-            )),
-            _ => Ok(assistant_text("parent done")),
+            // A cost cap cannot be admitted on an attempt with no reported
+            // usage, so the parent (priced) must report real usage before the
+            // spawn is even considered.
+            0 => Ok(ModelResponse {
+                usage: TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+                ..assistant_with(
+                    vec![spawn_call(
+                        "s1",
+                        serde_json::json!({"agent": self.agent, "task": "UNPRICED_CHILD look"}),
+                    )],
+                    FinishReason::ToolCalls,
+                )
+            }),
+            _ => Ok(ModelResponse {
+                usage: TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+                ..assistant_text("parent done")
+            }),
         }
     }
 

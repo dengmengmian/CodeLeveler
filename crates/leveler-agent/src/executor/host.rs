@@ -855,6 +855,39 @@ impl Executor {
         )
     }
 
+    /// Execute one already-narrowed read-only call for a host-owned surface
+    /// that is not a turn (`/btw`). It runs through the SAME admission and
+    /// execution pipeline as every other call, so no caller reaches the
+    /// execution entry directly; the surface is observe-class only, so the
+    /// pipeline reaches no mutating path.
+    pub async fn run_read_only_call(
+        &self,
+        call: ToolCall,
+        ctx: ToolContext,
+        cancellation: &CancellationToken,
+    ) -> Result<(String, bool), AgentError> {
+        let mut session_approved = HashSet::new();
+        // `parallel = true`: the surface is side-effect-free by declaration, so
+        // there is no side effect for a crash to lose and no barrier to wait on.
+        let admitted = self
+            .admit(call, ctx, true, &mut session_approved, cancellation)
+            .await
+            .map_err(|error| match error {
+                AdmitError::Fatal(error) => error,
+                AdmitError::Refused { call, reason } => {
+                    AgentError::Model(leveler_model::ModelError::new(
+                        leveler_model::ModelErrorKind::InvalidRequest,
+                        format!("tool `{}` refused: {reason}", call.name),
+                    ))
+                }
+            })?;
+        let mut modified_files = Vec::new();
+        let (content, is_error, ..) = self
+            .dispatch(&admitted, &mut modified_files, cancellation, None)
+            .await;
+        Ok((content, is_error))
+    }
+
     /// Execute one admitted call, returning `(content, is_error, metadata)`
     /// without touching shared state — safe to run concurrently for
     /// parallel-safe tools. The caller folds `metadata` (modified files,
@@ -2186,6 +2219,16 @@ mod authorize_tests {
             .await
             .ok()
             .expect("first admitted after approval");
+        assert_eq!(
+            first.resolved().write,
+            WriteScope::Workspace { root: root.clone() },
+            "a session grant skips approval; it does not lift write confinement"
+        );
+        // A command admission holds the execution gate until the call is
+        // released, so the first must be dropped before the second can be
+        // admitted (the drive dispatches each serial call before admitting the
+        // next; this test drives admission directly).
+        drop(first);
         let second = exec
             .admit(
                 rm_rf_call(),
@@ -2198,13 +2241,11 @@ mod authorize_tests {
             .ok()
             .expect("second admitted on the session grant");
         assert_eq!(approver.asks(), 1, "the second call must not re-prompt");
-        for admitted in [&first, &second] {
-            assert_eq!(
-                admitted.resolved().write,
-                WriteScope::Workspace { root: root.clone() },
-                "a session grant skips approval; it does not lift write confinement"
-            );
-        }
+        assert_eq!(
+            second.resolved().write,
+            WriteScope::Workspace { root: root.clone() },
+            "a session grant skips approval; it does not lift write confinement"
+        );
         assert!(matches!(
             second.resolved().authorization,
             AuthorizationEvidence::SessionGrant { .. }

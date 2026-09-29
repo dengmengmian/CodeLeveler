@@ -2710,6 +2710,20 @@ impl InProcessRuntimeClient {
                         .as_ref()
                         .map(|(registry, _)| registry.definitions())
                         .unwrap_or_default();
+                    // A side question executes its read-only tools through the
+                    // SAME ToolHost admission + execution pipeline a turn uses.
+                    // The app never reaches `ToolRegistry::execute` directly, so
+                    // the one execution boundary stays one boundary.
+                    let side_executor = side_tools.as_ref().map(|(registry, tool_context)| {
+                        leveler_agent::Executor::new(
+                            app.registry.clone(),
+                            Arc::new(registry.clone()),
+                            tool_context.clone(),
+                            model.clone(),
+                            1,
+                        )
+                        .with_approver(Arc::new(AutoApprove))
+                    });
                     let project = |messages: &[Message]| {
                         leveler_model::RequestProjection::project(
                             messages,
@@ -2866,21 +2880,19 @@ impl InProcessRuntimeClient {
                             break;
                         }
                         messages.push(resp.message);
-                        let (registry, tool_context) = side_tools
+                        let (_registry, tool_context) = side_tools
+                            .as_ref()
+                            .expect("a tool call implies the side surface exists");
+                        let executor = side_executor
                             .as_ref()
                             .expect("a tool call implies the side surface exists");
                         let mut parts = Vec::with_capacity(calls.len());
                         for call in calls {
-                            let (content, is_error) = match registry
-                                .execute(
-                                    &call.name,
-                                    call.arguments.clone(),
-                                    tool_context.clone(),
-                                    cancel.clone(),
-                                )
+                            let (content, is_error) = match executor
+                                .run_read_only_call(call.clone(), tool_context.clone(), &cancel)
                                 .await
                             {
-                                Ok(output) => (output.content, output.is_error),
+                                Ok(outcome) => outcome,
                                 Err(error) => {
                                     (format!("tool `{}` failed: {error}", call.name), true)
                                 }

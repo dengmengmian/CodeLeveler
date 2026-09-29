@@ -2936,7 +2936,18 @@ impl AgentHarness for Drive<'_> {
                         admitted.into_call(),
                     )
                 }
-                Err(AdmitError::Fatal(error)) => return Err(error),
+                Err(AdmitError::Fatal(error)) => {
+                    // A cancellation observed while this call waited for
+                    // admission must not drop the calls that already ran: route
+                    // it through the batch epilogue, which pairs the remaining
+                    // results and flushes the completed command's spend before
+                    // surfacing `Cancelled`.
+                    if matches!(error, AgentError::Cancelled) {
+                        cancelled_mid_batch = true;
+                        break;
+                    }
+                    return Err(error);
+                }
                 Err(AdmitError::Refused { call, reason }) => {
                     denied_calls_this_round += 1;
                     (

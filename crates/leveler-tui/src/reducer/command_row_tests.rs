@@ -263,7 +263,10 @@ fn a_network_denied_command_reads_as_needing_network_permission() {
         Action::Runtime(RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("net"),
             ok: false,
-            preview: "[network permission required] This command ran with network access blocked by the sandbox…\n\nexit: 6\n--- stderr ---\ncurl: (6) Could not resolve host: example.com".into(),
+            preview: format!(
+                "{} This command ran with network access blocked by the sandbox…\n\nexit: 6\n--- stderr ---\ncurl: (6) Could not resolve host: example.com",
+                crate::activity_stream::NETWORK_PERMISSION_REQUIRED
+            ),
             duration_ms: 300,
             applied_diff: None,
             exit_code: Some(6),
@@ -283,7 +286,7 @@ fn a_network_denied_command_reads_as_needing_network_permission() {
     assert!(
         !rows
             .iter()
-            .any(|r| r.contains("[network permission required]")),
+            .any(|r| r.contains(crate::activity_stream::NETWORK_PERMISSION_REQUIRED)),
         "the model-facing marker never reaches the user: {rows:?}"
     );
 }

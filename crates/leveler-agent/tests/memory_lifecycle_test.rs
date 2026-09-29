@@ -146,12 +146,15 @@ fn workspace(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 
 fn provider_saw(runtime: &CaptureRuntime, needle: &str) -> bool {
     runtime.requests().iter().any(|request| {
-        request.messages.iter().any(|message| {
-            message
-                .content
-                .iter()
-                .any(|part| matches!(part, ContentPart::Text { text } if text.contains(needle)))
-        })
+        // Recalled memory is a control-context block, separate from the
+        // transcript; a test reading only `messages` would miss it.
+        request.control_context.text().contains(needle)
+            || request.messages.iter().any(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::Text { text } if text.contains(needle)))
+            })
     })
 }
 
