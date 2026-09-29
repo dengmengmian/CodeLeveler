@@ -85,9 +85,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sh packaging/scripts/test_install.sh
 
-      # `release.yml` only runs on a tag, so a root file it packages can be
-      # deleted and stay broken until someone actually wants a release. Check
-      # the payload on every push.
+      # `release.yml` only runs when `./dev publish` dispatches it, so a root
+      # file it packages can be deleted and stay broken until someone actually
+      # wants a release. Check the payload on every push.
       - name: Release payload
         if: runner.os == 'Linux'
         run: sh packaging/scripts/check_release_payload.sh

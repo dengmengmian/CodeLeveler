@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::error::{Fail, Report};
 use crate::exec::{self, CommandSpec, Host};
-use crate::git::{self, Snapshot};
+use crate::git;
 use crate::qualify;
 use crate::root::{self, Env, GateOpts};
 use crate::version::{self, Level};
@@ -57,21 +57,23 @@ pub fn run(host: &dyn Host, repo: &Path, env: &Env, args: &[String]) -> Result<R
             format!("{tag} already exists locally"),
         ));
     }
-    let releases = github_releases(host, repo, &version::github_slug(&manifest)?)?;
+    let slug = version::github_slug(&manifest)?;
+    let releases = github_releases(host, repo, &slug)?;
     version::require_publish(&local, &tags, &releases)?;
     if opts.dry_run {
         return Ok(Report::ok(format!(
             "current: {current}\n\
              next: {next}\n\
              candidate: {}\n\
-             would-create tag: {tag}\n\
              would-push: git push origin HEAD\n\
-             would-push: git push origin refs/tags/{tag}\n\
+             would-dispatch: gh workflow run release.yml --repo {slug} --ref {branch} -f version={next} -f commit=<the version commit>\n\
              remote tag check: skipped\n\
              WOULD_RUN: pre-release\n\
              WOULD_RUN: dogfood\n\
              READY_TO_PUBLISH: NO\n\
-             note: the qualified commit does not exist until publish bumps the version",
+             note: the tag and the GitHub release are created by the release workflow
+             after every artifact verifies, at the commit that was built; the
+             qualified commit does not exist until publish bumps the version",
             snap.head
         )));
     }
@@ -181,24 +183,19 @@ pub fn run(host: &dyn Host, repo: &Path, env: &Env, args: &[String]) -> Result<R
         ));
     }
     git::confirm(host, repo, &published)?;
-    create_tag(host, repo, &tag, &published)?;
+    // Push the version commit first: the release workflow dispatches on the
+    // default branch, and its cache lives there so the next version can restore
+    // it. Tag and release are created by the workflow, after the build.
     push_ref(
         host,
         repo,
         &["push", "origin", "HEAD"],
         &format!(
-            "local tag {tag} points at {} and was not pushed\n./dev did not force-push or delete the tag",
+            "release commit {} was not pushed to origin\n./dev did not tag, dispatch, or reset this commit",
             published.head
         ),
     )?;
-    push_ref(
-        host,
-        repo,
-        &["push", "origin", &format!("refs/tags/{tag}")],
-        &format!(
-            "origin has the branch but not {tag}\nlocal tag {tag} was not pushed\n./dev did not force-push or delete the tag"
-        ),
-    )?;
+    dispatch_release(host, repo, &slug, &branch, next, &published.head)?;
     let ready = if qual.exit_code == 2 {
         "CONDITIONAL"
     } else {
@@ -210,16 +207,17 @@ pub fn run(host: &dyn Host, repo: &Path, env: &Env, args: &[String]) -> Result<R
             "current: {current}\n\
              next: {next}\n\
              candidate: {}\n\
-             tag: {tag}\n\
+             tag: {tag} (created by the release workflow after every artifact verifies)\n\
              Release Gate: PASS\n\
              Dogfood: {}\n\
              RC Qualification: {}\n\
              pushed: origin HEAD\n\
-             pushed: refs/tags/{tag}\n\
+             dispatched: release.yml version={next} commit={}\n\
              READY_TO_PUBLISH: {ready}",
             published.head,
             qualify::verdict(qual.release_exit),
-            qual.rc_exit.map(qualify::verdict).unwrap_or("NOT_STARTED")
+            qual.rc_exit.map(qualify::verdict).unwrap_or("NOT_STARTED"),
+            published.head
         ),
     ))
 }
@@ -353,22 +351,41 @@ fn after_commit(err: Fail, sha: &str) -> Fail {
     .exit(err.exit)
 }
 
-fn create_tag(host: &dyn Host, repo: &Path, tag: &str, snap: &Snapshot) -> Result<(), Fail> {
-    let out = host.run(&exec::git(repo, &["tag", "-a", tag, "-m", tag]))?;
+fn dispatch_release(
+    host: &dyn Host,
+    repo: &Path,
+    slug: &str,
+    branch: &str,
+    version: version::SemVer,
+    commit: &str,
+) -> Result<(), Fail> {
+    let spec = CommandSpec::new(
+        "gh",
+        [
+            "workflow",
+            "run",
+            "release.yml",
+            "--repo",
+            slug,
+            "--ref",
+            branch,
+            "-f",
+            &format!("version={version}"),
+            "-f",
+            &format!("commit={commit}"),
+        ],
+        repo,
+    );
+    let out = host.run(&spec)?;
     if out.status == 0 {
         return Ok(());
     }
-    let detail = exec::first_lines(&out.stderr, 20);
-    let code = if detail.to_ascii_lowercase().contains("already exists") {
-        "TAG_EXISTS"
-    } else {
-        "GIT_FAILED"
-    };
     Err(Fail::new(
-        code,
+        "RELEASE_DISPATCH_FAILED",
         format!(
-            "git tag failed\n{detail}\nlocal commit: {}\n./dev did not push or reset this commit",
-            snap.head
+            "gh workflow run release.yml exited {}\n{}\norigin has the release commit but the workflow was not dispatched; re-run it with:\n  gh workflow run release.yml --repo {slug} --ref {branch} -f version={version} -f commit={commit}",
+            out.status,
+            exec::first_lines(&out.stderr, 20)
         ),
     ))
 }

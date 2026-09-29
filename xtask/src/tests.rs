@@ -321,9 +321,10 @@ fn clean_all_invokes_cargo_clean_and_keeps_unknown_dirs() {
     }));
 }
 
-/// Unix only: creating a symlink on Windows needs a privilege the runner may
-/// not have, and an optional OS capability must be detected, not assumed. The
-/// guard under test reads link metadata, so unix exercises the same code.
+/// Unix only. The fixture calls `std::os::unix::fs::symlink`, which is not a
+/// Windows API — that is the compile break in CI run 36526610858, before the
+/// test could run. The guard itself only reads link metadata, and this run
+/// exercises that.
 #[cfg(unix)]
 #[test]
 fn clean_unlinks_registered_symlink_without_following_it() {
@@ -557,6 +558,112 @@ fn publish_qualification_failure_does_not_tag_or_push() {
             && !(spec.args.first().map(String::as_str) == Some("tag")
                 && spec.args.iter().any(|arg| arg == "-a"))
     }));
+}
+
+#[test]
+fn publish_dispatches_the_release_workflow_and_creates_no_local_tag() {
+    let repo_tmp = Tmp::new();
+    let lab_tmp = Tmp::new();
+    let repo = repo_tmp.path.canonicalize().unwrap();
+    let lab = lab_tmp.path.canonicalize().unwrap();
+    write_versions(&repo, "1.0.8");
+    write_lab(&lab, BASELINE);
+    point_config(&repo, &lab, "example/model");
+    let state = Mutex::new((false, false));
+    let host = FakeHost::new(move |spec| {
+        let mut state = state.lock().expect("state");
+        if is_cmd(spec, "git", &["rev-parse", "HEAD"]) {
+            return Ok(text(if state.1 { SHA_B } else { SHA_A }));
+        }
+        if is_cmd(spec, "git", &["status", "--porcelain"]) {
+            if state.0 && !state.1 {
+                return Ok(text(
+                    " M Cargo.toml\n M docs/RELEASE.md\n M docs/RELEASE.zh-CN.md\n",
+                ));
+            }
+            return Ok(text(""));
+        }
+        if is_cmd(spec, "git", &["rev-parse", "--abbrev-ref", "HEAD"]) {
+            return Ok(text("main"));
+        }
+        if is_cmd(spec, "git", &["remote"]) {
+            return Ok(text("origin"));
+        }
+        if is_cmd(spec, "git", &["tag", "--list"]) {
+            return Ok(text("v1.0.8\n"));
+        }
+        if spec.program == "gh" && spec.args.first().map(String::as_str) == Some("release") {
+            return Ok(text("v1.0.8\n"));
+        }
+        if spec.program == "gh" {
+            return Ok(text(""));
+        }
+        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("ls-remote") {
+            return Ok(text(""));
+        }
+        if spec.program == "cargo" {
+            state.0 = true;
+            return Ok(text(""));
+        }
+        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("add") {
+            return Ok(text(""));
+        }
+        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("commit") {
+            assert_eq!(
+                spec.args.get(2).map(String::as_str),
+                Some("release: v1.0.9")
+            );
+            state.1 = true;
+            return Ok(text(""));
+        }
+        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("cat-file") {
+            return Ok(text(""));
+        }
+        if spec.program == "python3" {
+            pass_layers(&lab);
+            return Ok(process(0, &format!("written: {RUN}/\n")));
+        }
+        Ok(text(""))
+    });
+    let outcome = dispatch_with(&repo, &args(&["publish"]), &Env::default(), &host);
+    assert_eq!(outcome.code, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        outcome.stdout.contains("READY_TO_PUBLISH: YES"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(
+        outcome
+            .stdout
+            .contains("dispatched: release.yml version=1.0.9"),
+        "{}",
+        outcome.stdout
+    );
+    let log = host.log();
+    assert!(
+        log.iter()
+            .any(|spec| is_cmd(spec, "git", &["push", "origin", "HEAD"])),
+        "expected the version commit to be pushed"
+    );
+    assert!(
+        log.iter().any(|spec| {
+            spec.program == "gh"
+                && spec.args.first().map(String::as_str) == Some("workflow")
+                && spec.args.iter().any(|a| a == "version=1.0.9")
+                && spec.args.iter().any(|a| a.starts_with("commit="))
+        }),
+        "expected a release workflow dispatch"
+    );
+    let tag_touched = log.iter().any(|spec| {
+        (spec.args.first().map(String::as_str) == Some("tag")
+            && spec.args.iter().any(|arg| arg == "-a"))
+            || (spec.args.first().map(String::as_str) == Some("push")
+                && spec.args.iter().any(|arg| arg.contains("refs/tags/")))
+    });
+    assert!(
+        !tag_touched,
+        "publish must let the workflow create the tag, not create one itself"
+    );
 }
 
 #[test]

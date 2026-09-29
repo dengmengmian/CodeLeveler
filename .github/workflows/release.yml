@@ -1,48 +1,156 @@
 name: Release
 
-# Tag `vX.Y.Z` → build the `leveler` binary for the four supported targets,
-# package each with its sha256, attach everything to a draft GitHub release,
-# and publish it once every asset is uploaded. Publishing is what makes
-# `leveler update --check` see the new version, so it is the last step: a
-# release is never public with an asset missing.
+# Publishing runs on `main`, not on the tag.
+#
+# GitHub scopes an Actions cache to the ref that saved it. A tag-triggered run
+# saves under its own tag and can only read the default branch, so `v1.0.8`
+# could never restore the ~390 MB-per-target release cache `v1.0.7` had just
+# saved. Measured on v1.0.8: `No cache found`, a 10m15s Windows build, 12m37s
+# end to end; only a re-run of the *same* tag ever hit (5m29s / 6m42s). Building
+# the release on `main` puts the cache on the default branch, where the next
+# version reads it through rust-cache's lockfile-agnostic restore key.
+#
+# `./dev publish 1.0.x` is the entry point: it bumps the version, runs the
+# release gates, pushes the version commit to main, and dispatches this workflow
+# with that exact commit. The tag and the GitHub release are created here, after
+# every artifact has been built and verified, so a failed build leaves neither a
+# tag nor a public release, and a re-run resumes instead of duplicating.
+#
+# A manually pushed `vX.Y.Z` tag still releases through the same jobs (the tag
+# is then the source of truth and is not re-created). It cannot save a cache,
+# because GitHub scopes a save to the ref of the run, but it can read the caches
+# this workflow saves on main.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (MAJOR.MINOR.PATCH, optional -prerelease)"
+        required: true
+        type: string
+      commit:
+        description: "40-hex commit SHA to build and tag; must equal the dispatched ref"
+        required: true
+        type: string
+      dry_run:
+        description: "Build and verify every artifact, but create no tag and no release"
+        required: false
+        default: false
+        type: boolean
+
+# `contents: write` creates the tag and the release; `actions: write` lets the
+# best-effort cache-prune job delete stale release caches.
+permissions:
+  contents: write
+  actions: write
+
+# One release at a time, and never cancel one in flight: a cancelled build must
+# not leave a tag or a half-uploaded release behind.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: write
-
 jobs:
-  # The tag and the binary must agree before anything is built: a release that
-  # says v1.0.1 while the binary reports 1.0.0 is a self-update loop waiting to
-  # happen. This is the gate the whole release depends on.
+  # The requested version, the checked-out commit, and Cargo.toml must agree
+  # before anything is built. The commit pin is the TOCTOU guard: main can move
+  # between `./dev publish` pushing and this run being created, and a release
+  # must build exactly the commit the version bump produced.
   version:
     name: version guard
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.guard.outputs.version }}
+      tag: ${{ steps.guard.outputs.tag }}
+      prerelease: ${{ steps.guard.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v5
-      - name: Tag matches the workspace version
+      - id: guard
+        name: Version and commit match
+        env:
+          REQUESTED: ${{ github.event.inputs.version }}
+          COMMIT: ${{ github.event.inputs.commit }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
+          # A tag push carries the version in the ref; a dispatch carries it in
+          # an input. The commit pin only exists for the dispatch path: a tag
+          # already points at exactly one commit.
+          if [ -n "${REQUESTED:-}" ]; then
+            version="${REQUESTED#v}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$version' is not MAJOR.MINOR.PATCH with an optional -prerelease suffix"
+            exit 1
+          fi
+          head="$(git rev-parse HEAD)"
+          if [ -n "${COMMIT:-}" ] && [ "$head" != "$COMMIT" ]; then
+            echo "::error::checked out $head but the request pinned $COMMIT"
+            echo "::error::main moved after ./dev publish pushed; re-run ./dev publish"
+            exit 1
+          fi
           cargo_version="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
-          echo "tag:   $tag"
-          echo "cargo: $cargo_version"
           if [ -z "$cargo_version" ]; then
             echo "::error::could not read the workspace version from Cargo.toml"
             exit 1
           fi
-          if [ "$tag" != "$cargo_version" ]; then
-            echo "::error::tag v$tag does not match workspace version $cargo_version"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::requested $version but Cargo.toml says $cargo_version"
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          case "$version" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # The SPA is platform-independent output that rust-embed freezes into every
+  # binary at Rust compile time. It used to be built four times, once per matrix
+  # runner, and sat on the Windows critical path. Build it once here, hash it,
+  # and hand the same bytes to every Rust build.
+  prepare-web:
+    name: prepare WebUI (once)
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.hash.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/leveler-web/web/package-lock.json
+
+      - name: Build WebUI
+        working-directory: crates/leveler-web/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Hash the built WebUI
+        id: hash
+        run: |
+          set -euo pipefail
+          digest="$(sh packaging/scripts/web_dist_hash.sh)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload WebUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: crates/leveler-web/web/dist
+          if-no-files-found: error
+          retention-days: 1
 
   build:
     name: build (${{ matrix.target }})
-    needs: version
+    needs: [version, prepare-web]
     strategy:
       fail-fast: false
       matrix:
@@ -62,32 +170,44 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The SPA is embedded by rust-embed at Rust compile time. Each matrix
-      # runner must create web/dist locally; the separate CI WebUI job cannot
-      # contribute files to this release build.
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      # rust-embed reads `crates/leveler-web/web/dist` at compile time, so it
+      # must exist before the first cargo build. rust-cache prunes workspace
+      # crates, so leveler-web always recompiles here and always embeds these
+      # bytes rather than a cached copy.
+      - name: Fetch the prepared WebUI
+        uses: actions/download-artifact@v4
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: crates/leveler-web/web/package-lock.json
+          name: web-dist
+          path: .
 
-      - name: Build WebUI
+      - name: Verify the WebUI artifact
+        shell: bash
+        env:
+          EXPECTED_DIGEST: ${{ needs.prepare-web.outputs.digest }}
         run: |
-          npm --prefix crates/leveler-web/web ci
-          npm --prefix crates/leveler-web/web run build
+          set -euo pipefail
+          test -s crates/leveler-web/web/dist/index.html
+          got="$(sh packaging/scripts/web_dist_hash.sh)"
+          if [ "$EXPECTED_DIGEST" != "$got" ]; then
+            echo "::error::WebUI artifact hash mismatch: built $EXPECTED_DIGEST, downloaded $got"
+            exit 1
+          fi
+          echo "WebUI digest: $got"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0
         with:
           targets: ${{ matrix.target }}
 
-      # Dependencies only, keyed per target, with fallback to an older
-      # Cargo.lock's cache (every version bump changes the lock).
+      # Dependencies only, keyed per target. On `main` this cache is saved to
+      # the default branch and restored by the next version through
+      # rust-cache's lockfile-agnostic restore key — the reason the build runs
+      # here instead of on the tag.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build
         run: cargo build --release --locked -p leveler-cli --target ${{ matrix.target }}
@@ -103,7 +223,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${{ needs.version.outputs.version }}"
           name="leveler-v${version}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/leveler" "dist/${name}/"
@@ -125,7 +245,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $version = "${{ needs.version.outputs.version }}"
           $name = "leveler-v$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/leveler.exe" "dist/$name/"
@@ -151,9 +271,78 @@ jobs:
             dist/*.zip.sha256
           if-no-files-found: error
 
+  # Only reachable with the workflow_dispatch dry_run input: it reuses the real
+  # build jobs above, verifies the same archives and checksums, and publishes
+  # nothing.
+  dry-run:
+    name: dry run · verify artifacts
+    needs: build
+    if: ${{ github.event.inputs.dry_run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify every artifact and its checksum
+        run: |
+          set -euo pipefail
+          expected=8
+          count="$(ls dist | wc -l)"
+          if [ "$count" -ne "$expected" ]; then
+            echo "::error::expected $expected assets, found $count"
+            exit 1
+          fi
+          for sum in dist/*.sha256; do
+            base="${sum%.sha256}"
+            if [ ! -f "$base" ]; then
+              echo "::error::checksum has no archive: $sum"
+              exit 1
+            fi
+            # PowerShell writes CRLF; `shasum -c` would read the \r as part of
+            # the filename. Compare the hex itself, which is the contract.
+            want="$(tr -d '\r' < "$sum" | awk '{print $1}')"
+            got="$(shasum -a 256 "$base" | awk '{print $1}')"
+            if [ "$want" != "$got" ]; then
+              echo "::error::$base checksum mismatch: file says $want, archive is $got"
+              exit 1
+            fi
+          done
+          echo "dry run: $count verified assets, no tag and no release created"
+
+  # rust-cache's restore key drops the Cargo.lock hash and only ever selects the
+  # newest match per target, so older release generations are dead weight: four
+  # ~390 MB caches per release against the repository's 10 GB cache limit. Keep
+  # the four this run just saved and delete the rest. Best effort: a cleanup
+  # failure must never fail a release that already built and verified.
+  prune-cache:
+    name: prune stale release caches
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' && github.event.inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Keep only the newest release cache per target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$SLUG/actions/caches?per_page=100" \
+            --jq '.actions_caches[] | select(.key | startswith("v0-rust-release-")) | [.created_at, .id, .key] | @tsv' \
+            | LC_ALL=C sort -r \
+            | awk -F'\t' 'NR > 4 { print $2 }' \
+            | while IFS= read -r id; do
+                [ -n "$id" ] || continue
+                echo "deleting stale release cache $id"
+                gh api --method DELETE "repos/$SLUG/actions/caches/$id" >/dev/null
+              done
+
   release:
     name: publish release
-    needs: build
+    needs: [version, build]
+    if: ${{ github.event.inputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     steps:
       # Checkout first: a later checkout would wipe downloaded artifacts.
@@ -164,19 +353,17 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # A tag with a SemVer pre-release part (`v1.0.0-beta.1`) is a GitHub
-      # pre-release, so `releases/latest` stays on the last stable tag.
-      # install.sh and Homebrew follow that; a beta is installed only when
-      # asked for by tag (`LEVELER_VERSION=v…`).
+      # A version with a SemVer pre-release part is a GitHub pre-release, so
+      # `releases/latest` stays on the last stable tag. install.sh and Homebrew
+      # follow that; a beta is installed only when asked for by tag.
       - name: Compose bilingual release notes
         run: |
           set -euo pipefail
-          # Tag is the heading. Skip each file's title and the cross-language link.
           notes() {
             awk 'NR==1 && /^# / { next } /^Chinese:/ { next } /^英文版：/ { next } { print }' "$1"
           }
           {
-            echo "# CodeLeveler ${GITHUB_REF_NAME}"
+            echo "# CodeLeveler v${{ needs.version.outputs.version }}"
             echo
             echo "## English"
             echo
@@ -187,26 +374,74 @@ jobs:
             notes docs/RELEASE.zh-CN.md
           } > /tmp/release-body.md
 
-      - name: Create draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          generate_release_notes: false
-          body_path: /tmp/release-body.md
-          # Upload is done by the next step, not this action: its parallel
-          # uploader does not retry transient 5xx responses from GitHub, so a
-          # single hiccup on any of the 8 assets fails the whole job.
+      # The tag is created here on the dispatch path, after every artifact
+      # exists and verified, so a failed build never leaves a tag. A re-run finds
+      # the tag it created and resumes; a tag at a different commit fails closed
+      # instead of silently publishing the wrong source. A tag-push run skips
+      # this: the pushed tag is already the source of truth.
+      - name: Ensure the tag points at the built commit
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.event.inputs.commit }}
+        run: |
+          set -euo pipefail
+          # Both the tag object and its peeled commit: an annotated tag's first
+          # line is the tag object, not the commit the release must point at,
+          # and a lightweight tag has no peeled line at all.
+          existing="$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          if [ -n "$existing" ]; then
+            at="$(printf '%s\n' "$existing" | awk -F'\t' '/\^\{\}$/ { print $1 }')"
+            if [ -z "$at" ]; then
+              at="$(printf '%s\n' "$existing" | awk -F'\t' 'NR == 1 { print $1 }')"
+            fi
+            if [ "$at" != "$SHA" ]; then
+              echo "::error::$TAG already exists at $at, not at the built commit $SHA"
+              exit 1
+            fi
+            echo "$TAG already exists at the built commit; resuming"
+          else
+            git tag -a "$TAG" -m "$TAG" "$SHA"
+            git push origin "refs/tags/$TAG"
+          fi
 
+      # A published release is immutable from here: this only creates a new
+      # draft, or resumes an incomplete draft from a failed previous attempt.
+      - name: Create or resume the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          state="$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)"
+          if [ "$state" = "false" ]; then
+            echo "::error::release $TAG is already published; refusing to overwrite"
+            exit 1
+          fi
+          if [ "$state" = "missing" ]; then
+            args=(--draft --title "$TAG" --notes-file /tmp/release-body.md)
+            if [ "$PRERELEASE" = "true" ]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$TAG" "${args[@]}"
+          else
+            echo "$TAG already has a draft release; resuming"
+          fi
+
+      # Uploaded serially with retries: the action's parallel uploader does not
+      # retry transient 5xx responses, so one hiccup on any asset would fail the
+      # whole job.
       - name: Upload release assets (serial, with retries)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
           for f in dist/*; do
             uploaded=0
             for attempt in 1 2 3 4 5; do
-              if gh release upload "$GITHUB_REF_NAME" "$f" --clobber; then
+              if gh release upload "$TAG" "$f" --clobber; then
                 uploaded=1
                 break
               fi
@@ -224,12 +459,13 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
           expected=$(ls dist | wc -l)
-          attached=$(gh release view "$GITHUB_REF_NAME" --json assets -q '.assets | length')
+          attached=$(gh release view "$TAG" --json assets -q '.assets | length')
           if [ "$attached" -ne "$expected" ]; then
             echo "::error::release has $attached assets, expected $expected; not publishing"
             exit 1
           fi
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit "$TAG" --draft=false
