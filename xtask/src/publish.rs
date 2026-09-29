@@ -249,13 +249,13 @@ fn parse_args(args: &[String]) -> Result<Opts, Fail> {
 }
 
 fn set_level(slot: &mut Option<Level>, level: Level) -> Result<(), Fail> {
-    if let Some(existing) = *slot {
-        if existing != level {
-            return Err(Fail::new(
-                "PUBLISH_LEVEL_CONFLICT",
-                "pass only one of --patch, --minor, --major",
-            ));
-        }
+    if let Some(existing) = *slot
+        && existing != level
+    {
+        return Err(Fail::new(
+            "PUBLISH_LEVEL_CONFLICT",
+            "pass only one of --patch, --minor, --major",
+        ));
     }
     *slot = Some(level);
     Ok(())

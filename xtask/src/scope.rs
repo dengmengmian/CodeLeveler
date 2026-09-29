@@ -50,10 +50,10 @@ pub fn affected(repo: &Path, files: &[PathBuf]) -> Result<Affected, Fail> {
     let repo = canonicalize_repo(repo)?;
     let mut reasons = Vec::new();
     for file in files {
-        if let Some(reason) = workspace_reason(&repo, file) {
-            if !reasons.contains(&reason) {
-                reasons.push(reason);
-            }
+        if let Some(reason) = workspace_reason(&repo, file)
+            && !reasons.contains(&reason)
+        {
+            reasons.push(reason);
         }
     }
     if !reasons.is_empty() {
@@ -358,10 +358,8 @@ fn package_name(text: &str) -> Option<String> {
             in_package = trimmed == "[package]";
             continue;
         }
-        if in_package {
-            if let Some(name) = assignment(trimmed, "name") {
-                return Some(name);
-            }
+        if in_package && let Some(name) = assignment(trimmed, "name") {
+            return Some(name);
         }
     }
     None

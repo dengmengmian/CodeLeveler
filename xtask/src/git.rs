@@ -20,10 +20,7 @@ pub fn snapshot(host: &dyn Host, repo: &Path) -> Result<Snapshot, Fail> {
     }
     Ok(Snapshot {
         head,
-        porcelain: status
-            .stdout
-            .trim_end_matches(|c| c == '\n' || c == '\r')
-            .to_string(),
+        porcelain: status.stdout.trim_end_matches(['\n', '\r']).to_string(),
     })
 }
 

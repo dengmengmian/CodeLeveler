@@ -308,10 +308,10 @@ fn workspace_version(manifest: &str) -> Result<SemVer, Fail> {
             section = trimmed.to_string();
             continue;
         }
-        if section == "[workspace.package]" {
-            if let Some(value) = assignment(trimmed, "version") {
-                return parse_stable(&value);
-            }
+        if section == "[workspace.package]"
+            && let Some(value) = assignment(trimmed, "version")
+        {
+            return parse_stable(&value);
         }
     }
     Err(Fail::new(
