@@ -111,6 +111,13 @@ export interface ContextCategory {
 /** Deterministic context-pressure level derived from real thresholds — never a model's judgement. */
 export type ContextPressure = 'normal' | 'warning' | 'critical';
 
+/** Who owns the conversation state a provider validates against. Today every supported route is [`Self::ClientManaged`]: the harness resends the full active history. The vocabulary exists so a future route that keeps the state server-side (`previous_response_id`-style) can say so without the kernel assuming client-owned replay state is an eternal property of models. */
+export type ConversationStateOwnership =
+  /** The client resends the model-visible history on every request. */
+  | 'client_managed'
+  /** The provider keeps the conversation state; the client sends a cursor. No supported route constructs this yet. */
+  | 'provider_managed';
+
 /** What kind of failure this is, in product terms. Vendor error codes are not part of this vocabulary — `Moonshot invalid_request_error`, `OpenAI invalid_request_error` and `Anthropic invalid_request_error` are all just [`FailureCategory::InvalidRequest`] here. */
 export type FailureCategory =
   /** A network/transport failure reaching a provider or service. */
@@ -200,6 +207,16 @@ export interface ModelRef {
   provider: string;
 }
 
+/** Provider-native context management the route exposes. All fields are `false` for every route supported today: CodeLeveler owns the active-history lifecycle. They are declared (not derived) so a future route can advertise e.g. server-side reasoning pruning without the harness having to branch on its name — the context policy reads these flags. A flag that no route declares is simply not consulted. */
+export interface NativeContextCapabilities {
+  /** The provider performs its own history compaction. */
+  native_compaction?: boolean;
+  /** The provider can prune historical reasoning server-side. */
+  reasoning_pruning?: boolean;
+  /** The provider owns conversation state across requests. */
+  server_state?: boolean;
+}
+
 /** Severity for a transient notification . */
 export type NotificationLevel = 'info' | 'warning' | 'error';
 
@@ -210,6 +227,13 @@ export type PermissionProfile = 'request_approval' | 'assisted' | 'full_access';
 
 /** The lifecycle state of a plan step (mirrors the orchestrator's `NodeStatus`). */
 export type PlanStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+
+/** How the route requires retained reasoning to be preserved. Orthogonal to representation: a route may never carry reasoning, carry it as an editable field, or carry it as an opaque block — and separately it either accepts a harness decision to fold/drop a retained turn, or it does not. This is the dimension the context lifecycle consults when it asks "may I cut this boundary?": it never asks "is this model DeepSeek?". */
+export type ReasoningIntegrity =
+  /** The route puts no integrity requirement on reasoning it retains. */
+  | 'unconstrained'
+  /** Every assistant turn still in the active history must replay its captured reasoning verbatim. The harness may not truncate, rewrite or silently omit it while the turn remains; only the context lifecycle may remove the whole turn. */
+  | 'retained_exact';
 
 /** What the projection did with the requested retention arm, in facts rather than in a claim. An experiment that asked for `None` and got every retained turn's reasoning anyway must not be recorded as `None`: [`Self::protocol_protected_turns`] is exactly how many turns the provider contract kept that the requested arm would have dropped. */
 export interface ReasoningProjectionSummary {
@@ -225,22 +249,39 @@ export interface ReasoningProjectionSummary {
   requested: ReasoningRetention;
 }
 
-/** The resolved reasoning-replay contract for one route. */
+/** The resolved reasoning contract for one route. Four orthogonal dimensions, none of which is a model or provider name: * [`Self::representation`] — the form captured reasoning takes on the wire; * [`Self::scope`] / [`Self::missing`] — when it is carried, and what an empty replayed turn carries; * [`Self::integrity`] — whether retained reasoning may be changed; * [`Self::state`] / [`Self::native_context`] — who owns the validated state, and what context management the provider offers. The context lifecycle reads this contract to decide whether a cut boundary keeps the protocol valid. A provider never gets a branch of its own. */
 export interface ReasoningReplayContract {
-  missing: MissingReasoningReplay;
-  scope: ReasoningReplayScope;
-  /** Whether authenticated/opaque reasoning blocks are a replay channel. */
-  signed_blocks?: boolean;
+  /** Whether retained reasoning must be replayed verbatim. */
+  integrity?: ReasoningIntegrity;
+  /** What an empty replayed turn carries. */
+  missing?: MissingReasoningReplay;
+  /** Provider-native context management, if any. */
+  native_context?: NativeContextCapabilities;
+  /** The form captured reasoning takes when replayed. */
+  representation?: ReasoningRepresentation;
+  /** When captured reasoning is carried. */
+  scope?: ReasoningReplayScope;
+  /** Who owns the validated conversation state. */
+  state?: ConversationStateOwnership;
 }
 
 /** When captured reasoning is carried back to a provider on historical assistant turns. This is a ROUTE fact, not a harness preference: it is resolved from the protocol the route speaks and the route's declared compatibility. A provider that validates the field and a provider that has no field at all both have to be expressible without naming either of them. */
 export type ReasoningReplayScope =
-  /** The route has no channel for historical reasoning. Captured reasoning stays in the durable transcript and never reaches this provider. This is the default: a route carries nothing until it declares otherwise, so no route inherits another's requirement. */
+  /** The route has no channel for historical reasoning. Captured reasoning stays in the durable transcript and never reaches this provider. */
   | 'never'
   /** Carried only on requests that expose tools — the scope a provider that validates reasoning on tool rounds defines its requirement in. */
   | 'when_tools_present'
   /** Carried on every request that spans the history. */
   | 'always';
+
+/** The FORM in which a route replays captured reasoning to the provider. One orthogonal dimension of [`ReasoningReplayContract`]. It answers "what does the provider expect this evidence to look like?", which is a different question from [`ReasoningReplayScope`]'s "when is it carried?" and from [`ReasoningIntegrity`]'s "may we change it?". */
+export type ReasoningRepresentation =
+  /** The route has no channel for captured reasoning. This is the default: a route carries nothing until it declares otherwise, so no route inherits another's requirement. */
+  | 'none'
+  /** A plain assistant message field the harness itself composes from the captured text (today: an OpenAI-Chat-compatible `reasoning_content`). */
+  | 'raw_assistant_field'
+  /** An authenticated/opaque block the provider issued on the way in and expects back verbatim (today: Messages `thinking` / `redacted_thinking`). */
+  | 'signed_block';
 
 /** How much historical assistant reasoning one request carries. This is the REQUESTED arm. The protocol-safe effective view is produced by [`crate::RequestProjection::project`], which reports any difference. [`ReasoningRetention::All`] is the production default and is byte-identical to carrying every reasoning block. */
 export type ReasoningRetention =
