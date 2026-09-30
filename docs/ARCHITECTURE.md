@@ -1056,6 +1056,43 @@ These products exist in this repository:
 
 A standalone desktop app and cloud workers are not shipped. Custom agents: [`AGENT_EXTENSIBILITY.md`](AGENT_EXTENSIBILITY.md).
 
+### 13.2 TUI projection and performance invariants (Do Not Regress)
+
+The TUI presents Runtime facts; it does not create them. These contracts are
+verified by deterministic tests and real dogfood — do not regress them:
+
+- **Projection rebuild is decoupled from paint cadence**: a streaming delta only
+  accumulates semantic input; the conversation projection rebuilds once per
+  painted frame, never once per delta.
+- **Bounded highlight cache**: fenced-code syntect results use a bounded LRU
+  (512 entries / 4 MiB) keyed by `(lang, exact code)`, independent of the theme;
+  the theme only maps colors at render time, eviction is O(1).
+- **Finalized-item wrap memo**: immutable transcript items reuse their wrapped
+  lines; only the item whose content changed is recomputed. Items that read live
+  state (ToolGroup / SubAgent / UserShell) are never memoized. **A height-only
+  resize must still invalidate the projection.**
+- **Workspace Diff is O(1) in git subprocesses**: tracked changes use one
+  `git diff --numstat HEAD` plus one multi-file `git diff HEAD`, and untracked
+  files are rendered as new-file patches in Rust; the process count does not grow
+  with the file count.
+- **A decision overlay's focused row is always visible**: approval /
+  clarification / every picker keeps the focused row and its decision block
+  inside any drawable height, and a resize returns to the focus.
+- **`Diff Failed` is not Empty**: an unreadable workspace must be shown as a
+  failure, never as "no changes".
+- **Error source and delivery are structured facts**: `LocalConfiguration`,
+  `Auth` (structured `error.code`) and `ConnectionRefused` (structured
+  `io::ErrorKind`) are decided from facts; `message.contains(...)` string
+  matching is forbidden.
+- **Responsive diff preview**: the Conversation edit-preview budget is derived
+  from the conversation viewport height (quantized so a notice row cannot shift
+  it); the full-screen Diff page still shows the whole patch.
+- **Ctrl+G jumps to the Final answer**: the anchor reuses the same memoized
+  projection; with no Final it only notifies and never moves the viewport.
+- **Performance baseline**: `leveler-tui`'s `perf_bench` is the deterministic
+  performance regression baseline and `ux_experiment` the 80×24 UX regression
+  fixture; both run manually with `--ignored`.
+
 ---
 
 ## 14. How One Task Actually Flows

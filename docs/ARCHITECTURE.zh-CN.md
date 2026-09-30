@@ -1038,6 +1038,34 @@ Web 客户端
 
 独立桌面应用和云端 Worker 还没有发布。自定义 Agent：[`AGENT_EXTENSIBILITY.zh-CN.md`](AGENT_EXTENSIBILITY.zh-CN.md)。
 
+### 13.2 TUI 投影与性能不变量（Do Not Regress）
+
+TUI 展示运行时事实，不自己制造事实。下列契约已由 deterministic 测试与真实
+dogfood 验证，不要在后续改动中回退：
+
+- **投影重建与绘制节奏解耦**：streaming delta 只累积语义增量，会话投影在
+  painted frame 节奏重建一次；不得退回“每个 delta 重建一次”。
+- **有界高亮缓存**：代码块 syntect 结果使用有界 LRU（512 项 / 4 MiB），key 为
+  `(lang, 代码内容)`，与主题无关；主题只在渲染期映射颜色，代价 O(1) 淘汰。
+- **finalized item 包裹结果 memo**：不可变 transcript item 复用已 wrap 行，只有
+  内容变化的 item 重新计算；读取 live 状态的 item（ToolGroup / SubAgent /
+  UserShell）不进入 memo。**仅高度变化的 resize 也必须使投影失效**。
+- **Workspace Diff 进程数 O(1)**：tracked 改动用一次 `git diff --numstat HEAD`
+  加一次多文件 `git diff HEAD`，untracked 在 Rust 内生成 new-file patch；git
+  进程数与文件数无关。
+- **决策 overlay 的焦点项始终可见**：approval / clarification / 所有 picker 在
+  任意可绘高度下把焦点行与决策块留在视口内，resize 后自动回到焦点。
+- **`Diff Failed` ≠ Empty**：读不到工作区时显式呈现失败，不能显示“无改动”。
+- **错误来源与投递事实结构化**：`LocalConfiguration`、`Auth`（结构化
+  `error.code`）、`ConnectionRefused`（结构化 `io::ErrorKind`）都从事实判定；
+  禁止 `message.contains(...)` 字符串特判。
+- **响应式 diff 预览**：Conversation 的 edit preview 预算由会话视口高度推导
+  （量化以避免 notice 行引起的抖动）；全屏 Diff 页仍显示完整 patch。
+- **Ctrl+G 跳到最终回答**：锚点复用同一份 memoized 投影；无 Final 时只提示，
+  不移动视口。
+- **性能基线**：`leveler-tui` 的 `perf_bench` 是 deterministic 性能回归基线，
+  `ux_experiment` 是 80×24 的 UX 回归 fixture；两者都以 `--ignored` 手动运行。
+
 ---
 
 ## 14. 一次任务到底怎么跑
