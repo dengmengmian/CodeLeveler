@@ -542,6 +542,7 @@ pub struct UiText {
     pub diff_files_pane: &'static str,
     pub diff_empty: &'static str,
     pub diff_loading: &'static str,
+    pub diff_failed: &'static str,
     pub diff_reload_hint: &'static str,
     pub diff_footer_hint: &'static str,
     /// Sessions screen: the empty state and the footer hint.
@@ -1377,6 +1378,7 @@ static ZH: UiText = UiText {
     diff_files_pane: " 文件 ",
     diff_empty: "无改动",
     diff_loading: "正在读取改动…",
+    diff_failed: "读取改动失败",
     diff_reload_hint: "Ctrl+D 刷新以加载补丁",
     diff_footer_hint: "↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回",
     sessions_empty: "暂无会话",
@@ -2093,6 +2095,7 @@ static EN: UiText = UiText {
     diff_files_pane: " Files ",
     diff_empty: "No changes",
     diff_loading: "Reading changes…",
+    diff_failed: "Failed to read changes",
     diff_reload_hint: "Ctrl+D to reload the patch",
     diff_footer_hint: "↑↓ select file · PgUp/PgDn scroll · Esc back",
     sessions_empty: "No sessions yet",

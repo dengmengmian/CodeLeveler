@@ -287,6 +287,23 @@ fn tui_session_commands_ui_and_logic() {
     typed(&mut s, "/diff");
     enter(&mut s);
     assert_eq!(s.active_screen, Screen::Diff);
+    // The screen asked the runtime for a fresh diff; answer it as the runtime
+    // would. Until then the screen must say "reading", not show the old files.
+    let query_id = s.diff_query.clone();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id,
+            diff: UiDiff {
+                files: vec![UiDiffFile {
+                    path: "src/main.rs".into(),
+                    added: 3,
+                    removed: 1,
+                    patch: Some("@@\n-old line\n+new line\n+another\n+third\n context line".into()),
+                }],
+            },
+        }),
+    );
     let diff_ui = screen(&mut s);
     assert!(
         diff_ui.contains("src/main.rs") || diff_ui.contains("main.rs"),

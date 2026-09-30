@@ -838,6 +838,29 @@ fn renders_plan_chrome_and_diff_screen() {
         ))
     };
     reduce(&mut state, ctrl_key('d')); // open diff
+    // Opening requests a fresh diff, so the previous listing must not be shown
+    // as the answer while the request is in flight: loading is not empty.
+    let loading = render_at(100, 24, &mut state);
+    assert!(
+        !loading.contains("src/login.rs"),
+        "a stale diff must not be shown while loading: {loading}"
+    );
+    // The runtime replies to the request with the requested diff.
+    let query_id = state.diff_query.clone();
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id,
+            diff: UiDiff {
+                files: vec![UiDiffFile {
+                    path: "src/login.rs".into(),
+                    added: 12,
+                    removed: 4,
+                    patch: Some("+added line\n-removed line".into()),
+                }],
+            },
+        }),
+    );
     let diff = render_at(100, 24, &mut state);
     assert!(diff.contains("src/login.rs"), "diff file missing");
     assert!(diff.contains("+12"), "diff added count missing");

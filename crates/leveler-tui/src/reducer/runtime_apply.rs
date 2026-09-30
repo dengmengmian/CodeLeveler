@@ -295,10 +295,26 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             state.turn_diff_files = Some(diff.files.len());
             state.diff_pending = false;
+            state.diff_error = None;
             if state.diff_selected >= diff.files.len() {
                 state.diff_selected = 0;
             }
             state.diff = Some(diff);
+        }
+        RuntimeEvent::DiffFailed { query_id, message } => {
+            if let Some(query_id) = query_id {
+                if state.diff_query.as_ref() != Some(&query_id) {
+                    return;
+                }
+                state.diff_query = None;
+            }
+            // A failed read is not an empty workspace: keep the failure fact and
+            // drop any stale listing so the screen cannot show old files as the
+            // answer to a request that did not succeed.
+            state.diff_pending = false;
+            state.diff = None;
+            state.diff_selected = 0;
+            state.diff_error = Some(message);
         }
         RuntimeEvent::SessionCompleted { report } => {
             state.transcript.push_completion(report);

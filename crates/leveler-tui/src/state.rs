@@ -314,6 +314,9 @@ pub struct AppState {
     /// from "there are no changes" — the Diff screen must never claim the
     /// workspace is clean while it is still computing the diff.
     pub diff_pending: bool,
+    /// Why the last `RequestDiff` failed, if it did. Separate from an empty
+    /// `diff`: an unreadable workspace must not be shown as "no changes".
+    pub diff_error: Option<String>,
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
@@ -583,6 +586,7 @@ impl AppState {
             diff_query: None,
             diff: None,
             diff_pending: false,
+            diff_error: None,
             diff_selected: 0,
             goal_mode_active: false,
             work_profile: "balanced".into(),

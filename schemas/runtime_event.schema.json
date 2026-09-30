@@ -581,6 +581,37 @@
       }
     },
     {
+      "description": "A requested working-tree diff could not be computed. Distinct from `DiffUpdated` with zero files, which is a real \"no changes\" answer: clients must never present an unreadable workspace as clean.",
+      "type": "object",
+      "required": [
+        "message",
+        "type"
+      ],
+      "properties": {
+        "message": {
+          "description": "Machine-facing detail (git's own message or the reason the path is not a work tree). Clients own the localized label.",
+          "type": "string"
+        },
+        "query_id": {
+          "description": "Present only for a `RequestDiff` response. `None` when the failure happened during a broadcast refresh.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "diff_failed"
+          ]
+        }
+      }
+    },
+    {
       "description": "A conversation checkpoint was created (spec §68).",
       "type": "object",
       "required": [
@@ -3533,6 +3564,37 @@
               "type": "string",
               "enum": [
                 "diff_updated"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A requested working-tree diff could not be computed. Distinct from `DiffUpdated` with zero files, which is a real \"no changes\" answer: clients must never present an unreadable workspace as clean.",
+          "type": "object",
+          "required": [
+            "message",
+            "type"
+          ],
+          "properties": {
+            "message": {
+              "description": "Machine-facing detail (git's own message or the reason the path is not a work tree). Clients own the localized label.",
+              "type": "string"
+            },
+            "query_id": {
+              "description": "Present only for a `RequestDiff` response. `None` when the failure happened during a broadcast refresh.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "diff_failed"
               ]
             }
           }

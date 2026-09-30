@@ -127,17 +127,32 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
 
     let mut rows: Vec<Line> = Vec::new();
     if files.is_empty() {
-        // Loading is not empty. Saying "无改动" while a diff of thousands of
-        // files is still being computed is a false claim about the workspace.
-        let text = if state.diff_pending {
-            t.diff_loading
+        // Loading is not empty, and a failed read is not empty either. Saying
+        // "无改动" while a diff of thousands of files is still being computed —
+        // or when git could not be read at all — is a false claim about the
+        // workspace.
+        if let Some(error) = &state.diff_error {
+            rows.push(Line::from(Span::styled(
+                t.diff_failed,
+                Style::default().fg(theme.status.error),
+            )));
+            for piece in wrap(error, list_w.max(1)) {
+                rows.push(Line::from(Span::styled(
+                    piece,
+                    Style::default().fg(theme.text.secondary),
+                )));
+            }
         } else {
-            t.diff_empty
-        };
-        rows.push(Line::from(Span::styled(
-            text,
-            Style::default().fg(theme.text.secondary),
-        )));
+            let text = if state.diff_pending {
+                t.diff_loading
+            } else {
+                t.diff_empty
+            };
+            rows.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(theme.text.secondary),
+            )));
+        }
     }
     for (i, f) in files.iter().enumerate() {
         let cursor = if i == selected { "› " } else { "  " };

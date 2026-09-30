@@ -3199,13 +3199,17 @@ impl InProcessRuntimeClient {
                                     format!("对话已回滚,但工作区文件回滚失败: {error}"),
                                 );
                             } else {
-                                let diff = compute_diff(&self.app.layout.repo_root, true);
-                                let _ =
-                                    self.events_for(&session_id)
-                                        .send(RuntimeEvent::DiffUpdated {
-                                            query_id: None,
-                                            diff,
-                                        });
+                                let event = match compute_diff(&self.app.layout.repo_root, true) {
+                                    Ok(diff) => RuntimeEvent::DiffUpdated {
+                                        query_id: None,
+                                        diff,
+                                    },
+                                    Err(error) => RuntimeEvent::DiffFailed {
+                                        query_id: None,
+                                        message: error.to_string(),
+                                    },
+                                };
+                                let _ = self.events_for(&session_id).send(event);
                             }
                         }
                         None => {
@@ -3774,8 +3778,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let repo = self.app.layout.repo_root.clone();
                 let events = self.events_for(&session_id);
                 tokio::task::spawn_blocking(move || {
-                    let diff = compute_diff(&repo, true);
-                    let _ = events.send(RuntimeEvent::DiffUpdated { query_id, diff });
+                    let event = match compute_diff(&repo, true) {
+                        Ok(diff) => RuntimeEvent::DiffUpdated { query_id, diff },
+                        Err(error) => RuntimeEvent::DiffFailed {
+                            query_id,
+                            message: error.to_string(),
+                        },
+                    };
+                    let _ = events.send(event);
                 });
                 Ok(())
             }

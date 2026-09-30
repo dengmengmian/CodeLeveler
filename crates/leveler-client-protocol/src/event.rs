@@ -319,6 +319,18 @@ pub enum RuntimeEvent {
         query_id: Option<CommandId>,
         diff: UiDiff,
     },
+    /// A requested working-tree diff could not be computed. Distinct from
+    /// `DiffUpdated` with zero files, which is a real "no changes" answer:
+    /// clients must never present an unreadable workspace as clean.
+    DiffFailed {
+        /// Present only for a `RequestDiff` response. `None` when the failure
+        /// happened during a broadcast refresh.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_id: Option<CommandId>,
+        /// Machine-facing detail (git's own message or the reason the path is
+        /// not a work tree). Clients own the localized label.
+        message: String,
+    },
     /// A conversation checkpoint was created (spec §68).
     CheckpointCreated { checkpoint: UiCheckpoint },
     /// The list of stored sessions (spec §52).
