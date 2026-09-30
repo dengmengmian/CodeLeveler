@@ -2043,8 +2043,11 @@ mod tests {
         let bottom_pad = cy.saturating_add(ch);
         for x in 0..buf.area.width {
             let sym = buf.cell((x, bottom_pad)).map(|c| c.symbol()).unwrap_or(" ");
-            let badge =
-                sym.contains('▼') || sym.chars().all(|c| c.is_ascii_digit() || c.is_whitespace());
+            let badge = sym.contains('↓')
+                || sym.contains('行')
+                || sym
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace());
             assert!(
                 sym.trim().is_empty() || badge,
                 "row below content must stay empty, col {x} is {sym:?}"
@@ -2100,7 +2103,12 @@ mod tests {
             for x in content_right..buf.area.width {
                 let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
                 assert!(
-                    sym.trim().is_empty() || sym.contains('▼'),
+                    sym.trim().is_empty()
+                        || sym.contains('↓')
+                        || sym.contains('行')
+                        || sym
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace()),
                     "col {x} row {y} leaked past content right {content_right}: {sym:?}"
                 );
             }
@@ -2110,6 +2118,35 @@ mod tests {
     #[test]
     fn dark_automated_render_owns_surfaces() {
         assert_opaque_workbench(crate::theme::Theme::dark());
+    }
+
+    /// The scroll-to-bottom badge counts CONTENT LINES, so it must say so.
+    /// `▼36` read as "36 new messages"; `↓ 36 行` cannot.
+    #[test]
+    fn scroll_badge_names_the_unit_as_lines() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = test_state();
+        state.transcript.push_user("overflow ".repeat(400));
+        state.conv.auto_scroll = false;
+        state.conv.scroll = 0;
+        state.conv.unread = 36;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, &mut state))
+            .unwrap();
+        assert!(state.conv.scroll_bottom_rect.is_some(), "badge is visible");
+        let buf = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+        }
+        assert!(text.contains('↓'), "badge keeps the scroll glyph: {text:?}");
+        assert!(text.contains('行'), "badge names the line unit: {text:?}");
+        assert!(!text.contains('▼'), "the ambiguous glyph is gone: {text:?}");
     }
 
     #[test]

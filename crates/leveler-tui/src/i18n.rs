@@ -532,6 +532,11 @@ pub struct UiText {
     pub clarify_nav_hint: &'static str,
     pub clarify_nav_hint_multi: &'static str,
     pub clarify_nav_hint_text: &'static str,
+    /// Single-question variants: `Tab`/`Shift+Tab` switch questions, so with one
+    /// question those hints advertise a key that does nothing.
+    pub clarify_nav_hint_single: &'static str,
+    pub clarify_nav_hint_multi_single: &'static str,
+    pub clarify_nav_hint_text_single: &'static str,
     /// Selection pickers (model, theme, mode, …).
     pub picker_search: &'static str,
     pub picker_recommended: &'static str,
@@ -878,6 +883,9 @@ pub struct UiText {
     pub activity_follow_on: &'static str,
     pub activity_follow_paused: &'static str,
     pub activity_new_lines: &'static str,
+    /// Scroll-to-bottom badge count. `{}` is a number of CONTENT LINES below
+    /// the viewport, never a message count.
+    pub conv_scroll_below: &'static str,
     pub activity_hint_scroll: &'static str,
     /// Collapsed row for a finished batch: "{} 个工具 · Ctrl+O".
     pub batch_done: &'static str,
@@ -1371,6 +1379,9 @@ static ZH: UiText = UiText {
     clarify_nav_hint: "↑↓ 选择   Enter 确认   Tab 下一项   Shift+Tab 上一项   Esc 返回",
     clarify_nav_hint_multi: "↑↓ 选择   Space 多选   Enter 确认   Tab 下一项   Shift+Tab 上一项   Esc 返回",
     clarify_nav_hint_text: "Enter 确认   Tab 下一项   Shift+Tab 上一项   Esc 返回",
+    clarify_nav_hint_single: "↑↓ 选择   Enter 确认   Esc 返回",
+    clarify_nav_hint_multi_single: "↑↓ 选择   Space 多选   Enter 确认   Esc 返回",
+    clarify_nav_hint_text_single: "Enter 确认   Esc 返回",
     picker_search: "搜索：",
     picker_recommended: "  推荐",
     picker_current: " 当前",
@@ -1704,6 +1715,7 @@ static ZH: UiText = UiText {
     activity_follow_on: "Follow ON",
     activity_follow_paused: "Follow PAUSED",
     activity_new_lines: "↓ {} 新行",
+    conv_scroll_below: "↓ {} 行",
     activity_hint_scroll: "↑↓ 滚动 · PgUp/PgDn 翻页 · g/G 首尾",
     disclosure_shell_one: "执行了 1 个命令",
     disclosure_shell_many: "执行了 {} 个命令",
@@ -2088,6 +2100,9 @@ static EN: UiText = UiText {
     clarify_nav_hint: "↑↓ choose   Enter confirm   Tab next   Shift+Tab back   Esc return",
     clarify_nav_hint_multi: "↑↓ choose   Space toggle   Enter confirm   Tab next   Shift+Tab back   Esc return",
     clarify_nav_hint_text: "Enter confirm   Tab next   Shift+Tab back   Esc return",
+    clarify_nav_hint_single: "↑↓ choose   Enter confirm   Esc return",
+    clarify_nav_hint_multi_single: "↑↓ choose   Space toggle   Enter confirm   Esc return",
+    clarify_nav_hint_text_single: "Enter confirm   Esc return",
     picker_search: "Search: ",
     picker_recommended: "  Recommended",
     picker_current: " current",
@@ -2421,6 +2436,7 @@ static EN: UiText = UiText {
     activity_follow_on: "Follow ON",
     activity_follow_paused: "Follow PAUSED",
     activity_new_lines: "↓ {} new lines",
+    conv_scroll_below: "↓ {} lines",
     activity_hint_scroll: "↑↓ scroll · PgUp/PgDn page · g/G ends",
     disclosure_shell_one: "Ran 1 shell command",
     disclosure_shell_many: "Ran {} shell commands",

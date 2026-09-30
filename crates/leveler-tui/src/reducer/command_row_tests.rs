@@ -239,7 +239,7 @@ fn terminal_rows_name_how_the_command_ended() {
 
 /// Stopping a command at the live edge keeps following it. Dogfood: the stop
 /// click pinned the viewport like a disclosure click, so the stopped row's
-/// result and the model's answer landed below the screen behind a ▼ badge.
+/// result and the model's answer landed below the screen behind the scroll badge.
 #[test]
 fn stopping_a_command_at_the_live_edge_keeps_following() {
     let mut s = state();
@@ -947,4 +947,53 @@ fn clicking_a_headerless_mixed_group_still_opens_it() {
     );
     // Presentation only: both calls are still two calls.
     assert_eq!(s.transcript.tool_calls().len(), 2);
+}
+
+/// A failed `RequestDiff` must not be shown as loading or as "no changes".
+#[test]
+fn diff_failed_is_a_distinct_state_from_loading_and_empty() {
+    use leveler_client_protocol::{CommandId, UiDiff};
+
+    let mut s = state();
+    let query = CommandId::generate();
+    s.diff_pending = true;
+    s.diff_query = Some(query.clone());
+    s.diff = None;
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffFailed {
+            query_id: Some(query.clone()),
+            message: "fatal: not a git repository".into(),
+        }),
+    );
+    assert!(!s.diff_pending, "the request is no longer in flight");
+    assert_eq!(
+        s.diff_error.as_deref(),
+        Some("fatal: not a git repository"),
+        "the failure fact is kept"
+    );
+    assert!(s.diff.is_none(), "no stale listing is shown as the answer");
+
+    // A foreign reply must not clear this client's error.
+    let other = CommandId::generate();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffFailed {
+            query_id: Some(other),
+            message: "someone else's failure".into(),
+        }),
+    );
+    assert_eq!(s.diff_error.as_deref(), Some("fatal: not a git repository"));
+
+    // A later successful (empty) answer is a real "no changes" and clears it.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
+            diff: UiDiff { files: vec![] },
+        }),
+    );
+    assert!(s.diff_error.is_none(), "success clears the failure");
+    assert!(s.diff.is_some(), "an empty diff is still a loaded answer");
 }

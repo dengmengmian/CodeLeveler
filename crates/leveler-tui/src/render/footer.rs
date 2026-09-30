@@ -223,7 +223,11 @@ pub(crate) fn render_slash_popup(
         // Own every inner cell (pads included) before writing glyphs.
         let fill = " ".repeat(inner.width as usize);
         buf.set_stringn(inner.x, y, &fill, inner.width as usize, pad_style);
-        let marker = if selected { ">" } else { " " };
+        let marker = if selected {
+            crate::presentation::tokens::FOCUS_CURSOR
+        } else {
+            " "
+        };
         put_clipped(
             buf,
             inner.x,

@@ -96,10 +96,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if max_scroll > 0 && scroll < max_scroll && !state.conv.selection.is_active() {
         let below = max_scroll - scroll;
         let n = state.conv.unread.max(below);
+        // The count is CONTENT LINES below the viewport, not messages. Say so:
+        // `↓36` read as "36 new messages" when it was really "36 rows".
         let hint = if n > 1 {
-            format!(" ▼{n} ")
+            format!(
+                " {} ",
+                state.t().conv_scroll_below.replace("{}", &n.to_string())
+            )
         } else {
-            " ▼ ".to_string()
+            " ↓ ".to_string()
         };
         let hint_w = (hint.chars().count() as u16).max(1).min(area.width);
         // Bottom-right, not center — less likely to sit on prose mid-line.

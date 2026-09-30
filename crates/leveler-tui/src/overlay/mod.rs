@@ -834,7 +834,14 @@ fn clarification_content(
             let state = active
                 .is_multi()
                 .then(|| if active.selected[i] { "[x]" } else { "[ ]" });
-            let prefix = option_prefix_spans(i, total, focused, "❯", state, theme);
+            let prefix = option_prefix_spans(
+                i,
+                total,
+                focused,
+                crate::presentation::tokens::FOCUS_CURSOR,
+                state,
+                theme,
+            );
             let label_style = if focused {
                 Style::default()
                     .fg(theme.text.primary)
@@ -855,8 +862,14 @@ fn clarification_content(
         }
         if active.allow_other {
             let focused = active.on_other_row();
-            let prefix =
-                option_prefix_spans(active.options.len(), total, focused, "❯", None, theme);
+            let prefix = option_prefix_spans(
+                active.options.len(),
+                total,
+                focused,
+                crate::presentation::tokens::FOCUS_CURSOR,
+                None,
+                theme,
+            );
             let prefix_w: usize = prefix
                 .iter()
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
@@ -906,10 +919,24 @@ fn clarification_content(
     }
 
     lines.push(Line::from(""));
+    // With a single question, `Tab`/`Shift+Tab` have nothing to switch to, so
+    // the hint must not advertise them. The keyboard contract is unchanged —
+    // only the hint text is.
+    let single = ov.len() <= 1;
     let hint = if active.kind == ClarificationQuestionKind::Text || active.on_other_row() {
-        t.clarify_nav_hint_text
+        if single {
+            t.clarify_nav_hint_text_single
+        } else {
+            t.clarify_nav_hint_text
+        }
     } else if active.is_multi() {
-        t.clarify_nav_hint_multi
+        if single {
+            t.clarify_nav_hint_multi_single
+        } else {
+            t.clarify_nav_hint_multi
+        }
+    } else if single {
+        t.clarify_nav_hint_single
     } else {
         t.clarify_nav_hint
     };
@@ -965,7 +992,11 @@ fn selection_content(
     let total = visible.len();
     for (pos, (_, opt, is_cursor)) in visible.into_iter().enumerate() {
         let row = lines.len();
-        let focus = if is_cursor { "▸" } else { " " };
+        let focus = if is_cursor {
+            crate::presentation::tokens::FOCUS_CURSOR
+        } else {
+            " "
+        };
         // A searchable list types digits into the query, so it stays
         // unnumbered; every other picker numbers its rows from the count so a
         // two-digit row never shifts the label.
@@ -1096,7 +1127,11 @@ fn approval_content(
             // choice rather than hunting for a marker.
             let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 2);
             lines.push(Line::from(Span::styled(
-                format!("▸ {text}{}", " ".repeat(pad)),
+                format!(
+                    "{} {text}{}",
+                    crate::presentation::tokens::FOCUS_CURSOR,
+                    " ".repeat(pad)
+                ),
                 Style::default()
                     .fg(theme.text.primary)
                     .bg(theme.surface.selection),
@@ -1519,7 +1554,7 @@ mod layout_tests {
         ap.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         let screen = frame_of(&Overlay::Approval(Box::new(ap)), 80, 16);
         assert!(
-            screen.iter().any(|l| l.contains("拒绝") && l.contains('▸')),
+            screen.iter().any(|l| l.contains("拒绝") && l.contains('❯')),
             "the focused Deny scrolled off:\n{}",
             screen.join("\n")
         );
@@ -1557,7 +1592,7 @@ mod layout_tests {
         }
         let screen = frame_of(&Overlay::ModelPicker(model), 80, 8);
         let row = focus_row(&screen, "模型 11");
-        assert!(row.contains('▸'), "the focused option is unmarked: {row:?}");
+        assert!(row.contains('❯'), "the focused option is unmarked: {row:?}");
     }
 
     /// Resizing re-derives the offset from the current focus, so a row that was
@@ -1577,7 +1612,7 @@ mod layout_tests {
             let screen = frame_of(&ov, w, h);
             let row = focus_row(&screen, "模型 11");
             assert!(
-                row.contains('▸'),
+                row.contains('❯'),
                 "{w}×{h}: the focused row scrolled off:\n{}",
                 screen.join("\n")
             );
@@ -1609,6 +1644,75 @@ mod layout_tests {
         assert!(
             window.offset + window.body > 29,
             "block end scrolled off: {window:?}"
+        );
+    }
+
+    fn question(header: &str, kind: ClarificationQuestionKind) -> UiClarificationQuestion {
+        UiClarificationQuestion {
+            header: header.into(),
+            question: format!("{header}？"),
+            kind,
+            options: vec!["A".into(), "B".into()],
+            allow_other: false,
+            min_choices: 0,
+            max_choices: None,
+        }
+    }
+
+    fn multi_question(questions: Vec<UiClarificationQuestion>) -> ClarificationOverlay {
+        ClarificationOverlay::new(UiClarificationRequest {
+            id: ClarificationId::new("c1"),
+            question: "需要你的选择".into(),
+            options: Vec::new(),
+            questions,
+        })
+    }
+
+    fn hint_row(rows: &[String]) -> &str {
+        rows.iter()
+            .rev()
+            .find(|r| r.contains("Esc"))
+            .unwrap_or_else(|| panic!("no hint row: {rows:#?}"))
+    }
+
+    /// With one question, `Tab`/`Shift+Tab` switch to nothing, so the hint must
+    /// not advertise a key that does nothing. The keyboard contract is
+    /// unchanged; only the words are.
+    #[test]
+    fn a_single_question_hint_does_not_advertise_tab() {
+        let rows = clarification_rows(&single_choice(&["A", "B"]));
+        let hint = hint_row(&rows);
+        assert!(hint.contains("Esc"), "hint present: {hint:?}");
+        assert!(
+            !hint.contains("Tab"),
+            "single question must not advertise Tab: {hint:?}"
+        );
+    }
+
+    /// Single-question variants of the multi-select and free-text shapes too.
+    #[test]
+    fn a_single_question_hint_for_multi_and_text_shapes_omits_tab() {
+        let multi = multi_question(vec![question("范围", ClarificationQuestionKind::Multi)]);
+        let hint = hint_row(&clarification_rows(&multi)).to_string();
+        assert!(hint.contains("Space"), "multi hint keeps Space: {hint:?}");
+        assert!(!hint.contains("Tab"), "multi single hint: {hint:?}");
+
+        let text = multi_question(vec![question("补充", ClarificationQuestionKind::Text)]);
+        let hint = hint_row(&clarification_rows(&text)).to_string();
+        assert!(!hint.contains("Tab"), "text single hint: {hint:?}");
+    }
+
+    /// Two or more questions still switch with Tab, so the hint keeps it.
+    #[test]
+    fn multiple_questions_still_advertise_tab() {
+        let ov = multi_question(vec![
+            question("一", ClarificationQuestionKind::Single),
+            question("二", ClarificationQuestionKind::Single),
+        ]);
+        let hint = hint_row(&clarification_rows(&ov)).to_string();
+        assert!(
+            hint.contains("Tab"),
+            "multi-question hint keeps Tab: {hint:?}"
         );
     }
 }
