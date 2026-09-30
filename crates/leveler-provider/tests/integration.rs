@@ -212,6 +212,38 @@ async fn non_retryable_400_fails_fast() {
     assert_eq!(server.request_count(), 1, "400 must not be retried");
 }
 
+/// The real gateway shape: HTTP 400 whose body carries a structured
+/// `error.code = invalid_api_key`. The classification reads that structured
+/// code end to end (transport -> `ModelError`) and lands on `Auth`, never on
+/// the free text. A genuine `invalid_request` code still lands on
+/// `InvalidRequest` (the neighboring test).
+#[tokio::test]
+async fn structured_invalid_api_key_400_is_classified_as_auth() {
+    let server = MockServer::start_one(MockResponse::Status {
+        code: 400,
+        body: r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#
+            .into(),
+    })
+    .await;
+    let reg = registry(&server);
+
+    let err = reg
+        .stream(request(), CancellationToken::new())
+        .await
+        .err()
+        .expect("400 must fail");
+    assert_eq!(err.kind, leveler_model::ModelErrorKind::Auth);
+    assert_eq!(err.provider_code(), Some("invalid_api_key"));
+    assert_eq!(err.status, Some(400));
+    assert_eq!(err.delivery_state, leveler_model::DeliveryState::Responded);
+    assert_eq!(
+        err.retryability(),
+        leveler_model::Retryability::Never,
+        "auth is terminal"
+    );
+    assert_eq!(server.request_count(), 1);
+}
+
 /// A provider's structured error code and correlation id survive the whole
 /// transport, so a report can name exactly what the vendor rejected and which
 /// request to look up. Extracted once here; nothing downstream parses the body.

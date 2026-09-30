@@ -38,7 +38,9 @@ pub use context_accounting::{
     COMPACTION_BREADCRUMB_MARKER, CompactionRecord, ContextAccounting, ContextCategory,
     ContextPressure, TokenCountKind,
 };
-pub use error::{DeliveryState, ModelError, ModelErrorKind, Retryability, StreamProgress};
+pub use error::{
+    DeliveryState, ModelError, ModelErrorKind, Retryability, StreamProgress, TransportFault,
+};
 pub use estimate::{
     IMAGE_BYTE_EQUIV, TokenEstimate, estimate_message, estimate_text, estimate_tokens,
     estimate_tool_definitions,

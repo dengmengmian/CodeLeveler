@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_model::{
     ContentPart, DeliveryState, FinishReason, Message, ModelError, ModelErrorKind, ModelEvent,
-    ModelRequest, ModelRuntime, Role, StreamProgress, TokenUsage, ToolCall,
+    ModelRequest, ModelRuntime, Role, StreamProgress, TokenUsage, ToolCall, TransportFault,
 };
 
 use crate::error::AgentCoreError;
@@ -72,6 +72,24 @@ impl ModelRound {
 /// passes through the same admission and settlement hooks.
 pub const MAX_RETRIES: u32 = 10;
 
+/// A connection the OS refused is not an upstream transient: nothing is
+/// listening, and no 30-second wait changes that. It gets a short, fast budget
+/// so a wrong `base_url` fails in about two seconds with a clear error instead
+/// of after ~3 minutes of backoff. Local services that are still starting up
+/// still recover, because the first retries are quick. Every other failure
+/// keeps the full schedule.
+const IMMEDIATE_ENDPOINT_MAX_RETRIES: u32 = 3;
+const IMMEDIATE_ENDPOINT_SCHEDULE_MS: [u64; IMMEDIATE_ENDPOINT_MAX_RETRIES as usize] =
+    [250, 500, 1_000];
+
+/// Whether this failure is a machine-local "nothing accepted the connection"
+/// answer that will not resolve on a long retry cadence. Read from the
+/// structured fault, never from the message.
+fn is_immediate_endpoint_failure(error: &ModelError) -> bool {
+    error.delivery_state == DeliveryState::NotSent
+        && error.transport_fault() == Some(TransportFault::ConnectionRefused)
+}
+
 /// Backoff before retry `retry` (1-based). Quick first recoveries, then a
 /// steady 30s rate so a real outage is not hammered; a provider-advertised
 /// `Retry-After` (capped) overrides the schedule entirely.
@@ -125,11 +143,28 @@ impl RetryPolicy {
         }
     }
 
+    /// How many retries this failure may spend. A refused connection gets the
+    /// short endpoint budget; everything else gets the configured budget.
+    fn max_retries_for(&self, error: &ModelError) -> u32 {
+        if is_immediate_endpoint_failure(error) {
+            self.max_retries.min(IMMEDIATE_ENDPOINT_MAX_RETRIES)
+        } else {
+            self.max_retries
+        }
+    }
+
     fn delay(&self, error: &ModelError, retry: u32) -> Duration {
         if self.delay_scale <= 0.0 {
             return Duration::ZERO;
         }
-        let base = retry_backoff_delay(error, retry);
+        let base = if is_immediate_endpoint_failure(error) {
+            let idx = (retry as usize)
+                .saturating_sub(1)
+                .min(IMMEDIATE_ENDPOINT_SCHEDULE_MS.len() - 1);
+            Duration::from_millis(IMMEDIATE_ENDPOINT_SCHEDULE_MS[idx])
+        } else {
+            retry_backoff_delay(error, retry)
+        };
         // A provider-advertised wait is honored exactly: jitter must never
         // retry BEFORE the window the server named. Only our own schedule is
         // jittered, to spread concurrent recoveries.
@@ -369,7 +404,7 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             );
             return Err(AgentCoreError::Model(error).into());
         }
-        if retries >= policy.max_retries {
+        if retries >= policy.max_retries_for(&error) {
             // The budget is spent. Surface the last failure instead of hiding
             // it behind an unbounded wait: whether to try again is the
             // person's decision, and the count travels with the error.
@@ -387,11 +422,12 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             return Err(AgentCoreError::Model(error).into());
         }
         retries += 1;
+        let max_retries = policy.max_retries_for(&error);
         let wait = policy.delay(&error, retries);
         // The retry controller emits this; presentation must never drive it.
         observer.on_event(AgentEvent::ModelRetrying {
             attempt: retries,
-            max_attempts: policy.max_retries,
+            max_attempts: max_retries,
             delay_ms: wait.as_millis() as u64,
         });
         // A silent retry re-sends the whole (often huge) request and looks
@@ -399,7 +435,7 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
         tracing::warn!(
             request_id = %request.request_id,
             retry = retries,
-            max_retries = policy.max_retries,
+            max_retries = max_retries,
             kind = ?error.kind,
             delivery = ?error.delivery_state,
             retryability = ?error.retryability(),
@@ -1060,6 +1096,86 @@ mod retry_decision_tests {
     fn no_response_timeout() -> ModelError {
         ModelError::new(ModelErrorKind::Timeout, "read timed out")
             .with_delivery_state(DeliveryState::SentNoResponse)
+    }
+
+    /// The transport's structured classification of a refused socket.
+    fn connection_refused() -> ModelError {
+        ModelError::new(
+            ModelErrorKind::ProviderUnavailable,
+            "Connection refused (os error 61)",
+        )
+        .with_delivery_state(DeliveryState::NotSent)
+        .with_transport_fault(TransportFault::ConnectionRefused)
+    }
+
+    /// A wrong `base_url` fails in seconds, not after the full ~3-minute
+    /// schedule: a refused socket gets a short, fast budget.
+    #[tokio::test]
+    async fn a_refused_connection_exhausts_a_short_fast_budget() {
+        let mut out = Vec::new();
+        let cancel = CancellationToken::new();
+        let (result, calls) = run(connection_refused(), u32::MAX, &cancel, &mut out).await;
+        let error = match result.expect_err("a refused socket must fail") {
+            AgentCoreError::Model(error) => error,
+            other => panic!("expected a model error, got {other:?}"),
+        };
+        assert_eq!(
+            calls,
+            1 + IMMEDIATE_ENDPOINT_MAX_RETRIES,
+            "one attempt plus the endpoint budget"
+        );
+        assert_eq!(error.retry_attempts, Some(IMMEDIATE_ENDPOINT_MAX_RETRIES));
+        let max_attempts: Vec<u32> = out
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ModelRetrying { max_attempts, .. } => Some(*max_attempts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            max_attempts,
+            vec![3, 3, 3],
+            "the event states the same budget"
+        );
+    }
+
+    /// The endpoint budget is scoped to the structured fault: a generic
+    /// pre-delivery transport failure keeps the full retry lifecycle.
+    #[tokio::test]
+    async fn a_generic_not_sent_transport_failure_keeps_the_full_budget() {
+        let mut out = Vec::new();
+        let cancel = CancellationToken::new();
+        let (result, calls) = run(not_sent(), u32::MAX, &cancel, &mut out).await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls,
+            1 + MAX_RETRIES,
+            "the full bounded lifecycle still runs"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_budget_and_schedule_apply_only_to_a_refused_socket() {
+        let policy = RetryPolicy::production();
+        assert_eq!(
+            policy.max_retries_for(&connection_refused()),
+            IMMEDIATE_ENDPOINT_MAX_RETRIES
+        );
+        assert_eq!(policy.max_retries_for(&not_sent()), MAX_RETRIES);
+
+        // Fast schedule (250/500/1000 ms plus <=20% jitter), never 30 s.
+        let first = policy.delay(&connection_refused(), 1);
+        assert!(
+            first >= Duration::from_millis(250) && first <= Duration::from_millis(320),
+            "{first:?}"
+        );
+        let third = policy.delay(&connection_refused(), 3);
+        assert!(
+            third >= Duration::from_millis(1_000) && third <= Duration::from_millis(1_250),
+            "{third:?}"
+        );
+        // An unrelated NotSent failure still gets the long first backoff.
+        assert!(policy.delay(&not_sent(), 1) >= Duration::from_millis(1_000));
     }
 
     /// A retry re-sends the round's request as built — the tool exchange in

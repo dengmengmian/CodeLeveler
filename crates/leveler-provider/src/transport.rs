@@ -17,6 +17,23 @@ use leveler_model::{DeliveryState, ModelError, ModelErrorKind, ProtocolContext, 
 /// auto-retried. Everything later in the chain is ambiguous — the request may
 /// already have reached the provider — and is reported as such rather than
 /// guessed.
+/// Walk a reqwest error's source chain for a structured [`std::io::ErrorKind`].
+///
+/// The fault is read from the OS error itself, never from a formatted message:
+/// reqwest reports a refused socket as `io::ErrorKind::ConnectionRefused` two
+/// links down the chain (`client error (Connect)` → `tcp connect error` →
+/// `Connection refused`), and that kind is what decides the retry budget.
+fn connect_io_kind(err: &reqwest::Error) -> Option<std::io::ErrorKind> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        source = error.source();
+    }
+    None
+}
+
 pub(crate) fn map_reqwest_error(err: &reqwest::Error) -> ModelError {
     let (kind, delivery_state) = if err.is_connect() {
         (ModelErrorKind::ProviderUnavailable, DeliveryState::NotSent)
@@ -30,7 +47,11 @@ pub(crate) fn map_reqwest_error(err: &reqwest::Error) -> ModelError {
         // was delivered cannot be established here.
         (ModelErrorKind::Transport, DeliveryState::Unknown)
     };
-    ModelError::new(kind, err.to_string()).with_delivery_state(delivery_state)
+    let mut error = ModelError::new(kind, err.to_string()).with_delivery_state(delivery_state);
+    if err.is_connect() && connect_io_kind(err) == Some(std::io::ErrorKind::ConnectionRefused) {
+        error = error.with_transport_fault(leveler_model::TransportFault::ConnectionRefused);
+    }
+    error
 }
 
 /// Build a POST request with auth and per-protocol headers applied.
@@ -102,7 +123,7 @@ pub(crate) async fn send_once(
         .message
         .clone()
         .unwrap_or_else(|| truncate(&text, 500));
-    let mut error = ModelError::from_status(code, reason);
+    let mut error = ModelError::from_status_and_code(code, reason, detail.code.as_deref());
     if let Some(code) = detail.code {
         error = error.with_provider_code(code);
     }
@@ -237,6 +258,39 @@ mod tests {
         assert!(t.len() <= 13); // 10 bytes + ellipsis
     }
 
+    /// The real gateway case: HTTP 400 whose body carries a structured
+    /// `error.code = invalid_api_key`. The classification step must read the
+    /// structured code, not the HTTP status alone and not the message text.
+    #[test]
+    fn structured_auth_code_in_a_400_body_classifies_as_auth() {
+        let body = r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#;
+        let detail = parse_provider_error(body);
+        assert_eq!(detail.code.as_deref(), Some("invalid_api_key"));
+        let reason = detail
+            .message
+            .clone()
+            .unwrap_or_else(|| truncate(body, 500));
+        let code = detail.code.clone().expect("structured code");
+        let error = ModelError::from_status_and_code(400, reason, Some(code.as_str()))
+            .with_provider_code(code);
+        assert_eq!(error.kind, leveler_model::ModelErrorKind::Auth);
+        assert_eq!(error.provider_code(), Some("invalid_api_key"));
+    }
+
+    /// A genuine invalid request with an unrelated structured code stays a
+    /// request error — the auth refinement must not swallow it.
+    #[test]
+    fn a_non_auth_structured_code_keeps_the_request_classification() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"bad tool schema"}}"#;
+        let detail = parse_provider_error(body);
+        let error = ModelError::from_status_and_code(
+            400,
+            detail.message.clone().unwrap_or_default(),
+            detail.code.as_deref(),
+        );
+        assert_eq!(error.kind, leveler_model::ModelErrorKind::InvalidRequest);
+    }
+
     fn ctx(api_key: Option<&str>, extra: Vec<(String, String)>) -> ProtocolContext {
         ProtocolContext {
             base_url: "https://x".into(),
@@ -320,6 +374,33 @@ mod tests {
         assert!(
             second <= Duration::from_millis(4_960),
             "and not a fresh full budget: {second:?}"
+        );
+    }
+
+    /// A refused socket is classified from the structured OS error, not from
+    /// the rendered message. The port is obtained by binding and immediately
+    /// dropping a listener, so it is guaranteed closed and local.
+    #[tokio::test]
+    async fn a_refused_connection_carries_a_structured_fault() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("nothing listens on the dropped port");
+        let mapped = map_reqwest_error(&err);
+        assert_eq!(mapped.kind, ModelErrorKind::ProviderUnavailable);
+        assert_eq!(mapped.delivery_state, DeliveryState::NotSent);
+        assert_eq!(
+            mapped.transport_fault(),
+            Some(leveler_model::TransportFault::ConnectionRefused),
+            "the fault must come from io::ErrorKind, not the message"
         );
     }
 

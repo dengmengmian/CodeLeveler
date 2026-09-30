@@ -47,6 +47,22 @@ pub enum ModelErrorKind {
     Other,
 }
 
+/// A specific transport fault the stack could name structurally.
+///
+/// Kept apart from [`ModelErrorKind`] because several faults share one kind and
+/// one delivery truth: a refused socket and a DNS miss are both
+/// `ProviderUnavailable` / `NotSent`, but only the refused socket is a
+/// machine-local "nothing is listening" answer that will not change on a
+/// 30-second retry cadence. Never inferred from a message — a fault is only set
+/// when the underlying error carries a structured [`std::io::ErrorKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportFault {
+    /// The TCP connection was refused (`ECONNREFUSED`): the host was reachable
+    /// but nothing accepted the connection.
+    ConnectionRefused,
+}
+
 /// How much output a stream produced before it was cut.
 ///
 /// Only meaningful for [`DeliveryState::StreamInterrupted`]. Both flags are
@@ -175,6 +191,9 @@ pub struct ModelError {
     /// cannot accidentally claim a safer state than it has evidence for.
     #[serde(default)]
     pub delivery_state: DeliveryState,
+    /// The specific structured transport fault, when the stack could name one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_fault: Option<TransportFault>,
     /// The provider this request was addressed to, when the failure came from a
     /// provider call. Diagnostic and presentational (so a client can say
     /// "Moonshot"); never an authority.
@@ -195,6 +214,7 @@ impl ModelError {
             provider_retries_exhausted: false,
             retry_attempts: None,
             delivery_state: DeliveryState::Unknown,
+            transport_fault: None,
             provider: None,
         }
     }
@@ -234,6 +254,17 @@ impl ModelError {
     /// The provider's correlation id for the failing request, when known.
     pub fn request_id(&self) -> Option<&str> {
         self.diagnostics.as_deref()?.request_id.as_deref()
+    }
+
+    /// The specific structured transport fault, when the stack could name one.
+    pub fn with_transport_fault(mut self, fault: TransportFault) -> Self {
+        self.transport_fault = Some(fault);
+        self
+    }
+
+    /// The structured transport fault, when the stack could name one.
+    pub fn transport_fault(&self) -> Option<TransportFault> {
+        self.transport_fault
     }
 
     /// The model id this request was addressed to, when known.
@@ -396,6 +427,23 @@ impl ModelError {
     /// Map an HTTP status code to a normalized error kind. A complete status
     /// means the request was delivered to the provider's gateway.
     pub fn from_status(status: u16, message: impl Into<String>) -> Self {
+        Self::from_status_and_code(status, message, None)
+    }
+
+    /// Like [`Self::from_status`], but a provider-supplied STRUCTURED error code
+    /// (`error.code` / `error.type`) can refine an otherwise coarser result.
+    ///
+    /// Gateways that answer HTTP 400 with `code = invalid_api_key` are reporting
+    /// an authentication failure, not a malformed request. The structured code
+    /// is the provider's own statement about what happened, so it wins over the
+    /// generic status bucket — but only over `InvalidRequest`/`Other`: a
+    /// definitive status (429, 5xx) is stronger evidence and is kept. Unknown
+    /// codes change nothing, and the free-text message is never consulted.
+    pub fn from_status_and_code(
+        status: u16,
+        message: impl Into<String>,
+        code: Option<&str>,
+    ) -> Self {
         let kind = match status {
             401 | 403 => ModelErrorKind::Auth,
             400 | 404 | 422 => ModelErrorKind::InvalidRequest,
@@ -403,12 +451,43 @@ impl ModelError {
             500..=599 => ModelErrorKind::ProviderUnavailable,
             _ => ModelErrorKind::Other,
         };
+        let kind = match kind {
+            ModelErrorKind::InvalidRequest | ModelErrorKind::Other
+                if code.is_some_and(structured_code_is_auth) =>
+            {
+                ModelErrorKind::Auth
+            }
+            other => other,
+        };
         // A provider HTTP body is untrusted external content: sanitize it at
         // this one boundary so every downstream store/render is safe.
         Self::new(kind, sanitize_provider_text(&message.into()))
             .with_status(status)
             .with_delivery_state(DeliveryState::Responded)
     }
+}
+
+/// Whether a provider's structured error code names an authentication or
+/// authorization failure. This is a vocabulary of shapes providers actually
+/// send (`invalid_api_key`, `authentication_error`, `permission_denied`, …),
+/// not a check on any particular provider: any response carrying one of these
+/// codes is classified the same way. The comparison is case-insensitive and
+/// never touches the free-text message.
+fn structured_code_is_auth(code: &str) -> bool {
+    matches!(
+        code.trim().to_ascii_lowercase().as_str(),
+        "invalid_api_key"
+            | "invalid_apikey"
+            | "authentication_error"
+            | "authentication_failed"
+            | "invalid_authentication"
+            | "invalid_credentials"
+            | "unauthorized"
+            | "forbidden"
+            | "permission_denied"
+            | "insufficient_permissions"
+            | "account_deactivated"
+    )
 }
 
 /// Provider-specific diagnostic facts attached to a [`ModelError`]. Never read
@@ -493,6 +572,63 @@ mod tests {
             ModelError::from_status(503, "down").kind,
             ModelErrorKind::ProviderUnavailable
         );
+    }
+
+    /// A structured provider code refines the coarse status bucket — but only
+    /// the coarse ones, and never by reading the free-text message.
+    #[test]
+    fn structured_auth_codes_refine_the_status_bucket() {
+        // 401/403 were always auth.
+        assert_eq!(ModelError::from_status(401, "x").kind, ModelErrorKind::Auth);
+        assert_eq!(ModelError::from_status(403, "x").kind, ModelErrorKind::Auth);
+
+        // The real gateway case: HTTP 400 with an explicit auth code.
+        assert_eq!(
+            ModelError::from_status_and_code(400, "Incorrect API key", Some("invalid_api_key"))
+                .kind,
+            ModelErrorKind::Auth
+        );
+        assert_eq!(
+            ModelError::from_status_and_code(400, "bad", Some("Authentication_Error")).kind,
+            ModelErrorKind::Auth,
+            "the comparison is case-insensitive"
+        );
+        assert_eq!(
+            ModelError::from_status_and_code(400, "bad", Some("permission_denied")).kind,
+            ModelErrorKind::Auth
+        );
+
+        // A genuine invalid request stays invalid — structured code included.
+        assert_eq!(
+            ModelError::from_status_and_code(400, "bad", Some("invalid_request")).kind,
+            ModelErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            ModelError::from_status_and_code(400, "bad", Some("unknown_error_code")).kind,
+            ModelErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            ModelError::from_status(400, "bad").kind,
+            ModelErrorKind::InvalidRequest
+        );
+
+        // A definitive status is stronger evidence than a contradictory code.
+        assert_eq!(
+            ModelError::from_status_and_code(429, "slow", Some("invalid_api_key")).kind,
+            ModelErrorKind::RateLimit
+        );
+        assert_eq!(
+            ModelError::from_status_and_code(503, "down", Some("invalid_api_key")).kind,
+            ModelErrorKind::ProviderUnavailable
+        );
+    }
+
+    /// The code is read from the STRUCTURED field only. A message that mentions
+    /// an API key must not be classified as auth by string matching.
+    #[test]
+    fn auth_classification_never_reads_the_message() {
+        let err = ModelError::from_status(400, "Incorrect API key provided: sk-secret");
+        assert_eq!(err.kind, ModelErrorKind::InvalidRequest);
     }
 
     #[test]
