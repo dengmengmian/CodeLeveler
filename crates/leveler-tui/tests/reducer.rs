@@ -3272,7 +3272,7 @@ fn session_list_event_populates_and_enter_opens() {
 }
 
 #[test]
-fn sessions_d_deletes_selected() {
+fn sessions_d_opens_a_delete_confirmation_instead_of_deleting() {
     let mut s = opened();
     reduce(&mut s, ctrl('s'));
     reduce(
@@ -3282,12 +3282,83 @@ fn sessions_d_deletes_selected() {
         }),
     );
     let effects = reduce(&mut s, key(KeyCode::Char('d')));
+    assert!(
+        effects.is_empty(),
+        "`d` must not delete on the first key: {effects:?}"
+    );
+    assert!(
+        matches!(s.overlay, Some(Overlay::ConfirmSessionDelete(_))),
+        "`d` must open the confirmation overlay"
+    );
+    assert_eq!(
+        s.sessions.len(),
+        1,
+        "the list is untouched before confirmation"
+    );
+}
+
+#[test]
+fn delete_confirmation_defaults_to_cancel() {
+    let mut s = opened();
+    reduce(&mut s, ctrl('s'));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionList {
+            sessions: vec![summary("a", "first")],
+        }),
+    );
+    reduce(&mut s, key(KeyCode::Char('d')));
+    // Enter acts on the initial selection, which is Cancel.
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        effects.is_empty(),
+        "Enter on the default Cancel must not delete: {effects:?}"
+    );
+    assert!(s.overlay.is_none(), "Cancel closes the confirmation");
+    assert_eq!(s.sessions.len(), 1, "cancel must not modify the list");
+}
+
+#[test]
+fn delete_confirmation_cancels_on_esc() {
+    let mut s = opened();
+    reduce(&mut s, ctrl('s'));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionList {
+            sessions: vec![summary("a", "first")],
+        }),
+    );
+    reduce(&mut s, key(KeyCode::Char('d')));
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(effects.is_empty(), "Esc must not delete: {effects:?}");
+    assert!(s.overlay.is_none());
+    assert_eq!(s.sessions.len(), 1);
+}
+
+#[test]
+fn delete_confirmation_deletes_only_after_explicit_selection() {
+    let mut s = opened();
+    reduce(&mut s, ctrl('s'));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionList {
+            sessions: vec![summary("a", "first")],
+        }),
+    );
+    reduce(&mut s, key(KeyCode::Char('d')));
+    // Move onto Delete, then confirm it deliberately.
+    reduce(&mut s, key(KeyCode::Down));
+    let effects = reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(
         effects,
         vec![Effect::Send(ClientCommand::DeleteSessionFor {
             requester_session_id: s.session_id.clone(),
             session_id: SessionId::new("a"),
         })]
+    );
+    assert!(
+        s.overlay.is_none(),
+        "the confirmation closes after deciding"
     );
 }
 

@@ -149,6 +149,26 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 })]
             }
         },
+        Overlay::ConfirmSessionDelete(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::ConfirmSessionDelete(sel));
+                Vec::new()
+            }
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => {
+                // The cancel row is a normal selection, not a delete: the
+                // confirmation only ever deletes the session the user picked
+                // by moving onto the delete row.
+                if key == SESSION_DELETE_CANCEL {
+                    Vec::new()
+                } else {
+                    vec![Effect::Send(ClientCommand::DeleteSessionFor {
+                        requester_session_id: state.session_id.clone(),
+                        session_id: leveler_client_protocol::SessionId::new(key),
+                    })]
+                }
+            }
+        },
         Overlay::UnsupportedMedia(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
                 state.overlay = Some(Overlay::UnsupportedMedia(sel));
@@ -302,6 +322,36 @@ pub(super) fn open_checkpoint_picker(state: &mut AppState) {
         "对话与工作区文件一并回退到此处；未提交的改动会丢失（非 git 仓库只回退对话）",
     );
     state.overlay = Some(Overlay::CheckpointPicker(Box::new(model)));
+}
+
+/// The key of the cancel row in the session-delete confirmation. Session ids
+/// are UUIDs, so this can never collide with the row it protects.
+const SESSION_DELETE_CANCEL: &str = "__cancel__";
+
+/// Ask before deleting a stored session. Deleting is irreversible and the
+/// runtime has no undo, so the safe choice (cancel) is the initial cursor and
+/// Enter only acts on what the user explicitly moved to.
+pub(super) fn open_session_delete_confirm(state: &mut AppState, index: usize) {
+    let Some(session) = state.sessions.get(index) else {
+        return;
+    };
+    let id = session.id.as_str().to_string();
+    let goal = crate::render::truncate_display(&session.goal, 40);
+    let updated = session.updated_at.clone();
+    let t = state.t();
+    let title = t.session_delete_title;
+    let cancel = t.session_delete_cancel;
+    let confirm = t.session_delete_confirm;
+    let warning = t.session_delete_warning;
+    let description = format!("{goal} · {updated} · {warning}");
+    let options = vec![
+        SelectionOption::new(SESSION_DELETE_CANCEL, cancel),
+        SelectionOption::new(id, confirm),
+    ];
+    let model = SelectionModel::new(title, options, false)
+        .with_description(description)
+        .without_quick_select();
+    state.overlay = Some(Overlay::ConfirmSessionDelete(Box::new(model)));
 }
 
 pub(super) fn open_mode_picker(state: &mut AppState) {

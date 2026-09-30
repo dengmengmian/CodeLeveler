@@ -47,6 +47,9 @@ pub enum Overlay {
     UnsupportedMedia(Box<SelectionModel>),
     /// Pick a conversation checkpoint to restore (spec §68).
     CheckpointPicker(Box<SelectionModel>),
+    /// Confirm deleting a stored session. Deleting is irreversible, so it takes
+    /// an explicit choice rather than firing on the first `d`.
+    ConfirmSessionDelete(Box<SelectionModel>),
 }
 
 /// A short label for the status line while an overlay is open.
@@ -67,9 +70,44 @@ impl Overlay {
             | Overlay::ThemePicker(_)
             | Overlay::WorkModePicker(_)
             | Overlay::CollabPicker(_)
-            | Overlay::CheckpointPicker(_) => None,
+            | Overlay::CheckpointPicker(_)
+            | Overlay::ConfirmSessionDelete(_) => None,
         }
     }
+}
+
+/// Everything a renderer needs to draw an overlay: its title, its fully
+/// wrapped content, the text cursor, and the rows that must stay visible.
+///
+/// A `Line` index here is a post-wrap screen row; the scroll contract is
+/// expressed in those rows so wrapping a long command cannot hide the focused
+/// decision behind the fold.
+pub struct OverlayContent {
+    pub title: String,
+    pub lines: Vec<Line<'static>>,
+    pub cursor: Option<(usize, usize)>,
+    /// Row of the focused item. A viewport must never scroll it away.
+    pub cursor_row: Option<usize>,
+    /// A row range (inclusive) that should stay together when it fits — the
+    /// block of decisions the focused row belongs to.
+    pub focus_block: Option<(usize, usize)>,
+    /// Trailing rows of pinned chrome (the key hint). They stay at the bottom
+    /// while the rows above them scroll.
+    pub tail_pin: usize,
+}
+
+/// Content markers as produced by a builder, in pre-wrap row coordinates.
+/// [`content`] remaps them once every row has been wrapped.
+struct RawContent {
+    title: String,
+    lines: Vec<Line<'static>>,
+    cursor: Option<(usize, usize)>,
+    /// Pre-wrap row of the focused option / input.
+    cursor_row: Option<usize>,
+    /// Pre-wrap row range of the decision block.
+    focus_block: Option<(usize, usize)>,
+    /// Pre-wrap row where the pinned trailing chrome begins.
+    tail_from: Option<usize>,
 }
 
 /// The overlay's title, content lines, and — when it has a text input — the
@@ -80,9 +118,38 @@ pub fn content_lines(
     inner_width: usize,
     locale: crate::i18n::Locale,
 ) -> (String, Vec<Line<'static>>, Option<(usize, usize)>) {
-    let (title, lines, cursor) = build_content(overlay, theme, inner_width, locale);
-    let (lines, cursor) = wrap_to_width(lines, cursor, inner_width);
-    (title, lines, cursor)
+    let content = content(overlay, theme, inner_width, locale);
+    (content.title, content.lines, content.cursor)
+}
+
+/// Build the overlay content and resolve its viewport markers against the
+/// wrapped rows.
+pub fn content(
+    overlay: &Overlay,
+    theme: &Theme,
+    inner_width: usize,
+    locale: crate::i18n::Locale,
+) -> OverlayContent {
+    let raw = build_content(overlay, theme, inner_width, locale);
+    let (lines, cursor, spans) = wrap_to_width(raw.lines, raw.cursor, inner_width);
+    let total = lines.len();
+    let map_row = |input: usize| spans.get(input).map(|(start, _)| *start);
+    let map_range = |lo: usize, hi: usize| {
+        let start = spans.get(lo)?.0;
+        let (end_start, end_count) = *spans.get(hi)?;
+        Some((start, end_start + end_count.saturating_sub(1)))
+    };
+    OverlayContent {
+        title: raw.title,
+        cursor,
+        cursor_row: raw.cursor_row.and_then(map_row),
+        focus_block: raw.focus_block.and_then(|(lo, hi)| map_range(lo, hi)),
+        tail_pin: raw
+            .tail_from
+            .and_then(|from| map_row(from).map(|start| total.saturating_sub(start)))
+            .unwrap_or(0),
+        lines,
+    }
 }
 
 /// Re-flow `lines` so none is wider than `width`, keeping each span's style.
@@ -95,11 +162,19 @@ fn wrap_to_width(
     lines: Vec<Line<'static>>,
     cursor: Option<(usize, usize)>,
     width: usize,
-) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+) -> (
+    Vec<Line<'static>>,
+    Option<(usize, usize)>,
+    Vec<(usize, usize)>,
+) {
     if width == 0 {
-        return (lines, cursor);
+        let spans = (0..lines.len()).map(|row| (row, 1)).collect();
+        return (lines, cursor, spans);
     }
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    // For each input row, the `(start, count)` span of output rows it produced.
+    // Viewport markers are given in input rows and remapped through this.
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(lines.len());
     let mut cursor_out = cursor;
     for (idx, line) in lines.into_iter().enumerate() {
         let start = out.len();
@@ -171,8 +246,9 @@ fn wrap_to_width(
         {
             cursor_out = Some((start + ccol / width, ccol % width));
         }
+        spans.push((start, out.len() - start));
     }
-    (out, cursor_out)
+    (out, cursor_out, spans)
 }
 
 /// Rebuild spans from styled characters, merging runs that share a style.
@@ -192,7 +268,7 @@ fn build_content(
     theme: &Theme,
     width: usize,
     locale: crate::i18n::Locale,
-) -> (String, Vec<Line<'static>>, Option<(usize, usize)>) {
+) -> RawContent {
     match overlay {
         Overlay::ModelPicker(model)
         | Overlay::ModePicker(model)
@@ -200,19 +276,10 @@ fn build_content(
         | Overlay::WorkModePicker(model)
         | Overlay::CollabPicker(model)
         | Overlay::UnsupportedMedia(model)
-        | Overlay::CheckpointPicker(model) => {
-            let (lines, cursor) = selection_content(model, theme, locale);
-            (model.title.clone(), lines, cursor)
-        }
-        Overlay::Approval(ov) => (
-            locale.text().overlay_approval.to_string(),
-            approval_content(ov, theme, width, locale),
-            None,
-        ),
-        Overlay::Clarification(ov) => {
-            let (lines, cursor) = clarification_content(ov, theme, width, locale);
-            (locale.text().clarify_title.to_string(), lines, cursor)
-        }
+        | Overlay::CheckpointPicker(model)
+        | Overlay::ConfirmSessionDelete(model) => selection_content(model, theme, locale),
+        Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
+        Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
     }
 }
 
@@ -227,8 +294,111 @@ pub fn overlay_height(
     width: u16,
     locale: crate::i18n::Locale,
 ) -> u16 {
-    let (_, lines, _) = content_lines(overlay, theme, width as usize, locale);
-    lines.len() as u16
+    content(overlay, theme, width as usize, locale).lines.len() as u16
+}
+
+/// The window of an overlay that a scrollable box shows: `offset` is the first
+/// body row drawn, `body` how many body rows fit, and `region` where the pinned
+/// trailing chrome begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayWindow {
+    offset: usize,
+    body: usize,
+    region: usize,
+}
+
+/// Choose the scroll offset that keeps the focused row — and, when it fits, the
+/// whole decision block around it — visible, with the trailing hint pinned to
+/// the bottom.
+///
+/// This is recomputed from the content every frame rather than stored, so a
+/// resize or a cursor move can never leave the focus off screen behind a stale
+/// offset.
+fn overlay_window(
+    total: usize,
+    height: usize,
+    cursor_row: Option<usize>,
+    focus_block: Option<(usize, usize)>,
+    tail_pin: usize,
+) -> OverlayWindow {
+    if total == 0 || height == 0 || total <= height {
+        return OverlayWindow {
+            offset: 0,
+            body: total,
+            region: total,
+        };
+    }
+    // Never let the pinned tail consume the whole box: the focused row needs at
+    // least one body row of its own.
+    let tail = tail_pin.min(total).min(height - 1);
+    let region = total - tail;
+    let body = height - tail;
+    let max_offset = region.saturating_sub(body);
+    // Prefer the whole decision block; fall back to the focused row alone when
+    // the block is taller than the viewport.
+    let block = focus_block.filter(|(lo, hi)| hi >= lo && *hi < region && (hi - lo + 1) <= body);
+    let anchor_end = match block {
+        Some((_, hi)) => hi,
+        None => cursor_row.filter(|row| *row < region).unwrap_or(region - 1),
+    };
+    let anchor_start = match block {
+        Some((lo, _)) => lo,
+        None => anchor_end,
+    };
+    let mut offset = (anchor_end + 1).saturating_sub(body);
+    if offset > anchor_start {
+        offset = anchor_start;
+    }
+    // Whatever anchor the block picked, the cursor row itself must be visible.
+    if let Some(row) = cursor_row.filter(|row| *row < region) {
+        if row < offset {
+            offset = row;
+        } else if row >= offset + body {
+            offset = row + 1 - body;
+        }
+    }
+    OverlayWindow {
+        offset: offset.min(max_offset),
+        body,
+        region,
+    }
+}
+
+fn visible_lines(
+    lines: &[Line<'static>],
+    total: usize,
+    height: usize,
+    window: OverlayWindow,
+) -> Vec<Line<'static>> {
+    if total <= height {
+        return lines.to_vec();
+    }
+    let mut out: Vec<Line<'static>> = lines[window.offset..window.offset + window.body].to_vec();
+    out.extend_from_slice(&lines[window.region..]);
+    out
+}
+
+/// Map the content cursor into the drawn rows, or `None` when the viewport
+/// scrolled it away (it can only be away for a search field whose list scrolled
+/// below it).
+fn cursor_in_window(
+    cursor: Option<(usize, usize)>,
+    total: usize,
+    height: usize,
+    window: OverlayWindow,
+) -> Option<(usize, usize)> {
+    let (row, col) = cursor?;
+    if total <= height {
+        return Some((row, col));
+    }
+    if row < window.region {
+        if row < window.offset || row >= window.offset + window.body {
+            return None;
+        }
+        Some((row - window.offset, col))
+    } else {
+        Some((window.body + (row - window.region), col))
+    }
 }
 
 /// Draw the active overlay centered over `area` (modal form, used on
@@ -244,20 +414,34 @@ pub fn render_overlay(
     // the conversation directly above; a box around them adds a border to
     // parse and a column of padding to nothing, and having some framed and
     // some bare made the same keys feel like different modes.
-    let (_, lines, cursor) = content_lines(overlay, theme, area.width as usize, locale);
-    let h = (lines.len() as u16).min(area.height);
+    let content = content(overlay, theme, area.width as usize, locale);
+    let total = content.lines.len();
+    let h = (total as u16).min(area.height);
     let [row] = Layout::vertical([Constraint::Length(h)])
         .flex(Flex::End)
         .areas(area);
+    let height = row.height as usize;
+    let window = overlay_window(
+        total,
+        height,
+        content.cursor_row,
+        content.focus_block,
+        content.tail_pin,
+    );
+    let lines = visible_lines(&content.lines, total, height, window);
+    // An overlay opened from a full-screen page sits over that page's own
+    // footer; clear the slot first so its text cannot show through under the
+    // decision's last line.
+    frame.render_widget(ratatui::widgets::Clear, row);
     theme.paint_surface(frame, row, theme.surface.elevated);
     frame.render_widget(Paragraph::new(lines), row);
     // A text field in an overlay needs a visible insertion point. The
     // composer's cursor is suppressed while an overlay owns the slot, so if
     // this does not place it, a question the user must type into has none.
-    if let Some((crow, ccol)) = cursor {
+    if let Some((crow, ccol)) = cursor_in_window(content.cursor, total, height, window) {
         let x = row.x.saturating_add(ccol as u16);
         let y = row.y.saturating_add(crow as u16);
-        if (crow as u16) < row.height && x < row.x.saturating_add(row.width) {
+        if x < row.x.saturating_add(row.width) {
             frame.set_cursor_position(ratatui::layout::Position::new(x, y));
         }
     }
@@ -561,7 +745,7 @@ fn clarification_content(
     theme: &Theme,
     width: usize,
     locale: crate::i18n::Locale,
-) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+) -> RawContent {
     let t = locale.text();
     let mut lines: Vec<Line> = Vec::new();
     let headline = if ov.legacy() {
@@ -590,7 +774,14 @@ fn clarification_content(
     let questions = ov.questions();
     let Some(active) = questions.get(ov.active()) else {
         lines.push(help_line(theme, t.clarify_hint));
-        return (lines, None);
+        return RawContent {
+            title: t.clarify_title.to_string(),
+            lines,
+            cursor: None,
+            cursor_row: None,
+            focus_block: None,
+            tail_from: None,
+        };
     };
 
     let mut prompt = vec![Span::styled(
@@ -620,6 +811,10 @@ fn clarification_content(
     lines.push(Line::from(""));
 
     let mut cursor_at: Option<(usize, usize)> = None;
+    // Every option row (including its wrapped continuation rows), so the
+    // decision block can be kept together when it fits.
+    let mut option_rows: Vec<(usize, usize)> = Vec::new();
+    let mut cursor_row: Option<usize> = None;
     if active.kind == ClarificationQuestionKind::Text {
         let row = lines.len();
         lines.push(Line::from(vec![
@@ -627,6 +822,7 @@ fn clarification_content(
             Span::raw(active.text.clone()),
         ]));
         cursor_at = Some((row, 2 + UnicodeWidthStr::width(active.text.as_str())));
+        cursor_row = Some(row);
     } else {
         let recorded = match active.answer.as_ref() {
             Some(crate::overlay::clarification::Answer::Picks(picks)) => picks.first().copied(),
@@ -650,7 +846,12 @@ fn clarification_content(
             // shows what was chosen; the cursor only says where the arrows are.
             let suffix = (recorded == Some(i))
                 .then(|| Span::styled(" ✓", Style::default().fg(theme.status.success)));
+            let start = lines.len();
             push_wrapped_row(&mut lines, prefix, option, label_style, suffix, width);
+            option_rows.push((start, lines.len() - 1));
+            if focused {
+                cursor_row = Some(start);
+            }
         }
         if active.allow_other {
             let focused = active.on_other_row();
@@ -678,11 +879,17 @@ fn clarification_content(
                     + 1
                     + UnicodeWidthStr::width(text.as_str());
                 cursor_at = Some((row, col));
+                cursor_row = Some(row);
             }
             lines.push(Line::from(spans));
+            option_rows.push((row, row));
         }
     }
 
+    // The hint (with any blocking notice) is chrome: it stays pinned while the
+    // rows above it scroll, so the keys that resolve the question are never
+    // scrolled off with the options.
+    let tail_from = Some(lines.len());
     if let Some(notice) = ov.notice() {
         let text = match notice {
             crate::overlay::clarification::ClarificationNotice::MinChoices(n) => {
@@ -707,17 +914,29 @@ fn clarification_content(
         t.clarify_nav_hint
     };
     lines.push(help_line(theme, hint));
-    (lines, cursor_at)
+    RawContent {
+        title: t.clarify_title.to_string(),
+        lines,
+        cursor: cursor_at,
+        cursor_row,
+        focus_block: option_rows
+            .first()
+            .zip(option_rows.last())
+            .map(|(first, last)| (first.0, last.1)),
+        tail_from,
+    }
 }
 
 fn selection_content(
     model: &SelectionModel,
     theme: &Theme,
     locale: crate::i18n::Locale,
-) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+) -> RawContent {
     let t = locale.text();
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor = None;
+    let mut cursor_row: Option<usize> = None;
+    let mut focus_block: Option<(usize, usize)> = None;
     // Without a border there is nowhere else for the title to live, and a list
     // of choices with no question above it is a puzzle.
     lines.push(Line::from(Span::styled(
@@ -745,6 +964,7 @@ fn selection_content(
     let visible = model.visible_rows();
     let total = visible.len();
     for (pos, (_, opt, is_cursor)) in visible.into_iter().enumerate() {
+        let row = lines.len();
         let focus = if is_cursor { "▸" } else { " " };
         // A searchable list types digits into the query, so it stays
         // unnumbered; every other picker numbers its rows from the count so a
@@ -791,11 +1011,26 @@ fn selection_content(
                 Style::default().fg(theme.text.secondary),
             )));
         }
+        if is_cursor {
+            cursor_row = Some(row);
+            // The focused option and its supporting description/reason are one
+            // decision; keep them together when the viewport is tall enough.
+            focus_block = Some((row, lines.len() - 1));
+        }
     }
 
+    // The key hint is chrome: pinned to the bottom while the list scrolls.
+    let tail_from = Some(lines.len());
     lines.push(Line::from(""));
     lines.push(help_line(theme, t.picker_hint));
-    (lines, cursor)
+    RawContent {
+        title: model.title.clone(),
+        lines,
+        cursor,
+        cursor_row,
+        focus_block,
+        tail_from,
+    }
 }
 
 fn approval_content(
@@ -803,7 +1038,7 @@ fn approval_content(
     theme: &Theme,
     width: usize,
     locale: crate::i18n::Locale,
-) -> Vec<Line<'static>> {
+) -> RawContent {
     let req = &ov.request;
     let mut lines: Vec<Line> = Vec::new();
     // The tool's name in the words the transcript already uses (the taxonomy's
@@ -851,7 +1086,10 @@ fn approval_content(
     }
     let options = ov.options(t);
     let total = options.len();
+    let mut option_rows: Vec<(usize, usize)> = Vec::new();
+    let mut cursor_row: Option<usize> = None;
     for (i, (label, is_cursor)) in options.into_iter().enumerate() {
+        let row = lines.len();
         let text = format!("{} {label}", option_number(i, total));
         if is_cursor {
             // The focused row is reversed end to end, so the eye lands on the
@@ -863,10 +1101,19 @@ fn approval_content(
                     .fg(theme.text.primary)
                     .bg(theme.surface.selection),
             )));
+            cursor_row = Some(row);
         } else {
             lines.push(Line::from(Span::raw(format!("  {text}"))));
         }
+        option_rows.push((row, row));
     }
+    // The decision block is the whole set of options: when it fits, keep it
+    // together so the user sees every choice, not just the focused one.
+    let focus_block = option_rows
+        .first()
+        .zip(option_rows.last())
+        .map(|(first, last)| (first.0, last.1));
+    let tail_from = Some(lines.len());
     lines.push(help_line(
         theme,
         if elided {
@@ -877,7 +1124,14 @@ fn approval_content(
             t.approval_hint_plain
         },
     ));
-    lines
+    RawContent {
+        title: t.overlay_approval.to_string(),
+        lines,
+        cursor: None,
+        cursor_row,
+        focus_block,
+        tail_from,
+    }
 }
 
 fn help_line(theme: &Theme, text: &str) -> Line<'static> {
@@ -1228,5 +1482,133 @@ mod layout_tests {
     fn the_other_row_is_numbered_like_an_option() {
         let rows = clarification_rows(&single_choice(&["Go", "Python"]));
         assert!(rows.iter().any(|r| r.contains("  3. 其他…")), "{rows:#?}");
+    }
+
+    // ── I-01 · Focused item is always visible ──────────────────────────────
+
+    fn picker(count: usize) -> Overlay {
+        let options: Vec<SelectionOption> = (0..count)
+            .map(|i| SelectionOption::new(format!("m{i}"), format!("模型 {i}")))
+            .collect();
+        let model = SelectionModel::new("选择模型", options, false);
+        Overlay::ModelPicker(Box::new(model))
+    }
+
+    fn focus_row<'a>(lines: &'a [String], needle: &str) -> &'a String {
+        lines
+            .iter()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no row for {needle}:\n{}", lines.join("\n")))
+    }
+
+    /// A tall approval is scrolled so the default focus (Deny) and the keys that
+    /// resolve it stay on screen. Before this, the tail was clipped and Down moved
+    /// a cursor nobody could see.
+    #[test]
+    fn a_tall_approval_keeps_its_decision_block_and_hint_visible() {
+        let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(20) + "target";
+        let mut ap = ApprovalOverlay::new(UiApprovalRequest {
+            id: ApprovalId::new("r1"),
+            tool: "shell_command".into(),
+            summary: String::new(),
+            command: Some(long),
+            risks: vec!["风险甲".into(), "风险乙".into()],
+            call_id: None,
+            always_persists: true,
+        });
+        ap.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let screen = frame_of(&Overlay::Approval(Box::new(ap)), 80, 16);
+        assert!(
+            screen.iter().any(|l| l.contains("拒绝") && l.contains('▸')),
+            "the focused Deny scrolled off:\n{}",
+            screen.join("\n")
+        );
+        assert!(
+            screen.iter().any(|l| l.contains("Ctrl+O")),
+            "the decision hint scrolled off:\n{}",
+            screen.join("\n")
+        );
+    }
+
+    /// Downs on a small clarification move the cursor into a row that scrolls
+    /// into view, so the `❯` marker is never nowhere on screen.
+    #[test]
+    fn a_deep_clarification_cursor_scrolls_into_view() {
+        let mut ov = single_choice(&["一", "二", "三", "四", "五", "六", "七", "八"]);
+        for _ in 0..7 {
+            ov.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        let screen = frame_of(&Overlay::Clarification(Box::new(ov)), 80, 8);
+        let row = focus_row(&screen, "八");
+        assert!(row.contains('❯'), "the focused option is unmarked: {row:?}");
+    }
+
+    /// A long picker scrolls with its cursor instead of stranding the focused
+    /// row below the fold.
+    #[test]
+    fn a_deep_picker_cursor_scrolls_the_list() {
+        let ov = picker(12);
+        let mut model = match ov {
+            Overlay::ModelPicker(model) => model,
+            _ => unreachable!(),
+        };
+        for _ in 0..11 {
+            model.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        let screen = frame_of(&Overlay::ModelPicker(model), 80, 8);
+        let row = focus_row(&screen, "模型 11");
+        assert!(row.contains('▸'), "the focused option is unmarked: {row:?}");
+    }
+
+    /// Resizing re-derives the offset from the current focus, so a row that was
+    /// visible at 100×30 stays visible at 80×8 without resetting the cursor.
+    #[test]
+    fn resize_keeps_the_focused_row_visible() {
+        let ov = picker(12);
+        let mut model = match ov {
+            Overlay::ModelPicker(model) => model,
+            _ => unreachable!(),
+        };
+        for _ in 0..11 {
+            model.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        let ov = Overlay::ModelPicker(model);
+        for (w, h) in [(100, 30), (80, 24), (80, 16), (60, 16)] {
+            let screen = frame_of(&ov, w, h);
+            let row = focus_row(&screen, "模型 11");
+            assert!(
+                row.contains('▸'),
+                "{w}×{h}: the focused row scrolled off:\n{}",
+                screen.join("\n")
+            );
+        }
+    }
+
+    /// The offset primitive itself: for any cursor and viewport, the cursor is
+    /// inside the drawn body rows.
+    #[test]
+    fn the_window_offset_always_contains_the_cursor_row() {
+        let total = 40;
+        for height in 2..=20usize {
+            for cursor in 0..total - 1 {
+                let window = overlay_window(total, height, Some(cursor), None, 1);
+                assert!(
+                    window.offset <= cursor && cursor < window.offset + window.body,
+                    "height={height} cursor={cursor} window={window:?}"
+                );
+            }
+        }
+    }
+
+    /// When the decision block fits, the offset keeps the whole block visible
+    /// rather than only the focused row.
+    #[test]
+    fn the_window_keeps_a_fitting_decision_block_together() {
+        let window = overlay_window(40, 10, Some(29), Some((25, 29)), 1);
+        assert!(window.offset <= 25, "block start scrolled off: {window:?}");
+        assert!(
+            window.offset + window.body > 29,
+            "block end scrolled off: {window:?}"
+        );
     }
 }

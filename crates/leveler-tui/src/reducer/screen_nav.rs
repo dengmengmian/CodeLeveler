@@ -144,11 +144,14 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                     }
                 }
                 KeyCode::Char('d') => {
-                    if let Some(s) = state.sessions.get(state.sessions_selected) {
-                        return vec![Effect::Send(ClientCommand::DeleteSessionFor {
-                            requester_session_id: state.session_id.clone(),
-                            session_id: s.id.clone(),
-                        })];
+                    // Deleting a session cannot be undone and the runtime keeps
+                    // no backup, so `d` only opens the confirmation. The actual
+                    // delete is sent from the confirm overlay's explicit choice.
+                    if state.sessions.get(state.sessions_selected).is_some() {
+                        super::overlay_keys::open_session_delete_confirm(
+                            state,
+                            state.sessions_selected,
+                        );
                     }
                 }
                 KeyCode::Char('t') => {

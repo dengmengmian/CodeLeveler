@@ -546,6 +546,11 @@ pub struct UiText {
     /// Sessions screen: the empty state and the footer hint.
     pub sessions_empty: &'static str,
     pub sessions_footer_hint: &'static str,
+    /// Sessions screen: the destructive delete confirmation.
+    pub session_delete_title: &'static str,
+    pub session_delete_cancel: &'static str,
+    pub session_delete_confirm: &'static str,
+    pub session_delete_warning: &'static str,
     /// Help screen: which `↑/↓` is meant — the composer or the transcript.
     pub help_scope_input: &'static str,
     pub help_scope_conversation: &'static str,
@@ -1374,6 +1379,10 @@ static ZH: UiText = UiText {
     diff_footer_hint: "↑↓ 选择文件 · PgUp/PgDn 滚动 · Esc 返回",
     sessions_empty: "暂无会话",
     sessions_footer_hint: "↑↓ 选择 · Enter 打开 · d 删除 · Esc 返回",
+    session_delete_title: "删除会话？",
+    session_delete_cancel: "取消",
+    session_delete_confirm: "删除",
+    session_delete_warning: "此操作无法撤销",
     help_scope_input: "输入框",
     help_scope_conversation: "对话",
     tool_filter_all: "全部",
@@ -2085,6 +2094,10 @@ static EN: UiText = UiText {
     diff_footer_hint: "↑↓ select file · PgUp/PgDn scroll · Esc back",
     sessions_empty: "No sessions yet",
     sessions_footer_hint: "↑↓ select · Enter open · d delete · Esc back",
+    session_delete_title: "Delete session?",
+    session_delete_cancel: "Cancel",
+    session_delete_confirm: "Delete",
+    session_delete_warning: "This cannot be undone",
     help_scope_input: "Input",
     help_scope_conversation: "Conversation",
     tool_filter_all: "All",

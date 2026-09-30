@@ -333,7 +333,8 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             | crate::overlay::Overlay::WorkModePicker(_)
             | crate::overlay::Overlay::CollabPicker(_)
             | crate::overlay::Overlay::UnsupportedMedia(_)
-            | crate::overlay::Overlay::CheckpointPicker(_) => {
+            | crate::overlay::Overlay::CheckpointPicker(_)
+            | crate::overlay::Overlay::ConfirmSessionDelete(_) => {
                 return StatusPhase::AwaitingUser;
             }
         }

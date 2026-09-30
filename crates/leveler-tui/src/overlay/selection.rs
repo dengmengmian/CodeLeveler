@@ -79,6 +79,9 @@ pub struct SelectionModel {
     /// Cursor as an index into the currently visible (filtered) rows.
     cursor: usize,
     searchable: bool,
+    /// Whether a digit confirms a row outright. Off for destructive
+    /// confirmations, where a stray key must not pick the dangerous choice.
+    quick_select: bool,
     query: String,
 }
 
@@ -92,6 +95,7 @@ impl SelectionModel {
             options,
             cursor: 0,
             searchable,
+            quick_select: true,
             query: String::new(),
         };
         model.cursor = model.first_enabled_visible().unwrap_or(0);
@@ -100,6 +104,13 @@ impl SelectionModel {
 
     pub fn with_description(mut self, text: impl Into<String>) -> Self {
         self.description = Some(text.into());
+        self
+    }
+
+    /// Turn off digit quick-select. A destructive confirmation must be a
+    /// deliberate move-to-the-row then Enter, never a single stray digit.
+    pub fn without_quick_select(mut self) -> Self {
+        self.quick_select = false;
         self
     }
 
@@ -189,8 +200,11 @@ impl SelectionModel {
                 self.clamp_cursor();
                 SelectionOutcome::None
             }
-            // Digits quick-select only when not searchable .
-            KeyCode::Char(d @ '1'..='9') if !self.searchable && !ctrl => self.quick_select(d),
+            // Digits quick-select only when not searchable and not a
+            // confirmation that opted out.
+            KeyCode::Char(d @ '1'..='9') if !self.searchable && self.quick_select && !ctrl => {
+                self.quick_select(d)
+            }
             KeyCode::Char(c) if self.searchable && !ctrl => {
                 self.query.push(c);
                 self.cursor = self.first_enabled_visible().unwrap_or(0);
