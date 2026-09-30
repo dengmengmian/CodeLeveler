@@ -139,6 +139,7 @@ pub fn item_render(
                 0,
                 None,
                 None,
+                crate::activity_stream::DIFF_PREVIEW_ROWS,
                 &mut Vec::new(),
             ));
         }

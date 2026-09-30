@@ -35,8 +35,12 @@ pub mod multi_agent;
 mod observability;
 pub mod overlay;
 pub mod pending_inputs;
+#[cfg(test)]
+mod perf_bench;
 mod plan_cell;
 mod presentation;
+pub mod profile;
+pub mod record;
 pub mod reducer;
 pub mod render;
 pub mod screen;
@@ -58,6 +62,8 @@ pub mod transcript;
 pub mod unfinished_goals;
 pub mod update;
 mod url_link;
+#[cfg(test)]
+mod ux_experiment;
 mod wait_status;
 mod workbench;
 

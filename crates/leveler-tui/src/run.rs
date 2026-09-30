@@ -257,6 +257,17 @@ pub async fn run(
     // The notification currently on screen and when it appeared, for expiry.
     let mut note_shown: Option<(Notification, Instant)> = None;
 
+    // Profiling bookkeeping. Inert unless LEVELER_TUI_PROFILE is set: the
+    // `Option<Instant>` slots stay `None`, so the normal path never reads a
+    // clock and the loop behaves exactly as before.
+    let mut pending_since: Option<Instant> = None;
+    let mut last_frame_start: Option<Instant> = None;
+    let mut last_delta_at: Option<Instant> = None;
+    let mut deltas_since_frame: u64 = 0;
+    let mut runtime_events_since_frame: u64 = 0;
+    let mut requests_since_frame: u64 = 0;
+    let mut recorder = crate::record::Recorder::from_env();
+
     paint(&mut alt, &mut stdout, &mut state, &mut tab_title)?;
 
     while state.running {
@@ -287,6 +298,7 @@ pub async fn run(
                         effects = reduce(&mut state, action);
                     }
                     paint_now = true;
+                    requests_since_frame += 1;
                 }
                 },
                 received = events.recv(), if events_open => match received {
@@ -297,7 +309,36 @@ pub async fn run(
                             events = client.subscribe_session(&session.id);
                             events_open = true;
                         }
+                        let delta_bytes = match &event {
+                            RuntimeEvent::AssistantTextDelta { delta, .. } => Some(delta.len()),
+                            _ => None,
+                        };
+                        if let Some(recorder) = recorder.as_mut() {
+                            recorder.record(&event);
+                        }
+                        let apply_start = crate::profile::start();
                         effects = reduce(&mut state, Action::Runtime(event));
+                        crate::profile::stop(apply_start, "tui.state_apply_ms");
+                        crate::profile::add("tui.runtime_event_count", 1);
+                        if let Some(bytes) = delta_bytes {
+                            crate::profile::add("stream.delta_count", 1);
+                            crate::profile::add("stream.delta_bytes", bytes as u64);
+                            if crate::profile::enabled() {
+                                if let Some(prev) = last_delta_at {
+                                    crate::profile::record_elapsed(
+                                        prev,
+                                        "stream.delta_interval_ms",
+                                    );
+                                }
+                                last_delta_at = Some(Instant::now());
+                            }
+                            deltas_since_frame += 1;
+                        }
+                        runtime_events_since_frame += 1;
+                        requests_since_frame += 1;
+                        if pending_since.is_none() {
+                            pending_since = crate::profile::start();
+                        }
                         pending_runtime_paint = true;
                     }
                     Err(RecvError::Lagged(_)) => {
@@ -335,6 +376,7 @@ pub async fn run(
                 Some(action) = completion_rx.recv() => {
                     effects = reduce(&mut state, action);
                     paint_now = true;
+                    requests_since_frame += 1;
                 }
                 _ = tick.tick() => {
                     effects = reduce(&mut state, Action::IdleTick(Instant::now()));
@@ -403,18 +445,49 @@ pub async fn run(
             paint_now = true;
         }
 
-        // Keep conversation viewport scroll in range as content/layout changes.
-        if state.active_screen == Screen::Conversation
-            && crate::conversation::sync_scroll(&mut state)
-        {
-            paint_now = true;
-        }
+        // Conversation viewport scroll is synced inside the paint branch below,
+        // not here: syncing rebuilds the projected lines, and a streaming turn
+        // bumps the transcript on every delta. Running it per loop iteration
+        // re-parsed the whole live message and re-wrapped the whole transcript
+        // once per delta instead of once per painted frame. Every reason sync
+        // could request a repaint (content growth, resize, scroll intent)
+        // already sets one of the paint conditions evaluated below.
 
         // Repaint on input, on runtime updates, and — while busy — on the tick
         // (spinner/elapsed). Idle ticks only repaint when the wall clock minute
         // changes (handled above via paint_now).
         if paint_now || (ticked && state.is_busy()) || (!state.is_busy() && pending_runtime_paint) {
+            if state.active_screen == Screen::Conversation {
+                crate::conversation::sync_scroll(&mut state);
+            }
+            crate::profile::add("tui.render_count", 1);
+            crate::profile::add("tui.render_requested_count", requests_since_frame);
+            crate::profile::add(
+                "tui.render_coalesced_count",
+                requests_since_frame.saturating_sub(1),
+            );
+            if ticked && requests_since_frame == 0 && deltas_since_frame == 0 {
+                crate::profile::add("tui.spinner_only_render_count", 1);
+            }
+            crate::profile::record_us("tui.deltas_per_frame", deltas_since_frame);
+            crate::profile::record_us("tui.runtime_events_per_frame", runtime_events_since_frame);
+            if let Some(t0) = pending_since {
+                crate::profile::record_elapsed(t0, "tui.render_wait_ms");
+            }
+            if let Some(prev) = last_frame_start {
+                crate::profile::record_elapsed(prev, "tui.frame_interval_ms");
+            }
+            let paint_start = crate::profile::start();
             paint(&mut alt, &mut stdout, &mut state, &mut tab_title)?;
+            crate::profile::stop(paint_start, "tui.render_ms");
+            if let Some(t0) = pending_since {
+                crate::profile::record_elapsed(t0, "tui.event_to_render_end_ms");
+            }
+            pending_since = None;
+            last_frame_start = crate::profile::start();
+            deltas_since_frame = 0;
+            runtime_events_since_frame = 0;
+            requests_since_frame = 0;
             pending_runtime_paint = false;
         }
     }
@@ -453,6 +526,7 @@ pub async fn run(
         TuiExit::Quit
     };
     guard.restore();
+    crate::profile::emit_report();
     if exit == TuiExit::Quit {
         // After raw mode is off: print full resume command so the user can reconnect.
         println!("{}", session_exit_hint(session_id.as_str()));

@@ -71,6 +71,7 @@ pub(crate) fn render_group(
         now_elapsed_secs,
         awaiting_approval,
         None,
+        DIFF_PREVIEW_ROWS,
         &mut rows,
     )
 }
@@ -98,6 +99,8 @@ pub(crate) fn render_group_rows(
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
+    // Responsive diff preview budget, computed from the conversation viewport.
+    diff_preview_rows: usize,
     rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
@@ -267,6 +270,7 @@ pub(crate) fn render_group_rows(
                     locale,
                     t,
                     group.expanded,
+                    diff_preview_rows,
                 ));
             }
             StreamUnit::FailMerge(calls) => {
@@ -1133,6 +1137,25 @@ const LIVE_TAIL_DELAY_SECS: u64 = 1;
 /// Diff rows a settled edit keeps on screen before the rest is counted.
 pub(crate) const DIFF_PREVIEW_ROWS: usize = 24;
 
+/// Floor for the responsive preview budget: enough to show the node's head,
+/// stats, a hunk header and at least one change pair.
+pub(crate) const DIFF_PREVIEW_MIN_ROWS: usize = 6;
+
+/// The preview budget for a settled edit, derived from the conversation
+/// viewport it is judged in. An edit node is `head + stats + preview + fold`
+/// rows; keeping the budget three rows under the viewport keeps the node's own
+/// head — which names the file — on screen beside its diff.
+///
+/// Quantized to 4 rows on purpose: a transient chrome change (a notice row
+/// appearing) moves the viewport by a row or two, and a continuous formula
+/// would shift the whole projection with it — and with it every anchor a
+/// navigation action computed a moment earlier. Four-row steps absorb that
+/// jitter while still tracking a real resize.
+pub(crate) fn diff_preview_rows_for_viewport(viewport_height: usize) -> usize {
+    let quantized = viewport_height.saturating_sub(3) / 4 * 4;
+    quantized.clamp(DIFF_PREVIEW_MIN_ROWS, DIFF_PREVIEW_ROWS)
+}
+
 /// Rows a resolved clarification's answer may take in the transcript before
 /// the rest is folded. A multi-question answer is one row per question, and
 /// the whole set is the record of what the user decided.
@@ -1773,7 +1796,12 @@ fn edit_unit_lines(
     t: &UiText,
     // The group was opened: show the whole diff instead of its preview.
     expanded: bool,
+    preview_rows: usize,
 ) -> Vec<Line<'static>> {
+    // Experimental UX seam (test-only): the harness sweeps preview budgets
+    // without touching production call sites. Production uses `preview_rows`.
+    #[cfg(test)]
+    let preview_rows = crate::ux_experiment::policy::diff_preview_cap(preview_rows);
     let Some(first) = calls.first() else {
         return Vec::new();
     };
@@ -1852,9 +1880,9 @@ fn edit_unit_lines(
     // a fold; opening the group shows every row.
     let start = out.len();
     crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out);
-    let hidden = (out.len() - start).saturating_sub(DIFF_PREVIEW_ROWS);
+    let hidden = (out.len() - start).saturating_sub(preview_rows);
     if !expanded && hidden > 0 {
-        out.truncate(start + DIFF_PREVIEW_ROWS);
+        out.truncate(start + preview_rows);
         out.push(clip_line(
             vec![
                 Span::styled("    ", Style::default().fg(theme.ink(Ink::Subtle))),
@@ -2140,6 +2168,8 @@ pub(crate) fn render_activity(
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
+    // Responsive diff preview budget, computed from the conversation viewport.
+    diff_preview_rows: usize,
     rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(ACTIVITY_INDENT.len());
@@ -2153,6 +2183,7 @@ pub(crate) fn render_activity(
         now_elapsed_secs,
         awaiting_approval,
         focused_command,
+        diff_preview_rows,
         &mut group_rows,
     );
     // The indent shifts every line, so the reported line offsets stay in the
@@ -3816,6 +3847,7 @@ mod tests {
             0,
             None,
             None,
+            DIFF_PREVIEW_ROWS,
             &mut Vec::new(),
         );
         let text: Vec<String> = indented
@@ -5694,5 +5726,55 @@ mod compact_command_tests {
         assert_eq!(fg_of(&lines, "README.md"), Some(theme.ink(Ink::Settled)));
         assert_eq!(fg_of(&lines, "0.2s"), Some(theme.ink(Ink::Meta)));
         assert_eq!(fg_of(&lines, "\u{203a}"), Some(theme.ink(Ink::Subtle)));
+    }
+}
+
+#[cfg(test)]
+mod diff_preview_tests {
+    use super::*;
+
+    /// The budget must leave room for an edit node's own head (1), stats (1)
+    /// and fold marker (1) inside the viewport it is judged in — otherwise a
+    /// long diff scrolls the file name off the screen above its changes.
+    #[test]
+    fn the_budget_keeps_an_edit_nodes_head_inside_its_viewport() {
+        for viewport in [9usize, 10, 11, 12, 13, 17, 27, 40] {
+            let cap = diff_preview_rows_for_viewport(viewport);
+            assert!(
+                (DIFF_PREVIEW_MIN_ROWS..=DIFF_PREVIEW_ROWS).contains(&cap),
+                "viewport {viewport}: budget {cap} out of range"
+            );
+            assert!(
+                cap + 3 <= viewport.max(9),
+                "viewport {viewport}: node of {} rows exceeds it",
+                cap + 3
+            );
+        }
+    }
+
+    /// Quantization is the point: a transient chrome row (a notice) moves the
+    /// viewport by one or two rows, and a continuous formula would shift every
+    /// diff line — and every navigation anchor computed a moment earlier.
+    #[test]
+    fn a_two_row_chrome_change_does_not_move_the_budget() {
+        assert_eq!(
+            diff_preview_rows_for_viewport(11),
+            diff_preview_rows_for_viewport(12)
+        );
+        assert_eq!(
+            diff_preview_rows_for_viewport(12),
+            diff_preview_rows_for_viewport(13)
+        );
+        assert_eq!(
+            diff_preview_rows_for_viewport(16),
+            diff_preview_rows_for_viewport(17)
+        );
+    }
+
+    /// A real resize still changes it.
+    #[test]
+    fn a_real_resize_moves_the_budget() {
+        assert!(diff_preview_rows_for_viewport(13) < diff_preview_rows_for_viewport(40));
+        assert_eq!(diff_preview_rows_for_viewport(40), DIFF_PREVIEW_ROWS);
     }
 }

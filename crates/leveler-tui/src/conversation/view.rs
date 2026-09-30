@@ -28,21 +28,27 @@ pub struct ConvKey {
     /// run time) are painted from it, so a new second is a new frame even when
     /// no transcript event arrived. Constant while idle.
     pub(crate) elapsed_secs: u64,
+    /// The diff preview budget derived from the conversation viewport height.
+    /// Part of the key because a height-only resize (same width) changes it and
+    /// would otherwise keep painting the previous budget's truncation.
+    pub(crate) diff_preview_rows: usize,
     /// The command row holding the keyboard focus, when the Command workbench
     /// focus is active. Part of the key because focus paints the row's opener
     /// (§11), and a cache that did not notice would keep two rows marked.
     pub(crate) focused_command: Option<leveler_client_protocol::ToolCallId>,
 }
 
-/// One memoized conversation build: cache key, wrapped lines, and the
-/// disclosure hit rows (absolute line index → transcript item index). The hit
-/// rows are rebuilt with the lines under the same key, so they can never go
-/// stale relative to what is painted.
+/// One memoized conversation build: cache key, wrapped lines, the disclosure
+/// hit rows (absolute line index → transcript item index), the command rows,
+/// and the absolute line where the last Final answer begins. Everything is
+/// rebuilt under the same key, so no derived index can go stale relative to
+/// what is painted.
 pub type ConvCacheEntry = (
     ConvKey,
     std::rc::Rc<Vec<Line<'static>>>,
     std::rc::Rc<Vec<(usize, usize)>>,
     std::rc::Rc<Vec<CommandHit>>,
+    Option<usize>,
 );
 
 /// A command call's clickable row in the built conversation: absolute line,
@@ -56,6 +62,50 @@ pub struct CommandHit {
     pub stoppable: bool,
 }
 
+/// Render inputs shared by every cacheable transcript unit. A unit is
+/// re-wrapped only when one of these changes or when the item itself changes.
+/// Live inputs (turn clock, approval, focus) are deliberately absent: a
+/// cacheable item never reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitEnv {
+    pub width: usize,
+    pub theme_id: crate::theme::ThemeId,
+    pub monochrome: bool,
+    pub locale: crate::i18n::Locale,
+    pub tools_expanded: bool,
+}
+
+/// A command row in unit-relative coordinates (resolved against the assembled
+/// conversation when the unit is placed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedCommand {
+    pub line: usize,
+    pub item_offset: usize,
+    pub call: usize,
+    pub stoppable: bool,
+}
+
+/// Wrapped lines for one immutable transcript item, plus its disclosure hit
+/// rows and command rows in item-relative coordinates. `items` is kept so the
+/// next build can tell whether the unit still matches what it wrapped.
+#[derive(Debug, Clone)]
+pub struct CachedUnit {
+    pub items: Vec<crate::transcript::TranscriptItem>,
+    pub env: UnitEnv,
+    pub lines: std::rc::Rc<Vec<Line<'static>>>,
+    pub hits: Vec<(usize, usize)>,
+    pub commands: Vec<CachedCommand>,
+}
+
+/// Per-item memo of wrapped transcript lines. Positional: entry N is the Nth
+/// cacheable unit of the last build. A unit is reused only when its items and
+/// env compare equal, so an insertion (compaction) or an in-place edit simply
+/// misses rather than reusing the wrong lines.
+#[derive(Debug, Default)]
+pub struct ItemLineCache {
+    pub units: Vec<CachedUnit>,
+}
+
 /// Viewport + interaction state for the Conversation.
 #[derive(Debug)]
 pub struct ConversationView {
@@ -63,7 +113,8 @@ pub struct ConversationView {
     pub scroll: usize,
     /// When true, stick to the bottom as new activity arrives.
     pub auto_scroll: bool,
-    /// Content ticks observed while pinned away from bottom (for ▼ N).
+    /// Content ticks observed while pinned away from bottom (for the
+    /// scroll-to-bottom badge, which counts content LINES).
     pub unread: usize,
     /// Last seen conversation line count (to detect growth while scrolled up).
     pub last_len: usize,
@@ -88,6 +139,10 @@ pub struct ConversationView {
     /// Memoized wrapped conversation lines + disclosure hit rows. Interior
     /// mutability so read-only render/measure paths can populate it.
     pub cache: std::cell::RefCell<Option<ConvCacheEntry>>,
+    /// Memoized wrapped lines per immutable transcript item. This is what keeps
+    /// a long finalized history from being re-wrapped on every streaming frame:
+    /// only the item whose content changed is recomputed.
+    pub item_cache: std::cell::RefCell<ItemLineCache>,
 }
 
 impl Default for ConversationView {
@@ -106,6 +161,7 @@ impl Default for ConversationView {
             plain: Vec::new(),
             plain_width: 0,
             cache: std::cell::RefCell::new(None),
+            item_cache: std::cell::RefCell::new(ItemLineCache::default()),
         }
     }
 }

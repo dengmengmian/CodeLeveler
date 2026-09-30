@@ -47,7 +47,7 @@ pub fn sync_scroll(state: &mut AppState) -> bool {
     let max_scroll = geometry::max_scroll(total, height);
     let mut changed = false;
 
-    // Track growth while the user is reading history → drive ▼ N.
+    // Track growth while the user is reading history → drive the scroll badge.
     if !state.conv.auto_scroll && total > state.conv.last_len {
         state.conv.unread = state.conv.unread.saturating_add(1);
         changed = true;

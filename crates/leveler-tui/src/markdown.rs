@@ -5,7 +5,9 @@
 //! doc is laid out to the current width — cheap word-wrapping, no re-parsing —
 //! honoring the "don't re-parse Markdown every frame" performance rule.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
@@ -60,7 +62,7 @@ enum MdBlock {
     Code {
         lang: Option<String>,
         title: Option<String>,
-        lines: Vec<Vec<((u8, u8, u8), String)>>,
+        lines: Arc<Vec<Vec<((u8, u8, u8), String)>>>,
     },
     /// A GFM table: a header row plus body rows, each cell a run of spans.
     /// `align` has one entry per column (from the separator row).
@@ -107,6 +109,13 @@ struct MdSpan {
 impl MdDoc {
     /// Parse markdown text into a document (done once per completed message).
     pub fn parse(text: &str) -> Self {
+        let started = crate::profile::start();
+        let doc = Self::parse_inner(text);
+        crate::profile::markdown_parse(started, text.len());
+        doc
+    }
+
+    fn parse_inner(text: &str) -> Self {
         let mut opts = Options::empty();
         opts.insert(Options::ENABLE_STRIKETHROUGH);
         opts.insert(Options::ENABLE_TABLES);
@@ -208,9 +217,9 @@ impl MdDoc {
                     let lang = code_lang.take();
                     let title = code_title.take();
                     let lines = if lang.as_deref() == Some("diff") {
-                        highlight_diff(&code_buf)
+                        Arc::new(highlight_diff(&code_buf))
                     } else {
-                        highlight_code(&code_buf, lang.as_deref())
+                        highlight_code_cached(&code_buf, lang.as_deref())
                     };
                     blocks.push(MdBlock::Code { lang, title, lines });
                 }
@@ -329,7 +338,7 @@ impl MdDoc {
                     parts.extend(items.iter().map(|item| spans_text(item)));
                 }
                 MdBlock::Code { lines, .. } => {
-                    for line in lines {
+                    for line in lines.iter() {
                         parts.push(line.iter().map(|(_, text)| text.as_str()).collect());
                     }
                 }
@@ -1132,8 +1141,160 @@ fn theme_set() -> &'static ThemeSet {
     TS.get_or_init(ThemeSet::load_defaults)
 }
 
+/// Per-line syntax-highlighted runs: `(rgb, text)` per segment.
+type HighlightedLines = Vec<Vec<((u8, u8, u8), String)>>;
+
+/// Upper bounds for the memoized highlight cache. The cache is derived data:
+/// the same `(lang, code)` always maps to the same highlighted runs, and the
+/// final color mapping happens later at render time, so entries never go stale
+/// with a theme change. Bounds are on both entry count and retained source
+/// bytes, so a session that pastes many large blocks cannot grow without limit.
+const HIGHLIGHT_CACHE_MAX_ENTRIES: usize = 512;
+const HIGHLIGHT_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+struct HighlightEntry {
+    lang: Option<String>,
+    code: String,
+    lines: Arc<HighlightedLines>,
+    /// Monotonic use counter; the smallest value is the eviction victim.
+    last_used: u64,
+}
+
+/// Bounded LRU over highlighted code blocks. Entries are stored under the hash
+/// of `(lang, code)` and compared by value on lookup, so a hash collision can
+/// only produce an extra miss, never a wrong highlight.
+#[derive(Default)]
+struct HighlightCache {
+    entries: HashMap<u64, HighlightEntry>,
+    tick: u64,
+    total_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl HighlightCache {
+    /// Bump and return the next use stamp.
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    /// Return the memoized highlight for `(lang, code)`, or `None` on miss.
+    fn get(&mut self, key: u64, lang: Option<&str>, code: &str) -> Option<Arc<HighlightedLines>> {
+        let tick = self.next_tick();
+        let entry = self.entries.get_mut(&key)?;
+        if entry.lang.as_deref() != lang || entry.code != code {
+            return None;
+        }
+        entry.last_used = tick;
+        self.hits = self.hits.wrapping_add(1);
+        Some(entry.lines.clone())
+    }
+
+    fn put(&mut self, key: u64, lang: Option<String>, code: String, lines: Arc<HighlightedLines>) {
+        let tick = self.next_tick();
+        self.misses = self.misses.wrapping_add(1);
+        let bytes = code.len();
+        self.total_bytes += bytes;
+        self.entries.insert(
+            key,
+            HighlightEntry {
+                lang,
+                code,
+                lines,
+                last_used: tick,
+            },
+        );
+        // Evict least-recently-used entries. The just-inserted entry is always
+        // kept, even if a single block alone exceeds the byte bound, because a
+        // single oversized block is still the most valuable cache entry.
+        while self.entries.len() > HIGHLIGHT_CACHE_MAX_ENTRIES
+            || (self.total_bytes > HIGHLIGHT_CACHE_MAX_BYTES && self.entries.len() > 1)
+        {
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+                .expect("cache is non-empty");
+            if let Some(evicted) = self.entries.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.code.len());
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn highlight_key(code: &str, lang: Option<&str>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lang.hash(&mut hasher);
+    code.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn highlight_cache() -> &'static Mutex<HighlightCache> {
+    static CACHE: OnceLock<Mutex<HighlightCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HighlightCache::default()))
+}
+
+fn lock_cache() -> std::sync::MutexGuard<'static, HighlightCache> {
+    match highlight_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Cumulative `(hits, misses)` of the syntax-highlight memo. Observability only:
+/// used by the markdown benchmark to report the warm/cold split.
+pub fn highlight_cache_stats() -> (u64, u64) {
+    let cache = lock_cache();
+    (cache.hits, cache.misses)
+}
+
+/// Drop every memoized highlight. Test-only: benchmarks need a true cold frame.
+#[cfg(test)]
+pub fn highlight_cache_clear() {
+    let mut cache = lock_cache();
+    cache.entries.clear();
+    cache.total_bytes = 0;
+}
+
+/// Memoized [`highlight_code`]. While a message streams, every painted frame
+/// re-parses the whole message; completed fenced blocks inside it are byte-for-
+/// byte identical between frames, so this turns their repeated syntect work into
+/// a cache hit. Only the still-growing tail block can miss.
+fn highlight_code_cached(code: &str, lang: Option<&str>) -> Arc<HighlightedLines> {
+    if code.is_empty() {
+        return Arc::new(Vec::new());
+    }
+    let key = highlight_key(code, lang);
+    let hit = {
+        let mut cache = lock_cache();
+        cache.get(key, lang, code)
+    };
+    if let Some(lines) = hit {
+        crate::profile::add("tui.syntect_cache_hit_count", 1);
+        return lines;
+    }
+    let started = crate::profile::start();
+    let lines = Arc::new(highlight_code(code, lang));
+    crate::profile::stop(started, "tui.syntect_ms");
+    crate::profile::add("tui.syntect_cache_miss_count", 1);
+    {
+        let mut cache = lock_cache();
+        cache.put(
+            key,
+            lang.map(str::to_string),
+            code.to_string(),
+            lines.clone(),
+        );
+    }
+    lines
+}
+
 /// Syntax-highlight a code block into per-line colored runs.
-fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Vec<((u8, u8, u8), String)>> {
+fn highlight_code(code: &str, lang: Option<&str>) -> HighlightedLines {
     let ss = syntax_set();
     let syntax = lang
         .and_then(|l| ss.find_syntax_by_token(l))
@@ -1960,6 +2121,50 @@ mod tests {
         assert!(
             !underlined_url,
             "URL inside inline code must not be link-styled: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn highlight_cache_memoizes_identical_blocks() {
+        // Same `(lang, code)` must be the SAME highlighted value, not merely an
+        // equal one: `Arc::ptr_eq` proves the second call reused the cache
+        // instead of re-running syntect. Content is unique to this test so a
+        // parallel test cannot pre-populate the entry.
+        let code = "fn cache_memoize_probe_alpha() { let x = 42; }\n";
+        let first = highlight_code_cached(code, Some("rust"));
+        let second = highlight_code_cached(code, Some("rust"));
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn highlight_cache_distinguishes_language_and_content() {
+        let code_a = "let cache_distinct_probe = \"alpha\";\n";
+        let code_b = "let cache_distinct_probe = \"beta\";\n";
+        let rust = highlight_code_cached(code_a, Some("rust"));
+        let json = highlight_code_cached(code_a, Some("json"));
+        let other = highlight_code_cached(code_b, Some("rust"));
+        assert!(!Arc::ptr_eq(&rust, &json), "language is part of the key");
+        assert!(!Arc::ptr_eq(&rust, &other), "content is part of the key");
+    }
+
+    #[test]
+    fn highlight_cache_eviction_is_bounded_and_never_wrong() {
+        // Overflow the entry bound, then re-request the ORIGINAL block: either
+        // it is still cached (still correct) or it is recomputed (still
+        // correct, because the value is a pure function of the key).
+        let probe = highlight_code_cached("fn bounded_probe_zero() {}\n", Some("rust"));
+        for i in 0..(HIGHLIGHT_CACHE_MAX_ENTRIES + 32) {
+            let code = format!("fn bounded_probe_{i}() {{ let v = {i}; }}\n");
+            let _ = highlight_code_cached(&code, Some("rust"));
+        }
+        let again = highlight_code_cached("fn bounded_probe_zero() {}\n", Some("rust"));
+        assert_eq!(
+            *probe, *again,
+            "recomputed output must match the cached one"
+        );
+        assert!(
+            highlight_cache().lock().unwrap().entries.len() <= HIGHLIGHT_CACHE_MAX_ENTRIES,
+            "entry bound must hold"
         );
     }
 }
