@@ -68,6 +68,7 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
         ("Ctrl+?", t.help_title),
         ("Ctrl+D/T/S", t.key_screens),
         ("Ctrl+End / Ctrl+↓", t.key_jump),
+        ("Ctrl+G", t.key_final_nav),
         ("End", t.key_end),
         ("Esc", t.key_esc),
     ];

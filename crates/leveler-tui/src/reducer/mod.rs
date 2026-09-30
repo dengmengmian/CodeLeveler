@@ -974,6 +974,13 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 request_jump_to_bottom(state);
                 return Vec::new();
             }
+            // Ctrl+G: jump to where the current/last Final answer starts.
+            // A long answer buries its own opening; page-back is the only trip
+            // back to it otherwise.
+            KeyCode::Char('g') if !btw => {
+                request_jump_to_final(state);
+                return Vec::new();
+            }
             _ => {}
         }
     }
@@ -1571,6 +1578,40 @@ fn request_jump_to_bottom(state: &mut AppState) {
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
         message: state.t().back_to_bottom.to_string(),
+    });
+}
+
+/// Jump conversation viewport to where the current/last Final answer begins.
+///
+/// A long answer scrolls its own opening off the top: the bottom of the answer
+/// is what follows the live edge, so the reader reaches the start only by
+/// paging back, and the completion line below says the turn ended without
+/// saying where the answer started. The anchor comes from the SAME memoized
+/// projection that paints, so the jump can never land on different lines than
+/// the ones on screen. Pins auto-follow (a deliberate navigation is a scroll
+/// away from the live edge, exactly like PageUp).
+fn request_jump_to_final(state: &mut AppState) {
+    let width = crate::conversation::geometry::content_width(state);
+    let Some(anchor) = state.final_answer_anchor(width) else {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: state.t().final_nav_empty.to_string(),
+        });
+        return;
+    };
+    let height = crate::conversation::geometry::viewport_height(state);
+    let total = crate::conversation::build::conversation_line_count(state, width);
+    let max_scroll = crate::conversation::geometry::max_scroll(total, height);
+    state.active_screen = Screen::Conversation;
+    state.workbench_focus = WorkbenchFocus::Conversation;
+    state.turn_nav = None;
+    state.conv.auto_scroll = false;
+    // One row of breathing space above the answer, clamped so a Final near the
+    // end of a short transcript cannot scroll past the content.
+    state.conv.scroll = anchor.saturating_sub(1).min(max_scroll);
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: state.t().final_nav.to_string(),
     });
 }
 
@@ -2399,6 +2440,115 @@ mod disclosure_tests {
         assert!(
             flags.iter().any(|(i, e)| *i == item_b && *e),
             "streaming new events must not auto-collapse a user-opened group: {flags:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod final_nav_tests {
+    use super::*;
+    use crate::state::Boot;
+    use leveler_client_protocol::{MessageId, SessionId};
+
+    fn state() -> AppState {
+        let mut s = AppState::new(
+            crate::theme::Theme::no_color(),
+            Boot {
+                session_id: SessionId::new("s1"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                reasoning_effort: None,
+            },
+        );
+        s.size = (80, 24);
+        // 12 conversation rows, like 80×24 paints after chrome.
+        s.conv.rect = Some((2, 3, 76, 12));
+        s
+    }
+
+    fn say(s: &mut AppState, id: &str, text: &str) {
+        let m = MessageId::new(id);
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                message_id: m.clone(),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                message_id: m.clone(),
+                delta: text.into(),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: m }),
+        );
+    }
+
+    fn ctrl_g() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)
+    }
+
+    /// The Final's first line must be on screen after Ctrl+G, and the viewport
+    /// must be pinned (a deliberate jump, not a re-follow).
+    #[test]
+    fn ctrl_g_lands_on_the_final_answer_start() {
+        let mut s = state();
+        s.transcript.push_user("长任务".into());
+        for i in 0..40 {
+            s.transcript.push_note(format!("filler {i}"));
+        }
+        say(&mut s, "f1", "## 总结\n\n完成了这次改动。");
+        reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+
+        let width = crate::conversation::geometry::content_width(&s);
+        let height = crate::conversation::geometry::viewport_height(&s);
+        let anchor = s.final_answer_anchor(width).expect("a Final answer exists");
+        let total = crate::conversation::build::conversation_line_count(&s, width);
+        let max_scroll = crate::conversation::geometry::max_scroll(total, height);
+        assert!(
+            anchor > max_scroll,
+            "precondition: the Final start is off the live edge ({anchor} > {max_scroll})"
+        );
+
+        reduce(&mut s, Action::Key(ctrl_g()));
+
+        assert!(!s.conv.auto_scroll, "jump pins auto-follow");
+        assert_eq!(s.conv.scroll, anchor.saturating_sub(1).min(max_scroll));
+        assert!(
+            s.conv.scroll <= anchor && anchor < s.conv.scroll + height.max(1),
+            "Final start {anchor} must be inside [{}, {})",
+            s.conv.scroll,
+            s.conv.scroll + height.max(1)
+        );
+        assert_eq!(
+            s.notification.as_ref().map(|n| n.message.as_str()),
+            Some(s.t().final_nav)
+        );
+    }
+
+    /// With no Final yet the key must explain itself, not move anything.
+    #[test]
+    fn ctrl_g_without_a_final_is_a_no_op_with_a_notice() {
+        let mut s = state();
+        s.transcript.push_user("还在进行".into());
+        s.transcript.push_note("filler".into());
+        s.conv.auto_scroll = false;
+        s.conv.scroll = 0;
+        let before = s.conv.scroll;
+        reduce(&mut s, Action::Key(ctrl_g()));
+        assert_eq!(s.conv.scroll, before, "no Final: nothing to jump to");
+        assert_eq!(
+            s.notification.as_ref().map(|n| n.message.as_str()),
+            Some(s.t().final_nav_empty)
         );
     }
 }

@@ -388,6 +388,7 @@ pub struct UiText {
     pub key_screens: &'static str,
     pub key_expand: &'static str,
     pub key_turn_nav: &'static str,
+    pub key_final_nav: &'static str,
     pub key_model: &'static str,
     pub key_jump: &'static str,
     pub key_end: &'static str,
@@ -420,6 +421,10 @@ pub struct UiText {
     pub turn_nav_live: &'static str,
     /// No user turns yet.
     pub turn_nav_empty: &'static str,
+    /// Notification after jumping to the current/last Final answer.
+    pub final_nav: &'static str,
+    /// Notification when there is no Final answer to jump to yet.
+    pub final_nav_empty: &'static str,
 
     // Screens
     pub screen_sessions: &'static str,
@@ -1268,6 +1273,7 @@ static ZH: UiText = UiText {
     key_screens: "Diff/工具/会话",
     key_expand: "Ctrl+O：展开/收起最新工具组",
     key_turn_nav: "跳转用户轮次",
+    key_final_nav: "跳到最终回答",
     key_model: "切换模型",
     key_jump: "回到底部输入（滚上看历史后）",
     key_end: "空输入时回底；有字时行尾",
@@ -1291,6 +1297,8 @@ static ZH: UiText = UiText {
     turn_nav: "轮次 {}/{}",
     turn_nav_live: "回到最新",
     turn_nav_empty: "还没有用户消息",
+    final_nav: "已跳到最终回答",
+    final_nav_empty: "还没有最终回答",
     screen_sessions: "会话",
     screen_tools: "工具",
     screen_diff: "改动",
@@ -1989,6 +1997,7 @@ static EN: UiText = UiText {
     key_screens: "diff/tools/sessions",
     key_expand: "Ctrl+O: expand/collapse the latest tool group",
     key_turn_nav: "jump user turns",
+    key_final_nav: "jump to the final answer",
     key_model: "switch model",
     key_jump: "jump to bottom after scrolling history",
     key_end: "empty: jump bottom · with text: end of line",
@@ -2012,6 +2021,8 @@ static EN: UiText = UiText {
     turn_nav: "turn {}/{}",
     turn_nav_live: "back to live",
     turn_nav_empty: "no user messages yet",
+    final_nav: "jumped to the final answer",
+    final_nav_empty: "no final answer yet",
     screen_sessions: "Sessions",
     screen_tools: "Tools",
     screen_diff: "Diff",
