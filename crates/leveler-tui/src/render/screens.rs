@@ -127,8 +127,15 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
 
     let mut rows: Vec<Line> = Vec::new();
     if files.is_empty() {
+        // Loading is not empty. Saying "无改动" while a diff of thousands of
+        // files is still being computed is a false claim about the workspace.
+        let text = if state.diff_pending {
+            t.diff_loading
+        } else {
+            t.diff_empty
+        };
         rows.push(Line::from(Span::styled(
-            t.diff_empty,
+            text,
             Style::default().fg(theme.text.secondary),
         )));
     }

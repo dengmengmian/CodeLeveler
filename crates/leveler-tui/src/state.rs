@@ -310,6 +310,10 @@ pub struct AppState {
     pub child_contribution_query: Option<leveler_client_protocol::CommandId>,
     pub diff_query: Option<leveler_client_protocol::CommandId>,
     pub diff: Option<UiDiff>,
+    /// A `RequestDiff` is in flight. Distinguishes "the answer is not here yet"
+    /// from "there are no changes" — the Diff screen must never claim the
+    /// workspace is clean while it is still computing the diff.
+    pub diff_pending: bool,
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
@@ -578,6 +582,7 @@ impl AppState {
             child_contribution_query: None,
             diff_query: None,
             diff: None,
+            diff_pending: false,
             diff_selected: 0,
             goal_mode_active: false,
             work_profile: "balanced".into(),

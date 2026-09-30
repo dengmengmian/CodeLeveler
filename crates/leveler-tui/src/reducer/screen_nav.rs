@@ -396,6 +396,10 @@ pub(super) fn open_diff_screen(state: &mut AppState) -> Vec<Effect> {
     }
     state.active_screen = Screen::Diff;
     state.diff_selected = 0;
+    // The previous diff may belong to another moment; do not show it as the
+    // answer while the fresh one is computed.
+    state.diff = None;
+    state.diff_pending = true;
     let query_id = leveler_client_protocol::CommandId::generate();
     state.diff_query = Some(query_id.clone());
     vec![Effect::Send(ClientCommand::RequestDiff {

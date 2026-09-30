@@ -294,6 +294,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 state.diff_query = None;
             }
             state.turn_diff_files = Some(diff.files.len());
+            state.diff_pending = false;
             if state.diff_selected >= diff.files.len() {
                 state.diff_selected = 0;
             }
@@ -1659,6 +1660,7 @@ fn apply_session_with(
         state.agent_detail_query = None;
         state.child_contribution_query = None;
         state.diff_query = None;
+        state.diff_pending = false;
         state.context.pending_query_id = None;
         state.trace.pending_query_id = None;
         state.context_files.clear();

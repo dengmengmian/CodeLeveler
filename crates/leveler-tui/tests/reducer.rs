@@ -3922,6 +3922,64 @@ fn ctrl_d_opens_diff_and_requests_it() {
 }
 
 #[test]
+fn diff_loading_is_distinct_from_empty() {
+    use leveler_client_protocol::UiDiff;
+    let mut s = opened();
+    let effects = reduce(&mut s, ctrl('d'));
+    assert!(
+        s.diff_pending,
+        "opening the Diff screen starts a load, not an answer"
+    );
+    let loading = rendered(&mut s, 80, 24);
+    assert!(loading.contains("正在读取改动"), "{loading}");
+    assert!(
+        !loading.contains("无改动"),
+        "loading must not claim the workspace is clean:\n{loading}"
+    );
+
+    let query_id = effects.iter().find_map(|effect| match effect {
+        Effect::Send(ClientCommand::RequestDiff { query_id, .. }) => query_id.clone(),
+        _ => None,
+    });
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id,
+            diff: UiDiff { files: Vec::new() },
+        }),
+    );
+    assert!(!s.diff_pending, "a response ends the load");
+    let empty = rendered(&mut s, 80, 24);
+    assert!(
+        empty.contains("无改动"),
+        "a loaded empty diff is reported as empty:\n{empty}"
+    );
+}
+
+#[test]
+fn reopening_the_diff_screen_returns_to_loading() {
+    use leveler_client_protocol::UiDiff;
+    let mut s = opened();
+    reduce(&mut s, ctrl('d'));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::DiffUpdated {
+            query_id: None,
+            diff: UiDiff { files: Vec::new() },
+        }),
+    );
+    assert!(!s.diff_pending);
+    // Close and reopen: the old (empty) answer must not be shown as current
+    // while the fresh request is in flight.
+    reduce(&mut s, ctrl('d'));
+    assert_eq!(s.active_screen, Screen::Conversation);
+    reduce(&mut s, ctrl('d'));
+    assert_eq!(s.active_screen, Screen::Diff);
+    assert!(s.diff_pending);
+    assert!(s.diff.is_none());
+}
+
+#[test]
 fn diff_updated_sets_files_and_nav_clamps() {
     use leveler_client_protocol::{UiDiff, UiDiffFile};
     let mut s = opened();
