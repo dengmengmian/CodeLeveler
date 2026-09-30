@@ -2398,6 +2398,13 @@
           ]
         },
         {
+          "description": "A local provider/model configuration or resolution failure: the request was never sent because this process could not build a route for it. Distinct from [`FailureCategory::InvalidRequest`] so a client never reports a local misconfiguration as a provider rejection.",
+          "type": "string",
+          "enum": [
+            "local_configuration"
+          ]
+        },
+        {
           "description": "A tool or command failed.",
           "type": "string",
           "enum": [

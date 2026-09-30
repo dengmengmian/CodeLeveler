@@ -32,6 +32,11 @@ pub enum FailureCategory {
     Provider,
     /// The request was malformed or rejected as invalid.
     InvalidRequest,
+    /// A local provider/model configuration or resolution failure: the request
+    /// was never sent because this process could not build a route for it.
+    /// Distinct from [`FailureCategory::InvalidRequest`] so a client never
+    /// reports a local misconfiguration as a provider rejection.
+    LocalConfiguration,
     /// A tool or command failed.
     Tool,
     /// A runtime/infrastructure failure that is not a provider call.
@@ -116,6 +121,7 @@ impl FailureCategory {
             FailureCategory::RateLimit => "rate_limit",
             FailureCategory::Provider => "provider",
             FailureCategory::InvalidRequest => "invalid_request",
+            FailureCategory::LocalConfiguration => "local_configuration",
             FailureCategory::Tool => "tool",
             FailureCategory::Runtime => "runtime",
             FailureCategory::Permission => "permission",

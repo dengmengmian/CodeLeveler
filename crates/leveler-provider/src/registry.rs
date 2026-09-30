@@ -137,10 +137,13 @@ impl ProviderRegistry {
 
     fn provider(&self, id: &str) -> Result<&Provider, ModelError> {
         self.providers.get(id).ok_or_else(|| {
+            // Resolution failed before anything was encoded or sent: this is the
+            // one place that can prove the request never left the process.
             ModelError::new(
                 ModelErrorKind::InvalidRequest,
                 format!("unknown provider `{id}`"),
             )
+            .with_delivery_state(leveler_model::DeliveryState::NotSent)
         })
     }
 
@@ -148,10 +151,12 @@ impl ProviderRegistry {
         self.models
             .get(&(model.provider.clone(), model.model.clone()))
             .ok_or_else(|| {
+                // Local model resolution never reaches the provider either.
                 ModelError::new(
                     ModelErrorKind::InvalidRequest,
                     format!("unknown model `{model}`"),
                 )
+                .with_delivery_state(leveler_model::DeliveryState::NotSent)
             })
     }
 
@@ -536,6 +541,41 @@ mod limits_tests {
             validate_limits("m", &limits(64_000, 65_000)),
             Err(RegistryError::InvalidLimits { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    fn empty_registry() -> ProviderRegistry {
+        ProviderRegistry {
+            providers: HashMap::new(),
+            models: HashMap::new(),
+        }
+    }
+
+    /// A provider that is not configured is resolved entirely in-process, so
+    /// the failure must carry the one fact the downstream presentation needs:
+    /// the request never left. Without it the UI can only guess, and guessed
+    /// "provider rejected the request" the last time.
+    #[test]
+    fn an_unresolved_provider_records_that_the_request_never_left() {
+        let Err(error) = empty_registry().provider("deepseek") else {
+            panic!("an unconfigured provider must not resolve");
+        };
+        assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
+        assert_eq!(error.delivery_state, leveler_model::DeliveryState::NotSent);
+    }
+
+    #[test]
+    fn an_unresolved_model_records_that_the_request_never_left() {
+        let model = ModelRef::new("deepseek", "deepseek-flash");
+        let Err(error) = empty_registry().entry(&model) else {
+            panic!("an unconfigured model must not resolve");
+        };
+        assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
+        assert_eq!(error.delivery_state, leveler_model::DeliveryState::NotSent);
     }
 }
 

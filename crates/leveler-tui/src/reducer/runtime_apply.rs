@@ -1237,6 +1237,10 @@ fn failure_is_resumable(failure: &leveler_client_protocol::UiFailure) -> bool {
             | leveler_client_protocol::FailureCategory::Timeout
             | leveler_client_protocol::FailureCategory::Provider
             | leveler_client_protocol::FailureCategory::RateLimit
+            // A local provider/model resolution failure is a configuration
+            // problem, not a dead task: once the config is fixed `继续` can
+            // re-enter. This is continuation, not automatic retry.
+            | leveler_client_protocol::FailureCategory::LocalConfiguration
     )
 }
 

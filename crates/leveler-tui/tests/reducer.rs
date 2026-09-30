@@ -1417,6 +1417,53 @@ fn an_exhausted_failure_states_how_many_retries_were_spent() {
     );
 }
 
+#[test]
+fn a_local_configuration_failure_is_a_continuation_point_not_a_dead_task() {
+    use leveler_client_protocol::{
+        FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
+    };
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "unknown provider `deepseek`".into(),
+            failure: Some(UiFailure {
+                category: FailureCategory::LocalConfiguration,
+                source: FailureSource::Local,
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-flash".into()),
+                provider_code: None,
+                request_id: None,
+                status: None,
+                retries: None,
+                retryability: FailureRetryability::Never,
+                delivery: FailureDelivery::NotSent,
+                summary: "本地模型配置无效，请求未发送；请在 ~/.leveler/config.toml 配置 provider/model。"
+                    .into(),
+                detail: "unknown provider `deepseek`".into(),
+            }),
+        }),
+    );
+    assert!(
+        s.resumable_task,
+        "fixing the config and typing 继续 must be able to re-enter"
+    );
+    let failure = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Failure(f) => Some(f),
+            _ => None,
+        })
+        .expect("a failure block");
+    assert!(
+        !failure.summary.contains("模型服务拒绝"),
+        "a local failure must not read as a remote rejection: {:?}",
+        failure.summary
+    );
+}
+
 /// Retry is ephemeral runtime state: a fresh state (a reopened session) never
 /// resumes a stale "Reconnecting" indicator.
 #[test]

@@ -70,25 +70,47 @@ pub(crate) fn turn_runtime_event(result: Result<AgentOutcome, AppError>) -> Runt
 /// the structured fields; the vendor's raw text travels only as `detail`.
 pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
     use leveler_model::{DeliveryState, ModelErrorKind, Retryability};
-    let category = match error.kind {
-        ModelErrorKind::Auth => FailureCategory::Authentication,
-        ModelErrorKind::InvalidRequest | ModelErrorKind::Decode | ModelErrorKind::Truncated => {
-            FailureCategory::InvalidRequest
+    // A request that provably never left this process cannot have been rejected
+    // by the provider. Only a local resolution/validation failure records
+    // `NotSent` with `InvalidRequest`; classifying it as a remote rejection
+    // sends the user to debug a service that was never called.
+    let local_resolution = error.delivery_state == DeliveryState::NotSent
+        && matches!(
+            error.kind,
+            ModelErrorKind::InvalidRequest | ModelErrorKind::Auth
+        );
+    let category = if local_resolution {
+        FailureCategory::LocalConfiguration
+    } else {
+        match error.kind {
+            ModelErrorKind::Auth => FailureCategory::Authentication,
+            ModelErrorKind::InvalidRequest | ModelErrorKind::Decode | ModelErrorKind::Truncated => {
+                FailureCategory::InvalidRequest
+            }
+            ModelErrorKind::RateLimit => FailureCategory::RateLimit,
+            ModelErrorKind::ProviderUnavailable | ModelErrorKind::ContentFiltered => {
+                FailureCategory::Provider
+            }
+            ModelErrorKind::Transport | ModelErrorKind::StreamInterrupted => {
+                FailureCategory::Network
+            }
+            ModelErrorKind::Timeout => FailureCategory::Timeout,
+            ModelErrorKind::Cancelled => FailureCategory::Cancelled,
+            ModelErrorKind::ConversationProtocol | ModelErrorKind::Other => {
+                FailureCategory::Internal
+            }
         }
-        ModelErrorKind::RateLimit => FailureCategory::RateLimit,
-        ModelErrorKind::ProviderUnavailable | ModelErrorKind::ContentFiltered => {
-            FailureCategory::Provider
-        }
-        ModelErrorKind::Transport | ModelErrorKind::StreamInterrupted => FailureCategory::Network,
-        ModelErrorKind::Timeout => FailureCategory::Timeout,
-        ModelErrorKind::Cancelled => FailureCategory::Cancelled,
-        ModelErrorKind::ConversationProtocol | ModelErrorKind::Other => FailureCategory::Internal,
     };
-    // A request refused before sending is the runtime's own failure; every
+    // Source follows the same fact: a locally refused request is the local
+    // execution's failure, a refused tool exchange is the runtime's, and every
     // other kind came back from the provider call.
-    let source = match error.kind {
-        ModelErrorKind::ConversationProtocol => FailureSource::Runtime,
-        _ => FailureSource::Provider,
+    let source = if local_resolution {
+        FailureSource::Local
+    } else {
+        match error.kind {
+            ModelErrorKind::ConversationProtocol => FailureSource::Runtime,
+            _ => FailureSource::Provider,
+        }
     };
     let retryability = match error.retryability() {
         Retryability::Safe => FailureRetryability::Safe,
@@ -109,20 +131,28 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
     // Provider-agnostic product copy. Deliberately generic: the runtime has no
     // evidence for a more specific cause, and inventing one from the raw text
     // would be a guess. The raw text stays in `detail`.
-    let summary = match category {
-        FailureCategory::Authentication => "模型服务拒绝了当前凭据。",
-        FailureCategory::InvalidRequest => "模型服务拒绝了当前请求。",
-        FailureCategory::RateLimit => "模型服务繁忙，请稍后重试。",
-        FailureCategory::Provider => "模型服务暂时不可用。",
-        FailureCategory::Network => "无法连接模型服务。",
-        FailureCategory::Timeout => "模型服务未及时响应。",
-        FailureCategory::Cancelled => "请求已取消。",
-        _ if error.kind == ModelErrorKind::ConversationProtocol => {
-            "内部会话协议错误，请求未发送给模型服务。"
+    let summary = if local_resolution {
+        // The exact missing provider/model travels in `detail`; the primary
+        // line points at the fix and never claims a provider rejection.
+        "本地模型配置无效，请求未发送；请在 ~/.leveler/config.toml 配置 provider/model。"
+            .to_string()
+    } else {
+        match category {
+            FailureCategory::Authentication => "模型服务拒绝了当前凭据。",
+            FailureCategory::InvalidRequest => "模型服务拒绝了当前请求。",
+            FailureCategory::LocalConfiguration => "本地模型配置无效，请求未发送。",
+            FailureCategory::RateLimit => "模型服务繁忙，请稍后重试。",
+            FailureCategory::Provider => "模型服务暂时不可用。",
+            FailureCategory::Network => "无法连接模型服务。",
+            FailureCategory::Timeout => "模型服务未及时响应。",
+            FailureCategory::Cancelled => "请求已取消。",
+            _ if error.kind == ModelErrorKind::ConversationProtocol => {
+                "内部会话协议错误，请求未发送给模型服务。"
+            }
+            _ => "请求失败。",
         }
-        _ => "请求失败。",
-    }
-    .to_string();
+        .to_string()
+    };
     UiFailure {
         category,
         source,
@@ -1171,6 +1201,115 @@ mod bridge_tests {
         assert_eq!(failure.delivery, FailureDelivery::NotSent);
         assert_eq!(failure.summary, "内部会话协议错误，请求未发送给模型服务。");
         assert!(failure.detail.contains("orphan tool result"));
+    }
+
+    /// A local provider-resolution failure must read as a local configuration
+    /// problem. The request never left, so no client may report it as a
+    /// provider rejection — this was the audit's confirmed misattribution.
+    #[test]
+    fn an_unknown_provider_is_a_local_failure_not_a_provider_rejection() {
+        use leveler_client_protocol::FailureDelivery;
+        use leveler_model::{DeliveryState, ModelError, ModelErrorKind};
+        let error = ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            "unknown provider `deepseek`",
+        )
+        .with_delivery_state(DeliveryState::NotSent)
+        .with_provider("deepseek")
+        .with_model("deepseek-flash");
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(failure.category, FailureCategory::LocalConfiguration);
+        assert_eq!(failure.source, FailureSource::Local);
+        assert_eq!(failure.delivery, FailureDelivery::NotSent);
+        assert!(
+            !failure.summary.contains("模型服务拒绝"),
+            "a request that never left cannot be a provider rejection: {}",
+            failure.summary
+        );
+        assert!(failure.detail.contains("unknown provider"));
+    }
+
+    /// The same fact covers an unresolved model id, which fails at the same
+    /// local resolution boundary.
+    #[test]
+    fn an_unknown_model_is_a_local_failure() {
+        use leveler_model::{DeliveryState, ModelError, ModelErrorKind};
+        let error = ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            "unknown model `deepseek/does-not-exist`",
+        )
+        .with_delivery_state(DeliveryState::NotSent)
+        .with_provider("deepseek")
+        .with_model("does-not-exist");
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(failure.category, FailureCategory::LocalConfiguration);
+        assert_eq!(failure.source, FailureSource::Local);
+    }
+
+    /// A genuine remote 400 is a different fact: the provider answered, so it
+    /// stays an invalid-request provider rejection.
+    #[test]
+    fn a_remote_invalid_request_is_still_a_provider_rejection() {
+        let error = leveler_model::ModelError::from_status(400, "Model not found")
+            .with_provider("deepseek");
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(failure.category, FailureCategory::InvalidRequest);
+        assert_eq!(failure.source, FailureSource::Provider);
+        assert_eq!(
+            failure.delivery,
+            leveler_client_protocol::FailureDelivery::Responded
+        );
+        assert_eq!(failure.summary, "模型服务拒绝了当前请求。");
+    }
+
+    /// A connection that never sent the request is a provider/network outage,
+    /// not an invalid request and not a local configuration error.
+    #[test]
+    fn a_connection_refusal_stays_a_provider_failure() {
+        use leveler_model::{DeliveryState, ModelError, ModelErrorKind};
+        let error = ModelError::new(ModelErrorKind::ProviderUnavailable, "connection refused")
+            .with_delivery_state(DeliveryState::NotSent)
+            .with_provider("deepseek");
+        let failure = ui_failure_from_model(&error);
+        assert_eq!(failure.category, FailureCategory::Provider);
+        assert_eq!(failure.source, FailureSource::Provider);
+        assert_eq!(
+            failure.delivery,
+            leveler_client_protocol::FailureDelivery::NotSent
+        );
+    }
+
+    /// A completion status maps to auth/timeout semantics without string work.
+    #[test]
+    fn status_codes_keep_their_category() {
+        let auth = ui_failure_from_model(&leveler_model::ModelError::from_status(401, "nope"));
+        assert_eq!(auth.category, FailureCategory::Authentication);
+        let boom = ui_failure_from_model(&leveler_model::ModelError::new(
+            leveler_model::ModelErrorKind::Timeout,
+            "deadline elapsed",
+        ));
+        assert_eq!(boom.category, FailureCategory::Timeout);
+    }
+
+    /// Regression guard for the confirmed misattribution: no local failure may
+    /// ever render the remote-rejection sentence, whatever its detail says.
+    #[test]
+    fn not_sent_never_claims_a_provider_rejection() {
+        use leveler_model::{DeliveryState, ModelError, ModelErrorKind};
+        for kind in [
+            ModelErrorKind::InvalidRequest,
+            ModelErrorKind::Auth,
+            ModelErrorKind::ProviderUnavailable,
+        ] {
+            let error = ModelError::new(kind, "unknown provider `deepseek`")
+                .with_delivery_state(DeliveryState::NotSent);
+            let failure = ui_failure_from_model(&error);
+            assert!(
+                !failure.summary.contains("模型服务拒绝"),
+                "{kind:?} with NotSent rendered a provider rejection: {}",
+                failure.summary
+            );
+        }
     }
 
     /// A failed turn's structured failure survives the durable `TaskFinished`
