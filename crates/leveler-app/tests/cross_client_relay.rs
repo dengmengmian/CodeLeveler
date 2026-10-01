@@ -188,6 +188,7 @@ async fn a_session_survives_its_first_client_and_carries_to_the_next() {
 
     let bootstrap = client_a
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "relay across clients".to_string(),
             model: None,
@@ -306,6 +307,7 @@ async fn concurrent_clients_share_one_event_stream_for_the_same_session() {
 
     let bootstrap = socket_client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "two clients".to_string(),
             model: None,

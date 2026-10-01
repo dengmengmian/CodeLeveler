@@ -54,8 +54,7 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
         if let Err(e) = context
-            .execution
-            .workspace
+            .require_workspace()?
             .revalidate_write_path(resolved, &context.write_scope())
         {
             drop(lock);
@@ -66,8 +65,8 @@ impl WorkspaceEditor {
         let committed_permissions: Option<std::fs::Permissions>;
         #[cfg(unix)]
         {
-            let root = context.execution.workspace.root().to_path_buf();
-            let root_fd = context.execution.workspace.root_fd();
+            let root = context.require_workspace()?.root().to_path_buf();
+            let root_fd = context.require_workspace()?.root_fd();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| {
@@ -88,8 +87,8 @@ impl WorkspaceEditor {
         }
         #[cfg(windows)]
         {
-            let root = context.execution.workspace.root().to_path_buf();
-            let root_dir = context.execution.workspace.root_dir();
+            let root = context.require_workspace()?.root().to_path_buf();
+            let root_dir = context.require_workspace()?.root_dir();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| ToolError::Io("target left workspace".into()))?
@@ -206,8 +205,7 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
         if let Err(e) = context
-            .execution
-            .workspace
+            .require_workspace()?
             .revalidate_write_path(resolved, &context.write_scope())
         {
             drop(lock);
@@ -215,8 +213,8 @@ impl WorkspaceEditor {
         }
         #[cfg(unix)]
         let result: Result<bool, ToolError> = {
-            let root = context.execution.workspace.root().to_path_buf();
-            let root_fd = context.execution.workspace.root_fd();
+            let root = context.require_workspace()?.root().to_path_buf();
+            let root_fd = context.require_workspace()?.root_fd();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| {
@@ -305,8 +303,7 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
         if let Err(e) = context
-            .execution
-            .workspace
+            .require_workspace()?
             .revalidate_write_path(resolved, &context.write_scope())
         {
             drop(lock);
@@ -314,8 +311,8 @@ impl WorkspaceEditor {
         }
         #[cfg(unix)]
         {
-            let root = context.execution.workspace.root().to_path_buf();
-            let root_fd = context.execution.workspace.root_fd();
+            let root = context.require_workspace()?.root().to_path_buf();
+            let root_fd = context.require_workspace()?.root_fd();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| {

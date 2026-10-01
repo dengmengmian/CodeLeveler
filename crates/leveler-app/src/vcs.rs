@@ -57,8 +57,12 @@ impl Application {
             pr_base: options.pr_base.clone(),
         };
 
-        let workflow =
-            GitWorkflow::with_environment(&self.layout.repo_root, self.environment.clone());
+        let workflow = GitWorkflow::with_environment(
+            self.layout
+                .require_workspace()
+                .map_err(|error| AppError::NotFound(error.to_string()))?,
+            self.environment.clone(),
+        );
         Ok(workflow.run(&workflow_options, &cancellation).await?)
     }
 }

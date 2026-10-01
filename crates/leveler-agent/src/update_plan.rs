@@ -50,12 +50,40 @@ struct Args {
     plan: Vec<PlanItem>,
 }
 
-/// Register the harness controls that are dispatched as tools.
+/// Which harness controls the active surface includes.
+///
+/// `update_plan` is always registered. Authoring is independent of delegation;
+/// progressive disclosure exposes it only after the model loads that pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HarnessControls {
+    /// Register `list_agents` / `save_agent` / `delete_agent` and
+    /// `save_skill` / `delete_skill`.
+    pub authoring: bool,
+}
+
+impl HarnessControls {
+    /// Every authoring control.
+    pub const ALL: Self = Self { authoring: true };
+    /// The plan protocol only.
+    pub const PROTOCOL_ONLY: Self = Self { authoring: false };
+}
+
+/// Register the harness controls that are dispatched as tools, with the full
+/// authoring control set. Test and compatibility entry point; production
+/// composes through [`register_harness_controls_with`].
 ///
 /// Called by the composition root AFTER [`leveler_tools::model_surface`], so a
 /// control is never mistaken for a capability the host could turn off.
 pub fn register_harness_controls(registry: &mut ToolRegistry) {
+    register_harness_controls_with(registry, HarnessControls::ALL);
+}
+
+/// Register the harness controls selected by `controls`.
+pub fn register_harness_controls_with(registry: &mut ToolRegistry, controls: HarnessControls) {
     registry.register(std::sync::Arc::new(UpdatePlanTool));
+    if !controls.authoring {
+        return;
+    }
     // Agent authoring: the top-level agent's only; children never hold them.
     registry.register(std::sync::Arc::new(crate::agent_registry::ListAgentsTool));
     registry.register(std::sync::Arc::new(crate::agent_registry::SaveAgentTool));
@@ -70,6 +98,9 @@ pub struct UpdatePlanTool;
 
 #[async_trait]
 impl Tool for UpdatePlanTool {
+    fn requires_workspace(&self) -> bool {
+        false
+    }
     fn name(&self) -> &'static str {
         "update_plan"
     }

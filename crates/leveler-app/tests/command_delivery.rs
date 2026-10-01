@@ -636,6 +636,7 @@ async fn auto_approve_is_per_session_and_restore_is_fail_closed_body() {
     // A trusted-local create with AutoApprove is honored and stored per-session.
     let approving = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: ApprovalPolicy::AutoApprove,
             goal: "unattended".to_string(),
             model: None,
@@ -657,6 +658,98 @@ async fn auto_approve_is_per_session_and_restore_is_fail_closed_body() {
     );
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn transport_trust_controls_real_session_approval_policy() {
+    leveler_test_support::bounded_test(
+        "transport_trust_controls_real_session_approval_policy",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        transport_trust_controls_real_session_approval_policy_body,
+    );
+}
+
+#[cfg(any(unix, windows))]
+async fn transport_trust_controls_real_session_approval_policy_body() {
+    use leveler_client_protocol::ApprovalPolicy;
+    use leveler_local_transport::{
+        ClientKind, LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let (tmp, _app, runtime, restored_session) = build_client().await;
+    let path = tmp.path().join("permission-runtime.sock");
+    let local = LocalSocketServer::bind(&path, runtime.clone())
+        .await
+        .unwrap();
+    let tcp = TcpRuntimeServer::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        "permission-test-token".to_string(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let local_task = tokio::spawn(local.serve(shutdown.clone()));
+    let tcp_task = tokio::spawn(tcp.serve(shutdown.clone()));
+    let trusted = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+    let forged = LocalSocketRuntimeClient::connect_tcp_as(
+        addr,
+        "permission-test-token".to_string(),
+        ClientKind::LocalInteractive,
+    )
+    .await
+    .unwrap();
+    let request = || CreateSessionRequest {
+        workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+        approval_policy: ApprovalPolicy::AutoApprove,
+        goal: "transport approval contract".to_string(),
+        model: None,
+        mode: WirePermissionProfile::FullAccess,
+    };
+    let created = trusted.create_session(request()).await.unwrap();
+    assert_eq!(
+        runtime.effective_approval_policy(&created.session.id).await,
+        ApprovalPolicy::AutoApprove
+    );
+    assert_eq!(
+        trusted.snapshot(&created.session.id).await.unwrap().mode,
+        WirePermissionProfile::FullAccess
+    );
+    assert!(forged.create_session(request()).await.is_err());
+    assert_eq!(
+        runtime.effective_approval_policy(&restored_session).await,
+        ApprovalPolicy::Interactive
+    );
+    assert!(
+        forged
+            .attach_session_policy(&restored_session, ApprovalPolicy::AutoApprove)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        runtime.effective_approval_policy(&restored_session).await,
+        ApprovalPolicy::Interactive
+    );
+    trusted
+        .attach_session_policy(&restored_session, ApprovalPolicy::AutoApprove)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.effective_approval_policy(&restored_session).await,
+        ApprovalPolicy::AutoApprove
+    );
+    assert_eq!(
+        trusted.snapshot(&restored_session).await.unwrap().mode,
+        WirePermissionProfile::Assisted
+    );
+    drop(trusted);
+    drop(forged);
+    shutdown.cancel();
+    local_task.await.unwrap().unwrap();
+    tcp_task.await.unwrap().unwrap();
+}
+
 #[test]
 fn daemon_session_runtime_options_are_isolated_per_session() {
     leveler_test_support::bounded_test(
@@ -670,6 +763,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session_body() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
             model: None,
@@ -679,6 +773,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
             model: None,
@@ -736,6 +831,7 @@ async fn creating_a_daemon_session_does_not_reap_another_live_turn_body() {
 
     client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "another session".to_string(),
             model: None,
@@ -765,6 +861,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session_body() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
             model: None,
@@ -774,6 +871,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
             model: None,
@@ -822,6 +920,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
     let (_tmp, _app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
             model: None,
@@ -831,6 +930,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
             model: None,
@@ -880,6 +980,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
 
     let first = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first over socket".to_string(),
             model: None,
@@ -889,6 +990,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second over socket".to_string(),
             model: None,
@@ -1050,6 +1152,7 @@ async fn first_message_retitles_a_placeholder_session_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let bootstrap = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "interactive session".to_string(),
             model: None,
@@ -1083,6 +1186,7 @@ async fn first_message_retitles_a_placeholder_session_body() {
 
     let named = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "已有正式目标".to_string(),
             model: None,
@@ -1300,6 +1404,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let onlooker = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "onlooker".to_string(),
             model: None,
@@ -1309,6 +1414,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it_body() {
         .unwrap();
     let requester = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "requester".to_string(),
             model: None,
@@ -1383,6 +1489,7 @@ async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime_bo
     // A second, untouched session for the leak check.
     let other = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: ApprovalPolicy::Interactive,
             goal: "bystander".to_string(),
             model: None,
@@ -1440,6 +1547,7 @@ async fn a_restored_checkpoint_says_where_it_landed_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let opened = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "restore".to_string(),
             model: None,
@@ -1500,6 +1608,7 @@ async fn a_forked_session_tells_the_session_it_was_forked_from_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let opened = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "fork me".to_string(),
             model: None,
@@ -1524,4 +1633,209 @@ async fn a_forked_session_tells_the_session_it_was_forked_from_body() {
     );
 
     settle_background_turns(&app, &client, &[&session_id]).await;
+}
+
+#[tokio::test]
+async fn no_workspace_session_persists_none_and_cannot_start_a_user_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "http://127.0.0.1:9");
+    let home = leveler_core::LevelerHome::from_root(tmp.path().join("home"));
+    let make_layout = || Layout::no_workspace(home.clone(), Some(tmp.path().join("configs")));
+    let id = {
+        let app = Arc::new(Application::assemble(make_layout()).unwrap());
+        let runtime = InProcessRuntimeClient::new(
+            app.clone(),
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        );
+        let bootstrap = runtime
+            .create_session(CreateSessionRequest {
+                workspace: leveler_local_transport::CreateWorkspaceSelection::None,
+                goal: "polish this sentence".into(),
+                model: None,
+                mode: WirePermissionProfile::Assisted,
+                approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            })
+            .await
+            .unwrap();
+        assert!(bootstrap.session.repository.is_none());
+        assert!(!runtime.has_primary_workspace());
+        let db = app.open_database().await.unwrap();
+        assert!(
+            leveler_storage::SessionRepository::new(&db)
+                .get(&bootstrap.session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .repository
+                .is_none()
+        );
+        let mut events = runtime.subscribe_session(&bootstrap.session.id);
+        runtime
+            .send(ClientCommand::RunUserShell {
+                session_id: bootstrap.session.id.clone(),
+                command: "printf forbidden".into(),
+            })
+            .await
+            .unwrap();
+        let mut denied = false;
+        while let Ok(event) = events.try_recv() {
+            if let RuntimeEvent::TurnFailed { .. } | RuntimeEvent::Notification { .. } = event {
+                denied = true;
+            }
+            assert!(!matches!(event, RuntimeEvent::UserShellStarted { .. }));
+        }
+        assert!(
+            denied,
+            "workspace-less direct user shell must report refusal"
+        );
+        bootstrap.session.id
+    };
+    let app = Arc::new(Application::assemble(make_layout()).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app,
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let restored = runtime.snapshot(&id).await.unwrap();
+    assert!(restored.repository.is_none());
+    assert!(restored.branch.is_none());
+}
+
+#[tokio::test]
+async fn no_workspace_chat_uses_the_existing_runtime_and_restores_answer_and_terminal() {
+    use leveler_test_support::{MockResponse, MockServer};
+    let chunk = serde_json::json!({"choices":[{"index":0,"delta":{"content":"这段文字已润色。"}}]})
+        .to_string();
+    let finish =
+        serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}).to_string();
+    let server = MockServer::start_one(MockResponse::sse(&[&chunk, &finish])).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &server.base_url());
+    let home = leveler_core::LevelerHome::from_root(tmp.path().join("home"));
+    let make_layout = || Layout::no_workspace(home.clone(), Some(tmp.path().join("configs")));
+    let id = {
+        let app = Arc::new(Application::assemble(make_layout()).unwrap());
+        let runtime = InProcessRuntimeClient::new(
+            app.clone(),
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        )
+        .with_durable_wire_ack();
+        let id = app
+            .create_session(&ModelRef::new("mock", "m"), "润色")
+            .await
+            .unwrap();
+        let mut events = runtime.subscribe_session(&id);
+        runtime
+            .deliver(submission("no-workspace-chat", &id, "帮我润色这段文字"))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    RuntimeEvent::TurnAnswered | RuntimeEvent::TurnCompleted => break,
+                    RuntimeEvent::TurnFailed { error, .. } => {
+                        panic!("no-workspace chat failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("existing runtime must publish its terminal");
+        let snapshot = runtime.snapshot(&id).await.unwrap();
+        assert!(snapshot.repository.is_none());
+        assert!(snapshot.task_terminal.is_some());
+        id
+    };
+    let app = Arc::new(Application::assemble(make_layout()).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app,
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let restored = runtime.snapshot(&id).await.unwrap();
+    assert!(restored.repository.is_none());
+    assert_eq!(
+        restored.task_status,
+        Some(leveler_client_protocol::UiTaskStatus::Answered)
+    );
+    assert!(restored.task_terminal.is_some());
+    assert!(restored.messages.iter().any(|message| {
+        serde_json::to_string(message)
+            .unwrap()
+            .contains("这段文字已润色")
+    }));
+}
+
+#[tokio::test]
+async fn a_repository_source_refuses_explicit_no_workspace_creation() {
+    let (_tmp, app, runtime, _) = build_client().await;
+    let result = runtime
+        .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::None,
+            goal: "must not inherit repository".into(),
+            model: None,
+            mode: WirePermissionProfile::FullAccess,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(ClientError::Runtime(message)) if message.contains("no-workspace runtime source"))
+    );
+    let bootstrap = runtime
+        .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            goal: "legacy repository task".into(),
+            model: None,
+            mode: WirePermissionProfile::Assisted,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        bootstrap.session.repository.as_deref(),
+        app.layout
+            .primary_workspace()
+            .map(|path| path.to_str().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn no_workspace_global_query_does_not_create_an_empty_source_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "http://127.0.0.1:9");
+    let home = leveler_core::LevelerHome::from_root(tmp.path().join("home"));
+    let layout = Layout::no_workspace(home, Some(tmp.path().join("configs")));
+    let database_path = layout.database_path();
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let runtime = InProcessRuntimeClient::new(
+        app,
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let requester = SessionId::new("global-discovery");
+    let mut events = runtime.subscribe_session(&requester);
+    assert!(!database_path.exists());
+    runtime
+        .send(ClientCommand::QueryGlobalTasks {
+            requester_session_id: requester,
+            query_id: "empty".into(),
+            include_archived: false,
+        })
+        .await
+        .unwrap();
+    let index = match events.recv().await.unwrap() {
+        RuntimeEvent::GlobalTasksLoaded { index, .. } => index,
+        other => panic!("unexpected discovery event: {other:?}"),
+    };
+    assert!(index.tasks.is_empty());
+    assert!(index.source_errors.is_empty());
+    assert!(!database_path.exists());
 }

@@ -623,29 +623,30 @@ reasoning 是一个 route 事实，不是 harness 偏好。当某条 route 声�
 
 就偷偷改变同一个工具的含义。
 
-### 8.1 可用、启用、暴露是三件不同的事
+### 8.1 可用、允许、暴露是三件不同的事
 
-一个可选能力只有在两个彼此独立的答案同时成立时，才会到达模型：
+CodeLeveler 只有一种正常工作方式。每个 goal 从基础编码工具和极小的能力控制接口
+开始；模型请求加载能力后，对应工具和指导才进入后续请求。
 
 ```text
-可用 AVAILABLE   这台机器能提供什么
-      ∩
-启用 ENABLED     这个产品模式要求什么
-      =
-暴露 EXPOSED     模型实际被提供什么
+可用 AVAILABLE   当前运行时能提供什么
+允许 PERMITTED   配置、权限和 sandbox 允许什么
+暴露 EXPOSED     当前请求实际携带什么
+
+EXPOSED ⊆ AVAILABLE ∩ PERMITTED
 ```
 
-可用是机械事实：是否配置了搜索服务，`git` 是否在 `PATH` 上，这个模型是否接受
-图片，本机将要选中的那款浏览器是否能被驱动。其中没有任何产品判断，也不询问模型
-看起来有多强。
+可用是机械事实：是否配置搜索服务、`git` 是否在 `PATH` 上、模型是否支持图片、
+本机所选浏览器是否能被驱动。允许独立归宿主权限和项目配置所有，包括
+`memory.enabled` 与委派权限。加载只改变暴露，不能创造能力或授予权限。
 
-启用是用户关于成本与范围的决定，由 work profile 承载。`Economy` 不要求任何可选
-能力，所以一台装了浏览器运行时、也配置了搜索 key 的机器，在 Economy 的一轮里
-两者都不会出现。
+模型决定任务需要什么能力；Harness 校验请求、加载既有 subsystem 并执行工具。
+Harness 不按任务文字、模型强弱、provider 或轮次选择能力。同一 goal 的能力只增
+不减；恢复未完成 goal 时恢复持久化的 active capabilities，新 goal 回到基础
+工具面。工具和指导的排序必须确定，避免每轮抖动。
 
-这个交集是边界，不是建议：两侧都无法拓宽对方。宿主拥有但模式没有要求的能力不会
-被宣传，模式要求但宿主无法提供的能力也不会被凭空造出来。正是这一点让「代码里有
-这个功能」无法重新长回「模型可以用这个功能」。
+历史 session 的 work-profile 值不再决定工具面。协作方式（`chat`、`plan`、`goal`）
+与执行权限仍保持各自独立的语义。
 
 ### 8.2 浏览器控制与网页搜索是两个独立能力
 
@@ -839,7 +840,7 @@ Terminal（TaskFinished）
 
 权威结果一旦提交，产品必须立即发布用户可见终态。终态后只有已经绑定到不可变 task/run 身份的工作可以继续；它不得延迟终态可见性，也不得把客户端重新切回运行中。会话级清理必须在发布前固定精确资源 ID。继续执行检查点属于权威 work-window 边界，必须在 `TaskFinished` 前提交；否则终态后重新读取“当前会话”会错误吸收下一回合；检查点创建失败时，保留具体错误并将该 work window 暂停为可恢复的 `Interrupted`，保留尚欠工作的 Goal；不能谎称检查点写入成功，后续继续从原始权威事实恢复。配置为 Required 的评审仍可产生完成警告；评审发现是 advisory 的模型结论，不是机械终态 verdict，纯 advisory 评审不得阻塞。
 
-后台进程的清理边界必须在启动时显式确定。默认的 `goal` 生命周期随创建它的目标终态回收；只有用户明确要求服务或 watcher 在任务完成后继续运行时，才使用 `runtime` 生命周期。两者都保留创建会话作为所有者，并继续通过统一后台任务接口观测和停止；`runtime` 只跳过目标终态清理，不绕过运行时所有权，进程退出、显式停止或运行时关闭仍会结算它。
+后台进程的清理边界必须在启动时显式确定。默认的 `goal` 生命周期随创建它的目标终态回收；`runtime` 跳过目标终态清理，但仍随当前 Runtime 退出回收，保留原有契约。`session` 和 `persistent` 进程从启动时起由独立 Execution Host 托管，保留创建会话作为访问归属；`session` 在显式删除会话时停止，`persistent` 用于用户明确要求跨 Runtime 重启继续运行的服务或 watcher，在进程自行结束或用户显式停止时结束。Execution Host 异常退出的结果按独立故障域处理，不保证服务随宿主退出。Runtime 更新不停止托管服务，也不将已有本地任务自动转换为托管任务。所有生命周期继续使用统一后台任务接口观测和停止。
 
 写入归属在执行前转换为操作系统执行边界，包含允许路径及其他执行者独占的排除路径。无法执行该限制的平台必须拒绝，不能退回全 workspace 写入。mutation 只从已执行限制的范围内结算，不使用全树 diff、过滤其他执行者变更或全树 rollback 补偿权限。后台 workload 必须整体结束后再结算 mutation，最后发布进程终态；父 shell 退出不满足这个边界。读日志、等待与停止都校验创建会话，允许同会话跨 turn 使用，其他会话不能只凭 task id 操作。
 
@@ -1038,7 +1039,128 @@ Web 客户端
 
 独立桌面应用和云端 Worker 还没有发布。自定义 Agent：[`AGENT_EXTENSIBILITY.zh-CN.md`](AGENT_EXTENSIBILITY.zh-CN.md)。
 
-### 13.2 TUI 投影与性能不变量（Do Not Regress）
+### 13.2 客户端协议与 Runtime Host
+
+`leveler-client-protocol` 定义客户端与运行时之间唯一的**业务语义协议**：
+`ClientCommand`、`RuntimeEvent`、`UiSessionSnapshot` 及其 envelope。CLI、TUI、
+Web 与未来桌面端在连接运行时时都使用这套语义，不为某个 Shell 另建会话、回合或工具事件协议。
+协议不规定进程如何启动，也不规定使用哪种本地连接。
+
+Runtime Host 是另一条边界：它负责让客户端找到、启动、接管或复活可连接的运行时，
+并编排版本/配置兼容性检查、旧进程退场与新进程交接、daemon 认证 token 与 ready contract、
+transport 绑定和空闲回收策略。它不处理 Agent loop、模型、工具、权限决策、
+会话持久化或恢复。这里的 **Runtime Host** 是进程和连接的生命周期编排者，
+不是第 9 章控制真实副作用的**宿主执行权威**。
+
+后台长期进程使用独立的 **Execution Host**，它属于 `leveler-execution` 的执行
+边界，不与 Runtime Host 合并。Execution Host 从启动时起唯一拥有托管进程的
+句柄、进程树、沙箱资源、输出读取器和退出监控；CodeLeveler Runtime 是它的
+客户端。Runtime 更新、正常退出或崩溃不会转移这些进程的 ownership。
+Execution Host 复用现有 `CommandRunner` 和后台 registry 的执行实现，不建立
+第二套 spawn、日志或停止路径。模型、Agent loop、会话生命周期、Goal、
+verification 和文件变更结算仍属于 CodeLeveler Runtime。
+
+OS workload 全部退出与语义结算完成是两个事实。Runtime 在 spawn 前持久化
+创建会话、writer、写入边界和 mutation baseline；Execution Host 不解释这些
+结算输入，只保存进程事实。进程组完全结束后，宿主持久记录退出事实，Runtime
+在线时结算，离线时由重连后的 Runtime 恢复结算。结算结果提交之前不得发布
+原有后台任务语义终态，也不得提前释放对应的写入归属。并发客户端不能各自
+结算一份结果；Runtime 的持久结算记录是该事实的唯一权威。
+
+Execution Host 的进程协议以 major/minor 和能力集合判断兼容性，不要求宿主与
+Runtime 的 build fingerprint 相同。不兼容时保留服务、显式报告错误。工作中的
+宿主不因 Runtime 更新而被替换；宿主自身的升级不承诺迁移现有进程。
+已经由旧 Runtime 持有的 legacy 任务保留旧清理和更新阻塞行为，不伪造迁移。
+
+Execution Host 崩溃是独立故障域。正常析构时的进程树清理不能证明 SIGKILL
+后的清理。恢复必须以持久元数据和可验证的进程身份为依据；无法安全证明身份
+时显示 unknown / recovery-required，保留未结算写入归属，不向可能复用的
+PID 或进程组发送信号，也不将无法观测的进程标记为已退出。
+
+第一阶段没有可证明进程出生身份的自动 adoption：持久记录仍为 Running/Killing
+或存在未决 spawn intent 时，拒绝自动替换丢失的宿主，并明确要求人工恢复。
+进程自行退出也不能让这一不确定状态凭猜测消失。已经持久确认的退出事实和日志
+可由新宿主恢复，不会当作正在运行的进程重新启动。
+
+当前 Execution Host 的 owner-only 状态目录安全后端支持 Unix，Windows 的安全
+后端尚未实现，托管生命周期明确拒绝执行；不回退到无保护的 TCP 或宽权限 token
+文件。现有 Runtime Host 的 Windows 支持及本地 `goal` / `runtime` 执行不因此改变。
+
+这些职责有各自的最终 owner：
+
+| 边界 | 负责什么 |
+| --- | --- |
+| Shell / 产品 | 参数与交互、项目选择，以及客户端持有的进程生命周期策略 |
+| `leveler-runtime-host` | runtime discovery / spawn / adopt / compatibility / handoff / revive；协调 token、readiness、bind 和 idle 策略 |
+| `leveler-local-transport` | 实际建立连接与监听、transport trust 和 endpoint ownership；Unix socket/flock 与 Windows pipe/instance guard 由平台适配层持有 |
+| `leveler-client-protocol` | 客户端命令、运行时事件及快照的语义契约 |
+| `leveler-app` / `leveler-engine` | 运行时内部状态、会话与回合生命周期、持久化和 crash recovery |
+
+Host 只编排 transport 的绑定与所有权取得；它不能再实现一份 socket、`flock`
+或运行时内部 ownership/recovery。客户端建立连接后，命令和事件经协议与 transport
+流动；业务命令不需要先经过 Host。也因此，“单 Runtime”指共享一套运行时实现，
+不表示所有项目或 embedded 模式必须共享一个操作系统 daemon 进程。
+
+Phase 1 前有两条各自实现的启动路径：`leveler-cli` 为默认 TUI 编排可脱离终端的
+项目 daemon，Web 的 `ProjectManager` 则自行 probe/spawn 并持有自己启动的子进程。
+现在两条路径都调用 `leveler-runtime-host`：TUI 使用 detached 的发现、版本交接与
+revive 入口；Web 使用 owned-child 的接管或启动入口。CLI 保留终端输入与文案，
+Web 保留项目 registry、路由、状态和它启动的子进程的监控与终止策略。
+两种进程所有权行为保持各自原有语义。
+Web 页面访问用的 token 仍是 Web 产品边界，不是 daemon 认证 token。
+embedded 模式仍使用同一套 `leveler-app` 运行时实现，不要求另起 daemon。
+
+客户端协议之下的 transport 使用同一套 framing、命令处理与重连逻辑：
+
+```text
+Client Protocol
+    └── Transport
+        ├── Unix socket：trusted-local
+        ├── Windows named pipe：trusted-local
+        └── TCP + bearer token：authenticated-remote
+```
+
+信任由服务端 transport 决定，客户端声明的 ClientKind 只能降低权能。TCP 即使是
+loopback、token 正确，也不能授予本地 AutoApprove 或计为本地交互等待者。
+PermissionProfile 保持原契约；transport gate 限制客户端授予 AutoApprove，
+不重新定义执行权限。daemon owner 的全局 AutoApprove 配置仍按既有语义生效。
+
+Unix 保留 owner-only socket 和 server lifetime flock。Windows adapter 使用拒绝
+远端连接的 named pipe、protected current-user SID DACL，并双向校验 pipe peer
+process 的 TokenUser SID。客户端还校验当前连接 pipe handle 的 owner SID，
+把身份检查直接绑定到安全对象；Win32 安全操作由 `leveler-win-local-ipc` 封装。
+这与 Unix 0600 一样是操作系统用户边界，不是应用签名认证；同用户进程和管理员
+不被视为边界外的未授权用户。不同服务账户不能自动获得本地信任。
+
+Windows pipe 名由当前 SID 和 Layout 的逻辑 socket path 哈希确定；路径使用
+UTF-16 编码，不直接把 Unicode repo path 放入 pipe 名。ready contract 继续保留
+`socket` 字段作为逻辑 endpoint，build/config identity 仍从 runtime_info 获取。
+Unix flock 与 Windows retained first-instance handle 分别是平台唯一的 lifetime
+ownership authority，均在 recovery 和 ready 发布前取得；UI 断开不释放 ownership，
+runtime crash 由 OS 释放。Windows pipe 不需要文件系统 stale socket cleanup。
+
+RuntimeHost 的 start/adopt/revive/handoff 共用生命周期，仅 transport、安全原语与
+detached process 配置具有平台差异。安全失败必须显式失败，不回退 trusted TCP。
+当前 Windows 实现与交叉编译证据不等于 Windows 实机验收，状态见
+[`DESKTOP_PHASE2_WINDOWS_TRANSPORT.md`](../DESKTOP_PHASE2_WINDOWS_TRANSPORT.md)。
+桌面 Shell 接入时应复用已有协议、Runtime Host 与运行时，而不复制进程编排或业务状态；
+这里不预设或创建 Electron 实现。
+
+### 13.2.1 Optional Workspace 与全局历史契约
+
+Session、TaskEngine 和 Runtime 只有一套实现。Session 的 `repository` 是持久的 optional primary workspace：已有项目为 `Some(path)`，No Workspace 为 `None`。Application state 始终存在；执行工作目录由执行能力和授权决定。三者不能通过 HOME、启动 cwd、上次项目或内部 scratch 路径互相替代。
+
+`Layout::no_workspace` 使用独立的 `state/no-workspace` source、socket identity 和 app-owned 配置。项目 runtime 拒绝显式 None；No Workspace runtime 拒绝其他项目关联。创建请求区分省略的 `RuntimeDefault`、显式 `None` 与 `Workspace`。原 CLI/TUI/Web 项目请求仍默认绑定原项目。No Workspace 复用同一 runtime，但不加载项目配置、rules/hooks、skills、MCP、Git/LSP、文件检查点或 shell context。工具 dispatch 在执行前检查真实 workspace 资源，默认要求 workspace 的工具即使被直接调用、权限为 FullAccess 或传入 HOME 绝对路径也必须拒绝。Web/search/browser 的独立能力仍遵守原权限机制。
+
+`leveler-app` 的 Global Task Index 通过 SQLite read-only 连接扫描已有 project stores 和 No Workspace store。它聚合持久事实，不创建数据库、不运行 migration、不启动 daemon、不维护第二份任务账本。source 错误随 partial result 返回；checkout 缺失保留历史并标记 workspace unavailable。打开跨来源 Session 时先解析 index 中的真实 owner，再由 Runtime Host 连接该 source；Web 的在线多项目 Router 保留原职责。全局扫描只向可信本地客户端开放，项目 Remote/Web 授权不能自动获得其他来源历史。
+
+`session_projection` 从持久 turn/event 顺序、boot 存活证据和实际 live waiter 派生 `task_status` 与 `task_terminal`，供本地列表、snapshot 和全局索引共享。原 `status` 保留 Session lifecycle 语义。唯一权威 terminal 是已提交 `TaskFinished`；Answered 表示回答，stop=Completed 是领域完成声明，均不代表独立验收。旧 TaskFinished 的 outcome=Completed、stop=None 保留原终态兼容，不补造领域声明。已提交 terminal 优先于尚未清理的旧 live lease；其后新受理 turn 的 durable identity/ordinal 和事件顺序阻止旧 terminal 覆盖新活动。没有 terminal 的最终正文或工具成功不能显示 completed。只读全局索引能够证明 owner 正在运行，却不能凭持久审批记录证明 waiter 存活；可操作 WaitingUser 从连接后的 owner snapshot 获得。
+
+断线后 snapshot 恢复持久正文、plan、终态和仍存活的 approval/clarification waiter。答复、超时、取消或 runtime restart 后的旧 interaction 不能重新操作；取消期间 future 被丢弃也必须清除 waiter。runtime 重启读取持久事实，旧 provider 流不自动续跑，旧 turn 按 owner epoch 表达 interrupted/unknown。未来 Desktop 使用 daemon 的 durable wire ACK 路径；默认 in-process 乐观 ACK 不作为 durable admission。ACK 丢失查询相同 command identity，未知结果不授权自动重跑。
+
+`optional_workspace` capability 在本地连接入口协商。旧客户端连接项目 source 时 `repository` 仍为 JSON string；支持该 capability 的新客户端才能进入 No Workspace source 并接收 null。JSON schema 与 TS DTO 通过既有生成流程同步；Mobile Dart 使用手写 JSON map 消费者，没有单独生成器。nullable repository migration 仅由 source owner 写连接执行，保留旧关联、外键、索引、trigger 和原任务事实；全局只读查询不迁移来源。
+
+### 13.3 TUI 投影与性能不变量（Do Not Regress）
 
 TUI 展示运行时事实，不自己制造事实。下列契约已由 deterministic 测试与真实
 dogfood 验证，不要在后续改动中回退：

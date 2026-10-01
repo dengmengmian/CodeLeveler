@@ -188,7 +188,9 @@ mod tests {
     fn downstream_snapshot_roundtrips_with_tag() {
         let snapshot = UiSessionSnapshot {
             id: SessionId::new("s1"),
-            repository: "/repo".to_string(),
+            repository: Some("/repo".to_string()),
+            task_status: None,
+            task_terminal: None,
             goal: "interactive session".to_string(),
             model: None,
             mode: crate::PermissionProfile::Assisted,

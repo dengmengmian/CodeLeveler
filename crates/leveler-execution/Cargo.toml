@@ -10,6 +10,7 @@ description = "Workspace path safety, risk levels, and process execution."
 
 [dependencies]
 sha2 = { workspace = true }
+getrandom = "0.2"
 leveler-core = { workspace = true }
 # The audited `unsafe` boundary for Windows write confinement. Depended on
 # unconditionally so `windows_confine`'s bookkeeping compiles and is tested on

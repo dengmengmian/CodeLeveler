@@ -308,7 +308,7 @@ impl RemotePolicy {
             // A replayed history carries every tool call's arguments and
             // output — repository content, same class as the observatory. A
             // remote client reads the conversation from the snapshot.
-            ClientCommand::QuerySessionHistory { .. } => RemoteVerdict::Deny {
+            ClientCommand::QueryGlobalTasks { .. } | ClientCommand::QuerySessionHistory { .. } => RemoteVerdict::Deny {
                 code: DENIED_COMMAND,
                 reason: "session history is local-only",
             },

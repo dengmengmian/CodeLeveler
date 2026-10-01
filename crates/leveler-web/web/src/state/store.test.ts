@@ -63,22 +63,20 @@ function stateWithSession(over: Partial<UiSessionSnapshot> = {}): AppState {
 }
 
 describe('product axes', () => {
-  it('adopts axes from the snapshot (runtime is the source of truth)', () => {
+  it('adopts collaboration but discards the legacy work profile from snapshots', () => {
     const state = stateWithSession({ work_profile: 'economy', collaboration: 'goal' });
-    expect(state.current?.workProfile).toBe('economy');
+    expect(state.current).not.toHaveProperty('workProfile');
     expect(state.current?.collaboration).toBe('goal');
   });
 
-  it('defaults to balanced/chat when an old runtime omits the fields', () => {
+  it('defaults to chat when an old runtime omits collaboration', () => {
     const state = stateWithSession();
-    expect(state.current?.workProfile).toBe('balanced');
     expect(state.current?.collaboration).toBe('chat');
   });
 
   it('set_axes updates the local view (optimistic, confirmed by session_updated)', () => {
     const state = stateWithSession();
-    reducer(state, { type: 'set_axes', workProfile: 'economy', collaboration: 'plan' });
-    expect(state.current?.workProfile).toBe('economy');
+    reducer(state, { type: 'set_axes', collaboration: 'plan' });
     expect(state.current?.collaboration).toBe('plan');
   });
 
@@ -170,6 +168,15 @@ describe('project → sessions', () => {
     reducer(state, { type: 'snapshot', session: snapshot({ id: 'b1', repository: '/B' }) });
     expect(state.selectedProject).toBe('/B');
     expect(state.current?.id).toBe('b1');
+  });
+
+  it('opening a no-workspace snapshot clears the previous project association', () => {
+    const state = structuredClone(initialState);
+    reducer(state, { type: 'select_project', path: '/A' });
+    reducer(state, { type: 'snapshot', session: snapshot({ id: 'none', repository: null }) });
+    expect(state.current?.repository).toBeNull();
+    expect(state.repository).toBeNull();
+    expect(state.selectedProject).toBeNull();
   });
 
   it('records offline project status without inventing online', () => {
@@ -482,7 +489,6 @@ describe('turn terminal truth', () => {
     expect(state.current?.tools[0]?.status).toBe('done');
     expect(state.current?.agents).toHaveLength(1);
     expect(state.current?.lastTurn?.outcome).toBe('answered');
-    expect(state.current?.workProfile).toBe('economy');
     expect(state.current?.collaboration).toBe('goal');
     expect(state.current?.permission).toBe('full_access');
   });

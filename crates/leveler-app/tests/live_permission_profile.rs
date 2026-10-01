@@ -57,13 +57,12 @@ async fn a_permission_change_reaches_a_sessions_running_execution() {
 
     // Building an engine is what gives a session its live cell.
     let engine = app
-        .engine_for_with_profile(
+        .engine_for_session(
             &leveler_model::ModelRef::new("mock", "m"),
             PermissionProfile::Assisted,
             false,
             std::sync::Arc::new(leveler_execution::AutoApprove),
             std::sync::Arc::new(leveler_agent::AutoClarify),
-            leveler_agent::WorkProfile::Balanced,
             false,
             Some("session-a"),
         )
@@ -101,13 +100,12 @@ async fn one_sessions_permission_change_does_not_move_another() {
     let mut engines = Vec::new();
     for scope in ["session-a", "session-b"] {
         engines.push(
-            app.engine_for_with_profile(
+            app.engine_for_session(
                 &model,
                 PermissionProfile::Assisted,
                 false,
                 std::sync::Arc::new(leveler_execution::AutoApprove),
                 std::sync::Arc::new(leveler_agent::AutoClarify),
-                leveler_agent::WorkProfile::Balanced,
                 false,
                 Some(scope),
             )
@@ -142,13 +140,12 @@ async fn a_later_turn_of_the_same_session_reuses_the_live_profile() {
     let app = app(&tmp);
     let model = leveler_model::ModelRef::new("mock", "m");
     let build = |mode| {
-        app.engine_for_with_profile(
+        app.engine_for_session(
             &model,
             mode,
             false,
             std::sync::Arc::new(leveler_execution::AutoApprove),
             std::sync::Arc::new(leveler_agent::AutoClarify),
-            leveler_agent::WorkProfile::Balanced,
             false,
             Some("session-a"),
         )
@@ -183,13 +180,12 @@ async fn set_permission_profile_reaches_a_running_engine_before_session_updated(
     let session_id = app.create_session(&model, "goal").await.unwrap();
 
     let engine = app
-        .engine_for_with_profile(
+        .engine_for_session(
             &model,
             PermissionProfile::Assisted,
             false,
             std::sync::Arc::new(leveler_execution::AutoApprove),
             std::sync::Arc::new(leveler_agent::AutoClarify),
-            leveler_agent::WorkProfile::Balanced,
             false,
             Some(session_id.as_str()),
         )

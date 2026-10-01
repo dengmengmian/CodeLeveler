@@ -432,7 +432,10 @@ impl Application {
     ) -> Result<leveler_core::SessionId, AppError> {
         self.task_engine(db)?
             .create_task(&leveler_engine::NewSession {
-                workspace: self.layout.repo_root.display().to_string(),
+                workspace: self
+                    .layout
+                    .primary_workspace()
+                    .map(|root| root.display().to_string()),
                 goal: goal.to_string(),
                 model: model.to_string(),
                 mode: PermissionProfile::Assisted.as_str().to_string(),
@@ -440,7 +443,6 @@ impl Application {
                 kind: ExecutionKind::Direct,
                 axes: Some(leveler_engine::NewSessionAxes {
                     collaboration: self.collaboration().as_str().to_string(),
-                    work_profile: self.work_profile().as_str().to_string(),
                 }),
             })
             .await
@@ -631,30 +633,17 @@ impl Application {
 
     /// The product axes a turn in `session_id` executes under.
     ///
-    /// The SESSION ROW is the single authority: `/work-mode` writes the choice
-    /// there, and every turn — interactive, headless, resumed — composes its
-    /// tool surface from it. This Application's in-memory work profile is the
-    /// value a NEW session is created with; it never competes with the row of
-    /// a session that already exists. `run_in_session_with_content` (the
-    /// interactive turn) used to read the Application default, so `/work-mode
-    /// economy` changed the row and the next turn still composed the balanced
-    /// surface — one durable fact with two readers.
+    /// Reload collaboration from the session row for every turn.
     pub(crate) async fn turn_axes(
         &self,
         repo: &SessionRepository<'_>,
         session_id: &leveler_core::SessionId,
-    ) -> Result<
-        (
-            leveler_agent::WorkProfile,
-            leveler_lifecycle::CollaborationMode,
-        ),
-        AppError,
-    > {
+    ) -> Result<leveler_lifecycle::CollaborationMode, AppError> {
         let Some(record) = repo.get(session_id).await? else {
-            return Ok((self.work_profile(), self.collaboration()));
+            return Ok(self.collaboration());
         };
-        let (work_profile, collaboration) = crate::axes_from_session_record(&record);
-        Ok((work_profile, collaboration))
+        self.validate_session_workspace(record.repository.as_deref())?;
+        Ok(crate::axes_from_session_record(&record))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -682,17 +671,16 @@ impl Application {
         self.sync_session_memory_policy(&db, session_id).await;
         let repo = SessionRepository::new(&db);
         // Product axes SoT is the session row (SetProductAxes / create defaults).
-        let (work_profile, collaboration) = self.turn_axes(&repo, session_id).await?;
+        let collaboration = self.turn_axes(&repo, session_id).await?;
         let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
 
         let engine = self
-            .engine_for_with_profile(
+            .engine_for_session(
                 model,
                 mode,
                 sandbox,
                 approver,
                 clarifier,
-                work_profile,
                 read_only,
                 Some(session_id.as_str()),
             )
@@ -744,16 +732,15 @@ impl Application {
         self.ensure_memory_consolidator(&db)?;
         self.sync_session_memory_policy(&db, session_id).await;
         let repo = SessionRepository::new(&db);
-        let (work_profile, collaboration) = self.turn_axes(&repo, session_id).await?;
+        let collaboration = self.turn_axes(&repo, session_id).await?;
         let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
         let engine = self
-            .engine_for_with_profile(
+            .engine_for_session(
                 model,
                 mode,
                 sandbox,
                 approver,
                 clarifier,
-                work_profile,
                 read_only,
                 Some(session_id.as_str()),
             )
@@ -879,9 +866,9 @@ impl Application {
         Ok(events.into_iter().next())
     }
 
-    /// (work_profile / collaboration). Application in-memory defaults are not
+    /// (collaboration). Application in-memory defaults are not
     /// the SoT for resume — the session row is (CLI `leveler resume` may
-    /// `assemble()` with balanced default).
+    /// `assemble()` with chat default).
     pub async fn resume_session(
         &self,
         session_id: &leveler_core::SessionId,
@@ -967,22 +954,22 @@ impl Application {
             .ok_or_else(|| AppError::Engine(format!("unknown persisted mode `{mode}`")))?;
         let kind = ExecutionKind::parse(&kind).map_err(app_error_from_engine)?;
         // Product axes: SoT is the session row, not Application defaults.
-        let (work_profile, collaboration) = crate::axes_from_session_record(&record);
+        let collaboration = crate::axes_from_session_record(&record);
         let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
 
         let engine = self
-            .engine_for_with_profile(
+            .engine_for_session(
                 &model,
                 mode,
                 sandbox,
                 approver,
                 clarifier,
-                work_profile,
                 read_only,
                 Some(session_id.as_str()),
             )
             .await?
             .with_task_cancel(task_cancel);
+        self.validate_session_workspace(record.repository.as_deref())?;
         let mut spec = self.direct_spec(record.goal.clone(), mode, sandbox);
         // Resume with the persisted strategy, not an assumed one.
         spec.runtime.kind = kind;
@@ -1063,85 +1050,51 @@ mod tests {
 
 #[cfg(test)]
 mod turn_axes_tests {
-    //! One durable fact, one reader. `/work-mode` writes the session row, so
-    //! every turn in that session — interactive included — must compose its
-    //! tool surface from the row and never from this process's create-time
-    //! default.
-
-    use leveler_agent::WorkProfile;
+    use crate::Application;
+    use leveler_agent::CollaborationMode;
     use leveler_model::ModelRef;
     use leveler_project::Layout;
     use leveler_storage::SessionRepository;
 
-    use crate::Application;
-
-    /// The axes under test come from the session row and the explicit
-    /// create-time default below, so the ambient global config cannot change
-    /// the answer either way.
-    fn isolated_app(tmp: &tempfile::TempDir, default: WorkProfile) -> Application {
-        let layout = Layout::from_parts(
+    fn isolated_app(tmp: &tempfile::TempDir) -> Application {
+        Application::assemble(Layout::from_parts(
             tmp.path().to_path_buf(),
             tmp.path().join("configs"),
             tmp.path().join("state"),
-        );
-        Application::assemble(layout)
-            .unwrap()
-            .with_work_profile(default)
+        ))
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn a_turn_reads_the_session_row_not_the_application_default() {
+    async fn a_plan_session_remains_a_read_only_overlay_after_restart() {
         let tmp = tempfile::tempdir().unwrap();
-        let creator = isolated_app(&tmp, WorkProfile::Economy);
-        let id = creator
-            .create_session(&ModelRef::new("mock", "m"), "quick scan")
-            .await
-            .unwrap();
-
-        // A fresh process: its own default is Balanced, and the row says
-        // Economy. The row wins for a session that already exists.
-        let next_process = isolated_app(&tmp, WorkProfile::Balanced);
-        assert_eq!(next_process.work_profile(), WorkProfile::Balanced);
-        let db = next_process.open_database().await.unwrap();
-        let repo = SessionRepository::new(&db);
-        let (work_profile, read_only) = next_process.turn_axes(&repo, &id).await.unwrap();
-        assert_eq!(
-            work_profile,
-            WorkProfile::Economy,
-            "the session row is the single authority for a turn's tool surface"
-        );
-        assert_eq!(read_only, leveler_lifecycle::CollaborationMode::Chat);
-    }
-
-    #[tokio::test]
-    async fn a_plan_session_is_a_read_only_overlay() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = isolated_app(&tmp, WorkProfile::Balanced)
-            .with_collaboration(leveler_agent::CollaborationMode::Plan);
+        let app = isolated_app(&tmp).with_collaboration(CollaborationMode::Plan);
         let id = app
             .create_session(&ModelRef::new("mock", "m"), "plan it")
             .await
             .unwrap();
-        let db = app.open_database().await.unwrap();
+        let resumer = isolated_app(&tmp);
+        let db = resumer.open_database().await.unwrap();
         let repo = SessionRepository::new(&db);
-        let (_, read_only) = app.turn_axes(&repo, &id).await.unwrap();
-        assert_eq!(read_only, leveler_lifecycle::CollaborationMode::Plan);
+        assert_eq!(
+            resumer.turn_axes(&repo, &id).await.unwrap(),
+            CollaborationMode::Plan
+        );
     }
 
-    /// A session id with no row is not a licence to invent axes: the
-    /// create-time defaults supply both axes, including the collaboration
-    /// mode; no second mutable copy is consulted.
     #[tokio::test]
-    async fn a_missing_row_falls_back_to_the_create_time_default() {
+    async fn a_missing_row_uses_collaboration_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = isolated_app(&tmp, WorkProfile::Economy);
+        let app = isolated_app(&tmp);
         let db = app.open_database().await.unwrap();
-        let repo = SessionRepository::new(&db);
-        let (work_profile, read_only) = app
-            .turn_axes(&repo, &leveler_core::SessionId::new("no-such-session"))
+        assert_eq!(
+            app.turn_axes(
+                &SessionRepository::new(&db),
+                &leveler_core::SessionId::new("missing")
+            )
             .await
-            .unwrap();
-        assert_eq!(work_profile, WorkProfile::Economy);
-        assert_eq!(read_only, leveler_lifecycle::CollaborationMode::Chat);
+            .unwrap(),
+            CollaborationMode::Chat
+        );
     }
 }

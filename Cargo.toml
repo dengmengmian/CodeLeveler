@@ -25,6 +25,8 @@ members = [
     "crates/leveler-remote-protocol",
     "crates/leveler-remote-agent",
     "crates/leveler-local-transport",
+    "crates/leveler-win-local-ipc",
+    "crates/leveler-runtime-host",
     "crates/leveler-media",
     "crates/leveler-browser",
     "crates/leveler-update",
@@ -71,6 +73,7 @@ leveler-remote-protocol = { version = "1.0.11", path = "crates/leveler-remote-pr
 leveler-remote-agent = { version = "1.0.11", path = "crates/leveler-remote-agent" }
 leveler-relay = { version = "1.0.11", path = "services/leveler-relay" }
 leveler-local-transport = { version = "1.0.11", path = "crates/leveler-local-transport" }
+leveler-runtime-host = { version = "1.0.11", path = "crates/leveler-runtime-host" }
 leveler-media = { version = "1.0.11", path = "crates/leveler-media" }
 leveler-browser = { version = "1.0.11", path = "crates/leveler-browser" }
 leveler-update = { version = "1.0.11", path = "crates/leveler-update" }

@@ -64,6 +64,9 @@ struct Input {
     /// stops it when the current goal finishes. Use `runtime` only when the
     /// user explicitly asks a dev server or watcher to remain running after
     /// task completion; it then runs until explicitly stopped or runtime exit.
+    /// `session` survives runtime updates until its creating session is deleted.
+    /// `persistent` is explicitly owned by the independent execution host and
+    /// survives runtime updates until it exits or the user stops it.
     #[serde(default)]
     background_lifetime: Option<BackgroundLifetimeInput>,
 }
@@ -73,6 +76,8 @@ struct Input {
 enum BackgroundLifetimeInput {
     Goal,
     Runtime,
+    Session,
+    Persistent,
 }
 
 impl From<BackgroundLifetimeInput> for BackgroundTaskLifetime {
@@ -80,6 +85,8 @@ impl From<BackgroundLifetimeInput> for BackgroundTaskLifetime {
         match value {
             BackgroundLifetimeInput::Goal => Self::Goal,
             BackgroundLifetimeInput::Runtime => Self::Runtime,
+            BackgroundLifetimeInput::Session => Self::Session,
+            BackgroundLifetimeInput::Persistent => Self::Persistent,
         }
     }
 }
@@ -112,7 +119,10 @@ impl Tool for RunCommandTool {
          `get_task`, `wait_task`, and `kill_task`. Background processes stop \
          when the goal finishes unless `background_lifetime` is `runtime`, \
          which keeps the process owned by this runtime until it exits or is \
-         killed. Default timeout 120s for a foreground run."
+         killed. Use `session` across runtime updates until its session is deleted; \
+         use `persistent` only when the user explicitly wants a service to \
+         survive runtime updates under the independent execution host. \
+         Default timeout 120s for a foreground run."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -385,6 +395,39 @@ fn normalize_args(program: &str, mut args: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_lifetime_accepts_host_owned_services_explicitly() {
+        for lifetime in ["persistent", "session"] {
+            let parsed = serde_json::from_value::<super::Input>(serde_json::json!({
+                "program": "server",
+                "background": true,
+                "background_lifetime": lifetime,
+            }));
+            assert!(
+                parsed.is_ok(),
+                "explicit {lifetime} lifetime must be accepted: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn background_lifetime_preserves_goal_default_and_runtime_contract() {
+        let default: super::Input = serde_json::from_value(serde_json::json!({
+            "program": "server", "background": true,
+        }))
+        .unwrap();
+        assert!(default.background_lifetime.is_none());
+        for lifetime in ["goal", "runtime"] {
+            assert!(
+                serde_json::from_value::<super::Input>(serde_json::json!({
+                    "program": "server", "background": true,
+                    "background_lifetime": lifetime,
+                }))
+                .is_ok()
+            );
+        }
+    }
+
     use super::*;
     #[allow(unused_imports)]
     use crate::tools::command_execution::{

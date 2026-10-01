@@ -115,7 +115,9 @@ impl InteractiveRuntimeClient for FakeRuntime {
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
-            repository: self.label.clone(),
+            repository: Some(self.label.clone()),
+            task_status: None,
+            task_terminal: None,
             goal: String::new(),
             model: None,
             mode: PermissionProfile::RequestApproval,

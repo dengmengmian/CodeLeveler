@@ -36,7 +36,9 @@ struct FakeRuntime {
 fn snapshot_for(session_id: &str) -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new(session_id),
-        repository: "/repo".to_string(),
+        repository: Some("/repo".to_string()),
+        task_status: None,
+        task_terminal: None,
         goal: "interactive session".to_string(),
         model: None,
         mode: PermissionProfile::Assisted,

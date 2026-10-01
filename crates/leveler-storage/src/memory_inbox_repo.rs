@@ -503,10 +503,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn economy_turn_is_not_admitted_to_the_memory_inbox() {
+    async fn legacy_work_profile_does_not_control_memory_admission() {
         let (db, session) = fixture().await;
-        SessionRepository::new(&db)
-            .set_axes(&session, "chat", "economy", leveler_core::now())
+        // Simulate an older binary writing the retained column after migration.
+        sqlx::query("UPDATE sessions SET work_profile = 'economy' WHERE id = ?1")
+            .bind(session.as_str())
+            .execute(db.pool())
             .await
             .unwrap();
 
@@ -524,7 +526,7 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert_eq!(admitted, 0);
+        assert_eq!(admitted, 1);
     }
 
     #[tokio::test]
@@ -949,13 +951,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "local performance probe; run explicitly with --nocapture"]
     async fn inbox_admission_performance_probe() {
-        async fn measure(work_profile: &str, turns: usize) -> std::time::Duration {
+        async fn measure(memory_enabled: bool, turns: usize) -> std::time::Duration {
             let db = Database::connect_in_memory().await.unwrap();
-            let mut record =
-                SessionRecord::new("/repo", "goal", "provider/model", leveler_core::now());
-            record.work_profile = work_profile.to_string();
+            let record = SessionRecord::new("/repo", "goal", "provider/model", leveler_core::now());
             let session = SessionId::new(record.id.clone());
-            SessionRepository::new(&db).create(&record).await.unwrap();
+            let sessions = SessionRepository::new(&db);
+            sessions.create(&record).await.unwrap();
+            sessions
+                .set_memory_enabled(&session, memory_enabled)
+                .await
+                .unwrap();
             let repo = TurnRepository::new(&db);
             let started = Instant::now();
             for index in 0..turns {
@@ -984,11 +989,11 @@ mod tests {
         let mut with_samples = Vec::new();
         for round in 0..7 {
             if round % 2 == 0 {
-                without_samples.push(measure("economy", turns).await.as_micros());
-                with_samples.push(measure("balanced", turns).await.as_micros());
+                without_samples.push(measure(false, turns).await.as_micros());
+                with_samples.push(measure(true, turns).await.as_micros());
             } else {
-                with_samples.push(measure("balanced", turns).await.as_micros());
-                without_samples.push(measure("economy", turns).await.as_micros());
+                with_samples.push(measure(true, turns).await.as_micros());
+                without_samples.push(measure(false, turns).await.as_micros());
             }
         }
         without_samples.sort_unstable();

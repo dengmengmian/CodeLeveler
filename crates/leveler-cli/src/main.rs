@@ -178,7 +178,10 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
     let home = leveler_core::LevelerHome::resolve(leveler_core::environment())
         .root()
         .to_path_buf();
-    let ignored = leveler_execution::untrusted_project_files(&home, &layout.repo_root);
+    let Some(repo) = layout.primary_workspace() else {
+        return;
+    };
+    let ignored = leveler_execution::untrusted_project_files(&home, repo);
     if ignored.is_empty() {
         return;
     }
@@ -194,7 +197,24 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
 
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
     let config_overridden = args.config_dir.is_some();
-    let layout = resolve_layout(args.repo, args.config_dir)?;
+    let no_workspace = matches!(
+        &args.command,
+        Some(Command::Serve {
+            no_workspace: true,
+            ..
+        })
+    );
+    let layout = if no_workspace {
+        if args.repo.is_some() {
+            anyhow::bail!("--repo cannot be combined with serve --no-workspace");
+        }
+        Layout::no_workspace(
+            leveler_core::LevelerHome::resolve(leveler_core::environment()),
+            args.config_dir,
+        )
+    } else {
+        resolve_layout(args.repo, args.config_dir)?
+    };
 
     // The ordinary first launch should become a working product, not a TUI
     // that can only report "no model configured". Reuse `leveler login` as the
@@ -226,6 +246,14 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
     };
 
     match command {
+        Command::ExecutionHost { state_dir } => {
+            let mut config = leveler_app::execution_host_config(&layout)?;
+            config.state_dir = state_dir;
+            leveler_execution::execution_host::serve(config)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         Command::Tui {
             model,
             mode,
@@ -247,6 +275,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             .await
         }
         Command::Serve {
+            no_workspace: _,
             model,
             mode,
             auto_approve,
@@ -349,7 +378,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             pr,
             pr_base,
             deny_network,
-            work_mode,
             max_model_steps,
             collaboration,
             parallel,
@@ -362,8 +390,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             let task = task.ok_or_else(|| {
                 anyhow::anyhow!("a task is required (or pass --resume <id> to continue a run)")
             })?;
-            let work_profile: leveler_lifecycle::WorkProfile =
-                work_mode.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
             let collab: leveler_lifecycle::CollaborationMode =
                 collaboration.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
             // pr implies push implies commit.
@@ -386,7 +412,6 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
                     output,
                     ship,
                     deny_network,
-                    work_profile,
                     collab,
                     max_model_steps,
                 )

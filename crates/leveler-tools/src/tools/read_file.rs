@@ -94,7 +94,7 @@ impl Tool for ReadFileTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context.execution.workspace.resolve_for_read(&input.path)?;
+        let path = context.require_workspace()?.resolve_for_read(&input.path)?;
 
         // Page at the budget the registry will enforce, less the room the
         // marker needs. `saturating_sub` keeps a pathologically small budget

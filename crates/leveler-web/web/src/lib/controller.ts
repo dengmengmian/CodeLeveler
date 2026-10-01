@@ -32,7 +32,6 @@ import type {
 } from '../types/protocol';
 
 /** 产品轴合法值（wire 契约：SetProductAxes 的注释）。 */
-export const WORK_PROFILES = ['economy', 'balanced'] as const;
 export const COLLABORATIONS = ['chat', 'plan', 'goal'] as const;
 
 type GetState = () => AppState;
@@ -737,21 +736,21 @@ export class RuntimeBridge {
     if (current) this.deliver({ type: 'select_model', session_id: current.id, model });
   }
 
-  /** 设置产品轴（work_profile × collaboration）。SoT 在 session record；
+  /** 设置协作方式。SoT 在 session record；
    *  乐观更新本地视图，runtime 回 session_updated 确认。回合运行中不许切
    *  （与 TUI 的 idle-only 规则一致——runtime 只在空闲时接受）。 */
-  setAxes(workProfile: string, collaboration: string): void {
+  setCollaboration(collaboration: string): void {
     const current = this.getState().current;
     if (!current) return;
     if (current.turnActive) {
       this.notice('回合运行中不能切换运行轴，先停止或等它结束');
       return;
     }
-    this.dispatch({ type: 'set_axes', workProfile, collaboration });
+    this.dispatch({ type: 'set_axes', collaboration });
     this.deliver({
       type: 'set_product_axes',
       session_id: current.id,
-      work_profile: workProfile,
+      work_profile: 'single', // Legacy wire field; ignored by current runtimes.
       collaboration,
     });
     if (collaboration === 'plan') {
@@ -935,17 +934,6 @@ export class RuntimeBridge {
         this.setModel(hit);
         return;
       }
-      case '/work-mode': {
-        if (!arg) return; // 无参数：由 Composer 打开工作档弹层
-        const work = arg.toLowerCase();
-        if (!(WORK_PROFILES as readonly string[]).includes(work)) {
-          this.dispatch({ type: 'notice', message: '用法：/work-mode economy|balanced' });
-          return;
-        }
-        const cur = this.getState().current;
-        if (cur) this.setAxes(work, cur.collaboration);
-        return;
-      }
       case '/collab': {
         if (!arg) return; // 无参数：由 Composer 打开协作弹层
         const collab = arg.toLowerCase();
@@ -954,7 +942,7 @@ export class RuntimeBridge {
           return;
         }
         const cur = this.getState().current;
-        if (cur) this.setAxes(cur.workProfile, collab);
+        if (cur) this.setCollaboration(collab);
         return;
       }
       case '/perm': {

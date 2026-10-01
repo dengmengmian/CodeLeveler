@@ -75,7 +75,7 @@ impl Tool for BlastRadiusTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let max_depth = input.max_depth.unwrap_or(DEFAULT_DEPTH).clamp(1, MAX_DEPTH);
-        let root = context.execution.workspace.root().to_path_buf();
+        let root = context.require_workspace()?.root().to_path_buf();
 
         let resolver = LspResolver {
             lsp: &self.lsp,

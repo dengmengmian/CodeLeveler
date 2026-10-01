@@ -70,7 +70,7 @@ impl Tool for ListFilesTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.unwrap_or_else(|| ".".to_string());
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
-        let base = context.execution.workspace.resolve_for_read(&rel)?;
+        let base = context.require_workspace()?.resolve_for_read(&rel)?;
 
         let listing = match WorkspaceSearch::list_dir(&base, limit) {
             Ok(listing) => listing,

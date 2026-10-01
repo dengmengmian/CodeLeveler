@@ -20,7 +20,7 @@ use crate::snapshot::SnapshotId;
 /// settlement time because the authority a task runs under is the one it was
 /// spawned with. A background process outlives the round that started it, so
 /// there is no later scope to consult.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MutationBaseline {
     pub snapshot: SnapshotId,
     pub workspace_root: PathBuf,
@@ -32,7 +32,7 @@ pub struct MutationBaseline {
 ///
 /// Produced exactly once per task, by the reaper, without any tool call. A
 /// waiter reads it; it never computes it (`docs/ARCHITECTURE.md` §18.3 H).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundSettlement {
     /// Workspace-relative paths changed in this task's admitted namespace.
     pub modified: Vec<String>,
@@ -62,7 +62,7 @@ const GROUP_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// fd inherited by a process outside the group must not extend the task.
 const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackgroundTaskStatus {
     Running,
     /// Kill requested; process has been signaled but has not reaped yet.
@@ -73,15 +73,19 @@ pub enum BackgroundTaskStatus {
 
 /// How long the runtime retains ownership of a background process.
 ///
-/// Both variants remain owned and observable by the creating session. The
-/// difference is only whether a successful goal terminal is a cleanup boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Every lifetime retains its creating session. Goal/Runtime are legacy local
+/// ownership; Session/Persistent run in the independent execution substrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackgroundTaskLifetime {
     /// Default: stop the process when the creating goal reaches a terminal state.
     Goal,
     /// Keep the process until it exits, is explicitly stopped, or the runtime
     /// shuts down. Intended for user-requested dev servers and watchers.
     Runtime,
+    /// Hosted work recoverable across runtime replacement; session deletion stops it.
+    Session,
+    /// Explicitly requested service, owned by the independent Execution Host.
+    Persistent,
 }
 
 impl BackgroundTaskStatus {
@@ -94,7 +98,7 @@ impl BackgroundTaskStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundTaskSnapshot {
     pub id: String,
     pub program: String,
@@ -104,6 +108,12 @@ pub struct BackgroundTaskSnapshot {
     pub exit_code: Option<i32>,
     pub log: String,
     pub duration_ms: u64,
+    /// The process-group leader's OS pid, captured at spawn and retained for
+    /// the task's whole record. A mechanical fact for a detail view; it carries
+    /// no authority — stopping a task still goes through this registry, never a
+    /// raw signal. `None` only for a task that never reached a process.
+    #[serde(default)]
+    pub pid: Option<u32>,
     /// The session that owns this task, when known. Session-owned tasks can be
     /// stopped by their owner through the runtime; daemon-scoped tasks have no
     /// owner and are not addressable by a client session.
@@ -112,7 +122,7 @@ pub struct BackgroundTaskSnapshot {
 
 /// One atomic observation of status and a bounded slice of retained output.
 /// `snapshot.log` is the delta, not a second copy of the full task log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundTaskObservation {
     pub snapshot: BackgroundTaskSnapshot,
     /// Terminal truth is retained even after its mutation report is delivered.
@@ -207,6 +217,9 @@ struct TaskInner {
     cwd: PathBuf,
     status: BackgroundTaskStatus,
     exit_code: Option<i32>,
+    /// The process-group leader's OS pid, recorded at spawn and kept after the
+    /// identity is dropped so a finished task's detail can still name it.
+    pid: Option<u32>,
     log: String,
     /// Absolute byte position in the sanitized output stream. The retained
     /// log may be truncated, so a plain index into `log` is not a cursor.
@@ -252,6 +265,9 @@ pub struct BackgroundTaskRegistry {
     lifecycle_events: broadcast::Sender<BackgroundTaskEvent>,
     /// Dropped when the last registry handle is dropped (session end).
     kill_on_drop: Arc<KillOnDrop>,
+    execution_host: Option<crate::execution_host::ExecutionHostConfig>,
+    retain_process_facts: bool,
+    hosted_monitors: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Default for BackgroundTaskRegistry {
@@ -373,9 +389,301 @@ impl BackgroundTaskRegistry {
             #[cfg(test)]
             spawn_registration_hook: Arc::new(std::sync::Mutex::new(None)),
             kill_on_drop: Arc::new(KillOnDrop::default()),
+            execution_host: None,
+            retain_process_facts: false,
+            hosted_monitors: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             runner: CommandRunner::with_environment(environment),
             lifecycle_events,
         }
+    }
+
+    pub(crate) fn retain_process_facts(mut self) -> Self {
+        self.retain_process_facts = true;
+        self
+    }
+    pub(crate) async fn forget_terminal_fact(&self, id: &str) -> Result<(), String> {
+        let mut st = self.inner.lock().await;
+        if st.tasks.get(id).is_some_and(|t| !t.status.is_terminal()) {
+            return Err("cannot forget a live process fact".into());
+        }
+        st.tasks.remove(id);
+        Ok(())
+    }
+
+    /// Configure independent ownership for explicitly hosted lifetimes.
+    pub fn with_execution_host(
+        mut self,
+        config: crate::execution_host::ExecutionHostConfig,
+    ) -> Self {
+        self.execution_host = Some(config);
+        self
+    }
+
+    fn journal(&self) -> Result<crate::host_settlement::SettlementJournal, String> {
+        let config = self
+            .execution_host
+            .as_ref()
+            .ok_or("persistent execution is not configured")?;
+        crate::host_settlement::SettlementJournal::open(&config.semantic_dir())
+    }
+
+    async fn host_client(&self) -> Result<crate::execution_host::ExecutionHostClient, String> {
+        let config = self
+            .execution_host
+            .clone()
+            .ok_or("persistent execution is not configured")?;
+        crate::execution_host::ExecutionHostClient::connect(config).await
+    }
+
+    /// Reconcile process facts without launching a new host. Unknown owner
+    /// state remains an error and retains every outstanding write reservation.
+    pub async fn reconcile_hosted(&self) -> Result<(), String> {
+        let Some(config) = &self.execution_host else {
+            return Ok(());
+        };
+        let Some(client) = crate::execution_host::ExecutionHostClient::probe(config).await? else {
+            if !self.journal()?.pending()?.is_empty() {
+                return Err(
+                    "Execution Host is absent with outstanding semantic reservations".into(),
+                );
+            }
+            return Ok(());
+        };
+        let journal = self.journal()?;
+        for task in client.list().await? {
+            if task.snapshot.status.is_terminal() {
+                journal.reconcile(&task.snapshot.id).await?;
+                client
+                    .acknowledge(
+                        &task.snapshot.id,
+                        task.snapshot
+                            .owner_scope
+                            .as_deref()
+                            .ok_or("missing hosted owner")?,
+                    )
+                    .await?;
+            } else {
+                self.monitor_hosted(task.snapshot)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn try_all_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
+        let mut snapshots = {
+            let st = self.inner.lock().await;
+            st.tasks.values().map(snapshot).collect::<Vec<_>>()
+        };
+        if let Some(config) = &self.execution_host {
+            if let Some(client) = crate::execution_host::ExecutionHostClient::probe(config).await? {
+                for task in client.list().await? {
+                    if task.snapshot.status.is_terminal() {
+                        self.journal()?.reconcile(&task.snapshot.id).await?;
+                        client
+                            .acknowledge(
+                                &task.snapshot.id,
+                                task.snapshot
+                                    .owner_scope
+                                    .as_deref()
+                                    .ok_or("missing hosted owner")?,
+                            )
+                            .await?;
+                    }
+                    snapshots.push(task.snapshot);
+                }
+            } else if !self.journal()?.pending()?.is_empty() {
+                return Err(
+                    "Execution Host is absent; outstanding service states are unknown".into(),
+                );
+            }
+        }
+        Ok(snapshots)
+    }
+
+    pub async fn try_active_snapshots_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<BackgroundTaskSnapshot>, String> {
+        Ok(self
+            .try_active_snapshots()
+            .await?
+            .into_iter()
+            .filter(|t| t.owner_scope.as_deref() == Some(scope))
+            .collect())
+    }
+
+    pub async fn try_active_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
+        Ok(self
+            .try_all_snapshots()
+            .await?
+            .into_iter()
+            .filter(|t| t.status.is_active())
+            .collect())
+    }
+
+    /// Only locally owned, nonrecoverable tasks prevent runtime replacement.
+    pub async fn try_update_blockers(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
+        // Validate remote owner availability too: incompatibility is never idle success.
+        self.try_active_snapshots().await?;
+        Ok(self.active_snapshots().await)
+    }
+
+    pub async fn kill_session(&self, owner: &str) -> Result<(), String> {
+        let local_ids = self.active_ids_for_scope(owner).await;
+        for id in local_ids {
+            self.kill_owned(&id, owner).await?;
+        }
+        if let Some(config) = &self.execution_host
+            && let Some(client) = crate::execution_host::ExecutionHostClient::probe(config).await?
+        {
+            let ids = client
+                .list()
+                .await?
+                .into_iter()
+                .filter(|t| {
+                    t.lifetime == BackgroundTaskLifetime::Session
+                        && t.snapshot.owner_scope.as_deref() == Some(owner)
+                        && t.snapshot.status.is_active()
+                })
+                .map(|t| t.snapshot.id)
+                .collect::<Vec<_>>();
+            for id in ids {
+                self.kill_owned(&id, owner).await?;
+                let result = self
+                    .wait_owned(
+                        &id,
+                        owner,
+                        Some(Duration::from_secs(5)),
+                        &CancellationToken::new(),
+                    )
+                    .await?;
+                if !result.status.is_terminal() {
+                    return Err(format!("session task `{id}` has not stopped"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn spawn_hosted(
+        &self,
+        request: ProcessRequest,
+        baseline: Option<MutationBaseline>,
+        owner: Option<&str>,
+        writer: &str,
+        lifetime: BackgroundTaskLifetime,
+    ) -> Result<String, String> {
+        let owner = owner.ok_or("hosted service requires a creating session")?;
+        let config = self
+            .execution_host
+            .clone()
+            .ok_or("persistent execution is not configured")?;
+        let client = crate::execution_host::ExecutionHostClient::ensure(config).await?;
+        let id = format!("host-{}", crate::execution_host::fresh_id()?);
+        self.journal()?
+            .prepare_with_scope(&id, owner, writer, baseline, request.write_scope.clone())
+            .await?;
+        // Transport failure is ambiguous: retain the prepared write reservation.
+        let task = match client.spawn(&id, request, owner, writer, lifetime).await {
+            Ok(task) => task,
+            Err(crate::execution_host::SpawnError::Rejected(error)) => {
+                self.journal()?.abandon_prepared(&id)?;
+                return Err(error);
+            }
+            Err(crate::execution_host::SpawnError::OutcomeUnknown(error)) => return Err(error),
+        };
+        let _ = self.lifecycle_events.send(BackgroundTaskEvent::Started {
+            owner_scope: Some(owner.into()),
+            task,
+        });
+        self.monitor_hosted(self.host_client().await?.get_owned(&id, owner).await?)?;
+        Ok(id)
+    }
+
+    fn monitor_hosted(&self, task: BackgroundTaskSnapshot) -> Result<(), String> {
+        let config = self
+            .execution_host
+            .clone()
+            .ok_or("execution host is not configured")?;
+        let owner = task.owner_scope.ok_or("hosted task has no session owner")?;
+        let id = task.id;
+        let monitors = self.hosted_monitors.clone();
+        if !monitors
+            .lock()
+            .map_err(|_| "hosted monitor lock poisoned")?
+            .insert(id.clone())
+        {
+            return Ok(());
+        }
+        let events = self.lifecycle_events.clone();
+        // Do not retain the local registry's KillOnDrop through a remote monitor.
+        tokio::spawn(async move {
+            let mut cursor = Some(0);
+            let mut reported_error: Option<String> = None;
+            loop {
+                let result: Result<bool, String> = async {
+                    let client =
+                        crate::execution_host::ExecutionHostClient::connect(config.clone()).await?;
+                    let journal =
+                        crate::host_settlement::SettlementJournal::open(&config.semantic_dir())?;
+                    let observation = client
+                        .observe_owned(&id, &owner, cursor, 64 * 1024, Duration::from_secs(1))
+                        .await?;
+                    let mut terminal_snapshot = None;
+                    if observation.snapshot.status.is_terminal() {
+                        // Any failure leaves the terminal unpublished and its
+                        // namespace reserved. Retry, including concurrent commit.
+                        journal.reconcile(&id).await?;
+                        // Exit events carry the complete retained log, not the
+                        // last observation page which could omit its tail.
+                        terminal_snapshot = Some(client.get_owned(&id, &owner).await?);
+                        client.acknowledge(&id, &owner).await?;
+                    }
+                    cursor = Some(observation.next_cursor);
+                    if observation.dropped_bytes > 0 {
+                        let _ = events.send(BackgroundTaskEvent::Output {
+                            owner_scope: Some(owner.clone()),
+                            task_id: id.clone(),
+                            chunk: format!(
+                                "[log history truncated: {} bytes unavailable]\n",
+                                observation.dropped_bytes
+                            ),
+                        });
+                    }
+                    if !observation.snapshot.log.is_empty() {
+                        let _ = events.send(BackgroundTaskEvent::Output {
+                            owner_scope: Some(owner.clone()),
+                            task_id: id.clone(),
+                            chunk: observation.snapshot.log.clone(),
+                        });
+                    }
+                    if observation.snapshot.status.is_terminal() {
+                        let _ = events.send(BackgroundTaskEvent::Exited {
+                            owner_scope: Some(owner.clone()),
+                            task: terminal_snapshot.ok_or("missing terminal snapshot")?,
+                        });
+                        return Ok(true);
+                    }
+                    Ok(false)
+                }
+                .await;
+                match result {
+                    Ok(true) => break,
+                    Ok(false) => reported_error = None,
+                    Err(error) => {
+                        if reported_error.as_ref() != Some(&error) {
+                            tracing::error!("hosted task observation pending: {error}");
+                            reported_error = Some(error);
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+            if let Ok(mut active) = monitors.lock() {
+                active.remove(&id);
+            }
+        });
+        Ok(())
     }
 
     pub async fn spawn(
@@ -426,9 +734,25 @@ impl BackgroundTaskRegistry {
         writer_scope: &str,
         lifetime: BackgroundTaskLifetime,
     ) -> Result<String, String> {
+        if matches!(
+            lifetime,
+            BackgroundTaskLifetime::Persistent | BackgroundTaskLifetime::Session
+        ) {
+            return self
+                .spawn_hosted(
+                    request,
+                    mutation_baseline,
+                    owner_scope,
+                    writer_scope,
+                    lifetime,
+                )
+                .await;
+        }
         let (id, mut reservation) = {
             let mut st = self.inner.lock().await;
-            prune_terminal_tasks(&mut st);
+            if !self.retain_process_facts {
+                prune_terminal_tasks(&mut st);
+            }
             let running = st.tasks.values().filter(|t| t.status.is_active()).count();
             if running + self.pending_spawns.load(Ordering::Acquire) >= MAX_CONCURRENT {
                 return Err(format!(
@@ -464,6 +788,7 @@ impl BackgroundTaskRegistry {
             hook.release.notified().await;
         }
         let identity = reservation.process_mut().identity();
+        let pid = process_identity_pid(&identity);
         let stdout = reservation.process_mut().take_stdout();
         let stderr = reservation.process_mut().take_stderr();
         let sandbox_scratch = reservation.process_mut().take_sandbox_scratch();
@@ -490,6 +815,7 @@ impl BackgroundTaskRegistry {
                 cwd: request.cwd.clone(),
                 status: BackgroundTaskStatus::Running,
                 exit_code: None,
+                pid: Some(pid),
                 log: String::new(),
                 log_end: 0,
                 log_prefix_len: 0,
@@ -625,12 +951,43 @@ impl BackgroundTaskRegistry {
         Ok(id)
     }
 
+    /// One atomic process/log fact. Persisting separately read cursors and logs
+    /// can corrupt archive offsets when an output pump truncates between reads.
+    pub(crate) async fn process_fact(
+        &self,
+        id: &str,
+    ) -> Option<(BackgroundTaskSnapshot, Option<u32>, u64, usize)> {
+        let state = self.inner.lock().await;
+        state.tasks.get(id).map(|task| {
+            let pid = task.identity.map(|identity| {
+                #[cfg(unix)]
+                {
+                    identity.pgid() as u32
+                }
+                #[cfg(not(unix))]
+                {
+                    identity.pid()
+                }
+            });
+            (snapshot(task), pid, task.log_end, task.log_prefix_len)
+        })
+    }
+
     pub async fn get(&self, id: &str) -> Option<BackgroundTaskSnapshot> {
         let st = self.inner.lock().await;
         st.tasks.get(id).map(snapshot)
     }
 
     pub async fn get_owned(&self, id: &str, owner: &str) -> Result<BackgroundTaskSnapshot, String> {
+        if id.starts_with("host-") {
+            let client = self.host_client().await?;
+            let task = client.get_owned(id, owner).await?;
+            if task.status.is_terminal() {
+                self.journal()?.reconcile(id).await?;
+                client.acknowledge(id, owner).await?;
+            }
+            return Ok(task);
+        }
         let st = self.inner.lock().await;
         let task = st
             .tasks
@@ -647,6 +1004,18 @@ impl BackgroundTaskRegistry {
         timeout: Option<Duration>,
         cancellation: &CancellationToken,
     ) -> Result<BackgroundTaskSnapshot, String> {
+        if id.starts_with("host-") {
+            let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+            loop {
+                let task = self.get_owned(id, owner).await?;
+                if task.status.is_terminal()
+                    || deadline.is_some_and(|d| tokio::time::Instant::now() >= d)
+                {
+                    return Ok(task);
+                }
+                tokio::select! { _ = cancellation.cancelled() => return Err("wait cancelled".into()), _ = tokio::time::sleep(Duration::from_millis(50)) => {} }
+            }
+        }
         // Task IDs are never reused and owner_scope is immutable. The wait
         // subscribes only after this locked authorization; observation checks
         // ownership again before delivering bytes or advancing a cursor.
@@ -659,6 +1028,13 @@ impl BackgroundTaskRegistry {
         id: &str,
         owner: &str,
     ) -> Result<Option<BackgroundSettlement>, String> {
+        if id.starts_with("host-") {
+            let task = self.get_owned(id, owner).await?;
+            if !task.status.is_terminal() {
+                return Ok(None);
+            }
+            return Ok(self.journal()?.read(id)?.settlement);
+        }
         let mut st = self.inner.lock().await;
         let task = st
             .tasks
@@ -690,6 +1066,9 @@ impl BackgroundTaskRegistry {
                 .map(|task| task.id.clone())
                 .collect()
         };
+        // Hosted services retain their durable namespace independently of a
+        // writer token. write_conflicts/foreign_write_paths consult the journal
+        // even after this writer retires; cleanup must not change their lifetime.
         for id in &ids {
             self.kill_owned(id, owner).await?;
         }
@@ -713,7 +1092,8 @@ impl BackgroundTaskRegistry {
     /// authority checks this before granting overlapping paths to a new writer.
     pub async fn write_conflicts(&self, owner: &str, paths: &[String]) -> Vec<String> {
         let st = self.inner.lock().await;
-        st.tasks
+        let mut conflicts = st
+            .tasks
             .values()
             .filter(|task| {
                 task.owner_scope.as_deref() == Some(owner)
@@ -723,7 +1103,28 @@ impl BackgroundTaskRegistry {
                         .any(|path| scope_overlaps(&task.write_scope, &task.cwd, path))
             })
             .map(|task| task.id.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        drop(st);
+        if let Some(config) = &self.execution_host {
+            match self.journal().and_then(|j| j.pending()) {
+                Ok(tasks) => conflicts.extend(
+                    tasks
+                        .into_iter()
+                        .filter(|t| {
+                            t.owner == owner
+                                && paths
+                                    .iter()
+                                    .any(|p| scope_overlaps(&t.write_scope, &config.repo_root, p))
+                        })
+                        .map(|t| t.task_id),
+                ),
+                Err(e) => {
+                    tracing::error!("could not establish hosted write ownership: {e}");
+                    conflicts.push(format!("hosted write ownership unavailable: {e}"));
+                }
+            }
+        }
+        conflicts
     }
 
     /// The actual namespaces still leased by other writers, including writers
@@ -750,6 +1151,37 @@ impl BackgroundTaskRegistry {
                     }
                 }
                 _ => paths.push(".".into()),
+            }
+        }
+        drop(state);
+        if self.execution_host.is_some() {
+            match self.journal().and_then(|j| j.pending()) {
+                Ok(tasks) => {
+                    for task in tasks
+                        .into_iter()
+                        .filter(|t| t.owner == owner && t.writer != writer)
+                    {
+                        match task.write_scope {
+                            crate::WriteScope::None => {}
+                            crate::WriteScope::ScopedWorkspace { root, allowed, .. } => {
+                                for path in allowed {
+                                    paths.push(
+                                        path.strip_prefix(&root)
+                                            .ok()
+                                            .filter(|p| !p.as_os_str().is_empty())
+                                            .map(|p| p.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| ".".into()),
+                                    );
+                                }
+                            }
+                            _ => paths.push(".".into()),
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!("could not establish hosted write ownership: {error}");
+                    paths.push(".".into());
+                }
             }
         }
         paths.sort();
@@ -781,6 +1213,10 @@ impl BackgroundTaskRegistry {
         timeout: Option<Duration>,
         cancellation: &CancellationToken,
     ) -> Result<BackgroundTaskSnapshot, String> {
+        if id.starts_with("host-") {
+            let record = self.journal()?.read(id)?;
+            return Box::pin(self.wait_owned(id, &record.owner, timeout, cancellation)).await;
+        }
         let notify = {
             let st = self.inner.lock().await;
             let task = st
@@ -871,6 +1307,19 @@ impl BackgroundTaskRegistry {
         timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<BackgroundTaskObservation, String> {
+        if id.starts_with("host-") {
+            let owner = owner.ok_or("hosted task requires session authorization")?;
+            let client = self.host_client().await?;
+            let mut result = tokio::select! {
+                _ = cancellation.cancelled() => return Err("wait cancelled".into()),
+                result = client.observe_owned(id, owner, cursor, max_bytes, timeout) => result?,
+            };
+            if result.snapshot.status.is_terminal() {
+                result.settlement = Some(self.journal()?.reconcile(id).await?);
+                client.acknowledge(id, owner).await?;
+            }
+            return Ok(result);
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if cancellation.is_cancelled() {
@@ -1075,6 +1524,16 @@ impl BackgroundTaskRegistry {
         id: &str,
         owner: Option<&str>,
     ) -> Result<BackgroundTaskSnapshot, String> {
+        if id.starts_with("host-") {
+            let owner = owner.ok_or("hosted task requires session authorization")?;
+            let client = self.host_client().await?;
+            let task = client.kill_owned(id, owner).await?;
+            if task.status.is_terminal() {
+                self.journal()?.reconcile(id).await?;
+                client.acknowledge(id, owner).await?;
+            }
+            return Ok(task);
+        }
         let identity = {
             let mut st = self.inner.lock().await;
             let task = st
@@ -1335,7 +1794,7 @@ fn truncate_log(log: &mut String) -> Option<usize> {
     None
 }
 
-fn take_log_delta(
+pub(crate) fn take_log_delta(
     log: &str,
     end: u64,
     prefix_len: usize,
@@ -1381,7 +1840,22 @@ fn snapshot_with_log(task: &TaskInner, log: String) -> BackgroundTaskSnapshot {
         exit_code: task.exit_code,
         log,
         duration_ms,
+        pid: task.pid,
         owner_scope: task.owner_scope.clone(),
+    }
+}
+
+/// The pid a detail view shows for a task: the process-group leader on unix
+/// (every spawn uses `process_group(0)`, so the leader is the child) and the
+/// direct pid on Windows.
+fn process_identity_pid(identity: &ProcessIdentity) -> u32 {
+    #[cfg(unix)]
+    {
+        identity.pgid() as u32
+    }
+    #[cfg(not(unix))]
+    {
+        identity.pid()
     }
 }
 
@@ -1675,6 +2149,7 @@ mod tests {
                     cwd: PathBuf::new(),
                     status: BackgroundTaskStatus::Exited,
                     exit_code: Some(0),
+                    pid: None,
                     log: String::new(),
                     log_end: 0,
                     log_prefix_len: 0,
@@ -1712,6 +2187,7 @@ mod tests {
                     cwd: PathBuf::new(),
                     status,
                     exit_code: None,
+                    pid: None,
                     log: String::new(),
                     log_end: 0,
                     log_prefix_len: 0,
@@ -1764,6 +2240,7 @@ mod tests {
             cwd: PathBuf::new(),
             status: BackgroundTaskStatus::Running,
             exit_code: Some(0),
+            pid: None,
             log: String::new(),
             log_end: 0,
             log_prefix_len: 0,
@@ -1803,6 +2280,7 @@ mod tests {
             cwd: PathBuf::new(),
             status: BackgroundTaskStatus::Running,
             exit_code: Some(0),
+            pid: None,
             log: String::new(),
             log_end: 0,
             log_prefix_len: 0,
@@ -2353,6 +2831,111 @@ mod tests {
 
         assert!(snap.log.contains("[stdout] out"), "log: {}", snap.log);
         assert!(snap.log.contains("[stderr] err"), "log: {}", snap.log);
+    }
+
+    /// Four concurrently spawned tasks must keep their own stdout/stderr and
+    /// their own pid: the live `Output` stream is tagged by task id, so a
+    /// viewer (and a `/btw` reader) can never attribute one task's line to
+    /// another. Also covers the mechanical fact the detail pane shows (pid).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_tasks_keep_output_and_pid_separate() {
+        let reg = host_registry();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rx = reg.subscribe();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let script = format!("printf 'out-{i}-{i}-{i}\\n'; printf 'err-{i}-{i}-{i}\\n' >&2");
+            let req =
+                ProcessRequest::new("sh", vec!["-c".into(), script], dir.path().to_path_buf());
+            let id = reg.spawn(req, None).await.expect("spawn");
+            let snap = reg.get(&id).await.expect("live snapshot");
+            assert!(
+                snap.pid.is_some_and(|pid| pid > 0),
+                "task {id} must expose its pid"
+            );
+            ids.push(id);
+        }
+
+        // Drain the lifecycle stream until every task has exited terminally.
+        let mut chunks: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut exited = std::collections::HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while exited.len() < ids.len() && Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Ok(BackgroundTaskEvent::Output { task_id, chunk, .. })) => {
+                    chunks.entry(task_id).or_default().push_str(&chunk);
+                }
+                Ok(Ok(BackgroundTaskEvent::Exited { task, .. })) => {
+                    exited.insert(task.id);
+                }
+                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
+            }
+        }
+
+        for (i, id) in ids.iter().enumerate() {
+            let seen = chunks.get(id).cloned().unwrap_or_default();
+            assert!(
+                seen.contains(&format!("out-{i}-{i}-{i}")),
+                "task {id} must see its own stdout, got {seen:?}"
+            );
+            assert!(
+                seen.contains(&format!("err-{i}-{i}-{i}")),
+                "task {id} must see its own stderr, got {seen:?}"
+            );
+            for other in 0..4 {
+                if other != i {
+                    let foreign = format!("out-{other}-{other}-{other}");
+                    assert!(
+                        !seen.contains(&foreign),
+                        "task {id} leaked another task's line {foreign}: {seen:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A chatty process must not grow the registry's retained log without
+    /// bound: the cap holds, UTF-8 stays valid, and the truncation is explicit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn high_volume_output_stays_bounded() {
+        let reg = host_registry();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // ~12k lines, far past the 256 KiB cap.
+        let script = "i=0; while [ $i -lt 12000 ]; do printf 'line-%05d-xxxxxxxxxxxxxxxxxxxxxxxx\\n' $i; i=$((i+1)); done";
+        let req = ProcessRequest::new(
+            "sh",
+            vec!["-c".into(), script.to_string()],
+            dir.path().to_path_buf(),
+        );
+        let id = reg.spawn(req, None).await.expect("spawn");
+        let snap = reg
+            .wait(
+                &id,
+                Some(Duration::from_secs(30)),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("wait");
+        assert!(
+            snap.log.len() <= MAX_LOG_BYTES + 64,
+            "retained log must stay bounded, was {} bytes",
+            snap.log.len()
+        );
+        assert!(
+            snap.log.contains("truncated"),
+            "early output must be explicitly marked as dropped"
+        );
+        assert!(snap.log.is_char_boundary(snap.log.len()));
+        // The newest output is what a live reader needs, so the tail survives.
+        assert!(
+            snap.log.contains("line-11999"),
+            "the retained window must keep the newest lines"
+        );
     }
 
     /// Real OS confinement canary for background spawn (mirrors foreground

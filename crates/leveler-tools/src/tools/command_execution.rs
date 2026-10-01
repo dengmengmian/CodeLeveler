@@ -68,12 +68,11 @@ impl CommandExecution {
         let reg = &self.background_tasks;
         let rel = cwd_rel.unwrap_or(".").to_string();
         let cwd = context
-            .execution
-            .workspace
+            .require_workspace()?
             .resolve_command_cwd(&rel, &context.write_scope())?;
 
         // Pre-spawn baseline for namespace accounting after process-group exit.
-        let root = context.execution.workspace.root().to_path_buf();
+        let root = context.require_workspace()?.root().to_path_buf();
         let mutation_baseline = if context.policy.read_only {
             None
         } else {
@@ -134,6 +133,8 @@ impl CommandExecution {
                 match lifetime {
                     BackgroundTaskLifetime::Goal => "goal",
                     BackgroundTaskLifetime::Runtime => "runtime",
+                    BackgroundTaskLifetime::Session => "session",
+                    BackgroundTaskLifetime::Persistent => "persistent",
                 }
             ))),
             Err(e) => Ok(ToolOutput::error(format!("background spawn failed: {e}"))),
@@ -174,8 +175,7 @@ impl CommandExecution {
         };
         let rel = cwd_rel.unwrap_or(".").to_string();
         let cwd = context
-            .execution
-            .workspace
+            .require_workspace()?
             .resolve_command_cwd(&rel, &context.write_scope())?;
         let executed_commands = leveler_execution::proven_executed_commands(program, &args);
 
@@ -203,7 +203,7 @@ impl CommandExecution {
         // Anything the diff would report then belongs to a concurrent sibling, and
         // rolling back to this snapshot would destroy that sibling's authorized
         // work — a `ls` reverting another agent's committed file.
-        let root = context.execution.workspace.root().to_path_buf();
+        let root = context.require_workspace()?.root().to_path_buf();
         let snapshot = if context.policy.read_only || context.policy.has_zero_write_authority() {
             None
         } else {

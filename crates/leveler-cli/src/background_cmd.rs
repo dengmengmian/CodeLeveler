@@ -1,10 +1,9 @@
 //! `leveler background ...`: read and stop this repository's live background
 //! tasks.
 //!
-//! The local runtime owns the tasks and their process groups; this CLI is a
-//! thin controller over the same socket protocol a TUI uses. `stop` never
-//! signals a process itself — it sends `CancelBackgroundTask` and the runtime,
-//! which owns the process group, terminates the tree.
+//! Runtime-scoped tasks use the runtime protocol. Persistent/session services
+//! use their stable execution owner directly, including while no runtime is
+//! online. The CLI never signals a process itself.
 //!
 //! This exists because a handover already names its blockers in the terminal
 //! it is waiting in; a user must be able to act on that list from a second
@@ -14,16 +13,27 @@ use leveler_project::Layout;
 
 use crate::cli::BackgroundCommand;
 
+#[derive(serde::Serialize)]
+struct InventoryEntry {
+    task_id: String,
+    program: String,
+    args: Vec<String>,
+    status: &'static str,
+    owner: &'static str,
+    elapsed_ms: u64,
+    session_id: Option<leveler_core::SessionId>,
+}
+
 #[allow(unused_variables)]
 pub async fn cmd_background(
     layout: Layout,
     command: BackgroundCommand,
 ) -> anyhow::Result<std::process::ExitCode> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         run(layout, command).await
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         eprintln!(
             "background tasks are managed through the local runtime; \
@@ -33,54 +43,121 @@ pub async fn cmd_background(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::process::ExitCode> {
     use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
+    use leveler_execution::BackgroundTaskStatus;
+    use leveler_execution::execution_host::ExecutionHostClient;
 
     let socket = layout.socket_path();
-    let Some(client) = crate::run_cmds::connect_default_runtime(&socket).await? else {
-        anyhow::bail!(
-            "no local runtime is running for this repository; start `leveler` (or `leveler serve`) first"
-        );
+    let client = leveler_runtime_host::probe_default_runtime(&socket).await?;
+    let blockers = match client.as_ref() {
+        Some(client) => {
+            leveler_local_transport::LocalRuntimeService::runtime_info(client)
+                .await
+                .map_err(|error| anyhow::anyhow!("could not read runtime status: {error}"))?
+                .health
+                .blockers
+        }
+        None => Vec::new(),
     };
-    let info = leveler_local_transport::LocalRuntimeService::runtime_info(&client)
+    let host = ExecutionHostClient::probe(&leveler_app::execution_host_config(&layout)?)
         .await
-        .map_err(|error| anyhow::anyhow!("could not read runtime status: {error}"))?;
-    let blockers = info.health.blockers;
+        .map_err(anyhow::Error::msg)?;
+    let hosted = match host.as_ref() {
+        Some(host) => host.list().await.map_err(anyhow::Error::msg)?,
+        None => Vec::new(),
+    };
 
     match command {
         BackgroundCommand::List { json } => {
+            let mut inventory = blockers
+                .iter()
+                .map(|task| InventoryEntry {
+                    task_id: task.task_id.clone(),
+                    program: task.program.clone(),
+                    args: task.args.clone(),
+                    status: "running",
+                    owner: "runtime",
+                    elapsed_ms: task.elapsed_ms,
+                    session_id: task.session_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            inventory.extend(hosted.iter().map(|task| {
+                let snapshot = &task.snapshot;
+                InventoryEntry {
+                    task_id: snapshot.id.clone(),
+                    program: snapshot.program.clone(),
+                    args: snapshot.args.clone(),
+                    status: match snapshot.status {
+                        BackgroundTaskStatus::Running => "running",
+                        BackgroundTaskStatus::Killing => "killing",
+                        BackgroundTaskStatus::Exited => "exited",
+                        BackgroundTaskStatus::Killed => "killed",
+                    },
+                    owner: "execution-host",
+                    elapsed_ms: snapshot.duration_ms,
+                    session_id: snapshot
+                        .owner_scope
+                        .clone()
+                        .map(leveler_core::SessionId::new),
+                }
+            }));
             if json {
-                println!("{}", serde_json::to_string_pretty(&blockers)?);
-            } else if blockers.is_empty() {
-                println!("no live background tasks");
+                println!("{}", serde_json::to_string_pretty(&inventory)?);
+            } else if inventory.is_empty() {
+                println!("no background tasks");
             } else {
-                for blocker in &blockers {
+                for task in &inventory {
                     println!(
-                        "{}  {}  {}",
-                        blocker.task_id,
-                        crate::run_cmds::blocker_command_line(&blocker.program, &blocker.args),
-                        crate::run_cmds::format_task_age(blocker.elapsed_ms),
+                        "{}  {}  {}  {}  {}",
+                        task.task_id,
+                        task.status,
+                        task.owner,
+                        crate::run_cmds::blocker_command_line(&task.program, &task.args),
+                        crate::run_cmds::format_task_age(task.elapsed_ms),
                     );
                 }
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
         BackgroundCommand::Logs { task_id } => {
+            if let Some(task) = hosted.iter().find(|task| task.snapshot.id == task_id) {
+                let owner = task
+                    .snapshot
+                    .owner_scope
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("hosted task has no session owner"))?;
+                let snapshot = host
+                    .as_ref()
+                    .expect("hosted inventory requires a host")
+                    .get_owned(&task_id, owner)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                print_log(&task_id, &snapshot.log);
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
             let Some(blocker) = blockers.iter().find(|blocker| blocker.task_id == task_id) else {
                 anyhow::bail!("no live background task `{task_id}`");
             };
-            if blocker.log_tail.trim().is_empty() {
-                println!("(no output captured for {task_id})");
-            } else {
-                print!("{}", blocker.log_tail);
-                if !blocker.log_tail.ends_with('\n') {
-                    println!();
-                }
-            }
+            print_log(&task_id, &blocker.log_tail);
             Ok(std::process::ExitCode::SUCCESS)
         }
         BackgroundCommand::Stop { task_id } => {
+            if let Some(task) = hosted.iter().find(|task| task.snapshot.id == task_id) {
+                let owner = task
+                    .snapshot
+                    .owner_scope
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("hosted task has no session owner"))?;
+                host.as_ref()
+                    .expect("hosted inventory requires a host")
+                    .kill_owned(&task_id, owner)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                println!("stop requested for {task_id}");
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
             let Some(blocker) = blockers.iter().find(|blocker| blocker.task_id == task_id) else {
                 anyhow::bail!("no live background task `{task_id}`");
             };
@@ -91,6 +168,8 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
                 );
             };
             client
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("task runtime is offline"))?
                 .send(ClientCommand::CancelBackgroundTask {
                     session_id,
                     task_id: task_id.clone(),
@@ -99,6 +178,17 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
                 .map_err(|error| anyhow::anyhow!("stop request refused: {error}"))?;
             println!("stop requested for {task_id}");
             Ok(std::process::ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn print_log(task_id: &str, log: &str) {
+    if log.trim().is_empty() {
+        println!("(no output captured for {task_id})");
+    } else {
+        print!("{log}");
+        if !log.ends_with('\n') {
+            println!();
         }
     }
 }

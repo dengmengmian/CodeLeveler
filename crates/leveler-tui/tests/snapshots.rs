@@ -34,7 +34,9 @@ fn opened_state() -> AppState {
     );
     let snap = UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "~/Develop/codeleveler".to_string(),
+        repository: Some("~/Develop/codeleveler".to_string()),
+        task_status: None,
+        task_terminal: None,
         goal: "interactive session".to_string(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
@@ -1628,7 +1630,7 @@ fn trace_state(locale: leveler_tui::Locale, tab: char) -> String {
         session: UiSessionObservation {
             session_id: SessionId::new("obs-1"),
             goal: "ship the parser".into(),
-            repository: "/repo".into(),
+            repository: Some("/repo".into()),
             created_at: "t0".into(),
             updated_at: "t1".into(),
             status: "completed".into(),
@@ -1751,14 +1753,17 @@ fn trace_chrome_follows_the_locale() {
 fn trace_raw_protocol_values_are_identical_in_both_locales() {
     let zh = trace_state(leveler_tui::Locale::Zh, '1');
     let en = trace_state(leveler_tui::Locale::En, '1');
-    // Ids, model names, status and profile values are runtime truth. A locale
+    assert!(
+        !zh.contains("balanced"),
+        "legacy profile leaked into trace: {zh}"
+    );
+    assert!(
+        !en.contains("balanced"),
+        "legacy profile leaked into trace: {en}"
+    );
+    // Ids, model names and status values are runtime truth. A locale
     // may not rewrite them.
-    for raw in [
-        "deepseek-v4-pro",
-        "completed",
-        "balanced",
-        "ship the parser",
-    ] {
+    for raw in ["deepseek-v4-pro", "completed", "ship the parser"] {
         assert!(zh.contains(raw), "zh lost raw value {raw}:\n{zh}");
         assert!(en.contains(raw), "en lost raw value {raw}:\n{en}");
     }
@@ -1808,10 +1813,9 @@ fn chrome_follows_the_locale_while_the_model_id_does_not() {
     assert!(!zh.contains("MODEL"), "zh kept the English chrome:\n{zh}");
 
     // Class C: the identifier beside it is the same bytes in both.
-    for id in ["deepseek-v4-pro", "balanced"] {
-        assert!(zh.contains(id), "zh rewrote the identifier {id}:\n{zh}");
-        assert!(en.contains(id), "en rewrote the identifier {id}:\n{en}");
-    }
+    let id = "deepseek-v4-pro";
+    assert!(zh.contains(id), "zh rewrote the identifier {id}:\n{zh}");
+    assert!(en.contains(id), "en rewrote the identifier {id}:\n{en}");
 }
 
 #[test]

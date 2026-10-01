@@ -378,21 +378,30 @@ const PLACEHOLDER_GOAL: &str = "interactive session";
 /// non-empty line (CJK/latin sentence-final punctuation only — `.` would
 /// mangle paths and version numbers), capped at 40 chars.
 fn title_from_first_message(content: &str) -> Option<String> {
-    let line = content
-        .trim()
-        .lines()
-        .find(|l| !l.trim().is_empty())?
-        .trim();
-    let sentence = line
-        .split(['。', '？', '！', '?', '!', '；', ';'])
-        .next()
-        .unwrap_or(line)
-        .trim();
-    let title: String = sentence.chars().take(40).collect();
-    (!title.is_empty()).then_some(title)
+    crate::session_projection::title_from_first_message(content)
 }
 
-fn emit_project_rules(events: &broadcast::Sender<RuntimeEvent>, repo: &Path) {
+fn session_status_wire(
+    status: leveler_lifecycle::SessionStatus,
+    task_status: leveler_client_protocol::UiTaskStatus,
+) -> &'static str {
+    use leveler_client_protocol::UiTaskStatus;
+    if status == leveler_lifecycle::SessionStatus::Running
+        && !matches!(
+            task_status,
+            UiTaskStatus::Running | UiTaskStatus::WaitingUser
+        )
+    {
+        "interrupted"
+    } else {
+        status.as_str()
+    }
+}
+
+fn emit_project_rules(events: &broadcast::Sender<RuntimeEvent>, repo: Option<&Path>) {
+    let Some(repo) = repo else {
+        return;
+    };
     let sources = leveler_context::load_rules(repo)
         .into_iter()
         .map(|rule| rule.source)
@@ -482,8 +491,8 @@ type BtwThreads = Arc<Mutex<HashMap<SessionId, BtwSession>>>;
 ///
 /// The retire drain and `runtime_info` both build it from [`runtime_quiescence`],
 /// so "the runtime is idle" means exactly one thing: no main turn and no
-/// background task left. A count of turns alone is not idle — a background
-/// build can outlive the turn that started it.
+/// runtime-owned background task left. Independently hosted services are not
+/// retiring runtime work; their owner stays alive through an engine update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RuntimeQuiescence {
     pub(crate) active_turns: u32,
@@ -503,12 +512,16 @@ impl RuntimeQuiescence {
 async fn runtime_quiescence(
     active: &ActiveTurns,
     background: &leveler_execution::BackgroundTaskRegistry,
-) -> RuntimeQuiescence {
+) -> Result<RuntimeQuiescence, ClientError> {
     let (turns, _) = active.load();
-    RuntimeQuiescence {
+    Ok(RuntimeQuiescence {
         active_turns: turns as u32,
-        active_background_tasks: background.alive_count().await as u32,
-    }
+        active_background_tasks: background
+            .try_update_blockers()
+            .await
+            .map_err(ClientError::Runtime)?
+            .len() as u32,
+    })
 }
 
 /// An in-process runtime client backed by an [`Application`].
@@ -751,15 +764,42 @@ impl leveler_agent::SteeringSource for SessionSteering {
 /// workspace mutation and any change to the main task stay forbidden. The row
 /// is a runtime notice. It is not submitted user input, and it is not appended
 /// to the main transcript.
-fn side_question_message(question: &str) -> Message {
+///
+/// `runtime_context` is the binding read-only projection of the main task
+/// ([`crate::side_question`]): the ids and facts needed to answer a status
+/// question from the runtime instead of from unbound files.
+fn side_question_message(question: &str, runtime_context: &str) -> Message {
     Message::user(
         format!(
-            "【旁问 / btw】这是主任务之外的旁问。回答需要时可以使用只读工具。\n\n不要修改工作区，不要推进或改变主任务，也不要改动它的目标、计划、完成状态或执行状态。\n\n独立回答这个旁问，然后回到主任务，不改变主任务。\n\n{question}"
+            "【旁问 / btw】这是主任务之外的旁问。回答需要时可以使用只读工具。\n\n不要修改工作区，不要推进或改变主任务，也不要改动它的目标、计划、完成状态或执行状态。\n\n独立回答这个旁问，然后回到主任务，不改变主任务。\n\n{runtime_context}\n\n【旁问】{question}"
         ),
         TranscriptOrigin::RuntimeNotice {
             notice: leveler_model::RuntimeNoticeKind::SideQuestion,
         },
     )
+}
+
+/// The runtime's background status as the observer projection names it. One
+/// mapping, so the side question and the Background Tasks page cannot describe
+/// the same task differently.
+fn background_status_label(status: leveler_execution::BackgroundTaskStatus) -> &'static str {
+    use leveler_execution::BackgroundTaskStatus as Status;
+    match status {
+        Status::Running => "running",
+        Status::Killing => "killing",
+        Status::Exited => "exited",
+        Status::Killed => "stopped",
+    }
+}
+
+/// Keep the newest `max` bytes of a log tail, on a char boundary. An injected
+/// context must stay bounded even when a task retained hundreds of kilobytes.
+fn truncate_tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let cut = leveler_core::ceil_char_boundary(text, text.len() - max);
+    text[cut..].to_string()
 }
 
 /// Drop a settled child's or call's handle.
@@ -778,7 +818,6 @@ struct SessionRuntimeConfig {
     model: ModelRef,
     mode: PermissionProfile,
     sandbox: bool,
-    work_profile: String,
     collaboration: String,
     /// Per-session approval policy. `AutoApprove` skips the approval overlay for
     /// this session only; the daemon-wide `auto_approve` still applies as a
@@ -847,7 +886,10 @@ impl InProcessRuntimeClient {
                     return;
                 }
                 let quiescence = runtime_quiescence(&active, &background).await;
-                if quiescence.quiescent() && clients.count() == 0 {
+                if let Err(error) = &quiescence {
+                    tracing::error!(%error, "cannot observe idle runtime blockers");
+                }
+                if quiescence.is_ok_and(RuntimeQuiescence::quiescent) && clients.count() == 0 {
                     if idle_since.elapsed() >= idle_timeout {
                         tracing::info!(
                             idle_secs = idle_timeout.as_secs(),
@@ -933,7 +975,6 @@ impl InProcessRuntimeClient {
                 model,
                 mode,
                 sandbox,
-                work_profile: "balanced".into(),
                 // Default: plain conversation (no update_goal gate).
                 collaboration: "chat".into(),
                 // Per-session default; the daemon-wide `auto_approve` still
@@ -1107,6 +1148,7 @@ impl InProcessRuntimeClient {
                             task_id: task.id,
                             program: task.program,
                             args: task.args,
+                            pid: task.pid,
                         });
                     }
                     Ok(leveler_execution::BackgroundTaskEvent::Output {
@@ -1144,15 +1186,27 @@ impl InProcessRuntimeClient {
                         // queued for the next receive, so the replacement
                         // cannot leave a stale active id behind.
                         background_events = background_registry.subscribe();
-                        let tasks = background_registry
-                            .active_snapshots_for_scope(background_session_id.as_str())
-                            .await
+                        let snapshots = match background_registry.try_active_snapshots().await {
+                            Ok(tasks) => tasks,
+                            Err(error) => {
+                                let _ = background_sender.send(RuntimeEvent::Notification {
+                                    level: NotificationLevel::Error,
+                                    message: format!("无法读取后台任务状态: {error}"),
+                                });
+                                continue;
+                            }
+                        };
+                        let tasks = snapshots
                             .into_iter()
+                            .filter(|task| {
+                                task.owner_scope.as_deref() == Some(background_session_id.as_str())
+                            })
                             .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
                                 task_id: task.id,
                                 program: task.program,
                                 args: task.args,
                                 elapsed_ms: task.duration_ms,
+                                pid: task.pid,
                             })
                             .collect();
                         let _ = background_sender
@@ -1210,6 +1264,9 @@ impl InProcessRuntimeClient {
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?
             .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        self.app
+            .validate_session_workspace(record.repository.as_deref())
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
         let model = ModelRef::parse(&record.model).ok_or_else(|| {
             ClientError::Runtime(format!(
                 "session {} stores invalid model reference `{}`",
@@ -1244,11 +1301,7 @@ impl InProcessRuntimeClient {
             model,
             mode,
             sandbox,
-            // Normalize on read: a legacy `delivery` row surfaces as `balanced`
-            // everywhere (snapshot, footer, next persist), not just in the engine.
-            work_profile: leveler_lifecycle::WorkProfile::from_persisted(&record.work_profile)
-                .as_str()
-                .to_string(),
+            // Retired column retained for old wire clients only.
             collaboration: record.collaboration.clone(),
             // Not persisted in the session record; a restored session prompts
             // unless the daemon-wide `auto_approve` fallback applies. A client
@@ -1300,7 +1353,7 @@ impl InProcessRuntimeClient {
             .set_axes(
                 session_id,
                 &config.collaboration,
-                &config.work_profile,
+                "single",
                 leveler_core::now(),
             )
             .await
@@ -1370,14 +1423,16 @@ impl InProcessRuntimeClient {
         // Capture the workspace too (git repos only), so restoring the
         // checkpoint rolls back the files the turn changed — including
         // command-driven mutations (plan B9 on top of A8).
-        let snapshot =
-            match leveler_execution::WorkspaceSnapshot::capture(&self.app.layout.repo_root).await {
+        let snapshot = match self.app.layout.primary_workspace() {
+            None => None,
+            Some(root) => match leveler_execution::WorkspaceSnapshot::capture(root).await {
                 Ok(snapshot) => snapshot, // None: not a git repo (transcript-only)
                 Err(error) => {
                     tracing::warn!("checkpoint workspace snapshot failed: {error}");
                     None
                 }
-            };
+            },
+        };
         self.checkpoints
             .record(session_id, checkpoint.clone(), snapshot);
         let _ = self
@@ -1922,56 +1977,65 @@ impl InProcessRuntimeClient {
     /// whose goal is still the interactive placeholder display the first
     /// sentence of their first user message instead — this also names the
     /// history created before placeholder retitling existed.
-    async fn list_sessions(&self) -> Vec<UiSessionSummary> {
-        let Ok(db) = self.app.open_database().await else {
-            return Vec::new();
-        };
-        let first_texts = MessageRepository::new(&db)
-            .first_user_texts()
+    async fn list_sessions(&self) -> Result<Vec<UiSessionSummary>, ClientError> {
+        let db = self
+            .app
+            .open_database()
             .await
-            .unwrap_or_default();
-        let rows = SessionRepository::new(&db).list().await.unwrap_or_default();
-        let mut summaries = Vec::with_capacity(rows.len());
-        for r in rows {
-            let id = SessionId::new(r.id.clone());
-            let declaration = match leveler_storage::EventRepository::new(&db)
-                .load_last_by_type(&id, "task_finished", None)
-                .await
-            {
-                Ok(Some(record)) => {
-                    match leveler_engine::EngineEvent::from_payload(&record.payload) {
-                        Ok(leveler_engine::EngineEvent::TaskFinished {
-                            stop: Some(leveler_lifecycle::StopReason::Answered),
-                            ..
-                        }) => Some(leveler_client_protocol::UiTaskDeclaration::Answered),
-                        Ok(leveler_engine::EngineEvent::TaskFinished {
-                            stop: Some(leveler_lifecycle::StopReason::Completed),
-                            ..
-                        }) => Some(leveler_client_protocol::UiTaskDeclaration::Completed),
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let facts = db
+            .session_facts(false)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let probe = crate::runtime_boot::StateDirBootLiveness::new(&self.app.layout.state_dir);
+        let mut summaries = Vec::with_capacity(facts.len());
+        for facts in facts {
+            let id = SessionId::new(facts.session.id.clone());
+            let live = self.active.is_running(&id);
+            let waiting = self
+                .pending
+                .lock()
+                .unwrap()
+                .values()
+                .any(|p| p.binding.session_id == id)
+                || self
+                    .pending_clarify
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|p| p.binding.session_id == id);
+            let (task_status, terminal) =
+                crate::session_projection::project_task(&facts, &probe, live, waiting)?;
+            let declaration =
+                terminal
+                    .as_ref()
+                    .and_then(|terminal| match terminal.stop.as_deref() {
+                        Some("answered") => {
+                            Some(leveler_client_protocol::UiTaskDeclaration::Answered)
+                        }
+                        Some("completed") => {
+                            Some(leveler_client_protocol::UiTaskDeclaration::Completed)
+                        }
                         _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let goal = if r.goal == PLACEHOLDER_GOAL || r.goal.trim().is_empty() {
-                first_texts
-                    .get(&r.id)
-                    .and_then(|text| title_from_first_message(text))
-                    .unwrap_or(r.goal)
-            } else {
-                r.goal
-            };
+                    });
+            let goal = crate::session_projection::project_title(
+                &facts.session.goal,
+                facts.first_user_text.as_deref(),
+            );
+            let r = facts.session;
             summaries.push(UiSessionSummary {
-                id: SessionId::new(r.id),
+                id,
                 goal,
-                status: r.status.as_str().to_string(),
+                status: session_status_wire(r.status, task_status).into(),
+                task_status: Some(task_status),
+                task_terminal: terminal,
                 declaration,
                 model: r.model,
-                updated_at: r.updated_at,
-                repository: Some(self.app.layout.repo_root.display().to_string()),
+                updated_at: facts.last_activity_at,
+                repository: r.repository,
             });
         }
-        summaries
+        Ok(summaries)
     }
 
     fn approver(&self, session_id: &SessionId, cancel: CancellationToken) -> Arc<dyn Approver> {
@@ -2054,7 +2118,7 @@ impl InProcessRuntimeClient {
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
-                emit_project_rules(&events, &repo);
+                emit_project_rules(&events, repo.as_deref());
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
@@ -2312,7 +2376,7 @@ impl InProcessRuntimeClient {
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
-                emit_project_rules(&events, &repo);
+                emit_project_rules(&events, repo.as_deref());
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
@@ -2398,7 +2462,7 @@ impl InProcessRuntimeClient {
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
-                emit_project_rules(&events, &repo);
+                emit_project_rules(&events, repo.as_deref());
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
@@ -2496,9 +2560,13 @@ impl InProcessRuntimeClient {
                         &session_id,
                         &scope,
                         leveler_lifecycle::CheckpointReason::Manual,
-                        Some(&leveler_agent::coding::GitWorkspace::new(
-                            &app.layout.repo_root,
-                        )),
+                        app.layout
+                            .primary_workspace()
+                            .map(leveler_agent::coding::GitWorkspace::new)
+                            .as_ref()
+                            .map(|workspace| {
+                                workspace as &dyn leveler_agent::coding::WorkspaceFacts
+                            }),
                         semantic,
                     )
                     .await
@@ -2631,7 +2699,6 @@ impl InProcessRuntimeClient {
         // the tool composition and the recorded turn disagree.
         let mode = config.mode;
         let sandbox = config.sandbox;
-        let work_profile = config.work_profile.clone();
         let btw = self.btw.clone();
 
         // One answer at a time per side thread: a second question while one is
@@ -2659,6 +2726,21 @@ impl InProcessRuntimeClient {
         };
 
         let handle = tokio::runtime::Handle::current();
+        // Snapshot the live view and the admitted turn NOW, before the blocking
+        // side thread starts: the observer describes the main task at the
+        // moment it was asked, and copying here means the side thread never
+        // locks or blocks the main turn.
+        let live_view = self.live_views.view(&session_id);
+        let turn = self
+            .active
+            .snapshots()
+            .into_iter()
+            .find(|turn| turn.session_id == session_id);
+        let cwd = self
+            .app
+            .layout
+            .primary_workspace()
+            .map(|root| root.display().to_string());
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
                 let _ = events.send(RuntimeEvent::BtwStarted {
@@ -2681,7 +2763,71 @@ impl InProcessRuntimeClient {
                         },
                         app.execution_overrides.as_ref(),
                     );
-                    let question_message = side_question_message(&question);
+                    // The main task's runtime projection: the same facts the
+                    // Background Tasks page renders, bound by id, copied out
+                    // without taking any lock the main turn could hold.
+                    let runtime_context = {
+                        let snapshots = app
+                            .background_tasks()
+                            .try_all_snapshots()
+                            .await
+                            .unwrap_or_default();
+                        let background_tasks: Vec<crate::side_question::BackgroundTaskFact> =
+                            snapshots
+                                .into_iter()
+                                .filter(|task| {
+                                    task.owner_scope.as_deref() == Some(session_id.as_str())
+                                })
+                                .map(|task| {
+                                    let command = if task.args.is_empty() {
+                                        task.program.clone()
+                                    } else {
+                                        format!("{} {}", task.program, task.args.join(" "))
+                                    };
+                                    crate::side_question::BackgroundTaskFact {
+                                        task_id: task.id,
+                                        command: command.clone(),
+                                        pid: task.pid,
+                                        status: background_status_label(task.status),
+                                        elapsed_ms: task.duration_ms,
+                                        exit_code: task.exit_code,
+                                        output_tail: truncate_tail(&task.log, 8 * 1024),
+                                    }
+                                })
+                                .collect();
+                        let running_task_ids: Vec<String> = background_tasks
+                            .iter()
+                            .filter(|task| task.status == "running" || task.status == "killing")
+                            .map(|task| task.task_id.clone())
+                            .collect();
+                        let active_tool_names: Vec<String> = live_view
+                            .active_tools
+                            .iter()
+                            .map(|tool| tool.name.clone())
+                            .collect();
+                        let wait_on = turn.as_ref().and_then(|_| {
+                            crate::side_question::derive_wait(&running_task_ids, &active_tool_names)
+                        });
+                        let ctx = crate::side_question::SideQuestionContext {
+                            session_id: session_id.as_str().to_string(),
+                            cwd: cwd.clone(),
+                            turn_elapsed_ms: turn.as_ref().map(|turn| turn.elapsed_ms),
+                            turn_idle_ms: turn.as_ref().map(|turn| turn.idle_ms),
+                            wait_on,
+                            active_tools: live_view
+                                .active_tools
+                                .iter()
+                                .map(|tool| crate::side_question::ActiveToolFact {
+                                    name: tool.name.clone(),
+                                    elapsed_ms: tool.elapsed_ms,
+                                    output_tail: truncate_tail(&tool.output_tail, 4 * 1024),
+                                })
+                                .collect(),
+                            background_tasks,
+                        };
+                        crate::side_question::render(&ctx)
+                    };
+                    let question_message = side_question_message(&question, &runtime_context);
                     // The read-only tool surface the side question may use.
                     // Composed from the same owner as a normal turn, narrowed to
                     // the observe-class tools — no mutating tool and no harness
@@ -2702,7 +2848,6 @@ impl InProcessRuntimeClient {
                                 &model,
                                 mode,
                                 sandbox,
-                                leveler_agent::WorkProfile::from_persisted(&work_profile),
                                 Some(session_id.as_str()),
                             )
                             .await
@@ -3092,7 +3237,7 @@ impl InProcessRuntimeClient {
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
-                emit_project_rules(&events, &repo);
+                emit_project_rules(&events, repo.as_deref());
                 let terminal_active = active.clone();
                 let terminal_admission = admission.clone();
                 let terminal_events = events.clone();
@@ -3188,7 +3333,10 @@ impl InProcessRuntimeClient {
                     match snapshot {
                         Some(snapshot) => {
                             if let Err(error) = leveler_execution::WorkspaceSnapshot::restore(
-                                &self.app.layout.repo_root,
+                                self.app
+                                    .layout
+                                    .require_workspace()
+                                    .map_err(|error| ClientError::Runtime(error.to_string()))?,
                                 &snapshot,
                             )
                             .await
@@ -3199,7 +3347,13 @@ impl InProcessRuntimeClient {
                                     format!("对话已回滚,但工作区文件回滚失败: {error}"),
                                 );
                             } else {
-                                let event = match compute_diff(&self.app.layout.repo_root, true) {
+                                let event = match compute_diff(
+                                    self.app
+                                        .layout
+                                        .require_workspace()
+                                        .map_err(|error| ClientError::Runtime(error.to_string()))?,
+                                    true,
+                                ) {
                                     Ok(diff) => RuntimeEvent::DiffUpdated {
                                         query_id: None,
                                         diff,
@@ -3333,6 +3487,95 @@ impl InProcessRuntimeClient {
 impl InteractiveRuntimeClient for InProcessRuntimeClient {
     async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
         match command {
+            ClientCommand::QueryGlobalTasks {
+                requester_session_id,
+                query_id,
+                include_archived,
+            } => {
+                let mut index = crate::global_task_index::query_global_tasks(
+                    self.app.layout.home(),
+                    include_archived,
+                )
+                .await;
+                let local_source = self.app.layout.database_path().display().to_string();
+                if index
+                    .tasks
+                    .iter()
+                    .any(|task| task.source_id == local_source)
+                {
+                    use leveler_client_protocol::UiGlobalTaskSourceErrorKind;
+                    let enrichment = async {
+                        let db = leveler_storage::Database::connect_read_only(
+                            &self.app.layout.database_path(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            (UiGlobalTaskSourceErrorKind::Storage, error.to_string())
+                        })?;
+                        let probe = crate::runtime_boot::StateDirBootLiveness::new(
+                            &self.app.layout.state_dir,
+                        );
+                        for task in index
+                            .tasks
+                            .iter_mut()
+                            .filter(|task| task.source_id == local_source)
+                        {
+                            let facts = db
+                                .session_facts_for(&task.id)
+                                .await
+                                .map_err(|error| {
+                                    (UiGlobalTaskSourceErrorKind::Storage, error.to_string())
+                                })?
+                                .ok_or_else(|| {
+                                    (
+                                        UiGlobalTaskSourceErrorKind::Storage,
+                                        format!("session {} disappeared during discovery", task.id),
+                                    )
+                                })?;
+                            let live = self.active.is_running(&task.id);
+                            let waiting = self
+                                .pending
+                                .lock()
+                                .unwrap()
+                                .values()
+                                .any(|waiter| waiter.binding.session_id == task.id)
+                                || self
+                                    .pending_clarify
+                                    .lock()
+                                    .unwrap()
+                                    .values()
+                                    .any(|waiter| waiter.binding.session_id == task.id);
+                            task.status = crate::session_projection::project_task(
+                                &facts, &probe, live, waiting,
+                            )
+                            .map_err(|error| {
+                                (UiGlobalTaskSourceErrorKind::Projection, error.to_string())
+                            })?
+                            .0;
+                        }
+                        Ok::<(), (UiGlobalTaskSourceErrorKind, String)>(())
+                    }
+                    .await;
+                    if let Err((kind, message)) = enrichment {
+                        index.tasks.retain(|task| task.source_id != local_source);
+                        index.source_errors.push(
+                            leveler_client_protocol::UiGlobalTaskSourceError {
+                                source_id: local_source,
+                                kind,
+                                message,
+                            },
+                        );
+                    }
+                }
+                let _ =
+                    self.events_for(&requester_session_id)
+                        .send(RuntimeEvent::GlobalTasksLoaded {
+                            requester_session_id,
+                            query_id,
+                            index,
+                        });
+                Ok(())
+            }
             ClientCommand::RequestPromptSuggestion { session_id } => {
                 spawn_auxiliary_assist(
                     self.app.clone(),
@@ -3572,12 +3815,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 // Idle-only is enforced by the TUI; runtime still accepts while idle.
                 let mut config = self.runtime_config(&session_id).await?;
-                // A new write only ever stores a current value; legacy `delivery`
-                // (from an old client) normalizes to `balanced` rather than
-                // persisting a value the product no longer offers.
-                config.work_profile = leveler_lifecycle::WorkProfile::from_persisted(&work_profile)
-                    .as_str()
-                    .to_string();
+                // Old clients may still send this field; it has no runtime effect.
+                if work_profile != "single" {
+                    tracing::warn!(legacy_work_profile = %work_profile, "work_profile is deprecated and ignored; capability loading is model-driven");
+                }
                 config.collaboration = collaboration.clone();
                 // Collaboration::Plan forces Safe-only tools via ToolContext.read_only
                 // (orthogonal to the permission profile).
@@ -3778,7 +4019,12 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let repo = self.app.layout.repo_root.clone();
                 let events = self.events_for(&session_id);
                 tokio::task::spawn_blocking(move || {
-                    let event = match compute_diff(&repo, true) {
+                    let event = match repo
+                        .as_deref()
+                        .ok_or_else(|| "no primary workspace is attached".to_string())
+                        .and_then(|root| {
+                            compute_diff(root, true).map_err(|error| error.to_string())
+                        }) {
                         Ok(diff) => RuntimeEvent::DiffUpdated { query_id, diff },
                         Err(error) => RuntimeEvent::DiffFailed {
                             query_id,
@@ -3804,7 +4050,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             }
             ClientCommand::RequestSessionList => {
                 let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await,
+                    sessions: self.list_sessions().await?,
                 });
                 Ok(())
             }
@@ -3814,7 +4060,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let _ = self
                     .events_for(&requester_session_id)
                     .send(RuntimeEvent::SessionList {
-                        sessions: self.list_sessions().await,
+                        sessions: self.list_sessions().await?,
                     });
                 Ok(())
             }
@@ -3843,7 +4089,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         // is an orphan the client has already switched to.
                         // Carry the caller's runtime axes over so a fresh
                         // conversation is not silently a different permission
-                        // profile or work mode.
+                        // permission profile or collaboration.
                         // Anything that fails from here on leaves a row the
                         // client never switched to. Roll it back rather than
                         // leaving an orphan in the session list.
@@ -3868,7 +4114,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             .events_for(&requester_session_id)
                             .send(RuntimeEvent::SessionOpened { session });
                         let _ = self.events.send(RuntimeEvent::SessionList {
-                            sessions: self.list_sessions().await,
+                            sessions: self.list_sessions().await?,
                         });
                     }
                     Err(error) => {
@@ -3891,6 +4137,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::DeleteSession { session_id } => {
                 let deleted: Result<(), anyhow::Error> = async {
                     let db = self.app.open_database().await?;
+                    self.app
+                        .background_tasks()
+                        .kill_session(session_id.as_str())
+                        .await
+                        .map_err(anyhow::Error::msg)?;
                     SessionRepository::new(&db).delete(&session_id).await?;
                     Ok(())
                 }
@@ -3900,9 +4151,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         level: NotificationLevel::Error,
                         message: format!("删除会话失败: {error}"),
                     });
+                    // The primary failure is already on the error channel; a
+                    // refresh of a listing that shares the broken store would
+                    // only replace that one honest failure with a second one.
+                    return Ok(());
                 }
                 let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await,
+                    sessions: self.list_sessions().await?,
                 });
                 Ok(())
             }
@@ -3912,17 +4167,23 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let deleted: Result<(), anyhow::Error> = async {
                     let db = self.app.open_database().await?;
+                    self.app
+                        .background_tasks()
+                        .kill_session(session_id.as_str())
+                        .await
+                        .map_err(anyhow::Error::msg)?;
                     SessionRepository::new(&db).delete(&session_id).await?;
                     Ok(())
                 }
                 .await;
                 if let Err(error) = deleted {
                     self.notify_error(&requester_session_id, format!("删除会话失败: {error}"));
+                    return Ok(());
                 }
                 let _ = self
                     .events_for(&requester_session_id)
                     .send(RuntimeEvent::SessionList {
-                        sessions: self.list_sessions().await,
+                        sessions: self.list_sessions().await?,
                     });
                 Ok(())
             }
@@ -3941,9 +4202,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 .await;
                 if let Err(error) = renamed {
                     self.notify_error(&session_id, format!("重命名会话失败: {error}"));
+                    return Ok(());
                 }
                 let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await,
+                    sessions: self.list_sessions().await?,
                 });
                 Ok(())
             }
@@ -3958,9 +4220,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 .await;
                 if let Err(error) = archived {
                     self.notify_error(&session_id, format!("归档会话失败: {error}"));
+                    return Ok(());
                 }
                 let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await,
+                    sessions: self.list_sessions().await?,
                 });
                 Ok(())
             }
@@ -3994,7 +4257,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             kind: leveler_engine::ExecutionKind::parse(&kind)?,
                             axes: Some(leveler_engine::NewSessionAxes {
                                 collaboration: record.collaboration.clone(),
-                                work_profile: crate::canonical_work_profile(&record.work_profile),
                             }),
                         })
                         .await?;
@@ -4025,7 +4287,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         self.notify_error(&session_id, format!("分叉会话失败: {error}"));
                     }
                 }
-                let sessions = self.list_sessions().await;
+                let sessions = self.list_sessions().await?;
                 let _ = self
                     .events_for(&session_id)
                     .send(RuntimeEvent::SessionList {
@@ -4136,22 +4398,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // Ownership is enforced before signalling: only a task the
                 // runtime still attributes to THIS session may be stopped. A
                 // task id alone is not authorisation.
-                let registry = self.app.background_tasks();
-                let owned = registry
-                    .active_ids_for_scope(session_id.as_str())
+                self.app
+                    .background_tasks()
+                    .kill_owned(&task_id, session_id.as_str())
                     .await
-                    .iter()
-                    .any(|id| id == &task_id);
-                if !owned {
-                    self.notify_error(
-                        &session_id,
-                        "该后台任务已结束或不属于当前会话,无需停止".to_string(),
-                    );
-                    return Ok(());
-                }
-                if let Err(err) = registry.kill(&task_id).await {
-                    self.notify_error(&session_id, err);
-                }
+                    .map_err(ClientError::Runtime)?;
                 Ok(())
             }
             ClientCommand::QueryContext {
@@ -4762,26 +5013,20 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             });
         }
 
-        // A durable `running` outlives the process that wrote it. Kill a TUI
-        // mid-turn and the column still says a turn is in flight, so reopening
-        // the session painted a live "waiting for the model" clock, elapsed
-        // time and all, over work that had ended with the process. The turns
-        // table is the finer truth and the startup reaper keeps it honest, so
-        // ask it: a session whose row says running while every one of its turns
-        // has settled is interrupted, and opens idle.
         let runtime_active = self.active.is_running(session_id);
-        let status = if record.status == leveler_lifecycle::SessionStatus::Running
-            && !runtime_active
-            && leveler_storage::TurnRepository::new(&db)
-                .list(session_id)
-                .await
-                .map(|turns| turns.iter().all(|t| t.status != "running"))
-                .unwrap_or(false)
-        {
-            leveler_lifecycle::SessionStatus::Interrupted
-        } else {
-            record.status
-        };
+        let facts = db
+            .session_facts_for(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        let probe = crate::runtime_boot::StateDirBootLiveness::new(&self.app.layout.state_dir);
+        let (task_status, task_terminal) = crate::session_projection::project_task(
+            &facts,
+            &probe,
+            runtime_active,
+            !pending_interactions.is_empty(),
+        )?;
+        let status = session_status_wire(record.status, task_status);
 
         // Unlike the best-effort fields above, a child row that cannot be
         // decoded fails the snapshot: it is canonical history, and every other
@@ -4793,25 +5038,34 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let active_background_tasks = self
             .app
             .background_tasks()
-            .active_snapshots_for_scope(session_id.as_str())
+            .try_active_snapshots()
             .await
+            .map_err(ClientError::Runtime)?
             .into_iter()
+            .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
             .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
                 task_id: task.id,
                 program: task.program,
                 args: task.args,
                 elapsed_ms: task.duration_ms,
+                pid: task.pid,
             })
             .collect();
 
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
             repository: record.repository,
+            task_status: Some(task_status),
+            task_terminal,
             goal: record.goal,
             model: Some(model),
             mode: protocol_mode(config.mode),
-            branch: detect_branch_label(&self.app.layout.repo_root),
-            status: status.as_str().to_string(),
+            branch: self
+                .app
+                .layout
+                .primary_workspace()
+                .and_then(detect_branch_label),
+            status: status.to_string(),
             finalization_stage: runtime_active.then_some(live.finalization_stage).flatten(),
             messages,
             pending_interactions,
@@ -4827,7 +5081,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             user_shells: self.user_shells.snapshot(session_id),
             completion_report: live.completion_report,
             reasoning,
-            work_profile: Some(config.work_profile.clone()),
+            work_profile: Some("single".into()),
             collaboration: Some(config.collaboration.clone()),
             children,
         })
@@ -4850,8 +5104,10 @@ fn spawn_retire_drain(runtime: &InProcessRuntimeClient) {
         // The SAME reading `runtime_info` reports, so a client that keeps
         // asking sees the drain reach zero.
         loop {
-            if runtime_quiescence(&active, &background).await.quiescent() {
-                break;
+            match runtime_quiescence(&active, &background).await {
+                Ok(state) if state.quiescent() => break,
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "cannot observe retiring runtime blockers"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -4874,7 +5130,12 @@ fn spawn_force_retire_drain(runtime: &InProcessRuntimeClient) {
     };
     let background = runtime.app.background_tasks().clone();
     tokio::spawn(async move {
-        while background.alive_count().await > 0 {
+        loop {
+            match background.try_update_blockers().await {
+                Ok(blockers) if blockers.is_empty() => break,
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "cannot observe update blockers"),
+            }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         tracing::info!("background work settled; force-retiring");
@@ -4884,6 +5145,10 @@ fn spawn_force_retire_drain(runtime: &InProcessRuntimeClient) {
 
 #[async_trait]
 impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
+    fn has_primary_workspace(&self) -> bool {
+        self.app.layout.primary_workspace().is_some()
+    }
+
     /// Re-assert the effective approval policy for an existing session
     /// (attach/resume). Memory-only and keyed by session id: it upgrades or
     /// downgrades exactly ONE session's live policy without touching the DB
@@ -4909,6 +5174,18 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         &self,
         request: leveler_local_transport::CreateSessionRequest,
     ) -> Result<leveler_local_transport::SessionBootstrap, ClientError> {
+        use leveler_local_transport::CreateWorkspaceSelection;
+        match &request.workspace {
+            CreateWorkspaceSelection::RuntimeDefault => {},
+            CreateWorkspaceSelection::None if self.app.layout.primary_workspace().is_none() => {},
+            CreateWorkspaceSelection::Workspace { path } => {
+                let root = std::fs::canonicalize(path).map_err(|error| ClientError::Runtime(error.to_string()))?;
+                if self.app.layout.primary_workspace() != Some(root.as_path()) {
+                    return Err(ClientError::Runtime("workspace belongs to a different runtime source; connect to its owner".into()));
+                }
+            },
+            _ => return Err(ClientError::Runtime("no-workspace session belongs to the no-workspace runtime source; connect to its owner".into())),
+        }
         let model = request
             .model
             .unwrap_or_else(|| self.default_runtime.model.clone());
@@ -4928,7 +5205,6 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 model: model.clone(),
                 mode: execution_mode(request.mode),
                 sandbox: self.default_runtime.sandbox,
-                work_profile: self.default_runtime.work_profile.clone(),
                 collaboration: self.default_runtime.collaboration.clone(),
                 approval_policy: request.approval_policy,
             },
@@ -4975,15 +5251,16 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             .to_owned();
         // The SAME reading the drain waits on: a client's view of "idle" is
         // never a second accounting.
-        let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await;
+        let quiescence = runtime_quiescence(&self.active, self.app.background_tasks()).await?;
         // Name the tasks behind the count, from the same registry the drain
         // waits on. Read-only: stopping one still goes through
         // `CancelBackgroundTask`.
         let blockers = self
             .app
             .background_tasks()
-            .active_snapshots()
+            .try_update_blockers()
             .await
+            .map_err(ClientError::Runtime)?
             .into_iter()
             .map(|task| leveler_client_protocol::UiBackgroundTaskBlocker {
                 task_id: task.id,
@@ -5280,6 +5557,15 @@ async fn compact_conversation(
         ),
         TranscriptOrigin::CompactionSummary,
     );
+    let background_snapshots = match app.background_tasks().try_active_snapshots().await {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            fail(format!(
+                "压缩失败：无法读取后台任务状态: {error}（原历史与任务状态未改动）"
+            ));
+            return false;
+        }
+    };
     if let Err(e) =
         commit_compaction_epoch(&db, session_id, summary_msg.clone(), compacted_from).await
     {
@@ -5311,27 +5597,43 @@ async fn compact_conversation(
             .ok()
             .flatten();
         let live = live_views.view(session_id);
-        let active_background_tasks = app
-            .background_tasks()
-            .active_snapshots_for_scope(session_id.as_str())
-            .await
+        let active_background_tasks = background_snapshots
             .into_iter()
+            .filter(|task| task.owner_scope.as_deref() == Some(session_id.as_str()))
             .map(|task| leveler_client_protocol::UiActiveBackgroundTask {
                 task_id: task.id,
                 program: task.program,
                 args: task.args,
                 elapsed_ms: task.duration_ms,
+                pid: task.pid,
             })
             .collect();
+        let task_projection = match db.session_facts_for(session_id).await {
+            Ok(facts) => facts.and_then(|facts| {
+                crate::session_projection::project_task(
+                    &facts,
+                    &crate::runtime_boot::StateDirBootLiveness::new(&app.layout.state_dir),
+                    false,
+                    false,
+                )
+                .ok()
+            }),
+            Err(_) => None,
+        };
+        let Some((task_status, task_terminal)) = task_projection else {
+            return false;
+        };
         let _ = events.send(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
                 id: session_id.clone(),
                 repository: record.repository,
+                task_status: Some(task_status),
+                task_terminal,
                 goal: record.goal,
                 model: Some(model.clone()),
                 mode: protocol_mode(mode),
-                branch: detect_branch_label(&app.layout.repo_root),
-                status: record.status.as_str().to_string(),
+                branch: app.layout.primary_workspace().and_then(detect_branch_label),
+                status: session_status_wire(record.status, task_status).into(),
                 finalization_stage: live.finalization_stage,
                 messages,
                 // Compact is admitted like a turn, so no turn is running and
@@ -5549,13 +5851,19 @@ mod side_question_tests {
 
     #[test]
     fn side_question_keeps_the_mode_contract_and_is_not_a_runtime_fact() {
-        let message = side_question_message("why this design?");
+        let message = side_question_message(
+            "why this design?",
+            "【当前运行时状态 · 只读快照】\n主任务: 空闲",
+        );
         let text = message.text_content();
         // The contract bounds side effects, not investigation.
         assert!(text.contains("可以使用只读工具"), "{text}");
         assert!(!text.contains("不要调用任何工具"), "{text}");
         assert!(text.contains("不要修改工作区"), "{text}");
         assert!(text.contains("不要推进或改变主任务"), "{text}");
+        // The observer projection travels with the question but is not the
+        // contract: the message stays CoreContract, not a runtime fact row.
+        assert!(text.contains("只读快照"), "{text}");
         assert!(text.contains("why this design?"), "{text}");
         assert_ne!(message.origin, Some(TranscriptOrigin::UserInput));
         let class = leveler_model::classify_transcript_origin(message.origin.as_ref());
@@ -6332,7 +6640,7 @@ mod session_declaration_tests {
             PermissionProfile::Assisted,
             false,
         );
-        let summaries = client.list_sessions().await;
+        let summaries = client.list_sessions().await.unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(
             summaries[0].declaration, None,
@@ -6362,7 +6670,7 @@ mod session_declaration_tests {
                 .append(&id, None, &tag, &payload, leveler_core::now())
                 .await
                 .unwrap();
-            let summaries = client.list_sessions().await;
+            let summaries = client.list_sessions().await.unwrap();
             assert_eq!(
                 summaries[0].declaration, declaration,
                 "latest stop is the only declaration source"

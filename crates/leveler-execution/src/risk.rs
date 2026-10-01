@@ -27,7 +27,7 @@ pub enum RiskLevel {
 /// [`PermissionProfile`] is a preset over this (see
 /// [`PermissionProfile::write_scope`]); a late-bound child before
 /// `claim_write_scope` is [`WriteScope::None`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteScope {
     /// Nothing may be written — the workspace is mounted read-only at the OS
     /// boundary (scratch and toolchain caches stay writable so builds work).

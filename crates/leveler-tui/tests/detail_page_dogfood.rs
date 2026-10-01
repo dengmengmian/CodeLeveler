@@ -76,7 +76,7 @@ fn click(column: u16, row: u16) -> Action {
 }
 
 #[test]
-fn background_stop_button_targets_clicked_row_and_rechecks_live_state() {
+fn background_detail_stop_targets_the_selected_task_and_rechecks_live_state() {
     use leveler_client_protocol::ClientCommand;
     use leveler_tui::action::Effect;
     let mut s = opened();
@@ -87,14 +87,16 @@ fn background_stop_button_targets_clicked_row_and_rechecks_live_state() {
                 task_id: id.into(),
                 program: id.into(),
                 args: vec![],
+                pid: None,
             },
         );
     }
     s.active_screen = Screen::ActivityList;
-    s.background_list_selected = Some("first".into());
+    s.background_list_selected = Some("second".into());
     let text = render_text(&mut s, 60, 16);
-    println!("--- BACKGROUND STOP CONTROLS ---\n{text}");
-    let (x, y) = stop_button(&text, Some("second"));
+    println!("--- BACKGROUND DETAIL STOP ---\n{text}");
+    // The page has exactly one stop control, bound to the selected task.
+    let (x, y) = stop_button(&text, None);
     let effects = reduce(&mut s, click(x, y));
     assert!(
         matches!(effects.as_slice(), [Effect::Send(ClientCommand::CancelBackgroundTask { session_id, task_id })]
@@ -108,10 +110,21 @@ fn background_stop_button_targets_clicked_row_and_rechecks_live_state() {
         "sending cancel is not authoritative termination"
     );
 
+    // Selecting the other running task retargets the same control.
+    s.background_list_selected = Some("first".into());
+    let text = render_text(&mut s, 60, 16);
+    let (x, y) = stop_button(&text, None);
+    let effects = reduce(&mut s, click(x, y));
+    assert!(
+        matches!(effects.as_slice(), [Effect::Send(ClientCommand::CancelBackgroundTask { task_id, .. })]
+        if task_id == "first"),
+        "{effects:?}"
+    );
+
     runtime(
         &mut s,
         RuntimeEvent::BackgroundTaskExited {
-            task_id: "second".into(),
+            task_id: "first".into(),
             exit_code: None,
             duration_ms: 100,
             ok: false,
@@ -119,17 +132,14 @@ fn background_stop_button_targets_clicked_row_and_rechecks_live_state() {
             output: String::new(),
         },
     );
+    let after = render_text(&mut s, 60, 16);
+    assert!(
+        !after.contains("[停止]"),
+        "a terminal task must not advertise a stop: {after}"
+    );
     assert!(
         reduce(&mut s, click(x, y)).is_empty(),
         "stale paint must not cancel a terminal task"
-    );
-    let after = render_text(&mut s, 60, 16);
-    assert!(
-        !after
-            .lines()
-            .find(|line| line.contains("second"))
-            .unwrap()
-            .contains("[停止]")
     );
 }
 
@@ -144,6 +154,7 @@ fn background_stop_button_detail_is_clickable_and_cannot_leak_to_other_screens()
             task_id: "detail".into(),
             program: "watch".into(),
             args: vec![],
+            pid: None,
         },
     );
     s.active_screen = Screen::Activity;
@@ -175,7 +186,7 @@ fn background_stop_button_detail_is_clickable_and_cannot_leak_to_other_screens()
 }
 
 #[test]
-fn background_stop_buttons_follow_scrolled_rows_and_resize() {
+fn background_detail_stop_follows_selection_and_resize() {
     use leveler_client_protocol::ClientCommand;
     use leveler_tui::action::Effect;
     let mut s = opened();
@@ -188,6 +199,7 @@ fn background_stop_buttons_follow_scrolled_rows_and_resize() {
                 task_id: id.clone(),
                 program: id,
                 args: vec![],
+                pid: None,
             },
         );
     }
@@ -197,9 +209,9 @@ fn background_stop_buttons_follow_scrolled_rows_and_resize() {
         let text = render_text(&mut s, width, 8);
         assert!(
             !text.contains("job-00"),
-            "selection must actually scroll the list"
+            "the capped list must scroll to the selection"
         );
-        let (x, y) = stop_button(&text, Some("job-19"));
+        let (x, y) = stop_button(&text, None);
         assert!(x + 6 <= width);
         assert!(matches!(reduce(&mut s, click(x, y)).as_slice(),
             [Effect::Send(ClientCommand::CancelBackgroundTask { task_id, .. })] if task_id == "job-19"));
@@ -259,6 +271,7 @@ fn dogfood_background_task_detail_page() {
             task_id: "bg-1".into(),
             program: "make".into(),
             args: vec!["up".into()],
+            pid: None,
         },
     );
     for chunk in [
@@ -488,6 +501,7 @@ fn dogfood_background_jobs_footer_and_list() {
                 task_id: id.into(),
                 program: program.into(),
                 args: vec![],
+                pid: None,
             },
         );
     }
@@ -539,16 +553,25 @@ fn dogfood_background_jobs_footer_and_list() {
     assert!(s.background_failures_seen.contains("bg-fail"));
     assert!(s.background_task_labels.contains_key("bg-fail"));
 
-    // Open the running task's detail; the live tail is there.
+    // Enter focuses the selected task's live output inside the same page.
     s.background_list_selected = Some("bg-run".into());
     press(&mut s, KeyCode::Enter);
-    assert_eq!(s.active_screen, Screen::Activity);
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    assert_eq!(
+        s.background_list_focus,
+        leveler_tui::activity::BackgroundPane::Output
+    );
     let detail = render_text(&mut s, 90, 24);
     println!("--- DETAIL (running) ---\n{detail}");
     assert!(detail.contains("compiling leveler-tui"), "{detail}");
     assert!(detail.contains("running"), "{detail}");
 
-    // Esc returns to the conversation; the badge is gone, the count is not.
+    // First Esc leaves the log; the second returns to the conversation.
+    press(&mut s, KeyCode::Esc);
+    assert_eq!(
+        s.background_list_focus,
+        leveler_tui::activity::BackgroundPane::List
+    );
     press(&mut s, KeyCode::Esc);
     assert_eq!(s.active_screen, Screen::Conversation);
     let back = render_text(&mut s, 120, 30);

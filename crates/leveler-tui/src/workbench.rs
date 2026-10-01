@@ -2187,7 +2187,7 @@ mod tests {
     #[test]
     fn header_shows_full_path_when_wide_and_basename_when_narrow() {
         let mut state = test_state();
-        state.repository = "/Users/me/Develop/app/codeleveler".into();
+        state.repository = Some("/Users/me/Develop/app/codeleveler".into());
         state.branch = Some("main".into());
         let full = crate::status_line::home_collapsed_repo(&state);
         // Wide terminal fits the full home-collapsed path.
@@ -3315,6 +3315,8 @@ mod tests {
             stopped,
             exit_code: if ok { Some(0) } else { Some(1) },
             duration_ms: Some(duration_ms),
+            pid: None,
+            last_output_at: None,
             output: String::new(),
         }
     }

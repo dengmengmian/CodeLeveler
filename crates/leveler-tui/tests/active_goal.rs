@@ -35,7 +35,9 @@ fn state() -> AppState {
 fn snapshot(goal: &str, status: &str) -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "/repo".to_string(),
+        repository: Some("/repo".to_string()),
+        task_status: None,
+        task_terminal: None,
         goal: goal.to_string(),
         model: ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
@@ -306,7 +308,7 @@ fn a_narrow_terminal_keeps_the_glyph_and_clock_and_never_overlaps() {
 #[test]
 fn a_wide_header_caps_the_goal_instead_of_sacrificing_repository_context() {
     let mut state = state();
-    state.repository = "/workspace/CodeLeveler".into();
+    state.repository = Some("/workspace/CodeLeveler".into());
     state.branch = Some("main".into());
     submit(
         &mut state,

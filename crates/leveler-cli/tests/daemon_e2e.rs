@@ -16,12 +16,24 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
-use leveler_local_transport::{
-    CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient,
+use leveler_client_protocol::{
+    BuildIdentity, ClientCommand, ClientError, InteractiveRuntimeClient, RestartReason,
+    RuntimeEvent, RuntimeHealth, RuntimeId, RuntimeInfo, SessionId, UiSessionSnapshot,
 };
+use leveler_local_transport::{
+    CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient, LocalSocketServer,
+    SessionBootstrap,
+};
+use leveler_project::Layout;
+use leveler_runtime_host::{
+    DaemonReviver, DetachedRuntimeLaunch, HandoffAction, HandoffEvent, HandoffUi,
+    OwnedRuntimeLaunch, ensure_default_runtime, ensure_owned_runtime, probe_default_runtime,
+};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 // Test-owned daemons run in their own process group and are reclaimed on drop,
 // so a panic or a fired deadline cannot leave an orphan `leveler serve` behind.
 use leveler_test_support::ManagedChild;
@@ -97,6 +109,25 @@ fn spawn_serve(env: &TestEnv, ready: &Path) -> ManagedChild {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     ManagedChild::spawn(&mut command).expect("spawn leveler serve")
+}
+
+fn spawn_tcp_serve(env: &TestEnv, ready: &Path, token: &str) -> ManagedChild {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
+    command
+        .arg("--repo")
+        .arg(&env.repo)
+        .arg("serve")
+        .arg("--tcp")
+        .arg("127.0.0.1:0")
+        .arg("--ready-json")
+        .arg(ready)
+        .env("LEVELER_HOME", &env.home)
+        .env("LEVELER_CONFIG_DIR", &env.config_dir)
+        .env("LEVELER_DAEMON_TOKEN", token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    ManagedChild::spawn(&mut command).expect("spawn TCP leveler serve")
 }
 
 #[cfg(feature = "test-crash-barrier")]
@@ -217,6 +248,149 @@ fn find_state_dir(env: &TestEnv) -> PathBuf {
     dirs.pop().unwrap()
 }
 
+struct SilentHandoffUi;
+
+impl HandoffUi for SilentHandoffUi {
+    fn emit(&self, _event: HandoffEvent) {}
+
+    fn input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<HandoffAction>> {
+        None
+    }
+}
+
+/// Only the old runtime's two handoff obligations are simulated. The Host,
+/// Unix transport and replacement daemon all run their production paths.
+struct OldBuildRuntime {
+    build: BuildIdentity,
+    commands: Arc<Mutex<Vec<RestartReason>>>,
+    events: broadcast::Sender<RuntimeEvent>,
+}
+
+#[async_trait::async_trait]
+impl InteractiveRuntimeClient for OldBuildRuntime {
+    async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+        match command {
+            ClientCommand::ShutdownWhenIdle { reason } => {
+                self.commands.lock().unwrap().push(reason);
+                Ok(())
+            }
+            other => Err(ClientError::Runtime(format!(
+                "unexpected command to old runtime: {other:?}"
+            ))),
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+        self.events.subscribe()
+    }
+
+    async fn snapshot(&self, _session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
+        Err(ClientError::Runtime("old runtime has no sessions".into()))
+    }
+}
+
+#[async_trait::async_trait]
+impl LocalRuntimeService for OldBuildRuntime {
+    async fn create_session(
+        &self,
+        _request: CreateSessionRequest,
+    ) -> Result<SessionBootstrap, ClientError> {
+        Err(ClientError::Runtime(
+            "old runtime cannot create sessions".into(),
+        ))
+    }
+
+    async fn runtime_info(&self) -> Result<RuntimeInfo, ClientError> {
+        Ok(RuntimeInfo {
+            runtime_id: RuntimeId::new("old-build-runtime"),
+            version: self.build.version.clone(),
+            build: self.build.clone(),
+            config_fingerprint: None,
+            pid: std::process::id(),
+            health: RuntimeHealth {
+                accepting_work: true,
+                quiescent: true,
+                ..RuntimeHealth::default()
+            },
+        })
+    }
+}
+
+struct RetireOldBuildUi {
+    commands: Arc<Mutex<Vec<RestartReason>>>,
+    shutdown: CancellationToken,
+}
+
+impl HandoffUi for RetireOldBuildUi {
+    fn emit(&self, event: HandoffEvent) {
+        // A Status event proves that ShutdownWhenIdle was ACKed and the Host
+        // observed the old runtime's drain state. Only then release its socket.
+        if matches!(event, HandoffEvent::Status(_)) && !self.commands.lock().unwrap().is_empty() {
+            self.shutdown.cancel();
+        }
+    }
+
+    fn input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<HandoffAction>> {
+        None
+    }
+}
+
+/// The Host starts a detached daemon, so the test records its PID before
+/// `exec` and reclaims it even when a later assertion fails.
+struct HostDaemonGuard {
+    pid_file: PathBuf,
+}
+
+impl HostDaemonGuard {
+    fn pid(&self) -> u32 {
+        std::fs::read_to_string(&self.pid_file)
+            .expect("Host daemon wrapper recorded a PID")
+            .trim()
+            .parse()
+            .expect("Host daemon PID is numeric")
+    }
+}
+
+impl Drop for HostDaemonGuard {
+    fn drop(&mut self) {
+        if let Ok(raw) = std::fs::read_to_string(&self.pid_file)
+            && let Ok(pid) = raw.trim().parse::<u32>()
+        {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .output();
+        }
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn detached_host_launch(env: &TestEnv) -> (DetachedRuntimeLaunch, HostDaemonGuard) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = env.home.join("leveler-test-wrapper.sh");
+    let pid_file = env.home.join("host-daemon.pid");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' \"$$\" > {}\nexport LEVELER_HOME={}\nexport LEVELER_CONFIG_DIR={}\nexec {} \"$@\"\n",
+        shell_quote(&pid_file),
+        shell_quote(&env.home),
+        shell_quote(&env.config_dir),
+        shell_quote(Path::new(env!("CARGO_BIN_EXE_leveler"))),
+    );
+    std::fs::write(&executable, script).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (
+        DetachedRuntimeLaunch {
+            executable,
+            ready_prefix: "leveler-host-contract".to_string(),
+        },
+        HostDaemonGuard { pid_file },
+    )
+}
+
 /// Scenario A: a daemon restart keeps the same RuntimeId; the id equals the
 /// persisted state-dir identity.
 #[test]
@@ -249,6 +423,313 @@ fn runtime_id_survives_a_daemon_restart() {
     assert_eq!(persisted.trim(), first_id);
 }
 
+/// A supervised TCP daemon reports the original ready fields, accepts the
+/// supplied bearer token, and keeps that secret out of process arguments.
+#[test]
+fn tcp_daemon_ready_contract_keeps_token_out_of_argv() {
+    leveler_test_support::bounded_test(
+        "tcp_daemon_ready_contract_keeps_token_out_of_argv",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        tcp_daemon_ready_contract_keeps_token_out_of_argv_body,
+    );
+}
+
+/// The public Host API starts a real daemon when absent, reuses the existing
+/// process, then revives the same client after that process dies.
+#[test]
+fn host_starts_adopts_and_revives_a_real_daemon() {
+    leveler_test_support::bounded_test(
+        "host_starts_adopts_and_revives_a_real_daemon",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        host_starts_adopts_and_revives_a_real_daemon_body,
+    );
+}
+
+/// Web's owned-child policy returns a child only for the process it starts;
+/// another project manager can attach to that same daemon without owning it.
+#[test]
+fn owned_host_starts_then_adopts_a_real_daemon() {
+    leveler_test_support::bounded_test(
+        "owned_host_starts_then_adopts_a_real_daemon",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        owned_host_starts_then_adopts_a_real_daemon_body,
+    );
+}
+
+async fn owned_host_starts_then_adopts_a_real_daemon_body() {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let socket = layout.socket_path();
+    let (launch, guard) = detached_host_launch(&env);
+    let ready_path = env.home.join("owned-ready.json");
+    assert!(!socket.exists(), "the first call starts without a daemon");
+
+    let started = ensure_owned_runtime(
+        &env.repo,
+        &socket,
+        Some(OwnedRuntimeLaunch {
+            executable: &launch.executable,
+            ready_path: &ready_path,
+        }),
+    )
+    .await
+    .expect("owned Host starts and connects to a real daemon");
+    let mut child = started
+        .child
+        .expect("the caller owns the newly started child");
+    let first = LocalRuntimeService::runtime_info(&started.client)
+        .await
+        .expect("ready socket serves the started runtime");
+    assert_eq!(child.id(), Some(first.pid));
+    assert_eq!(guard.pid(), first.pid);
+    assert_eq!(find_socket(&env), socket);
+    let ready_client = LocalSocketRuntimeClient::connect(&socket)
+        .await
+        .expect("ready socket accepts another client");
+    assert_eq!(
+        LocalRuntimeService::runtime_info(&ready_client)
+            .await
+            .unwrap()
+            .runtime_id,
+        first.runtime_id
+    );
+
+    // An unusable launcher proves that adoption does not start another child.
+    let missing_executable = env.home.join("nonexistent-leveler");
+    let adopted = ensure_owned_runtime(
+        &env.repo,
+        &socket,
+        Some(OwnedRuntimeLaunch {
+            executable: &missing_executable,
+            ready_path: &env.home.join("must-not-be-written.json"),
+        }),
+    )
+    .await
+    .expect("owned Host adopts the existing daemon");
+    assert!(
+        adopted.child.is_none(),
+        "adopting must not transfer child ownership"
+    );
+    let second = LocalRuntimeService::runtime_info(&adopted.client)
+        .await
+        .expect("adopted client reaches the same runtime");
+    assert_eq!(second.pid, first.pid);
+    assert_eq!(second.runtime_id, first.runtime_id);
+
+    drop(adopted);
+    drop(ready_client);
+    drop(started.client);
+    child.start_kill().expect("stop owned daemon");
+    child.wait().await.expect("reap owned daemon");
+    std::fs::remove_file(&guard.pid_file).unwrap();
+}
+
+/// A different reported build must receive ShutdownWhenIdle before a new
+/// daemon can take the same repository socket and answer with the current build.
+#[test]
+fn host_retires_an_old_build_before_starting_a_replacement() {
+    leveler_test_support::bounded_test(
+        "host_retires_an_old_build_before_starting_a_replacement",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        host_retires_an_old_build_before_starting_a_replacement_body,
+    );
+}
+
+async fn host_retires_an_old_build_before_starting_a_replacement_body() {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let (launch, guard) = detached_host_launch(&env);
+    let mut old_build = BuildIdentity::current();
+    old_build.fingerprint.push_str("-previous-build");
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let (events, _) = broadcast::channel(4);
+    let old_runtime = Arc::new(OldBuildRuntime {
+        build: old_build.clone(),
+        commands: commands.clone(),
+        events,
+    });
+    let shutdown = CancellationToken::new();
+    let _shutdown_on_drop = shutdown.clone().drop_guard();
+    let server = LocalSocketServer::bind(layout.socket_path(), old_runtime)
+        .await
+        .expect("old build owns the repository socket");
+    let old_server = tokio::spawn(server.serve(shutdown.clone()));
+    let ui: Arc<dyn HandoffUi> = Arc::new(RetireOldBuildUi {
+        commands: commands.clone(),
+        shutdown,
+    });
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(20),
+        ensure_default_runtime(&layout, &launch, ui),
+    )
+    .await
+    .expect("Host handoff completes")
+    .expect("Host connects to replacement daemon");
+    let old_server_result = old_server.await.expect("old server task joins");
+    old_server_result.expect("old server retired cleanly");
+    assert_eq!(
+        *commands.lock().unwrap(),
+        vec![RestartReason::BuildMismatch],
+        "Host must retire the old build for the correct reason"
+    );
+    let replacement = LocalRuntimeService::runtime_info(&client).await.unwrap();
+    assert_eq!(
+        replacement.pid,
+        guard.pid(),
+        "replacement is a real child process"
+    );
+    assert_ne!(replacement.pid, std::process::id());
+    assert!(
+        replacement.build.matches(&BuildIdentity::current()),
+        "replacement must report the current build"
+    );
+    assert_ne!(replacement.build, old_build);
+}
+
+async fn host_starts_adopts_and_revives_a_real_daemon_body() {
+    let env = test_env("http://127.0.0.1:9");
+    let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let (launch, guard) = detached_host_launch(&env);
+    let ui: Arc<dyn HandoffUi> = Arc::new(SilentHandoffUi);
+    assert!(
+        probe_default_runtime(&layout.socket_path())
+            .await
+            .unwrap()
+            .is_none(),
+        "the first ensure must begin with no runtime"
+    );
+
+    let client = ensure_default_runtime(&layout, &launch, ui.clone())
+        .await
+        .expect("Host starts a daemon and connects");
+    let first = LocalRuntimeService::runtime_info(&client).await.unwrap();
+    assert_eq!(
+        first.pid,
+        guard.pid(),
+        "Host must connect to its spawned process"
+    );
+    assert_eq!(find_socket(&env), layout.socket_path());
+
+    // An invalid executable makes accidental replacement observable: adopt
+    // must return the already-running daemon without trying to spawn.
+    let adopt_only = DetachedRuntimeLaunch {
+        executable: env.home.join("nonexistent-leveler"),
+        ready_prefix: "must-not-launch".to_string(),
+    };
+    let adopted = ensure_default_runtime(&layout, &adopt_only, ui.clone())
+        .await
+        .expect("compatible runtime is adopted");
+    let adopted_info = LocalRuntimeService::runtime_info(&adopted).await.unwrap();
+    assert_eq!(adopted_info.pid, first.pid);
+    assert_eq!(adopted_info.runtime_id, first.runtime_id);
+    drop(adopted);
+
+    let killed = Command::new("kill")
+        .arg("-KILL")
+        .arg(first.pid.to_string())
+        .status()
+        .expect("kill original daemon");
+    assert!(killed.success(), "original daemon must be killed");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if tokio::net::UnixStream::connect(layout.socket_path())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("killed daemon stops answering");
+
+    client.set_reviver(Arc::new(DaemonReviver::new(layout.clone(), launch, ui)));
+    let revived = LocalRuntimeService::runtime_info(&client)
+        .await
+        .expect("a safe read revives and retries through the same client");
+    assert_ne!(
+        revived.pid, first.pid,
+        "revival must start a new OS process"
+    );
+    assert_eq!(
+        revived.pid,
+        guard.pid(),
+        "Host wrapper records the revived process"
+    );
+    assert_eq!(
+        revived.runtime_id, first.runtime_id,
+        "runtime identity survives revival"
+    );
+}
+
+async fn tcp_daemon_ready_contract_keeps_token_out_of_argv_body() {
+    let env = test_env("http://127.0.0.1:9");
+    let ready_path = env.home.join("tcp-ready.json");
+    let token = "runtime-host-contract-token-supplied-through-environment";
+    let mut daemon = spawn_tcp_serve(&env, &ready_path, token);
+    let ready = wait_ready(&ready_path, &mut daemon, Duration::from_secs(30));
+
+    assert_eq!(ready["pid"].as_u64(), Some(u64::from(daemon.id())));
+    assert_eq!(
+        ready["socket"].as_str(),
+        Some(find_socket(&env).to_str().unwrap())
+    );
+    let addr: std::net::SocketAddr = ready["addr"]
+        .as_str()
+        .expect("TCP ready address")
+        .parse()
+        .expect("ready address is a socket address");
+    assert!(addr.ip().is_loopback(), "TCP daemon must bind loopback");
+    assert_ne!(addr.port(), 0, "ready address must expose the bound port");
+    assert_eq!(ready["token"].as_str(), Some(token));
+    let runtime_id = ready["runtime_id"].as_str().expect("runtime_id");
+    assert!(!runtime_id.is_empty());
+
+    // Inspect the running OS process. Checking only our Command builder would
+    // not prove that the launched daemon kept the secret off its real argv.
+    let ps = Command::new("ps")
+        .args(["-p", &daemon.id().to_string(), "-o", "command="])
+        .output()
+        .expect("inspect daemon argv with ps");
+    assert!(
+        ps.status.success(),
+        "ps failed: {}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    let argv = String::from_utf8(ps.stdout).expect("ps output is UTF-8");
+    assert!(
+        argv.contains("serve"),
+        "ps must identify the daemon process: {argv}"
+    );
+    assert!(
+        !argv.contains(token),
+        "bearer token leaked into daemon argv"
+    );
+
+    let tcp_client = LocalSocketRuntimeClient::connect_tcp(addr, token)
+        .await
+        .expect("ready token connects to TCP daemon");
+    let tcp_info = LocalRuntimeService::runtime_info(&tcp_client)
+        .await
+        .expect("TCP daemon serves runtime info");
+    assert_eq!(tcp_info.runtime_id.as_str(), runtime_id);
+
+    // The per-repo Unix socket remains live for an existing local client.
+    let unix_client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .expect("local socket remains connectable");
+    let unix_info = LocalRuntimeService::runtime_info(&unix_client)
+        .await
+        .expect("Unix daemon serves runtime info");
+    assert_eq!(unix_info.runtime_id.as_str(), runtime_id);
+
+    drop(tcp_client);
+    drop(unix_client);
+    stop_daemon(&mut daemon);
+}
+
 /// Scenario D: two daemons racing one repository — exactly one survives, and
 /// the socket answers with exactly that identity.
 #[test]
@@ -269,7 +750,7 @@ async fn concurrent_daemon_starts_elect_exactly_one_runtime_body() {
 
     // One contender must exit (the election loser); the other must be ready.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let (mut winner, winner_ready) = loop {
+    let (mut winner, winner_ready, loser_ready) = loop {
         let a_exit = a.try_wait().expect("a status");
         let b_exit = b.try_wait().expect("b status");
         match (a_exit, b_exit) {
@@ -278,11 +759,11 @@ async fn concurrent_daemon_starts_elect_exactly_one_runtime_body() {
                     !status.success(),
                     "the losing daemon must exit with an error, got {status}"
                 );
-                break (b, ready_b.clone());
+                break (b, ready_b.clone(), ready_a.clone());
             }
             (None, Some(status)) => {
                 assert!(!status.success());
-                break (a, ready_a.clone());
+                break (a, ready_a.clone(), ready_b.clone());
             }
             (Some(_), Some(_)) => panic!("both daemons exited; nobody won the election"),
             (None, None) => {
@@ -294,6 +775,11 @@ async fn concurrent_daemon_starts_elect_exactly_one_runtime_body() {
             }
         }
     };
+
+    assert!(
+        !loser_ready.exists(),
+        "the losing process must not publish readiness as a second owner"
+    );
 
     let ready = wait_ready(&winner_ready, &mut winner, Duration::from_secs(30));
     let winner_id = ready["runtime_id"]
@@ -360,6 +846,7 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication_body() {
     let client = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "crash me".to_string(),
             model: None,
@@ -501,6 +988,7 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped_b
         .unwrap();
     let daemon_session = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "daemon work".to_string(),
             model: None,
@@ -638,6 +1126,7 @@ async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "shell work".to_string(),
             model: None,
@@ -742,6 +1231,7 @@ async fn sigkill_after_durable_ack_before_transcript_append_recovers_once_body()
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "deterministic crash".to_string(),
             model: None,
@@ -890,6 +1380,7 @@ async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart_body()
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "receipt crash".to_string(),
             model: None,
@@ -1034,6 +1525,7 @@ async fn connected_client_recovers_after_daemon_sigkill_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "survive the crash".to_string(),
             model: None,
@@ -1124,4 +1616,260 @@ async fn connected_client_recovers_after_daemon_sigkill_body() {
 
     drop(client);
     stop_daemon(&mut daemon);
+}
+
+#[test]
+fn no_workspace_host_durably_admits_and_restores_after_process_restart() {
+    leveler_test_support::bounded_test(
+        "no_workspace_host_durably_admits_and_restores_after_process_restart",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        no_workspace_host_durably_admits_and_restores_after_process_restart_body,
+    );
+}
+
+async fn no_workspace_host_durably_admits_and_restores_after_process_restart_body() {
+    use leveler_client_protocol::{ApprovalPolicy, CommandEnvelope, CommandId, PermissionProfile};
+    use leveler_core::LevelerHome;
+    use leveler_local_transport::CreateWorkspaceSelection;
+    let env = test_env("http://127.0.0.1:9");
+    let home = LevelerHome::from_root(env.home.clone());
+    let layout = Layout::no_workspace(home.clone(), Some(env.config_dir.clone()));
+    let (launch, guard) = detached_host_launch(&env);
+    let client = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+        .await
+        .unwrap();
+    let first_info = LocalRuntimeService::runtime_info(&client).await.unwrap();
+    let bootstrap = client
+        .create_session(CreateSessionRequest {
+            workspace: CreateWorkspaceSelection::None,
+            goal: "no workspace persisted task".into(),
+            model: None,
+            mode: PermissionProfile::Assisted,
+            approval_policy: ApprovalPolicy::Interactive,
+        })
+        .await
+        .unwrap();
+    assert!(bootstrap.session.repository.is_none());
+    let session = bootstrap.session.id;
+    let mut events = client.subscribe_session(&session);
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("no-workspace-host-input"),
+        session_id: session.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "persistent input without a directory".into(),
+            attachments: vec![],
+        },
+    };
+    // Intentionally lose the response: send a real Deliver frame then close
+    // without reading any ACK. Admission is proved independently below.
+    use tokio::io::AsyncWriteExt;
+    let mut lost_ack_socket = tokio::net::UnixStream::connect(layout.socket_path())
+        .await
+        .unwrap();
+    let request = serde_json::json!({
+        "type": "deliver",
+        "body": leveler_client_protocol::ProtocolEnvelope::wrap(envelope.clone()),
+    });
+    let frame =
+        serde_json::to_vec(&leveler_client_protocol::ProtocolEnvelope::wrap(request)).unwrap();
+    lost_ack_socket.write_u32(frame.len() as u32).await.unwrap();
+    lost_ack_socket.write_all(&frame).await.unwrap();
+    lost_ack_socket.flush().await.unwrap();
+    drop(lost_ack_socket);
+    // The fixture provider is unavailable. Wait for the truthful failure before
+    // killing the process; the failure does not erase accepted user input.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap(),
+                RuntimeEvent::TurnFailed { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("unavailable provider produces a terminal failure");
+    let db = leveler_storage::Database::connect_read_only(&layout.database_path())
+        .await
+        .unwrap();
+    let admitted = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.len(),
+        1,
+        "ACK loss must still leave exactly one durable initiating turn"
+    );
+    assert!(
+        admitted[0]
+            .payload
+            .as_deref()
+            .unwrap()
+            .contains("persistent input without a directory")
+    );
+    drop(db);
+    unsafe {
+        libc_kill(guard.pid() as i32, 9);
+    }
+    drop(events);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match probe_default_runtime(&layout.socket_path()).await {
+                Ok(None) => break,
+                Ok(Some(_)) => tokio::task::yield_now().await,
+                Err(leveler_local_transport::TransportError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("probe after owned SIGKILL: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let restarted = ensure_default_runtime(&layout, &launch, Arc::new(SilentHandoffUi))
+        .await
+        .unwrap();
+    let second_info = LocalRuntimeService::runtime_info(&restarted).await.unwrap();
+    assert_ne!(first_info.pid, second_info.pid);
+    assert_eq!(first_info.runtime_id, second_info.runtime_id);
+    let restored = restarted.snapshot(&session).await.unwrap();
+    assert!(
+        restored.repository.is_none(),
+        "restart must not inherit cwd or HOME"
+    );
+    assert!(
+        restored
+            .messages
+            .iter()
+            .any(|message| message.text == "persistent input without a directory")
+    );
+    assert_eq!(
+        restored.task_status,
+        Some(leveler_client_protocol::UiTaskStatus::Failed)
+    );
+    assert!(restored.pending_interactions.is_empty());
+    // The original command identity queries/reuses its settled receipt. It
+    // must not dispatch a second initiating turn after the lost response.
+    restarted.deliver(envelope).await.unwrap();
+    let db = leveler_storage::Database::connect_read_only(&layout.database_path())
+        .await
+        .unwrap();
+    assert_eq!(
+        leveler_storage::TurnRepository::new(&db)
+            .list(&session)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let after_duplicate = restarted.snapshot(&session).await.unwrap();
+    assert_eq!(
+        after_duplicate
+            .messages
+            .iter()
+            .filter(|message| message.text == "persistent input without a directory")
+            .count(),
+        1
+    );
+    let index = leveler_app::global_task_index::query_global_tasks(&home, false).await;
+    assert!(index.source_errors.is_empty(), "{:?}", index.source_errors);
+    let task = index.tasks.iter().find(|task| task.id == session).unwrap();
+    assert!(task.primary_workspace.is_none());
+    assert_eq!(task.status, restored.task_status.unwrap());
+}
+
+#[test]
+fn global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected() {
+    leveler_test_support::bounded_test(
+        "global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected_body,
+    );
+}
+
+async fn global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected_body() {
+    use leveler_client_protocol::{ApprovalPolicy, PermissionProfile};
+    use leveler_core::LevelerHome;
+    use leveler_local_transport::CreateWorkspaceSelection;
+    let env = test_env("http://127.0.0.1:9");
+    let home = LevelerHome::from_root(env.home.clone());
+    let repo_b = env.repo.with_file_name("repo-b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    let layout_a = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
+    let layout_b = Layout::ephemeral(repo_b.clone(), Some(env.config_dir.clone()), &env.home);
+    let app_b = leveler_app::Application::assemble(layout_b.clone()).unwrap();
+    let session_b = app_b
+        .create_session(&leveler_model::ModelRef::new("mock", "m"), "B history")
+        .await
+        .unwrap();
+    drop(app_b);
+    let (launch_a, mut guard_a) = detached_host_launch(&env);
+    let client_a = ensure_default_runtime(&layout_a, &launch_a, Arc::new(SilentHandoffUi))
+        .await
+        .unwrap();
+    let boot_a = client_a
+        .create_session(CreateSessionRequest {
+            workspace: CreateWorkspaceSelection::RuntimeDefault,
+            goal: "A history".into(),
+            model: None,
+            mode: PermissionProfile::Assisted,
+            approval_policy: ApprovalPolicy::Interactive,
+        })
+        .await
+        .unwrap();
+    let guard_a_path = env.home.join("host-daemon-a.pid");
+    std::fs::rename(&guard_a.pid_file, &guard_a_path).unwrap();
+    guard_a.pid_file = guard_a_path;
+    let (launch_b, _guard_b) = detached_host_launch(&env);
+    let index = leveler_app::global_task_index::query_global_tasks(&home, false).await;
+    let task_b = index
+        .tasks
+        .iter()
+        .find(|task| task.id == session_b)
+        .unwrap();
+    let client_b = leveler_runtime_host::connect_global_task_runtime(
+        &home,
+        &task_b.source_id,
+        &session_b,
+        Some(env.config_dir.clone()),
+        &launch_b,
+        Arc::new(SilentHandoffUi),
+    )
+    .await
+    .unwrap();
+    let snapshot_b = client_b.snapshot(&session_b).await.unwrap();
+    assert_eq!(
+        snapshot_b.repository.as_deref(),
+        layout_b.primary_workspace().unwrap().to_str()
+    );
+    assert_eq!(
+        client_a
+            .snapshot(&boot_a.session.id)
+            .await
+            .unwrap()
+            .repository
+            .as_deref(),
+        layout_a.primary_workspace().unwrap().to_str()
+    );
+    assert_ne!(
+        LocalRuntimeService::runtime_info(&client_a)
+            .await
+            .unwrap()
+            .runtime_id,
+        LocalRuntimeService::runtime_info(&client_b)
+            .await
+            .unwrap()
+            .runtime_id
+    );
 }

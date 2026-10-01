@@ -183,7 +183,7 @@ The default permission profile is `assisted`. Ordinary repository writes, builds
 
 ## Browser and web search
 
-These tools are optional. They are exposed only when the selected work profile enables them and the current machine can provide them.
+Each goal starts with the base coding tools. The model loads optional capabilities when needed; the runtime exposes their tools only when they are available and permitted.
 
 - **Chrome, Edge, or Chromium:** CodeLeveler starts a dedicated automation session. `browser_tab`, `browser_act`, and `browser_inspect` can navigate, interact, and inspect console, page-error, and network records.
 - **Safari:** opt in with `default = "safari"` under `[browser]` in `~/.leveler/config.toml`, then enable Safari Remote Automation. Safari supports tabs and interaction, but its WebDriver backend cannot provide console, page-error, or network inspection.

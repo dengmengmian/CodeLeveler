@@ -54,7 +54,7 @@ impl Tool for LoadSkillTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: LoadInput = super::parse_input(self.name(), input)?;
-        match registry_for(&context).load_skill(&input.name) {
+        match registry_for(&context)?.load_skill(&input.name) {
             Ok(detail) => Ok(ToolOutput::ok(leveler_skills::render_skill_package(
                 &detail,
             ))),
@@ -167,16 +167,19 @@ pub fn is_skill_definition_write(tool: &str) -> bool {
     matches!(tool, SAVE_SKILL_TOOL | DELETE_SKILL_TOOL)
 }
 
-fn store_for(context: &ToolContext) -> SkillStore {
-    let root = context.execution.workspace.root();
-    SkillStore::for_project_in(root, &|key| context.execution.environment.var_os(key))
-}
-
-fn registry_for(context: &ToolContext) -> SkillRegistry {
-    let root = context.execution.workspace.root();
-    SkillRegistry::load(&SkillRoots::for_project_in(root, &|key| {
+fn store_for(context: &ToolContext) -> Result<SkillStore, ToolError> {
+    let root = context.require_workspace()?.root();
+    Ok(SkillStore::for_project_in(root, &|key| {
         context.execution.environment.var_os(key)
     }))
+}
+
+fn registry_for(context: &ToolContext) -> Result<SkillRegistry, ToolError> {
+    let root = context.require_workspace()?.root();
+    Ok(SkillRegistry::load(&SkillRoots::for_project_in(
+        root,
+        &|key| context.execution.environment.var_os(key),
+    )))
 }
 
 /// Validate a `save_skill` / `delete_skill` call before anyone is asked, and
@@ -186,13 +189,21 @@ pub fn skill_authoring_preflight(
     arguments: &serde_json::Value,
     context: &ToolContext,
 ) -> Result<String, String> {
-    let store = store_for(context);
-    let registry = registry_for(context);
+    let store = store_for(context).map_err(|e| e.to_string())?;
+    let registry = registry_for(context).map_err(|e| e.to_string())?;
     match tool {
         SAVE_SKILL_TOOL => {
             let args: SaveSkillArgs = serde_json::from_value(arguments.clone())
                 .map_err(|e| format!("save_skill: {e}"))?;
-            save_preview(&args, &store, &registry, context.execution.workspace.root())
+            save_preview(
+                &args,
+                &store,
+                &registry,
+                context
+                    .require_workspace()
+                    .map_err(|e| e.to_string())?
+                    .root(),
+            )
         }
         DELETE_SKILL_TOOL => {
             let args: DeleteSkillArgs = serde_json::from_value(arguments.clone())
@@ -217,7 +228,14 @@ pub fn skill_authoring_preflight(
                 "Delete {scope} skill \"{name}\"\nLocation: {location}\n\
                  Future turns will no longer resolve this name here.",
                 scope = args.scope.as_str(),
-                location = display_path(&target, scope, context.execution.workspace.root()),
+                location = display_path(
+                    &target,
+                    scope,
+                    context
+                        .require_workspace()
+                        .map_err(|e| e.to_string())?
+                        .root()
+                ),
             ))
         }
         _ => Err(format!("{tool} is not a skill authoring tool")),
@@ -352,7 +370,7 @@ impl Tool for SaveSkillTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let args: SaveSkillArgs = super::parse_input(self.name(), input)?;
-        let store = store_for(&context);
+        let store = store_for(&context)?;
         let draft = args.draft();
         let scope = args.scope.scope();
         let written = match args.action {
@@ -365,7 +383,7 @@ impl Tool for SaveSkillTool {
         };
         // Re-resolve so the result reports the registry's real state, not the
         // intent.
-        let registry = registry_for(&context);
+        let registry = registry_for(&context)?;
         let status = registry
             .get(&draft.name)
             .map(status_line)
@@ -411,13 +429,13 @@ impl Tool for DeleteSkillTool {
         let args: DeleteSkillArgs = super::parse_input(self.name(), input)?;
         let name = args.name.trim();
         let scope = args.scope.scope();
-        match store_for(&context).delete(scope, name) {
+        match store_for(&context)?.delete(scope, name) {
             Ok(()) => Ok(ToolOutput::ok(format!(
                 "Deleted {} skill \"{name}\".",
                 args.scope.as_str()
             ))),
             Err(error) => {
-                let registry = registry_for(&context);
+                let registry = registry_for(&context)?;
                 if registry.get(name).is_some() {
                     return Ok(ToolOutput::error(delete_refusal(
                         name,
@@ -462,7 +480,7 @@ mod tests {
     async fn load_skill_surfaces_structured_scripts_and_dir() {
         let dir = tmp("struct");
         let ctx = context(&dir);
-        let store = store_for(&ctx);
+        let store = store_for(&ctx).unwrap();
         store
             .create(
                 SkillScope::Project,
@@ -483,7 +501,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let root = ctx.execution.workspace.root().to_path_buf();
+        let root = ctx.require_workspace().unwrap().root().to_path_buf();
         let skill_dir = root.join(".leveler").join("skills").join("pack");
 
         let loaded = LoadSkillTool
@@ -569,6 +587,7 @@ mod tests {
             "body": "b",
         });
         store_for(&ctx)
+            .unwrap()
             .create(
                 SkillScope::Project,
                 &SkillDraft {

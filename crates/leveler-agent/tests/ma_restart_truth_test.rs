@@ -189,6 +189,8 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> Coding
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
+            allow_host_input: true,
+            capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
             develop_model: None,
         },
@@ -214,7 +216,7 @@ fn gated_spec(dir: &Path) -> TaskSpec {
             limits: leveler_agent::StepLimits::default(),
         },
         coding: leveler_agent::coding::CodingTaskSpec {
-            repository: dir.to_path_buf(),
+            repository: Some(dir.to_path_buf()),
             mode: PermissionProfile::Assisted,
             sandbox: false,
         },

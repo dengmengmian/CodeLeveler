@@ -20,12 +20,18 @@ pub mod background;
 pub mod checkpoint;
 mod clarify;
 pub mod command;
+pub mod execution_host;
+pub mod git_effects;
 pub mod hooks;
+pub mod host_settlement;
 pub mod permission_rules;
 pub mod policy;
 pub mod risk;
 mod shell_ast;
-pub use shell_ast::{literal_command_words, literal_program_names, proven_executed_commands};
+pub use shell_ast::{
+    ExecutedCommands, executed_commands, literal_command_words, literal_program_names,
+    proven_executed_commands,
+};
 pub mod snapshot;
 pub mod trust;
 mod url_open;
@@ -57,6 +63,9 @@ pub use command::{
     ProcessIdentity, ProcessOutput, ProcessRequest, ToolExecutionStatus, VerifyNetworkPolicy,
     credential_env_names, is_credential_env_name, looks_like_absolute_path_arg,
     process_request_for_verify_check, seal_read_denials, shell_invocation,
+};
+pub use git_effects::{
+    CallGitEffects, GitCommandEffects, GitEffects, call_git_effects, git_command_effects,
 };
 pub use hooks::{HookRunner, LifecycleEvent, PreHookResult};
 pub use permission_rules::{

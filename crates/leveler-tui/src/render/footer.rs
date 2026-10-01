@@ -1067,17 +1067,15 @@ mod p1_tests {
     }
 
     #[test]
-    fn trust_chip_is_model_work_permission_session() {
+    fn trust_chip_is_model_permission_session() {
         let mut s = state();
         s.model_label = "deepseek/v4".into();
-        s.work_profile = "balanced".into();
         s.mode_label = "Assisted".into();
         s.collaboration = "chat".into();
-        assert_eq!(composer_trust_chip(&s), "v4 · balanced · auto · chat");
-        s.work_profile = "delivery".into();
+        assert_eq!(composer_trust_chip(&s), "v4 · auto · chat");
         s.mode_label = "RequestApproval".into();
         s.collaboration = "plan".into();
-        assert_eq!(composer_trust_chip(&s), "v4 · delivery · ask · plan");
+        assert_eq!(composer_trust_chip(&s), "v4 · ask · plan");
     }
 
     /// The stderr startup notice is swallowed by the alternate screen, so the
@@ -1126,7 +1124,7 @@ mod slash_popup_layout_tests {
 
     #[test]
     fn descriptions_share_one_column() {
-        let names = ["/model", "/permission", "/work-mode"];
+        let names = ["/model", "/permission"];
         let content_w = 40;
         let (command_col, _) = slash_popup_columns(content_w, &names);
         assert_eq!(command_col, SLASH_COMMAND_COL);
@@ -1223,7 +1221,7 @@ mod slash_popup_layout_tests {
 
     #[test]
     fn cjk_labels_use_terminal_cell_width() {
-        for (text, cells) in [("权限审批", 8), ("切换模型", 8), ("工作模式", 8)] {
+        for (text, cells) in [("权限审批", 8), ("切换模型", 8), ("协作方式", 8)] {
             assert_eq!(
                 UnicodeWidthStr::width(text),
                 cells,
@@ -1241,7 +1239,7 @@ mod slash_popup_layout_tests {
 
     #[test]
     fn descriptions_align_across_varied_command_lengths() {
-        let names = ["/model", "/permission", "/work-mode", "/collab"];
+        let names = ["/model", "/permission", "/collab"];
         let content_w = 40;
         let (command_col, _) = slash_popup_columns(content_w, &names);
         let start = command_col + SLASH_COL_GAP;
@@ -1301,7 +1299,7 @@ mod slash_popup_layout_tests {
 
     #[test]
     fn narrow_widths_do_not_panic_or_underflow() {
-        let names = ["/permission", "/work-mode"];
+        let names = ["/permission"];
         for w in [0u16, 1, 2, 5, 10] {
             let content_w = slash_popup_content_width(w);
             let (command_col, desc_col) = slash_popup_columns(content_w, &names);

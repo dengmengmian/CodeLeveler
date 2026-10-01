@@ -69,8 +69,8 @@ impl Tool for DiagnosticsTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let abs = context.execution.workspace.resolve_for_read(&input.path)?;
-        let root = context.execution.workspace.root().to_path_buf();
+        let abs = context.require_workspace()?.resolve_for_read(&input.path)?;
+        let root = context.require_workspace()?.root().to_path_buf();
 
         let Some(language) = Language::from_path(&abs) else {
             return Ok(ToolOutput::ok(format!(

@@ -283,24 +283,30 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
     frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
-/// The Background Jobs list page: running tasks first, then recently finished
-/// ones. Enter opens the selected task's Detail Page, `x` stops a selected
-/// running task, Esc returns to the conversation. Acknowledging the current
-/// failures happens when the page opens (`activity::open_background_list`), so
-/// this renderer stays pure.
+/// The Background Tasks page: a master/detail console.
+///
+/// The top pane is the job list (running first, then recently finished); ↑/↓
+/// selects. The bottom pane is the selected task's status, its runtime facts
+/// (pid, elapsed, exit code) and its real retained stdout/stderr, updated live
+/// from the same events the list is built from. The page owns no lifecycle:
+/// `x` stops the selected task through the runtime's cancellation command, and
+/// Esc never touches a process.
 fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = &state.theme;
     let t = state.t();
     let list = crate::activity::background_job_list(state);
-    let hint = if list.running.is_empty() {
-        t.background_hint_list_idle
-    } else {
-        t.background_hint_list_running
-    };
+    let counts = format!(
+        "{} {} · {} {}",
+        t.background_list_running,
+        list.running.len(),
+        t.background_list_finished,
+        list.finished.len()
+    );
+    let hint = background_page_hint(state, &list, t);
     let page = crate::secondary::SecondaryPage {
         title: t.background_list_title,
-        status: crate::secondary::main_status_spans(state, area.width as usize),
-        hint,
+        status: vec![Span::styled(counts, Style::default().fg(theme.text.muted))],
+        hint: &hint,
     };
     let layout = crate::secondary::layout(area, 0);
     crate::secondary::draw_header(frame, &layout, &page, theme);
@@ -309,39 +315,143 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     if body.width == 0 || body.height == 0 {
         return;
     }
-    let stop_rect = background_stop_rect(Rect { height: 1, ..body }, t);
-    let row_width = body
-        .width
-        .saturating_sub(stop_rect.map_or(0, |r| r.width + 2));
+
     let BackgroundListBody {
         lines,
         selected_line,
-        stop_rows,
-    } = background_list_body(state, &list, row_width as usize, theme, t);
-    let height = body.height as usize;
+    } = background_list_body(state, &list, body.width as usize, theme, t);
+
+    // The list is capped to a third of the pane (min 3 rows) so the live log
+    // keeps most of the space; the remainder is the selected task's detail.
+    let list_height = (lines.len() as u16)
+        .min((body.height / 3).max(3))
+        .min(body.height.saturating_sub(4))
+        .max(1);
+    let list_area = Rect {
+        height: list_height,
+        ..body
+    };
+    let rule_area = Rect {
+        y: body.y + list_height,
+        height: 1,
+        ..body
+    };
+    let detail_area = Rect {
+        y: body.y + list_height + 1,
+        height: body.height.saturating_sub(list_height + 1),
+        ..body
+    };
+
     // Keep the selection visible without a second scroll owner: the offset is
     // derived from the selection, so the list needs no scroll state and a
     // resize can never strand the highlighted row.
-    let max_offset = lines.len().saturating_sub(height);
+    let max_offset = lines.len().saturating_sub(list_area.height as usize);
     let offset = selected_line
-        .map(|line| line.saturating_sub(height.saturating_sub(1)))
+        .map(|line| line.saturating_sub(list_area.height.saturating_sub(1) as usize))
         .unwrap_or(0)
         .min(max_offset);
-    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
-    frame.render_widget(Paragraph::new(visible), body);
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(offset)
+        .take(list_area.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), list_area);
+
+    if rule_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(rule_area.width as usize),
+                Style::default().fg(theme.border.normal),
+            ))),
+            rule_area,
+        );
+    }
+
+    if detail_area.height == 0 {
+        return;
+    }
+    let Some(task_id) = crate::activity::selected_list_task(state) else {
+        return;
+    };
+    let Some(summary) = list.rows().find(|s| s.id.as_key() == task_id).cloned() else {
+        return;
+    };
+    let running = summary.status == crate::activity::ActivityStatus::Running;
+    let stop_rect = if running {
+        background_stop_rect(
+            Rect {
+                height: 1,
+                ..detail_area
+            },
+            t,
+        )
+    } else {
+        None
+    };
+    // The stop button overlays the fact line's right edge; reserve its cells so
+    // a long fact string can never run underneath it.
+    let detail_width = detail_area
+        .width
+        .saturating_sub(stop_rect.map_or(0, |r| r.width + 2));
+    let detail =
+        background_detail_pane_lines(state, &summary, &task_id, detail_width as usize, theme, t);
+    let total = detail.len();
+    crate::activity::sync_background_task_view(state, &task_id, total, detail_area.height as usize);
+    let view = crate::activity::background_task_view(state, &task_id);
+    let offset = view.scroll.min(view.max_scroll);
+    let visible: Vec<Line<'static>> = detail
+        .into_iter()
+        .skip(offset)
+        .take(detail_area.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), detail_area);
     if let Some(rect) = stop_rect {
-        for (line, task_id) in stop_rows {
-            if line >= offset && line < offset + height {
-                render_background_stop(
-                    frame,
-                    Rect {
-                        y: body.y + (line - offset) as u16,
-                        ..rect
-                    },
-                    &task_id,
-                    state,
-                );
+        render_background_stop(frame, rect, &task_id, state);
+    }
+}
+
+/// The page's footer hint, which follows the pane that owns ↑/↓ and names the
+/// follow chip while the output has the keys.
+fn background_page_hint(
+    state: &AppState,
+    list: &crate::activity::BackgroundJobList,
+    t: &crate::i18n::UiText,
+) -> String {
+    use crate::activity::BackgroundPane;
+    if list.is_empty() {
+        return t.activity_esc.to_string();
+    }
+    let selected_running = crate::activity::selected_list_task(state)
+        .and_then(|id| state.background_task_labels.get(&id))
+        .is_some_and(|c| c.is_running());
+    match state.background_list_focus {
+        BackgroundPane::List => {
+            if selected_running {
+                t.background_hint_list_running.to_string()
+            } else {
+                t.background_hint_list_idle.to_string()
             }
+        }
+        BackgroundPane::Output => {
+            let mut hint = String::new();
+            if let Some(id) = crate::activity::selected_list_task(state) {
+                let view = crate::activity::background_task_view(state, &id);
+                let chip = if view.follow {
+                    t.activity_follow_on.to_string()
+                } else if view.unread > 0 {
+                    format!(
+                        "{} · {}",
+                        t.activity_follow_paused,
+                        t.activity_new_lines.replace("{}", &view.unread.to_string())
+                    )
+                } else {
+                    t.activity_follow_paused.to_string()
+                };
+                hint.push_str(&chip);
+                hint.push_str(" · ");
+            }
+            hint.push_str(t.background_hint_output);
+            hint
         }
     }
 }
@@ -349,7 +459,6 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
 struct BackgroundListBody {
     lines: Vec<Line<'static>>,
     selected_line: Option<usize>,
-    stop_rows: Vec<(usize, String)>,
 }
 
 fn background_stop_rect(row: Rect, t: &crate::i18n::UiText) -> Option<Rect> {
@@ -388,7 +497,6 @@ fn background_list_body(
 ) -> BackgroundListBody {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut selected_line = None;
-    let mut stop_rows = Vec::new();
     let selected = state.background_list_selected.as_deref();
     if list.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -398,7 +506,6 @@ fn background_list_body(
         return BackgroundListBody {
             lines,
             selected_line,
-            stop_rows,
         };
     }
     if !list.running.is_empty() {
@@ -411,8 +518,13 @@ fn background_list_body(
             if on {
                 selected_line = Some(lines.len());
             }
-            stop_rows.push((lines.len(), summary.id.as_key().to_string()));
-            lines.push(background_list_row(summary, on, width, theme));
+            lines.push(background_list_row(
+                summary,
+                exit_code_for(state, summary.id.as_key()),
+                on,
+                width,
+                theme,
+            ));
         }
     }
     if !list.finished.is_empty() {
@@ -426,21 +538,37 @@ fn background_list_body(
             if on {
                 selected_line = Some(lines.len());
             }
-            lines.push(background_list_row(summary, on, width, theme));
+            lines.push(background_list_row(
+                summary,
+                exit_code_for(state, summary.id.as_key()),
+                on,
+                width,
+                theme,
+            ));
         }
     }
     BackgroundListBody {
         lines,
         selected_line,
-        stop_rows,
     }
 }
 
 /// One job row: `→ ● label … duration`. The glyph carries the status ink, the
 /// duration is right-aligned in muted grey, and the label truncates first so a
 /// long command can never push the duration off the edge.
+/// A terminal task's exit code, read from the projection the detail pane also
+/// reads. `None` while running and for a stop the runtime reported as `Killed`
+/// without a code.
+fn exit_code_for(state: &AppState, task_id: &str) -> Option<i32> {
+    state
+        .background_task_labels
+        .get(task_id)
+        .and_then(|chrome| chrome.exit_code)
+}
+
 fn background_list_row(
     summary: &crate::activity::ActivitySummary,
+    exit_code: Option<i32>,
     selected: bool,
     width: usize,
     theme: &Theme,
@@ -450,6 +578,12 @@ fn background_list_row(
     let prefix = if selected { "→ " } else { "  " };
     let glyph = crate::activity::activity_glyph(summary.status);
     let dur = crate::status_line::fmt_elapsed(summary.duration_secs);
+    // The shell's own "EXIT n" word, so a failure's code is visible without
+    // opening the detail; the label truncation accounts for its width.
+    let meta = match exit_code {
+        Some(code) => format!("EXIT {code}  {dur}"),
+        None => dur,
+    };
     let accent = Style::default().fg(theme.accent.primary);
     let glyph_style = match summary.status {
         ActivityStatus::Running | ActivityStatus::Waiting => accent,
@@ -467,7 +601,7 @@ fn background_list_row(
     });
     let head = format!("{indent}{prefix}{glyph} ");
     let head_w = unicode_width::UnicodeWidthStr::width(head.as_str());
-    let dur_w = unicode_width::UnicodeWidthStr::width(dur.as_str());
+    let dur_w = unicode_width::UnicodeWidthStr::width(meta.as_str());
     const GAP: usize = 2;
     let label_budget = width.saturating_sub(head_w + GAP + dur_w).max(4);
     let label = truncate_display(&summary.title, label_budget);
@@ -477,7 +611,7 @@ fn background_list_row(
         Span::styled(head, glyph_style),
         Span::styled(label, label_style),
         Span::raw(" ".repeat(pad)),
-        Span::styled(dur, Style::default().fg(theme.text.muted)),
+        Span::styled(meta, Style::default().fg(theme.text.muted)),
     ])
 }
 
@@ -674,6 +808,135 @@ fn background_detail_body(
             width,
         ));
     }
+}
+
+/// The Background Tasks page's detail pane: identity + runtime facts, then the
+/// task's real retained output. The facts come from the same projection the
+/// list uses, so the two panes can never disagree about a task's state.
+fn background_detail_pane_lines(
+    state: &AppState,
+    summary: &crate::activity::ActivitySummary,
+    task_id: &str,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    use crate::activity::ActivityStatus;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let (status_text, status_style) = activity_status_text(
+        state,
+        &crate::activity::ActivityId::Background(task_id.to_string()),
+        summary,
+        t,
+        theme,
+    );
+    let glyph = crate::activity::activity_glyph(summary.status);
+    let status_w = unicode_width::UnicodeWidthStr::width(status_text.as_str()) + 3;
+    let label = truncate_display(&summary.title, width.saturating_sub(status_w).max(8));
+    lines.push(Line::from(vec![
+        Span::styled(
+            label,
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("{glyph} {status_text}"), status_style),
+    ]));
+
+    let chrome = crate::activity::background_chrome(state, task_id);
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(pid) = chrome.and_then(|c| c.pid) {
+        facts.push(format!("{} {pid}", t.background_meta_pid));
+    }
+    facts.push(format!(
+        "{} {}",
+        t.background_meta_elapsed,
+        crate::status_line::fmt_elapsed(summary.duration_secs)
+    ));
+    match summary.status {
+        ActivityStatus::Running | ActivityStatus::Waiting => {
+            let freshness = match chrome.and_then(|c| c.last_output_at) {
+                Some(at) => t.background_meta_last_output.replace(
+                    "{}",
+                    &crate::status_line::fmt_elapsed(at.elapsed().as_secs()),
+                ),
+                None => t.background_meta_no_output.to_string(),
+            };
+            facts.push(freshness);
+        }
+        _ => {
+            if let Some(code) = chrome.and_then(|c| c.exit_code) {
+                facts.push(format!("{} {code}", t.background_meta_exit));
+            }
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{}{}",
+            crate::layout::DETAIL_BODY_INDENT,
+            truncate_display(&facts.join(" · "), content_width(width))
+        ),
+        Style::default().fg(theme.text.muted),
+    )));
+    lines.push(Line::from(""));
+    lines.push(section_line(t.activity_output_label, theme));
+    let output = chrome.map(|c| c.output.as_str()).unwrap_or("");
+    if output.trim().is_empty() {
+        lines.push(detail_line(
+            t.activity_no_output.to_string(),
+            Style::default().fg(theme.text.muted),
+            width,
+        ));
+        return lines;
+    }
+    for raw in output.lines() {
+        lines.push(background_output_line(raw, width, theme));
+    }
+    lines
+}
+
+/// One retained output line. The runtime tags every chunk with its stream
+/// (`[stdout] ` / `[stderr] `); stderr and the truncation marker must stay
+/// visible, so they are styled instead of being flattened into stdout.
+fn background_output_line(raw: &str, width: usize, theme: &Theme) -> Line<'static> {
+    let line = sanitize_terminal_line(raw);
+    let avail = content_width(width);
+    let indent = crate::layout::DETAIL_BODY_INDENT;
+    if let Some(rest) = line.strip_prefix("[stderr] ") {
+        return Line::from(vec![
+            Span::raw(indent),
+            Span::styled(
+                "[stderr] ",
+                Style::default()
+                    .fg(theme.status.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_display(rest, avail.saturating_sub(9)),
+                Style::default().fg(theme.status.error),
+            ),
+        ]);
+    }
+    if let Some(rest) = line.strip_prefix("[stdout] ") {
+        return Line::from(vec![
+            Span::raw(indent),
+            Span::styled(
+                truncate_display(rest, avail),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]);
+    }
+    // A truncated-prefix marker or an untagged continuation line.
+    let style = if line.starts_with('…') {
+        Style::default().fg(theme.text.muted)
+    } else {
+        Style::default().fg(theme.text.secondary)
+    };
+    Line::from(Span::styled(
+        format!("{indent}{}", truncate_display(&line, avail)),
+        style,
+    ))
 }
 
 /// A sub-agent's body. The semantic task, then either the running call or the
@@ -1899,6 +2162,8 @@ mod tests {
                 stopped: false,
                 exit_code: None,
                 duration_ms: None,
+                pid: None,
+                last_output_at: None,
                 output: "Compiling leveler-core ...\ntest result: ok\n".into(),
             },
         );
@@ -1932,6 +2197,8 @@ mod tests {
                 stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(133_000),
+                pid: None,
+                last_output_at: None,
                 output: "test result: ok. 428 passed\n".into(),
             },
         );
@@ -2022,6 +2289,8 @@ mod tests {
                 stopped: false,
                 exit_code: None,
                 duration_ms: None,
+                pid: None,
+                last_output_at: None,
                 output: "Compiling leveler-tui\n".into(),
             },
         );
@@ -2125,6 +2394,8 @@ mod tests {
                     stopped: false,
                     exit_code: None,
                     duration_ms: None,
+                    pid: None,
+                    last_output_at: None,
                     output: "a line of output that is much wider than the terminal\n".into(),
                 },
             );

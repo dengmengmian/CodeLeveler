@@ -110,7 +110,7 @@ async fn open_session(db: &Database) -> SessionId {
         .create_task(&NewSession {
             // No repository: this harness has no workspace, and the engine
             // must not need one.
-            workspace: "/nowhere".into(),
+            workspace: Some("/nowhere".into()),
             goal: "process alpha".into(),
             model: "mock/minimal".into(),
             mode: "read-only".into(),

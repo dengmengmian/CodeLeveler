@@ -34,7 +34,8 @@ export function modelRefString(model: ModelRef): string {
 }
 
 /** 从仓库路径取项目名（最后一段）。 */
-export function repoShortName(repository: string): string {
+export function repoShortName(repository: string | null): string {
+  if (repository === null) return '无工作区';
   const trimmed = repository.replace(/\/+$/, '');
   const name = trimmed.split('/').pop();
   return name || repository || '当前项目';
@@ -112,17 +113,6 @@ export function permissionMeta(profile: PermissionProfile): PermissionMeta {
       return { label: '完全访问', cls: 'p-full' };
     case 'assisted':
       return { label: '辅助模式', cls: 'p-assist' };
-  }
-}
-
-/** 工作档（work_profile 轴）的展示标签。含义以 runtime 为准，这里只翻译。 */
-export function workProfileLabel(profile: string): string {
-  switch (profile) {
-    case 'economy':
-      return 'Economy';
-    case 'balanced':
-    default:
-      return 'Balanced';
   }
 }
 

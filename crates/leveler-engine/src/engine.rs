@@ -270,7 +270,7 @@ pub struct EngineBoot {
 /// MEAN belongs to the harness that chose them.
 pub struct NewSession {
     /// The workspace the session is about, as it should be persisted.
-    pub workspace: String,
+    pub workspace: Option<String>,
     pub goal: String,
     pub model: String,
     /// The permission mode's wire string.
@@ -284,7 +284,6 @@ pub struct NewSession {
 
 pub struct NewSessionAxes {
     pub collaboration: String,
-    pub work_profile: String,
 }
 
 /// Harness-supplied execution configuration written at a fenced start.
@@ -578,14 +577,20 @@ impl TaskEngine {
     /// Create and persist the session row, including its execution config,
     /// and the durable task row associated with it.
     pub async fn create_task(&self, session: &NewSession) -> Result<SessionId, EngineError> {
-        let mut record = SessionRecord::new(
-            session.workspace.clone(),
-            session.goal.clone(),
-            session.model.clone(),
-            leveler_core::now(),
-        );
+        let now = leveler_core::now();
+        let mut record = match &session.workspace {
+            Some(workspace) => SessionRecord::new(
+                workspace.clone(),
+                session.goal.clone(),
+                session.model.clone(),
+                now,
+            ),
+            None => {
+                SessionRecord::without_workspace(session.goal.clone(), session.model.clone(), now)
+            }
+        };
         if let Some(axes) = &session.axes {
-            record = record.with_axes(&axes.collaboration, &axes.work_profile);
+            record = record.with_axes(&axes.collaboration, "single");
         }
         let id = SessionId::new(record.id.clone());
         self.stores

@@ -12,8 +12,8 @@ pub const REPOSITORY_OWNER_FILE: &str = ".repository-root";
 /// Resolved paths for a CodeLeveler run rooted at a repository.
 #[derive(Debug, Clone)]
 pub struct Layout {
-    /// Repository root (the current working directory by default).
-    pub repo_root: PathBuf,
+    /// Optional user-selected workspace. None is never replaced by cwd or home.
+    pub repo_root: Option<PathBuf>,
     /// Directory holding provider/model/policy config bundles.
     pub config_dir: PathBuf,
     /// Runtime-state directory for this repo: `<home>/state/projects/<id>/`.
@@ -25,7 +25,40 @@ pub struct Layout {
     home: LevelerHome,
 }
 
+/// No user-selected directory exists for this source.
+#[derive(Debug, Clone, Copy)]
+pub struct NoWorkspace;
+
+impl std::fmt::Display for NoWorkspace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("this session has no workspace; directory capabilities are unavailable")
+    }
+}
+impl std::error::Error for NoWorkspace {}
+
 impl Layout {
+    /// The persisted source's user-selected workspace, never its state directory.
+    pub fn primary_workspace(&self) -> Option<&Path> {
+        self.repo_root.as_deref()
+    }
+
+    /// Refuse directory-dependent operations rather than inventing a root.
+    pub fn require_workspace(&self) -> Result<&Path, NoWorkspace> {
+        self.primary_workspace().ok_or(NoWorkspace)
+    }
+
+    /// A workspace-free source using the same runtime implementation and an
+    /// independent application-owned state namespace. No project configuration
+    /// or process working directory is inherited.
+    pub fn no_workspace(home: LevelerHome, config_dir: Option<PathBuf>) -> Self {
+        Self {
+            repo_root: None,
+            config_dir: config_dir.unwrap_or_else(|| home.root().join("configs")),
+            state_dir: home.no_workspace_state_dir(),
+            home,
+        }
+    }
+
     /// Build a layout for `repo_root`, resolving the config directory.
     ///
     /// The config directory is taken from `config_dir_override`, else the
@@ -53,7 +86,7 @@ impl Layout {
         let state_dir = home.project_state_dir(&encode_repo_path(&repo_root));
         write_owner_marker_if_directory_exists(&state_dir, &repo_root);
         Self {
-            repo_root,
+            repo_root: Some(repo_root),
             config_dir,
             state_dir,
             home,
@@ -96,7 +129,7 @@ impl Layout {
         let state_dir = home.project_state_dir(&encode_repo_path(&repo_root));
         write_owner_marker_if_directory_exists(&state_dir, &repo_root);
         Self {
-            repo_root,
+            repo_root: Some(repo_root),
             config_dir,
             state_dir,
             home,
@@ -138,7 +171,10 @@ impl Layout {
     /// the short `run/sockets/` dir, keyed by the same 16-hex repo-path hash,
     /// so any process resolving the same repository derives the same endpoint.
     pub fn socket_path(&self) -> PathBuf {
-        let hash = path_hash(&self.repo_root.to_string_lossy());
+        let hash = match &self.repo_root {
+            Some(root) => path_hash(&root.to_string_lossy()),
+            None => path_hash("no-workspace"),
+        };
         self.home.sockets_dir().join(format!("{hash}.sock"))
     }
 
@@ -158,7 +194,7 @@ impl Layout {
                 .unwrap_or_else(|| state_dir.clone()),
         );
         Self {
-            repo_root,
+            repo_root: Some(repo_root),
             config_dir,
             state_dir,
             home,
@@ -363,6 +399,24 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn no_workspace_layout_has_independent_identity_and_never_inherits_a_root() {
+        let root = std::env::temp_dir().join(format!(
+            "leveler-unbound-layout-{}",
+            leveler_core::new_uuid_string()
+        ));
+        let home = LevelerHome::from_root(root.clone());
+        let unbound = Layout::no_workspace(home.clone(), None);
+        let project = Layout::ephemeral(root.join("repo"), None, &root);
+        assert!(unbound.primary_workspace().is_none());
+        assert!(unbound.require_workspace().is_err());
+        assert_eq!(unbound.state_dir, home.no_workspace_state_dir());
+        assert_ne!(unbound.state_dir, project.state_dir);
+        assert_ne!(unbound.socket_path(), project.socket_path());
+        assert!(!unbound.state_dir.join(REPOSITORY_OWNER_FILE).exists());
+        assert_eq!(unbound.config_dir, home.root().join("configs"));
+    }
+
     fn env_home(home: &str) -> leveler_core::EnvSnapshot {
         leveler_core::EnvSnapshot::new(
             [(
@@ -471,7 +525,7 @@ mod tests {
         // repo_root is canonicalized in resolve; recompute the hash from it.
         let expected = format!(
             "/home/x/.leveler/run/sockets/{}.sock",
-            path_hash(&layout.repo_root.to_string_lossy())
+            path_hash(&layout.repo_root.as_ref().unwrap().to_string_lossy())
         );
         assert_eq!(layout.socket_path(), PathBuf::from(expected));
     }

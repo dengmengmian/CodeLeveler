@@ -75,7 +75,11 @@ async fn main() -> anyhow::Result<()> {
     // environment. The home is removed when `main` returns.
     let home = leveler_project::EphemeralHome::create("tui-smoke")?;
     let layout = home.layout(repo, None);
-    let repo = layout.repo_root.display().to_string();
+    let repo = layout
+        .primary_workspace()
+        .expect("the smoke run always has a workspace")
+        .display()
+        .to_string();
     let app = Arc::new(Application::assemble(layout)?);
     let session_id = app
         .create_session(&model, "tui smoke / live campaign")
@@ -93,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     let snap = client.snapshot(&session_id).await?;
     println!(
-        "[snapshot] repo={} model={:?} vision={} models={} auto_deny={auto_deny}",
+        "[snapshot] repo={:?} model={:?} vision={} models={} auto_deny={auto_deny}",
         snap.repository,
         snap.model,
         snap.vision,

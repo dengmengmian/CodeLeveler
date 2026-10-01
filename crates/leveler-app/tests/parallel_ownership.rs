@@ -24,7 +24,7 @@ fn engine(db: &Database, runtime: &str) -> TaskEngine {
 async fn create_parallel_parent(engine: &TaskEngine) -> leveler_core::SessionId {
     engine
         .create_task(&NewSession {
-            workspace: "/repo".into(),
+            workspace: Some("/repo".into()),
             goal: "parallel goal".into(),
             model: "mock/m".into(),
             mode: "assisted".into(),

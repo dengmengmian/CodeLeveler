@@ -28,7 +28,12 @@ impl Executor {
     /// The roots declarative agents are read from.
     pub(crate) fn agent_roots(&self) -> AgentRoots {
         self.agent_roots.clone().unwrap_or_else(|| {
-            AgentRoots::for_project(self.tool_context.execution.workspace.root())
+            self.tool_context
+                .execution
+                .workspace
+                .as_ref()
+                .map(|workspace| AgentRoots::for_project(workspace.root()))
+                .unwrap_or_default()
         })
     }
 
@@ -106,7 +111,11 @@ impl Executor {
                 ));
             }
         }
-        let root = self.tool_context.execution.workspace.root();
+        let root = self
+            .tool_context
+            .require_workspace()
+            .map_err(|error| error.to_string())?
+            .root();
         // One resolved registry for every bound skill, built from this
         // execution's environment: the same answer `load_skill`, `$mention` and
         // `Agent.skills` see.

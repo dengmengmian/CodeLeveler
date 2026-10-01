@@ -754,8 +754,10 @@ async fn btw_accounts_for_side_history_and_only_folds_with_an_accepted_summary()
 }
 
 /// The `/btw` side surface exposes real read-only tools and no mutating tool
-/// or harness control. `find_references` and friends come from the same
-/// capability composition a normal turn uses, narrowed to the observe class.
+/// or harness control. A bounded side question has no capability loading
+/// protocol, so optional packs (`find_references` and friends) stay
+/// undisclosed — see `session_axes_resume.rs`
+/// `a_side_question_has_only_base_observation_tools`.
 #[tokio::test]
 async fn btw_side_surface_is_read_only_and_excludes_harness_controls() {
     let (_tmp, _server, app, _client, session) = harness(vec![]).await;
@@ -764,7 +766,6 @@ async fn btw_side_surface_is_read_only_and_excludes_harness_controls() {
             &ModelRef::new("mock", "m"),
             PermissionProfile::Assisted,
             false,
-            leveler_agent::WorkProfile::Balanced,
             Some(session.as_str()),
         )
         .await
@@ -780,7 +781,7 @@ async fn btw_side_surface_is_read_only_and_excludes_harness_controls() {
         "list_files",
         "find_files",
         "read_project_rules",
-        "find_references",
+        "get_task",
     ] {
         assert!(
             names.iter().any(|name| name == present),
@@ -942,6 +943,102 @@ async fn btw_can_call_a_read_only_tool_without_touching_the_main_task() {
         before_turns + 1,
         "only the explicit main turn creates a turn"
     );
+}
+
+/// A `/btw` status question must answer from the SAME authoritative runtime
+/// state the Background Tasks page renders: the task id, command, pid and its
+/// real retained stdout/stderr all reach the side request. An unbound
+/// historical log in the workspace is explicitly not current truth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn btw_reads_live_background_state_instead_of_stale_files() {
+    use leveler_execution::ProcessRequest;
+
+    let response = MockResponse::SilentThenJson {
+        silent_ms: 0,
+        body: serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "bg answered"}, "finish_reason": "stop"}]
+        })
+        .to_string(),
+    };
+    let (tmp, server, app, client, session) = harness(vec![response]).await;
+
+    // A live, session-owned background task keeps emitting real output.
+    let registry = app.background_tasks().clone();
+    let request = ProcessRequest::new(
+        "sh",
+        vec![
+            "-c".into(),
+            "printf 'live-stdout-marker\\n'; printf 'live-stderr-marker\\n' >&2; sleep 30".into(),
+        ],
+        tmp.path().to_path_buf(),
+    );
+    let task_id = registry
+        .spawn_owned(request, None, Some(session.as_str()))
+        .await
+        .expect("spawn background task");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = registry.get(&task_id).await.expect("task record");
+        if snap.log.contains("live-stdout-marker") && snap.log.contains("live-stderr-marker") {
+            assert!(snap.pid.is_some(), "the live snapshot must carry the pid");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no live output arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A stale, unbound artifact that must never be treated as current state.
+    std::fs::create_dir_all(tmp.path().join("tmp/run")).unwrap();
+    std::fs::write(
+        tmp.path().join("tmp/run/old.log"),
+        "fatal error: portal 404 (from an old commit)\n",
+    )
+    .unwrap();
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::Btw {
+            session_id: session.clone(),
+            question: "现在后台任务在输出什么？".into(),
+        })
+        .await
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            RuntimeEvent::BtwCompleted => break,
+            RuntimeEvent::BtwFailed { error } => panic!("{error}"),
+            _ => {}
+        }
+    }
+
+    let bodies = server.request_bodies().await;
+    assert_eq!(bodies.len(), 1, "one side request without a tool call");
+    let body = &bodies[0];
+    assert!(
+        body.contains(&task_id),
+        "the live task id must reach the side request: {body}"
+    );
+    assert!(body.contains("PID "), "the pid must reach it: {body}");
+    assert!(
+        body.contains("live-stdout-marker") && body.contains("live-stderr-marker"),
+        "the real retained stdout/stderr must reach it: {body}"
+    );
+    assert!(
+        body.contains("只读快照") && body.contains("历史资料"),
+        "provenance must travel with the facts: {body}"
+    );
+    assert!(
+        !body.contains("from an old commit"),
+        "an unbound historical file must not be injected as current state: {body}"
+    );
+    registry.kill(&task_id).await.expect("stop the task");
 }
 
 /// PR4 surface budget for `/btw`, measured from the request the provider
@@ -1172,9 +1269,11 @@ async fn btw_reports_an_unreachable_budget_instead_of_sending_it() {
         })
         .to_string(),
     };
-    // 4 096 reliable tokens against a read-only surface of ~2.9k: after a fold
-    // the fixed cost plus any retained tail still exceeds it.
-    let (_tmp, server, app, client, session) = harness(vec![response]).await;
+    // The read-only surface plus the `/btw` runtime projection is ~3.0k tokens;
+    // a 3 400 reliable budget leaves no room for a retained tail after a fold,
+    // so the side question must report that truth instead of sending it.
+    let (_tmp, server, app, client, session) =
+        harness_with_window(vec![response], 8_192, 3_400).await;
     let db = app.open_database().await.unwrap();
     let repo = MessageRepository::new(&db);
     let history: Vec<String> = (0..8)

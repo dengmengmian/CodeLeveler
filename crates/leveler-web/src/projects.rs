@@ -13,14 +13,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
 
 use leveler_client_protocol::ProjectStatus;
-use leveler_local_transport::LocalSocketRuntimeClient;
 use leveler_project::Layout;
+use leveler_runtime_host::{
+    EnsureOwnedError, OwnedRuntimeError, OwnedRuntimeLaunch, connect_existing_runtime,
+    ensure_owned_runtime,
+};
 
 use crate::router::RouterService;
 
@@ -368,7 +370,7 @@ impl ProjectManager {
             },
         );
         let socket = (self.socket_for)(&repo);
-        let status = match LocalSocketRuntimeClient::connect(&socket).await {
+        let status = match connect_existing_runtime(&socket).await {
             Ok(client) => {
                 self.router.add_daemon(repo.clone(), Arc::new(client)).await;
                 ProjectStatus::Online
@@ -382,54 +384,56 @@ impl ProjectManager {
     /// daemon and connect once it reports ready.
     async fn bring_online(&self, repo: &Path) -> Result<(), ProjectError> {
         let socket = (self.socket_for)(repo);
-        if let Ok(client) = LocalSocketRuntimeClient::connect(&socket).await {
-            self.router
-                .add_daemon(repo.to_path_buf(), Arc::new(client))
-                .await;
-            return Ok(());
-        }
-        let Some(exe) = &self.exe else {
-            return Err(ProjectError(format!(
-                "项目没有运行中的 daemon（{}），且当前环境无法代为启动",
-                socket.display()
-            )));
-        };
-        let ready_path = std::env::temp_dir().join(format!(
-            "leveler-web-ready-{}-{}.json",
-            std::process::id(),
-            path_nonce(repo)
-        ));
-        let _ = std::fs::remove_file(&ready_path);
-        let mut child = tokio::process::Command::new(exe)
-            .arg("--repo")
-            .arg(repo)
-            .arg("serve")
-            .arg("--ready-json")
-            .arg(&ready_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| ProjectError(format!("启动 daemon 失败：{error}")))?;
-
-        let socket = match wait_ready(&ready_path, &mut child).await {
-            Ok(socket) => socket,
-            Err(error) => {
-                let _ = child.start_kill();
-                return Err(error);
-            }
-        };
-        let _ = std::fs::remove_file(&ready_path);
-
-        let client = connect_with_retry(&socket).await.map_err(|error| {
-            let _ = child.start_kill();
-            ProjectError(format!("daemon 已就绪但连接失败：{error}"))
-        })?;
+        let ready_path = self.exe.as_ref().map(|_| {
+            std::env::temp_dir().join(format!(
+                "leveler-web-ready-{}-{}.json",
+                std::process::id(),
+                path_nonce(repo)
+            ))
+        });
+        let launch = self
+            .exe
+            .as_ref()
+            .zip(ready_path.as_ref())
+            .map(|(exe, ready_path)| OwnedRuntimeLaunch {
+                executable: exe,
+                ready_path,
+            });
+        let owned = ensure_owned_runtime(repo, &socket, launch)
+            .await
+            .map_err(|error| {
+                ProjectError(match error {
+                    EnsureOwnedError::NoLauncher { socket } => format!(
+                        "项目没有运行中的 daemon（{}），且当前环境无法代为启动",
+                        socket.display()
+                    ),
+                    EnsureOwnedError::Spawn(error) => format!("启动 daemon 失败：{error}"),
+                    EnsureOwnedError::Ready(error) => match error {
+                        OwnedRuntimeError::InvalidReadyJson(error) => {
+                            format!("无法解析 daemon 就绪信息：{error}")
+                        }
+                        OwnedRuntimeError::MissingSocket => {
+                            "daemon 就绪信息缺少 socket 字段".into()
+                        }
+                        OwnedRuntimeError::ChildExited(status) => {
+                            format!(
+                                "daemon 启动即退出（{status}）——多半是该仓库已有 daemon 或配置错误"
+                            )
+                        }
+                        OwnedRuntimeError::Timeout => "等待 daemon 就绪超时".into(),
+                    },
+                    EnsureOwnedError::Connect(error) => {
+                        format!("daemon 已就绪但连接失败：{error}")
+                    }
+                })
+            })?;
         self.router
-            .add_daemon(repo.to_path_buf(), Arc::new(client))
+            .add_daemon(repo.to_path_buf(), Arc::new(owned.client))
             .await;
 
+        let Some(child) = owned.child else {
+            return Ok(());
+        };
         // The monitor owns the child: it reaps a natural death as `offline`
         // and answers the manager's kill signal (remove / restart / shutdown).
         let (kill_tx, kill_rx) = oneshot::channel();
@@ -543,55 +547,6 @@ async fn historical_repositories(home: &Path, ephemeral_root: &Path) -> Vec<Path
     });
     repos.sort();
     repos
-}
-
-/// Wait for the daemon's readiness file and return the socket path it reports.
-/// A child that exits first fails fast with its status instead of burning the
-/// whole timeout.
-async fn wait_ready(
-    ready_path: &Path,
-    child: &mut tokio::process::Child,
-) -> Result<PathBuf, ProjectError> {
-    const READY_TIMEOUT: Duration = Duration::from_secs(20);
-    const POLL: Duration = Duration::from_millis(100);
-    let mut waited = Duration::ZERO;
-    loop {
-        if let Ok(bytes) = std::fs::read(ready_path) {
-            let ready: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|error| ProjectError(format!("无法解析 daemon 就绪信息：{error}")))?;
-            let socket = ready
-                .get("socket")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ProjectError("daemon 就绪信息缺少 socket 字段".to_string()))?;
-            return Ok(PathBuf::from(socket));
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(ProjectError(format!(
-                "daemon 启动即退出（{status}）——多半是该仓库已有 daemon 或配置错误"
-            )));
-        }
-        if waited >= READY_TIMEOUT {
-            return Err(ProjectError("等待 daemon 就绪超时".to_string()));
-        }
-        tokio::time::sleep(POLL).await;
-        waited += POLL;
-    }
-}
-
-/// The readiness file is written after the socket is bound, so the first
-/// attempt normally succeeds; the retries cover scheduler noise only.
-async fn connect_with_retry(
-    socket: &Path,
-) -> Result<LocalSocketRuntimeClient, leveler_local_transport::TransportError> {
-    let mut last = None;
-    for _ in 0..5 {
-        match LocalSocketRuntimeClient::connect(socket).await {
-            Ok(client) => return Ok(client),
-            Err(error) => last = Some(error),
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    Err(last.expect("at least one attempt ran"))
 }
 
 /// Own the spawned child until it dies or the manager asks for its death.

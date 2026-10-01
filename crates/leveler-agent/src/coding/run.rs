@@ -152,7 +152,7 @@ fn is_auto_replayable(
 /// they are the Coding completion gate's inputs, not runtime lifecycle.
 #[derive(Clone)]
 pub struct CodingTaskSpec {
-    pub repository: PathBuf,
+    pub repository: Option<PathBuf>,
     pub mode: PermissionProfile,
     pub sandbox: bool,
 }
@@ -1132,7 +1132,11 @@ impl CodingRuntime {
     pub async fn create_task(&self, spec: &TaskSpec) -> Result<SessionId, EngineError> {
         self.engine
             .create_task(&leveler_engine::NewSession {
-                workspace: spec.coding.repository.display().to_string(),
+                workspace: spec
+                    .coding
+                    .repository
+                    .as_ref()
+                    .map(|root| root.display().to_string()),
                 goal: spec.runtime.goal.clone(),
                 model: self.factory.model.to_string(),
                 mode: mode_str(spec.coding.mode).to_string(),
@@ -1140,7 +1144,6 @@ impl CodingRuntime {
                 kind: spec.runtime.kind,
                 axes: Some(leveler_engine::NewSessionAxes {
                     collaboration: "goal".to_string(),
-                    work_profile: "balanced".to_string(),
                 }),
             })
             .await
@@ -1529,7 +1532,7 @@ impl CodingRuntime {
                     session_id,
                     &result,
                     None,
-                    Some(&spec.coding.repository),
+                    spec.coding.repository.as_deref(),
                     observer,
                     &cancellation,
                 )
@@ -1593,7 +1596,7 @@ impl CodingRuntime {
             session_id,
             &result,
             Some(&goal),
-            Some(&spec.coding.repository),
+            spec.coding.repository.as_deref(),
             observer,
             &terminal_cancellation,
         )
@@ -1612,6 +1615,9 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
+        if let Some(capabilities) = &self.factory.capabilities {
+            capabilities.reset();
+        }
         // A chat turn tolerates the odd unreadable legacy row (it only loses
         // context), unlike resume which must reconstruct exactly.
         let raw = self.load_request_transcript(session_id, None, None).await?;
@@ -1697,7 +1703,14 @@ impl CodingRuntime {
                                 objective_hint.as_deref(),
                                 false,
                                 None,
-                                Some(&GitWorkspace::new(&spec.coding.repository)),
+                                spec.coding
+                                    .repository
+                                    .as_deref()
+                                    .map(GitWorkspace::new)
+                                    .as_ref()
+                                    .map(|workspace| {
+                                        workspace as &dyn crate::coding::checkpoint::WorkspaceFacts
+                                    }),
                                 &self.context_summarizer(
                                     session_id,
                                     &ports.budget_scope,
@@ -1722,7 +1735,10 @@ impl CodingRuntime {
                             self.engine.stores.events.clone(),
                             Some(crate::coding::checkpoint::CodingCheckpointContext::new(
                                 self.engine.clone(),
-                                Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
+                                spec.coding.repository.as_deref().map(|root| {
+                                    Arc::new(GitWorkspace::new(root))
+                                        as Arc<dyn crate::coding::checkpoint::WorkspaceFacts>
+                                }),
                             )),
                             ports,
                             cancellation.clone(),
@@ -1757,7 +1773,7 @@ impl CodingRuntime {
             session_id,
             &result,
             None,
-            Some(&spec.coding.repository),
+            spec.coding.repository.as_deref(),
             observer,
             &terminal_cancellation,
         )
@@ -1872,7 +1888,7 @@ impl CodingRuntime {
                         session_id,
                         &result,
                         None,
-                        Some(&spec.coding.repository),
+                        spec.coding.repository.as_deref(),
                         observer,
                         &cancellation,
                     )
@@ -1923,7 +1939,7 @@ impl CodingRuntime {
                 session_id,
                 &result,
                 None,
-                Some(&spec.coding.repository),
+                spec.coding.repository.as_deref(),
                 observer,
                 &cancellation,
             )
@@ -1947,7 +1963,7 @@ impl CodingRuntime {
                         session_id,
                         &result,
                         None,
-                        Some(&spec.coding.repository),
+                        spec.coding.repository.as_deref(),
                         observer,
                         &cancellation,
                     )
@@ -1966,6 +1982,11 @@ impl CodingRuntime {
         // Same rules as chat: a checkpoint's block when one is fresh, else the
         // snapshot merged with the post-snapshot rows, folded if still oversized.
         let prior_result = async {
+        if let Some(capabilities) = &self.factory.capabilities {
+            if let Some(goal) = &goal {
+                capabilities.bind_goal(self.engine.stores.goals.clone(), token.clone(), goal.clone()).await.map_err(EngineError::Config)?;
+            } else { capabilities.reset(); }
+        }
             let scope = lineage.goal_id.as_ref().map(|id| id.as_str()).unwrap_or(lineage.root_turn_id.as_str());
             let scoped = crate::coding::turn::persisted_budget_progress(self.engine.stores.events.as_ref(), session_id, scope).await?;
             let latest = crate::coding::turn::last_persisted_progress(self.engine.stores.events.as_ref(), session_id).await?.unwrap_or_default();
@@ -1982,7 +2003,7 @@ impl CodingRuntime {
                 Some(lineage.objective.text()),
                 true,
                 checkpoint_scope.as_ref(),
-                Some(&GitWorkspace::new(&spec.coding.repository)),
+                spec.coding.repository.as_deref().map(GitWorkspace::new).as_ref().map(|workspace| workspace as &dyn crate::coding::checkpoint::WorkspaceFacts),
                 &self.context_summarizer(session_id, lineage.goal_id.as_ref().map(|id| id.as_str()).unwrap_or(lineage.root_turn_id.as_str()), spec.runtime.limits, &cancellation),
                 &cancellation,
                 observer,
@@ -1998,7 +2019,7 @@ impl CodingRuntime {
                     session_id,
                     &result,
                     lineage.goal_id.as_ref(),
-                    Some(&spec.coding.repository),
+                    spec.coding.repository.as_deref(),
                     observer,
                     &cancellation,
                 )
@@ -2045,7 +2066,7 @@ impl CodingRuntime {
             session_id,
             &result,
             goal.as_ref(),
-            Some(&spec.coding.repository),
+            spec.coding.repository.as_deref(),
             observer,
             &terminal_cancellation,
         )
@@ -2242,7 +2263,10 @@ impl CodingRuntime {
                     self.engine.stores.events.clone(),
                     Some(crate::coding::checkpoint::CodingCheckpointContext::new(
                         self.engine.clone(),
-                        Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
+                        spec.coding.repository.as_deref().map(|root| {
+                            Arc::new(GitWorkspace::new(root))
+                                as Arc<dyn crate::coding::checkpoint::WorkspaceFacts>
+                        }),
                     )),
                     ports,
                     cancellation.clone(),
@@ -2346,7 +2370,10 @@ impl CodingRuntime {
                 return Ok(report);
             }
 
-            let diff = review_diff(&spec.coding.repository, &report.modified_files).await;
+            let diff = match spec.coding.repository.as_deref() {
+                Some(root) => review_diff(root, &report.modified_files).await,
+                None => None,
+            };
             let brief = crate::coding::develop::review_brief(
                 &goal,
                 &work_order,
@@ -2540,6 +2567,16 @@ impl CodingRuntime {
         observer: &mut (dyn FnMut(EngineEvent) + Send),
         cancellation: CancellationToken,
     ) -> Result<TaskReport, EngineError> {
+        if let Some(capabilities) = &self.factory.capabilities {
+            capabilities
+                .bind_goal(
+                    self.engine.stores.goals.clone(),
+                    runner.token.clone(),
+                    goal_id.clone(),
+                )
+                .await
+                .map_err(EngineError::Config)?;
+        }
         // Multi-turn Goal: inject bounded session history so follow-ups can
         // resolve deictic references ("刚才那个超时").
         let objective_text = content_objective_text(&task.content);
@@ -2549,7 +2586,7 @@ impl CodingRuntime {
                 &runner.session_id,
                 goal_id,
                 &objective_text,
-                Some(&spec.coding.repository),
+                spec.coding.repository.as_deref(),
                 spec.runtime.limits,
                 &cancellation,
                 observer,
@@ -2588,7 +2625,10 @@ impl CodingRuntime {
                         self.engine.stores.events.clone(),
                         Some(crate::coding::checkpoint::CodingCheckpointContext::new(
                             self.engine.clone(),
-                            Some(Arc::new(GitWorkspace::new(&spec.coding.repository))),
+                            spec.coding.repository.as_deref().map(|root| {
+                                Arc::new(GitWorkspace::new(root))
+                                    as Arc<dyn crate::coding::checkpoint::WorkspaceFacts>
+                            }),
                         )),
                         ports,
                         cancellation.clone(),
@@ -2727,7 +2767,10 @@ impl CodingRuntime {
         // leaves a breadcrumb instead of silence.
         log.append(None, stage(true, "launching", reason.clone()), observer)
             .await?;
-        let diff = review_diff(&spec.coding.repository, modified_files).await;
+        let diff = match spec.coding.repository.as_deref() {
+            Some(root) => review_diff(root, modified_files).await,
+            None => None,
+        };
         match run_harness_child(
             runner,
             &self.factory,

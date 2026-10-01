@@ -183,7 +183,7 @@ TUI 中点击底部的后台任务摘要（`↗`）打开列表，点击任务�
 
 ## 浏览器和网页搜索
 
-这些都是可选工具。只有当前工作配置允许、并且本机能够提供时，才会出现在模型的工具列表中。
+每个 goal 从基础编码工具开始。模型按需加载可选能力；运行时确认能力可用且权限允许后，对应工具才会进入模型的工具列表。
 
 - **Chrome、Edge 或 Chromium：** CodeLeveler 会启动独立的自动化会话。`browser_tab`、`browser_act` 和 `browser_inspect` 可以导航、交互，并读取 console、页面错误和网络记录。
 - **Safari：** 在 `~/.leveler/config.toml` 的 `[browser]` 下配置 `default = "safari"`，并打开 Safari Remote Automation。Safari 支持标签页和交互，但 WebDriver 后端不能提供 console、页面错误或网络检查。

@@ -65,7 +65,7 @@ impl Tool for ViewImageTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context.execution.workspace.resolve_for_read(&input.path)?;
+        let path = context.require_workspace()?.resolve_for_read(&input.path)?;
         // Check the size before reading, so a huge file is rejected instead of
         // pulled fully into memory first.
         match tokio::fs::metadata(&path).await {

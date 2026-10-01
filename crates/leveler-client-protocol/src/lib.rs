@@ -45,6 +45,7 @@ mod continuation;
 mod contribution;
 mod event;
 mod failure;
+mod global_tasks;
 mod goals;
 mod media;
 mod observability;
@@ -83,6 +84,10 @@ pub use event::{
     UiChildAgent, UiChildState, UiCommandStop, UiHistoryEntry, UiMemoryCandidate, UiMemoryEntry,
     UiMemoryKind, parse_runtime_event,
 };
+pub use global_tasks::{
+    UiGlobalTaskIndex, UiGlobalTaskSourceError, UiGlobalTaskSourceErrorKind, UiGlobalTaskSummary,
+    UiTaskStatus, UiTaskTerminal,
+};
 pub use goals::{UiGoalRecap, UiUnfinishedGoal};
 pub use media::{AttachmentId, AttachmentKind, AttachmentRef};
 pub use observability::{
@@ -102,7 +107,9 @@ pub use snapshot::{
     UiMessageKind, UiReasoningState, UiRole, UiSessionSnapshot, UiSessionSummary,
     UiTaskDeclaration, UiTurnBlocker, UiUserShell,
 };
-pub use version::{PROTOCOL_VERSION, ProtocolEnvelope, ProtocolError, ProtocolVersion};
+pub use version::{
+    PROTOCOL_VERSION, ProtocolCapability, ProtocolEnvelope, ProtocolError, ProtocolVersion,
+};
 pub use wire_types::{ApprovalDecision, ApprovalPolicy, PermissionProfile};
 
 #[cfg(feature = "testing")]

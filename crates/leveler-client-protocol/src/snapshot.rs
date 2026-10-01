@@ -63,6 +63,21 @@ mod tests {
     }
 
     #[test]
+    fn workspace_snapshot_distinguishes_none_from_legacy_repository() {
+        let legacy = serde_json::json!({"id":"s", "repository":"/repo", "goal":"g", "model":null, "mode":"assisted", "branch":null, "status":"idle", "messages":[]});
+        let snapshot: UiSessionSnapshot = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap()["repository"],
+            "/repo"
+        );
+        let mut absent = legacy;
+        absent["repository"] = serde_json::Value::Null;
+        let snapshot: UiSessionSnapshot = serde_json::from_value(absent)
+            .expect("No Workspace must decode without a fake repository");
+        assert!(serde_json::to_value(snapshot).unwrap()["repository"].is_null());
+    }
+
+    #[test]
     fn message_id_roundtrips_as_str() {
         let id = MessageId::new("msg-42");
         assert_eq!(id.as_str(), "msg-42");
@@ -111,7 +126,9 @@ mod tests {
     fn snapshot_carries_product_axes_when_set() {
         let mut snap = UiSessionSnapshot {
             id: crate::SessionId::new("s1"),
-            repository: "/repo".into(),
+            repository: Some("/repo".into()),
+            task_status: None,
+            task_terminal: None,
             goal: "g".into(),
             model: None,
             mode: crate::PermissionProfile::Assisted,
@@ -154,7 +171,9 @@ mod tests {
     fn snapshot_omits_reasoning_when_unset() {
         let snap = UiSessionSnapshot {
             id: crate::SessionId::new("s1"),
-            repository: "/repo".into(),
+            repository: Some("/repo".into()),
+            task_status: None,
+            task_terminal: None,
             goal: "g".into(),
             model: None,
             mode: crate::PermissionProfile::Assisted,
@@ -452,6 +471,10 @@ pub enum UiTaskDeclaration {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiSessionSummary {
     pub id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_status: Option<crate::UiTaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_terminal: Option<crate::UiTaskTerminal>,
     pub goal: String,
     pub status: String,
     /// Latest durable task declaration; absent for legacy or non-declaration endings.
@@ -480,6 +503,10 @@ pub struct UiActiveBackgroundTask {
     pub args: Vec<String>,
     /// Runtime-observed age at snapshot time.
     pub elapsed_ms: u64,
+    /// The process-group leader's OS pid, when known. Additive; older clients
+    /// decode it as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// One live background task that is keeping a runtime from becoming idle.
@@ -511,8 +538,12 @@ pub struct UiBackgroundTaskBlocker {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UiSessionSnapshot {
     pub id: SessionId,
-    pub repository: String,
+    pub repository: Option<String>,
     pub goal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_status: Option<crate::UiTaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_terminal: Option<crate::UiTaskTerminal>,
     pub model: Option<ModelRef>,
     pub mode: PermissionProfile,
     /// VCS branch, if the repository is a git repo.
@@ -570,20 +601,15 @@ pub struct UiSessionSnapshot {
     /// the model has no controllable effort knob (do not invent one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<UiReasoningState>,
-    /// Product work-profile axis (`economy | balanced`; legacy `delivery` reads
-    /// as `balanced`). The source
-    /// of truth is the session record (`SetProductAxes`); carried here so a
-    /// reconnecting client shows the axis the runtime will actually use
-    /// instead of a stale local guess. Absent on old runtimes.
+    /// Deprecated compatibility field. New runtimes emit `single`; historical
+    /// values never control tool exposure. Clients must not display a selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_profile: Option<String>,
-    /// Product collaboration axis (`chat | plan | goal`). Same contract as
-    /// `work_profile` — the runtime routes submits (goal) and restricts tools
-    /// (plan) from this value, so clients must not invent it.
+    /// Product collaboration axis (`chat | plan | goal`). The runtime routes
+    /// submissions and applies the read-only planning overlay from this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration: Option<String>,
-    /// Every delegated child of this session, oldest first, from the durable
-    /// record. Additive: absent on old runtimes.
+    /// Every delegated child of this session, oldest first, from durable storage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<crate::UiChildAgent>,
 }

@@ -85,10 +85,12 @@ fn boot() -> Boot {
     }
 }
 
-fn snapshot(id: &str, goal: &str, repo: &str, model: &str) -> UiSessionSnapshot {
+fn snapshot(id: &str, goal: &str, repo: Option<&str>, model: &str) -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new(id),
-        repository: repo.into(),
+        repository: repo.map(str::to_string),
+        task_status: None,
+        task_terminal: None,
         goal: goal.into(),
         model: leveler_client_protocol::ModelRef::parse(model),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
@@ -150,7 +152,7 @@ async fn replay_a_recorded_session() {
             session: snapshot(
                 &session.id,
                 &session.goal,
-                &session.repository,
+                session.repository.as_deref(),
                 &session.model,
             ),
         }),

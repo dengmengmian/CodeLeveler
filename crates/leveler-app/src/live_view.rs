@@ -125,7 +125,8 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
         | RuntimeEvent::TurnTruncated { .. }
         | RuntimeEvent::TurnIncomplete { .. }
         | RuntimeEvent::TurnFailed { .. }
-        | RuntimeEvent::TurnCancelled => {
+        | RuntimeEvent::TurnCancelled
+        | RuntimeEvent::TaskCancelled => {
             view.active_tools.clear();
             view.tool_started.clear();
             view.plan = None;
@@ -280,5 +281,41 @@ mod tests {
                 "terminal event left an active plan behind: {terminal:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod task_cancel_cleanup_tests {
+    use super::*;
+    #[test]
+    fn committed_task_cancellation_clears_running_chrome_for_reconnect() {
+        let views = LiveViews::default();
+        let session = SessionId::new("cancelled");
+        views.apply(
+            &session,
+            &RuntimeEvent::ToolCallStarted {
+                id: leveler_core::ToolCallId::new("call"),
+                name: "run_command".into(),
+                arguments: "{}".into(),
+                parallel: false,
+            },
+        );
+        views.apply(
+            &session,
+            &RuntimeEvent::PlanUpdated {
+                plan: UiPlan { steps: Vec::new() },
+            },
+        );
+        views.apply(
+            &session,
+            &RuntimeEvent::TurnFinalizing {
+                stage: FinalizationStage::ResolvingOutcome,
+            },
+        );
+        views.apply(&session, &RuntimeEvent::TaskCancelled);
+        let restored = views.view(&session);
+        assert!(restored.active_tools.is_empty());
+        assert!(restored.plan.is_none());
+        assert!(restored.finalization_stage.is_none());
     }
 }

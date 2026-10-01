@@ -160,7 +160,7 @@ function emptyAgents(): AgentsView {
 export interface SessionView {
   id: SessionId;
   title: string;
-  repository: string;
+  repository: string | null;
   branch: string | null;
   status: string;
   messages: ChatMessage[];
@@ -192,8 +192,6 @@ export interface SessionView {
   model: ModelRef | null;
   availableModels: ModelRef[];
   permission: PermissionProfile;
-  /** 产品轴（economy|balanced）；SoT 是 session record，snapshot 带回 */
-  workProfile: string;
   /** 产品轴（chat|plan|goal）；goal 时 runtime 把普通提交路由成 goal turn */
   collaboration: string;
   /** runtime 决议后的 reasoning effort（snapshot.reasoning.effective），只展示不发明 */
@@ -223,7 +221,7 @@ export interface AppState {
   /** true = 空状态 hero（新对话，尚未建会话） */
   draft: boolean;
   /** 当前 runtime 的仓库路径（分组回退值 + hero 项目选择器） */
-  repository: string;
+  repository: string | null;
   /** 中央主区域视图（对话 / 改动 / Execution 占位） */
   stageView: StageView;
   /** Single-sidebar destination. Independent of workspace tabs. */
@@ -262,7 +260,7 @@ export const initialState: AppState = {
   sessions: [],
   current: null,
   draft: true,
-  repository: '',
+  repository: null,
   stageView: 'chat',
   railNav: 'sessions',
   workspaceSection: 'files',
@@ -359,7 +357,7 @@ export type Action =
   | { type: 'queue_move'; id: string; dir: -1 | 1 }
   | { type: 'set_permission'; mode: PermissionProfile }
   | { type: 'set_model'; model: ModelRef }
-  | { type: 'set_axes'; workProfile: string; collaboration: string }
+  | { type: 'set_axes'; collaboration: string }
   | { type: 'agent_activity'; label: string }
   | { type: 'attachment_added'; attachment: AttachmentRef }
   | { type: 'attachment_removed'; id: string }
@@ -419,7 +417,7 @@ function viewFromSnapshot(
   return {
     id: snap.id,
     title: snap.goal || '未命名会话',
-    repository: snap.repository,
+    repository: snap.repository ?? null,
     branch: snap.branch ?? null,
     status: snap.status,
     messages,
@@ -449,7 +447,6 @@ function viewFromSnapshot(
     availableModels: snap.available_models ?? [],
     permission: snap.mode,
     // 轴的 SoT 是 session record；老 runtime 不带字段时保留本地值 / 回退默认。
-    workProfile: snap.work_profile ?? (sameSession ? prev.workProfile : 'balanced'),
     collaboration: snap.collaboration ?? (sameSession ? prev.collaboration : 'chat'),
     // reasoning.effective 缺席 = 老 runtime（保留旧值）；present but null =
     // 模型没有可控档位（就是 null，不发明）。
@@ -531,14 +528,13 @@ function markBusy(current: SessionView): void {
 
 /** TUI `apply_meta`: header fields only. Does not touch transcript, tools, agents, lastTurn. */
 function applySessionMeta(current: SessionView, snap: UiSessionSnapshot): void {
-  current.repository = snap.repository;
+  current.repository = snap.repository ?? null;
   current.branch = snap.branch ?? null;
   current.model = snap.model ?? null;
   current.availableModels = snap.available_models ?? [];
   current.permission = snap.mode;
   if (snap.status) current.status = snap.status;
   if (snap.goal) current.title = snap.goal || current.title;
-  if (snap.work_profile) current.workProfile = snap.work_profile;
   if (snap.collaboration) current.collaboration = snap.collaboration;
   if (snap.reasoning !== undefined && snap.reasoning !== null) {
     current.reasoningEffort = snap.reasoning.effective ?? null;
@@ -593,19 +589,15 @@ export function reducer(state: AppState, action: Action): void {
       const view = viewFromSnapshot(action.session, state.current, action.contextWindow);
       state.current = view;
       state.draft = false;
-      if (view.repository) {
-        state.repository = view.repository;
-        state.selectedProject = view.repository;
-      }
+      state.repository = view.repository;
+      state.selectedProject = view.repository;
       return;
     }
     case 'session_meta': {
       if (!state.current || state.current.id !== action.session.id) return;
       applySessionMeta(state.current, action.session);
-      if (state.current.repository) {
-        state.repository = state.current.repository;
-        state.selectedProject = state.current.repository;
-      }
+      state.repository = state.current.repository;
+      state.selectedProject = state.current.repository;
       return;
     }
     case 'select_project':
@@ -1038,7 +1030,6 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'set_axes':
       if (state.current) {
-        state.current.workProfile = action.workProfile;
         state.current.collaboration = action.collaboration;
       }
       return;

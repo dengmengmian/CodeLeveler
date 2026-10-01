@@ -31,8 +31,12 @@ pub enum AuthorizationEvidence {
 /// The immutable policy an admitted call executes under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedExecutionPolicy {
-    /// The one write boundary. A session grant or a rule never widens it —
-    /// they only skip the prompt.
+    /// The one write boundary. A session grant or a rule never widens it on
+    /// its own — they only skip the prompt — but the boundary a Git call
+    /// carries is derived from that call's own mechanical EFFECTS (a command
+    /// that writes repository metadata runs with the repository's `.git`
+    /// unsealed), and the same derivation applies however the call was
+    /// authorized. See `executor::host::resolve_policy`.
     pub write: WriteScope,
     pub network_allowed: bool,
     pub authorization: AuthorizationEvidence,

@@ -15,4 +15,4 @@ pub use config::{
     VerifySpec,
 };
 pub use detect::{Language, detect_languages};
-pub use layout::{EphemeralHome, Layout};
+pub use layout::{EphemeralHome, Layout, NoWorkspace};

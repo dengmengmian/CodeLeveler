@@ -295,11 +295,13 @@ impl Tool for ApplyPatchTool {
         for change in changes {
             match change {
                 FileChange::Add { path, content } => {
-                    let resolved =
-                        match context.execution.workspace.resolve_for_write(&path, &scope) {
-                            Ok(p) => p,
-                            Err(e) => return Ok(ToolOutput::error(e.to_string())),
-                        };
+                    let resolved = match context
+                        .require_workspace()?
+                        .resolve_for_write(&path, &scope)
+                    {
+                        Ok(p) => p,
+                        Err(e) => return Ok(ToolOutput::error(e.to_string())),
+                    };
                     match tokio::fs::symlink_metadata(&resolved).await {
                         Ok(_) => {
                             return Ok(ToolOutput::error(format!(
@@ -320,11 +322,13 @@ impl Tool for ApplyPatchTool {
                     modified.push(path);
                 }
                 FileChange::Delete { path } => {
-                    let resolved =
-                        match context.execution.workspace.resolve_for_write(&path, &scope) {
-                            Ok(p) => p,
-                            Err(e) => return Ok(ToolOutput::error(e.to_string())),
-                        };
+                    let resolved = match context
+                        .require_workspace()?
+                        .resolve_for_write(&path, &scope)
+                    {
+                        Ok(p) => p,
+                        Err(e) => return Ok(ToolOutput::error(e.to_string())),
+                    };
                     let expected = match tokio::fs::read_to_string(&resolved).await {
                         Ok(content) => content,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -354,11 +358,13 @@ impl Tool for ApplyPatchTool {
                     move_to,
                     chunks,
                 } => {
-                    let resolved =
-                        match context.execution.workspace.resolve_for_write(&path, &scope) {
-                            Ok(p) => p,
-                            Err(e) => return Ok(ToolOutput::error(e.to_string())),
-                        };
+                    let resolved = match context
+                        .require_workspace()?
+                        .resolve_for_write(&path, &scope)
+                    {
+                        Ok(p) => p,
+                        Err(e) => return Ok(ToolOutput::error(e.to_string())),
+                    };
                     let existing = match tokio::fs::read_to_string(&resolved).await {
                         Ok(s) => s,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -402,8 +408,7 @@ impl Tool for ApplyPatchTool {
                     match move_to {
                         Some(dest) => {
                             let dest_resolved = match context
-                                .execution
-                                .workspace
+                                .require_workspace()?
                                 .resolve_for_write(&dest, &scope)
                             {
                                 Ok(p) => p,
@@ -520,7 +525,7 @@ impl Tool for ApplyPatchTool {
         // like an outside change to its next patch. A path we can no longer read
         // was deleted here; forget it so a recreated file starts clean.
         for rel in &modified {
-            match context.execution.workspace.resolve_for_read(rel) {
+            match context.require_workspace()?.resolve_for_read(rel) {
                 Ok(resolved) => match tokio::fs::read(&resolved).await {
                     Ok(bytes) => context.execution.file_state.record(rel, &bytes),
                     Err(_) => context.execution.file_state.forget(rel),
@@ -995,7 +1000,11 @@ mod tests {
         // The commit path resolves against the canonical workspace root. Use
         // that exact path here as well so macOS `/var` -> `/private/var`
         // canonicalization cannot make this test lock a different file.
-        let second_resolved = context.execution.workspace.root().join("src/second.rs");
+        let second_resolved = context
+            .require_workspace()
+            .unwrap()
+            .root()
+            .join("src/second.rs");
         let lock_path = leveler_project::layout::target_lock_path(
             &context.execution.environment,
             &second_resolved,
@@ -1108,7 +1117,11 @@ mod tests {
         // uncanonicalized `dir`-based path produced a different lock file, the
         // tool never blocked, and this test raced its own external writes
         // (~40% failures under load).
-        let second_resolved = context.execution.workspace.root().join("src/second.rs");
+        let second_resolved = context
+            .require_workspace()
+            .unwrap()
+            .root()
+            .join("src/second.rs");
         let lock_path = leveler_project::layout::target_lock_path(
             &context.execution.environment,
             &second_resolved,
@@ -1196,7 +1209,11 @@ mod tests {
 
         // Same canonical-root derivation as the clobber test above: the lock
         // is only a lock if it hashes the path the commit path hashes.
-        let second_resolved = context.execution.workspace.root().join("src/second.rs");
+        let second_resolved = context
+            .require_workspace()
+            .unwrap()
+            .root()
+            .join("src/second.rs");
         let lock_path = leveler_project::layout::target_lock_path(
             &context.execution.environment,
             &second_resolved,

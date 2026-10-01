@@ -65,7 +65,9 @@ impl InteractiveRuntimeClient for WatchedRuntime {
     async fn snapshot(&self, session_id: &SessionId) -> Result<UiSessionSnapshot, ClientError> {
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
-            repository: "/repo".to_string(),
+            repository: Some("/repo".to_string()),
+            task_status: None,
+            task_terminal: None,
             goal: String::new(),
             model: None,
             mode: PermissionProfile::RequestApproval,

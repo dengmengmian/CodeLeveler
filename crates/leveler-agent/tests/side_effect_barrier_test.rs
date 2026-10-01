@@ -174,6 +174,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
         steering: None,
         allow_delegation: true,
+        allow_host_input: true,
+        capabilities: None,
         independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         develop_model: None,
     };

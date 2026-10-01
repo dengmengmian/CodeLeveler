@@ -66,7 +66,9 @@ fn opened(goal: &str) -> AppState {
     );
     let snap = UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "~/Develop/navsvc".into(),
+        repository: Some("~/Develop/navsvc".into()),
+        task_status: None,
+        task_terminal: None,
         goal: goal.into(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/deepseek-v4-flash"),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
@@ -679,7 +681,9 @@ fn s10_resume() {
     let mut s = opened("继续之前的退款审计任务");
     let snap = UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "~/Develop/navsvc".into(),
+        repository: Some("~/Develop/navsvc".into()),
+        task_status: None,
+        task_terminal: None,
         goal: "给 navsvc 加一条端到端的退款审计链路".into(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/deepseek-v4-flash"),
         mode: leveler_client_protocol::PermissionProfile::Assisted,

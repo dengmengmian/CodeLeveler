@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use leveler_client_protocol::{
     ApprovalPolicy, ClientCommand, ClientError, InteractiveRuntimeClient, ModelRef,
     PermissionProfile, ProtocolError, RuntimeEvent, SessionId, UiSessionSnapshot,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use leveler_client_protocol::{CommandEnvelope, ProtocolEnvelope};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -86,9 +86,23 @@ pub trait RuntimeReviver: Send + Sync {
     async fn revive(&self) -> Result<(), String>;
 }
 
+/// Omitted legacy selection inherits only the connected runtime's workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CreateWorkspaceSelection {
+    #[default]
+    RuntimeDefault,
+    None,
+    Workspace {
+        path: String,
+    },
+}
+
 /// Everything the daemon needs to create a new interactive session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
+    #[serde(default)]
+    pub workspace: CreateWorkspaceSelection,
     pub goal: String,
     pub model: Option<ModelRef>,
     pub mode: PermissionProfile,
@@ -121,6 +135,11 @@ pub struct AttachmentBytes {
 /// contract when a daemon owns session creation.
 #[async_trait]
 pub trait LocalRuntimeService: InteractiveRuntimeClient {
+    /// A no-workspace source may only serve peers that negotiated nullable snapshots.
+    fn has_primary_workspace(&self) -> bool {
+        true
+    }
+
     async fn create_session(
         &self,
         request: CreateSessionRequest,
@@ -202,7 +221,7 @@ pub enum TransportError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum WireRequest {
     Ping,
     Send(ClientCommand),
@@ -219,6 +238,13 @@ enum WireRequest {
         /// TCP connection is normalized to `Interactive` at the daemon boundary
         /// (see `handle_connection`). Set by the connecting client, never from a
         /// relayed body, so a remote peer cannot spoof it.
+        #[serde(default)]
+        client_kind: ClientKind,
+    },
+    /// Explicit workspace selection has a distinct verb so an older daemon
+    /// cannot ignore the new request field and create in its default repository.
+    CreateSessionSelected {
+        request: CreateSessionRequest,
         #[serde(default)]
         client_kind: ClientKind,
     },
@@ -252,7 +278,7 @@ enum WireRequest {
     },
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl WireRequest {
     /// Whether this request may be replayed after a transport failure whose
     /// outcome is unknown. Reads (Ping/Snapshot/LocalWaiters/RuntimeInfo)
@@ -275,6 +301,7 @@ impl WireRequest {
             | WireRequest::Deliver(_) => true,
             WireRequest::Send(_)
             | WireRequest::CreateSession { .. }
+            | WireRequest::CreateSessionSelected { .. }
             | WireRequest::Subscribe { .. } => false,
         }
     }
@@ -282,7 +309,7 @@ impl WireRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "body", rename_all = "snake_case")]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum WireResponse {
     Ack,
     Snapshot(UiSessionSnapshot),
@@ -298,7 +325,7 @@ enum WireResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct WireError {
     message: String,
     session_id: Option<SessionId>,
@@ -314,7 +341,7 @@ struct WireError {
     ownership_conflict: bool,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl From<ClientError> for WireError {
     fn from(error: ClientError) -> Self {
         match error {
@@ -357,7 +384,7 @@ impl From<ClientError> for WireError {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl WireError {
     fn into_client_error(self) -> ClientError {
         match self.session_id {
@@ -374,16 +401,17 @@ impl WireError {
 /// before any request is read. Unix-socket clients skip this — the socket file's
 /// `0600` permission is the trust boundary there; a TCP listener has none.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Handshake {
     token: String,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-#[cfg(unix)]
-mod unix {
+#[cfg(any(unix, windows))]
+mod transport {
+    #[cfg(unix)]
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -392,11 +420,23 @@ mod unix {
     use std::net::SocketAddr;
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+    #[cfg(windows)]
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer};
+    use tokio::net::{TcpListener, TcpStream};
+    #[cfg(unix)]
+    use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::broadcast;
     use tokio_util::either::Either;
 
     use super::*;
+    #[cfg(windows)]
+    mod windows_adapter {
+        include!("windows.rs");
+    }
+    #[cfg(windows)]
+    pub use windows_adapter::LocalSocketServer;
+    #[cfg(windows)]
+    use windows_adapter::connect_windows;
 
     async fn write_frame<T: Serialize>(
         writer: &mut (impl AsyncWrite + Unpin),
@@ -457,10 +497,33 @@ mod unix {
         // trusted to grant AutoApprove, whatever `ClientKind` it declares.
         transport_trusted: bool,
     ) -> Result<(), TransportError> {
-        let request = read_frame::<WireRequest>(&mut stream).await?.into_body()?;
+        let envelope = read_frame::<WireRequest>(&mut stream).await?;
+        let understands_optional_workspace = envelope
+            .capabilities
+            .contains(&leveler_client_protocol::ProtocolCapability::OptionalWorkspace);
+        let request = envelope.into_body()?;
+        if !runtime.has_primary_workspace() && !understands_optional_workspace {
+            return send_result(
+                &mut stream,
+                Err(ClientError::Runtime(
+                    "this source requires the optional_workspace protocol capability".into(),
+                )),
+            )
+            .await;
+        }
         match request {
             WireRequest::Ping => send_response(&mut stream, WireResponse::Ack).await,
             WireRequest::Send(command) => {
+                if !transport_trusted && matches!(&command, ClientCommand::QueryGlobalTasks { .. })
+                {
+                    return send_result(
+                        &mut stream,
+                        Err(ClientError::Runtime(
+                            "global tasks require trusted local access".into(),
+                        )),
+                    )
+                    .await;
+                }
                 if matches!(&command, ClientCommand::Quit) {
                     return send_result(
                         &mut stream,
@@ -477,6 +540,20 @@ mod unix {
                 .await
             }
             WireRequest::Deliver(envelope) => {
+                if !transport_trusted
+                    && matches!(
+                        &envelope.body.command,
+                        ClientCommand::QueryGlobalTasks { .. }
+                    )
+                {
+                    return send_result(
+                        &mut stream,
+                        Err(ClientError::Runtime(
+                            "global tasks require trusted local access".into(),
+                        )),
+                    )
+                    .await;
+                }
                 if matches!(&envelope.body.command, ClientCommand::Quit) {
                     return send_result(
                         &mut stream,
@@ -506,6 +583,10 @@ mod unix {
                 .await
             }
             WireRequest::CreateSession {
+                mut request,
+                client_kind,
+            }
+            | WireRequest::CreateSessionSelected {
                 mut request,
                 client_kind,
             } => {
@@ -626,8 +707,10 @@ mod unix {
                 // Held for exactly as long as this subscription is served, so
                 // a client that dies without closing still decrements.
                 let _waiter = match client_kind {
-                    ClientKind::LocalInteractive => Some(local_waiters.attach()),
-                    ClientKind::Remote => None,
+                    ClientKind::LocalInteractive if transport_trusted => {
+                        Some(local_waiters.attach())
+                    }
+                    _ => None,
                 };
                 let mut events = match session_id {
                     Some(session_id) => runtime.subscribe_session(&session_id),
@@ -647,6 +730,7 @@ mod unix {
                         // EOF, an error, or unexpected data all mean "done".
                         _ = reader.read_u8() => return Ok(()),
                         event = events.recv() => match event {
+                            Ok(RuntimeEvent::GlobalTasksLoaded { .. }) if !transport_trusted || client_kind == ClientKind::Remote => continue,
                             Ok(event) => send_response(&mut writer, WireResponse::Event(event)).await?,
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "local socket event subscriber lagged");
@@ -664,6 +748,7 @@ mod unix {
     }
 
     /// A bound local runtime server.
+    #[cfg(unix)]
     pub struct LocalSocketServer {
         path: PathBuf,
         socket_device: u64,
@@ -681,6 +766,7 @@ mod unix {
         _lock: std::fs::File,
     }
 
+    #[cfg(unix)]
     impl Drop for LocalSocketServer {
         fn drop(&mut self) {
             let metadata = match std::fs::symlink_metadata(&self.path) {
@@ -706,6 +792,7 @@ mod unix {
         }
     }
 
+    #[cfg(unix)]
     impl LocalSocketServer {
         pub async fn bind(
             path: impl AsRef<Path>,
@@ -842,7 +929,11 @@ mod unix {
             path: impl AsRef<Path>,
             client_kind: ClientKind,
         ) -> Result<Self, TransportError> {
-            Self::open(Endpoint::Unix(path.as_ref().to_path_buf()), client_kind).await
+            #[cfg(unix)]
+            let endpoint = Endpoint::Unix(path.as_ref().to_path_buf());
+            #[cfg(windows)]
+            let endpoint = Endpoint::Windows(path.as_ref().to_path_buf());
+            Self::open(endpoint, client_kind).await
         }
 
         /// Connect to a loopback TCP daemon, authenticating with the bearer token
@@ -975,10 +1066,19 @@ mod unix {
             request: CreateSessionRequest,
         ) -> Result<SessionBootstrap, ClientError> {
             match self
-                .request(WireRequest::CreateSession {
-                    request,
-                    client_kind: self.client_kind,
-                })
+                .request(
+                    if request.workspace == CreateWorkspaceSelection::RuntimeDefault {
+                        WireRequest::CreateSession {
+                            request,
+                            client_kind: self.client_kind,
+                        }
+                    } else {
+                        WireRequest::CreateSessionSelected {
+                            request,
+                            client_kind: self.client_kind,
+                        }
+                    },
+                )
                 .await
                 .map_err(transport_client_error)?
             {
@@ -1088,6 +1188,11 @@ mod unix {
     #[async_trait]
     impl InteractiveRuntimeClient for LocalSocketRuntimeClient {
         async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+            if self.client_kind == ClientKind::Remote
+                && matches!(&command, ClientCommand::QueryGlobalTasks { .. })
+            {
+                return Err(ClientError::Runtime("global tasks are local-only".into()));
+            }
             if let ClientCommand::OpenSession { session_id }
             | ClientCommand::OpenSessionFor { session_id, .. } = &command
             {
@@ -1110,6 +1215,11 @@ mod unix {
         }
 
         async fn deliver(&self, envelope: CommandEnvelope) -> Result<(), ClientError> {
+            if self.client_kind == ClientKind::Remote
+                && matches!(&envelope.command, ClientCommand::QueryGlobalTasks { .. })
+            {
+                return Err(ClientError::Runtime("global tasks are local-only".into()));
+            }
             match self
                 .request(WireRequest::Deliver(ProtocolEnvelope::wrap(envelope)))
                 .await
@@ -1190,18 +1300,30 @@ mod unix {
     /// `0600` perms; a TCP client presents a bearer token on every connection.
     #[derive(Clone)]
     enum Endpoint {
+        #[cfg(unix)]
         Unix(PathBuf),
-        Tcp { addr: SocketAddr, token: Arc<str> },
+        #[cfg(windows)]
+        Windows(PathBuf),
+        Tcp {
+            addr: SocketAddr,
+            token: Arc<str>,
+        },
     }
 
     /// One connection over either transport. `Either` yields a single concrete
     /// type that impls AsyncRead + AsyncWrite for both stream kinds.
+    #[cfg(unix)]
     type ClientStream = Either<UnixStream, TcpStream>;
+    #[cfg(windows)]
+    type ClientStream = Either<NamedPipeClient, TcpStream>;
 
     /// Open (and, for TCP, authenticate) one connection to the endpoint.
     async fn connect_endpoint(endpoint: &Endpoint) -> Result<ClientStream, TransportError> {
         match endpoint {
+            #[cfg(unix)]
             Endpoint::Unix(path) => Ok(Either::Left(UnixStream::connect(path).await?)),
+            #[cfg(windows)]
+            Endpoint::Windows(path) => Ok(Either::Left(connect_windows(path).await?)),
             Endpoint::Tcp { addr, token } => {
                 let mut stream = TcpStream::connect(addr).await?;
                 write_frame(
@@ -1527,12 +1649,12 @@ mod unix {
     }
 }
 
-#[cfg(all(unix, test))]
-pub(crate) use unix::tcp_request;
-#[cfg(unix)]
-pub use unix::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
+#[cfg(all(any(unix, windows), test))]
+pub(crate) use transport::tcp_request;
+#[cfg(any(unix, windows))]
+pub use transport::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod unsupported {
     use tokio::sync::broadcast;
 
@@ -1678,10 +1800,10 @@ mod unsupported {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub use unsupported::{LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer};
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -1718,7 +1840,9 @@ mod tests {
                 last_attach: Mutex::new(None),
                 snapshot: Arc::new(Mutex::new(UiSessionSnapshot {
                     id: SessionId::new("s1"),
-                    repository: "/repo".to_string(),
+                    repository: Some("/repo".to_string()),
+                    task_status: None,
+                    task_terminal: None,
                     goal: "interactive session".to_string(),
                     model: Some(ModelRef::new("mock", "m")),
                     mode: PermissionProfile::Assisted,
@@ -1792,6 +1916,9 @@ mod tests {
 
     #[async_trait]
     impl LocalRuntimeService for TestRuntime {
+        fn has_primary_workspace(&self) -> bool {
+            self.snapshot.lock().unwrap().repository.is_some()
+        }
         async fn attach_session_policy(
             &self,
             _session_id: &SessionId,
@@ -1848,6 +1975,188 @@ mod tests {
         (bound, runtime, shutdown)
     }
 
+    #[test]
+    fn omitted_workspace_selection_remains_distinct_from_explicit_none() {
+        let legacy = serde_json::json!({"goal":"chat", "model":null, "mode":"assisted"});
+        let request: CreateSessionRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(request.workspace, CreateWorkspaceSelection::RuntimeDefault);
+        let mut explicit = legacy;
+        explicit["workspace"] = serde_json::json!({"kind":"none"});
+        let request: CreateSessionRequest = serde_json::from_value(explicit).unwrap();
+        assert_eq!(request.workspace, CreateWorkspaceSelection::None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_none_cannot_be_silently_downgraded_by_legacy_daemon() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = creates.clone();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server = tokio::spawn(async move {
+            let mut subscriptions = Vec::new();
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = stop.cancelled() => return,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let length = stream.read_u32().await.unwrap() as usize;
+                let mut bytes = vec![0; length];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let kind = request["body"]["type"].as_str().unwrap();
+                // This predates workspace selection: unknown request variants
+                // are refused, while unknown fields of CreateSession were ignored.
+                let response = match kind {
+                    "subscribe" => serde_json::json!({"type":"ack"}),
+                    "create_session" => {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        serde_json::json!({"type":"session_created","body":{"session":TestRuntime::new().snapshot.lock().unwrap().clone(),"context_window":128000}})
+                    }
+                    _ => {
+                        serde_json::json!({"type":"error","body":{"message":"unsupported legacy request","session_id":null}})
+                    }
+                };
+                let reply = serde_json::to_vec(
+                    &serde_json::json!({"protocol":{"major":1,"minor":12},"body":response}),
+                )
+                .unwrap();
+                stream.write_u32(reply.len() as u32).await.unwrap();
+                stream.write_all(&reply).await.unwrap();
+                if kind == "subscribe" {
+                    subscriptions.push(stream);
+                }
+            }
+        });
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let result = client
+            .create_session(CreateSessionRequest {
+                workspace: CreateWorkspaceSelection::None,
+                goal: "without workspace".into(),
+                model: None,
+                mode: PermissionProfile::Assisted,
+                approval_policy: ApprovalPolicy::Interactive,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "legacy daemon must never claim a repository session fulfilled None"
+        );
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn snapshot_with_capability(workspace: bool, capable: bool) -> serde_json::Value {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capability.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        if !workspace {
+            runtime.snapshot.lock().unwrap().repository = None;
+        }
+        let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let mut envelope = serde_json::json!({"protocol":{"major":1,"minor":12},"body":{"type":"snapshot","body":{"session_id":"s1"}}});
+        if capable {
+            envelope["capabilities"] = serde_json::json!(["optional_workspace"]);
+        }
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        stream.write_u32(bytes.len() as u32).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        let len = stream.read_u32().await.unwrap() as usize;
+        let mut response = vec![0; len];
+        stream.read_exact(&mut response).await.unwrap();
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&response).unwrap()["body"].clone()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_capability_gate_preserves_legacy_repo_and_requires_opt_in_for_none() {
+        for capable in [false, true] {
+            let repo = snapshot_with_capability(true, capable).await;
+            assert_eq!(repo["type"], "snapshot");
+            assert_eq!(repo["body"]["repository"], "/repo");
+        }
+        let no_workspace = snapshot_with_capability(false, true).await;
+        assert_eq!(no_workspace["type"], "snapshot");
+        assert!(no_workspace["body"]["repository"].is_null());
+        let rejected = snapshot_with_capability(false, false).await;
+        assert_eq!(rejected["type"], "error");
+        assert!(
+            rejected["body"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("optional_workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_global_task_access_is_refused_and_local_answers_are_not_broadcast() {
+        let (addr, runtime, shutdown) = tcp_server("global-token").await;
+        let client = LocalSocketRuntimeClient::connect_tcp(addr, "global-token")
+            .await
+            .unwrap();
+        let session = SessionId::new("s1");
+        let command = ClientCommand::QueryGlobalTasks {
+            requester_session_id: session.clone(),
+            query_id: "global".into(),
+            include_archived: false,
+        };
+        assert!(
+            client
+                .send(command.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trusted local")
+        );
+        assert!(
+            client
+                .deliver(CommandEnvelope {
+                    command_id: leveler_client_protocol::CommandId::new("global-tcp"),
+                    session_id: session.clone(),
+                    expected_version: None,
+                    issued_at: "now".into(),
+                    command,
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trusted local")
+        );
+        assert!(runtime.commands.lock().unwrap().is_empty());
+        assert!(runtime.deliveries.lock().unwrap().is_empty());
+        client.snapshot(&session).await.unwrap();
+        let mut events = client.subscribe_session(&session);
+        runtime
+            .events
+            .send(RuntimeEvent::GlobalTasksLoaded {
+                requester_session_id: session,
+                query_id: "local-query".into(),
+                index: Default::default(),
+            })
+            .unwrap();
+        runtime.events.send(RuntimeEvent::TurnAnswered).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            RuntimeEvent::TurnAnswered
+        ));
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn tcp_daemon_serves_a_request_after_a_correct_token() {
         let (addr, _runtime, shutdown) = tcp_server("s3cret-token").await;
@@ -1856,6 +2165,7 @@ mod tests {
             "s3cret-token",
             WireRequest::CreateSession {
                 request: CreateSessionRequest {
+                    workspace: CreateWorkspaceSelection::RuntimeDefault,
                     approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                     goal: "tcp session".to_string(),
                     model: None,
@@ -1870,6 +2180,7 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_binds_on_a_stale_socket_elect_exactly_one_server() {
         // Leave a stale socket file behind (dead daemon): every contender
@@ -1967,6 +2278,7 @@ mod tests {
     /// A reviver that performs a REAL ensure: binds a fresh LocalSocketServer
     /// for the same path and serves it. Called only by the client's genuine
     /// failure paths — the test itself never restarts anything.
+    #[cfg(unix)]
     struct TestReviver {
         path: PathBuf,
         runtime: Arc<TestRuntime>,
@@ -1974,6 +2286,7 @@ mod tests {
         shutdown: CancellationToken,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl RuntimeReviver for TestReviver {
         async fn revive(&self) -> Result<(), String> {
@@ -2015,6 +2328,7 @@ mod tests {
     /// The transport's REAL failure path invokes the reviver, the daemon
     /// comes back, and the same client object reaches the same runtime —
     /// requests and the event stream both recover.
+    #[cfg(unix)]
     #[tokio::test]
     async fn runtime_reviver_restarts_dead_daemon_for_connected_client() {
         let dir = tempfile::tempdir().unwrap();
@@ -2085,6 +2399,7 @@ mod tests {
     /// daemon under a real TUI produced exactly that — nothing on screen for
     /// half a minute, and the turn the runtime had settled as interrupted was
     /// never marked.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_reconnected_subscription_says_the_connection_broke() {
         let dir = tempfile::tempdir().unwrap();
@@ -2130,6 +2445,7 @@ mod tests {
     /// frame (the "mutation may have run" moment), counts it, and drops the
     /// connection without answering. Exits and removes its socket after the
     /// first connection so a reviver can bind the real server.
+    #[cfg(unix)]
     fn deadend_server(path: &Path) -> Arc<std::sync::atomic::AtomicUsize> {
         let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = received.clone();
@@ -2155,6 +2471,7 @@ mod tests {
     /// session, but the response was lost. The client revives the daemon but
     /// must NOT replay the mutation — outcome-unknown error, and the revived
     /// runtime never runs a second CreateSession.
+    #[cfg(unix)]
     #[tokio::test]
     async fn create_session_is_not_replayed_after_uncertain_transport_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -2186,6 +2503,7 @@ mod tests {
 
         let error = client
             .create_session(CreateSessionRequest {
+                workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
                 model: None,
@@ -2224,6 +2542,7 @@ mod tests {
     /// behind the intermittent `deliver_envelope_can_retry…` failure under a
     /// loaded machine, where a subscription-loop revive and a request-path
     /// revive run at once.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_reviver_reports_success_only_once_the_socket_answers() {
         let dir = tempfile::tempdir().unwrap();
@@ -2261,6 +2580,7 @@ mod tests {
     /// Deliver (CommandEnvelope) IS replayed after revival — with the SAME
     /// command_id, so the daemon's receipt dedup keeps the logical mutation
     /// at most once.
+    #[cfg(unix)]
     #[tokio::test]
     async fn deliver_envelope_can_retry_after_revival_without_duplicate_effect() {
         let dir = tempfile::tempdir().unwrap();
@@ -2307,6 +2627,7 @@ mod tests {
     /// A delivery the transport could not complete has no answer. It must reach
     /// the caller as the typed outcome-unknown, never as a runtime rejection a
     /// client would read as "not delivered".
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_delivery_the_transport_could_not_complete_is_outcome_unknown() {
         let dir = tempfile::tempdir().unwrap();
@@ -2377,6 +2698,7 @@ mod tests {
 
     /// Raw Send has no idempotency key: after an uncertain failure it fails
     /// outcome-unknown and is never replayed.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unsafe_request_without_reviver_is_outcome_unknown() {
         let dir = tempfile::tempdir().unwrap();
@@ -2394,6 +2716,7 @@ mod tests {
         let received = deadend_server(&path);
         let error = client
             .create_session(CreateSessionRequest {
+                workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
                 model: None,
@@ -2411,8 +2734,10 @@ mod tests {
 
     /// A reviver that always fails: revival failure must NOT downgrade the
     /// mutation-outcome uncertainty to a plain Unavailable.
+    #[cfg(unix)]
     struct FailingReviver;
 
+    #[cfg(unix)]
     #[async_trait]
     impl RuntimeReviver for FailingReviver {
         async fn revive(&self) -> Result<(), String> {
@@ -2420,6 +2745,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn unsafe_request_stays_outcome_unknown_when_revival_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -2458,6 +2784,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn raw_send_is_not_replayed_after_uncertain_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -2522,6 +2849,7 @@ mod tests {
 
     fn create_req(policy: ApprovalPolicy) -> CreateSessionRequest {
         CreateSessionRequest {
+            workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "s".to_string(),
             model: None,
             mode: PermissionProfile::Assisted,
@@ -2529,9 +2857,65 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_concurrent_binds_elect_one_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.identity");
+        let runtime = Arc::new(TestRuntime::new());
+        let (a, b) = tokio::join!(
+            LocalSocketServer::bind(&path, runtime.clone()),
+            LocalSocketServer::bind(&path, runtime)
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        let error = if a.is_ok() {
+            b.err().unwrap()
+        } else {
+            a.err().unwrap()
+        };
+        assert!(matches!(error, TransportError::AlreadyRunning(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_pipe_owner_survives_first_client_disconnect_and_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Unicode-仓库.runtime");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            LocalSocketServer::bind(&path, runtime.clone()).await,
+            Err(TransportError::AlreadyRunning(_))
+        ));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+        let first = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        first.snapshot(&SessionId::new("s1")).await.unwrap();
+        drop(first);
+        let second = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let third = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        second.snapshot(&SessionId::new("s1")).await.unwrap();
+        third.snapshot(&SessionId::new("s1")).await.unwrap();
+        assert!(matches!(
+            LocalSocketServer::bind(&path, runtime.clone()).await,
+            Err(TransportError::AlreadyRunning(_))
+        ));
+        drop(second);
+        drop(third);
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+        let restarted = LocalSocketServer::bind(&path, runtime).await.unwrap();
+        drop(restarted);
+        assert!(
+            !path.exists(),
+            "named pipe must not leave a fake filesystem endpoint"
+        );
+    }
+
     /// S4 — a trusted-local interactive client may create an AutoApprove session,
     /// and the runtime actually receives AutoApprove.
-    #[cfg(unix)]
     #[tokio::test]
     async fn trusted_local_may_create_an_auto_approve_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -2560,7 +2944,6 @@ mod tests {
 
     /// S1 / §11 — a Remote client (the bridge's connection kind) that explicitly
     /// requests AutoApprove is REJECTED, and the request never reaches the runtime.
-    #[cfg(unix)]
     #[tokio::test]
     async fn remote_client_cannot_create_an_auto_approve_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -2594,7 +2977,6 @@ mod tests {
     /// R006 R6-P2 — the resume door is gated exactly like the create door:
     /// a trusted-local client may re-assert AutoApprove on an existing
     /// session; a Remote client (or any TCP origin) is rejected observably.
-    #[cfg(unix)]
     #[tokio::test]
     async fn trusted_local_may_attach_auto_approve_but_remote_cannot() {
         let dir = tempfile::tempdir().unwrap();
@@ -2648,7 +3030,6 @@ mod tests {
 
     /// S8 — a Remote client requesting the safe Interactive policy (or omitting
     /// it, which defaults to Interactive) is allowed and stays Interactive.
-    #[cfg(unix)]
     #[tokio::test]
     async fn remote_client_may_create_an_interactive_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -2738,6 +3119,7 @@ mod tests {
             .unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "tcp e2e".to_string(),
                 model: None,
@@ -2758,10 +3140,38 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[tokio::test]
+    async fn tcp_forged_local_kind_cannot_disarm_remote_approval_timeout() {
+        let server = TcpRuntimeServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "secret",
+            Arc::new(TestRuntime::new()),
+        )
+        .await
+        .unwrap();
+        let waiters = server.local_waiters();
+        let addr = server.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+        let client =
+            LocalSocketRuntimeClient::connect_tcp_as(addr, "secret", ClientKind::LocalInteractive)
+                .await
+                .unwrap();
+        // Snapshot requests cross the same server and establish that it served requests.
+        client.snapshot(&SessionId::new("s1")).await.unwrap();
+        assert_eq!(
+            waiters.count(),
+            0,
+            "TCP metadata must not count as a trusted human waiter"
+        );
+        drop(client);
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     /// The remote approval timeout must not fire while someone is at the
     /// keyboard, so the daemon has to know how many local UIs are attached —
     /// and must not count a phone's bridge among them.
-    #[cfg(unix)]
     #[tokio::test]
     async fn local_waiters_counts_local_uis_and_excludes_the_remote_agent() {
         let dir = tempfile::tempdir().unwrap();
@@ -2859,7 +3269,6 @@ mod tests {
         assert_eq!(client_kind, ClientKind::LocalInteractive);
     }
 
-    #[cfg(unix)]
     async fn wait_for_waiters(waiters: &LocalWaiters, expected: usize) {
         for _ in 0..100 {
             if waiters.count() == expected {
@@ -2870,7 +3279,6 @@ mod tests {
         panic!("expected {expected} local waiters, saw {}", waiters.count());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn socket_round_trips_session_snapshot_command_and_event() {
         let dir = tempfile::tempdir().unwrap();
@@ -2885,6 +3293,7 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "interactive session".to_string(),
                 model: None,
@@ -2896,7 +3305,7 @@ mod tests {
         assert_eq!(bootstrap.context_window, 128_000);
 
         let snapshot = client.snapshot(&SessionId::new("s1")).await.unwrap();
-        assert_eq!(snapshot.repository, "/repo");
+        assert_eq!(snapshot.repository.as_deref(), Some("/repo"));
 
         client
             .send(ClientCommand::RequestSessionList)
@@ -3064,7 +3473,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn client_reconnects_and_resyncs_tracked_sessions_after_daemon_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -3081,7 +3489,8 @@ mod tests {
         first_task.await.unwrap().unwrap();
 
         let replacement_runtime = TestRuntime::new();
-        replacement_runtime.snapshot.lock().unwrap().repository = "/repo-after-restart".to_string();
+        replacement_runtime.snapshot.lock().unwrap().repository =
+            Some("/repo-after-restart".to_string());
         let second_shutdown = CancellationToken::new();
         let second_server = LocalSocketServer::bind(&path, Arc::new(replacement_runtime))
             .await
@@ -3091,7 +3500,7 @@ mod tests {
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let RuntimeEvent::SessionOpened { session } = events.recv().await.unwrap()
-                    && session.repository == "/repo-after-restart"
+                    && session.repository.as_deref() == Some("/repo-after-restart")
                 {
                     break session;
                 }

@@ -310,7 +310,12 @@ pub(crate) async fn upload_attachments(
 /// `starts_with` checks compare like with like (and symlink escapes fail).
 async fn repository(state: &AppState, session_id: &str) -> Result<Repository, EndpointError> {
     let snapshot = state.service.snapshot(&SessionId::new(session_id)).await?;
-    let configured = PathBuf::from(&snapshot.repository);
+    let configured = PathBuf::from(snapshot.repository.as_deref().ok_or_else(|| {
+        EndpointError::new(
+            StatusCode::CONFLICT,
+            "this session has no primary workspace",
+        )
+    })?);
     // Capture the repository object first. `dir` remains bound to this opened
     // directory even if its ambient pathname is renamed or replaced later.
     let dir = cap_std::fs::Dir::open_ambient_dir(&configured, cap_std::ambient_authority())

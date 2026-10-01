@@ -10,6 +10,7 @@ use crate::transcript::TurnEndStatus;
 
 pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
     match event {
+        RuntimeEvent::GlobalTasksLoaded { .. } => {}
         RuntimeEvent::RuntimeReady => {}
         RuntimeEvent::SessionOpened { session } => apply_session(state, session),
         RuntimeEvent::SessionHistoryLoaded {
@@ -889,6 +890,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             task_id,
             program,
             args,
+            pid,
         } => {
             // One lifecycle, one human label. The id stays as the projection
             // key (stable identity, never text matching); what the user reads
@@ -905,7 +907,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             };
             state.background_task_labels.insert(
                 task_id.clone(),
-                crate::state::BackgroundTaskChrome::running(label.clone(), state.elapsed_secs),
+                crate::state::BackgroundTaskChrome {
+                    pid,
+                    ..crate::state::BackgroundTaskChrome::running(label.clone(), state.elapsed_secs)
+                },
             );
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
@@ -1006,6 +1011,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 if !clean.is_empty() {
                     chrome.output.push_str(&clean);
                     cap_background_output(&mut chrome.output);
+                    chrome.last_output_at = Some(std::time::Instant::now());
                 }
             }
         }
@@ -1405,6 +1411,7 @@ fn replace_active_background_tasks(
             state.elapsed_secs.saturating_sub(task.elapsed_ms / 1000),
         );
         chrome.output = previous_output;
+        chrome.pid = task.pid;
         state
             .background_task_labels
             .insert(task.task_id.clone(), chrome);
@@ -1550,9 +1557,6 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     // Product axes: the session record is the source of truth; adopt when the
     // runtime sends them so a reconnect cannot show a stale local guess. Old
     // runtimes omit the fields — keep the local value then.
-    if let Some(work_profile) = &session.work_profile {
-        state.work_profile = work_profile.clone();
-    }
     if let Some(collaboration) = &session.collaboration {
         state.collaboration = collaboration.clone();
     }

@@ -1,7 +1,6 @@
 //! Tool-call authorization helpers: command/path extraction, write
 //! allowlists, approval signatures, tool classification.
 
-use leveler_execution::{is_shell_wrapper_program, shell_c_script};
 use leveler_model::ToolCall;
 use sha2::{Digest, Sha256};
 
@@ -166,6 +165,15 @@ pub(crate) fn call_needs_host_escape(call: &ToolCall) -> bool {
     })
 }
 
+/// What a Git call's effects are, in the prompt.
+///
+/// Stable capability ids, not prose: the same string a log line and a bug
+/// report can be grepped for. Deliberately not "Git requires permission" —
+/// that sentence is what makes a permission problem undiagnosable later.
+pub(crate) fn git_capability_note(effects: &leveler_execution::CallGitEffects) -> String {
+    format!("Git 副作用: {}", effects.capabilities().join(", "))
+}
+
 /// Pull `(program, args)` out of a command tool call for classification.
 ///
 /// - `run_command` → structured `(program, args)`
@@ -246,46 +254,37 @@ pub(crate) fn command_line_for_match(
             .and_then(|v| v.as_str())
             .map(String::from);
     }
-    program.map(|p| format!("{} {}", p, args.join(" ")).trim().to_string())
+    program.map(|program| {
+        std::iter::once(program)
+            .chain(args.iter().map(String::as_str))
+            .map(command_identity_word)
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(bytes);
-    format!("{:x}", digest.finalize())
+/// Canonical POSIX quoting preserves argv boundaries for display and rule
+/// matching on every platform. Execution always consumes the original argv.
+fn command_identity_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-./:@%+=,".contains(&byte))
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 /// A stable signature for "approve for the session".
 ///
-/// Ordinary `run_command` uses `tool:program:first_arg` so approving `git push`
-/// covers later `git push`s. Shell wrappers **must not** collapse to
-/// `…:sh:-c` / `shell_command:sh:-c` — that would grant every subsequent shell
-/// script. For `shell_command` and `run_command` of `sh -c` / `cmd /C <script>`,
-/// identity is the SHA-256 of the trimmed script body.
-///
-/// Shell detection and `-c`/`/C` extraction are shared with
-/// [`leveler_execution::classify_command`] via
-/// [`leveler_execution::is_shell_wrapper_program`] /
-/// [`leveler_execution::shell_c_script`].
-pub(crate) fn approval_signature(tool: &str, program: Option<&str>, args: &[String]) -> String {
-    if tool == "shell_command" {
-        let script = shell_c_script(args).unwrap_or("").trim();
-        return format!("shell_command:{}", sha256_hex(script.as_bytes()));
-    }
-    if tool == "run_command"
-        && let Some(p) = program
-        && is_shell_wrapper_program(p)
-        && let Some(script) = shell_c_script(args)
-    {
-        return format!("run_command:{}", sha256_hex(script.trim().as_bytes()));
-    }
-    match program {
-        Some(p) => format!(
-            "{tool}:{p}:{}",
-            args.first().map(String::as_str).unwrap_or("")
-        ),
-        None => tool.to_string(),
-    }
+/// Bind the complete proposed call, including cwd, environment, script and
+/// argv boundaries. Reuse the action fingerprint rather than maintaining a
+/// second command identity. The proposal does not resolve repository config,
+/// implicit cwd or executable contents, so this is not a resource grant.
+pub(crate) fn approval_signature(call: &ToolCall) -> String {
+    format!("{}:{}", call.name, action_fingerprint(call))
 }
 
 /// Stable, non-reversible identity of one exact proposed action. Used to bind
@@ -301,6 +300,16 @@ pub(crate) fn action_fingerprint(call: &ToolCall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approval_signature(tool: &str, program: Option<&str>, args: &[String]) -> String {
+        let arguments = if tool == "shell_command" {
+            serde_json::json!({"cmd": leveler_execution::shell_c_script(args).unwrap_or("")})
+        } else {
+            serde_json::json!({"program": program, "args": args})
+        };
+        super::approval_signature(&tool_call(tool, arguments))
+    }
+
     use leveler_core::ToolCallId;
 
     fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -396,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_grant_is_script_hash_not_sh_c() {
+    fn shell_command_grant_is_exact_action_not_sh_c() {
         let call = tool_call("shell_command", serde_json::json!({"cmd": "echo hi"}));
         let (program, args) = extract_command(&call);
         let sig = approval_signature("shell_command", program.as_deref(), &args);
@@ -408,7 +417,7 @@ mod tests {
             sig.starts_with("shell_command:"),
             "expected shell_command:{{hash}}, got {sig}"
         );
-        let expected = format!("shell_command:{}", sha256_hex("echo hi".as_bytes()));
+        let expected = format!("shell_command:{}", action_fingerprint(&call));
         assert_eq!(sig, expected);
     }
 
@@ -424,12 +433,11 @@ mod tests {
             sig_echo, sig_rm,
             "ApproveSession for echo must not auto-allow rm"
         );
-        // Same script again shares the grant. Hash uses trim(script); raw cmd
-        // padding must not change grant identity.
+        // Only the exact proposal shares the grant, without script normalization.
         let echo2 = tool_call("shell_command", serde_json::json!({"cmd": "  echo hi  "}));
         let (p3, a3) = extract_command(&echo2);
         let sig_echo_padded = approval_signature("shell_command", p3.as_deref(), &a3);
-        assert_eq!(sig_echo, sig_echo_padded);
+        assert_ne!(sig_echo, sig_echo_padded);
 
         // Mimic authorize(): ApproveSession inserts signature into session set;
         // a later call is auto-allowed only when its signature is present.
@@ -446,12 +454,150 @@ mod tests {
     }
 
     #[test]
-    fn run_command_shell_wrapper_uses_script_hash() {
+    fn session_grants_bind_explicit_working_directory() {
+        let signature = |cwd: &str| {
+            let call = tool_call(
+                "run_command",
+                serde_json::json!({
+                    "program":"git", "args":["push", "origin", "main"], "cwd":cwd
+                }),
+            );
+            super::approval_signature(&call)
+        };
+        assert_ne!(signature("repo-a"), signature("repo-b"));
+    }
+
+    #[test]
+    fn wrapper_session_grants_bind_program_flags_and_positional_arguments() {
+        let script = "git push \"$1\" \"$2\" main";
+        let approved = vec![
+            "-c".into(),
+            script.into(),
+            "owner".into(),
+            "origin".into(),
+            "--no-force".into(),
+        ];
+        let signature = approval_signature("run_command", Some("sh"), &approved);
+        for (program, args) in [
+            ("bash", approved.clone()),
+            (
+                "sh",
+                vec![
+                    "-lc".into(),
+                    script.into(),
+                    "owner".into(),
+                    "origin".into(),
+                    "--no-force".into(),
+                ],
+            ),
+            (
+                "sh",
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "owner".into(),
+                    "other".into(),
+                    "--no-force".into(),
+                ],
+            ),
+            (
+                "sh",
+                vec![
+                    "-c".into(),
+                    script.into(),
+                    "owner".into(),
+                    "origin".into(),
+                    "--force".into(),
+                ],
+            ),
+        ] {
+            assert_ne!(
+                signature,
+                approval_signature("run_command", Some(program), &args),
+                "{program} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_session_grants_do_not_generalize_destructive_arguments() {
+        for (program, approved, changed) in [
+            ("rm", vec!["-rf", "approved"], vec!["-rf", "other"]),
+            ("sudo", vec!["sh", "approved.sh"], vec!["sh", "other.sh"]),
+        ] {
+            let approved = approved.into_iter().map(String::from).collect::<Vec<_>>();
+            let changed = changed.into_iter().map(String::from).collect::<Vec<_>>();
+            assert_ne!(
+                approval_signature("run_command", Some(program), &approved),
+                approval_signature("run_command", Some(program), &changed)
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_shell_session_grants_bind_the_script() {
+        for program in ["pwsh", "powershell", "powershell.exe", "fish"] {
+            assert_ne!(
+                approval_signature(
+                    "run_command",
+                    Some(program),
+                    &["-c".into(), "echo approved".into()]
+                ),
+                approval_signature(
+                    "run_command",
+                    Some(program),
+                    &["-c".into(), "rm victim".into()]
+                ),
+                "{program} must not grant all inline scripts"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_structured_git_grants_preserve_argument_boundaries() {
+        let approved = tool_call(
+            "run_command",
+            serde_json::json!({
+                "program":"git", "args":["push", "/tmp/remote --force", "main"]
+            }),
+        );
+        let changed = tool_call(
+            "run_command",
+            serde_json::json!({
+                "program":"git", "args":["push", "/tmp/remote", "--force", "main"]
+            }),
+        );
+        let command = |call: &ToolCall| {
+            let (program, args) = extract_command(call);
+            command_line_for_match(call, program.as_deref(), &args).unwrap()
+        };
+        let approved = command(&approved);
+        let changed = command(&changed);
+        let rules = leveler_execution::always_rules_for("run_command", Some(&approved), &[]);
+        let rules = leveler_execution::PermissionRuleSet::from_rules(rules);
+        assert_eq!(
+            rules.evaluate("run_command", Some(&approved), &[]),
+            leveler_execution::RuleDecision::Allow
+        );
+        assert_eq!(
+            rules.evaluate("run_command", Some(&changed), &[]),
+            leveler_execution::RuleDecision::NoMatch
+        );
+    }
+
+    #[test]
+    fn run_command_shell_wrapper_uses_complete_argv_hash() {
         let args = vec!["-c".to_string(), "echo hi".to_string()];
         let sig = approval_signature("run_command", Some("sh"), &args);
         assert_eq!(
             sig,
-            format!("run_command:{}", sha256_hex("echo hi".as_bytes()))
+            format!(
+                "run_command:{}",
+                action_fingerprint(&tool_call(
+                    "run_command",
+                    serde_json::json!({"program":"sh", "args":args})
+                ))
+            )
         );
         let sig_rm = approval_signature(
             "run_command",
@@ -459,23 +605,75 @@ mod tests {
             &["-c".to_string(), "rm -rf x".to_string()],
         );
         assert_ne!(sig, sig_rm);
-        // Windows cmd /C also hashes the script body (shared shell_c_script).
+        // Windows cmd /C binds the wrapper and all its arguments as well.
         let sig_cmd = approval_signature(
             "run_command",
             Some("cmd"),
             &["/C".to_string(), "echo hi".to_string()],
         );
-        assert_eq!(
-            sig_cmd,
-            format!("run_command:{}", sha256_hex("echo hi".as_bytes()))
+        assert_ne!(sig, sig_cmd);
+        // Ordinary command policy stays the same; an approval is exact.
+        assert_ne!(
+            approval_signature(
+                "run_command",
+                Some("cargo"),
+                &["test".into(), "-p".into(), "foo".into()]
+            ),
+            approval_signature(
+                "run_command",
+                Some("cargo"),
+                &["test".into(), "-p".into(), "other".into()]
+            )
         );
-        // Non-shell run_command keeps program:first_arg form.
-        let git = approval_signature(
-            "run_command",
-            Some("git"),
-            &["push".to_string(), "origin".to_string()],
+    }
+
+    #[test]
+    fn git_session_grants_bind_the_complete_argv() {
+        for program in ["git", "/usr/bin/git"] {
+            for (approved, variants) in [
+                (
+                    vec!["push", "origin", "main"],
+                    vec![
+                        vec!["push", "--force", "origin", "main"],
+                        vec!["push", "other", "main"],
+                    ],
+                ),
+                (
+                    vec!["fetch", "origin"],
+                    vec![
+                        vec!["fetch", "https://unknown.example/repo"],
+                        vec!["fetch", "origin", "--upload-pack=payload"],
+                    ],
+                ),
+            ] {
+                let args = approved.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+                let signature = approval_signature("run_command", Some(program), &args);
+                assert_eq!(
+                    signature,
+                    approval_signature("run_command", Some(program), &args)
+                );
+                for variant in variants {
+                    let variant = variant.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+                    assert_ne!(
+                        signature,
+                        approval_signature("run_command", Some(program), &variant),
+                        "approval must bind every Git argument"
+                    );
+                }
+            }
+        }
+        assert_ne!(
+            approval_signature(
+                "run_command",
+                Some("git"),
+                &["push".into(), "origin main".into()]
+            ),
+            approval_signature(
+                "run_command",
+                Some("git"),
+                &["push".into(), "origin".into(), "main".into()]
+            )
         );
-        assert_eq!(git, "run_command:git:push");
     }
 
     #[test]

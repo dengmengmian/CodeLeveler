@@ -36,8 +36,6 @@ pub enum Overlay {
     ModePicker(Box<SelectionModel>),
     /// Named TUI palettes (`auto` / `dark` / `light` / `high-contrast`).
     ThemePicker(Box<SelectionModel>),
-    /// `/work-mode` — economy / balanced.
-    WorkModePicker(Box<SelectionModel>),
     /// `/collab` — chat / plan / goal.
     CollabPicker(Box<SelectionModel>),
     Approval(Box<ApprovalOverlay>),
@@ -68,7 +66,6 @@ impl Overlay {
             Overlay::ModelPicker(_)
             | Overlay::ModePicker(_)
             | Overlay::ThemePicker(_)
-            | Overlay::WorkModePicker(_)
             | Overlay::CollabPicker(_)
             | Overlay::CheckpointPicker(_)
             | Overlay::ConfirmSessionDelete(_) => None,
@@ -273,7 +270,6 @@ fn build_content(
         Overlay::ModelPicker(model)
         | Overlay::ModePicker(model)
         | Overlay::ThemePicker(model)
-        | Overlay::WorkModePicker(model)
         | Overlay::CollabPicker(model)
         | Overlay::UnsupportedMedia(model)
         | Overlay::CheckpointPicker(model)

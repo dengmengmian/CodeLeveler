@@ -65,8 +65,7 @@ impl Tool for WriteFileTool {
             return Ok(ToolOutput::error(denied));
         }
         let resolved = match context
-            .execution
-            .workspace
+            .require_workspace()?
             .resolve_for_write(&input.path, &context.write_scope())
         {
             Ok(resolved) => resolved,

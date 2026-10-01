@@ -69,7 +69,9 @@ impl InteractiveRuntimeClient for RecordingRuntime {
         Ok(UiSessionSnapshot {
             id: session_id.clone(),
             // The label rides along so a test can tell which project answered.
-            repository: self.label.clone(),
+            repository: Some(self.label.clone()),
+            task_status: None,
+            task_terminal: None,
             goal: String::new(),
             model: None,
             mode: PermissionProfile::Assisted,
@@ -305,8 +307,8 @@ async fn a_snapshot_comes_from_the_streams_own_project() {
         .snapshot(BETA, &SessionId::new("s1"))
         .await
         .unwrap();
-    assert_eq!(alpha.repository, "alpha");
-    assert_eq!(beta.repository, "beta");
+    assert_eq!(alpha.repository.as_deref(), Some("alpha"));
+    assert_eq!(beta.repository.as_deref(), Some("beta"));
 }
 
 /// One project going offline must not take the others with it.

@@ -274,6 +274,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
         steering: None,
         allow_delegation: true,
+        allow_host_input: true,
+        capabilities: None,
         independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
         develop_model: None,
     };
@@ -462,7 +464,7 @@ async fn blocked_goal_is_typed_in_terminal_events_and_session_status() {
             limits: StepLimits::default(),
         },
         coding: leveler_agent::coding::CodingTaskSpec {
-            repository: h.dir.path().to_path_buf(),
+            repository: Some(h.dir.path().to_path_buf()),
             mode: PermissionProfile::Assisted,
             sandbox: false,
         },
@@ -549,7 +551,7 @@ async fn engine_stamps_running_and_terminal_session_status_itself() {
             limits: StepLimits::default(),
         },
         coding: leveler_agent::coding::CodingTaskSpec {
-            repository: h.dir.path().to_path_buf(),
+            repository: Some(h.dir.path().to_path_buf()),
             mode: PermissionProfile::Assisted,
             sandbox: false,
         },

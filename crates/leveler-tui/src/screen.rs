@@ -158,13 +158,6 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         BusyPolicy::Always,
     ),
     slash(
-        "/work-mode",
-        &["/work_mode"],
-        SlashCategory::Agent,
-        SlashVisibility::Searchable,
-        BusyPolicy::IdleOnly,
-    ),
-    slash(
         "/collab",
         &[],
         SlashCategory::Agent,
@@ -404,7 +397,6 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/develop" => s.develop,
         "/btw" => s.btw,
         "/recap" => s.recap,
-        "/work-mode" | "/work_mode" => s.work_mode,
         "/collab" => s.collab,
         "/agents" => s.agents,
         "/skills" => s.skills,
@@ -667,6 +659,17 @@ mod surface_tests {
     /// The closed TUI command surface. Adding or removing a command changes
     /// this list on purpose, never as a side effect.
     #[test]
+    fn retired_work_mode_is_absent_from_all_completion_tokens() {
+        let tokens = all_slash_tokens();
+        for retired in ["/work-mode", "/work_mode", "/work-profile"] {
+            assert!(
+                !tokens.contains(&retired),
+                "{retired} is still discoverable"
+            );
+        }
+    }
+
+    #[test]
     fn registry_is_the_closed_command_surface() {
         let names: Vec<_> = SLASH_DEFS.iter().map(|d| d.name).collect();
         assert_eq!(
@@ -678,7 +681,6 @@ mod surface_tests {
                 "/develop",
                 "/btw",
                 "/recap",
-                "/work-mode",
                 "/collab",
                 "/agents",
                 "/skills",
@@ -827,7 +829,7 @@ mod ghost_tests {
         assert_eq!(
             slash_arg_ghost("/work-mode", zh),
             None,
-            "option commands use a picker, not a CLI ghost"
+            "retired commands have no argument hint"
         );
         assert_eq!(slash_arg_ghost("/collab ", zh), None);
     }
@@ -885,7 +887,6 @@ mod ghost_tests {
             "empty / is the high-frequency core only"
         );
         for hidden in [
-            "/work-mode",
             "/agents",
             "/skills",
             "/trace",
@@ -1066,7 +1067,6 @@ mod ghost_tests {
             ("/permission", "权限审批", "permission approval"),
             ("/goal", "设置目标", "set goal"),
             ("/btw", "临时提问", "quick question"),
-            ("/work-mode", "执行策略", "work strategy"),
             ("/collab", "协作模式", "collaboration mode"),
             ("/diff", "查看改动", "view changes"),
         ];

@@ -26,7 +26,9 @@ const NEXT_STEP: &str = "查看 demo-order-01 的里程碑进度";
 fn snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "/repo".to_string(),
+        repository: Some("/repo".to_string()),
+        task_status: None,
+        task_terminal: None,
         goal: "interactive session".to_string(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,

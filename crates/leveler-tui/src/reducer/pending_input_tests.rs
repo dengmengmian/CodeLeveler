@@ -487,7 +487,9 @@ fn submits(effects: &[Effect]) -> Vec<ClientCommand> {
 fn idle_snapshot() -> leveler_client_protocol::UiSessionSnapshot {
     leveler_client_protocol::UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "/repo".into(),
+        repository: Some("/repo".into()),
+        task_status: None,
+        task_terminal: None,
         goal: "interactive session".into(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: leveler_client_protocol::PermissionProfile::Assisted,

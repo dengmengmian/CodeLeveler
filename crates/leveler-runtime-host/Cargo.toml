@@ -1,0 +1,27 @@
+[package]
+name = "leveler-runtime-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared local runtime lifecycle orchestration for CodeLeveler shells."
+
+[dependencies]
+leveler-core = { workspace = true }
+leveler-app = { workspace = true }
+leveler-engine = { workspace = true }
+leveler-project = { workspace = true }
+leveler-client-protocol = { workspace = true }
+leveler-local-transport = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+getrandom = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

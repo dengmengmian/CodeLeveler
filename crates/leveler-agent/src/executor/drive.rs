@@ -314,7 +314,7 @@ impl Executor {
         let mut tools = self.registry.definitions();
         // A child clarifier is unattended. Only the top-level turn can ask
         // the user. `ask_user` remains a parser alias of this tool.
-        if self.depth == 0 {
+        if self.depth == 0 && self.policy.allow_host_input {
             tools.push(request_user_input_tool_definition());
         }
         // Nothing to request under 完全访问 — the elevation it asks for is
@@ -357,6 +357,11 @@ impl Executor {
             tools.push(update_goal_tool_definition());
         }
 
+        if let Some(state) = &self.capabilities {
+            tools.retain(|tool| state.permits_tool(&tool.name));
+            tools.push(crate::capability::control_definition());
+        }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
     }
 
@@ -376,6 +381,17 @@ impl Executor {
         aborted: &mut AbortedFacts,
     ) -> Result<AgentOutcome, DriveAborted> {
         let tools = self.request_tool_definitions();
+        if let Some(state) = &self.capabilities {
+            tracing::info!(event="capability_available",catalog_tokens=leveler_model::estimate_text(&state.catalog().to_string()),catalog=%state.catalog());
+            tracing::info!(event="tool_surface_changed",reason="initial",active_capabilities=?state.active(),tool_count=tools.len(),schema_tokens=leveler_model::estimate_tool_definitions(&tools),tool_names=?tools.iter().map(|tool|&tool.name).collect::<Vec<_>>());
+        }
+        if self.capabilities.is_some() {
+            control_context.blocks.push(PromptSegment::control(
+                "capability_discovery", PromptSource::ExecutionState,
+                PromptAuthority::CoreContract, SegmentLifecycle::SessionPrefix, true,
+                "Additional capabilities are available on demand. Use capability(action=\"list\") to discover them, then capability(action=\"enable\", id=...) when needed. Enabled tools appear on the following request.",
+            ));
+        }
         // Legacy sessions contain System rows. Recover only their source
         // identities to reload applicable files, never their stale contents.
         let mut scoped_paths = Vec::new();
@@ -413,13 +429,15 @@ impl Executor {
         // keywords are not required — ordinary implementation goals must still
         // evaluate bounded Worker work.
         let context_diverged = false;
-        if should_inject_delegation_hint(self.policy.allow_delegation, self.depth)
-            && !messages.iter().any(|m| {
-                m.role == Role::User
-                    && m.text_content()
-                        .contains(crate::sub_agent::MULTI_AGENT_HINT_HEADER)
-            })
-        {
+        if should_inject_delegation_hint(
+            self.policy.allow_delegation
+                && self.capability_exposed(crate::capability::CapabilityId::MultiAgent, true),
+            self.depth,
+        ) && !messages.iter().any(|m| {
+            m.role == Role::User
+                && m.text_content()
+                    .contains(crate::sub_agent::MULTI_AGENT_HINT_HEADER)
+        }) {
             control_context.blocks.push(PromptSegment::control(
                 "multi_agent_hint",
                 PromptSource::DelegationHint,
@@ -1195,6 +1213,69 @@ impl<'a> Drive<'a> {
     }
 }
 
+impl Drive<'_> {
+    fn refresh_capability_surface(&mut self, reason: &str) {
+        let Some(state) = &self.executor.capabilities else {
+            return;
+        };
+        let tools = self.executor.request_tool_definitions();
+        if tools == self.tools {
+            return;
+        }
+        let previous_schema_tokens = leveler_model::estimate_tool_definitions(&self.tools);
+        self.tools = tools;
+        let request = self.objective.text();
+        let mut optional = self.executor.system_segments(request);
+        optional.retain(|segment| {
+            matches!(
+                segment.name.as_str(),
+                "memory_guidance"
+                    | "memory_catalog"
+                    | "skills_guidance"
+                    | "multi_agent_guidance"
+                    | "host_interaction_guidance"
+            )
+        });
+        let extra =
+            self.executor
+                .turn_control_context_inner(request, request, false, false, self.observer);
+        optional.extend(extra.blocks.into_iter().filter(|segment| {
+            matches!(
+                segment.name.as_str(),
+                "selected_skills" | "skill_index" | "agent_catalog" | "memory_recall"
+            )
+        }));
+        for segment in optional {
+            if !self
+                .control_context
+                .blocks
+                .iter()
+                .any(|current| current.name == segment.name)
+            {
+                self.control_context.blocks.push(segment);
+            }
+        }
+        if self.executor.depth == 0
+            && state.exposed(crate::capability::CapabilityId::MultiAgent)
+            && !self
+                .control_context
+                .blocks
+                .iter()
+                .any(|segment| segment.name == "multi_agent_hint")
+        {
+            self.control_context.blocks.push(PromptSegment::control(
+                "multi_agent_hint",
+                PromptSource::DelegationHint,
+                PromptAuthority::CoreContract,
+                SegmentLifecycle::SessionPrefix,
+                true,
+                multi_agent_steer_hint(),
+            ));
+        }
+        tracing::info!(event="tool_surface_changed",reason,active_capabilities=?state.active(),tool_count=self.tools.len(),schema_tokens=leveler_model::estimate_tool_definitions(&self.tools),loaded_schema_tokens=leveler_model::estimate_tool_definitions(&self.tools).saturating_sub(previous_schema_tokens),tool_names=?self.tools.iter().map(|tool|&tool.name).collect::<Vec<_>>());
+    }
+}
+
 #[async_trait]
 impl AgentHarness for Drive<'_> {
     type Stop = AgentOutcome;
@@ -1298,6 +1379,30 @@ impl AgentHarness for Drive<'_> {
             }
         });
         let mut context = self.control_context.clone();
+        let optional_names = [
+            "memory_guidance",
+            "memory_catalog",
+            "skills_guidance",
+            "multi_agent_guidance",
+            "host_interaction_guidance",
+            "selected_skills",
+            "skill_index",
+            "agent_catalog",
+            "memory_recall",
+            "multi_agent_hint",
+        ];
+        let mut optional: Vec<_> = context
+            .blocks
+            .iter()
+            .filter(|block| optional_names.contains(&block.name.as_str()))
+            .cloned()
+            .collect();
+        context
+            .blocks
+            .retain(|block| !optional_names.contains(&block.name.as_str()));
+        optional.sort_by(|a, b| a.name.cmp(&b.name));
+        context.blocks.extend(optional);
+
         context.blocks.push(PromptSegment::control(
             "execution_state",
             PromptSource::ExecutionState,
@@ -1314,6 +1419,7 @@ impl AgentHarness for Drive<'_> {
         rt: &mut LoopContext,
         messages: &mut Vec<Message>,
     ) -> Result<Flow<AgentOutcome>, AgentError> {
+        self.refresh_capability_surface("model_requested");
         // Mid-turn user input goes in at the top of the round, before the
         // model is asked anything: a correction that arrives after the work
         // is done is worthless. Empty is the normal case.
@@ -1361,21 +1467,30 @@ impl AgentHarness for Drive<'_> {
         let _ = rt;
         // Discover scoped rules before this request, keeping them outside the
         // transcript so folding history cannot remove current constraints.
-        let fresh = load_scoped_rules(
-            self.executor.tool_context.execution.workspace.root(),
-            &self.scoped_paths,
-            &self
-                .control_context
-                .blocks
-                .iter()
-                .filter_map(|segment| {
-                    segment
-                        .name
-                        .strip_prefix("scoped_rules:")
-                        .map(str::to_string)
-                })
-                .collect::<Vec<_>>(),
-        );
+        let fresh = self
+            .executor
+            .tool_context
+            .execution
+            .workspace
+            .as_ref()
+            .map(|workspace| {
+                load_scoped_rules(
+                    workspace.root(),
+                    &self.scoped_paths,
+                    &self
+                        .control_context
+                        .blocks
+                        .iter()
+                        .filter_map(|segment| {
+                            segment
+                                .name
+                                .strip_prefix("scoped_rules:")
+                                .map(str::to_string)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
         if !fresh.is_empty() {
             for rule in &fresh {
                 push_unique_path(&mut self.progress.scoped_rule_sources, &rule.source);
@@ -1859,7 +1974,147 @@ impl AgentHarness for Drive<'_> {
         // cut short can still be refused in place (transcript pairing).
         let call_snapshot: Vec<ToolCall> = calls.clone();
 
+        let advertised: std::collections::HashSet<String> =
+            self.tools.iter().map(|tool| tool.name.clone()).collect();
         for (index, call) in calls.into_iter().enumerate() {
+            if cancellation.is_cancelled() && !rt.deadline_expired() {
+                cancelled_mid_batch = true;
+                break;
+            }
+            if self.executor.capabilities.is_some()
+                && !advertised.contains(&call.name)
+                && !(call.name == "ask_user" && advertised.contains("request_user_input"))
+            {
+                let content = format!(
+                    "Tool {} is not exposed on this request. Discover and enable its capability first.",
+                    call.name
+                );
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.to_string(),
+                    name: call.name.clone(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                });
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.to_string(),
+                    name: call.name.clone(),
+                    is_error: true,
+                    preview: content.clone(),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content,
+                        is_error: true,
+                    },
+                });
+                denied_calls_this_round += 1;
+                continue;
+            }
+            if call.name == "capability" && self.executor.capabilities.is_some() {
+                (self.observer)(AgentEvent::ToolCall {
+                    id: call.id.to_string(),
+                    name: call.name.clone(),
+                    arguments: compact_json(&call.arguments),
+                    parallel: false,
+                });
+                if let Some(barrier) = &self.executor.event_barrier {
+                    barrier.flush().await?;
+                }
+                if cancellation.is_cancelled() && !rt.deadline_expired() {
+                    results[index] = Some(deny_call(
+                        &mut *self.observer,
+                        call,
+                        "cancelled before capability loading".into(),
+                    ));
+                    cancelled_mid_batch = true;
+                    break;
+                }
+                if let Some(fence) = &self.executor.execution_fence {
+                    fence
+                        .ensure_current()
+                        .await
+                        .map_err(AgentError::StaleOwnership)?;
+                }
+                let state = self
+                    .executor
+                    .capabilities
+                    .as_ref()
+                    .expect("disclosure state");
+                let valid = call.arguments.as_object().is_some_and(|args| {
+                    args.keys().all(|key| key == "action" || key == "id")
+                        && args.get("id").is_none_or(serde_json::Value::is_string)
+                });
+                let action = call
+                    .arguments
+                    .get("action")
+                    .and_then(|value| value.as_str());
+                let result = if !valid {
+                    Err("capability expects action and optional id only".to_string())
+                } else {
+                    match action {
+                        Some("list" | "status") => Ok((state.catalog().to_string(), false)),
+                        Some("enable") => match call
+                            .arguments
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                        {
+                            Some(id) => match crate::capability::CapabilityId::parse(id) {
+                                Ok(id) => state.enable(id).await.map(|changed| {
+                                    (
+                                        format!(
+                                            "{} enabled; tools available on the following request.",
+                                            id.as_str()
+                                        ),
+                                        changed,
+                                    )
+                                }),
+                                Err(error) => Err(error),
+                            },
+                            None => Err("capability enable requires string id".into()),
+                        },
+                        _ => Err("capability action must be list, status, or enable".into()),
+                    }
+                };
+                let (content, is_error) = match result {
+                    Ok((content, changed)) => {
+                        if changed {
+                            self.refresh_capability_surface("model_requested");
+                        }
+                        (content, false)
+                    }
+                    Err(error) => {
+                        tracing::info!(event="capability_enable_denied",reason=%error);
+                        (error, true)
+                    }
+                };
+                if is_error {
+                    denied_calls_this_round += 1;
+                }
+                (self.observer)(AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: call.id.to_string(),
+                    name: call.name.clone(),
+                    is_error,
+                    preview: content.clone(),
+                    applied_diff: None,
+                });
+                results[index] = Some(ContentPart::ToolResult {
+                    result: ToolResultContent {
+                        call_id: call.id,
+                        content,
+                        is_error,
+                    },
+                });
+                continue;
+            }
+
             // A child reports one typed finding: validated at the tool
             // boundary, recorded in ITS ledger (the parent adopts on
             // join), persisted through the same EvidenceLedgerUpdated
@@ -2470,21 +2725,30 @@ impl AgentHarness for Drive<'_> {
             if self.executor.registry.mutates_files(&call.name) {
                 let mut target_paths = self.scoped_paths.clone();
                 collect_scoped_paths_from_call(&call, &mut target_paths);
-                let fresh = load_scoped_rules(
-                    self.executor.tool_context.execution.workspace.root(),
-                    &target_paths,
-                    &self
-                        .control_context
-                        .blocks
-                        .iter()
-                        .filter_map(|segment| {
-                            segment
-                                .name
-                                .strip_prefix("scoped_rules:")
-                                .map(str::to_string)
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                let fresh = self
+                    .executor
+                    .tool_context
+                    .execution
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| {
+                        load_scoped_rules(
+                            workspace.root(),
+                            &target_paths,
+                            &self
+                                .control_context
+                                .blocks
+                                .iter()
+                                .filter_map(|segment| {
+                                    segment
+                                        .name
+                                        .strip_prefix("scoped_rules:")
+                                        .map(str::to_string)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .unwrap_or_default();
                 if !fresh.is_empty() {
                     self.scoped_paths = target_paths;
                     let sources = fresh

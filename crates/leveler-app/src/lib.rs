@@ -17,6 +17,7 @@ pub mod doctor;
 /// hand-written dialect that drifts from it.
 pub mod event_bridge;
 pub mod global_config;
+pub mod global_task_index;
 pub mod goal_discovery;
 mod goal_recap;
 mod interactive;
@@ -31,6 +32,8 @@ pub mod runtime_boot;
 mod runtime_identity;
 mod session;
 pub mod session_history;
+pub mod session_projection;
+mod side_question;
 pub mod skills;
 mod user_shell;
 mod vcs;
@@ -45,7 +48,7 @@ pub use vcs::ShipOptions;
 
 use std::sync::{Arc, OnceLock};
 
-use leveler_agent::{CollaborationMode, WorkProfile};
+use leveler_agent::CollaborationMode;
 use leveler_execution::{PermissionProfile, Workspace};
 use leveler_model::{ModelRef, ModelRuntime};
 use leveler_project::{Layout, layout::yaml_files};
@@ -57,11 +60,31 @@ use leveler_storage::{Database, SessionRepository};
 use leveler_tools::{CapabilityPacks, ToolContext, model_surface};
 use sha2::{Digest, Sha256};
 
+/// Stable process-owner state shares the project's private global namespace,
+/// independently of the replaceable runtime endpoint and build generation.
+pub fn execution_host_config(
+    layout: &Layout,
+) -> Result<leveler_execution::execution_host::ExecutionHostConfig, AppError> {
+    Ok(leveler_execution::execution_host::ExecutionHostConfig {
+        state_dir: layout.state_dir.join("execution-host"),
+        repo_root: layout
+            .require_workspace()
+            .map_err(|error| AppError::NotFound(error.to_string()))?
+            .to_path_buf(),
+        executable: std::env::current_exe().map_err(|source| AppError::Io {
+            path: "current executable".to_string(),
+            source,
+        })?,
+    })
+}
+
 /// Errors assembling the application.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("config error: {0}")]
     Config(#[from] leveler_provider::ConfigError),
+    #[error("execution host error: {0}")]
+    ExecutionHost(String),
     #[error("registry error: {0}")]
     Registry(#[from] leveler_provider::RegistryError),
     #[error("storage error: {0}")]
@@ -148,13 +171,8 @@ pub struct LoadedConfig {
 /// The ONE decision about whether durable project memory is part of this
 /// project at all.
 ///
-/// Memory used to be gated implicitly by `work_profile` alone (economy turns
-/// carried none), which made a privacy decision a side effect of a cost mode.
-/// This type is the single owner: the user's `memory.enabled` switch decides
-/// whether the capability exists, and `work_profile` still decides whether the
-/// economy surface withholds it. Every memory consumer — tool exposure, the
-/// prompt index, per-turn recall, and the background extractor — reads this,
-/// so the four cannot drift apart.
+/// Independent project permission for durable memory. Capability disclosure
+/// controls model exposure; this policy controls whether loading is permitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryPolicy {
     enabled: bool,
@@ -171,14 +189,6 @@ impl MemoryPolicy {
     /// Whether the user wants memory enabled for this project.
     pub fn enabled(self) -> bool {
         self.enabled
-    }
-
-    /// Whether memory reaches the model under `profile`.
-    ///
-    /// A disabled project never exposes memory; an economy turn withholds the
-    /// capability surface even when the project has it enabled.
-    pub fn exposes(self, profile: WorkProfile) -> bool {
-        self.enabled && profile != WorkProfile::Economy
     }
 }
 
@@ -211,11 +221,13 @@ pub fn runtime_config_fingerprint(layout: &Layout) -> std::io::Result<String> {
 
     let mut hasher = Sha256::new();
     hash_optional_file(&mut hasher, b"global-config", &layout.home().config_file())?;
-    hash_optional_file(
-        &mut hasher,
-        b"project-config",
-        &layout.repo_root.join(".leveler/config.yaml"),
-    )?;
+    if let Some(root) = layout.primary_workspace() {
+        hash_optional_file(
+            &mut hasher,
+            b"project-config",
+            &root.join(".leveler/config.yaml"),
+        )?;
+    }
     for (kind, files) in [
         (b"provider".as_slice(), yaml_files(&layout.providers_dir())),
         (b"model".as_slice(), yaml_files(&layout.models_dir())),
@@ -235,7 +247,7 @@ pub fn runtime_config_fingerprint(layout: &Layout) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod memory_policy_tests {
-    use super::{MemoryPolicy, WorkProfile};
+    use super::MemoryPolicy;
     use leveler_project::{MemoryConfig, ProjectConfig};
 
     #[test]
@@ -245,19 +257,15 @@ mod memory_policy_tests {
             ..ProjectConfig::default()
         });
         assert!(!policy.enabled());
-        assert!(!policy.exposes(WorkProfile::Balanced));
-        assert!(!policy.exposes(WorkProfile::Economy));
     }
 
     #[test]
-    fn an_enabled_project_still_withholds_memory_from_economy() {
+    fn an_enabled_project_permits_memory() {
         let policy = MemoryPolicy::from_project(&ProjectConfig {
             memory: MemoryConfig { enabled: true },
             ..ProjectConfig::default()
         });
         assert!(policy.enabled());
-        assert!(policy.exposes(WorkProfile::Balanced));
-        assert!(!policy.exposes(WorkProfile::Economy));
     }
 }
 
@@ -358,8 +366,6 @@ pub struct Application {
     /// When set, overrides the resolved execution policy on every execution
     /// path (single-knob ablation runs). `None` = resolver defaults.
     execution_overrides: Option<leveler_agent::coding::ExecutionOverrides>,
-    /// Product work profile (economy / balanced).
-    work_profile: WorkProfile,
     /// Whether durable project memory is part of this project. Resolved once at
     /// assembly from `.leveler/config.yaml`; a config change is a new process
     /// generation, so the value is immutable for this Application's lifetime.
@@ -536,7 +542,10 @@ impl Application {
     pub fn assemble(layout: Layout) -> Result<Self, AppError> {
         let environment = Arc::new(leveler_core::EnvSnapshot::new(
             std::env::vars_os(),
-            std::env::current_dir().unwrap_or_else(|_| layout.repo_root.clone()),
+            std::env::current_dir().map_err(|source| AppError::Io {
+                path: "process environment cwd".into(),
+                source,
+            })?,
             std::env::temp_dir(),
         ));
         let _ = leveler_core::install_environment((*environment).clone());
@@ -596,9 +605,12 @@ impl Application {
         })?;
 
         // Project config + env (composition root may read env — AGENTS.md).
-        let background_tasks = Arc::new(
-            leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone()),
-        );
+        let background_tasks =
+            leveler_execution::BackgroundTaskRegistry::with_environment(environment.clone());
+        let background_tasks = Arc::new(match layout.primary_workspace() {
+            Some(_) => background_tasks.with_execution_host(execution_host_config(&layout)?),
+            None => background_tasks,
+        });
         // Lazy: this holds only paths and the configured product until the
         // first navigate actually starts a browser.
         let browser = Arc::new(leveler_browser::Browser::new(
@@ -608,7 +620,10 @@ impl Application {
         ));
         let (memory_events, _) = tokio::sync::broadcast::channel(128);
         let memory = MemoryPolicy::from_project(
-            &leveler_project::ProjectConfig::load(&layout.repo_root).unwrap_or_default(),
+            &layout
+                .primary_workspace()
+                .and_then(leveler_project::ProjectConfig::load)
+                .unwrap_or_default(),
         );
         Ok(Self {
             layout,
@@ -620,7 +635,6 @@ impl Application {
             memory_consolidator: OnceLock::new(),
             memory_events,
             execution_overrides: None,
-            work_profile: WorkProfile::Balanced,
             memory,
             collaboration: CollaborationMode::Chat,
             model_step_ceiling: None,
@@ -701,12 +715,6 @@ impl Application {
         })
     }
 
-    /// Set work profile for subsequent engine builds and session creates.
-    pub fn with_work_profile(mut self, profile: WorkProfile) -> Self {
-        self.work_profile = profile;
-        self
-    }
-
     /// Set collaboration mode for subsequent session creates.
     pub fn with_collaboration(mut self, mode: CollaborationMode) -> Self {
         self.collaboration = mode;
@@ -724,10 +732,6 @@ impl Application {
     pub fn with_model_step_ceiling(mut self, max_model_steps: Option<u32>) -> Self {
         self.model_step_ceiling = model_step_ceiling_from_flag(max_model_steps);
         self
-    }
-
-    pub fn work_profile(&self) -> WorkProfile {
-        self.work_profile
     }
 
     pub fn collaboration(&self) -> CollaborationMode {
@@ -763,6 +767,15 @@ impl Application {
         let mut guard = self.database.lock().await;
         let db = guard.get_or_insert_with(|| db).clone();
         Ok(db)
+    }
+
+    /// Recover hosted process settlements at an explicit runtime startup
+    /// boundary. Merely reading the session database never performs this work.
+    pub async fn reconcile_execution_services(&self) -> Result<(), AppError> {
+        self.background_tasks
+            .reconcile_hosted()
+            .await
+            .map_err(AppError::ExecutionHost)
     }
 
     /// Start this runtime's project memory worker explicitly. Database-only
@@ -843,9 +856,28 @@ impl Application {
         self.registry.model_refs()
     }
 
+    pub(crate) fn validate_session_workspace(
+        &self,
+        repository: Option<&str>,
+    ) -> Result<(), AppError> {
+        let expected = self
+            .layout
+            .primary_workspace()
+            .map(|root| root.display().to_string());
+        if repository != expected.as_deref() {
+            return Err(AppError::NotFound(
+                "session workspace association does not match this runtime source".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The parsed `.leveler/config.yaml` for the repo (defaults if absent).
     pub fn project_config(&self) -> leveler_project::ProjectConfig {
-        leveler_project::ProjectConfig::load(&self.layout.repo_root).unwrap_or_default()
+        self.layout
+            .primary_workspace()
+            .and_then(leveler_project::ProjectConfig::load)
+            .unwrap_or_default()
     }
 
     /// The single memory-capability decision for this project.
@@ -875,7 +907,7 @@ impl Application {
     /// Connect to the configured MCP servers once and cache their tools, so
     /// every turn reuses the same connections instead of respawning processes.
     async fn mcp_tools(&self) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
-        if self.config.mcp_servers.is_empty() {
+        if self.layout.primary_workspace().is_none() || self.config.mcp_servers.is_empty() {
             return Vec::new();
         }
         let mut guard = self.mcp_tools.lock().await;
@@ -900,11 +932,14 @@ impl Application {
         model: &ModelRef,
         mode: PermissionProfile,
         sandbox: bool,
-        work_profile: WorkProfile,
         read_only: bool,
         session_scope: Option<&str>,
     ) -> Result<(CapabilityPacks, ToolContext, leveler_tools::ToolRegistry), AppError> {
-        let workspace = Workspace::new(&self.layout.repo_root)?;
+        let workspace = self
+            .layout
+            .primary_workspace()
+            .map(Workspace::new)
+            .transpose()?;
         // The ablation seam (`leveler eval ablate`): overrides reach BOTH
         // consumers — the executor factory's resolver and the tool-context
         // limits — so a run differs from control in exactly the flipped knob.
@@ -926,11 +961,16 @@ impl Application {
             .with_memory_root(self.layout.memory_dir())
             .with_browser(self.browser.clone())
             .with_search_api_key(search_api_key(self.environment.as_ref()));
-        let tool_context = ToolContext::with_environment(workspace, mode, self.environment.clone())
-            .with_policy_limits(max_files)
-            .with_sandbox(sandbox)
-            .with_deny_env(provider_secret_env_names(&self.config.providers))
-            .with_read_only(read_only);
+        let tool_context = match workspace {
+            Some(workspace) => {
+                ToolContext::with_environment(workspace, mode, self.environment.clone())
+            }
+            None => ToolContext::without_workspace_with_environment(mode, self.environment.clone()),
+        }
+        .with_policy_limits(max_files)
+        .with_sandbox(sandbox)
+        .with_deny_env(provider_secret_env_names(&self.config.providers))
+        .with_read_only(read_only);
         // The permission profile this turn authorizes under is the SESSION's
         // live cell, not the value captured here: a user who switches profile
         // while this turn runs must be obeyed by it and by every agent it has
@@ -941,15 +981,16 @@ impl Application {
             Some(scope) => tool_context.with_session_scope(scope),
             None => tool_context,
         };
-        // The model-visible surface is composed here, from what this host can
-        // actually do — never from a guess about the task or the model.
-        // ONE answer for the whole memory surface. `exposed` decided the tools;
-        // the index, the recall root and the prompt guidance used to bypass it
-        // entirely, so an Economy turn carried every memory body while the
-        // tools were unregistered — two owners for one capability.
-        let exposed = self.exposed_capabilities(work_profile, model).await;
-        let registry = model_surface(exposed, &capabilities);
-        Ok((exposed, tool_context, registry))
+        // Build all mechanically available tools. The executor discloses them
+        // progressively, independently of this registry's construction.
+        let available_packs = self.capability_availability(model).await;
+        let registry = model_surface(available_packs, &capabilities);
+        let registry = if self.layout.primary_workspace().is_none() {
+            registry.workspace_independent_subset()
+        } else {
+            registry
+        };
+        Ok((available_packs, tool_context, registry))
     }
 
     /// The read-only tool surface a `/btw` side question may use.
@@ -964,18 +1005,24 @@ impl Application {
         model: &ModelRef,
         mode: PermissionProfile,
         sandbox: bool,
-        work_profile: WorkProfile,
         session_scope: Option<&str>,
     ) -> Result<(leveler_tools::ToolRegistry, ToolContext), AppError> {
-        let (_exposed, tool_context, registry) = self
-            .compose_tool_surface(model, mode, sandbox, work_profile, true, session_scope)
+        let (_available, tool_context, registry) = self
+            .compose_tool_surface(model, mode, sandbox, true, session_scope)
             .await?;
-        Ok((registry.read_only_subset(), tool_context))
+        // A bounded side question has no goal or capability loading protocol.
+        // It may inspect base primitives without implicitly exposing packs.
+        let registry = registry.read_only_subset();
+        let definitions = registry.definitions();
+        let optional: Vec<&str> = definitions
+            .iter()
+            .filter(|tool| leveler_agent::capability::tool_capability(&tool.name).is_some())
+            .map(|tool| tool.name.as_str())
+            .collect();
+        Ok((registry.without_named(&optional), tool_context))
     }
 
-    /// Build the Coding harness for `model`, rooted at the repository. Uses this Application's work profile
-    /// (CLI / create-time default). Resume must call
-    /// [`Self::engine_for_with_profile`] with axes loaded from the session row.
+    /// Build the coding harness with the minimal initial model surface.
     pub async fn engine_for(
         &self,
         model: &ModelRef,
@@ -984,17 +1031,8 @@ impl Application {
         approver: Arc<dyn leveler_execution::Approver>,
         clarifier: Arc<dyn leveler_agent::Clarifier>,
     ) -> Result<leveler_agent::coding::CodingRuntime, AppError> {
-        self.engine_for_with_profile(
-            model,
-            mode,
-            sandbox,
-            approver,
-            clarifier,
-            self.work_profile,
-            false,
-            None,
-        )
-        .await
+        self.engine_for_session(model, mode, sandbox, approver, clarifier, false, None)
+            .await
     }
 
     /// AVAILABLE: which optional capabilities this MACHINE can provide.
@@ -1011,10 +1049,11 @@ impl Application {
             // The symbol tools ask a language server when one is installed and
             // otherwise answer from a scan that needs nothing, so the
             // capability itself is always providable here.
-            code_intelligence: true,
+            code_intelligence: self.layout.primary_workspace().is_some(),
             // Both git tools shell out to `git`; without the binary each one
             // can only report that it could not start.
-            vcs: leveler_browser::which(environment, "git").is_some(),
+            vcs: self.layout.primary_workspace().is_some()
+                && leveler_browser::which(environment, "git").is_some(),
             web_fetch: true,
             // Advertising a search tool without a key spends schema on a call
             // that can only fail. A blank value is not a configuration.
@@ -1029,7 +1068,7 @@ impl Application {
             // The app always hands the tools a memory root and a workspace to
             // read skills from.
             memory: true,
-            skills: true,
+            skills: self.layout.primary_workspace().is_some(),
             // Not "is a browser installed": is the browser this host would
             // SELECT — the call's, then `[browser].default`, then the system
             // default — one it can actually drive? Answering with a different
@@ -1040,65 +1079,78 @@ impl Application {
         }
     }
 
-    /// ENABLED: which optional capabilities this product mode ASKS for.
-    ///
-    /// A user's decision about cost and scope, never an inference about the
-    /// task. `Economy` asks for none of them — the primitives and the protocol
-    /// only — which is why a machine with a browser runtime installed still
-    /// shows an Economy turn zero browser tools. Memory additionally honours
-    /// the project's own `memory.enabled` switch: a disabled project asks for
-    /// no memory surface regardless of profile.
-    fn capability_selection(work_profile: WorkProfile, memory: MemoryPolicy) -> CapabilityPacks {
-        match work_profile {
-            WorkProfile::Economy => CapabilityPacks::NONE,
-            WorkProfile::Balanced => CapabilityPacks {
-                memory: memory.exposes(work_profile),
-                ..CapabilityPacks::ALL
-            },
-        }
-    }
-
-    /// EXPOSED: the packs that actually reach the model's surface.
-    ///
-    /// Enabled ∩ available. Being available buys nothing on its own, and
-    /// asking for something this machine cannot do buys nothing either.
-    async fn exposed_capabilities(
-        &self,
-        work_profile: WorkProfile,
-        model: &leveler_model::ModelRef,
-    ) -> CapabilityPacks {
-        Self::capability_selection(work_profile, self.memory)
-            .intersect(self.capability_availability(model).await)
-    }
-
-    /// Like [`Self::engine_for`], but force a work profile (resume / axes reload).
+    /// Build a session harness with its live permission cell and planning overlay.
     #[allow(clippy::too_many_arguments)]
-    pub async fn engine_for_with_profile(
+    pub async fn engine_for_session(
         &self,
         model: &ModelRef,
         mode: PermissionProfile,
         sandbox: bool,
         approver: Arc<dyn leveler_execution::Approver>,
         clarifier: Arc<dyn leveler_agent::Clarifier>,
-        work_profile: WorkProfile,
         read_only: bool,
         session_scope: Option<&str>,
     ) -> Result<leveler_agent::coding::CodingRuntime, AppError> {
-        // ONE answer for the whole memory surface. `exposed` decided the tools;
-        // the index, the recall root and the prompt guidance used to bypass it
-        // entirely, so an Economy turn carried every memory body while the
-        // tools were unregistered — two owners for one capability.
-        let (exposed, tool_context, mut registry) = self
-            .compose_tool_surface(model, mode, sandbox, work_profile, read_only, session_scope)
+        self.reconcile_execution_services().await?;
+        let (available_packs, tool_context, mut registry) = self
+            .compose_tool_surface(model, mode, sandbox, read_only, session_scope)
             .await?;
-        // Harness controls are not a capability the host can turn off: they
-        // steer the harness, so the harness registers them.
-        leveler_agent::register_harness_controls(&mut registry);
+        // Register available controls; exposure is owned by CapabilityDisclosure.
+        leveler_agent::register_harness_controls_with(
+            &mut registry,
+            leveler_agent::HarnessControls::ALL,
+        );
         // Attach external MCP tools (connect once, cached across turns).
         for tool in self.mcp_tools().await {
             registry.register(tool);
         }
-        let memory_catalog = if exposed.memory {
+        use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
+        let mut available = vec![
+            CapabilityId::Authoring,
+            CapabilityId::HostInteraction,
+            CapabilityId::MultiAgent,
+        ];
+        for (present, id) in [
+            (available_packs.browser, CapabilityId::Browser),
+            (available_packs.memory, CapabilityId::Memory),
+            (available_packs.skills, CapabilityId::Skills),
+            (
+                available_packs.code_intelligence,
+                CapabilityId::CodeIntelligence,
+            ),
+            (
+                available_packs.web_fetch || available_packs.web_search,
+                CapabilityId::Web,
+            ),
+            (available_packs.media, CapabilityId::Media),
+            (
+                registry
+                    .definitions()
+                    .iter()
+                    .any(|tool| tool.name.starts_with("mcp__")),
+                CapabilityId::ExternalTools,
+            ),
+        ] {
+            if present {
+                available.push(id);
+            }
+        }
+        let permitted = available
+            .iter()
+            .copied()
+            .filter(|id| match id {
+                CapabilityId::Memory => self.memory.enabled(),
+                CapabilityId::MultiAgent => {
+                    self.project_config().agents.delegation && self.config.agents_delegation
+                }
+                CapabilityId::Authoring => !read_only,
+                _ => true,
+            })
+            .collect();
+        let capabilities = Arc::new(
+            CapabilityDisclosure::new(available, permitted, vec![]).map_err(AppError::Engine)?,
+        );
+        let memory_catalog = if available_packs.memory && self.memory.enabled() {
             load_memory_catalog(&self.layout.memory_dir())
         } else {
             String::new()
@@ -1108,14 +1160,22 @@ impl Application {
         let leveler_home = leveler_core::LevelerHome::resolve(leveler_core::environment())
             .root()
             .to_path_buf();
-        let merged_rules = leveler_execution::load_merged_rules(
-            &leveler_home,
-            &self.layout.permissions_path(),
-            &self.layout.repo_root,
-        );
-        let permission_rules = merged_rules.rules;
-        let hook_runner =
-            leveler_execution::HookRunner::load(&leveler_home, &self.layout.repo_root);
+        let permission_rules = self
+            .layout
+            .primary_workspace()
+            .map(|root| {
+                leveler_execution::load_merged_rules(
+                    &leveler_home,
+                    &self.layout.permissions_path(),
+                    root,
+                )
+                .rules
+            })
+            .unwrap_or_default();
+        let hook_runner = match self.layout.primary_workspace() {
+            Some(root) => leveler_execution::HookRunner::load(&leveler_home, root),
+            None => leveler_execution::HookRunner::empty(self.layout.state_dir.clone()),
+        };
         let runtime: Arc<dyn ModelRuntime> = self.registry.clone();
         let db = self.open_database().await?;
         Ok(leveler_agent::coding::CodingRuntime {
@@ -1129,9 +1189,10 @@ impl Application {
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
                 overrides: self.execution_overrides.clone(),
+                capabilities: Some(capabilities),
                 memory_catalog,
-                memory_expose: exposed.memory,
-                memory_root: exposed.memory.then(|| self.layout.memory_dir()),
+                memory_expose: available_packs.memory,
+                memory_root: Some(self.layout.memory_dir()),
                 background_tasks: self.background_tasks.clone(),
                 permission_rules,
                 permission_rules_path: Some(self.layout.permissions_path()),
@@ -1142,6 +1203,7 @@ impl Application {
                 // Project config wins over global when set; both default true.
                 allow_delegation: self.project_config().agents.delegation
                     && self.config.agents_delegation,
+                allow_host_input: true,
                 independent_review: combine_independent_review(
                     self.config.agents_independent_review,
                     self.project_config().agents.independent_review,
@@ -1156,12 +1218,12 @@ impl Application {
         })
     }
 
-    /// Product axes stored on the session row (SoT for resume). Independent of
+    /// Collaboration stored on the session row (SoT for resume). Independent of
     /// this Application's in-memory defaults.
     pub async fn session_product_axes(
         &self,
         session_id: &leveler_core::SessionId,
-    ) -> Result<(WorkProfile, CollaborationMode), AppError> {
+    ) -> Result<CollaborationMode, AppError> {
         let db = self.open_database().await?;
         let record = SessionRepository::new(&db)
             .get(session_id)
@@ -1174,25 +1236,15 @@ impl Application {
 /// Decode product axes from a session row; unknown wire values fall back safely.
 pub(crate) fn axes_from_session_record(
     record: &leveler_storage::SessionRecord,
-) -> (WorkProfile, CollaborationMode) {
+) -> CollaborationMode {
     use std::str::FromStr;
-    // The legacy `delivery` profile reads as `balanced` here, at the domain
-    // boundary — the single compatibility rule, not one per client.
-    let work = WorkProfile::from_persisted(&record.work_profile);
-    let collab =
-        CollaborationMode::from_str(&record.collaboration).unwrap_or(CollaborationMode::Chat);
-    (work, collab)
+    CollaborationMode::from_str(&record.collaboration).unwrap_or(CollaborationMode::Chat)
 }
 
-/// Canonical wire value for a persisted work-profile column.
-///
-/// A client-facing projection must never emit a value the product no longer
-/// offers: the legacy `delivery` profile (and anything unrecognized) reads as
-/// `balanced`. Living beside [`axes_from_session_record`], this is the single
-/// normalization point every projection shares, so none can drift from the
-/// persistence boundary.
-pub(crate) fn canonical_work_profile(raw: &str) -> String {
-    WorkProfile::from_persisted(raw).as_str().to_string()
+/// Compatibility marker for old wire clients. The retired database column
+/// carries no runtime authority and every historical value has one semantics.
+pub(crate) fn canonical_work_profile(_raw: &str) -> String {
+    "single".to_string()
 }
 
 /// How many catalog titles reach the system prefix.
@@ -1246,7 +1298,7 @@ impl Application {
         match leveler_memory::collect_turn_candidates(
             &store,
             user_text,
-            Some(self.layout.repo_root.as_path()),
+            self.layout.primary_workspace(),
         ) {
             Ok(outcomes) => outcomes
                 .into_iter()
@@ -1373,7 +1425,11 @@ impl Application {
         ),
         AppError,
     > {
-        let cwd = self.layout.repo_root.clone();
+        let cwd = self
+            .layout
+            .require_workspace()
+            .map_err(|error| AppError::NotFound(error.to_string()))?
+            .to_path_buf();
         let (program, args) = leveler_execution::shell_invocation(command);
         let mut request = leveler_execution::ProcessRequest::new(program, args, cwd.clone());
         request.timeout = std::time::Duration::from_secs(7 * 24 * 3600);
@@ -1619,11 +1675,11 @@ mod canonical_work_profile_tests {
     use super::canonical_work_profile;
 
     #[test]
-    fn a_persisted_delivery_reads_as_balanced() {
-        assert_eq!(canonical_work_profile("delivery"), "balanced");
-        assert_eq!(canonical_work_profile("balanced"), "balanced");
-        assert_eq!(canonical_work_profile("economy"), "economy");
+    fn every_legacy_value_maps_to_single_semantics() {
+        assert_eq!(canonical_work_profile("delivery"), "single");
+        assert_eq!(canonical_work_profile("balanced"), "single");
+        assert_eq!(canonical_work_profile("economy"), "single");
         // Unknown values fall back to the default, never to a retired value.
-        assert_eq!(canonical_work_profile("nonsense"), "balanced");
+        assert_eq!(canonical_work_profile("nonsense"), "single");
     }
 }

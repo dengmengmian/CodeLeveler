@@ -99,14 +99,6 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 Vec::new()
             }
         },
-        Overlay::WorkModePicker(mut sel) => match sel.on_key(effective) {
-            SelectionOutcome::None => {
-                state.overlay = Some(Overlay::WorkModePicker(sel));
-                Vec::new()
-            }
-            SelectionOutcome::Cancel => Vec::new(),
-            SelectionOutcome::Confirm(key) => super::submit::apply_work_profile(state, &key),
-        },
         Overlay::CollabPicker(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
                 state.overlay = Some(Overlay::CollabPicker(sel));
@@ -371,21 +363,6 @@ pub(super) fn open_mode_picker(state: &mut AppState) {
     ];
     let model = SelectionModel::new(t.overlay_mode, options, false).focus_key(current);
     state.overlay = Some(Overlay::ModePicker(Box::new(model)));
-}
-
-pub(super) fn open_work_mode_picker(state: &mut AppState) {
-    let current = state.work_profile.as_str();
-    let t = state.t();
-    let options = vec![
-        SelectionOption::new("balanced", "balanced")
-            .description(t.work_mode_balanced)
-            .current(current == "balanced"),
-        SelectionOption::new("economy", "economy")
-            .description(t.work_mode_economy)
-            .current(current == "economy"),
-    ];
-    let model = SelectionModel::new(t.overlay_work_mode, options, false).focus_key(current);
-    state.overlay = Some(Overlay::WorkModePicker(Box::new(model)));
 }
 
 pub(super) fn open_collab_picker(state: &mut AppState) {

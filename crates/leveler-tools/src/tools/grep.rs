@@ -94,7 +94,7 @@ impl Tool for GrepTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.clone().unwrap_or_else(|| ".".to_string());
-        let search_root = context.execution.workspace.resolve_for_read(&rel)?;
+        let search_root = context.require_workspace()?.resolve_for_read(&rel)?;
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
 
         let query = GrepQuery {
@@ -106,7 +106,7 @@ impl Tool for GrepTool {
         };
         let result = match WorkspaceSearch::grep(
             &search_root,
-            context.execution.workspace.root(),
+            context.require_workspace()?.root(),
             &query,
             &cancellation,
         )

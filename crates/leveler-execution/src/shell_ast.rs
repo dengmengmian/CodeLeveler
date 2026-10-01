@@ -113,8 +113,175 @@ fn classify_command_node(cmd: &Node, src: &[u8]) -> Option<CommandClass> {
         }
     }
 
-    let first_arg = args.first().and_then(|a| a.as_deref());
-    Some(classify_program(basename(&program), first_arg))
+    // Git is classified from its EFFECTS (see [`crate::git_effects`]), which
+    // needs the whole argument vector. An argument we cannot read statically
+    // (`git clean $FLAGS`) drops out of that vector, so the verdict for Git
+    // fails closed rather than reading as the harmless no-flag form.
+    let readable: Vec<String> = args.iter().flatten().cloned().collect();
+    let opaque = args.iter().any(Option::is_none);
+    let verdict = classify_program(basename(&program), &readable);
+    if opaque && verdict == CommandClass::Safe && basename(&program) == "git" {
+        return Some(CommandClass::Dangerous);
+    }
+    Some(verdict)
+}
+
+/// Every command a program will run, with each argument resolved from the
+/// source.
+///
+/// [`proven_executed_commands`] answers a narrower question — which commands a
+/// zero exit code proves ran — so it refuses `a; b` and pipelines. This
+/// enumerator answers "what will execute at all", which is what an EFFECT
+/// decision needs. `complete` is `false` whenever a command, an argument, or
+/// the script itself could not be read: an incomplete list may still gate, but
+/// it must never be the basis for granting a capability.
+#[derive(Default)]
+pub struct ExecutedCommands {
+    pub commands: Vec<Vec<String>>,
+    pub complete: bool,
+    /// Shell redirections can write independently of the enumerated programs.
+    /// Their authority must not inherit a Git program's metadata capability.
+    pub shell_writes: bool,
+}
+
+impl ExecutedCommands {
+    pub fn git_effects(&self) -> crate::git_effects::CallGitEffects {
+        let mut effects = crate::git_effects::call_git_effects(&self.commands, self.complete);
+        effects.fully_git &= !self.shell_writes;
+        effects
+    }
+}
+
+pub fn executed_commands(program: &str, args: &[String]) -> ExecutedCommands {
+    if is_shell_wrapper_program(program) {
+        return match shell_c_script(args) {
+            Some(script) => executed_commands_in_script(script),
+            // A wrapper whose body is not a literal (`bash script.sh`): what it
+            // runs is not knowable here.
+            None => ExecutedCommands::default(),
+        };
+    }
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(program.to_string());
+    command.extend(args.iter().cloned());
+    ExecutedCommands {
+        commands: vec![command],
+        complete: true,
+        shell_writes: false,
+    }
+}
+
+fn executed_commands_in_script(script: &str) -> ExecutedCommands {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return ExecutedCommands::default();
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return ExecutedCommands::default();
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return ExecutedCommands::default();
+    }
+    let mut out = ExecutedCommands {
+        commands: Vec::new(),
+        complete: true,
+        shell_writes: false,
+    };
+    // Redirections may live outside a command node (including redirected
+    // groups), and command enumeration deliberately stops at resolved argv.
+    // Inspect the whole AST independently so neither shape loses its writes.
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "file_redirect" && redirect_writes_file(&node, script.as_bytes()) {
+            out.shell_writes = true;
+        }
+        for index in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(index) {
+                nodes.push(child);
+            }
+        }
+    }
+    collect_executed(&root, script.as_bytes(), &mut out);
+    out
+}
+
+/// Push every `command` node's argv. A node that cannot be read leaves
+/// `complete` false: the list may still be useful for gating, never for
+/// granting.
+fn collect_executed(node: &Node, src: &[u8], out: &mut ExecutedCommands) {
+    if node.kind() == "command" {
+        // An environment prefix changes the program's environment
+        // (`GIT_DIR=… git push`). The command STILL RUNS, so its effects still
+        // count — dropping it here would let an env prefix walk a remote write
+        // past the gate — but it is not the plain invocation an effect-derived
+        // capability may be granted on.
+        let mut cursor = node.walk();
+        let env_prefixed = node
+            .children(&mut cursor)
+            .any(|child| child.kind() == "variable_assignment");
+        let Some(name) = node.child_by_field_name("name") else {
+            return;
+        };
+        let Some(program) = resolve_command_name(&name, src) else {
+            out.complete = false;
+            return;
+        };
+        let args = literal_arguments(node, src);
+        if args.iter().any(Option::is_none) {
+            out.complete = false;
+            return;
+        }
+        let words: Vec<String> = args.into_iter().flatten().collect();
+        // A nested `sh -c '…'`: its body is what runs, not the shell.
+        if is_shell_wrapper_program(&program)
+            && let Some(pos) = words.iter().position(|w| is_shell_c_flag(w))
+        {
+            let Some(body) = words.get(pos + 1) else {
+                return;
+            };
+            let nested = executed_commands_in_script(body);
+            out.complete &= nested.complete && !env_prefixed;
+            out.shell_writes |= nested.shell_writes;
+            out.commands.extend(nested.commands);
+            return;
+        }
+        let mut command = Vec::with_capacity(words.len() + 1);
+        command.push(program);
+        command.extend(words);
+        out.commands.push(command);
+        out.complete &= !env_prefixed;
+        return;
+    }
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i) {
+            collect_executed(&child, src, out);
+        }
+    }
+}
+
+fn redirect_writes_file(redirect: &Node, src: &[u8]) -> bool {
+    let mut cursor = redirect.walk();
+    let operator = redirect
+        .children(&mut cursor)
+        .find(|child| !child.is_named());
+    match operator.map(|operator| operator.kind()) {
+        Some(">" | ">>" | "&>" | "&>>" | ">|") => true,
+        Some(">&") => {
+            // >&2 duplicates an existing fd; >&path opens a file. An opaque
+            // destination might be either and cannot receive metadata scope.
+            !redirect
+                .child_by_field_name("destination")
+                .and_then(|node| resolve_literal(&node, src))
+                .is_some_and(|target| {
+                    !target.is_empty() && target.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Arguments of a `command` node; each is `None` when it is not a plain

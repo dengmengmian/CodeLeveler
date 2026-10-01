@@ -49,7 +49,7 @@ impl TaskCreationStore for Database {
         .bind(&record.created_at)
         .bind(&record.updated_at)
         .bind(&record.collaboration)
-        .bind(&record.work_profile)
+        .bind("single")
         .bind(mode)
         .bind(sandbox)
         .bind(kind)
@@ -94,7 +94,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.collaboration, "plan");
-        assert_eq!(stored.work_profile, "delivery");
+        assert_eq!(stored.work_profile, "single");
     }
 
     #[tokio::test]

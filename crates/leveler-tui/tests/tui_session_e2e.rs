@@ -55,7 +55,9 @@ fn opened() -> AppState {
         Action::Runtime(RuntimeEvent::SessionOpened {
             session: UiSessionSnapshot {
                 id: SessionId::new("e2e"),
-                repository: "~/Develop/demo".into(),
+                repository: Some("~/Develop/demo".into()),
+                task_status: None,
+                task_terminal: None,
                 goal: "e2e".into(),
                 model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
                 mode: PermissionProfile::Assisted,
@@ -443,7 +445,7 @@ fn tui_slash_popup_lists_renamed_commands() {
     );
     assert!(
         !names.contains(&"/work-mode"),
-        "work-mode is searchable, not on empty /: {names:?}"
+        "retired work-mode must not appear in command completion: {names:?}"
     );
     assert!(names.contains(&"/collab"), "got {names:?}");
     assert!(names.contains(&"/goal"), "got {names:?}");
@@ -489,7 +491,7 @@ fn tui_trace_queries_durable_observatory_and_esc_returns() {
                 session: UiSessionObservation {
                     session_id: SessionId::new("e2e"),
                     goal: "e2e".into(),
-                    repository: "/repo".into(),
+                    repository: Some("/repo".into()),
                     created_at: "t".into(),
                     updated_at: "t".into(),
                     status: "completed".into(),
@@ -569,7 +571,7 @@ fn trace_observation(window_from: i64, window_to: i64) -> UiObservabilityLoaded 
         session: UiSessionObservation {
             session_id: SessionId::new("e2e"),
             goal: "e2e".into(),
-            repository: "/repo".into(),
+            repository: Some("/repo".into()),
             created_at: "t".into(),
             updated_at: "t".into(),
             status: "completed".into(),

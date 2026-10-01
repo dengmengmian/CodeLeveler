@@ -1399,6 +1399,10 @@ pub struct TurnPolicy {
     // ── Delegation ──────────────────────────────────────────────────────────
     /// When false, `spawn_agent` is not advertised (delegation kill-switch).
     pub allow_delegation: bool,
+    /// When false, `request_user_input` is not advertised. An
+    /// unattended turn has no interactive host to answer it, so the schema is
+    /// not paid for on every request. Default true.
+    pub allow_host_input: bool,
     /// Max sub-agents running at once (within a spawn batch).
     pub max_concurrent_agents: usize,
     /// Max sub-agents spawned across the whole top-level run.
@@ -1418,6 +1422,7 @@ impl Default for TurnPolicy {
             reasoning_retention: ReasoningRetention::All,
             goal_mode: false,
             allow_delegation: true,
+            allow_host_input: true,
             max_concurrent_agents: DEFAULT_MAX_CONCURRENT_AGENTS,
             max_total_agents: DEFAULT_MAX_TOTAL_AGENTS,
         }
@@ -1442,6 +1447,7 @@ pub struct Executor {
     steering: Option<Arc<dyn SteeringSource>>,
     runtime: Arc<dyn ModelRuntime>,
     registry: Arc<ToolRegistry>,
+    capabilities: Option<Arc<crate::capability::CapabilityDisclosure>>,
     tool_context: ToolContext,
     model: ModelRef,
     continuation: ContinuationPolicy,
@@ -1592,11 +1598,16 @@ impl Executor {
         // identity, not a platform guess: a case-folding volume makes
         // `src/Parser.rs` and `src/parser.rs` one file, and treating them as
         // two hands both children "exclusive" ownership of the same bytes.
-        let case_insensitive = tool_context.execution.workspace.path_case_insensitive();
+        let case_insensitive = tool_context
+            .execution
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.path_case_insensitive());
         Self {
             commit_co_author: true,
             runtime,
             registry,
+            capabilities: None,
             tool_context,
             model,
             continuation: if model_step_window == 0 {
@@ -1723,6 +1734,20 @@ impl Executor {
     /// Short INDEX lines injected into the system prompt (bodies never go here).
     /// Whether memory is exposed to the model this turn. Gates the index, the
     /// prompt guidance and automatic recall together with the tools.
+    pub fn with_capabilities(
+        mut self,
+        capabilities: Option<Arc<crate::capability::CapabilityDisclosure>>,
+    ) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    fn capability_exposed(&self, id: crate::capability::CapabilityId, legacy: bool) -> bool {
+        self.capabilities
+            .as_ref()
+            .map_or(legacy, |state| state.exposed(id))
+    }
+
     pub fn with_memory_expose(mut self, expose: bool) -> Self {
         self.memory_expose = expose;
         self
@@ -1972,6 +1997,10 @@ impl Executor {
         Executor {
             commit_co_author: self.commit_co_author,
             runtime: self.runtime.clone(),
+            capabilities: self
+                .capabilities
+                .as_ref()
+                .map(|state| Arc::new(state.for_child(&registry.definitions()))),
             registry,
             tool_context: self.tool_context.clone(),
             model: model_override.unwrap_or_else(|| self.model.clone()),
@@ -2008,6 +2037,9 @@ impl Executor {
                 max_total_agents: self.policy.max_total_agents,
                 // Children never advertise spawn_agent (depth already blocks it).
                 allow_delegation: false,
+                // A child is unattended; it has no host to ask (depth blocks
+                // it too, but the policy states it).
+                allow_host_input: false,
                 // A sub-agent finishes when it goes quiet; only the top-level
                 // run uses explicit goal resolution.
                 goal_mode: false,
@@ -2112,6 +2144,13 @@ impl Executor {
         self
     }
 
+    /// Surface switch: when false, `request_user_input` is not in the tool
+    /// list. An unattended turn has no interactive host.
+    pub fn with_host_input(mut self, allow: bool) -> Self {
+        self.policy.allow_host_input = allow;
+        self
+    }
+
     /// Apply a resolved context policy (window, reservation, headroom,
     /// threshold, retention) in one call.
     pub fn with_context_policy(mut self, context_policy: ResolvedContextPolicy) -> Self {
@@ -2202,33 +2241,56 @@ impl Executor {
     }
 
     fn system_segments(&self, request: &str) -> Vec<PromptSegment> {
-        let root = self.tool_context.execution.workspace.root();
+        let root = self
+            .tool_context
+            .execution
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root());
         // The delivery policy is project data read from the same
         // `.leveler/config.yaml` the rest of the runtime reads. Composing it
         // here keeps the selection next to the rules it selects, and keeps a
         // model from ever being the thing that decides which rules matter.
-        let policy = leveler_project::ProjectConfig::load(root)
+        let policy = root
+            .and_then(leveler_project::ProjectConfig::load)
             .map(|config| leveler_context::RuleDeliveryPolicy {
                 always: config.rules.always_delivered,
                 budget_bytes: config.rules.budget_bytes,
             })
             .unwrap_or_default();
-        let project_rules = leveler_context::load_rules_for_delivery(root, &policy);
-        let mut segments = PromptBuilder::new()
-            .commit_co_author(self.commit_co_author)
-            .turn_context(TurnContext {
-                model: self.model.clone(),
-                mode: self.tool_context.policy.mode(),
-                network_allowed: self.approval_policy.network_allowed,
-                deny_network: self.tool_context.policy.network_denied(),
-                cwd: self.tool_context.execution.workspace.root().to_path_buf(),
-                project_rules,
-                user_language: crate::prompt::user_language(request),
-                repo_map: workspace_listing(self.tool_context.execution.workspace.root()),
-            })
-            .memory_catalog(self.memory_catalog.clone())
-            .memory_expose(self.memory_expose)
-            .segments();
+        let project_rules = root
+            .map(|root| leveler_context::load_rules_for_delivery(root, &policy))
+            .unwrap_or_default();
+        let mut segments =
+            PromptBuilder::new()
+                .optional_guidance(
+                    self.capability_exposed(crate::capability::CapabilityId::Skills, true),
+                    self.capability_exposed(
+                        crate::capability::CapabilityId::MultiAgent,
+                        self.policy.allow_delegation,
+                    ),
+                    self.capability_exposed(
+                        crate::capability::CapabilityId::HostInteraction,
+                        self.policy.allow_host_input,
+                    ),
+                )
+                .commit_co_author(self.commit_co_author)
+                .turn_context(TurnContext {
+                    model: self.model.clone(),
+                    mode: self.tool_context.policy.mode(),
+                    network_allowed: self.approval_policy.network_allowed,
+                    deny_network: self.tool_context.policy.network_denied(),
+                    cwd: root.map(std::path::Path::to_path_buf),
+                    project_rules,
+                    user_language: crate::prompt::user_language(request),
+                    repo_map: root.map(workspace_listing).unwrap_or_default(),
+                })
+                .memory_catalog(self.memory_catalog.clone())
+                .memory_expose(self.capability_exposed(
+                    crate::capability::CapabilityId::Memory,
+                    self.memory_expose,
+                ))
+                .segments();
         let mut prompt = String::new();
         match self.agent_role {
             AgentRole::Explorer => prompt.push_str(
@@ -2656,8 +2718,10 @@ impl Executor {
     /// visible on the next one; placed after the system prompt so the cached
     /// prefix is untouched.
     fn agent_catalog_injection(&self) -> Option<String> {
-        (self.depth == 0 && self.policy.allow_delegation)
-            .then(|| self.load_agent_registry().render_catalog())
+        (self.depth == 0
+            && self.policy.allow_delegation
+            && self.capability_exposed(crate::capability::CapabilityId::MultiAgent, true))
+        .then(|| self.load_agent_registry().render_catalog())
     }
 
     /// The per-turn index of skills available to this agent: name + scope +
@@ -2667,8 +2731,11 @@ impl Executor {
     fn skill_index_injection(&self) -> Option<String> {
         // The catalog names skills `load_skill` can open. Without that tool
         // the names are not a capability this turn has.
+        if !self.capability_exposed(crate::capability::CapabilityId::Skills, true) {
+            return None;
+        }
         self.registry.get("load_skill")?;
-        let root = self.tool_context.execution.workspace.root();
+        let root = self.tool_context.execution.workspace.as_ref()?.root();
         let environment = &self.tool_context.execution.environment;
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
@@ -2682,9 +2749,12 @@ impl Executor {
 
     /// Resolve `$name` mentions in the user request into a system injection block.
     fn skill_turn_injection(&self, request: &str) -> Option<SelectedSkills> {
+        if !self.capability_exposed(crate::capability::CapabilityId::Skills, true) {
+            return None;
+        }
         // Built from this execution's own environment, so `$mention` and
         // `save_skill` agree about where the user's skills live.
-        let root = self.tool_context.execution.workspace.root();
+        let root = self.tool_context.execution.workspace.as_ref()?.root();
         let environment = &self.tool_context.execution.environment;
         let registry = leveler_skills::SkillRegistry::load(
             &leveler_skills::SkillRoots::for_project_in(root, &|key| environment.var_os(key)),
@@ -2709,7 +2779,7 @@ impl Executor {
     /// and the trace. Turn assembly carries the result in ControlContext,
     /// independently of conversation persistence and history compaction.
     fn relevant_memory_injection(&self, request: &str) -> MemoryInjection {
-        if !self.memory_expose {
+        if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
             tracing::debug!(memory_exposed = false, "memory recall skipped");
             return MemoryInjection::default();
         }
@@ -2782,7 +2852,7 @@ impl Executor {
     /// runtime-owned batch consolidator. The main turn performs only this
     /// deterministic, zero-model-call fast path.
     fn maintain_memory(&self, request: &str) -> Vec<AgentEvent> {
-        if !self.memory_expose {
+        if !self.capability_exposed(crate::capability::CapabilityId::Memory, self.memory_expose) {
             return Vec::new();
         }
         let Some(root) = self.memory_root.as_ref() else {
@@ -3237,6 +3307,101 @@ mod ownership_authority_tests {
             .unwrap();
 
         assert_eq!(approver.asks.load(Ordering::SeqCst), 1);
+    }
+
+    /// Git's permission VERDICT and the repository-metadata CAPABILITY it runs
+    /// with are two readings of one parse of the call, so they cannot drift
+    /// apart. The verdict comes from the call's effects; the capability is the
+    /// mechanical precondition of those effects; nothing here inspects the
+    /// model, the task, or a command string.
+    #[tokio::test]
+    async fn git_effects_decide_the_verdict_and_the_metadata_capability_together() {
+        use leveler_execution::{PolicyResolution, WriteScope};
+
+        async fn resolve(executor: &Executor, ctx: &ToolContext, cmd: &str) -> (bool, WriteScope) {
+            let call = leveler_model::ToolCall {
+                id: leveler_core::ToolCallId::new("git-cap"),
+                name: "shell_command".into(),
+                arguments: serde_json::json!({ "cmd": cmd }),
+            };
+            match executor
+                .resolve_policy(&call, ctx, &CancellationToken::new())
+                .await
+            {
+                PolicyResolution::Allow(resolved) => (false, resolved.write),
+                PolicyResolution::Ask(pending) => (true, pending.write.clone()),
+                PolicyResolution::Deny(denial) => panic!("unexpected denial: {}", denial.reason),
+            }
+        }
+
+        let executor = executor();
+        let ctx = executor.tool_context.clone();
+        let WriteScope::Workspace { root } = ctx.write_scope() else {
+            panic!("assisted confines writes to the workspace");
+        };
+        let sealed = WriteScope::Workspace { root: root.clone() };
+        let unsealed = WriteScope::WorkspaceWithGit { root: root.clone() };
+
+        // A read needs no repository metadata write, so the seal stays and
+        // nobody is asked.
+        assert_eq!(
+            resolve(&executor, &ctx, "git status").await,
+            (false, sealed.clone())
+        );
+        assert_eq!(
+            resolve(&executor, &ctx, "git branch --show-current").await,
+            (false, sealed.clone())
+        );
+
+        // A sync against the repository's own remote writes fetched metadata
+        // only: it runs unsealed and still asks nobody.
+        assert_eq!(
+            resolve(&executor, &ctx, "git fetch origin").await,
+            (false, unsealed.clone())
+        );
+        assert_eq!(
+            resolve(&executor, &ctx, "git fetch --prune origin").await,
+            (false, unsealed.clone())
+        );
+        assert_eq!(
+            resolve(&executor, &ctx, "git ls-remote origin").await,
+            (false, sealed.clone())
+        );
+
+        // A remote the repository does not configure is asked for.
+        assert!(
+            resolve(&executor, &ctx, "git fetch https://unknown.example/x.git")
+                .await
+                .0
+        );
+
+        // Workspace mutation is a different permission from a sync, and it runs
+        // unsealed once approved so the refs it writes can actually land.
+        assert_eq!(
+            resolve(&executor, &ctx, "git pull").await,
+            (true, unsealed.clone())
+        );
+        assert_eq!(
+            resolve(&executor, &ctx, "git switch -c feat").await.1,
+            unsealed
+        );
+
+        // Remote writes and irreversible history loss are never inherited from
+        // the fetch decision.
+        assert!(resolve(&executor, &ctx, "git push origin main").await.0);
+        assert!(resolve(&executor, &ctx, "git reset --hard").await.0);
+        assert!(resolve(&executor, &ctx, "git clean -fd").await.0);
+        assert!(
+            resolve(&executor, &ctx, "git remote set-url origin x")
+                .await
+                .0
+        );
+
+        // A command that is not Git keeps the sealed workspace.
+        assert_eq!(
+            resolve(&executor, &ctx, "cargo test").await,
+            (false, sealed)
+        );
     }
 
     /// The write-authority fallback is the dangerous edge: `effective_write_

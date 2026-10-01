@@ -17,7 +17,6 @@ import {
   modelLabel,
   modelRefString,
   reasoningLabel,
-  workProfileLabel,
 } from '../lib/format';
 import { CTRL_ICON } from '../lib/icons';
 import { runConfigCompact } from '../lib/runConfig';
@@ -55,11 +54,6 @@ const PERMISSIONS: ReadonlyArray<{
 ];
 
 /** 产品轴选项（wire 值 → 描述）。含义以 runtime 为准，这里只解释。 */
-const WORK_OPTIONS: ReadonlyArray<readonly [string, string]> = [
-  ['economy', '省着用：更少的探索与验证轮次'],
-  ['balanced', '默认：探索、实现、验证均衡'],
-];
-
 const COLLAB_OPTIONS: ReadonlyArray<readonly [string, string]> = [
   ['chat', '普通交互执行'],
   ['plan', '只读出方案，确认后再执行'],
@@ -81,7 +75,6 @@ export function Composer() {
   const current = state.current;
   const turnActive = current?.turnActive ?? false;
   const queue = state.queue.filter((q) => q.sessionId === current?.id);
-  const workProfile = current?.workProfile ?? 'balanced';
   const collaboration = current?.collaboration ?? 'chat';
   const reasoning = reasoningLabel(current?.reasoningEffort ?? null);
   const models = current?.availableModels ?? [];
@@ -195,18 +188,6 @@ export function Composer() {
         };
       });
     }
-    if (popup === 'work') {
-      return WORK_OPTIONS.map(([w, desc]) => ({
-        key: w,
-        label: workProfileLabel(w),
-        desc,
-        current: workProfile === w,
-        run: () => {
-          bridge.setAxes(w, collaboration);
-          setPopup(null);
-        },
-      }));
-    }
     if (popup === 'collab') {
       return COLLAB_OPTIONS.map(([c, desc]) => ({
         key: c,
@@ -214,7 +195,7 @@ export function Composer() {
         desc,
         current: collaboration === c,
         run: () => {
-          bridge.setAxes(workProfile, c);
+          bridge.setCollaboration(c);
           setPopup(null);
         },
       }));
@@ -248,15 +229,13 @@ export function Composer() {
   const pickerTitle =
     popup === 'model'
       ? 'Model'
-      : popup === 'work'
-        ? 'Work Profile'
-        : popup === 'collab'
-          ? 'Collaboration'
-          : popup === 'perm'
-            ? 'Permission'
-            : popup === 'checkpoint'
-              ? 'Restore checkpoint'
-              : null;
+      : popup === 'collab'
+        ? 'Collaboration'
+        : popup === 'perm'
+          ? 'Permission'
+          : popup === 'checkpoint'
+            ? 'Restore checkpoint'
+            : null;
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Escape') {
@@ -522,7 +501,6 @@ export function Composer() {
                 >
                   {runConfigCompact({
                     modelLabel: modelLabel(current?.model),
-                    workProfile,
                   })}
                 </button>
                 {popup === 'run' && (
@@ -551,25 +529,13 @@ export function Composer() {
                         <div className="run-readonly">{reasoning}</div>
                       </>
                     )}
-                    <div className="run-sec">Work Profile</div>
-                    {WORK_OPTIONS.map(([w, desc]) => (
-                      <button
-                        key={w}
-                        type="button"
-                        className={`pop-item${workProfile === w ? ' sel' : ''}`}
-                        onClick={() => bridge.setAxes(w, collaboration)}
-                      >
-                        <span className="cmd">{workProfileLabel(w)}</span>
-                        <span className="desc">{desc}</span>
-                      </button>
-                    ))}
                     <div className="run-sec">Collaboration</div>
                     {COLLAB_OPTIONS.map(([c, desc]) => (
                       <button
                         key={c}
                         type="button"
                         className={`pop-item${collaboration === c ? ' sel' : ''}`}
-                        onClick={() => bridge.setAxes(workProfile, c)}
+                        onClick={() => bridge.setCollaboration(c)}
                       >
                         <span className="cmd">{collaborationLabel(c)}</span>
                         <span className="desc">{desc}</span>

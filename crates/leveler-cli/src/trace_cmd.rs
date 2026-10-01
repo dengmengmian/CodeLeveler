@@ -39,7 +39,7 @@ pub(crate) async fn cmd_trace(
     println!("  session  {}", s.session_id.as_str());
     println!("  goal     {}", s.goal);
     println!("  status   {}   model {}", s.status, s.model);
-    println!("  axes     {} / {}", s.work_profile, s.collaboration);
+    println!("  collab   {}", s.collaboration);
     println!("  duration {}", opt_duration(s.duration_ms));
     println!(
         "  requests {}   in {}  cached {}  out {}  reasoning {}  last_lat {:?}",

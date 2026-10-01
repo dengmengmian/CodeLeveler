@@ -58,6 +58,9 @@ impl WebSearchTool {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn requires_workspace(&self) -> bool {
+        false
+    }
     fn name(&self) -> &'static str {
         "web_search"
     }

@@ -11,7 +11,6 @@ export interface SlashCommand {
 
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { command: '/model', description: '切换模型', kind: 'selector', group: 'run', groupLabel: 'RUN CONFIGURATION' },
-  { command: '/work-mode', description: '工作档', kind: 'selector', group: 'run', groupLabel: 'RUN CONFIGURATION' },
   { command: '/collab', description: '协作档', kind: 'selector', group: 'run', groupLabel: 'RUN CONFIGURATION' },
   { command: '/perm', description: '权限档位', kind: 'selector', group: 'run', groupLabel: 'RUN CONFIGURATION' },
   { command: '/clear', description: '开始新对话（当前会话留在列表）', kind: 'action', group: 'conversation', groupLabel: 'CONVERSATION' },
@@ -48,7 +47,7 @@ export function slashByCommand(command: string): SlashCommand | undefined {
   return SLASH_COMMANDS.find((c) => c.command === command);
 }
 
-export type SlashPopup = 'model' | 'work' | 'collab' | 'perm' | 'checkpoint';
+export type SlashPopup = 'model' | 'collab' | 'perm' | 'checkpoint';
 
 export type SlashTarget =
   | { kind: 'action'; command: string }
@@ -59,7 +58,6 @@ export type SlashTarget =
 
 const SELECTOR_POPUP: Record<string, Exclude<SlashPopup, 'checkpoint'>> = {
   '/model': 'model',
-  '/work-mode': 'work',
   '/collab': 'collab',
   '/perm': 'perm',
 };

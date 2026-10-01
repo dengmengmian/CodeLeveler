@@ -93,11 +93,12 @@ pub struct UiObservationField {
 pub struct UiSessionObservation {
     pub session_id: SessionId,
     pub goal: String,
-    pub repository: String,
+    pub repository: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub status: String,
     pub model: String,
+    /// Deprecated compatibility marker, always `single` on new runtimes.
     pub work_profile: String,
     pub collaboration: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

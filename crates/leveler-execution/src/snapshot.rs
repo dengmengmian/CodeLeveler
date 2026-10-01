@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static CAPTURE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// A captured workspace state: a git tree object id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotId(pub String);
 
 impl std::fmt::Display for SnapshotId {

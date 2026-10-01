@@ -36,7 +36,9 @@ fn golden_path() -> PathBuf {
 fn snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new("s_golden"),
-        repository: "/repo".to_string(),
+        repository: Some("/repo".to_string()),
+        task_status: None,
+        task_terminal: None,
         goal: "修一个 bug".to_string(),
         model: None,
         mode: PermissionProfile::RequestApproval,

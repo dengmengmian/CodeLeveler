@@ -59,7 +59,7 @@ pub struct ToolContext {
 /// design.
 #[derive(Clone)]
 pub struct ExecutionResources {
-    pub workspace: Arc<Workspace>,
+    pub workspace: Option<Arc<Workspace>>,
     pub runner: Arc<CommandRunner>,
     pub environment: Arc<leveler_core::EnvSnapshot>,
     /// Captures original file content before the first write, for rollback.
@@ -300,9 +300,25 @@ impl ToolContext {
         mode: PermissionProfile,
         environment: Arc<leveler_core::EnvSnapshot>,
     ) -> Self {
+        Self::with_optional_workspace(Some(workspace), mode, environment)
+    }
+
+    /// Construct a context without any user filesystem or shell capability.
+    pub fn without_workspace_with_environment(
+        mode: PermissionProfile,
+        environment: Arc<leveler_core::EnvSnapshot>,
+    ) -> Self {
+        Self::with_optional_workspace(None, mode, environment)
+    }
+
+    fn with_optional_workspace(
+        workspace: Option<Workspace>,
+        mode: PermissionProfile,
+        environment: Arc<leveler_core::EnvSnapshot>,
+    ) -> Self {
         Self {
             execution: ExecutionResources {
-                workspace: Arc::new(workspace),
+                workspace: workspace.map(Arc::new),
                 runner: Arc::new(CommandRunner::with_environment(environment.clone())),
                 environment,
                 checkpoint: Arc::new(Checkpoint::new()),
@@ -330,6 +346,14 @@ impl ToolContext {
             command_lease: None,
             output: None,
         }
+    }
+
+    /// A structural execution prerequisite, independent of mutable grants.
+    pub fn require_workspace(&self) -> Result<&Workspace, ToolError> {
+        self.execution
+            .workspace
+            .as_deref()
+            .ok_or(ToolError::WorkspaceUnavailable)
     }
 
     /// Point this context at a permission profile the SESSION owns, instead
@@ -402,7 +426,10 @@ impl ToolContext {
     /// back to the pre-command snapshot by `run_command`.
     /// [`ToolPolicy::write_scope`] anchored on this context's workspace.
     pub fn write_scope(&self) -> WriteScope {
-        self.policy.write_scope(self.execution.workspace.root())
+        match &self.execution.workspace {
+            Some(workspace) => self.policy.write_scope(workspace.root()),
+            None => WriteScope::None,
+        }
     }
 
     pub fn with_command_write_constraints(
@@ -467,6 +494,8 @@ impl ToolOutput {
 /// are returned as [`ToolOutput`] with `is_error = true`).
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
+    #[error("workspace capability unavailable: this session has no primary workspace")]
+    WorkspaceUnavailable,
     #[error("unknown tool `{0}`")]
     NotFound(String),
     #[error("invalid arguments for `{tool}`: {message}")]
@@ -497,6 +526,12 @@ pub trait Tool: Send + Sync {
     /// A concise description for the model. Same ownership contract as
     /// [`Self::name`].
     fn description(&self) -> &str;
+
+    /// Whether this implementation requires a user-selected directory.
+    /// Unknown/external tools fail closed; independent capabilities opt out.
+    fn requires_workspace(&self) -> bool {
+        true
+    }
 
     /// The JSON Schema for this tool's arguments.
     fn input_schema(&self) -> serde_json::Value;
@@ -599,7 +634,7 @@ mod write_scope_tests {
     #[test]
     fn assisted_confines_writes_to_the_workspace() {
         let (c, _d) = ctx(PermissionProfile::Assisted);
-        let root = c.execution.workspace.root().to_path_buf();
+        let root = c.require_workspace().unwrap().root().to_path_buf();
         assert_eq!(c.write_scope(), WriteScope::Workspace { root });
     }
 

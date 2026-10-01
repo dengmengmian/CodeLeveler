@@ -68,6 +68,7 @@ pub fn profile_step_limits(profile: &TurnProfile) -> StepLimits {
 pub struct ExecutorFactory {
     pub runtime: Arc<dyn ModelRuntime>,
     pub registry: Arc<ToolRegistry>,
+    pub capabilities: Option<Arc<crate::capability::CapabilityDisclosure>>,
     pub tool_context: ToolContext,
     pub model: ModelRef,
     pub commit_co_author: bool,
@@ -77,7 +78,7 @@ pub struct ExecutorFactory {
     /// Whether the memory capability reaches the model at all this turn.
     ///
     /// ONE answer for tools, index, recall root and prompt guidance. Without
-    /// it an Economy turn still carried the index, the recall bodies and the
+    /// it an unexposed memory pack still carried the index, the recall bodies and the
     /// guidance while the tools were unregistered — telling the model to call
     /// a `remember` it did not have.
     pub memory_expose: bool,
@@ -101,6 +102,10 @@ pub struct ExecutorFactory {
     pub steering: Option<Arc<dyn crate::SteeringSource>>,
     /// When false, top-level executors do not advertise `spawn_agent`.
     pub allow_delegation: bool,
+    /// When false, top-level executors do not advertise `request_user_input`.
+    /// An unattended surface pays no schema for a host it does
+    /// not have (see [`Executor::with_host_input`]).
+    pub allow_host_input: bool,
     /// Whether the harness launches an independent reviewer at closure.
     /// Default `Off`; only explicit configuration turns it on.
     pub independent_review: crate::coding::policy::IndependentReviewPolicy,
@@ -163,6 +168,7 @@ impl ExecutorFactory {
             self.model.clone(),
             0,
         )
+        .with_capabilities(self.capabilities.clone())
         .with_background_tasks(self.background_tasks.clone())
         .with_continuation_policy(continuation)
         .with_max_output_tokens(resolved.max_output_tokens)
@@ -182,6 +188,7 @@ impl ExecutorFactory {
         .with_execution_controls(resolved.max_parallel_tools)
         .with_sub_agent_policies(child_policies)
         .with_delegation(self.allow_delegation)
+        .with_host_input(self.allow_host_input)
         // Every profile carries only the limits explicitly selected by its caller.
         .with_step_limits(profile_step_limits(&profile));
 

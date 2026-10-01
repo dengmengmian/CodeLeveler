@@ -19,10 +19,12 @@ use crate::Application;
 impl Application {
     /// The resolved registry for this project.
     pub fn skill_registry(&self) -> SkillRegistry {
-        SkillRegistry::load(&SkillRoots::for_project_in(
-            &self.layout.repo_root,
-            &|key| self.environment.var_os(key),
-        ))
+        let roots = self
+            .layout
+            .primary_workspace()
+            .map(|root| SkillRoots::for_project_in(root, &|key| self.environment.var_os(key)))
+            .unwrap_or_else(SkillRoots::empty);
+        SkillRegistry::load(&roots)
     }
 
     /// Every entry with its status here, plus the directory entries that are not

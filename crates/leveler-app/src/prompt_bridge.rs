@@ -78,6 +78,43 @@ pub(crate) struct PendingClarification {
 }
 pub(crate) type PendingClarifications = Arc<Mutex<HashMap<ClarificationId, PendingClarification>>>;
 
+/// The awaiting future owns the waiter lifetime. Outer cancellation may drop
+/// that future before its select branch runs, so cleanup must happen on Drop.
+enum PendingWaiterGuard {
+    Approval {
+        pending: PendingApprovals,
+        events: broadcast::Sender<RuntimeEvent>,
+        id: ApprovalId,
+    },
+    Clarification {
+        pending: PendingClarifications,
+        events: broadcast::Sender<RuntimeEvent>,
+        id: ClarificationId,
+    },
+}
+impl Drop for PendingWaiterGuard {
+    fn drop(&mut self) {
+        match self {
+            Self::Approval {
+                pending,
+                events,
+                id,
+            } => {
+                pending.lock().unwrap().remove(id);
+                let _ = events.send(RuntimeEvent::ApprovalResolved { id: id.clone() });
+            }
+            Self::Clarification {
+                pending,
+                events,
+                id,
+            } => {
+                pending.lock().unwrap().remove(id);
+                let _ = events.send(RuntimeEvent::ClarificationResolved { id: id.clone() });
+            }
+        }
+    }
+}
+
 pub(crate) fn resolve_approval(
     pending: &PendingApprovals,
     request_id: &ApprovalId,
@@ -173,6 +210,11 @@ impl Clarifier for ChannelClarifier {
                 reply: tx,
             },
         );
+        let _waiter = PendingWaiterGuard::Clarification {
+            pending: self.pending.clone(),
+            events: self.events.clone(),
+            id: request.id.clone(),
+        };
         if self
             .events
             .send(RuntimeEvent::ClarificationRequested { request: ui })
@@ -187,7 +229,7 @@ impl Clarifier for ChannelClarifier {
         // or nobody is left to answer — each keeping its own meaning instead
         // of collapsing to a fake empty "answer".
         let mut rx = rx;
-        let outcome = loop {
+        loop {
             tokio::select! {
                 answer = &mut rx => break match answer {
                     // The wire keeps `answer: String` with "" meaning the user
@@ -203,15 +245,7 @@ impl Clarifier for ChannelClarifier {
                     }
                 }
             }
-        };
-        self.pending.lock().unwrap().remove(&request.id);
-        // However it resolved (answered, cancelled, or timed out), tell every
-        // connected client to dismiss the prompt so a second client can't answer
-        // a clarification that no longer exists.
-        let _ = self.events.send(RuntimeEvent::ClarificationResolved {
-            id: request.id.clone(),
-        });
-        outcome
+        }
     }
 }
 
@@ -238,6 +272,11 @@ impl Approver for ChannelApprover {
                 reply: tx,
             },
         );
+        let _waiter = PendingWaiterGuard::Approval {
+            pending: self.pending.clone(),
+            events: self.events.clone(),
+            id: request.id.clone(),
+        };
         if self
             .events
             .send(RuntimeEvent::ApprovalRequested { request: ui })
@@ -249,7 +288,7 @@ impl Approver for ChannelApprover {
         // If the turn is cancelled, or the UI that could answer is gone,
         // default to the safe (Deny) decision instead of waiting forever.
         let mut rx = rx;
-        let decision = loop {
+        loop {
             tokio::select! {
                 decision = &mut rx => break decision.unwrap_or(ApprovalDecision::Deny),
                 _ = self.cancel.cancelled() => break ApprovalDecision::Deny,
@@ -259,15 +298,7 @@ impl Approver for ChannelApprover {
                     }
                 }
             }
-        };
-        self.pending.lock().unwrap().remove(&request.id);
-        // However it resolved (answered, cancelled, or timed out), tell every
-        // connected client to dismiss the prompt so a second client can't answer
-        // an approval that no longer exists.
-        let _ = self.events.send(RuntimeEvent::ApprovalResolved {
-            id: request.id.clone(),
-        });
-        decision
+        }
     }
 }
 

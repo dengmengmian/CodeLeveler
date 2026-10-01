@@ -155,6 +155,19 @@ impl ToolRegistry {
         subset
     }
 
+    /// Only implementations independent of a user-selected directory.
+    pub fn workspace_independent_subset(&self) -> ToolRegistry {
+        let mut subset = ToolRegistry::new();
+        for tool in self
+            .tools
+            .values()
+            .filter(|tool| !tool.requires_workspace())
+        {
+            subset.register(tool.clone());
+        }
+        subset
+    }
+
     /// Every tool except MCP proxies. A delegated agent gets this: an MCP
     /// server runs in its own unsandboxed process, outside any claimed write
     /// scope, so its effect cannot be bounded to a child's. Filtering the
@@ -229,6 +242,11 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::NotFound(name.to_string()))?
             .clone();
 
+        // Resource presence is a structural prerequisite, not a second
+        // permission decision. Grants cannot materialize a missing workspace.
+        if tool.requires_workspace() {
+            context.require_workspace()?;
+        }
         let input = tool.normalize_input(input);
         // A structural rejection is final either way; the tool may only
         // choose the wording. run_command turns "\"program\" is a required
@@ -348,25 +366,9 @@ fn validate_schema(
     }
 }
 
-/// A set of optional capability packs.
-///
-/// The same shape answers three DIFFERENT questions, and keeping them apart is
-/// the point:
-///
-/// - **AVAILABLE** — can this machine provide the capability at all? A browser
-///   runtime installed, a search key configured, `git` on PATH, a model that
-///   accepts an image. Mechanical facts, nothing else.
-/// - **ENABLED** — does the current product mode / session ask for it?
-/// - **EXPOSED** — what the model actually sees, which is
-///   [`Self::intersect`] of the two.
-///
-/// A capability being AVAILABLE is not a reason to advertise it. `Economy`
-/// enables no optional pack, so a machine with a browser runtime still shows a
-/// plain coding turn zero browser tools.
-///
-/// None of the three is ever a judgement about the task or about the model's
-/// ability (`docs/ARCHITECTURE.md` §1.1): the surface never grows because a
-/// task looks hard or shrinks because a model looks weak.
+/// Optional capability implementation packs for mechanical registry composition.
+/// The host chooses available implementations; the coding harness owns the
+/// current model-visible exposure and permission decisions independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CapabilityPacks {
     /// Symbol navigation over a language server.
@@ -415,7 +417,7 @@ impl CapabilityPacks {
         browser: true,
     };
 
-    /// EXPOSED = ENABLED ∩ AVAILABLE.
+    /// Mechanical intersection of independently selected pack sets.
     ///
     /// The one operator that turns the two independent answers into a surface.
     /// Neither side can widen the other: a capability the product did not ask
@@ -482,11 +484,8 @@ pub fn core_surface(capabilities: &Capabilities) -> ToolRegistry {
 /// The model-visible surface: the core primitives plus the packs this host has
 /// been asked for AND can provide.
 ///
-/// This is the whole composition. There is no dynamic expansion and no
-/// model-controlled discovery: the harness decides what exists, once, before
-/// the turn starts. `packs` is the EXPOSED set — see
-/// [`CapabilityPacks::intersect`] — and `capabilities` carries the handles the
-/// tools of each exposed pack are constructed from.
+/// Build the registered implementation set. The progressive coding harness
+/// filters request schemas and admission from its goal-scoped disclosure state.
 pub fn model_surface(packs: CapabilityPacks, capabilities: &Capabilities) -> ToolRegistry {
     use crate::tools;
     let mut registry = core_surface(capabilities);
@@ -719,7 +718,7 @@ mod tests {
         }
     }
 
-    /// No pack means no pack. `Economy` composes exactly the core surface.
+    /// No optional packs composes exactly the initial primitives.
     #[test]
     fn no_packs_is_the_core_surface() {
         assert_eq!(
@@ -875,13 +874,31 @@ mod tests {
     fn read_only_subset_is_an_explicit_allowlist_without_side_effect_tools() {
         let subset = default_registry().read_only_subset();
         // Pure lookups stay in.
-        for name in ["read_file", "grep", "list_files", "git_status", "git_diff"] {
+        for name in [
+            "read_file",
+            "grep",
+            "list_files",
+            "git_status",
+            "git_diff",
+            // A `/btw` observer needs the task ids' retained output, and this
+            // is the read-only path to it (the same registry the TUI reads).
+            "get_task",
+        ] {
             assert!(subset.get(name).is_some(), "{name} must be in the subset");
         }
         // Safe-labeled tools with side effects must NOT ride in on the label:
         // create_checkpoint resets the rollback baseline; wait_task consumes
-        // a background task's one-time settlement report.
-        for name in ["create_checkpoint", "wait_task"] {
+        // a background task's one-time settlement report. Neither may a
+        // mutating or process-controlling tool ride into an observer surface.
+        for name in [
+            "create_checkpoint",
+            "wait_task",
+            "kill_task",
+            "run_command",
+            "write_file",
+            "apply_patch",
+            "update_plan",
+        ] {
             assert!(
                 subset.get(name).is_none(),
                 "{name} must not be in the subset"

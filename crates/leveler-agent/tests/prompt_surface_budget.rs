@@ -144,10 +144,10 @@ fn isolated_env(root: &Path, home: &Path) -> Arc<EnvSnapshot> {
     ))
 }
 
-/// Economy enables no optional pack. Balanced here is the production
-/// intersection for a non-vision model with git, no search key and no browser.
-fn packs(economy: bool) -> CapabilityPacks {
-    if economy {
+/// Internal minimal baseline enables no optional packs. Full availability is the
+/// mechanical intersection for a non-vision model with git, no search key and no browser.
+fn packs(minimal_baseline: bool) -> CapabilityPacks {
+    if minimal_baseline {
         CapabilityPacks::NONE
     } else {
         CapabilityPacks {
@@ -163,9 +163,9 @@ fn packs(economy: bool) -> CapabilityPacks {
     }
 }
 
-fn registry(economy: bool, env: Arc<EnvSnapshot>) -> leveler_tools::ToolRegistry {
+fn registry(minimal_baseline: bool, env: Arc<EnvSnapshot>) -> leveler_tools::ToolRegistry {
     let capabilities = leveler_tools::Capabilities::in_process(env);
-    let mut registry = model_surface(packs(economy), &capabilities);
+    let mut registry = model_surface(packs(minimal_baseline), &capabilities);
     leveler_agent::register_harness_controls(&mut registry);
     registry
 }
@@ -174,13 +174,13 @@ fn executor(
     root: &Path,
     home: &Path,
     script: Arc<Script>,
-    economy: bool,
+    minimal_baseline: bool,
     goal: bool,
 ) -> leveler_agent::Executor {
     let env = isolated_env(root, home);
     leveler_agent::Executor::new(
         script,
-        Arc::new(registry(economy, env.clone())),
+        Arc::new(registry(minimal_baseline, env.clone())),
         ToolContext::with_environment(
             Workspace::new(root).unwrap(),
             PermissionProfile::Assisted,
@@ -190,7 +190,7 @@ fn executor(
         4,
     )
     .with_delegation(true)
-    .with_memory_expose(!economy)
+    .with_memory_expose(!minimal_baseline)
     .with_goal_mode(goal)
 }
 
@@ -225,7 +225,7 @@ fn column(source: &PromptSource) -> &'static str {
         | PromptSource::AgentRole { .. }
         | PromptSource::AgentBrief
         | PromptSource::CommitTrailer
-        | PromptSource::DelegationHint => "core",
+        | PromptSource::DelegationHint => "contract",
         _ => "other",
     }
 }
@@ -246,8 +246,8 @@ fn report(case: &str, request: &ModelRequest) -> String {
         *columns.entry(column(&segment.source)).or_default() += segment.token_estimate;
     }
     out.push_str(&format!(
-        "CASE {case}\n  projection {projection}\n  control {control}\n  tools {tools} (description {desc} schema {schema})\n  messages {messages}\n  columns core {} project {} repo {} catalog {} runtime {} other {}\n  tool_count {}\n  tools {}\n",
-        columns.get("core").copied().unwrap_or(0),
+        "CASE {case}\n  projection {projection}\n  control {control}\n  tools {tools} (description {desc} schema {schema})\n  messages {messages}\n  columns contract {} project {} repo {} catalog {} runtime {} other {}\n  tool_count {}\n  tools {}\n",
+        columns.get("contract").copied().unwrap_or(0),
         columns.get("project").copied().unwrap_or(0),
         columns.get("repo").copied().unwrap_or(0),
         columns.get("catalog").copied().unwrap_or(0),
@@ -331,13 +331,13 @@ fn report(case: &str, request: &ModelRequest) -> String {
 async fn capture(
     root: &Path,
     home: &Path,
-    economy: bool,
+    minimal_baseline: bool,
     goal: bool,
     prompt: &str,
     responses: Vec<ModelResponse>,
 ) -> ModelRequest {
     let script = Script::new(responses);
-    executor(root, home, script.clone(), economy, goal)
+    executor(root, home, script.clone(), minimal_baseline, goal)
         .run(prompt, &mut |_| {}, &mut NoopSink, CancellationToken::new())
         .await
         .expect("turn");
@@ -356,8 +356,8 @@ async fn current_prompt_surface_inventory() {
     let coding = "Read src/lib.rs, change one comment, and run the smallest check.";
 
     let chat = capture(&root, home.path(), false, false, simple, vec![text("4")]).await;
-    let economy = capture(&root, home.path(), true, false, simple, vec![text("4")]).await;
-    let balanced = capture(&root, home.path(), false, false, coding, vec![text("done")]).await;
+    let minimal_baseline = capture(&root, home.path(), true, false, simple, vec![text("4")]).await;
+    let full_baseline = capture(&root, home.path(), false, false, coding, vec![text("done")]).await;
     let goal = capture(
         &root,
         home.path(),
@@ -461,15 +461,15 @@ async fn current_prompt_surface_inventory() {
 
     let mut report_text = String::from(
         "CURRENT_PROMPT_SURFACE\n\
-         pin: economy=no optional packs; balanced=code_intelligence+vcs+web_fetch+memory+skills; \
+         pin: minimal_baseline=no optional packs; full_baseline=code_intelligence+vcs+web_fetch+memory+skills; \
          web_search/browser/media off (no key, no browser handle, non-vision)\n\
          home: empty, so user-level skills and agents are not in these numbers\n\
          fixed = control + tools; messages are the turn input, not history growth\n\n",
     );
     let cases = [
         ("chat", &chat, 22_415_u64),
-        ("economy", &economy, 19_715),
-        ("balanced", &balanced, 22_415),
+        ("minimal_baseline", &minimal_baseline, 19_715),
+        ("full_baseline", &full_baseline, 22_415),
         ("goal", &goal, 23_145),
         ("explorer", &explorer, 13_820),
         ("worker", &worker, 18_444),
@@ -494,12 +494,12 @@ async fn current_prompt_surface_inventory() {
         );
     }
     assert!(
-        economy
+        minimal_baseline
             .control_context
             .blocks
             .iter()
             .all(|segment| segment.name != "skill_index"),
-        "economy has no load_skill, so it does not get the skill catalog"
+        "minimal_baseline has no load_skill, so it does not get the skill catalog"
     );
     for (name, request) in [("explorer", &explorer), ("reviewer", &reviewer)] {
         for absent in ["request_user_input", "request_permissions", "spawn_agent"] {
@@ -527,4 +527,278 @@ async fn current_prompt_surface_inventory() {
     let path = std::env::temp_dir().join("prompt-surface-current.txt");
     std::fs::write(&path, &report_text).unwrap();
     eprintln!("{report_text}\nWROTE {}", path.display());
+}
+
+/// Internal primitive baseline used to compare schema costs with the progressive
+/// initial surface. This fixture is not a user-selectable product mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_baseline_inventory() {
+    let root = repo_root();
+    let home = tempfile::tempdir().unwrap();
+
+    let initial_baseline = {
+        let env = isolated_env(&root, home.path());
+        let capabilities = leveler_tools::Capabilities::in_process(env.clone());
+        let mut registry = model_surface(
+            CapabilityPacks {
+                vcs: true,
+                ..CapabilityPacks::NONE
+            },
+            &capabilities,
+        );
+        leveler_agent::register_harness_controls_with(
+            &mut registry,
+            leveler_agent::HarnessControls::PROTOCOL_ONLY,
+        );
+        let script = Script::new(vec![text("done")]);
+        leveler_agent::Executor::new(
+            script.clone(),
+            Arc::new(registry),
+            ToolContext::with_environment(
+                Workspace::new(&root).unwrap(),
+                PermissionProfile::Assisted,
+                env,
+            ),
+            ModelRef::new("mock", "m"),
+            4,
+        )
+        .with_delegation(false)
+        .with_host_input(false)
+        .with_goal_mode(false)
+        .run(
+            "Read src/lib.rs, change one comment, and run the smallest check.",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("initial_baseline turn");
+        script.requests.lock().unwrap().remove(0)
+    };
+
+    let goal_initial_baseline = {
+        let env = isolated_env(&root, home.path());
+        let capabilities = leveler_tools::Capabilities::in_process(env.clone());
+        let mut registry = model_surface(
+            CapabilityPacks {
+                vcs: true,
+                ..CapabilityPacks::NONE
+            },
+            &capabilities,
+        );
+        leveler_agent::register_harness_controls_with(
+            &mut registry,
+            leveler_agent::HarnessControls::PROTOCOL_ONLY,
+        );
+        let script = Script::new(vec![tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        )]);
+        leveler_agent::Executor::new(
+            script.clone(),
+            Arc::new(registry),
+            ToolContext::with_environment(
+                Workspace::new(&root).unwrap(),
+                PermissionProfile::Assisted,
+                env,
+            ),
+            ModelRef::new("mock", "m"),
+            4,
+        )
+        .with_delegation(false)
+        .with_host_input(false)
+        .with_goal_mode(true)
+        .run(
+            "Read src/lib.rs, change one comment, and run the smallest check.",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("initial_baseline goal turn");
+        script.requests.lock().unwrap().remove(0)
+    };
+
+    for (name, request) in [
+        ("initial_baseline", &initial_baseline),
+        ("initial_baseline_goal", &goal_initial_baseline),
+    ] {
+        eprintln!("{}", report(name, request));
+    }
+    for absent in [
+        "save_agent",
+        "save_skill",
+        "spawn_agent",
+        "request_user_input",
+        "remember",
+        "browser_act",
+        "web_fetch",
+        "find_symbol",
+        "load_skill",
+    ] {
+        assert!(
+            initial_baseline
+                .tools
+                .iter()
+                .all(|tool| tool.name != absent),
+            "initial primitive baseline must not carry {absent}"
+        );
+    }
+    for present in [
+        "read_file",
+        "apply_patch",
+        "run_command",
+        "shell_command",
+        "git_status",
+        "git_diff",
+        "update_plan",
+    ] {
+        assert!(
+            initial_baseline
+                .tools
+                .iter()
+                .any(|tool| tool.name == present),
+            "initial primitive baseline must carry {present}"
+        );
+    }
+    assert!(
+        initial_baseline
+            .tools
+            .iter()
+            .all(|tool| tool.name != "update_goal"),
+        "update_goal is goal-mode only"
+    );
+    assert!(
+        goal_initial_baseline
+            .tools
+            .iter()
+            .any(|tool| tool.name == "update_goal"),
+        "goal initial_baseline carries update_goal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn progressive_initial_surface_inventory() {
+    use leveler_agent::capability::{CapabilityDisclosure, CapabilityId, control_definition};
+    let root = repo_root();
+    let home = tempfile::tempdir().unwrap();
+    let available = vec![
+        CapabilityId::Memory,
+        CapabilityId::MultiAgent,
+        CapabilityId::Skills,
+        CapabilityId::CodeIntelligence,
+        CapabilityId::Web,
+        CapabilityId::Authoring,
+        CapabilityId::HostInteraction,
+    ];
+    let disclosure =
+        Arc::new(CapabilityDisclosure::new(available.clone(), available, vec![]).unwrap());
+    let script = Script::new(vec![tool_call(
+        "done",
+        "update_goal",
+        serde_json::json!({"status":"complete","summary":"done"}),
+    )]);
+    executor(&root, home.path(), script.clone(), false, true)
+        .with_capabilities(Some(disclosure.clone()))
+        .run(
+            "Inspect a local source file.",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let initial = script.requests.lock().unwrap().remove(0);
+    let full = capture(
+        &root,
+        home.path(),
+        false,
+        true,
+        "Inspect a local source file.",
+        vec![tool_call(
+            "done",
+            "update_goal",
+            serde_json::json!({"status":"complete","summary":"done"}),
+        )],
+    )
+    .await;
+    for required in [
+        "read_file",
+        "list_files",
+        "find_files",
+        "grep",
+        "read_project_rules",
+        "apply_patch",
+        "write_file",
+        "run_command",
+        "shell_command",
+        "get_task",
+        "wait_task",
+        "kill_task",
+        "git_status",
+        "git_diff",
+        "update_plan",
+        "update_goal",
+        "capability",
+        "request_permissions",
+    ] {
+        assert!(
+            initial.tools.iter().any(|tool| tool.name == required),
+            "initial surface missing {required}"
+        );
+    }
+    for optional in [
+        "find_symbol",
+        "read_symbol",
+        "find_references",
+        "diagnostics",
+        "blast_radius",
+        "web_fetch",
+        "web_search",
+        "view_image",
+        "memory",
+        "remember",
+        "forget",
+        "load_skill",
+        "browser_tab",
+        "browser_act",
+        "browser_inspect",
+        "spawn_agent",
+        "list_agents",
+        "save_agent",
+        "delete_agent",
+        "save_skill",
+        "delete_skill",
+        "request_user_input",
+    ] {
+        assert!(
+            !initial.tools.iter().any(|tool| tool.name == optional),
+            "initial surface exposes {optional}"
+        );
+    }
+    let catalog_tokens = estimate_text(&disclosure.catalog().to_string());
+    let control_tokens = estimate_tool_definitions(&[control_definition()]);
+    let schema_tokens = estimate_tool_definitions(&initial.tools);
+    assert!(
+        catalog_tokens + control_tokens < 1000,
+        "capability discovery exceeded its budget"
+    );
+    assert_eq!(initial.tools.len(), 18, "pinned initial surface grew");
+    assert!(
+        schema_tokens <= 6800,
+        "initial schema grew beyond its fixed budget: {schema_tokens}"
+    );
+    assert!(initial.tools.len() < full.tools.len());
+    eprintln!(
+        "PROGRESSIVE_INITIAL_SURFACE initial_tool_count={} initial_schema_tokens={} catalog_tokens={} control_schema_tokens={} available_full_count={} full_schema_tokens={} fixed_request_tokens={}",
+        initial.tools.len(),
+        schema_tokens,
+        catalog_tokens,
+        control_tokens,
+        full.tools.len(),
+        estimate_tool_definitions(&full.tools),
+        schema_tokens + estimate_text(&initial.control_context.text())
+    );
+    eprintln!("{}", report("progressive_initial", &initial));
 }

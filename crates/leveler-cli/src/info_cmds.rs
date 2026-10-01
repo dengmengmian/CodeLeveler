@@ -15,16 +15,24 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
     // Load config leniently so doctor can report problems instead of aborting.
     let config = Application::load_config(&layout).unwrap_or_default();
     println!("{}", Line::heading("leveler doctor"));
-    println!("  repo:    {}", layout.repo_root.display());
+    println!(
+        "  repo:    {}",
+        layout
+            .primary_workspace()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "No Workspace".to_string())
+    );
     println!("  config:  {}", layout.config_dir.display());
     println!("  memory:  {}", layout.memory_dir().display());
     println!();
 
     let mut results =
         leveler_app::doctor::run_with_memory(&config, Some(layout.memory_dir().as_path()));
-    results.push(leveler_app::doctor::agents_check(
-        &leveler_agent::agent_registry::AgentRoots::for_project(&layout.repo_root),
-    ));
+    if let Some(root) = layout.primary_workspace() {
+        results.push(leveler_app::doctor::agents_check(
+            &leveler_agent::agent_registry::AgentRoots::for_project(root),
+        ));
+    }
     for r in &results {
         print_check(r);
     }

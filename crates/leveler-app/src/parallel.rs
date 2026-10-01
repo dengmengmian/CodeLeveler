@@ -51,7 +51,11 @@ impl Application {
         cancellation: CancellationToken,
     ) -> Result<ParallelEditOutcome, AppError> {
         let n = n.max(2);
-        let repo_root = self.layout.repo_root.clone();
+        let repo_root = self
+            .layout
+            .require_workspace()
+            .map_err(|error| AppError::NotFound(error.to_string()))?
+            .to_path_buf();
         let config_dir = self.layout.config_dir.clone();
         let main_git = GitWorkflow::with_environment(&repo_root, self.environment.clone());
 
@@ -69,7 +73,7 @@ impl Application {
         let engine = self.task_engine(&db)?;
         let parent = engine
             .create_task(&NewSession {
-                workspace: repo_root.display().to_string(),
+                workspace: Some(repo_root.display().to_string()),
                 goal: task.to_string(),
                 model: model.to_string(),
                 mode: mode_str(mode).to_string(),
@@ -77,7 +81,6 @@ impl Application {
                 kind: ExecutionKind::Parallel,
                 axes: Some(leveler_engine::NewSessionAxes {
                     collaboration: self.collaboration().as_str().to_string(),
-                    work_profile: self.work_profile().as_str().to_string(),
                 }),
             })
             .await

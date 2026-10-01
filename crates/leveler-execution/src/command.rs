@@ -53,7 +53,7 @@ pub fn credential_env_names_from(
 }
 
 /// A request to run one program with explicit arguments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProcessRequest {
     pub program: String,
     pub args: Vec<String>,

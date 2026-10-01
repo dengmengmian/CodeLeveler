@@ -43,7 +43,11 @@ const PREVIEW_INSTRUCTIONS_CHARS: usize = 1200;
 /// directory of the home in the tool's own environment.
 fn roots_for(context: &ToolContext) -> AgentRoots {
     AgentRoots {
-        project_root: Some(context.execution.workspace.root().to_path_buf()),
+        project_root: context
+            .execution
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root().to_path_buf()),
         user_agents_dir: leveler_core::leveler_home_dir_from(|k| {
             context.execution.environment.var_os(k)
         })
@@ -54,10 +58,17 @@ fn roots_for(context: &ToolContext) -> AgentRoots {
 /// The resolved skill registry in the tool's own environment, so an agent
 /// definition is validated against the skills the runtime will actually load.
 fn skill_registry_for(context: &ToolContext) -> leveler_skills::SkillRegistry {
-    let root = context.execution.workspace.root();
-    leveler_skills::SkillRegistry::load(&leveler_skills::SkillRoots::for_project_in(root, &|k| {
-        context.execution.environment.var_os(k)
-    }))
+    let roots = context
+        .execution
+        .workspace
+        .as_ref()
+        .map(|workspace| {
+            leveler_skills::SkillRoots::for_project_in(workspace.root(), &|k| {
+                context.execution.environment.var_os(k)
+            })
+        })
+        .unwrap_or_else(leveler_skills::SkillRoots::empty);
+    leveler_skills::SkillRegistry::load(&roots)
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]

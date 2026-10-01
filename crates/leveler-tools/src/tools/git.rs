@@ -18,12 +18,12 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 /// The VCS capability for this call: the workspace it inspects and the shared,
 /// sandboxed runner every other tool call goes through.
-fn vcs(context: &ToolContext) -> GitWorkflow {
-    GitWorkflow::with_runner(
-        context.execution.workspace.root(),
+fn vcs(context: &ToolContext) -> Result<GitWorkflow, ToolError> {
+    Ok(GitWorkflow::with_runner(
+        context.require_workspace()?.root(),
         context.execution.runner.clone(),
         context.execution.environment.clone(),
-    )
+    ))
 }
 
 async fn inspect(
@@ -31,7 +31,7 @@ async fn inspect(
     args: &[&str],
     cancellation: CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
-    let output = match vcs(context).inspect(args, cancellation).await {
+    let output = match vcs(context)?.inspect(args, cancellation).await {
         Ok(output) => output,
         Err(error) => return Ok(ToolOutput::error(error.to_string())),
     };
@@ -132,7 +132,7 @@ impl Tool for GitDiffTool {
         // Refuse credential paths before handing the path to git.
         let path_owned;
         if let Some(p) = &input.path {
-            context.execution.workspace.resolve_for_read(p)?;
+            context.require_workspace()?.resolve_for_read(p)?;
             args.push("--");
             path_owned = p.clone();
             args.push(&path_owned);

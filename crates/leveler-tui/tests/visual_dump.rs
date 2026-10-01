@@ -50,7 +50,9 @@ fn opened() -> AppState {
     );
     let snap = UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "~/x".into(),
+        repository: Some("~/x".into()),
+        task_status: None,
+        task_terminal: None,
         goal: "g".into(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
@@ -432,6 +434,7 @@ fn visual_background_timeline() {
             task_id: "bg-1".into(),
             program: "make".into(),
             args: vec!["up".into()],
+            pid: None,
         }),
     );
 

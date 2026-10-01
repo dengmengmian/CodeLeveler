@@ -4,6 +4,32 @@
   "description": "An event flowing from the runtime to clients.",
   "oneOf": [
     {
+      "type": "object",
+      "required": [
+        "index",
+        "query_id",
+        "requester_session_id",
+        "type"
+      ],
+      "properties": {
+        "index": {
+          "$ref": "#/definitions/UiGlobalTaskIndex"
+        },
+        "query_id": {
+          "type": "string"
+        },
+        "requester_session_id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "global_tasks_loaded"
+          ]
+        }
+      }
+    },
+    {
       "description": "The runtime finished booting and is ready for commands.",
       "type": "object",
       "required": [
@@ -1581,6 +1607,15 @@
             "type": "string"
           }
         },
+        "pid": {
+          "description": "The process-group leader's OS pid, when the runtime observed one. A read-only fact for a detail view; it carries no authority. Additive; older clients ignore the unknown field.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "program": {
           "type": "string"
         },
@@ -2991,6 +3026,32 @@
     "RuntimeEvent": {
       "description": "An event flowing from the runtime to clients.",
       "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "index",
+            "query_id",
+            "requester_session_id",
+            "type"
+          ],
+          "properties": {
+            "index": {
+              "$ref": "#/definitions/UiGlobalTaskIndex"
+            },
+            "query_id": {
+              "type": "string"
+            },
+            "requester_session_id": {
+              "$ref": "#/definitions/SessionId"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "global_tasks_loaded"
+              ]
+            }
+          }
+        },
         {
           "description": "The runtime finished booting and is ready for commands.",
           "type": "object",
@@ -4569,6 +4630,15 @@
                 "type": "string"
               }
             },
+            "pid": {
+              "description": "The process-group leader's OS pid, when the runtime observed one. A read-only fact for a detail view; it carries no authority. Additive; older clients ignore the unknown field.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "program": {
               "type": "string"
             },
@@ -5064,6 +5134,15 @@
           "description": "Runtime-observed age at snapshot time.",
           "type": "integer",
           "format": "uint64",
+          "minimum": 0.0
+        },
+        "pid": {
+          "description": "The process-group leader's OS pid, when known. Additive; older clients decode it as absent.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
           "minimum": 0.0
         },
         "program": {
@@ -5993,6 +6072,104 @@
         }
       }
     },
+    "UiGlobalTaskIndex": {
+      "type": "object",
+      "required": [
+        "source_errors",
+        "tasks"
+      ],
+      "properties": {
+        "source_errors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiGlobalTaskSourceError"
+          }
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UiGlobalTaskSummary"
+          }
+        }
+      }
+    },
+    "UiGlobalTaskSourceError": {
+      "type": "object",
+      "required": [
+        "kind",
+        "message",
+        "source_id"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/UiGlobalTaskSourceErrorKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        }
+      }
+    },
+    "UiGlobalTaskSourceErrorKind": {
+      "type": "string",
+      "enum": [
+        "discovery",
+        "storage",
+        "projection"
+      ]
+    },
+    "UiGlobalTaskSummary": {
+      "type": "object",
+      "required": [
+        "id",
+        "last_activity_at",
+        "model",
+        "source_id",
+        "status",
+        "title"
+      ],
+      "properties": {
+        "archived_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/definitions/SessionId"
+        },
+        "last_activity_at": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "primary_workspace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/UiTaskStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "workspace_available": {
+          "description": "Availability is separate from lifecycle; a deleted checkout retains its history.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
     "UiGoalRecap": {
       "description": "One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts.\n\nTruth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero.",
       "type": "object",
@@ -6721,7 +6898,6 @@
         "input_tokens",
         "model",
         "output_tokens",
-        "repository",
         "request_count",
         "request_failures",
         "request_retries",
@@ -6828,7 +7004,10 @@
           "minimum": 0.0
         },
         "repository": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "request_count": {
           "type": "integer",
@@ -6870,6 +7049,7 @@
           "type": "string"
         },
         "work_profile": {
+          "description": "Deprecated compatibility marker, always `single` on new runtimes.",
           "type": "string"
         }
       }
@@ -6882,7 +7062,6 @@
         "id",
         "messages",
         "mode",
-        "repository",
         "status"
       ],
       "properties": {
@@ -6924,14 +7103,14 @@
           }
         },
         "children": {
-          "description": "Every delegated child of this session, oldest first, from the durable record. Additive: absent on old runtimes.",
+          "description": "Every delegated child of this session, oldest first, from durable storage.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/UiChildAgent"
           }
         },
         "collaboration": {
-          "description": "Product collaboration axis (`chat | plan | goal`). Same contract as `work_profile` — the runtime routes submits (goal) and restricts tools (plan) from this value, so clients must not invent it.",
+          "description": "Product collaboration axis (`chat | plan | goal`). The runtime routes submissions and applies the read-only planning overlay from this value.",
           "type": [
             "string",
             "null"
@@ -7043,11 +7222,34 @@
           }
         },
         "repository": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "status": {
           "description": "Persisted status string (e.g. \"running\", \"completed\").",
           "type": "string"
+        },
+        "task_status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiTaskStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiTaskTerminal"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "user_shells": {
           "description": "User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block.",
@@ -7063,7 +7265,7 @@
           "type": "boolean"
         },
         "work_profile": {
-          "description": "Product work-profile axis (`economy | balanced`; legacy `delivery` reads as `balanced`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes.",
+          "description": "Deprecated compatibility field. New runtimes emit `single`; historical values never control tool exposure. Clients must not display a selector.",
           "type": [
             "string",
             "null"
@@ -7112,6 +7314,26 @@
         "status": {
           "type": "string"
         },
+        "task_status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiTaskStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UiTaskTerminal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "updated_at": {
           "type": "string"
         }
@@ -7142,6 +7364,58 @@
         "answered",
         "completed"
       ]
+    },
+    "UiTaskStatus": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "running",
+        "waiting_user",
+        "answered",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "unknown",
+        "blocked",
+        "incomplete"
+      ]
+    },
+    "UiTaskTerminal": {
+      "description": "Latest committed TaskFinished fact. This does not prove a later turn settled.",
+      "type": "object",
+      "required": [
+        "outcome",
+        "sequence",
+        "warnings"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "stop": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     },
     "UiToolAggregate": {
       "description": "Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration.",

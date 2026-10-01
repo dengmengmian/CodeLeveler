@@ -33,6 +33,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Internal stable owner for project background services.
+    #[command(hide = true)]
+    ExecutionHost {
+        #[arg(long, value_name = "PATH")]
+        state_dir: PathBuf,
+    },
     /// Open the interactive terminal UI (the default with no subcommand).
     Tui {
         /// Model reference (defaults to the configured default).
@@ -60,6 +66,9 @@ pub enum Command {
 
     /// Run the long-lived local runtime daemon for this repository.
     Serve {
+        /// Serve the app-owned source without a primary workspace.
+        #[arg(long)]
+        no_workspace: bool,
         /// Default model for newly created sessions.
         #[arg(long)]
         model: Option<String>,
@@ -224,6 +233,9 @@ pub enum Command {
     },
 
     /// Run an agent task: the model uses tools to investigate and edit the repo.
+    ///
+    /// Exit codes: 0 completed | 1 execution failure | 2 usage error |
+    /// 3 agent did not complete (honest, see stop_reason) | 130 interrupted.
     Run {
         /// The natural-language task. Omit only with `--resume`.
         task: Option<String>,
@@ -266,9 +278,6 @@ pub enum Command {
         /// Deny network access to run_command processes (OS sandbox).
         #[arg(long = "deny-network", alias = "sandbox")]
         deny_network: bool,
-        /// Work profile: economy | balanced (default balanced).
-        #[arg(long, default_value = "balanced")]
-        work_mode: String,
         /// Model-step safety ceiling for this run: a mechanical circuit
         /// breaker against a runaway model/tool loop, NOT a task budget. The
         /// task ends on its goal lifecycle or a resource budget. Default 200,
@@ -767,7 +776,7 @@ pub enum SessionsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum BackgroundCommand {
-    /// List live background tasks on the local runtime.
+    /// List live tasks owned by the runtime and independent execution host.
     List {
         /// Print machine-readable JSON.
         #[arg(long)]
@@ -781,7 +790,23 @@ pub enum BackgroundCommand {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    #[test]
+    fn execution_host_daemon_accepts_explicit_private_state_directory() {
+        let parsed = super::Cli::try_parse_from([
+            "leveler",
+            "--repo",
+            "/tmp/project",
+            "execution-host",
+            "--state-dir",
+            "/tmp/private-home/project/execution-host",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "host launch arguments must parse: {parsed:?}"
+        );
+    }
+
+    use clap::{CommandFactory, Parser};
 
     use super::*;
 
@@ -842,6 +867,30 @@ mod tests {
     }
 
     #[test]
+    fn help_and_shell_completions_do_not_advertise_retired_work_mode() {
+        let mut command = Cli::command();
+        let run = command.find_subcommand_mut("run").unwrap();
+        assert!(!run.render_long_help().to_string().contains("--work-mode"));
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::PowerShell,
+        ] {
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "leveler", &mut script);
+            assert!(!String::from_utf8(script).unwrap().contains("--work-mode"));
+        }
+    }
+
+    #[test]
+    fn retired_work_mode_is_not_a_cli_option() {
+        let error = Cli::try_parse_from(["leveler", "run", "fix it", "--work-mode", "balanced"])
+            .expect_err("there is a single product tool-surface policy");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
     fn run_parses_collaboration_axis() {
         let cli = parse(&[
             "leveler",
@@ -849,17 +898,10 @@ mod tests {
             "plan the feature",
             "--collaboration",
             "plan",
-            "--work-mode",
-            "balanced",
         ]);
         match cli.command {
-            Some(Command::Run {
-                collaboration,
-                work_mode,
-                ..
-            }) => {
+            Some(Command::Run { collaboration, .. }) => {
                 assert_eq!(collaboration, "plan");
-                assert_eq!(work_mode, "balanced");
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -1123,6 +1165,7 @@ mod tests {
         ]);
         match cli.command {
             Some(Command::Serve {
+                no_workspace,
                 model,
                 mode,
                 auto_approve,
@@ -1131,6 +1174,7 @@ mod tests {
                 tcp,
                 ready_json,
             }) => {
+                assert!(!no_workspace);
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
                 assert!(matches!(mode, RunMode::FullAccess));
                 assert!(!auto_approve);

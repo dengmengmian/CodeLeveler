@@ -458,6 +458,8 @@ mod tests {
 
         fn summary(id: &str, updated_at: &str) -> UiSessionSummary {
             UiSessionSummary {
+                task_status: None,
+                task_terminal: None,
                 id: SessionId::new(id),
                 goal: format!("goal {id}"),
                 status: "idle".to_string(),
@@ -490,7 +492,9 @@ mod tests {
             }
             Ok(UiSessionSnapshot {
                 id: session_id.clone(),
-                repository: "/repo".to_string(),
+                repository: Some("/repo".to_string()),
+                task_status: None,
+                task_terminal: None,
                 goal: "g".to_string(),
                 model: None,
                 mode: leveler_client_protocol::PermissionProfile::Assisted,
@@ -728,6 +732,7 @@ mod tests {
             .add_daemon(PathBuf::from("/daemon"), daemon.clone())
             .await;
         let request = CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "g".to_string(),
             model: None,
@@ -751,6 +756,7 @@ mod tests {
         assert!(matches!(
             router
                 .create_session_for(Path::new("/missing"), CreateSessionRequest {
+                    workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
                     approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                     goal: "g".to_string(),
                     model: None,

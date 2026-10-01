@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::approval::{is_shell_wrapper_program, needs_human_consent};
+use crate::approval::needs_human_consent;
 
 /// Effect of a matching rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,12 +24,12 @@ pub struct RuleMatch {
     /// Exact tool name (e.g. `run_command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    /// Prefix of the rendered command line (`program` + args joined by space).
+    /// Prefix of the rendered command identity (structured argv is quoted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_prefix: Option<String>,
-    /// Exact (whitespace-trimmed) command line. Used for compound shells that
-    /// cannot be safely prefix-matched: only this one verbatim command is
-    /// allowed, so an appended payload (`cmd; rm -rf /`) never rides the rule.
+    /// Exact (whitespace-trimmed) command identity. Newly generated command
+    /// grants use this field; arguments cannot broaden the approved action.
+    /// This does not bind cwd or resolve repository configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_exact: Option<String>,
     /// Glob over the paths the call WRITES (simple `*` / `**` / `?`). An
@@ -305,8 +305,7 @@ pub fn project_rules_path(repo_root: &Path) -> PathBuf {
 /// other files / similar commands in a plan) must stop re-prompting.
 ///
 /// Granularity:
-/// - `run_command` / simple `shell_command` → `program [first-arg]` prefix
-///   (e.g. `git push`, `cargo test`);
+/// - `run_command` / `shell_command` → exact approved command identity;
 /// - `apply_patch` / `replace` → **tool-level** allow (all paths for that tool),
 ///   so a plan can edit many files after one Always;
 ///
@@ -359,24 +358,14 @@ pub fn always_rules_for(
     }
 }
 
-/// A standing allow rule for a shell-like tool. Simple commands get a
-/// `program [first-arg]` prefix rule (covers `cargo test …` variants). A
-/// compound shell (pipes, `$()`, `&&`, wrappers) cannot be prefix-generalized
-/// safely, so it gets an EXACT rule instead of nothing — persisting the one
-/// verbatim command the user approved without opening a hole for variants.
+/// Persist only the exact approved command identity. New standing grants do
+/// not generalize argv, targets or effects. Existing manually authored prefix
+/// rules remain supported by the rule evaluator.
 fn command_rule(
     tool: &str,
     command: Option<&str>,
     allow: impl Fn(RuleMatch) -> PermissionRule,
 ) -> Vec<PermissionRule> {
-    if let Some(prefix) = durable_command_prefix(command) {
-        return vec![allow(RuleMatch {
-            tool: Some(tool.to_string()),
-            command_prefix: Some(prefix),
-            command_exact: None,
-            write_path_glob: None,
-        })];
-    }
     let Some(exact) = command.map(str::trim).filter(|c| !c.is_empty()) else {
         return Vec::new();
     };
@@ -386,33 +375,6 @@ fn command_rule(
         command_exact: Some(exact.to_string()),
         write_path_glob: None,
     })]
-}
-
-/// Prefix for a durable allow rule, or `None` when the command is unsafe to
-/// generalize (wrappers, empty, shell metacharacters).
-fn durable_command_prefix(command: Option<&str>) -> Option<String> {
-    let cmd = command?.trim();
-    if cmd.is_empty() {
-        return None;
-    }
-    // Reject compound / interpolated shell so Always cannot become "any script".
-    if cmd.chars().any(|c| {
-        matches!(
-            c,
-            '|' | '&' | ';' | '<' | '>' | '$' | '`' | '\n' | '(' | ')' | '{' | '}'
-        )
-    }) {
-        return None;
-    }
-    let mut tokens = cmd.split_whitespace();
-    let program = tokens.next()?;
-    if is_shell_wrapper_program(program) {
-        return None;
-    }
-    Some(match tokens.next() {
-        Some(second) => format!("{program} {second}"),
-        None => program.to_string(),
-    })
 }
 
 /// Append one rule to the project rules file (`<repo_root>/.leveler/
@@ -578,28 +540,32 @@ rules:
     }
 
     #[test]
-    fn always_rules_run_command_prefix_is_program_first_arg() {
+    fn always_rules_run_command_is_exact() {
         let rules = always_rules_for("run_command", Some("cargo test --workspace"), &[]);
         assert_eq!(rules.len(), 1);
         assert_eq!(
-            rules[0].match_.command_prefix.as_deref(),
-            Some("cargo test")
+            rules[0].match_.command_exact.as_deref(),
+            Some("cargo test --workspace")
         );
         assert_eq!(rules[0].match_.tool.as_deref(), Some("run_command"));
         assert_eq!(rules[0].effect, RuleEffect::Allow);
-        // The derived rule actually allows a matching later call.
+        // A repeated action is covered, a changed argv needs its own decision.
         let set = PermissionRuleSet::from_rules(rules);
         assert_eq!(
-            set.evaluate("run_command", Some("cargo test -p foo"), &[]),
+            set.evaluate("run_command", Some("cargo test --workspace"), &[]),
             RuleDecision::Allow
+        );
+        assert_eq!(
+            set.evaluate("run_command", Some("cargo test -p foo"), &[]),
+            RuleDecision::NoMatch
         );
         assert_eq!(
             set.evaluate("run_command", Some("cargo clean"), &[]),
             RuleDecision::NoMatch
         );
-        // No second token → just the program.
+        // A bare program also derives an exact command.
         let rules = always_rules_for("run_command", Some("ls"), &[]);
-        assert_eq!(rules[0].match_.command_prefix.as_deref(), Some("ls"));
+        assert_eq!(rules[0].match_.command_exact.as_deref(), Some("ls"));
         assert!(always_rules_for("run_command", None, &[]).is_empty());
         assert!(always_rules_for("run_command", Some("  "), &[]).is_empty());
     }
@@ -630,40 +596,81 @@ rules:
     }
 
     #[test]
-    fn always_rules_simple_shell_command_gets_prefix() {
+    fn always_rules_simple_shell_command_is_exact() {
         let rules = always_rules_for("shell_command", Some("cargo test --workspace"), &[]);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].match_.tool.as_deref(), Some("shell_command"));
         assert_eq!(
-            rules[0].match_.command_prefix.as_deref(),
-            Some("cargo test")
+            rules[0].match_.command_exact.as_deref(),
+            Some("cargo test --workspace")
         );
         let set = PermissionRuleSet::from_rules(rules);
         assert_eq!(
             set.evaluate("shell_command", Some("cargo test -p foo"), &[]),
-            RuleDecision::Allow
+            RuleDecision::NoMatch
         );
     }
 
     #[test]
-    fn always_rules_shell_git_push_covers_later_similar_pushes() {
-        // "始终允许" for shell `git push` must stop re-prompting for `git push origin main`.
-        let rules = always_rules_for("shell_command", Some("git push"), &[]);
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].match_.command_prefix.as_deref(), Some("git push"));
-        let set = PermissionRuleSet::from_rules(rules);
+    fn quoted_command_arguments_do_not_create_truncated_prefix_grants() {
+        let approved = "cargo 'publish local'";
+        let rules = always_rules_for("run_command", Some(approved), &[]);
+        assert_eq!(rules[0].match_.command_prefix, None);
+        let rules = PermissionRuleSet::from_rules(rules);
         assert_eq!(
-            set.evaluate("shell_command", Some("git push"), &[]),
+            rules.evaluate("run_command", Some(approved), &[]),
             RuleDecision::Allow
         );
         assert_eq!(
-            set.evaluate("shell_command", Some("git push origin main"), &[]),
-            RuleDecision::Allow
-        );
-        assert_eq!(
-            set.evaluate("shell_command", Some("git status"), &[]),
+            rules.evaluate("run_command", Some("cargo 'publish remote'"), &[]),
             RuleDecision::NoMatch
         );
+    }
+
+    #[test]
+    fn always_rules_git_grants_cover_only_the_approved_command() {
+        for tool in ["shell_command", "run_command"] {
+            for (approved, variants) in [
+                (
+                    "git push origin main",
+                    vec![
+                        "git push --force origin main",
+                        "git push other main",
+                        "git push origin other",
+                    ],
+                ),
+                (
+                    "git fetch origin",
+                    vec![
+                        "git fetch https://unknown.example/repo",
+                        "git fetch other",
+                        "git fetch origin --upload-pack=payload",
+                    ],
+                ),
+                (
+                    "/usr/bin/git push origin main",
+                    vec!["/usr/bin/git push --force origin main"],
+                ),
+                (
+                    "'git' push origin main",
+                    vec!["'git' push --force origin main"],
+                ),
+            ] {
+                let rules = always_rules_for(tool, Some(approved), &[]);
+                assert_eq!(rules.len(), 1);
+                assert_eq!(rules[0].match_.command_prefix, None);
+                assert_eq!(rules[0].match_.command_exact.as_deref(), Some(approved));
+                let set = PermissionRuleSet::from_rules(rules);
+                assert_eq!(set.evaluate(tool, Some(approved), &[]), RuleDecision::Allow);
+                for variant in variants {
+                    assert_eq!(
+                        set.evaluate(tool, Some(variant), &[]),
+                        RuleDecision::NoMatch,
+                        "{approved} must not grant {variant}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

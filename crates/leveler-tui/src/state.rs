@@ -140,6 +140,14 @@ pub struct BackgroundTaskChrome {
     pub stopped: bool,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
+    /// The process-group leader's OS pid, from the runtime's start/reconcile
+    /// fact. Display only: the TUI never signals a pid; stopping still goes
+    /// through the runtime's cancellation command.
+    pub pid: Option<u32>,
+    /// When this view last applied an output chunk. A projection freshness
+    /// clock — "how long since the screen last moved" — never a process fact.
+    /// `None` until the first chunk.
+    pub last_output_at: Option<std::time::Instant>,
     /// Output retained from authoritative events. Empty means none arrived.
     pub output: String,
 }
@@ -153,6 +161,8 @@ impl BackgroundTaskChrome {
             stopped: false,
             exit_code: None,
             duration_ms: None,
+            pid: None,
+            last_output_at: None,
             output: String::new(),
         }
     }
@@ -320,8 +330,6 @@ pub struct AppState {
     pub diff_selected: usize,
     /// Whether the current busy turn was launched with `/goal`.
     pub goal_mode_active: bool,
-    /// Product work profile: economy | balanced.
-    pub work_profile: String,
     /// Collaboration mode: chat | plan | goal.
     pub collaboration: String,
 
@@ -443,6 +451,13 @@ pub struct AppState {
     /// Painted stop controls, bound to their screen and exact task identity.
     /// These are hit regions only; cancellation rechecks the live projection.
     pub background_stop_hits: Vec<(Screen, ratatui::layout::Rect, String)>,
+    /// Which pane owns ↑/↓ on the Background Tasks page: the task list or the
+    /// selected task's live output. Presentation state only.
+    pub background_list_focus: crate::activity::BackgroundPane,
+    /// Per-task log viewport (scroll/follow), keyed by task id. Kept per task
+    /// so switching selection never carries another task's scroll position.
+    /// Bounded by the same terminal-task window as the chrome map.
+    pub background_task_views: std::collections::HashMap<String, crate::activity::ActivityView>,
     /// Last-painted one-line plan summary hit (row, x_start, x_end).
     pub plan_hit: Option<(u16, u16, u16)>,
     /// Last-painted header goal hit (row, x_start, x_end).
@@ -478,7 +493,7 @@ pub struct AppState {
     pub skill_catalog_root: Option<String>,
 
     /// Header/welcome metadata, filled from the session snapshot.
-    pub repository: String,
+    pub repository: Option<String>,
     pub branch: Option<String>,
     /// The session's goal, verbatim from the runtime snapshot. This is the
     /// authoritative task objective and the fallback title for the Active Goal
@@ -589,7 +604,6 @@ impl AppState {
             diff_error: None,
             diff_selected: 0,
             goal_mode_active: false,
-            work_profile: "balanced".into(),
             collaboration: "chat".into(),
             pending_attachments: Vec::new(),
             vision: false,
@@ -637,6 +651,8 @@ impl AppState {
             background_failures_seen: std::collections::HashSet::new(),
             background_footer_hit: None,
             background_stop_hits: Vec::new(),
+            background_list_focus: crate::activity::BackgroundPane::List,
+            background_task_views: std::collections::HashMap::new(),
             plan_hit: None,
             goal_hit: None,
             command_selected: None,
@@ -649,7 +665,7 @@ impl AppState {
             file_index_requested: false,
             skill_catalog: Vec::new(),
             skill_catalog_root: None,
-            repository: String::new(),
+            repository: None,
             branch: None,
             goal: String::new(),
             staged_goal: None,

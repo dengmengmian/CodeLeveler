@@ -619,34 +619,36 @@ It must not silently change Tool semantics because:
 “this task looks hard”
 ```
 
-### 8.1 Available, Enabled, and Exposed Are Three Different Facts
+### 8.1 Available, Permitted, and Exposed Are Three Different Facts
 
-An optional capability reaches a model only where two independent answers
-agree:
+CodeLeveler has one normal working strategy. Each goal begins with the base
+coding tools and a small capability control. Optional tools and their guidance
+join following requests only when the model requests a capability.
 
 ```text
-AVAILABLE   what this MACHINE can provide
-      ∩
-ENABLED     what this PRODUCT MODE asks for
-      =
-EXPOSED     what the model is offered
+AVAILABLE   what this runtime can provide
+PERMITTED   what configuration, permissions, and sandbox allow
+EXPOSED     what the current request carries
+
+EXPOSED ⊆ AVAILABLE ∩ PERMITTED
 ```
 
-AVAILABLE is mechanical: is a search provider configured, is `git` on `PATH`,
-does this model accept an image, can the browser this host would select be
-driven. Nothing in it is a product choice and nothing in it consults how
-capable the model seems.
+Availability is mechanical: a configured search provider, `git` on `PATH`,
+vision support, or a browser runtime that can drive the selected browser.
+Permission is independently owned by host policy and project configuration,
+including `memory.enabled` and delegation permission. Loading changes exposure;
+it cannot create availability or grant permission.
 
-ENABLED is the user's decision about cost and scope, carried by the work
-profile. `Economy` asks for no optional capability at all, which is why a
-machine with a browser runtime installed and a search key configured still
-offers an Economy turn neither of them.
+The model decides which capability its task needs. The harness validates the
+request, loads the existing subsystem, and executes tools. It never selects
+capabilities from task wording, model reputation, provider identity, or step
+count. A capability remains loaded until its goal ends; an unfinished goal
+restores its durable active capabilities, and a new goal starts from the base
+surface. Tool and guidance ordering must remain deterministic.
 
-The intersection is a boundary rather than a suggestion: neither side can
-widen the other. A capability the host owns but the mode did not ask for is
-not advertised, and a capability the mode asked for but the host cannot
-provide is not conjured. This is what keeps “the code for it exists” from
-growing back into “the model can use it”.
+Legacy session work-profile values have no role in choosing the tool surface.
+Collaboration (`chat`, `plan`, `goal`) and execution permission retain their
+independent meanings.
 
 ### 8.2 Browser Control and Web Search Are Separate Capabilities
 
@@ -849,7 +851,7 @@ Declarations, verification evidence, and lifecycle describe separate facts. File
 
 Once the authoritative result is committed, the Product must publish the user-visible terminal immediately. Only work already detached to an immutable task/run identity may continue afterward; it must not delay terminal visibility or move a client back into a running state. Session-scoped cleanup must snapshot its exact resource ids before publication. A continuation checkpoint belongs to the authoritative window boundary and is committed before `TaskFinished`, because letting it re-read “current session” afterward could absorb the next turn; failure to create that checkpoint preserves the concrete error and pauses the window as recoverable `Interrupted`, retaining the owed Goal. It must not claim a successful checkpoint; a later resume rebuilds from canonical facts. A review configured as required may still produce completion warnings. Findings remain advisory model conclusions, not mechanical terminal verdicts; an advisory review must not block.
 
-A background process chooses its cleanup boundary explicitly when it starts. The default `goal` lifetime is reaped when its creating goal reaches a terminal state. Only an explicit user request for a server or watcher to remain alive after task completion selects the `runtime` lifetime. Both retain the creating session as owner and remain observable and stoppable through the same background-task interface; `runtime` skips only goal-terminal cleanup and is still settled on process exit, explicit stop, or runtime shutdown.
+A background process chooses its cleanup boundary explicitly when it starts. The default `goal` lifetime is reaped when its creating goal reaches a terminal state. `runtime` skips goal-terminal cleanup but is still reaped when the current Runtime exits, preserving its existing contract. `session` and `persistent` processes are owned by the independent Execution Host from spawn, while retaining their creating session as access owner. `session` tasks stop on explicit session deletion. `persistent` is for explicitly requested services or watchers that must survive Runtime restarts; it ends on process exit or explicit stop. Execution Host failure is a separate failure domain and does not guarantee service termination. Runtime updates do not stop hosted services or automatically convert existing local tasks. All lifetimes remain observable and stoppable through the same background-task interface.
 
 Write ownership becomes an operating-system execution boundary before dispatch, including allowed paths and paths exclusively owned by other executors. Unsupported enforcement fails closed instead of granting workspace-wide writes. Mutation settlement observes only the enforced scope; whole-tree diffs, filtering other executors' changes, and whole-tree rollback are not permission enforcement. A background workload ends in this order: the entire workload exits, mutations settle, then its terminal state is published. Parent-shell exit is insufficient. Log access, waiting, and stopping require the creating session; later turns in that session may operate the task, but a task id alone grants no cross-session access.
 
@@ -1056,7 +1058,160 @@ These products exist in this repository:
 
 A standalone desktop app and cloud workers are not shipped. Custom agents: [`AGENT_EXTENSIBILITY.md`](AGENT_EXTENSIBILITY.md).
 
-### 13.2 TUI projection and performance invariants (Do Not Regress)
+### 13.2 Client Protocol and Runtime Host
+
+`leveler-client-protocol` defines the single **semantic contract** between
+clients and the Runtime: `ClientCommand`, `RuntimeEvent`, `UiSessionSnapshot`,
+and their envelopes. CLI, TUI, Web, and future Desktop clients use this
+contract when connecting to a Runtime, instead of defining shell-specific
+session, turn, or tool events. The protocol does not decide how a process starts
+or which local connection carries it.
+
+Runtime Host is a separate boundary. It makes a connectable Runtime available
+by discovering, starting, adopting, or reviving it. It orchestrates build and
+configuration compatibility, retirement and handoff, daemon authentication
+tokens and the readiness contract, transport binding, and idle policy. It does
+not run the Agent loop or own models, tools, permission decisions, session
+persistence, or recovery.
+**Runtime Host** orchestrates processes and connections; it is distinct from
+the **Host Authority** in Section 9, which controls real side effects.
+
+Long-lived background processes use an independent **Execution Host** within
+the `leveler-execution` boundary. It is distinct from Runtime Host. From spawn,
+Execution Host alone owns hosted child handles, process trees, sandbox
+resources, output readers, and exit monitoring. CodeLeveler Runtime is its
+client; Runtime updates, exits, and crashes do not transfer process ownership.
+Execution Host reuses `CommandRunner` and the background registry rather than
+introducing another spawn, log, or stop implementation. Models, the Agent loop,
+session lifecycle, Goals, verification, and file-change settlement remain in
+CodeLeveler Runtime.
+
+OS workload exit and semantic settlement are separate facts. Before spawn,
+Runtime durably records the creating session, writer, write scope, and mutation
+baseline. Execution Host does not interpret settlement inputs; it records
+process facts. Once the complete process group exits, Host records the exit
+durably. Runtime reconciles immediately while online or after reconnecting.
+The existing semantic terminal cannot be published, and write ownership cannot
+be released, before settlement commits. Concurrent clients cannot commit
+independent settlement results; Runtime's durable settlement record is the
+single authority for that fact.
+
+The Execution Host process protocol negotiates major/minor compatibility and
+capabilities, rather than requiring the Runtime's build fingerprint. An
+incompatible client reports the error and leaves services running. Runtime
+updates do not replace a working Execution Host. Host upgrades do not promise
+live process migration. Legacy tasks already owned by an older Runtime retain
+their cleanup and update-blocking behavior; migration must not be fabricated.
+
+Execution Host crashes are a separate failure domain. Normal destructor cleanup
+does not prove tree cleanup after SIGKILL. Recovery requires durable metadata
+and verifiable process identities. When identity cannot be established safely,
+report unknown / recovery-required, retain unsettled write ownership, and never
+signal a potentially reused PID or process group or claim an unobserved exit.
+
+Phase one does not implement automatic adoption with a provable process birth
+identity. Persisted Running/Killing records or unresolved spawn intents prevent
+automatic replacement of a lost host and require explicit recovery. A process
+possibly exiting on its own cannot resolve this uncertainty by assumption.
+Durably confirmed exit facts and logs can be restored by a new Host without
+restarting those workloads.
+
+The current Execution Host owner-only state-directory security backend supports
+Unix. Windows hosted lifetimes fail closed until that security backend exists;
+there is no fallback to unprotected TCP or permissive token files. Existing
+Runtime Host Windows support and local `goal` / `runtime` execution are unchanged.
+
+Each boundary has one owner:
+
+| Boundary | Responsibility |
+| --- | --- |
+| Shell / Product | Arguments, interaction, project selection, and client-owned process lifetime policy |
+| `leveler-runtime-host` | Runtime discovery / spawn / adopt / compatibility / handoff / revive; token, readiness, bind, and idle orchestration |
+| `leveler-local-transport` | Connections, listeners, transport trust and endpoint ownership; platform adapters hold Unix socket/flock or Windows pipe/instance guard |
+| `leveler-client-protocol` | Semantic client commands, runtime events, and snapshots |
+| `leveler-app` / `leveler-engine` | Internal runtime state, session and turn lifecycle, persistence, and crash recovery |
+
+Host orchestrates transport binding and ownership acquisition; it does not
+reimplement the socket, `flock`, or internal runtime ownership and recovery.
+Once connected, commands and events flow through the protocol and transport;
+business commands do not pass through Host. “One Runtime” means one shared
+runtime implementation, not one OS daemon process for every project or an
+obligation to use a daemon in embedded mode.
+
+Before Phase 1, the CLI and Web each implemented a startup path: the default
+TUI path orchestrated a detached per-repository daemon, while Web's
+`ProjectManager` probed or spawned project daemons and owned the children it
+started. Both paths now call `leveler-runtime-host`: TUI uses its detached
+discovery, version handoff, and revival entry point; Web uses its owned-child
+adopt-or-start entry point. CLI retains terminal input and text. Web retains
+its project registry, routing, status, and spawned-child monitoring and
+termination policy. Both process ownership behaviors retain their existing
+semantics. The Web page access token remains a Web
+Product concern, distinct from the daemon authentication token. Embedded mode
+continues to use the same `leveler-app` Runtime implementation without
+requiring another daemon.
+
+Below the client protocol, transports share framing, request handling and
+reconnection:
+
+```text
+Client Protocol
+    └── Transport
+        ├── Unix socket: trusted-local
+        ├── Windows named pipe: trusted-local
+        └── TCP + bearer token: authenticated-remote
+```
+
+The server transport establishes trust. Declared ClientKind can only reduce
+privilege. Loopback TCP with a valid token cannot grant local AutoApprove or
+count as a local interactive waiter. PermissionProfile retains its existing
+contract; the transport gate restricts client-granted AutoApprove without
+redesigning execution permissions. The daemon owner's global AutoApprove
+configuration retains its existing behavior.
+
+Unix retains an owner-only socket and server lifetime flock. The Windows
+adapter rejects remote named-pipe clients, installs a protected current-user
+SID DACL, and checks the actual pipe peer process TokenUser SID in both
+directions. The client also checks the connected pipe handle's owner SID,
+binding identity directly to the security object. `leveler-win-local-ipc`
+encapsulates the Win32 security operations.
+Like Unix 0600, this is an OS user boundary, not application-signature
+authentication. Same-user processes and administrators are within that
+boundary; a different service account is not automatically trusted.
+
+Windows pipe names derive from the current SID and a hash of Layout's logical
+socket path, encoded as UTF-16 rather than embedding Unicode repository paths.
+The readiness contract retains `socket` as a logical endpoint; build/config
+identity remains in runtime_info. Unix flock and the Windows retained first
+pipe instance handle are each the platform's single lifetime ownership
+authority, acquired before recovery and ready publication. UI disconnect
+does not release ownership; the OS releases it after runtime crash. Windows
+pipes need no filesystem stale-socket cleanup.
+
+RuntimeHost shares start/adopt/revive/handoff across platforms. Only transport,
+OS security primitives and detached-process configuration differ. Security
+failure is explicit, with no trusted-TCP fallback. Implementation and cross
+compilation do not establish Windows real-host acceptance; see
+[`DESKTOP_PHASE2_WINDOWS_TRANSPORT.md`](../DESKTOP_PHASE2_WINDOWS_TRANSPORT.md).
+A Desktop Shell should reuse the protocol, Runtime Host and Runtime instead
+of copying process orchestration or business state. This does not create or
+presuppose an Electron implementation.
+
+### 13.2.1 Optional Workspace and Global History Contracts
+
+Session, TaskEngine, and Runtime retain one implementation. A Session's durable `repository` is its optional primary workspace: existing projects remain `Some(path)` and No Workspace is `None`. Application state always exists; execution working directories depend on capability and authorization. HOME, startup cwd, the previous project, and internal scratch paths cannot substitute for any of these facts.
+
+`Layout::no_workspace` has its own `state/no-workspace` source, socket identity, and app-owned configuration. Project runtimes reject explicit None; No Workspace runtimes reject project associations. Creation distinguishes omitted `RuntimeDefault`, explicit `None`, and `Workspace`. Existing CLI/TUI/Web project requests retain their default project. No Workspace uses the same Runtime without project configuration, rules/hooks, skills, MCP, Git/LSP, file checkpoints, or shell context. Tool dispatch checks actual workspace resources before execution. Tools require a workspace by default and reject direct calls even with FullAccess or absolute HOME paths. Independent web/search/browser capabilities retain their permission checks.
+
+The `leveler-app` Global Task Index scans existing project stores and the No Workspace store through SQLite read-only connections. It projects durable facts without creating databases, migrating sources, starting daemons, or maintaining another task ledger. Source failures accompany partial results. Missing checkouts retain history with workspace availability. Opening a cross-source Session first resolves its actual index owner, then asks Runtime Host to connect to that source; Web's online multi-project Router retains its responsibilities. Global discovery is restricted to trusted local clients; project Remote/Web access does not authorize other sources' history.
+
+`session_projection` derives `task_status` and `task_terminal` from durable turn/event order, boot liveness, and actual live waiters for local lists, snapshots, and the global index. Existing `status` retains Session lifecycle semantics. Only committed `TaskFinished` establishes an authoritative terminal. Answered means an answer; stop=Completed means a domain completion declaration, not independent acceptance. Legacy TaskFinished with outcome=Completed and stop=None retains its terminal compatibility without inventing a declaration. A committed terminal outranks its old live lease during cleanup. A later admitted turn's durable identity/ordinal and event order prevent the old terminal from overriding new activity. Final prose and successful tools without a terminal cannot imply completed. Read-only discovery can establish a running owner but cannot infer waiter liveness from persisted approval records; actionable WaitingUser comes from the connected owner's snapshot.
+
+Reconnect snapshots restore durable prose, plans, terminals, and surviving approval/clarification waiters. Answered, timed-out, cancelled, or restarted interactions cannot become actionable again; dropping a future during cancellation must also remove its waiter. Runtime restart restores durable facts without automatically resuming provider streams; old turns report interrupted/unknown according to owner epoch. Future Desktop clients use the daemon's durable wire ACK path. Default in-process optimistic ACK is not durable admission. Lost ACKs are resolved using the same command identity; unknown outcomes do not authorize automatic reruns.
+
+The local connection entry negotiates `optional_workspace`. Legacy clients entering project sources still receive a JSON string `repository`; only capable new clients may enter No Workspace sources and receive null. JSON schemas and TS DTOs use the existing generation workflow; Mobile Dart uses handwritten JSON-map consumers without a separate generator. Nullable repository migration runs only on the source owner's write connection and preserves old associations, foreign keys, indexes, triggers, and task facts. Global read-only discovery never migrates a source.
+
+### 13.3 TUI projection and performance invariants (Do Not Regress)
 
 The TUI presents Runtime facts; it does not create them. These contracts are
 verified by deterministic tests and real dogfood — do not regress them:

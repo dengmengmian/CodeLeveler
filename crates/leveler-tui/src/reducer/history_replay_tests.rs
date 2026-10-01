@@ -47,7 +47,9 @@ fn message(role: UiRole, text: &str) -> UiMessage {
 fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "/repo".into(),
+        repository: Some("/repo".into()),
+        task_status: None,
+        task_terminal: None,
         goal: "g".into(),
         model: None,
         mode: PermissionProfile::Assisted,
@@ -234,6 +236,7 @@ fn replayed_background_lifecycle_is_history_and_cannot_replace_live_activity() {
             task_id: "live-now".into(),
             program: "cargo".into(),
             args: vec!["test".into()],
+            pid: None,
         }),
     );
     reduce(
@@ -250,6 +253,7 @@ fn replayed_background_lifecycle_is_history_and_cannot_replace_live_activity() {
                         task_id: "old".into(),
                         program: "false".into(),
                         args: vec![],
+                        pid: None,
                     },
                 },
                 leveler_client_protocol::UiHistoryEntry {

@@ -10,7 +10,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     checkpoints: [], completionReport: null, memory: null, turnActive: false,
     activity: null, reasoning: '', reasoningSuperseded: false, turnStartedAt: null,
     lastTurn: null, model: null, availableModels: [], permission: 'assisted',
-    workProfile: 'balanced', collaboration: 'chat', reasoningEffort: null,
+    collaboration: 'chat', reasoningEffort: null,
     tokens: { input: 0, output: 0 }, contextTokens: 0, contextWindow: null,
     ...over,
   };

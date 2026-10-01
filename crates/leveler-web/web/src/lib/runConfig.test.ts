@@ -9,11 +9,10 @@ describe('runConfigSummary', () => {
       runConfigSummary({
         modelLabel: 'GLM-5.2',
         reasoning: reasoningLabel('max'),
-        workProfile: 'balanced',
         collaboration: 'goal',
         permission: 'assisted',
       }),
-    ).toBe('GLM-5.2 · Max · Balanced · Goal · 辅助模式');
+    ).toBe('GLM-5.2 · Max · Goal · 辅助模式');
   });
 
   it('omits reasoning when the model has no effort', () => {
@@ -21,16 +20,15 @@ describe('runConfigSummary', () => {
       runConfigSummary({
         modelLabel: 'glm-5.2',
         reasoning: null,
-        workProfile: 'economy',
         collaboration: 'chat',
         permission: 'request_approval',
       }),
-    ).toBe('glm-5.2 · Economy · Chat · 逐次确认');
+    ).toBe('glm-5.2 · Chat · 逐次确认');
   });
 
-  it('compact control shows model and work profile only', () => {
-    expect(runConfigCompact({ modelLabel: 'DeepSeek V4', workProfile: 'balanced' })).toBe(
-      'DeepSeek V4 · Balanced',
+  it('compact control omits legacy work profiles', () => {
+    expect(runConfigCompact({ modelLabel: 'DeepSeek V4' })).toBe(
+      'DeepSeek V4',
     );
   });
 });

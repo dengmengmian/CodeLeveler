@@ -132,6 +132,8 @@ export type FailureCategory =
   | 'provider'
   /** The request was malformed or rejected as invalid. */
   | 'invalid_request'
+  /** A local provider/model configuration or resolution failure: the request was never sent because this process could not build a route for it. Distinct from [`FailureCategory::InvalidRequest`] so a client never reports a local misconfiguration as a provider rejection. */
+  | 'local_configuration'
   /** A tool or command failed. */
   | 'tool'
   /** A runtime/infrastructure failure that is not a provider call. */
@@ -303,6 +305,7 @@ export type RestartReason =
 
 /** An event flowing from the runtime to clients. */
 export type RuntimeEvent =
+  | { type: 'global_tasks_loaded'; index: UiGlobalTaskIndex; query_id: string; requester_session_id: SessionId }
   /** The runtime finished booting and is ready for commands. */
   | { type: 'runtime_ready' }
   /** A session was opened / its snapshot refreshed. */
@@ -353,6 +356,8 @@ export type RuntimeEvent =
   | { type: 'plan_updated'; plan: UiPlan }
   /** The working-tree diff changed or was explicitly requested (spec §21). */
   | { type: 'diff_updated'; diff: UiDiff; query_id?: CommandId | null }
+  /** A requested working-tree diff could not be computed. Distinct from `DiffUpdated` with zero files, which is a real "no changes" answer: clients must never present an unreadable workspace as clean. */
+  | { type: 'diff_failed'; message: string; query_id?: CommandId | null }
   /** A conversation checkpoint was created (spec §68). */
   | { type: 'checkpoint_created'; checkpoint: UiCheckpoint }
   /** The list of stored sessions (spec §52). */
@@ -418,7 +423,7 @@ export type RuntimeEvent =
   /** A transient notification for the status line. */
   | { type: 'notification'; level: NotificationLevel; message: string }
   /** A background process task was started (`run_command` background=true). */
-  | { type: 'background_task_started'; args: string[]; program: string; task_id: string }
+  | { type: 'background_task_started'; args: string[]; pid?: number | null; program: string; task_id: string }
   /** A live chunk of a background task's combined stdout/stderr, already sanitized and capped by the runtime. Additive; older clients ignore the unknown type. The final [`Self::BackgroundTaskExited`] log stays authoritative. */
   | { type: 'background_task_output'; chunk: string; task_id: string }
   /** A background task finished (exit or kill). `output` is the task's final retained log, authoritative over the streamed chunks (a lifecycle broadcast lag can drop a chunk). Empty when the runtime produced none. */
@@ -470,6 +475,8 @@ export interface UiActiveBackgroundTask {
   args: string[];
   /** Runtime-observed age at snapshot time. */
   elapsed_ms: number;
+  /** The process-group leader's OS pid, when known. Additive; older clients decode it as absent. */
+  pid?: number | null;
   program: string;
   task_id: string;
 }
@@ -768,6 +775,32 @@ export interface UiFinding {
   symbol?: string | null;
 }
 
+export interface UiGlobalTaskIndex {
+  source_errors: UiGlobalTaskSourceError[];
+  tasks: UiGlobalTaskSummary[];
+}
+
+export interface UiGlobalTaskSourceError {
+  kind: UiGlobalTaskSourceErrorKind;
+  message: string;
+  source_id: string;
+}
+
+export type UiGlobalTaskSourceErrorKind = 'discovery' | 'storage' | 'projection';
+
+export interface UiGlobalTaskSummary {
+  archived_at?: string | null;
+  id: SessionId;
+  last_activity_at: string;
+  model: string;
+  primary_workspace?: string | null;
+  source_id: string;
+  status: UiTaskStatus;
+  title: string;
+  /** Availability is separate from lifecycle; a deleted checkout retains its history. */
+  workspace_available?: boolean | null;
+}
+
 /** One durable goal checkpoint, projected for history presentation (long-goal P3). Every Recap a client renders maps to exactly one persisted checkpoint (`checkpoint_id`) — the client presents these fields, it never rebuilds its own summary, and it never parses `display_summary` to reconstruct facts. Truth rules ride the shape: `findings_total == None` means the ledger was not readable when the checkpoint was cut — UNKNOWN, which a client must never render as zero. */
 export interface UiGoalRecap {
   /** The persisted `GoalCheckpointId` this Recap presents. */
@@ -981,7 +1014,7 @@ export interface UiSessionObservation {
   output_tokens: number;
   /** Reasoning tokens summed over the requests that reported a breakdown — a SUBSET of `output_tokens`, never an addition to it. `None` when no request reported one, which is an absence of measurement. */
   reasoning_tokens?: number | null;
-  repository: string;
+  repository?: string | null;
   request_count: number;
   request_failures: number;
   request_retries: number;
@@ -991,6 +1024,7 @@ export interface UiSessionObservation {
   tool_finished: number;
   tool_started: number;
   updated_at: string;
+  /** Deprecated compatibility marker, always `single` on new runtimes. */
   work_profile: string;
 }
 
@@ -1005,9 +1039,9 @@ export interface UiSessionSnapshot {
   /** VCS branch, if the repository is a git repo. */
   branch?: string | null;
   checkpoints?: UiCheckpoint[];
-  /** Every delegated child of this session, oldest first, from the durable record. Additive: absent on old runtimes. */
+  /** Every delegated child of this session, oldest first, from durable storage. */
   children?: UiChildAgent[];
-  /** Product collaboration axis (`chat | plan | goal`). Same contract as `work_profile` — the runtime routes submits (goal) and restricts tools (plan) from this value, so clients must not invent it. */
+  /** Product collaboration axis (`chat | plan | goal`). The runtime routes submissions and applies the read-only planning overlay from this value. */
   collaboration?: string | null;
   completion_report?: UiCompletionReport | null;
   diff?: UiDiff | null;
@@ -1027,14 +1061,16 @@ export interface UiSessionSnapshot {
   reasoning?: UiReasoningState | null;
   /** Durable goal recaps for this session's goals (long-goal P3), oldest first. Each maps to one persisted GoalCheckpoint; a reopened client interleaves them into history by `transcript_ordinal`. Additive. */
   recaps?: UiGoalRecap[];
-  repository: string;
+  repository?: string | null;
   /** Persisted status string (e.g. "running", "completed"). */
   status: string;
+  task_status?: UiTaskStatus | null;
+  task_terminal?: UiTaskTerminal | null;
   /** User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block. */
   user_shells?: UiUserShell[];
   /** Whether the current model accepts image input (spec §42). */
   vision?: boolean;
-  /** Product work-profile axis (`economy | balanced`; legacy `delivery` reads as `balanced`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes. */
+  /** Deprecated compatibility field. New runtimes emit `single`; historical values never control tool exposure. Clients must not display a selector. */
   work_profile?: string | null;
 }
 
@@ -1048,6 +1084,8 @@ export interface UiSessionSummary {
   /** Repository root the session belongs to. Filled by the runtime that owns the session and by the WebUI aggregation router (multi-project grouping); omitted on the wire when unknown so old fixtures and clients keep parsing. */
   repository?: string | null;
   status: string;
+  task_status?: UiTaskStatus | null;
+  task_terminal?: UiTaskTerminal | null;
   updated_at: string;
 }
 
@@ -1059,6 +1097,17 @@ export interface UiShadowedAgent {
 
 /** A task's own terminal declaration, projected from its durable TaskFinished stop. This is not verification evidence and does not replace session lifecycle. */
 export type UiTaskDeclaration = 'answered' | 'completed';
+
+export type UiTaskStatus = 'idle' | 'running' | 'waiting_user' | 'answered' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'unknown' | 'blocked' | 'incomplete';
+
+/** Latest committed TaskFinished fact. This does not prove a later turn settled. */
+export interface UiTaskTerminal {
+  outcome: string;
+  reason?: string | null;
+  sequence: number;
+  stop?: string | null;
+  warnings: string[];
+}
 
 /** Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration. */
 export interface UiToolAggregate {
@@ -1112,6 +1161,8 @@ export type UserShellId = string;
 
 /** A command from a UI client to the runtime. */
 export type ClientCommand =
+  /** Read local durable sources; never starts their runtimes. */
+  | { type: 'query_global_tasks'; include_archived?: boolean; query_id: string; requester_session_id: SessionId }
   /** Ask the runtime for one best-effort prediction of the user's next prompt. The request is advisory UI chrome: it starts no task, persists no message, and may produce no event when there is insufficient context. */
   | { type: 'request_prompt_suggestion'; session_id: SessionId }
   /** Generate a one-shot recap after the UI has observed a post-turn idle window. The runtime may decline when the conversation is too short. */
@@ -1134,6 +1185,8 @@ export type ClientCommand =
   | { type: 'add_clipboard_image'; session_id: SessionId }
   /** Retire this runtime once its current work has settled. One mechanism covers both cases the caller cares about: an idle runtime drains instantly and exits, a busy one stops taking new work and exits when the work it already owns is done. The caller never polls for idleness and never kills anything — the runtime owns the drain, because only it knows what "still working" means. */
   | { type: 'shutdown_when_idle'; reason: RestartReason }
+  /** End this runtime NOW for a generation handover, cancelling the main turns it still owns instead of waiting for them to reach a terminal. The explicit, user-chosen escape from a handover whose drain cannot finish — a turn that will never terminate on its own. Distinct from `Quit`: this is a version handover, not a user shutdown, so it never kills background work. The caller must have settled those first; the runtime keeps waiting for them if any remain. */
+  | { type: 'force_retire'; reason: RestartReason }
   /** Cooperatively cancel the running turn (graceful; resumable). */
   | { type: 'cancel_current_turn'; session_id: SessionId }
   /** Escalate a cancel the user has already requested once. */
@@ -1154,7 +1207,7 @@ export type ClientCommand =
   | { type: 'set_default_model'; model: ModelRef; session_id: SessionId }
   /** Switch the execution mode used for subsequent turns . */
   | { type: 'set_permission_profile'; mode: PermissionProfile; session_id: SessionId }
-  /** Set product session axes (work profile × collaboration). Wire strings: work_profile = economy|balanced (legacy `delivery` reads as `balanced`); collaboration = chat|plan|goal. */
+  /** Set collaboration (`chat | plan | goal`). `work_profile` is a deprecated compatibility field accepted from old clients and ignored by the runtime. */
   | { type: 'set_product_axes'; collaboration: string; session_id: SessionId; work_profile: string }
   /** Confirm a collaboration-plan proposal and auto-enter goal mode (K24). */
   | { type: 'confirm_plan_to_goal'; content: string; session_id: SessionId }

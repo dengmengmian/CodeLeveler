@@ -70,7 +70,7 @@ impl Tool for ReadProjectRulesTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: ReadRulesInput = super::parse_input(self.name(), input)?;
-        let root: &Path = context.execution.workspace.root();
+        let root: &Path = context.require_workspace()?.root();
         let rules = load_rules(root);
 
         let Some(source) = input.source.as_deref() else {

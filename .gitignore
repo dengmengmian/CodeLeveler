@@ -24,6 +24,7 @@
 # Local editor / agent scratch
 .omc/
 .pi/
+.claude/
 .idea/
 .vscode/
 .DS_Store

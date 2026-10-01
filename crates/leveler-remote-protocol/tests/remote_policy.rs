@@ -298,6 +298,15 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
+            "query_global_tasks",
+            ClientCommand::QueryGlobalTasks {
+                requester_session_id: session(),
+                query_id: "g".into(),
+                include_archived: false,
+            },
+            false,
+        ),
+        (
             "request_session_list_for",
             ClientCommand::RequestSessionListFor {
                 requester_session_id: session(),

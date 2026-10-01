@@ -592,14 +592,7 @@ mod tests {
     fn splash_does_not_list_advanced_commands() {
         for locale in [Locale::Zh, Locale::En] {
             let text = paint(&state(locale), 80, 24);
-            for cmd in [
-                "/plan",
-                "/goal",
-                "/skill",
-                "/permission",
-                "/work-mode",
-                "/feature-dev",
-            ] {
+            for cmd in ["/plan", "/goal", "/skill", "/permission", "/feature-dev"] {
                 assert!(!text.contains(cmd), "{locale:?} leaked {cmd}: {text}");
             }
         }
@@ -609,7 +602,7 @@ mod tests {
     fn slash_registry_still_has_commands_removed_from_splash() {
         for locale in [Locale::Zh, Locale::En] {
             let listed = crate::screen::slash_commands(locale.text());
-            for cmd in ["/goal", "/collab", "/permission", "/work-mode"] {
+            for cmd in ["/goal", "/collab", "/permission"] {
                 assert!(
                     listed.iter().any(|(n, _)| *n == cmd),
                     "{locale:?} registry lost {cmd}"

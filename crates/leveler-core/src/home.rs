@@ -81,6 +81,11 @@ impl LevelerHome {
         self.root.join("state")
     }
 
+    /// Durable state for the source with no primary workspace.
+    pub fn no_workspace_state_dir(&self) -> PathBuf {
+        self.state_dir().join("no-workspace")
+    }
+
     /// All per-project durable state: `state/projects/`.
     pub fn projects_dir(&self) -> PathBuf {
         self.state_dir().join("projects")

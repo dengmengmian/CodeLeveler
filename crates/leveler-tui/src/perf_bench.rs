@@ -54,7 +54,9 @@ fn opened() -> AppState {
     state.size = (WIDTH as u16, HEIGHT);
     let snap = UiSessionSnapshot {
         id: SessionId::new("perf"),
-        repository: "~/perf".into(),
+        repository: Some("~/perf".into()),
+        task_status: None,
+        task_terminal: None,
         goal: "benchmark".into(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,

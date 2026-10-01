@@ -90,6 +90,20 @@ fn clarify_call() -> MockResponse {
     ])
 }
 
+/// The harness exposes `request_user_input` only after the model asks for the
+/// host-interaction capability; a fresh goal starts with no pack loaded.
+fn capability_enable_call(id: &str) -> MockResponse {
+    let arguments = serde_json::json!({ "action": "enable", "id": id });
+    sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call-capability",
+            "function": {"name": "capability", "arguments": arguments.to_string()}
+        }]}}]})
+        .to_string(),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+    ])
+}
+
 fn text(content: &str) -> MockResponse {
     sse(vec![
         serde_json::json!({"choices": [{"delta": {"content": content}, "finish_reason": "stop"}]})
@@ -156,6 +170,8 @@ fn frame(state: &mut AppState, label: &str) -> String {
 async fn a_multi_question_clarification_runs_end_to_end_from_the_agent_to_the_screen() {
     isolate_global_config();
     let server = MockServer::start(vec![
+        // 0: the model asks for the capability the clarification tool needs.
+        capability_enable_call("host_interaction"),
         // 1: the model asks the three questions.
         clarify_call(),
         // 2: the model answers after being handed the user's decisions.
@@ -235,6 +251,10 @@ compatibility:
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut drove = false;
     let mut sent_answers = false;
+    // Requests made by the time the clarification reached the screen. The
+    // disclosure round the model needs before `request_user_input` is exposed
+    // is legitimate; a request AFTER the question is on screen is not.
+    let mut requests_at_drive = 0usize;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let event = match tokio::time::timeout(left, rx.recv()).await {
@@ -258,6 +278,7 @@ compatibility:
         let clarifying = matches!(&state.overlay, Some(Overlay::Clarification(_)));
         if clarifying && !drove {
             drove = true;
+            requests_at_drive = server.request_count();
             // The wire carried all three questions, with their kinds.
             let tabs = match &state.overlay {
                 Some(Overlay::Clarification(ov)) => ov.len(),
@@ -330,8 +351,8 @@ compatibility:
             break;
         }
         assert!(
-            server.request_count() < 2 || sent_answers,
-            "the model was asked again before the answer was sent"
+            !drove || server.request_count() == requests_at_drive || sent_answers,
+            "the model was asked again while the clarification was unanswered"
         );
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -341,11 +362,14 @@ compatibility:
     assert!(drove, "the clarification never reached the TUI");
     assert!(sent_answers);
 
-    // The model was actually handed the decisions: the second request carries
-    // the tool result, which is the composed answer.
+    // The model was actually handed the decisions: the request after the
+    // answer carries the tool result, which is the composed answer.
     let bodies = server.request_bodies().await;
-    assert!(bodies.len() >= 2, "the model ran once: {bodies:?}");
-    let second = &bodies[1];
+    assert!(
+        bodies.len() >= 3,
+        "disclosure, clarification, answer: {bodies:?}"
+    );
+    let second = bodies.last().expect("the answer-carrying request");
     for expected in ["删除全部 mock", "单元测试", "TUI 测试", "展示登录引导"] {
         assert!(
             second.contains(expected),

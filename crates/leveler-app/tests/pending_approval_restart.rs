@@ -213,3 +213,184 @@ async fn an_unanswered_approval_does_not_survive_a_restart() {
         "an approval that was never given must not have executed anything"
     );
 }
+
+#[tokio::test]
+async fn a_reconnected_client_restores_only_a_live_waiter_and_cancel_cleans_it_up() {
+    let server = MockServer::start_one(tool_call_sse(
+        "run_command",
+        serde_json::json!({"program":"rm","args":["scratch.txt"],"reason":"清理"}),
+    ))
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("scratch.txt"), "preserve").unwrap();
+    let (app, client, id) = session_awaiting_approval(tmp.path(), &server.base_url()).await;
+    // The subscriber that received ApprovalRequested has disconnected in the helper.
+    // A new subscriber restores the interaction from the actual runtime waiter.
+    let mut events = client.subscribe_session(&id);
+    let restored = client.snapshot(&id).await.unwrap();
+    assert_eq!(
+        restored.task_status,
+        Some(leveler_client_protocol::UiTaskStatus::WaitingUser)
+    );
+    assert!(
+        restored
+            .pending_interactions
+            .iter()
+            .any(|item| matches!(item, UiPendingInteraction::Approval(_)))
+    );
+    client
+        .send(ClientCommand::CancelTask {
+            session_id: id.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match events.recv().await.unwrap() {
+                RuntimeEvent::TaskCancelled | RuntimeEvent::TurnCancelled => break,
+                RuntimeEvent::TurnFailed { error, .. } => {
+                    panic!("cancel did not close its terminal: {error}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let settled = client.snapshot(&id).await.unwrap();
+    assert!(settled.pending_interactions.is_empty());
+    assert!(settled.active_tools.is_empty());
+    assert_eq!(
+        settled.task_status,
+        Some(leveler_client_protocol::UiTaskStatus::Cancelled)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("scratch.txt")).unwrap(),
+        "preserve"
+    );
+    let db = app.open_database().await.unwrap();
+    assert!(
+        leveler_storage::EventRepository::new(&db)
+            .load_last_by_type(&id, "task_finished", None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_reconnected_client_restores_live_clarification_and_cancel_drops_the_waiter() {
+    let server = MockServer::start(vec![
+        tool_call_sse(
+            "capability",
+            serde_json::json!({"action":"enable","id":"host_interaction"}),
+        ),
+        tool_call_sse(
+            "request_user_input",
+            serde_json::json!({"question":"要简洁还是详细？","options":["简洁","详细"]}),
+        ),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &server.base_url());
+    let home = leveler_core::LevelerHome::from_root(tmp.path().join("home"));
+    let app = Arc::new(
+        Application::assemble(Layout::no_workspace(home, Some(tmp.path().join("configs"))))
+            .unwrap(),
+    );
+    let id = app
+        .create_session(&ModelRef::new("mock", "m"), "clarify")
+        .await
+        .unwrap();
+    let runtime = InProcessRuntimeClient::new(
+        app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let mut original = runtime.subscribe_session(&id);
+    runtime
+        .send(ClientCommand::SubmitMessage {
+            session_id: id.clone(),
+            content: "帮我修改文字".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match original.recv().await.unwrap() {
+                RuntimeEvent::ClarificationRequested { .. } => break,
+                RuntimeEvent::TurnFailed { error, .. } => panic!("clarification failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(original);
+    let mut reconnected = runtime.subscribe_session(&id);
+    let snapshot = runtime.snapshot(&id).await.unwrap();
+    assert_eq!(
+        snapshot.task_status,
+        Some(leveler_client_protocol::UiTaskStatus::WaitingUser)
+    );
+    assert!(
+        snapshot
+            .pending_interactions
+            .iter()
+            .any(|item| matches!(item, UiPendingInteraction::Clarification(_)))
+    );
+    runtime
+        .send(ClientCommand::QueryGlobalTasks {
+            requester_session_id: id.clone(),
+            query_id: "waiting".into(),
+            include_archived: false,
+        })
+        .await
+        .unwrap();
+    let index = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let RuntimeEvent::GlobalTasksLoaded { index, .. } = reconnected.recv().await.unwrap()
+            {
+                break index;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(index.source_errors.is_empty());
+    assert_eq!(
+        index
+            .tasks
+            .iter()
+            .find(|task| task.id == id)
+            .unwrap()
+            .status,
+        snapshot.task_status.unwrap()
+    );
+    runtime
+        .send(ClientCommand::CancelTask {
+            session_id: id.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                reconnected.recv().await.unwrap(),
+                RuntimeEvent::TaskCancelled
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let settled = runtime.snapshot(&id).await.unwrap();
+    assert!(settled.pending_interactions.is_empty());
+    assert_eq!(
+        settled.task_status,
+        Some(leveler_client_protocol::UiTaskStatus::Cancelled)
+    );
+}

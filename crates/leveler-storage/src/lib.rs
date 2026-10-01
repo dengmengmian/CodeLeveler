@@ -20,6 +20,7 @@ mod message_repo;
 mod message_store;
 mod model_request_repo;
 mod ownership_store;
+mod session_facts;
 mod session_repo;
 mod session_store;
 mod task_creation_store;
@@ -53,6 +54,7 @@ pub use model_request_repo::{
 pub use ownership_store::{
     MemoryOwnershipState, MemoryOwnershipStore, OwnershipError, OwnershipStore, TaskOwner,
 };
+pub use session_facts::SessionFacts;
 pub use session_repo::{SessionRecord, SessionRepository};
 pub use session_store::{MemorySessionStore, SessionStore};
 pub use task_creation_store::TaskCreationStore;

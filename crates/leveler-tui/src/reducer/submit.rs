@@ -6,7 +6,7 @@ use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
 
 use super::overlay_keys::{
     apply_theme_id, open_checkpoint_picker, open_collab_picker, open_mode_picker,
-    open_model_picker, open_theme_picker, open_unsupported_media, open_work_mode_picker,
+    open_model_picker, open_theme_picker, open_unsupported_media,
 };
 use super::runtime_apply::start_turn;
 use super::screen_nav::{
@@ -417,12 +417,10 @@ pub(super) fn complete_file_mention(state: &mut AppState) {
 pub(super) fn request_file_candidates(state: &mut AppState) -> Vec<Effect> {
     if crate::screen::file_mention_query(state).is_some()
         && !state.file_index_requested
-        && !state.repository.is_empty()
+        && let Some(repository) = state.repository.clone()
     {
         state.file_index_requested = true;
-        vec![Effect::LoadFileCandidates {
-            repository: state.repository.clone(),
-        }]
+        vec![Effect::LoadFileCandidates { repository }]
     } else {
         Vec::new()
     }
@@ -515,7 +513,6 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         }
         "context" => open_context(state),
         "clean" => open_clean(state),
-        "work-mode" => set_work_mode(state, command),
         "collab" => set_collab_cmd(state, command),
         "memory" => memory_slash(state, command),
         "agents" => agents_slash(state, command),
@@ -688,8 +685,8 @@ fn build_export_markdown(state: &AppState) -> String {
     use crate::transcript::TranscriptItem;
     let mut out = String::from("# CodeLeveler 对话导出\n\n");
     out.push_str(&format!("- 会话: {}\n", state.session_id.as_str()));
-    if !state.repository.is_empty() {
-        out.push_str(&format!("- 项目: {}\n", state.repository));
+    if let Some(repository) = state.repository.as_deref() {
+        out.push_str(&format!("- 项目: {repository}\n"));
     }
     out.push('\n');
     for item in state.transcript.items() {
@@ -747,41 +744,6 @@ fn run_btw(state: &mut AppState, command: &str) -> Vec<Effect> {
     })]
 }
 
-fn set_work_mode(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let arg = command
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if arg.is_empty() {
-        open_work_mode_picker(state);
-        return Vec::new();
-    }
-    apply_work_profile(state, &arg)
-}
-
-pub(super) fn apply_work_profile(state: &mut AppState, arg: &str) -> Vec<Effect> {
-    // Only profiles with distinct runtime behavior are user-selectable. The
-    // legacy `delivery` value had none (it was identical to `balanced`).
-    if !matches!(arg, "economy" | "balanced") {
-        state.notification = Some(Notification {
-            level: NotificationLevel::Warning,
-            message: state.t().work_mode_usage.to_string(),
-        });
-        return Vec::new();
-    }
-    state.work_profile = arg.to_string();
-    state.notification = Some(Notification {
-        level: NotificationLevel::Info,
-        message: format!("work-mode → {arg}"),
-    });
-    vec![Effect::Send(ClientCommand::SetProductAxes {
-        session_id: state.session_id.clone(),
-        work_profile: state.work_profile.clone(),
-        collaboration: state.collaboration.clone(),
-    })]
-}
-
 fn set_collab_cmd(state: &mut AppState, command: &str) -> Vec<Effect> {
     let arg = command
         .split_whitespace()
@@ -818,30 +780,31 @@ pub(super) fn apply_collab(state: &mut AppState, collab: &str) -> Vec<Effect> {
     });
     vec![Effect::Send(ClientCommand::SetProductAxes {
         session_id: state.session_id.clone(),
-        work_profile: state.work_profile.clone(),
+        work_profile: "single".into(), // Legacy wire field; no product axis.
         collaboration: state.collaboration.clone(),
     })]
 }
 
 /// Expand `~/…` repository display paths for filesystem discovery.
-fn skill_root(state: &AppState) -> std::path::PathBuf {
-    if state.repository.is_empty() {
-        return leveler_core::environment().current_dir().to_path_buf();
-    }
-    let raw = state.repository.as_str();
+fn skill_root(state: &AppState) -> Option<std::path::PathBuf> {
+    let raw = state.repository.as_deref()?;
     if let Some(rest) = raw.strip_prefix("~/")
         && let Some(home) = leveler_core::environment()
             .var_os("HOME")
             .or_else(|| leveler_core::environment().var_os("USERPROFILE"))
     {
-        return std::path::PathBuf::from(home).join(rest);
+        return Some(std::path::PathBuf::from(home).join(rest));
     }
-    std::path::PathBuf::from(raw)
+    Some(std::path::PathBuf::from(raw))
 }
 
 /// Rescan project + user skills when the root changes (or first `$` keystroke).
 pub(super) fn refresh_skill_catalog(state: &mut AppState) {
-    let root = skill_root(state);
+    let Some(root) = skill_root(state) else {
+        state.skill_catalog.clear();
+        state.skill_catalog_root = None;
+        return;
+    };
     let key = root.display().to_string();
     if state.skill_catalog_root.as_deref() == Some(key.as_str()) {
         return;
@@ -859,8 +822,10 @@ pub(super) fn refresh_skill_catalog(state: &mut AppState) {
 /// entry. Read-only, and local: it reads the same registry `$name` and
 /// `load_skill` use, so the listing cannot drift from what loads.
 fn skills_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
-    let root = skill_root(state);
-    let registry = leveler_skills::describe(&root);
+    let registry = match skill_root(state) {
+        Some(root) => leveler_skills::describe(&root),
+        None => leveler_skills::SkillRegistry::load(&leveler_skills::SkillRoots::empty()),
+    };
     let name = command.strip_prefix("skills").unwrap_or(command).trim();
     let t = state.t();
     let note = if name.is_empty() {
@@ -1173,7 +1138,7 @@ fn clear_goal(state: &mut AppState) -> Vec<Effect> {
     if flipped_collab {
         effects.push(Effect::Send(ClientCommand::SetProductAxes {
             session_id: state.session_id.clone(),
-            work_profile: state.work_profile.clone(),
+            work_profile: "single".into(), // Legacy wire field; no product axis.
             collaboration: state.collaboration.clone(),
         }));
     }

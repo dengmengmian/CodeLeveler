@@ -197,6 +197,7 @@ async fn a_new_session_starts_on_the_persisted_default() {
         InProcessRuntimeClient::new(app.clone(), resolved, PermissionProfile::Assisted, false);
     let bootstrap = restarted
         .create_session(CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             goal: "restarted".to_string(),
             model: None,
             mode: WirePermissionProfile::Assisted,

@@ -12,8 +12,18 @@ use serde::{Deserialize, Serialize};
 /// `major` for a breaking wire change.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 12,
+    minor: 13,
 };
+
+/// Features explicitly supported by the peer. Absence means a legacy peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolCapability {
+    OptionalWorkspace,
+    #[serde(other)]
+    Unknown,
+}
 
 /// A semantic-ish protocol version. Same `major` = compatible; `minor` is
 /// forward/backward compatible within a major.
@@ -50,6 +60,8 @@ pub enum ProtocolError {
 pub struct ProtocolEnvelope<T> {
     pub protocol: ProtocolVersion,
     pub body: T,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<ProtocolCapability>,
 }
 
 impl<T> ProtocolEnvelope<T> {
@@ -58,6 +70,7 @@ impl<T> ProtocolEnvelope<T> {
         Self {
             protocol: PROTOCOL_VERSION,
             body,
+            capabilities: vec![ProtocolCapability::OptionalWorkspace],
         }
     }
 
@@ -93,6 +106,7 @@ mod tests {
         let env = ProtocolEnvelope {
             protocol: ProtocolVersion { major: 2, minor: 0 },
             body: ClientCommand::Quit,
+            capabilities: Vec::new(),
         };
         assert_eq!(
             env.into_body().unwrap_err(),
@@ -114,7 +128,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":12},"body":{"type":"quit"}}"#
+            r#"{"protocol":{"major":1,"minor":13},"body":{"type":"quit"},"capabilities":["optional_workspace"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

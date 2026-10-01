@@ -171,6 +171,8 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             hook_runner: leveler_execution::HookRunner::empty(std::path::PathBuf::from(".")),
             steering: None,
             allow_delegation: true,
+            allow_host_input: true,
+            capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
             develop_model: None,
         },
@@ -196,7 +198,7 @@ fn spec(h: &Harness, goal: &str) -> TaskSpec {
             limits: StepLimits::default(),
         },
         coding: leveler_agent::coding::CodingTaskSpec {
-            repository: h.dir.path().to_path_buf(),
+            repository: Some(h.dir.path().to_path_buf()),
             mode: PermissionProfile::Assisted,
             sandbox: false,
         },

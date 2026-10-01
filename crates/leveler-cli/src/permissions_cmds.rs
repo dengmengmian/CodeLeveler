@@ -32,12 +32,15 @@ pub(crate) fn cmd_permissions(
             println!();
             print_source("global", &global_path);
             print_source("project", &layout.permissions_path());
-            print_source("repo", &project_rules_path(&layout.repo_root));
+            print_source("repo", &project_rules_path(layout.require_workspace()?));
             // The repo file is trust-gated, so listing its rules without saying
             // whether they apply would misrepresent what is in force.
-            if !leveler_execution::untrusted_project_files(&global_home, &layout.repo_root)
-                .iter()
-                .any(|entry| entry.path.ends_with("permissions.yaml"))
+            if !leveler_execution::untrusted_project_files(
+                &global_home,
+                layout.require_workspace()?,
+            )
+            .iter()
+            .any(|entry| entry.path.ends_with("permissions.yaml"))
             {
                 return Ok(std::process::ExitCode::SUCCESS);
             }
@@ -52,7 +55,7 @@ pub(crate) fn cmd_permissions(
             let mut cleared = false;
             for path in [
                 layout.permissions_path(),
-                project_rules_path(&layout.repo_root),
+                project_rules_path(layout.require_workspace()?),
             ] {
                 let existed = path.is_file();
                 clear_rules_file(&path).map_err(anyhow::Error::msg)?;

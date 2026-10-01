@@ -98,7 +98,7 @@ pub(crate) async fn cmd_lsp(
         anyhow::bail!("language server `{}` is not installed", spec.program);
     }
 
-    let root = layout.repo_root.clone();
+    let root = layout.require_workspace()?.to_path_buf();
     let path = if file.is_absolute() {
         file.clone()
     } else {

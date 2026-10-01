@@ -35,6 +35,9 @@ pub struct WebFetchTool;
 
 #[async_trait]
 impl Tool for WebFetchTool {
+    fn requires_workspace(&self) -> bool {
+        false
+    }
     fn name(&self) -> &'static str {
         "web_fetch"
     }

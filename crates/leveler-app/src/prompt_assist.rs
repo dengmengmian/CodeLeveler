@@ -46,7 +46,7 @@ pub(crate) async fn generate(
 
     let context = if raw.messages.is_empty() {
         match kind {
-            AssistKind::PromptSuggestion => repository_context(&app.layout.repo_root)?,
+            AssistKind::PromptSuggestion => repository_context(app.layout.primary_workspace()?)?,
             AssistKind::AwaySummary => return None,
         }
     } else {

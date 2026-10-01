@@ -193,6 +193,8 @@ async fn fixture() -> Fixture {
             hook_runner: leveler_execution::HookRunner::empty(".".into()),
             steering: None,
             allow_delegation: true,
+            allow_host_input: true,
+            capabilities: None,
             independent_review: leveler_agent::coding::IndependentReviewPolicy::Off,
             develop_model: None,
         },
@@ -222,7 +224,7 @@ fn spec(fx: &Fixture) -> TaskSpec {
             },
         },
         coding: leveler_agent::coding::CodingTaskSpec {
-            repository: fx.dir.path().into(),
+            repository: Some(fx.dir.path().into()),
             mode: PermissionProfile::Assisted,
             sandbox: false,
         },

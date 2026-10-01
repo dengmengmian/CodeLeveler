@@ -830,7 +830,9 @@ fn a_reconnect_restores_the_running_clock_and_output() {
     let mut s = state();
     let mut snap = leveler_client_protocol::UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "/repo".into(),
+        repository: Some("/repo".into()),
+        task_status: None,
+        task_terminal: None,
         goal: "g".into(),
         model: None,
         mode: leveler_client_protocol::PermissionProfile::Assisted,

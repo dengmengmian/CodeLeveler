@@ -241,8 +241,14 @@ fn sandbox_first_verdicts() {
     assert_eq!(classify("rm", &["-rf"]), CommandClass::Dangerous);
     assert_eq!(classify("/usr/bin/sudo", &[]), CommandClass::Dangerous);
     assert_eq!(classify("curl", &["x"]), CommandClass::Safe);
-    assert_eq!(classify("git", &["push", "origin"]), CommandClass::Safe);
+    // Git is decided by EFFECT: a remote write is Dangerous even though the
+    // program name is not, while a metadata read is not.
+    assert_eq!(
+        classify("git", &["push", "origin"]),
+        CommandClass::Dangerous
+    );
     assert_eq!(classify("git", &["status"]), CommandClass::Safe);
+    assert_eq!(classify("git", &["fetch", "origin"]), CommandClass::Safe);
     assert_eq!(classify("cargo", &["test"]), CommandClass::Safe);
     assert_eq!(classify("ls", &[]), CommandClass::Safe);
     assert_eq!(classify("brew", &["install"]), CommandClass::Safe);
@@ -353,7 +359,11 @@ fn assisted_still_auto_runs_ordinary_commands() {
     for (program, args) in [
         ("cargo", vec!["test"]),
         ("sh", vec!["-c", "ls -la && git status"]),
-        ("git", vec!["push"]),
+        // A repository sync writes only fetched metadata: not an authority
+        // question under a profile that already grants the network and the
+        // workspace. `git push` is asserted in its own test.
+        ("git", vec!["fetch", "origin"]),
+        ("git", vec!["commit", "-m", "x"]),
     ] {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         let requirement = policy.evaluate(

@@ -163,6 +163,27 @@ impl Executor {
         session_approved: &mut HashSet<String>,
         cancellation: &CancellationToken,
     ) -> Result<AdmittedCall, AdmitError> {
+        if ctx.execution.workspace.is_none()
+            && self
+                .registry
+                .get(&call.name)
+                .is_some_and(|tool| tool.requires_workspace())
+        {
+            return Err(AdmitError::Refused {
+                reason: "tool requires a primary workspace; no workspace is attached".into(),
+                call,
+            });
+        }
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|state| !state.permits_tool(&call.name))
+        {
+            return Err(AdmitError::Refused {
+                reason: format!("tool {} capability is not exposed", call.name),
+                call,
+            });
+        }
         if self.registry.runs_command(&call.name) || self.registry.mutates_files(&call.name) {
             let lease = tokio::select! {
                 lease = ctx.execution.command_gate.clone().lock_owned() => lease,
@@ -354,7 +375,46 @@ impl Executor {
         ctx: &ToolContext,
         cancellation: &CancellationToken,
     ) -> PolicyResolution {
-        let write = ctx.write_scope();
+        // Extract command for run_command / shell_command so the policy can
+        // classify it. shell_command uses a platform wrapper for classification
+        // but permission rules match the raw `cmd` string.
+        let (program, args) = extract_command(call);
+        let command_view = program.as_ref().map(|p| CommandView {
+            program: p,
+            args: &args,
+        });
+        let command_line = command_line_for_match(call, program.as_deref(), &args);
+
+        // Git states its own mechanical effects from argv. Two things follow
+        // from that ONE parse, so they can never drift apart: which repository
+        // metadata capability the call runs with (the same answer whether it
+        // was auto-allowed, matched a standing rule, or was just approved),
+        // and what a prompt has to say about it. The permission VERDICT itself
+        // stays the policy's job (`classify_command`).
+        let git_effects = program.as_deref().map(|program| {
+            let executed = leveler_execution::executed_commands(program, &args);
+            executed.git_effects()
+        });
+        // A Git invocation that writes repository metadata runs with the
+        // repository's `.git` unsealed. That is a mechanical REQUIREMENT of the
+        // effect, not an authority question by itself — the verdict above still
+        // decides whether a person is asked, and ownership-narrowed scopes
+        // (`None`, `ScopedWorkspace`) are never widened.
+        let write = match (&git_effects, ctx.write_scope()) {
+            (Some(git), WriteScope::Workspace { root }) if git.needs_repository_write_scope() => {
+                WriteScope::WorkspaceWithGit { root }
+            }
+            (_, scope) => scope,
+        };
+        if let Some(git) = git_effects.as_ref().filter(|git| git.any_git) {
+            tracing::debug!(
+                tool = %call.name,
+                command = command_line.as_deref().unwrap_or(""),
+                capabilities = ?git.capabilities(),
+                unsealed_repository_metadata = git.needs_repository_write_scope(),
+                "git capability resolution"
+            );
+        }
         let network_allowed = !ctx.policy.network_denied();
         // Denied only because the profile does not reach the network by
         // default (请求批准), not by the run itself: a user approval of a call
@@ -432,16 +492,6 @@ impl Executor {
                 call.name
             ));
         }
-
-        // Extract command for run_command / shell_command so the policy can
-        // classify it. shell_command uses a platform wrapper for classification
-        // but permission rules match the raw `cmd` string.
-        let (program, args) = extract_command(call);
-        let command_view = program.as_ref().map(|p| CommandView {
-            program: p,
-            args: &args,
-        });
-        let command_line = command_line_for_match(call, program.as_deref(), &args);
 
         // CodeLeveler's own consent surface is not a capability the agent
         // holds. `leveler memory accept|reject|remember|forget` IS the human
@@ -560,6 +610,9 @@ impl Executor {
                 // say. "<tool> requested by the model" is filler, and filler in
                 // a decision prompt trains people to stop reading it.
                 let mut notes = Vec::new();
+                if let Some(git) = git_effects.as_ref().filter(|git| git.any_git) {
+                    notes.push(crate::authorization::git_capability_note(git));
+                }
                 if call_needs_host_escape(call) {
                     notes.push(format!("{} 会打开工作区之外的应用或文件", call.name));
                 }
@@ -585,7 +638,7 @@ impl Executor {
                         command: command_line.clone(),
                         paths: rule_paths,
                     },
-                    signature: approval_signature(&call.name, program.as_deref(), &args),
+                    signature: approval_signature(call),
                     write,
                     network_allowed,
                     command_line,
@@ -1638,8 +1691,8 @@ mod authorize_tests {
                 .unwrap();
         assert_eq!(set.rules().len(), 1);
         assert_eq!(
-            set.rules()[0].match_.command_prefix.as_deref(),
-            Some("rm -rf")
+            set.rules()[0].match_.command_exact.as_deref(),
+            Some("rm -rf scratch")
         );
 
         // A fresh session set is auto-allowed by the live rule set — the
@@ -1650,6 +1703,18 @@ mod authorize_tests {
             .await
             .unwrap();
         assert_eq!(approver.asks(), 1);
+
+        let mut changed = rm_rf_call();
+        changed.arguments["args"] = serde_json::json!(["-rf", "other"]);
+        executor
+            .authorize(&changed, &mut fresh_session)
+            .await
+            .unwrap();
+        assert_eq!(
+            approver.asks(),
+            2,
+            "a different deletion target needs a fresh approval"
+        );
     }
 
     #[tokio::test]
@@ -2134,7 +2199,7 @@ mod authorize_tests {
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
         let exec = executor_for(dir.path(), approver.clone());
         let ctx = exec.tool_context.clone();
-        let root = ctx.execution.workspace.root().to_path_buf();
+        let root = ctx.require_workspace().unwrap().root().to_path_buf();
 
         match exec
             .resolve_policy(&grep_call(), &ctx, &CancellationToken::new())
@@ -2170,7 +2235,7 @@ mod authorize_tests {
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
         let exec = executor_sharing(dir.path(), &profile, approver);
         let ctx = exec.tool_context.clone();
-        let root = ctx.execution.workspace.root().to_path_buf();
+        let root = ctx.require_workspace().unwrap().root().to_path_buf();
         let admitted = exec
             .admit(
                 grep_call(),
@@ -2206,7 +2271,7 @@ mod authorize_tests {
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveSession));
         let exec = executor_for(dir.path(), approver.clone());
         let ctx = exec.tool_context.clone();
-        let root = ctx.execution.workspace.root().to_path_buf();
+        let root = ctx.require_workspace().unwrap().root().to_path_buf();
         let mut session = HashSet::new();
         let first = exec
             .admit(

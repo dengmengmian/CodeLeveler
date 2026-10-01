@@ -80,7 +80,9 @@ fn opened(goal: &str) -> AppState {
     );
     let snap = UiSessionSnapshot {
         id: SessionId::new("uxexp"),
-        repository: "~/Develop/navsvc".into(),
+        repository: Some("~/Develop/navsvc".into()),
+        task_status: None,
+        task_terminal: None,
         goal: goal.into(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/deepseek-flash"),
         mode: PermissionProfile::Assisted,

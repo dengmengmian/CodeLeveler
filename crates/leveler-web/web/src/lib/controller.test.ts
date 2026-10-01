@@ -83,34 +83,32 @@ function harness(): Harness {
 }
 
 describe('product axes commands', () => {
-  it('setAxes sends set_product_axes (the real protocol variant)', () => {
+  it('setCollaboration sends set_product_axes (the real protocol variant)', () => {
     const { bridge, sent, state } = harness();
-    bridge.setAxes('economy', 'goal');
+    bridge.setCollaboration('goal');
     expect(sent).toHaveLength(1);
     expect(sent[0]).toEqual({
       type: 'set_product_axes',
       session_id: 's1',
-      work_profile: 'economy',
+      work_profile: 'single',
       collaboration: 'goal',
     });
-    expect(state.current?.workProfile).toBe('economy');
     expect(state.current?.collaboration).toBe('goal');
   });
 
   it('axes cannot change mid-turn (idle-only, TUI parity)', () => {
     const { bridge, sent, state } = harness();
     reducer(state, { type: 'turn_active', value: true });
-    bridge.setAxes('economy', 'chat');
+    bridge.setCollaboration('chat');
     expect(sent).toHaveLength(0);
-    expect(state.current?.workProfile).toBe('balanced');
   });
 
-  it('slash /work-mode and /collab drive the axes', () => {
+  it('retired work-mode is not a command; collab alone changes collaboration', () => {
     const { bridge, sent } = harness();
     bridge.runSlash('/work-mode economy');
     bridge.runSlash('/collab goal');
-    expect(sent.map((c) => c.type)).toEqual(['set_product_axes', 'set_product_axes']);
-    expect(sent[1]).toMatchObject({ work_profile: 'economy', collaboration: 'goal' });
+    expect(sent.map((c) => c.type)).toEqual(['set_product_axes']);
+    expect(sent[0]).toMatchObject({ work_profile: 'single', collaboration: 'goal' });
   });
 
   it('the retired delivery profile is rejected, not applied', () => {
@@ -503,7 +501,6 @@ describe('session_updated vs session_opened', () => {
     expect(state.current?.tools).toHaveLength(1);
     expect(state.current?.tools[0]?.status).toBe('done');
     expect(state.current?.permission).toBe('full_access');
-    expect(state.current?.workProfile).toBe('economy');
     expect(state.current?.collaboration).toBe('goal');
   });
 

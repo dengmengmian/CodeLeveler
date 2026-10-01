@@ -30,7 +30,7 @@ pub(crate) fn cmd_trust(
     cmd: Option<TrustCommand>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let home = leveler_home();
-    let repo = layout.repo_root.clone();
+    let repo = layout.require_workspace()?.to_path_buf();
 
     match cmd {
         Some(TrustCommand::Revoke) => {

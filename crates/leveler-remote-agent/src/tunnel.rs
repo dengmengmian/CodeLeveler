@@ -646,6 +646,7 @@ fn forwards_to_device(event: &leveler_client_protocol::RuntimeEvent) -> bool {
     !matches!(
         event,
         leveler_client_protocol::RuntimeEvent::SessionHistoryLoaded { .. }
+            | leveler_client_protocol::RuntimeEvent::GlobalTasksLoaded { .. }
     )
 }
 
@@ -664,6 +665,11 @@ mod downstream_filter_tests {
             session_id: SessionId::new("s1"),
             entries: Vec::new(),
             omitted_turns: 0,
+        }));
+        assert!(!forwards_to_device(&RuntimeEvent::GlobalTasksLoaded {
+            requester_session_id: SessionId::new("s1"),
+            query_id: "global".into(),
+            index: Default::default(),
         }));
         assert!(forwards_to_device(&RuntimeEvent::TurnAnswered));
     }

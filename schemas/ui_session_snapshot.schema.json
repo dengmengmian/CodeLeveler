@@ -8,7 +8,6 @@
     "id",
     "messages",
     "mode",
-    "repository",
     "status"
   ],
   "properties": {
@@ -50,14 +49,14 @@
       }
     },
     "children": {
-      "description": "Every delegated child of this session, oldest first, from the durable record. Additive: absent on old runtimes.",
+      "description": "Every delegated child of this session, oldest first, from durable storage.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/UiChildAgent"
       }
     },
     "collaboration": {
-      "description": "Product collaboration axis (`chat | plan | goal`). Same contract as `work_profile` — the runtime routes submits (goal) and restricts tools (plan) from this value, so clients must not invent it.",
+      "description": "Product collaboration axis (`chat | plan | goal`). The runtime routes submissions and applies the read-only planning overlay from this value.",
       "type": [
         "string",
         "null"
@@ -169,11 +168,34 @@
       }
     },
     "repository": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "status": {
       "description": "Persisted status string (e.g. \"running\", \"completed\").",
       "type": "string"
+    },
+    "task_status": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiTaskStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "task_terminal": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiTaskTerminal"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "user_shells": {
       "description": "User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block.",
@@ -189,7 +211,7 @@
       "type": "boolean"
     },
     "work_profile": {
-      "description": "Product work-profile axis (`economy | balanced`; legacy `delivery` reads as `balanced`). The source of truth is the session record (`SetProductAxes`); carried here so a reconnecting client shows the axis the runtime will actually use instead of a stale local guess. Absent on old runtimes.",
+      "description": "Deprecated compatibility field. New runtimes emit `single`; historical values never control tool exposure. Clients must not display a selector.",
       "type": [
         "string",
         "null"
@@ -386,6 +408,15 @@
           "description": "Runtime-observed age at snapshot time.",
           "type": "integer",
           "format": "uint64",
+          "minimum": 0.0
+        },
+        "pid": {
+          "description": "The process-group leader's OS pid, when known. Additive; older clients decode it as absent.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
           "minimum": 0.0
         },
         "program": {
@@ -1135,6 +1166,58 @@
         "system",
         "tool"
       ]
+    },
+    "UiTaskStatus": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "running",
+        "waiting_user",
+        "answered",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "unknown",
+        "blocked",
+        "incomplete"
+      ]
+    },
+    "UiTaskTerminal": {
+      "description": "Latest committed TaskFinished fact. This does not prove a later turn settled.",
+      "type": "object",
+      "required": [
+        "outcome",
+        "sequence",
+        "warnings"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "stop": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     },
     "UiUserShell": {
       "description": "One user shell execution (`!command`) as the reconnect snapshot carries it: the active one plus a bounded recent history. `output_tail` is the bounded end of the combined output (never the full log).",

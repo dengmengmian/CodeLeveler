@@ -128,7 +128,7 @@ pub(crate) fn summaries(state: &AppState) -> Vec<ActivitySummary> {
         let secondary = if !child.purpose.is_empty() {
             Some(crate::multi_agent::name_the_workspace(
                 &child.purpose,
-                &state.repository,
+                state.repository.as_deref().unwrap_or(""),
             ))
         } else {
             child.recent_step.clone()
@@ -455,22 +455,15 @@ pub(crate) fn selected_list_task(state: &AppState) -> Option<String> {
 pub(crate) fn open_background_list(state: &mut AppState) {
     acknowledge_failures(state);
     ensure_list_selection(state);
+    state.background_list_focus = BackgroundPane::List;
     state.active_screen = crate::screen::Screen::ActivityList;
     state.screen_scroll = 0;
 }
 
 pub(crate) fn close_background_list(state: &mut AppState) {
     state.active_screen = crate::screen::Screen::Conversation;
+    state.background_list_focus = BackgroundPane::List;
     state.screen_scroll = 0;
-}
-
-/// Open the selected list row's detail page.
-pub(crate) fn open_list_selected(state: &mut AppState) -> Vec<crate::action::Effect> {
-    ensure_list_selection(state);
-    let Some(id) = selected_list_task(state) else {
-        return Vec::new();
-    };
-    open(state, ActivityId::Background(id))
 }
 
 /// Status-strip activity lines and the summary index each line belongs to.
@@ -597,6 +590,17 @@ pub(crate) fn close(state: &mut AppState) {
     state.activity_view = ActivityView::default();
 }
 
+/// Which pane owns ↑/↓ on the Background Tasks page. A page-local focus, not
+/// a workbench region: it never affects the main conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundPane {
+    /// The task list: ↑/↓ moves the selection.
+    #[default]
+    List,
+    /// The selected task's live output: ↑/↓ scrolls the log.
+    Output,
+}
+
 /// The Activity Detail viewport. Mirrors the conversation viewport's follow
 /// semantics: auto-follow sticks to the newest output, scrolling back pauses
 /// it and counts what arrived, and jumping to the bottom resumes.
@@ -633,8 +637,13 @@ impl Default for ActivityView {
 /// reading back. Called by the renderer, which is the only place the content
 /// height is known. Returns true when a repaint is due.
 pub(crate) fn sync_view(state: &mut AppState, total: usize, height: usize) -> bool {
+    sync_view_inner(&mut state.activity_view, total, height)
+}
+
+/// The shared follow/scroll bookkeeping, applied to whichever view owns the
+/// output being measured (the Activity Detail or one background task).
+fn sync_view_inner(view: &mut ActivityView, total: usize, height: usize) -> bool {
     let max_scroll = total.saturating_sub(height);
-    let view = &mut state.activity_view;
     let mut changed = false;
     if view.viewport_height != height {
         view.viewport_height = height;
@@ -664,10 +673,9 @@ pub(crate) fn sync_view(state: &mut AppState, total: usize, height: usize) -> bo
     changed
 }
 
-/// Scroll the Activity Detail by `delta` lines (negative = up). Scrolling up
-/// leaves follow; reaching the bottom resumes it and clears the unread count.
-pub(crate) fn scroll_lines(state: &mut AppState, delta: isize) {
-    let view = &mut state.activity_view;
+/// Scroll a view by `delta` lines (negative = up). Scrolling up leaves follow;
+/// reaching the bottom resumes it and clears the unread count.
+fn scroll_view(view: &mut ActivityView, delta: isize) {
     if delta < 0 {
         view.follow = false;
         view.scroll = view
@@ -681,6 +689,11 @@ pub(crate) fn scroll_lines(state: &mut AppState, delta: isize) {
             view.unread = 0;
         }
     }
+}
+
+/// Scroll the Activity Detail by `delta` lines (negative = up).
+pub(crate) fn scroll_lines(state: &mut AppState, delta: isize) {
+    scroll_view(&mut state.activity_view, delta);
 }
 
 /// Page the Activity Detail. Empty viewports still advance by one row so a
@@ -701,6 +714,94 @@ pub(crate) fn to_bottom(state: &mut AppState) {
     state.activity_view.follow = true;
     state.activity_view.unread = 0;
     state.activity_view.scroll = state.activity_view.max_scroll;
+}
+
+/// The per-task log viewport for a background task. A task the page has never
+/// measured reads as a fresh following view, so it never inherits another
+/// task's scroll position.
+pub(crate) fn background_task_view(state: &AppState, id: &str) -> ActivityView {
+    state
+        .background_task_views
+        .get(id)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// The selected background task's log viewport, created on first use.
+pub(crate) fn background_task_view_mut<'a>(
+    state: &'a mut AppState,
+    id: &str,
+) -> &'a mut ActivityView {
+    state
+        .background_task_views
+        .entry(id.to_string())
+        .or_default()
+}
+
+/// Publish the measured geometry for one background task's log pane. Returns
+/// true when a repaint is due.
+pub(crate) fn sync_background_task_view(
+    state: &mut AppState,
+    id: &str,
+    total: usize,
+    height: usize,
+) -> bool {
+    let view = background_task_view_mut(state, id);
+    sync_view_inner(view, total, height)
+}
+
+/// Scroll the selected background task's output. Only valid while the Output
+/// pane owns the keys.
+pub(crate) fn scroll_selected_output(state: &mut AppState, delta: isize) {
+    let Some(id) = state.background_list_selected.clone() else {
+        return;
+    };
+    let view = background_task_view_mut(state, &id);
+    scroll_view(view, delta);
+}
+
+pub(crate) fn page_selected_output(state: &mut AppState, direction: isize) {
+    let Some(id) = state.background_list_selected.clone() else {
+        return;
+    };
+    let view = background_task_view_mut(state, &id);
+    let page = view.viewport_height.saturating_sub(1).max(1);
+    scroll_view(view, direction * page as isize);
+}
+
+pub(crate) fn top_selected_output(state: &mut AppState) {
+    let Some(id) = state.background_list_selected.clone() else {
+        return;
+    };
+    let view = background_task_view_mut(state, &id);
+    view.follow = false;
+    view.scroll = 0;
+}
+
+pub(crate) fn bottom_selected_output(state: &mut AppState) {
+    let Some(id) = state.background_list_selected.clone() else {
+        return;
+    };
+    let view = background_task_view_mut(state, &id);
+    view.follow = true;
+    view.unread = 0;
+    view.scroll = view.max_scroll;
+}
+
+/// Move the page focus between the task list and the selected task's output.
+pub(crate) fn toggle_background_focus(state: &mut AppState) {
+    state.background_list_focus = match state.background_list_focus {
+        BackgroundPane::List => BackgroundPane::Output,
+        BackgroundPane::Output => BackgroundPane::List,
+    };
+}
+
+pub(crate) fn focus_background_output(state: &mut AppState) {
+    state.background_list_focus = BackgroundPane::Output;
+}
+
+pub(crate) fn focus_background_list(state: &mut AppState) {
+    state.background_list_focus = BackgroundPane::List;
 }
 
 /// Cap on terminal background tasks kept reopenable. Live tasks are bounded
@@ -729,6 +830,7 @@ pub(crate) fn bound_terminal_background(state: &mut AppState) {
     for (id, _) in terminal.into_iter().take(excess) {
         state.background_task_labels.remove(&id);
         state.background_failures_seen.remove(&id);
+        state.background_task_views.remove(&id);
         if matches!(&state.background_list_selected, Some(sel) if sel == &id) {
             state.background_list_selected = None;
         }
@@ -868,7 +970,8 @@ mod tests {
     #[test]
     fn a_child_row_spends_its_width_on_the_reason_not_the_repo_path() {
         let mut state = test_state();
-        state.repository = "/private/tmp/agent-501/-Users-example-long-scratch/example-etl".into();
+        state.repository =
+            Some("/private/tmp/agent-501/-Users-example-long-scratch/example-etl".into());
         state.elapsed_secs = 10;
         state.team.apply_update(crate::multi_agent::ChildUpdate {
             id: "c1".into(),
@@ -1127,6 +1230,8 @@ second line ignored"
                 stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(1000),
+                pid: None,
+                last_output_at: None,
                 output: String::new(),
             },
         );
@@ -1490,6 +1595,8 @@ second line ignored"
                 stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(8_000),
+                pid: None,
+                last_output_at: None,
                 output: "test result: ok\n".into(),
             },
         );
@@ -1521,6 +1628,8 @@ second line ignored"
                 stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(1_000),
+                pid: None,
+                last_output_at: None,
                 output: String::new(),
             },
         );
@@ -1549,6 +1658,8 @@ second line ignored"
                     stopped: false,
                     exit_code: Some(0),
                     duration_ms: Some(1_000),
+                    pid: None,
+                    last_output_at: None,
                     output: String::new(),
                 },
             );
@@ -1580,6 +1691,8 @@ second line ignored"
             stopped,
             exit_code: if ok { Some(0) } else { Some(1) },
             duration_ms: Some(ms),
+            pid: None,
+            last_output_at: None,
             output: String::new(),
         }
     }

@@ -50,6 +50,20 @@ fn spawn_call(background: bool) -> MockResponse {
     ])
 }
 
+/// The model must ask for the delegation capability before `spawn_agent` is
+/// exposed; a fresh goal starts with no optional pack loaded.
+fn capability_enable_call(id: &str) -> MockResponse {
+    let arguments = serde_json::json!({ "action": "enable", "id": id });
+    sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call-capability",
+            "function": {"name": "capability", "arguments": arguments.to_string()}
+        }]}}]})
+        .to_string(),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+    ])
+}
+
 fn text(content: &str) -> MockResponse {
     sse(vec![
         serde_json::json!({"choices": [{"delta": {"content": content}, "finish_reason": "stop"}]})
@@ -150,6 +164,7 @@ async fn next_child_event(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_stops_a_running_foreground_child() {
     let (_tmp, _server, client, session) = client_with(vec![
+        capability_enable_call("multi_agent"),
         spawn_call(false),
         // The child's first model call: silent long enough that only a
         // cancel can end it inside the test's deadline.

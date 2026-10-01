@@ -38,7 +38,6 @@ function session(over: Partial<SessionView> = {}): SessionView {
     model: null,
     availableModels: [],
     permission: 'assisted',
-    workProfile: 'balanced',
     collaboration: 'chat',
     reasoningEffort: null,
     tokens: { input: 0, output: 0 },

@@ -84,7 +84,9 @@ fn state() -> AppState {
 fn snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "/repo".to_string(),
+        repository: Some("/repo".to_string()),
+        task_status: None,
+        task_terminal: None,
         goal: "interactive session".to_string(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: PermissionProfile::Assisted,
@@ -167,9 +169,35 @@ fn session_opened_sets_labels_without_welcome_card() {
 }
 
 #[test]
+fn session_opened_workspace_some_then_none_clears_repository_and_file_candidates() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot(),
+        }),
+    );
+    assert_eq!(s.repository.as_deref(), Some("/repo"));
+    s.file_candidates.push("old.rs".into());
+    let mut no_workspace = snapshot();
+    no_workspace.repository = None;
+    no_workspace.branch = None;
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: no_workspace,
+        }),
+    );
+    assert_eq!(s.repository, None);
+    assert_eq!(s.branch, None);
+    assert!(s.file_candidates.is_empty());
+}
+
+#[test]
 fn session_updated_adopts_product_axes_from_snapshot() {
     let mut s = state();
-    // Boot defaults are balanced/chat; the runtime (session record) says
+    // Collaboration comes from the runtime; legacy work_profile is ignored.
+    // The runtime session record says
     // otherwise — the snapshot value must win over the local guess.
     let mut snap = snapshot();
     snap.work_profile = Some("delivery".into());
@@ -178,7 +206,6 @@ fn session_updated_adopts_product_axes_from_snapshot() {
         &mut s,
         Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
     );
-    assert_eq!(s.work_profile, "delivery");
     assert_eq!(s.collaboration, "goal");
 
     // An old runtime without the fields must NOT clobber the local state.
@@ -188,7 +215,6 @@ fn session_updated_adopts_product_axes_from_snapshot() {
             session: snapshot(),
         }),
     );
-    assert_eq!(s.work_profile, "delivery");
     assert_eq!(s.collaboration, "goal");
 }
 
@@ -3224,6 +3250,8 @@ fn tools_screen_navigates_and_esc_returns() {
 
 fn summary(id: &str, goal: &str) -> leveler_client_protocol::UiSessionSummary {
     leveler_client_protocol::UiSessionSummary {
+        task_status: None,
+        task_terminal: None,
         id: SessionId::new(id),
         goal: goal.into(),
         status: "completed".into(),
@@ -4311,88 +4339,20 @@ fn memory_updated_event_keeps_the_plain_updated_label() {
 }
 
 #[test]
-fn slash_work_mode_sends_product_axes() {
-    let mut s = opened();
-    // Default collaboration is chat; /work-mode only changes the work profile.
-    assert_eq!(s.collaboration, "chat");
-    typed(&mut s, "/work-mode economy");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.work_profile, "economy");
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Send(ClientCommand::SetProductAxes {
-                work_profile,
-                collaboration,
-                ..
-            }) if work_profile == "economy" && collaboration == "chat"
-        )),
-        "effects={effects:?}"
-    );
-}
-
-/// `delivery` has no runtime behavior distinct from `balanced`; it is no longer
-/// a user-selectable value, and typing it must not silently apply something.
-#[test]
-fn slash_work_mode_rejects_delivery() {
-    let mut s = opened();
-    typed(&mut s, "/work-mode delivery");
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert!(effects.is_empty(), "effects={effects:?}");
-    assert_eq!(s.work_profile, "balanced", "delivery must not be applied");
-}
-
-#[test]
-fn bare_work_mode_opens_picker_on_current_value() {
-    let mut s = opened();
-    assert_eq!(s.work_profile, "balanced");
-    typed(&mut s, "/work-mode");
-    reduce(&mut s, key(KeyCode::Enter));
-    let Some(Overlay::WorkModePicker(model)) = &s.overlay else {
-        panic!(
-            "bare /work-mode must open the shared picker, got {:?}",
-            s.overlay
+fn retired_work_mode_commands_do_not_change_session_axes_or_open_a_picker() {
+    for command in ["/work-mode", "/work-mode economy", "/work_mode balanced"] {
+        let mut s = opened();
+        typed(&mut s, command);
+        let effects = reduce(&mut s, key(KeyCode::Enter));
+        assert!(s.overlay.is_none(), "{command}");
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send(ClientCommand::SetProductAxes { .. }))),
+            "{command}: {effects:?}"
         );
-    };
-    let focused = model
-        .visible_rows()
-        .into_iter()
-        .find(|(_, _, on)| *on)
-        .map(|(_, o, _)| o.key.as_str());
-    assert_eq!(focused, Some("balanced"));
-}
-
-#[test]
-fn work_mode_picker_enter_applies_and_updates_state() {
-    let mut s = opened();
-    typed(&mut s, "/work-mode");
-    reduce(&mut s, key(KeyCode::Enter));
-    // Options: balanced, economy — Down once lands on economy.
-    reduce(&mut s, key(KeyCode::Down));
-    let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.work_profile, "economy");
-    assert!(s.overlay.is_none());
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Send(ClientCommand::SetProductAxes {
-                work_profile,
-                ..
-            }) if work_profile == "economy"
-        )),
-        "effects={effects:?}"
-    );
-}
-
-#[test]
-fn work_mode_picker_esc_returns_to_input() {
-    let mut s = opened();
-    typed(&mut s, "/work-mode");
-    reduce(&mut s, key(KeyCode::Enter));
-    assert!(matches!(s.overlay, Some(Overlay::WorkModePicker(_))));
-    reduce(&mut s, key(KeyCode::Esc));
-    assert!(s.overlay.is_none());
-    assert_eq!(s.work_profile, "balanced", "Esc must not apply a mode");
+        assert_eq!(s.collaboration, "chat");
+    }
 }
 
 #[test]
@@ -5116,6 +5076,7 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
             task_id: "bg-7f3a".into(),
             program: "cargo".into(),
             args: vec!["test".into(), "-p".into(), "leveler-tui".into()],
+            pid: None,
         }),
     );
     let msg = s.notification.as_ref().unwrap().message.clone();
@@ -5132,6 +5093,7 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
             task_id: "bg-91c2".into(),
             program: "npm".into(),
             args: vec!["run".into(), "dev".into()],
+            pid: None,
         }),
     );
     reduce(
@@ -5222,6 +5184,7 @@ fn background_output_streams_into_the_task_projection() {
             task_id: "bg-out".into(),
             program: "make".into(),
             args: vec!["up".into()],
+            pid: None,
         }),
     );
     for chunk in ["[+] Building web\n", "server listening on :3000\n"] {
@@ -5280,6 +5243,7 @@ fn x_on_a_running_background_detail_cancels_that_task_only() {
             task_id: "bg-2".into(),
             program: "cargo".into(),
             args: vec!["test".into()],
+            pid: None,
         }),
     );
     s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
@@ -5321,6 +5285,7 @@ fn a_finished_background_task_keeps_its_detail_and_reopens_from_the_row() {
             task_id: "bg-2".into(),
             program: "cargo".into(),
             args: vec!["test".into(), "--workspace".into()],
+            pid: None,
         }),
     );
     s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
@@ -5375,15 +5340,18 @@ fn a_finished_background_task_keeps_its_detail_and_reopens_from_the_row() {
         "opening the list sends nothing: {effects:?}"
     );
     assert_eq!(s.active_screen, Screen::ActivityList);
-    // Only one task exists, so it is selected; Enter opens its detail.
+    // Only one task exists, so it is selected; Enter focuses its live log.
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(
         effects.is_empty(),
-        "opening a finished task sends nothing: {effects:?}"
+        "focusing a finished task's log sends nothing: {effects:?}"
     );
-    assert_eq!(s.active_screen, Screen::Activity);
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    assert_eq!(
+        s.background_list_focus,
+        leveler_tui::activity::BackgroundPane::Output
+    );
     let frame = render_screen_text(&mut s);
-    assert!(frame.contains("Background Task"), "{frame}");
     assert!(frame.contains("test result: ok"), "{frame}");
 }
 
@@ -5396,6 +5364,7 @@ fn activity_enter_opens_detail_and_esc_closes_without_cancel() {
             task_id: "bg-2".into(),
             program: "cargo".into(),
             args: vec!["test".into(), "--workspace".into()],
+            pid: None,
         }),
     );
     reduce(&mut s, key(KeyCode::Tab));
@@ -5414,22 +5383,31 @@ fn activity_enter_opens_detail_and_esc_closes_without_cancel() {
         "Enter must not cancel: {effects:?}"
     );
     let effects = reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.active_screen, Screen::Activity);
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    assert_eq!(
+        s.background_list_focus,
+        leveler_tui::activity::BackgroundPane::Output
+    );
     assert!(
         effects.is_empty(),
-        "opening a background detail sends nothing: {effects:?}"
+        "focusing a background log sends nothing: {effects:?}"
     );
+    // First Esc leaves the log, the second closes the page; neither cancels.
     let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(
+        s.background_list_focus,
+        leveler_tui::activity::BackgroundPane::List
+    );
+    assert!(
+        effects.is_empty(),
+        "Esc back to the list sends no command: {effects:?}"
+    );
+    reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
-    assert!(s.activity_open.is_none());
     assert!(
         s.background_task_labels
             .get("bg-2")
             .is_some_and(|c| c.is_running())
-    );
-    assert!(
-        effects.is_empty(),
-        "Esc close sends no command: {effects:?}"
     );
 }
 
@@ -5449,6 +5427,7 @@ fn the_background_list_acknowledges_failures_and_keeps_history() {
                 task_id: id.into(),
                 program: program.into(),
                 args: args.into_iter().map(String::from).collect(),
+                pid: None,
             }),
         );
     }
@@ -5502,6 +5481,7 @@ fn x_in_the_background_list_stops_only_the_selected_running_task() {
                 task_id: id.into(),
                 program: "npm".into(),
                 args: vec!["start".into()],
+                pid: None,
             }),
         );
     }
@@ -5550,6 +5530,7 @@ fn a_stopped_background_task_is_shown_as_stopped_not_failed() {
             task_id: "bg-1".into(),
             program: "npm".into(),
             args: vec!["start".into()],
+            pid: None,
         }),
     );
     // A kill reads `ok: false` but `stopped: true` in the runtime's authority.
@@ -6711,7 +6692,7 @@ fn slash_skill_name_is_not_a_command() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
-    s.repository = dir.path().display().to_string();
+    s.repository = Some(dir.path().display().to_string());
 
     typed(&mut s, "/code");
     assert!(
@@ -6731,7 +6712,7 @@ fn dollar_popup_lists_skills_and_tab_completes_the_mention() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
-    s.repository = dir.path().display().to_string();
+    s.repository = Some(dir.path().display().to_string());
 
     typed(&mut s, "请 $code");
     let matches = leveler_tui::screen::visible_skill_popup(&s);
@@ -6761,7 +6742,7 @@ fn dollar_popup_enter_completes_instead_of_sending() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
-    s.repository = dir.path().display().to_string();
+    s.repository = Some(dir.path().display().to_string());
 
     typed(&mut s, "$code");
     let effects = reduce(&mut s, key(KeyCode::Enter));
@@ -6786,7 +6767,7 @@ fn dollar_without_a_matching_skill_shows_no_popup() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
-    s.repository = dir.path().display().to_string();
+    s.repository = Some(dir.path().display().to_string());
 
     typed(&mut s, "costs $100");
     assert!(leveler_tui::screen::visible_skill_popup(&s).is_empty());
@@ -6798,7 +6779,7 @@ fn dollar_in_a_shell_escape_is_not_a_skill_mention() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "code-review", "Review the change");
     let mut s = opened();
-    s.repository = dir.path().display().to_string();
+    s.repository = Some(dir.path().display().to_string());
 
     typed(&mut s, "!echo $");
     assert!(leveler_tui::screen::visible_skill_popup(&s).is_empty());
@@ -6819,7 +6800,7 @@ fn a_skill_named_like_a_builtin_keeps_both() {
     let dir = tempfile::tempdir().unwrap();
     write_project_skill(dir.path(), "help", "Project help skill");
     let mut s = opened();
-    s.repository = dir.path().display().to_string();
+    s.repository = Some(dir.path().display().to_string());
 
     typed(&mut s, "$hel");
     assert!(
@@ -9047,7 +9028,7 @@ fn slash_skills_reads_the_local_registry_without_a_round_trip() {
     )
     .unwrap();
     let mut s = opened();
-    s.repository = tmp.path().display().to_string();
+    s.repository = Some(tmp.path().display().to_string());
 
     typed(&mut s, "/skills");
     let effects = reduce(&mut s, key(KeyCode::Enter));

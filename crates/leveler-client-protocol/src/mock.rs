@@ -30,7 +30,9 @@ impl MockRuntimeClient {
         let (events, _) = broadcast::channel(1024);
         let snapshot = UiSessionSnapshot {
             id: session_id,
-            repository: "/repo".to_string(),
+            repository: Some("/repo".to_string()),
+            task_status: None,
+            task_terminal: None,
             goal: "interactive session".to_string(),
             model: None,
             mode: PermissionProfile::Assisted,

@@ -103,7 +103,7 @@ fn overview(
         Span::styled(format!("{} · {}", s.status, s.model), dim),
     ]));
     lines.push(Line::from(Span::styled(
-        format!("{}  {} / {}", s.goal, s.work_profile, s.collaboration),
+        format!("{}  {}", s.goal, s.collaboration),
         dim,
     )));
     lines.push(Line::from(""));

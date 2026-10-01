@@ -6,7 +6,7 @@
 //! - **Notice** (1 line): the transient Notice Surface for user-action feedback
 //!   (only when there is one; see `workbench::render_notice`)
 //! - **Status** (1 line): live activity only (empty when idle)
-//! - **Input border**: `{model} [(effort)] · work-mode · permission · session`
+//! - **Input border**: `{model} [(effort)] · permission · session`
 //! - **Footer** (1 line): runtime context + local wall clock — `Context 8k/1M · 22:22`
 //!
 //! Vertical breathing (workbench): blank above the input when status/queue/plan
@@ -121,11 +121,11 @@ pub(crate) fn friendly_model_label(
     }
 }
 
-/// Input-border runtime summary: `{model} [(effort)] · work · perm · session`.
+/// Input-border runtime summary: `{model} [(effort)] · perm · session`.
 ///
 /// Every field is a value already on [`AppState`]. Missing `reasoning_effort`
 /// omits the parentheses. When `max_width` is tight, drop from the right:
-/// session, then permission, then work_mode, then effort, then truncate model.
+/// session, then permission, then effort, then truncate model.
 pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String {
     let model = friendly_model_label(&state.model_label, &state.available_models);
     let effort = state
@@ -137,7 +137,6 @@ pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String 
     let untrusted = (!state.untrusted_config.is_empty()).then_some(state.t().untrusted_config_chip);
 
     let mut extras: Vec<String> = Vec::new();
-    extras.push(state.work_profile.clone());
     extras.push(perm.to_string());
     extras.push(state.collaboration.clone());
     if let Some(u) = untrusted {
@@ -330,7 +329,6 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             crate::overlay::Overlay::ModelPicker(_)
             | crate::overlay::Overlay::ModePicker(_)
             | crate::overlay::Overlay::ThemePicker(_)
-            | crate::overlay::Overlay::WorkModePicker(_)
             | crate::overlay::Overlay::CollabPicker(_)
             | crate::overlay::Overlay::UnsupportedMedia(_)
             | crate::overlay::Overlay::CheckpointPicker(_)
@@ -598,10 +596,9 @@ fn blocked_wait_lines(
 /// no repo is set. Shared by the header, workbench, and splash surfaces so the
 /// collapse rule stays in one place.
 pub(crate) fn home_collapsed_repo(state: &AppState) -> String {
-    if state.repository.is_empty() {
+    let Some(repo) = state.repository.as_deref() else {
         return "—".to_string();
-    }
-    let repo = state.repository.as_str();
+    };
     match leveler_core::environment().var_os("HOME") {
         Some(h) => match repo.strip_prefix(h.to_string_lossy().as_ref()) {
             Some(rest) => format!("~{rest}"),
@@ -748,7 +745,7 @@ mod tests {
     fn header_is_branch_and_path_only() {
         let mut state = test_state();
         state.branch = Some("kcn".into());
-        state.repository = "/Users/example/projects/example-service".into();
+        state.repository = Some("/Users/example/projects/example-service".into());
         state.model_label = "deepseek/v3".into();
         state.mode_label = "Assisted".into();
         let header = header_line(&state, 120).to_string();
@@ -903,7 +900,7 @@ mod tests {
     fn header_prefers_branch_when_narrow() {
         let mut state = test_state();
         state.branch = Some("main".into());
-        state.repository = "/very/long/path/to/a/repository".into();
+        state.repository = Some("/very/long/path/to/a/repository".into());
         let narrow = header_line(&state, 12).to_string();
         assert!(narrow.contains("main") || narrow.contains("⑂"), "{narrow}");
     }
@@ -924,12 +921,11 @@ mod tests {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.reasoning_effort = Some("max".into());
-        state.work_profile = "balanced".into();
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
         assert_eq!(
             runtime_status_chip(&state, 80),
-            "deepseek-v4-flash (max) · balanced · ask · chat"
+            "deepseek-v4-flash (max) · ask · chat"
         );
     }
 
@@ -938,11 +934,10 @@ mod tests {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.reasoning_effort = None;
-        state.work_profile = "balanced".into();
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
         let chip = runtime_status_chip(&state, 80);
-        assert_eq!(chip, "deepseek-v4-flash · balanced · ask · chat");
+        assert_eq!(chip, "deepseek-v4-flash · ask · chat");
         assert!(!chip.contains('('), "{chip}");
     }
 
@@ -954,7 +949,6 @@ mod tests {
             leveler_client_protocol::ModelRef::parse("openai/gpt-5").unwrap(),
             leveler_client_protocol::ModelRef::parse("azure/gpt-5").unwrap(),
         ];
-        state.work_profile = "balanced".into();
         state.mode_label = "Assisted".into();
         state.collaboration = "chat".into();
         assert!(
@@ -969,16 +963,15 @@ mod tests {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.reasoning_effort = Some("max".into());
-        state.work_profile = "balanced".into();
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
-        let mid = runtime_status_chip(&state, 36);
+        let mid = runtime_status_chip(&state, 33);
         assert!(mid.contains("deepseek-v4-flash"), "{mid}");
-        assert!(mid.contains("balanced"), "{mid}");
+        assert!(mid.contains("ask"), "{mid}");
         assert!(!mid.contains("chat"), "session is dropped first: {mid}");
         let tight = runtime_status_chip(&state, 22);
         assert!(tight.contains("deepseek-v4-flash"), "{tight}");
-        assert!(!tight.contains("balanced"), "{tight}");
+        assert!(!tight.contains("ask"), "{tight}");
     }
 
     #[test]
@@ -1303,6 +1296,8 @@ mod tests {
                 stopped: false,
                 exit_code: Some(0),
                 duration_ms: Some(1_000),
+                pid: None,
+                last_output_at: None,
                 output: String::new(),
             },
         );

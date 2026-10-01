@@ -53,7 +53,7 @@ mod progress;
 pub mod runtime;
 pub mod workflow;
 
-pub use axes::{CollaborationMode, WorkProfile};
+pub use axes::CollaborationMode;
 pub use checkpoint::{
     CheckpointChild, CheckpointFindings, CheckpointPlan, CheckpointReason, CheckpointWorkspace,
     GOAL_CHECKPOINT_SCHEMA_VERSION, GoalCheckpoint,

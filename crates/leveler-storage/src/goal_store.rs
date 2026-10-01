@@ -115,6 +115,18 @@ pub trait GoalStore: Send + Sync {
     /// identity are checked atomically with the state transition.
     async fn reopen(&self, token: &OwnershipToken, goal_id: &GoalId) -> Result<(), OwnershipError>;
 
+    /// Capabilities exposed for this exact goal, in deterministic id order.
+    async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError>;
+
+    /// Append one capability under current ownership. Idempotent; no unload.
+    /// A settled goal must be reopened before it can load additional tools.
+    async fn enable_capability(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        capability_id: &str,
+    ) -> Result<(), OwnershipError>;
+
     /// One goal by id, or `None` when it does not exist.
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError>;
 
@@ -236,6 +248,47 @@ impl GoalStore for Database {
         goal_write_miss(self, token, goal_id, false).await
     }
 
+    async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError> {
+        if self.get(goal_id).await?.is_none() {
+            return Err(StorageError::InvalidData(format!(
+                "goal {goal_id} not found"
+            )));
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT capability_id FROM goal_capabilities WHERE goal_id = ?1 ORDER BY capability_id",
+        )
+        .bind(goal_id.as_str())
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    async fn enable_capability(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        capability_id: &str,
+    ) -> Result<(), OwnershipError> {
+        let inserted = sqlx::query(
+            "INSERT INTO goal_capabilities (goal_id, capability_id) \
+             SELECT goals.id, ?5 FROM goals JOIN tasks ON tasks.id = goals.task_id \
+             WHERE goals.id = ?1 AND goals.task_id = ?2 AND goals.state = 'running' \
+             AND tasks.owner_runtime_id = ?3 AND tasks.owner_epoch = ?4 \
+             ON CONFLICT(goal_id, capability_id) DO UPDATE SET capability_id = excluded.capability_id",
+        )
+        .bind(goal_id.as_str())
+        .bind(token.task_id.as_str())
+        .bind(token.runtime_id.as_str())
+        .bind(token.owner_epoch.get() as i64)
+        .bind(capability_id)
+        .execute(self.pool())
+        .await
+        .map_err(StorageError::from)?;
+        if inserted.rows_affected() == 1 {
+            return Ok(());
+        }
+        goal_write_miss(self, token, goal_id, false).await
+    }
+
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError> {
         let row: Option<(String, String, String, String, String, Option<String>, i64)> =
             sqlx::query_as(
@@ -337,6 +390,7 @@ fn parse_ts(s: &str) -> Result<Timestamp, StorageError> {
 /// contract as the SQLite adapter.
 pub struct MemoryGoalStore {
     pub(crate) rows: Mutex<Vec<GoalRecord>>,
+    capabilities: Mutex<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>>,
     ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
 }
 
@@ -344,6 +398,7 @@ impl Default for MemoryGoalStore {
     fn default() -> Self {
         Self {
             rows: Mutex::new(Vec::new()),
+            capabilities: Mutex::new(std::collections::BTreeMap::new()),
             ownership: std::sync::OnceLock::new(),
         }
     }
@@ -476,6 +531,56 @@ impl GoalStore for MemoryGoalStore {
             .map_err(OwnershipError::Storage)
     }
 
+    async fn active_capabilities(&self, goal_id: &GoalId) -> Result<Vec<String>, StorageError> {
+        if self.get(goal_id).await?.is_none() {
+            return Err(StorageError::InvalidData(format!(
+                "goal {goal_id} not found"
+            )));
+        }
+        Ok(self
+            .capabilities
+            .lock()
+            .unwrap()
+            .get(goal_id.as_str())
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn enable_capability(
+        &self,
+        token: &OwnershipToken,
+        goal_id: &GoalId,
+        capability_id: &str,
+    ) -> Result<(), OwnershipError> {
+        let ownership = self.ownership.get().ok_or_else(|| {
+            StorageError::InvalidData(
+                "memory goal store has no ownership authority configured".into(),
+            )
+        })?;
+        ownership
+            .with_current(token, || {
+                let rows = self.rows.lock().unwrap();
+                if !rows.iter().any(|goal| {
+                    &goal.id == goal_id
+                        && goal.task_id == token.task_id
+                        && goal.state == GoalState::Running
+                }) {
+                    return Err(StorageError::InvalidData(format!(
+                        "running goal {goal_id} not found for task {}",
+                        token.task_id
+                    )));
+                }
+                self.capabilities
+                    .lock()
+                    .unwrap()
+                    .entry(goal_id.to_string())
+                    .or_default()
+                    .insert(capability_id.to_owned());
+                Ok::<_, StorageError>(())
+            })?
+            .map_err(OwnershipError::Storage)
+    }
+
     async fn get(&self, goal_id: &GoalId) -> Result<Option<GoalRecord>, StorageError> {
         Ok(self
             .rows
@@ -538,6 +643,24 @@ mod tests {
         assert_eq!(got.windows_run, 0);
         assert_eq!(got.settled_at, None);
 
+        assert!(store.active_capabilities(&goal).await.unwrap().is_empty());
+        store
+            .enable_capability(token, &goal, "memory")
+            .await
+            .unwrap();
+        store
+            .enable_capability(token, &goal, "browser")
+            .await
+            .unwrap();
+        store
+            .enable_capability(token, &goal, "browser")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.active_capabilities(&goal).await.unwrap(),
+            vec!["browser", "memory"]
+        );
+
         // A goal that owes work is reported as owed.
         let owed = store.unfinished().await.unwrap();
         assert_eq!(owed.len(), 1);
@@ -554,6 +677,13 @@ mod tests {
         let settled = store.get(&goal).await.unwrap().unwrap();
         assert_eq!(settled.state, GoalState::Settled);
         assert!(settled.settled_at.is_some());
+        assert!(
+            store
+                .enable_capability(token, &goal, "skills")
+                .await
+                .is_err(),
+            "a settled goal cannot load more capabilities"
+        );
         assert!(
             store.unfinished().await.unwrap().is_empty(),
             "a settled goal owes nothing"
@@ -573,10 +703,25 @@ mod tests {
         assert_eq!(reopened.id, goal, "resume preserves exact goal identity");
         assert_eq!(reopened.state, GoalState::Running);
         assert_eq!(reopened.settled_at, None);
+        assert_eq!(
+            store.active_capabilities(&goal).await.unwrap(),
+            vec!["browser", "memory"]
+        );
+        let next = store
+            .open(token, "new goal", leveler_core::now())
+            .await
+            .unwrap();
+        assert!(store.active_capabilities(&next).await.unwrap().is_empty());
         // Retrying the same explicit reopen is idempotent.
         store.reopen(token, &goal).await.unwrap();
 
         assert_eq!(store.get(&GoalId::new("missing")).await.unwrap(), None);
+        assert!(
+            store
+                .active_capabilities(&GoalId::new("missing"))
+                .await
+                .is_err()
+        );
     }
 
     /// The reason this table exists rather than columns on `tasks`: a session
@@ -670,6 +815,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_enable_rejects_a_goal_owned_by_another_task() {
+        let db = Database::connect_in_memory().await.unwrap();
+        let (_, first) = seeded_task(&db).await;
+        let (_, second) = seeded_task(&db).await;
+        let goal = db
+            .open(&first, "first task", leveler_core::now())
+            .await
+            .unwrap();
+        assert!(
+            db.enable_capability(&second, &goal, "browser")
+                .await
+                .is_err()
+        );
+        assert!(db.active_capabilities(&goal).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn sqlite_store_hosts_many_goals_per_task() {
         let db = Database::connect_in_memory().await.unwrap();
         let (_, token) = seeded_task(&db).await;
@@ -692,15 +854,24 @@ mod tests {
         let goal = {
             let db = Database::connect(&path).await.unwrap();
             let (_, token) = seeded_task(&db).await;
-            db.open(&token, "survive a restart", leveler_core::now())
+            let goal = db
+                .open(&token, "survive a restart", leveler_core::now())
                 .await
-                .unwrap()
+                .unwrap();
+            db.enable_capability(&token, &goal, "browser")
+                .await
+                .unwrap();
+            goal
         };
         let db = Database::connect(&path).await.unwrap();
         let owed = db.unfinished().await.unwrap();
         assert_eq!(owed.len(), 1, "the goal must survive the connection");
         assert_eq!(owed[0].id, goal);
         assert_eq!(owed[0].objective, "survive a restart");
+        assert_eq!(
+            db.active_capabilities(&goal).await.unwrap(),
+            vec!["browser"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -756,10 +927,27 @@ mod tests {
         assert!(matches!(result, Err(OwnershipError::Stale { .. })));
         assert!(store.for_task(&stale.task_id).await.unwrap().is_empty());
 
-        store
+        let goal = store
             .open(current, "current owner", leveler_core::now())
             .await
             .unwrap();
+        store
+            .enable_capability(current, &goal, "browser")
+            .await
+            .unwrap();
+        for capability in ["browser", "memory"] {
+            assert!(
+                matches!(
+                    store.enable_capability(stale, &goal, capability).await,
+                    Err(OwnershipError::Stale { .. })
+                ),
+                "even duplicate enables must be fenced"
+            );
+        }
+        assert_eq!(
+            store.active_capabilities(&goal).await.unwrap(),
+            vec!["browser"]
+        );
         assert_eq!(store.for_task(&current.task_id).await.unwrap().len(), 1);
     }
 

@@ -72,6 +72,12 @@ const NOTIFICATION_TTL_INFO: Duration = Duration::from_secs(4);
 /// cost of the moving top line (a deliberate visual, unlike the old silent
 /// waits). The elapsed clock is `Instant`-based, independent of this cadence.
 const BUSY_TICK: Duration = Duration::from_millis(150);
+/// Minimum interval between two frames driven only by background-task output.
+/// A dev server can emit hundreds of lines per second, and repainting a full
+/// frame per chunk spends the whole budget on terminal writes an idle reader
+/// never sees. The busy tick still guarantees progress, and any other runtime
+/// event repaints immediately.
+const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(50);
 /// Cadence for Conversation edge auto-scroll while drag-selecting text.
 const SELECTION_TICK: Duration = Duration::from_millis(50);
 /// Coalescing window for PTYs that deliver pasted text as plain key events.
@@ -253,6 +259,13 @@ pub async fn run(
     let mut alt: Option<Terminal<CrosstermBackend<Stdout>>> = None;
     let mut tab_title = crate::terminal_title::TerminalTitleProjection::default();
     let mut pending_runtime_paint = false;
+    // A background task's output arrives as many small chunks. Painting a full
+    // frame per chunk is what makes a chatty process stall an idle TUI, so a
+    // background-only batch is throttled to this minimum interval (the busy
+    // tick still guarantees a repaint). Any other runtime event paints at once.
+    let mut pending_immediate_paint = false;
+    let mut pending_background_paint = false;
+    let mut last_paint = Instant::now();
     let mut pending_terminal_actions: VecDeque<Action> = VecDeque::new();
     // The notification currently on screen and when it appeared, for expiry.
     let mut note_shown: Option<(Notification, Instant)> = None;
@@ -309,6 +322,10 @@ pub async fn run(
                             events = client.subscribe_session(&session.id);
                             events_open = true;
                         }
+                        // Read the trigger from the event before it is moved
+                        // into the reducer; a background chunk is coalescable.
+                        let is_background_output =
+                            matches!(&event, RuntimeEvent::BackgroundTaskOutput { .. });
                         let delta_bytes = match &event {
                             RuntimeEvent::AssistantTextDelta { delta, .. } => Some(delta.len()),
                             _ => None,
@@ -339,6 +356,11 @@ pub async fn run(
                         if pending_since.is_none() {
                             pending_since = crate::profile::start();
                         }
+                        if is_background_output {
+                            pending_background_paint = true;
+                        } else {
+                            pending_immediate_paint = true;
+                        }
                         pending_runtime_paint = true;
                     }
                     Err(RecvError::Lagged(_)) => {
@@ -362,6 +384,7 @@ pub async fn run(
                             }
                         }
                         pending_runtime_paint = true;
+                        pending_immediate_paint = true;
                     }
                     Err(RecvError::Closed) => {
                         events_open = false;
@@ -456,7 +479,13 @@ pub async fn run(
         // Repaint on input, on runtime updates, and — while busy — on the tick
         // (spinner/elapsed). Idle ticks only repaint when the wall clock minute
         // changes (handled above via paint_now).
-        if paint_now || (ticked && state.is_busy()) || (!state.is_busy() && pending_runtime_paint) {
+        if paint_now
+            || (ticked && (state.is_busy() || pending_runtime_paint))
+            || (!state.is_busy() && pending_immediate_paint)
+            || (!state.is_busy()
+                && pending_background_paint
+                && last_paint.elapsed() >= BACKGROUND_PAINT_INTERVAL)
+        {
             if state.active_screen == Screen::Conversation {
                 crate::conversation::sync_scroll(&mut state);
             }
@@ -485,10 +514,13 @@ pub async fn run(
             }
             pending_since = None;
             last_frame_start = crate::profile::start();
+            last_paint = Instant::now();
             deltas_since_frame = 0;
             runtime_events_since_frame = 0;
             requests_since_frame = 0;
             pending_runtime_paint = false;
+            pending_immediate_paint = false;
+            pending_background_paint = false;
         }
     }
 

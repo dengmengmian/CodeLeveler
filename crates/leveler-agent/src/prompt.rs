@@ -50,6 +50,7 @@ pub(crate) struct PromptBuilder {
     /// guidance AND the index together: guidance for tools the model was not
     /// given tells it to call something that is not there.
     memory_expose: bool,
+    optional_guidance: [bool; 3],
 }
 
 impl Default for PromptBuilder {
@@ -59,6 +60,7 @@ impl Default for PromptBuilder {
             commit_co_author: true,
             memory_catalog: String::new(),
             memory_expose: false,
+            optional_guidance: [true; 3],
         }
     }
 }
@@ -69,7 +71,7 @@ pub(crate) struct TurnContext {
     pub(crate) mode: PermissionProfile,
     pub(crate) network_allowed: bool,
     pub(crate) deny_network: bool,
-    pub(crate) cwd: PathBuf,
+    pub(crate) cwd: Option<PathBuf>,
     pub(crate) project_rules: Vec<ProjectInstruction>,
     /// The language the user is writing in, when we can name it. `None` falls
     /// back to the generic "mirror the user" rule.
@@ -160,6 +162,16 @@ impl PromptBuilder {
     /// Titles the model can ASK about, for the case query recall misses on
     /// wording. Never bodies, and never the preferences that are already
     /// injected in full.
+    pub(crate) fn optional_guidance(
+        mut self,
+        skills: bool,
+        delegation: bool,
+        host_input: bool,
+    ) -> Self {
+        self.optional_guidance = [skills, delegation, host_input];
+        self
+    }
+
     pub(crate) fn memory_catalog(mut self, catalog: impl Into<String>) -> Self {
         self.memory_catalog = catalog.into();
         self
@@ -182,16 +194,51 @@ impl PromptBuilder {
         // tool calls, wire compatibility), never by a model-specific prompt:
         // a prompt that can replace the base can also drop the safety and
         // permission rules that live in it.
+        let asking = BASE_PROMPT
+            .find("## Asking the user")
+            .expect("asking section");
+        let skills = BASE_PROMPT.find("## Skills").expect("skills section");
+        let agents = BASE_PROMPT.find("## Sub-agents").expect("agents section");
+        let plan = BASE_PROMPT.find("## Plan").expect("plan section");
+        let base = format!("{}{}", &BASE_PROMPT[..asking], &BASE_PROMPT[plan..]);
         let mut segments = vec![PromptSegment::control(
             "base",
             PromptSource::BasePrompt,
             PromptAuthority::CoreContract,
             SegmentLifecycle::SessionPrefix,
             true,
-            BASE_PROMPT,
+            base,
         )];
+        for (enabled, name, fragment) in [
+            (
+                self.optional_guidance[0],
+                "skills_guidance",
+                &BASE_PROMPT[skills..agents],
+            ),
+            (
+                self.optional_guidance[1],
+                "multi_agent_guidance",
+                &BASE_PROMPT[agents..plan],
+            ),
+            (
+                self.optional_guidance[2],
+                "host_interaction_guidance",
+                &BASE_PROMPT[asking..skills],
+            ),
+        ] {
+            if enabled {
+                segments.push(PromptSegment::control(
+                    name,
+                    PromptSource::BasePrompt,
+                    PromptAuthority::CoreContract,
+                    SegmentLifecycle::SessionPrefix,
+                    true,
+                    fragment,
+                ));
+            }
+        }
         // Memory guidance ships only when the capability actually reaches the
-        // model. It used to be hard-coded in `base.md`, so an Economy turn — no
+        // model. It used to be hard-coded in `base.md`, so a turn with no
         // memory tools registered — still instructed the model to propose a
         // `remember` it could not call. The guidance is the harness contract
         // for the capability; recalled bodies are advisory and are a different
@@ -302,7 +349,10 @@ impl TurnContext {
                 self.model,
                 mode_label(self.mode),
                 network,
-                self.cwd.display(),
+                self.cwd
+                    .as_ref()
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| "unavailable (no primary workspace)".into()),
                 language,
             ),
         )];
@@ -357,12 +407,15 @@ impl TurnContext {
             "- File tools take workspace-relative paths. `.` means the cwd. \
              When the user names the absolute cwd, the tool path is `.`. \
              A structured file tool does not accept a `~` prefix or a `~/Users/...` path.\n\
-             - Under assisted and request-approval, workspace `.git` is write-protected \
-             for mutating git commands (`git pull`, `fetch`, `commit`, `rebase`, and the like). \
-             A sandbox denial of that write can be escalated on the same command by setting \
+             - Under assisted and request-approval the workspace `.git` is sealed. A command \
+             whose mechanical effects the runtime resolves from its own argv already runs with \
+             `.git` unsealed, so an ordinary `git pull`, `fetch`, `commit` or `rebase` needs no \
+             extra permission. The metadata write is still denied for mutating git commands the \
+             runtime cannot resolve that way (a wrapper, an unknown subcommand); escalate such \
+             a denial on the same command by setting \
              `escalate` (`filesystem` = `git`, plus `network` = true when the command contacts \
              a remote). That elevation is one call; there is no separate permission round. \
-             Read-only git (`status`, `diff`, `log`) does not need that elevation.\n\
+             Read-only git (`status`, `diff`, `log`) never needs it.\n\
              - Host openers (`open`, `xdg-open`, Windows `start`) leave the sandbox and raise \
              an approval prompt. They are blocked only when that prompt is denied.\n",
         );
@@ -441,7 +494,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/w"),
+                cwd: Some(std::path::PathBuf::from("/w")),
                 project_rules: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级工具库"),
                 repo_map: None,
@@ -468,7 +521,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/repo"),
+                cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: None,
                 repo_map: None,
@@ -492,7 +545,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/repo"),
+                cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: None,
                 repo_map: None,
@@ -509,7 +562,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/Users/example/project"),
+                cwd: Some(std::path::PathBuf::from("/Users/example/project")),
                 project_rules: Vec::new(),
                 user_language: None,
                 repo_map: None,
@@ -529,7 +582,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::FullAccess,
                 network_allowed: false,
                 deny_network: false,
-                cwd: std::path::PathBuf::from("/repo"),
+                cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: None,
                 repo_map: None,
@@ -845,7 +898,7 @@ mod tests {
             mode,
             network_allowed,
             deny_network: !network_allowed,
-            cwd: std::path::PathBuf::from("/repo"),
+            cwd: Some(std::path::PathBuf::from("/repo")),
             project_rules: Vec::new(),
             user_language: None,
             repo_map: None,
@@ -1078,7 +1131,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/repo"),
+                cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: vec![ProjectInstruction {
                     source: "src/AGENTS.md".to_string(),
                     content: "Prefer small modules.".to_string(),
@@ -1107,7 +1160,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/repo"),
+                cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级的 Go 工具库"),
                 repo_map: None,
@@ -1132,7 +1185,7 @@ mod tests {
                 mode: leveler_execution::PermissionProfile::Assisted,
                 network_allowed: false,
                 deny_network: true,
-                cwd: std::path::PathBuf::from("/repo"),
+                cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: user_language("make this repo production ready"),
                 repo_map: None,
@@ -1233,7 +1286,7 @@ mod tests {
     }
 
     /// With the capability off, NOTHING about memory reaches the model: no
-    /// guidance, no index. An Economy turn used to carry both while the tools
+    /// guidance, no index. An unexposed memory pack used to carry both while the tools
     /// were unregistered, instructing the model to propose a `remember` it
     /// could not call.
     #[test]

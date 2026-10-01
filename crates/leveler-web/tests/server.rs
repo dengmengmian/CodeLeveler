@@ -398,7 +398,7 @@ async fn use_repository(server: &TestServer, repository: &Path) {
         .snapshot(&SessionId::new("s1"))
         .await
         .unwrap();
-    snapshot.repository = repository.to_string_lossy().into_owned();
+    snapshot.repository = Some(repository.to_string_lossy().into_owned());
     server.service.mock.set_snapshot(snapshot);
 }
 
@@ -1142,4 +1142,36 @@ async fn ws_does_not_forward_another_session_s_events() {
         "the tab was handed another session's event: {frame}"
     );
     assert_eq!(frame["event"]["message"], "mine");
+}
+
+#[tokio::test]
+async fn ws_does_not_forward_local_global_task_answers() {
+    let server = TestServer::start().await;
+    let (mut socket, _) =
+        connect_async(format!("ws://{}/ws?session=s1&token={TOKEN}", server.addr))
+            .await
+            .unwrap();
+    assert_eq!(next_json(&mut socket).await["type"], "snapshot");
+    let private_answer = RuntimeEvent::GlobalTasksLoaded {
+        requester_session_id: SessionId::new("s1"),
+        query_id: "local-only".into(),
+        index: leveler_client_protocol::UiGlobalTaskIndex::default(),
+    };
+    server.service.mock.emit(private_answer.clone());
+    server
+        .service
+        .emit_for(&SessionId::new("s1"), private_answer);
+    server.service.emit_for(
+        &SessionId::new("s1"),
+        RuntimeEvent::Notification {
+            level: NotificationLevel::Info,
+            message: "safe-marker".into(),
+        },
+    );
+    let frame = next_json(&mut socket).await;
+    assert_eq!(
+        frame["event"]["type"], "notification",
+        "private answer escaped: {frame}"
+    );
+    assert_eq!(frame["event"]["message"], "safe-marker");
 }

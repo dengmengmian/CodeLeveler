@@ -2,8 +2,11 @@
 //! tui, and resume, plus their shared finish/ship helpers.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -11,11 +14,14 @@ use tokio_util::sync::CancellationToken;
 use leveler_agent::StopReason;
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::InteractiveRuntimeClient;
-use leveler_local_transport::{
-    CreateSessionRequest, LocalSocketRuntimeClient, LocalSocketServer, TcpRuntimeServer,
-    TransportError,
-};
+use leveler_local_transport::{CreateSessionRequest, LocalSocketRuntimeClient};
 use leveler_project::Layout;
+#[cfg(test)]
+use leveler_runtime_host::{
+    RuntimeConsistency, bind_daemon_transports, classify_runtime, classify_runtime_generation,
+    force_handover_allowed, generate_daemon_token, handoff_key,
+    probe_default_runtime as connect_default_runtime, stalled_turn_sessions, verify_replacement,
+};
 
 use crate::cli::{OutputFormat, RunMode};
 use crate::common::{build_approver, map_mode, resolve_model, spawn_interrupt_handler};
@@ -32,12 +38,10 @@ pub(crate) async fn cmd_run(
     output: OutputFormat,
     ship: leveler_app::ShipOptions,
     sandbox: bool,
-    work_profile: leveler_lifecycle::WorkProfile,
     collaboration: leveler_lifecycle::CollaborationMode,
     max_model_steps: Option<u32>,
 ) -> anyhow::Result<std::process::ExitCode> {
     let mut app = Application::assemble(layout)?
-        .with_work_profile(work_profile)
         .with_collaboration(collaboration)
         .with_model_step_ceiling(max_model_steps);
     if let Some(overrides) = eval_env_overrides()? {
@@ -156,9 +160,6 @@ pub(crate) async fn cmd_run_parallel(
         Ok(std::process::ExitCode::SUCCESS)
     }
 }
-#[cfg(unix)]
-const DEFAULT_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketIntent {
     Embedded,
@@ -187,208 +188,6 @@ fn socket_intent(
     }
 }
 
-#[cfg(unix)]
-pub(crate) async fn connect_default_runtime(
-    path: &Path,
-) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
-    match tokio::time::timeout(
-        DEFAULT_DAEMON_CONNECT_TIMEOUT,
-        tokio::net::UnixStream::connect(path),
-    )
-    .await
-    {
-        Ok(Ok(_probe)) => LocalSocketRuntimeClient::connect(path).await.map(Some),
-        Ok(Err(error)) => {
-            tracing::debug!(%error, socket = %path.display(), "skipping unavailable local runtime");
-            Ok(None)
-        }
-        Err(_) => {
-            tracing::debug!(
-                socket = %path.display(),
-                timeout_ms = DEFAULT_DAEMON_CONNECT_TIMEOUT.as_millis(),
-                "timed out probing local runtime"
-            );
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) async fn connect_default_runtime(
-    _path: &Path,
-) -> Result<Option<LocalSocketRuntimeClient>, TransportError> {
-    Ok(None)
-}
-
-/// How long an ensure-started daemon gets to report readiness before the TUI
-/// gives up. Model/config loading dominates; ten seconds is generous.
-#[cfg(unix)]
-const DAEMON_ENSURE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a daemon with NO attached client and NO work waits before it
-/// retires its own process.
-///
-/// This is resource reclamation, not generation handover: the daemon exists to
-/// outlive a TUI that started work, so the countdown only starts once nothing
-/// is owed and nobody is watching. Override for dogfood/tests with
-/// `LEVELER_DAEMON_IDLE_TIMEOUT_SECS` (a positive number of seconds).
-const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
-fn daemon_idle_timeout() -> Duration {
-    std::env::var("LEVELER_DAEMON_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DAEMON_IDLE_TIMEOUT)
-}
-
-/// The client-side daemon revival hook: when the daemon dies mid-session,
-/// the transport calls back here to run the SAME discover-or-start flow the
-/// TUI used at startup. The connected probe client is dropped immediately —
-/// revival only guarantees a runtime is serving again; the caller reconnects
-/// itself.
-#[cfg(unix)]
-struct DaemonReviver {
-    layout: Layout,
-}
-
-#[cfg(unix)]
-#[async_trait::async_trait]
-impl leveler_local_transport::RuntimeReviver for DaemonReviver {
-    async fn revive(&self) -> Result<(), String> {
-        ensure_default_runtime(&self.layout)
-            .await
-            .map(|_probe_client| ())
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// Whether the connected runtime is the build this client expects.
-#[cfg(unix)]
-#[derive(Debug)]
-enum RuntimeConsistency {
-    Current,
-    Outdated {
-        runtime: leveler_core::BuildIdentity,
-        expected: leveler_core::BuildIdentity,
-    },
-    ConfigChanged,
-    /// The runtime did not report a usable identity — a build older than the
-    /// handshake, or an unreadable snapshot.
-    Unknown,
-}
-
-#[cfg(unix)]
-fn classify_runtime_generation(
-    reported: Option<&leveler_client_protocol::RuntimeInfo>,
-    expected_build: &leveler_core::BuildIdentity,
-    expected_config_fingerprint: &str,
-) -> RuntimeConsistency {
-    match classify_runtime(reported.map(|info| &info.build), expected_build) {
-        RuntimeConsistency::Current => match reported.and_then(|info| {
-            info.config_fingerprint
-                .as_deref()
-                .map(|fingerprint| fingerprint == expected_config_fingerprint)
-        }) {
-            Some(true) => RuntimeConsistency::Current,
-            Some(false) => RuntimeConsistency::ConfigChanged,
-            None => RuntimeConsistency::Unknown,
-        },
-        other => other,
-    }
-}
-
-/// Classify a runtime from what it reported. `None` — a daemon that predates
-/// the handshake, or a transport failure — is `Unknown`, never agreement:
-/// silence is not a claim to be the same build.
-#[cfg(unix)]
-fn classify_runtime(
-    reported: Option<&leveler_core::BuildIdentity>,
-    expected: &leveler_core::BuildIdentity,
-) -> RuntimeConsistency {
-    let Some(runtime) = reported else {
-        return RuntimeConsistency::Unknown;
-    };
-    if !runtime.is_known() || !expected.is_known() {
-        return RuntimeConsistency::Unknown;
-    }
-    if expected.matches(runtime) {
-        RuntimeConsistency::Current
-    } else {
-        RuntimeConsistency::Outdated {
-            runtime: runtime.clone(),
-            expected: expected.clone(),
-        }
-    }
-}
-
-/// Did the replacement actually become the build we expected?
-///
-/// Spawning successfully proves nothing: the process that came up has to say
-/// it is the build this client is, or the runtime was not replaced — it was
-/// merely restarted. Exactly one verdict, and no retry: a replacement that
-/// keeps coming back as the wrong build is something to report, not something
-/// to keep relaunching.
-#[cfg(unix)]
-fn verify_replacement(
-    reported: Option<&leveler_core::BuildIdentity>,
-    expected: &leveler_core::BuildIdentity,
-) -> anyhow::Result<()> {
-    // The replacement was spawned from `current_exe`, so reporting our exact
-    // identity — dirty flag included — is proof it is this build. `matches`
-    // answers a different question (is a daemon we did not spawn possibly
-    // stale code?), and its "two dirty trees may differ" rule applied here
-    // would reject the binary we just launched ourselves: on a modified tree
-    // the TUI would never start, and would say so by printing one build name
-    // twice.
-    if reported.is_some_and(|r| r.is_known() && r == expected) {
-        return Ok(());
-    }
-    match classify_runtime(reported, expected) {
-        RuntimeConsistency::Current => Ok(()),
-        RuntimeConsistency::Outdated { runtime, expected } => anyhow::bail!(
-            "the local runtime started as {} but this CodeLeveler is {}; \
-             the runtime was not replaced correctly",
-            runtime.short(),
-            expected.short()
-        ),
-        RuntimeConsistency::ConfigChanged => {
-            anyhow::bail!("the replacement runtime loaded a different configuration generation")
-        }
-        RuntimeConsistency::Unknown => {
-            anyhow::bail!("the local runtime started but did not report a usable build identity")
-        }
-    }
-}
-
-/// Ask the runtime who it is, then classify the answer.
-#[cfg(unix)]
-async fn runtime_is_current(
-    client: &LocalSocketRuntimeClient,
-    layout: &Layout,
-) -> anyhow::Result<RuntimeConsistency> {
-    let expected = leveler_core::BuildIdentity::current();
-    let reported = leveler_local_transport::LocalRuntimeService::runtime_info(client)
-        .await
-        .ok();
-    let expected_config = leveler_app::runtime_config_fingerprint(layout)?;
-    Ok(classify_runtime_generation(
-        reported.as_ref(),
-        &expected,
-        &expected_config,
-    ))
-}
-
-/// How often the handover wait re-states a retiring runtime's progress.
-///
-/// This is an observation cadence, NEVER a deadline. A runtime still
-/// finishing the work it already owns is not a startup failure; the only
-/// thing this interval decides is how often the user is told what is still
-/// owed.
-#[cfg(unix)]
-const HANDOVER_STATUS_INTERVAL: Duration = Duration::from_secs(5);
-
 /// The lifecycle line a retiring runtime reports: exactly the two things the
 /// drain waits for, so a user can see WHY it has not exited yet.
 ///
@@ -397,14 +196,14 @@ const HANDOVER_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 /// nothing about what to do next. The list comes from the runtime's own
 /// `BackgroundTaskRegistry` via `RuntimeInfo.health.blockers`, so it is the
 /// same set `alive_count` counts, never a `ps` guess.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HandoffLang {
     Zh,
     En,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl HandoffLang {
     /// The UI language, resolved the same way every other surface resolves it.
     fn current() -> Self {
@@ -422,17 +221,12 @@ impl HandoffLang {
     }
 }
 
-#[cfg(unix)]
-fn retiring_status(health: &leveler_client_protocol::RuntimeHealth) -> String {
-    retiring_status_lang(health, HandoffLang::current())
-}
-
 /// The lifecycle line a retiring runtime reports, in the user's language.
 ///
 /// The user thinks in *versions*, never in "runtimes": this text says "the
 /// previous CodeLeveler version" and never exposes `quiescent`, a fingerprint
 /// or a pgid. The counts are the runtime's own.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn retiring_status_lang(
     health: &leveler_client_protocol::RuntimeHealth,
     lang: HandoffLang,
@@ -509,7 +303,7 @@ fn retiring_status_lang(
 /// Describe a turn's progress for the handover line. "no observable progress"
 /// is a HINT computed from idle time alone — never "dead", never a verdict, and
 /// it never triggers an action by itself.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn turn_status_label(
     blocker: &leveler_client_protocol::UiTurnBlocker,
     lang: HandoffLang,
@@ -521,40 +315,8 @@ fn turn_status_label(
     }
 }
 
-/// A stable identity for the handoff state, used only to decide whether to
-/// restate it. Deliberately excludes anything that changes every poll (a
-/// task's age), so a long wait prints once, not every interval.
-#[cfg(unix)]
-fn handoff_key(health: &leveler_client_protocol::RuntimeHealth) -> String {
-    let turns = health
-        .turn_blockers
-        .iter()
-        .map(|blocker| {
-            format!(
-                "{}:{}",
-                blocker.session_id.as_str(),
-                blocker.suspected_stalled_after(leveler_client_protocol::STALE_TURN_WARN_AFTER)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{}|{}|{}|{}|{}",
-        health.active_turns,
-        health.active_background_tasks,
-        health.quiescent(),
-        health
-            .blockers
-            .iter()
-            .map(|blocker| blocker.task_id.as_str())
-            .collect::<Vec<_>>()
-            .join(","),
-        turns,
-    )
-}
-
 /// `program args…` as one line, so a blocker reads as the command it is.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn blocker_command_line(program: &str, args: &[String]) -> String {
     let mut line = program.to_string();
     for arg in args {
@@ -565,7 +327,7 @@ pub(crate) fn blocker_command_line(program: &str, args: &[String]) -> String {
 }
 
 /// A compact age for the blocker line (`1d 01h`, `18m`, `4s`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn format_task_age(elapsed_ms: u64) -> String {
     let secs = elapsed_ms / 1000;
     let (days, hours, minutes, seconds) = (
@@ -585,25 +347,13 @@ pub(crate) fn format_task_age(elapsed_ms: u64) -> String {
     }
 }
 
-/// How long a cooperative interrupt may take to settle before the wait offers
-/// the explicit force escape. Starts only AFTER the user has asked to
-/// interrupt — it is not a handover timeout.
-#[cfg(unix)]
-const HANDOVER_CANCEL_GRACE: Duration = Duration::from_secs(5);
-
 /// What the user asked the handover to do, read from the terminal.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandoverInput {
-    /// Cooperatively cancel the turns that show no observable progress.
-    Interrupt,
-    /// End the old runtime now (only when no background work is at risk).
-    Force,
-}
+#[cfg(any(unix, windows))]
+type HandoverInput = leveler_runtime_host::HandoffAction;
 
 /// Decide what a raw terminal line means. Anything unrecognized is ignored,
 /// never guessed: a stray keystroke must not interrupt or force anything.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn parse_handover_input(line: &str) -> Option<HandoverInput> {
     match line.trim().to_ascii_lowercase().as_str() {
         "i" | "interrupt" => Some(HandoverInput::Interrupt),
@@ -615,7 +365,7 @@ fn parse_handover_input(line: &str) -> Option<HandoverInput> {
 /// Reads handover commands from the terminal, when there is one. In a
 /// non-interactive process (piped stdin, CI, a test) this returns `None`, so
 /// the wait never blocks on input and never forces.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_handover_input() -> Option<tokio::sync::mpsc::UnboundedReceiver<HandoverInput>> {
     use std::io::IsTerminal;
 
@@ -638,379 +388,137 @@ fn spawn_handover_input() -> Option<tokio::sync::mpsc::UnboundedReceiver<Handove
     Some(rx)
 }
 
-/// The sessions whose turns show no observable progress past the product
-/// threshold. The one place "stalled" is decided, so the status text, the
-/// recovery prompt and every test agree.
-#[cfg(unix)]
-fn stalled_turn_sessions(
-    health: &leveler_client_protocol::RuntimeHealth,
-) -> Vec<leveler_core::SessionId> {
-    health
-        .turn_blockers
-        .iter()
-        .filter(|blocker| {
-            blocker.suspected_stalled_after(leveler_client_protocol::STALE_TURN_WARN_AFTER)
-        })
-        .map(|blocker| blocker.session_id.clone())
-        .collect()
-}
+/// Render lifecycle observations in the current terminal language. The host
+/// owns the handoff state machine; this shell owns user-visible text and input.
+#[cfg(any(unix, windows))]
+struct TuiHandoffUi;
 
-/// Whether the explicit force escape may run. Background work is a
-/// user-launched process a handover must never silently destroy, so a force is
-/// offered only when there is none; otherwise the user settles it first via
-/// the existing `leveler background stop` path.
-#[cfg(unix)]
-fn force_handover_allowed(health: &leveler_client_protocol::RuntimeHealth) -> bool {
-    health.active_background_tasks == 0
-}
-
-/// Send the cooperative interrupt for every stalled turn. Nothing is forced:
-/// the runtime cancels gracefully and the wait observes whether it settled.
-#[cfg(unix)]
-async fn request_turn_interrupts(
-    client: &LocalSocketRuntimeClient,
-    sessions: &[leveler_core::SessionId],
-) -> usize {
-    let mut sent = 0;
-    for session_id in sessions {
-        if client
-            .send(leveler_client_protocol::ClientCommand::CancelCurrentTurn {
-                session_id: session_id.clone(),
-            })
-            .await
-            .is_ok()
-        {
-            sent += 1;
-        }
-    }
-    sent
-}
-
-/// Handle one terminal command against the last-known health. Every refusal is
-/// explained to the user rather than silently dropped.
-#[cfg(unix)]
-async fn apply_handover_input(
-    client: &LocalSocketRuntimeClient,
-    input: HandoverInput,
-    health: Option<&leveler_client_protocol::RuntimeHealth>,
-    lang: HandoffLang,
-    grace: Duration,
-    grace_deadline: &mut Option<tokio::time::Instant>,
-) {
-    let Some(health) = health else {
-        eprintln!(
-            "  {}",
-            lang.pick(
-                "暂时读不到旧版本状态，无法执行该操作。",
-                "The previous version's state cannot be read yet; that action is unavailable.",
-            )
-        );
-        return;
-    };
-    match input {
-        HandoverInput::Interrupt => {
-            let stalled = stalled_turn_sessions(health);
-            if stalled.is_empty() {
-                eprintln!(
-                    "  {}",
+#[cfg(any(unix, windows))]
+impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
+    fn emit(&self, event: leveler_runtime_host::HandoffEvent) {
+        use leveler_runtime_host::HandoffEvent;
+        let lang = HandoffLang::current();
+        match event {
+            HandoffEvent::Status(health) => {
+                let status = retiring_status_lang(&health, lang);
+                let stalled = leveler_runtime_host::stalled_turn_sessions(&health).len();
+                let mut message = format!(
+                    "{}\n  {status}\n  {}",
+                    lang.pick("版本更新等待中", "Version update pending"),
                     lang.pick(
-                        "当前没有检测到长时间无进展的任务。",
-                        "No task is currently showing a lack of progress.",
-                    )
-                );
-                return;
-            }
-            if request_turn_interrupts(client, &stalled).await > 0 {
-                *grace_deadline = Some(tokio::time::Instant::now() + grace);
-                eprintln!(
-                    "  {}",
-                    lang.pick(
-                        "已请求中断，等待旧版本正常收尾…",
-                        "Interrupt requested; waiting for the previous version to settle…",
-                    )
-                );
-            } else {
-                eprintln!(
-                    "  {}",
-                    lang.pick(
-                        "中断请求未送达旧版本。",
-                        "The interrupt request could not reach the previous version.",
-                    )
-                );
-            }
-        }
-        HandoverInput::Force => {
-            if !force_handover_allowed(health) {
-                eprintln!(
-                    "  {}",
-                    lang.pick(
-                        "仍有后台任务在运行，不能强制切换；请先按上面的提示停止它们。",
-                        "Background tasks are still running; force handover is unavailable. Stop them first, as shown above.",
-                    )
-                );
-                return;
-            }
-            match client
-                .send(leveler_client_protocol::ClientCommand::ForceRetire {
-                    reason: leveler_client_protocol::RestartReason::BuildMismatch,
-                })
-                .await
-            {
-                Ok(()) => eprintln!(
-                    "  {}",
-                    lang.pick(
-                        "已强制结束旧版本，正在切换…",
-                        "Force-ending the previous version; switching…",
-                    )
-                ),
-                Err(error) => eprintln!(
-                    "  {}{error}",
-                    lang.pick("强制切换失败：", "Force handover failed: ")
-                ),
-            }
-        }
-    }
-}
-
-/// Observe a retiring runtime until it is gone and replaced (or simply gone).
-///
-/// There is NO deadline on the WAIT itself on purpose: the former 10s bail
-/// turned "the old runtime is still working" into "the new TUI cannot start".
-/// A generation handover waits for the old runtime's own drain, never
-/// interrupts a healthy turn, and never starts a second daemon for the same
-/// repository.
-///
-/// What it adds is an ESCAPE for a drain that cannot finish. A turn that shows
-/// no observable progress runs for a human to see, and — only in an interactive
-/// terminal — the user may cooperatively interrupt it, and, if that does not
-/// settle within the cancel grace, explicitly force the handover. A
-/// non-interactive process only ever waits.
-///
-/// `observed_pid` is the retiring runtime's pid. It is how the wait tells
-/// "still draining" from "already replaced": a concurrent client's reviver
-/// can spawn the replacement on the same socket before this wait ends, and
-/// waiting for a socket that is now served by a *different* healthy runtime
-/// would hang forever.
-///
-/// `interval` only paces how often progress is re-stated.
-#[cfg(unix)]
-async fn observe_retiring_runtime(
-    client: &LocalSocketRuntimeClient,
-    socket_path: &Path,
-    _reason: leveler_client_protocol::RestartReason,
-    observed_pid: Option<u32>,
-    interval: Duration,
-) {
-    observe_retiring_runtime_with_grace(
-        client,
-        socket_path,
-        observed_pid,
-        interval,
-        HANDOVER_CANCEL_GRACE,
-    )
-    .await;
-}
-
-/// [`observe_retiring_runtime`] with an injectable cancel grace, so a test can
-/// exercise the recovery path without waiting out the product constant.
-#[cfg(unix)]
-async fn observe_retiring_runtime_with_grace(
-    client: &LocalSocketRuntimeClient,
-    socket_path: &Path,
-    observed_pid: Option<u32>,
-    interval: Duration,
-    grace: Duration,
-) {
-    let mut last = String::new();
-    // Spawned lazily: a healthy handover never starts a stdin reader, so the
-    // common path cannot steal a keystroke from the TUI that follows.
-    let mut input: Option<tokio::sync::mpsc::UnboundedReceiver<HandoverInput>> = None;
-    let mut grace_deadline: Option<tokio::time::Instant> = None;
-    let mut force_hint_shown = false;
-    loop {
-        let (key, status, health) =
-            match leveler_local_transport::LocalRuntimeService::runtime_info(client).await {
-                Ok(info) => {
-                    if observed_pid.is_some_and(|pid| info.pid != pid) {
-                        // A replacement runtime is already serving this socket:
-                        // the old generation is gone and the handover is done.
-                        return;
-                    }
-                    // Dedupe on what actually changed — counts, phase, blocker
-                    // identity, and whether a turn crossed the no-progress
-                    // threshold — never on the rendered age: a running task's age
-                    // grows every poll, and reprinting the whole block every few
-                    // seconds is noise, not news.
-                    (
-                        handoff_key(&info.health),
-                        retiring_status(&info.health),
-                        Some(info.health),
-                    )
-                }
-                Err(_) => {
-                    if tokio::net::UnixStream::connect(socket_path).await.is_err() {
-                        // The request path failed AND the socket no longer answers:
-                        // the previous runtime has released it. Handover complete.
-                        return;
-                    }
-                    // Still alive but not answering the handshake (an older
-                    // generation): say so once, then keep waiting rather than
-                    // failing the startup on a runtime we cannot read.
-                    let lang = HandoffLang::current();
-                    let status = lang
-                    .pick(
-                        "旧版本 CodeLeveler 未响应握手，暂时无法读取其状态。",
-                        "The previous CodeLeveler version does not answer the handshake; its state cannot be read yet.",
-                    )
-                    .to_string();
-                    (status.clone(), status, None)
-                }
-            };
-        if key != last {
-            let lang = HandoffLang::current();
-            let stalled = health
-                .as_ref()
-                .map(|health| stalled_turn_sessions(health).len())
-                .unwrap_or(0);
-            let mut message = format!(
-                "{}\n  {status}\n  {}",
-                lang.pick("版本更新等待中", "Version update pending"),
-                lang.pick(
-                    "现有任务不会被自动中断，完成后将自动切换到当前版本。",
-                    "Existing work will not be interrupted; the current version will take over automatically.",
-                ),
-            );
-            if stalled > 0 {
-                message.push_str(&format!(
-                    "\n  {}",
-                    lang.pick(
-                        "检测到长时间无进展的任务：输入 i 尝试中断，或继续等待。",
-                        "A task shows no progress: type i to interrupt it, or keep waiting.",
-                    )
-                ));
-            }
-            eprintln!("{message}");
-            last = key;
-        }
-        // The cooperative grace expired with the turn still there: the
-        // graceful path did not settle, so OFFER (never take) the force escape.
-        if let Some(deadline) = grace_deadline
-            && tokio::time::Instant::now() >= deadline
-        {
-            let still_stalled = health
-                .as_ref()
-                .is_some_and(|health| !stalled_turn_sessions(health).is_empty());
-            if !still_stalled {
-                grace_deadline = None;
-            } else if !force_hint_shown {
-                let lang = HandoffLang::current();
-                eprintln!(
-                    "  {}",
-                    lang.pick(
-                        "中断未生效：输入 f 强制结束旧版本并继续切换。",
-                        "The interrupt did not settle: type f to force-end the previous version and continue.",
-                    )
-                );
-                force_hint_shown = true;
-            }
-        }
-        match input.as_mut() {
-            Some(rx) => {
-                tokio::select! {
-                    biased;
-                    message = rx.recv() => match message {
-                        Some(input) => {
-                            let lang = HandoffLang::current();
-                            apply_handover_input(
-                                client,
-                                input,
-                                health.as_ref(),
-                                lang,
-                                grace,
-                                &mut grace_deadline,
-                            )
-                            .await;
-                        }
-                        None => input = None,
-                    },
-                    _ = tokio::time::sleep(interval) => {}
-                }
-            }
-            None => {
-                // Recovery is only offered once there is something to recover
-                // from; until then the wait is a plain safe wait.
-                if health
-                    .as_ref()
-                    .is_some_and(|health| !stalled_turn_sessions(health).is_empty())
-                {
-                    input = spawn_handover_input();
-                }
-                tokio::time::sleep(interval).await;
-            }
-        }
-    }
-}
-
-/// Ask a different-generation runtime to retire, then wait for it to go.
-///
-/// The runtime owns the drain — it keeps the work it already owns and exits
-/// once that work is done. Replacing a binary on disk is not an update; this
-/// is.
-#[cfg(unix)]
-async fn retire_runtime(
-    client: &LocalSocketRuntimeClient,
-    socket_path: &Path,
-    reason: leveler_client_protocol::RestartReason,
-) -> anyhow::Result<()> {
-    let observed_pid = leveler_local_transport::LocalRuntimeService::runtime_info(client)
-        .await
-        .ok()
-        .map(|info| info.pid);
-    client
-        .send(leveler_client_protocol::ClientCommand::ShutdownWhenIdle { reason })
-        .await
-        .map_err(|e| anyhow::anyhow!("could not ask the local runtime to retire: {e}"))?;
-    observe_retiring_runtime(
-        client,
-        socket_path,
-        reason,
-        observed_pid,
-        HANDOVER_STATUS_INTERVAL,
-    )
-    .await;
-    Ok(())
-}
-
-/// Discover the repository's local runtime, starting one if none is running.
-///
-/// The default TUI path: probe the per-repo socket; when nobody answers,
-/// spawn `leveler --repo <root> serve` as a *detached* process (its own
-/// process group, no kill-on-drop — the daemon must outlive this TUI), wait
-/// for its `--ready-json`, and connect. Two TUIs racing this function are
-/// safe: the socket bind's flock elects exactly one daemon, the loser child
-/// exits `AlreadyRunning`, and the losing TUI's retry loop connects to the
-/// winner. Returns the connected client; a startup failure is a hard error
-/// carrying the daemon's log tail — never a silent fall back to an
-/// in-process runtime.
-#[cfg(unix)]
-async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
-    let socket_path = layout.socket_path();
-    if let Some(client) = connect_default_runtime(&socket_path).await? {
-        match runtime_is_current(&client, layout).await? {
-            // Same build: reuse it, silently. This is the overwhelmingly
-            // common case and must stay free.
-            RuntimeConsistency::Current => return Ok(client),
-            // A runtime that cannot say what it is might be anything, and it
-            // might be busy. Leave it alone and say so — replacing a runtime
-            // we cannot reason about is how active work gets destroyed.
-            RuntimeConsistency::Unknown => {
-                let lang = HandoffLang::current();
-                anyhow::bail!(
-                    "{}\n  {}\n{}",
-                    lang.pick(
-                        "发现旧版本 CodeLeveler",
-                        "Previous CodeLeveler version detected",
+                        "现有任务不会被自动中断，完成后将自动切换到当前版本。",
+                        "Existing work will not be interrupted; the current version will take over automatically.",
                     ),
+                );
+                if stalled > 0 {
+                    message.push_str(&format!(
+                        "\n  {}",
+                        lang.pick(
+                            "检测到长时间无进展的任务：输入 i 尝试中断，或继续等待。",
+                            "A task shows no progress: type i to interrupt it, or keep waiting.",
+                        )
+                    ));
+                }
+                eprintln!("{message}");
+            }
+            HandoffEvent::HandshakeUnavailable => {
+                let status = lang.pick(
+                    "旧版本 CodeLeveler 未响应握手，暂时无法读取其状态。",
+                    "The previous CodeLeveler version does not answer the handshake; its state cannot be read yet.",
+                );
+                eprintln!(
+                    "{}\n  {status}\n  {}",
+                    lang.pick("版本更新等待中", "Version update pending"),
+                    lang.pick(
+                        "现有任务不会被自动中断，完成后将自动切换到当前版本。",
+                        "Existing work will not be interrupted; the current version will take over automatically.",
+                    )
+                );
+            }
+            HandoffEvent::ForceAvailable => eprintln!(
+                "  {}",
+                lang.pick(
+                    "中断未生效：输入 f 强制结束旧版本并继续切换。",
+                    "The interrupt did not settle: type f to force-end the previous version and continue.",
+                )
+            ),
+            HandoffEvent::StateUnavailable => eprintln!(
+                "  {}",
+                lang.pick(
+                    "暂时读不到旧版本状态，无法执行该操作。",
+                    "The previous version's state cannot be read yet; that action is unavailable.",
+                )
+            ),
+            HandoffEvent::NoStalledTurns => eprintln!(
+                "  {}",
+                lang.pick(
+                    "当前没有检测到长时间无进展的任务。",
+                    "No task is currently showing a lack of progress.",
+                )
+            ),
+            HandoffEvent::InterruptRequested => eprintln!(
+                "  {}",
+                lang.pick(
+                    "已请求中断，等待旧版本正常收尾…",
+                    "Interrupt requested; waiting for the previous version to settle…",
+                )
+            ),
+            HandoffEvent::InterruptDeliveryFailed => eprintln!(
+                "  {}",
+                lang.pick(
+                    "中断请求未送达旧版本。",
+                    "The interrupt request could not reach the previous version.",
+                )
+            ),
+            HandoffEvent::ForceBlocked => eprintln!(
+                "  {}",
+                lang.pick(
+                    "仍有后台任务在运行，不能强制切换；请先按上面的提示停止它们。",
+                    "Background tasks are still running; force handover is unavailable. Stop them first, as shown above.",
+                )
+            ),
+            HandoffEvent::ForceRequested => eprintln!(
+                "  {}",
+                lang.pick(
+                    "已强制结束旧版本，正在切换…",
+                    "Force-ending the previous version; switching…",
+                )
+            ),
+            HandoffEvent::ForceFailed(error) => eprintln!(
+                "  {}{error}",
+                lang.pick("强制切换失败：", "Force handover failed: ")
+            ),
+        }
+    }
+
+    fn input(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<leveler_runtime_host::HandoffAction>> {
+        spawn_handover_input()
+    }
+
+    fn render_ensure_error(&self, error: &leveler_runtime_host::EnsureError) -> String {
+        format_ensure_error(error)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn daemon_launch() -> anyhow::Result<leveler_runtime_host::DetachedRuntimeLaunch> {
+    Ok(leveler_runtime_host::DetachedRuntimeLaunch {
+        executable: std::env::current_exe()?,
+        ready_prefix: "leveler-tui-ready".to_string(),
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn format_ensure_error(host: &leveler_runtime_host::EnsureError) -> String {
+    use leveler_runtime_host::EnsureError;
+    match host {
+        EnsureError::UnknownGeneration => {
+            let lang = HandoffLang::current();
+            format!(
+                    "{}\n  {}\n{}",
+                    lang.pick("发现旧版本 CodeLeveler", "Previous CodeLeveler version detected"),
                     lang.pick(
                         "当前项目仍连接到不支持自动版本切换的早期版本。",
                         "This project is still connected to an earlier version that cannot complete an automatic version switch.",
@@ -1019,131 +527,84 @@ async fn ensure_default_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRu
                         "该版本无法自动完成版本切换；请退出后重新启动 CodeLeveler 以切换到当前版本。",
                         "This version cannot complete an automatic version switch. Exit and start CodeLeveler again to switch to the current version.",
                     ),
-                );
-            }
-            RuntimeConsistency::Outdated { runtime, expected } => {
-                tracing::info!(
-                    runtime = %runtime.short(),
-                    expected = %expected.short(),
-                    "local runtime is a different build; asking it to retire"
-                );
-                retire_runtime(
-                    &client,
-                    &socket_path,
-                    leveler_client_protocol::RestartReason::BuildMismatch,
                 )
-                .await?;
-            }
-            RuntimeConsistency::ConfigChanged => {
-                tracing::info!(
-                    "local runtime loaded a different configuration generation; asking it to retire"
-                );
-                retire_runtime(
-                    &client,
-                    &socket_path,
-                    leveler_client_protocol::RestartReason::ConfigChanged,
-                )
-                .await?;
-            }
         }
-    }
-
-    std::fs::create_dir_all(&layout.state_dir)?;
-    let log_path = layout.state_dir.join("daemon.log");
-    let log = std::fs::File::create(&log_path)?;
-    let ready_path = std::env::temp_dir().join(format!(
-        "leveler-tui-ready-{}-{}.json",
-        std::process::id(),
-        leveler_core::new_uuid_string()
-    ));
-    let _ = std::fs::remove_file(&ready_path);
-    let exe = std::env::current_exe()?;
-    let mut child = tokio::process::Command::new(&exe)
-        .arg("--repo")
-        .arg(&layout.repo_root)
-        .arg("serve")
-        .arg("--ready-json")
-        .arg(&ready_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log.try_clone()?))
-        .stderr(std::process::Stdio::from(log))
-        // Detached: the daemon owns task lifetime, so it must not share the
-        // TUI's process group (terminal signals) and is never kill-on-drop.
-        .process_group(0)
-        .spawn()?;
-    // NOTE on lifetime: the daemon also installs a SIGHUP handler (see the
-    // serve shutdown select) so a closing terminal cannot hard-kill it and
-    // wipe in-memory session policy (R006 R6-P2 enabling condition).
-
-    let deadline = tokio::time::Instant::now() + DAEMON_ENSURE_TIMEOUT;
-    let client = loop {
-        // The child exiting is not necessarily failure: losing the daemon
-        // election (another TUI's child bound first) exits AlreadyRunning,
-        // and the winner is exactly who we want to connect to.
-        let child_done = child.try_wait()?.is_some();
-        if ready_path.is_file()
-            && let Ok(client) = LocalSocketRuntimeClient::connect(&socket_path).await
-        {
-            break client;
-        }
-        if child_done && let Some(client) = connect_default_runtime(&socket_path).await? {
-            break client;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let _ = child.start_kill();
-            anyhow::bail!(
-                "the local runtime did not become ready within {}s; \
-                 inspect {} or run `leveler tui --in-process` as a fallback",
-                DAEMON_ENSURE_TIMEOUT.as_secs(),
-                log_path.display()
-            );
-        }
-        if child_done {
-            // Startup failed for real (bad config, corrupt identity, …):
-            // surface it now instead of burning the whole deadline.
-            let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
-            let tail = tail.lines().rev().take(8).collect::<Vec<_>>();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            anyhow::bail!(
-                "the local runtime failed to start (log: {}):\n{}\n\
-                 run `leveler tui --in-process` as a fallback",
-                log_path.display(),
-                tail.join("\n")
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    let _ = std::fs::remove_file(&ready_path);
-    // Identity check is best-effort observability: log which runtime serves
-    // us; an old daemon that cannot answer still serves sessions fine.
-    match leveler_local_transport::LocalRuntimeService::runtime_info(&client).await {
-        Ok(info) => tracing::info!(
-            runtime_id = %info.runtime_id,
-            pid = info.pid,
-            "connected to local runtime"
+        EnsureError::ReadyTimeout { seconds, log_path } => format!(
+            "the local runtime did not become ready within {}s; inspect {} or run `leveler tui --in-process` as a fallback",
+            seconds,
+            log_path.display()
         ),
-        Err(error) => tracing::debug!(%error, "local runtime did not report an identity"),
+        EnsureError::StartupFailed { log_path, tail } => format!(
+            "the local runtime failed to start (log: {}):\n{}\nrun `leveler tui --in-process` as a fallback",
+            log_path.display(),
+            tail
+        ),
     }
-    // §20: a spawn that returned Ok proves nothing. The replacement has to
-    // say it is the build we expected, or the bootstrap failed — and it fails
-    // once, without a second attempt, because a restart loop over a build that
-    // keeps coming back wrong helps nobody.
-    let reported = leveler_local_transport::LocalRuntimeService::runtime_info(&client)
-        .await
-        .ok();
-    verify_replacement(
-        reported.as_ref().map(|info| &info.build),
-        &leveler_core::BuildIdentity::current(),
-    )?;
-    let expected_config = leveler_app::runtime_config_fingerprint(layout)?;
-    if reported
-        .as_ref()
-        .and_then(|info| info.config_fingerprint.as_deref())
-        != Some(expected_config.as_str())
+}
+
+#[cfg(any(unix, windows))]
+fn map_ensure_error(error: anyhow::Error) -> anyhow::Error {
+    if let Some(host) = error.downcast_ref::<leveler_runtime_host::EnsureError>() {
+        return anyhow::anyhow!(format_ensure_error(host));
+    }
+    error
+}
+
+#[cfg(any(unix, windows))]
+async fn ensure_tui_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntimeClient> {
+    let client = leveler_runtime_host::ensure_default_runtime(
+        layout,
+        &daemon_launch()?,
+        Arc::new(TuiHandoffUi),
+    )
+    .await
+    .map_err(map_ensure_error)?;
+    if let Some(host) = leveler_execution::execution_host::ExecutionHostClient::probe(
+        &leveler_app::execution_host_config(layout)?,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?
     {
-        anyhow::bail!("the replacement runtime did not load the current configuration generation");
+        let count = host
+            .list()
+            .await
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .filter(|task| {
+                matches!(
+                    task.snapshot.status,
+                    leveler_execution::BackgroundTaskStatus::Running
+                        | leveler_execution::BackgroundTaskStatus::Killing
+                )
+            })
+            .count();
+        if count > 0 {
+            eprintln!("{} {count}", HandoffLang::current().pick(
+                "后台服务继续由独立执行宿主持有，不阻塞版本更新：",
+                "Background services remain owned by the execution host and do not block version updates:",
+            ));
+        }
     }
     Ok(client)
+}
+
+#[cfg(test)]
+#[cfg(any(unix, windows))]
+async fn observe_retiring_runtime(
+    client: &LocalSocketRuntimeClient,
+    socket_path: &Path,
+    _reason: leveler_client_protocol::RestartReason,
+    observed_pid: Option<u32>,
+    interval: Duration,
+) {
+    leveler_runtime_host::observe_retiring_runtime(
+        client,
+        socket_path,
+        observed_pid,
+        interval,
+        &TuiHandoffUi,
+    )
+    .await;
 }
 
 /// Bind the TUI-embedded Web UI against an existing local runtime service.
@@ -1157,7 +618,7 @@ async fn bind_tui_web_ui(
     repo_root: PathBuf,
     shutdown: CancellationToken,
 ) -> Result<String, String> {
-    let token = generate_daemon_token();
+    let token = leveler_runtime_host::generate_daemon_token();
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
     let router = leveler_web::RouterService::new(service, repo_root);
     let manager = leveler_web::ProjectManager::new(
@@ -1246,33 +707,34 @@ pub(crate) async fn cmd_tui(
         // The normal product path: discover the repository's runtime, start
         // one when none is running, and connect. The TUI does not own task
         // lifetime here — closing it leaves the daemon (and its tasks)
-        // running. Unix only: platforms without the socket transport keep
-        // the embedded runtime.
-        #[cfg(unix)]
+        // running. Platforms without local IPC keep the embedded runtime.
+        #[cfg(any(unix, windows))]
         SocketIntent::ProbeDefault => {
-            let client = ensure_default_runtime(&layout).await?;
+            let client = ensure_tui_runtime(&layout).await?;
             // Supervisor semantics for a daemon that dies mid-session: the
             // client's reconnect/request paths call back into the same
             // ensure-daemon flow (idempotent; a concurrent revival race
             // elects one winner), the restarted daemon keeps its durable
             // RuntimeId, recovery reacquires a fresh OwnerEpoch inside the
             // daemon, and session subscriptions resync from a fresh snapshot.
-            client.set_reviver(Arc::new(DaemonReviver {
-                layout: layout.clone(),
-            }));
+            client.set_reviver(Arc::new(leveler_runtime_host::DaemonReviver::new(
+                layout.clone(),
+                daemon_launch()?,
+                Arc::new(TuiHandoffUi),
+            )));
             Some(client)
         }
-        #[cfg(not(unix))]
-        SocketIntent::ProbeDefault => connect_default_runtime(&socket_path).await.map_err(
-            |error| {
+        #[cfg(not(any(unix, windows)))]
+        SocketIntent::ProbeDefault => leveler_runtime_host::probe_default_runtime(&socket_path)
+            .await
+            .map_err(|error| {
                 anyhow::anyhow!(
                     "the local runtime at {} answered the probe but rejected the client: {error}",
                     socket_path.display()
                 )
-            },
-        )?,
+            })?,
         SocketIntent::RequireExplicit => Some(
-            LocalSocketRuntimeClient::connect(&socket_path)
+            leveler_runtime_host::connect_existing_runtime(&socket_path)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -1342,6 +804,7 @@ pub(crate) async fn cmd_tui(
             }
             let bootstrap = client
                 .create_session(CreateSessionRequest {
+                    workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
                     goal: "interactive session".to_string(),
                     model,
                     mode: match map_mode(mode) {
@@ -1380,7 +843,9 @@ pub(crate) async fn cmd_tui(
             history_path: Some(layout.state_dir.join("input_history.json")),
             context_window,
             locale: leveler_tui::Locale::resolve(global.lang.as_deref()),
-            untrusted_config: crate::trust_cmds::untrusted_config_display(&layout.repo_root),
+            untrusted_config: crate::trust_cmds::untrusted_config_display(
+                layout.require_workspace()?,
+            ),
             reasoning_effort: global.reasoning_effort_for(&effort_key),
         };
         // A phone can be served over this connection.
@@ -1395,7 +860,7 @@ pub(crate) async fn cmd_tui(
         let runtime_service: Arc<dyn leveler_local_transport::LocalRuntimeService> = client.clone();
         let remote_launcher = crate::remote_invite::launcher(
             runtime_service.clone(),
-            layout.repo_root.clone(),
+            layout.require_workspace()?.to_path_buf(),
             leveler_remote_agent::RemoteHome::new(
                 leveler_core::LevelerHome::resolve(leveler_core::environment()).remote_state_dir(),
             ),
@@ -1403,7 +868,7 @@ pub(crate) async fn cmd_tui(
         let web_shutdown = CancellationToken::new();
         let web_launcher = make_web_launcher(
             runtime_service,
-            layout.repo_root.clone(),
+            layout.require_workspace()?.to_path_buf(),
             web_shutdown.clone(),
         );
         let client: Arc<dyn InteractiveRuntimeClient> = client;
@@ -1427,6 +892,7 @@ pub(crate) async fn cmd_tui(
     }
 
     let app = Arc::new(Application::assemble(layout)?);
+    app.reconcile_execution_services().await?;
     let model_ref = resolve_model(app.as_ref(), model)?;
     let mode = map_mode(mode);
 
@@ -1479,11 +945,11 @@ pub(crate) async fn cmd_tui(
     let remote_service: Arc<dyn leveler_local_transport::LocalRuntimeService> =
         in_process_client.clone();
     let quit_client = in_process_client.clone();
-    let remote_repo_root = app.layout.repo_root.clone();
+    let remote_repo_root = app.layout.require_workspace()?.to_path_buf();
     let web_shutdown = CancellationToken::new();
     let web_launcher = make_web_launcher(
         web_service,
-        app.layout.repo_root.clone(),
+        app.layout.require_workspace()?.to_path_buf(),
         web_shutdown.clone(),
     );
 
@@ -1510,7 +976,9 @@ pub(crate) async fn cmd_tui(
         context_window,
         // LEVELER_LANG → ~/.leveler/config.toml lang → system → zh.
         locale: leveler_tui::Locale::resolve(app.config.lang.as_deref()),
-        untrusted_config: crate::trust_cmds::untrusted_config_display(&app.layout.repo_root),
+        untrusted_config: crate::trust_cmds::untrusted_config_display(
+            app.layout.require_workspace()?,
+        ),
         reasoning_effort: app
             .config
             .models
@@ -1566,66 +1034,6 @@ pub(crate) async fn cmd_tui(
     std::process::exit(0);
 }
 
-/// The daemon's bound transports. In TCP mode the per-repo Unix socket is
-/// bound too — as the ownership lock that proves no other live daemon serves
-/// this repository (a fresh ephemeral TCP port proves nothing, and startup
-/// reaps `running` turns on that proof). The Unix socket is served as well,
-/// so same-machine clients can attach token-less.
-struct BoundServers {
-    unix: Option<LocalSocketServer>,
-    tcp: Option<(TcpRuntimeServer, String)>,
-}
-
-/// Bind the daemon transports: always the per-repo Unix socket (ownership
-/// lock + local clients), plus the loopback TCP listener when `tcp` is set.
-/// Binding the socket FIRST is what makes a second daemon on the same repo
-/// fail fast instead of reaping the first daemon's active turns.
-async fn bind_daemon_transports(
-    socket_path: &Path,
-    tcp: Option<SocketAddr>,
-    token: Option<String>,
-    service: Arc<dyn leveler_local_transport::LocalRuntimeService>,
-    local_waiters: leveler_local_transport::LocalWaiters,
-) -> anyhow::Result<BoundServers> {
-    let unix =
-        LocalSocketServer::bind_with_waiters(socket_path, service.clone(), local_waiters.clone())
-            .await?;
-    let tcp = match tcp {
-        Some(addr) => {
-            let token = token.unwrap_or_else(generate_daemon_token);
-            let server =
-                TcpRuntimeServer::bind_with_waiters(addr, token.clone(), service, local_waiters)
-                    .await?;
-            Some((server, token))
-        }
-        None => None,
-    };
-    Ok(BoundServers {
-        unix: Some(unix),
-        tcp,
-    })
-}
-
-/// A 256-bit bearer token from the OS CSPRNG, hex-encoded. Never derived from
-/// time/pid — it is the daemon's only network auth secret, so it must be
-/// unpredictable.
-fn generate_daemon_token() -> String {
-    use std::fmt::Write;
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
-    let mut token = String::with_capacity(64);
-    for b in bytes {
-        let _ = write!(token, "{b:02x}");
-    }
-    token
-}
-
-/// Open `url` in the OS default browser, best-effort (any failure is ignored —
-/// the URL is still shown in the TUI notification as a fallback).
-/// Environment variable carrying the daemon bearer token. Secrets never go on
-/// argv (`ps` exposes it); the spawning WebUI passes the token this way.
-pub(crate) const DAEMON_TOKEN_ENV: &str = "LEVELER_DAEMON_TOKEN";
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_serve(
     layout: Layout,
@@ -1660,63 +1068,19 @@ pub(crate) async fn cmd_serve(
         .with_client_presence(local_waiters.clone())
         .with_durable_wire_ack(),
     );
-    let service: Arc<dyn leveler_local_transport::LocalRuntimeService> = runtime.clone();
-
-    // Token comes from the environment when a supervising process (the WebUI
-    // aggregator) supplied one; otherwise mint a fresh one. Never from argv.
-    let token = tcp.map(|_| {
-        std::env::var(DAEMON_TOKEN_ENV)
-            .ok()
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(generate_daemon_token)
-    });
-    // Bind first — a successful Unix socket bind proves no live daemon owns
-    // this repo, so afterwards startup may classify old `running` rows as
-    // crash leftovers. TCP mode binds the socket too (ownership lock + local
-    // token-less clients); an ephemeral TCP port alone proves nothing.
-    let bound = bind_daemon_transports(&socket_path, tcp, token, service, local_waiters).await?;
-    // Only a real daemon process evicts itself; the token/handle are absent
-    // for the embedded runtime, where this is a no-op.
-    runtime.spawn_idle_eviction(daemon_idle_timeout());
-
-    let runtime_id = app.runtime_id()?;
-    // Recovery is an authoritative write, performed as this runtime's boot.
-    // The socket lock proves no other daemon is live — not that no TUI or
-    // `leveler run` is — so only turns of boots proven dead are reaped.
-    let db = app.open_database().await?;
-    let engine = app.task_engine(&db)?;
-    let reap =
-        leveler_engine::reap_after_restart(&engine, None, leveler_engine::ReapScope::EndedBoots)
-            .await?;
-    leveler_engine::release_reaped(&engine, &reap.reaped_sessions).await;
-    for conflict in &reap.conflicts {
-        tracing::warn!(session = conflict.session_id.as_str(), refusal = ?conflict.refusal,
-            "not reaping running turns without proof their boot has ended");
-    }
-    if !reap.events.is_empty() {
-        tracing::warn!(
-            reaped = reap.events.len(),
-            "reaped zombie turns before daemon startup"
-        );
-    }
-    // Start durable memory recovery only after dead turns have been reaped.
-    // Opening the database remains side-effect free for read-only commands;
-    // the daemon composition root explicitly owns this background service.
-    app.start_memory_consolidator().await?;
-
-    if let Some(path) = &ready_json {
-        // Machine-readable readiness for the supervising process (spawned by
-        // the WebUI aggregator or an ensure-daemon TUI): where to connect,
-        // how to authenticate, and which runtime identity is serving.
-        let ready = serde_json::json!({
-            "pid": std::process::id(),
-            "socket": socket_path,
-            "addr": bound.tcp.as_ref().map(|(s, _)| s.local_addr()).transpose()?.map(|a| a.to_string()),
-            "token": bound.tcp.as_ref().map(|(_, t)| t.clone()),
-            "runtime_id": runtime_id.as_str(),
-        });
-        std::fs::write(path, serde_json::to_vec_pretty(&ready)?)?;
-    }
+    // The host establishes exclusive ownership before recovery and publishes
+    // readiness only after the application finishes its existing recovery.
+    let prepared = leveler_runtime_host::prepare_daemon(
+        &app,
+        &runtime,
+        &socket_path,
+        tcp,
+        ready_json.as_deref(),
+        local_waiters,
+    )
+    .await?;
+    let bound = prepared.bound;
+    let runtime_id = prepared.runtime_id;
 
     println!("{}", Line::heading("Local runtime ready"));
     if let Some(server) = &bound.unix {
@@ -1808,7 +1172,8 @@ pub(crate) async fn cmd_web(
             // "open project" flow works (POST /api/projects) instead of 404ing.
             // The daemon is the primary behind the RouterService; added projects
             // get their own probe-or-spawn daemons like the in-process path.
-            let router = leveler_web::RouterService::new(service, layout.repo_root.clone());
+            let router =
+                leveler_web::RouterService::new(service, layout.require_workspace()?.to_path_buf());
             let manager = leveler_web::ProjectManager::new(
                 router.clone(),
                 leveler_core::LevelerHome::resolve(leveler_core::environment()),
@@ -1831,6 +1196,7 @@ pub(crate) async fn cmd_web(
                 ));
             }
             let app = Arc::new(Application::assemble(layout)?);
+            app.reconcile_execution_services().await?;
             let model_ref = resolve_model(app.as_ref(), model)?;
             let runtime = Arc::new(InProcessRuntimeClient::new_with_options(
                 app.clone(),
@@ -1856,7 +1222,10 @@ pub(crate) async fn cmd_web(
                 );
             }
             app.start_memory_consolidator().await?;
-            let router = leveler_web::RouterService::new(service, app.layout.repo_root.clone());
+            let router = leveler_web::RouterService::new(
+                service,
+                app.layout.require_workspace()?.to_path_buf(),
+            );
             let manager = leveler_web::ProjectManager::new(
                 router.clone(),
                 leveler_core::LevelerHome::resolve(leveler_core::environment()),
@@ -1873,7 +1242,7 @@ pub(crate) async fn cmd_web(
                     .discover_historical_projects(&std::env::temp_dir())
                     .await;
             });
-            let token = generate_daemon_token();
+            let token = leveler_runtime_host::generate_daemon_token();
             let server = leveler_web::bind_multi(router, manager, addr, token.clone()).await?;
             (server, Some(runtime), token)
         }
@@ -2086,8 +1455,7 @@ pub(crate) async fn cmd_run_resume(
     confirm_recovery: bool,
     output: OutputFormat,
 ) -> anyhow::Result<std::process::ExitCode> {
-    // Axes SoT is the session row: resume_session reloads work_profile /
-    // collaboration from DB. assemble() defaults (balanced) must not stick.
+    // Resume reloads collaboration and active capabilities from durable state.
     let app = Application::assemble(layout)?;
     let session_id = leveler_core::SessionId::new(id.clone());
 
@@ -2107,8 +1475,8 @@ pub(crate) async fn cmd_run_resume(
 
     if output == OutputFormat::Text {
         println!("{}", Line::heading(&format!("Resuming session {id}")));
-        if let Ok((wp, collab)) = app.session_product_axes(&session_id).await {
-            println!("  work-mode: {} · collab: {}", wp.as_str(), collab.as_str());
+        if let Ok(collab) = app.session_product_axes(&session_id).await {
+            println!("  collab: {}", collab.as_str());
         }
     }
 
@@ -2163,6 +1531,45 @@ async fn ship_changes_and_print(
         Err(e) => println!("{}", Line::fail(&format!("ship failed: {e}"))),
     }
     println!();
+}
+
+/// Exit code for a run that ended honestly without an independently verified
+/// completion: `Blocked`, `Stalled`, `Incomplete`, `Answered`,
+/// `BudgetExhausted` or `TurnLimitReached`.
+///
+/// It is deliberately distinct from [`std::process::ExitCode::FAILURE`] (1),
+/// which is reserved for an execution/runtime/provider error. An honest
+/// refusal must not look like a crash to a shell, CI job or evaluator. The
+/// exact cause stays available machine-readably in the JSONL
+/// `session_completed` event's `stop_reason`.
+pub(crate) const NOT_COMPLETED_EXIT_CODE: u8 = 3;
+
+/// The headless `leveler run` / `leveler run --resume` exit-code contract.
+///
+/// `StopReason` is the runtime's authoritative outcome fact and is also
+/// emitted machine-readably. The process exit code is its coarse scriptable
+/// projection:
+///
+/// ```text
+/// 0    completed     independently verified completion
+/// 1    failed        execution / runtime / provider error (crash, transport)
+/// 2    usage error   CLI argument error (clap)
+/// 3    not completed agent ended honestly without a verified completion
+/// 130  interrupted   cancelled; the session is resumable
+/// ```
+///
+/// A run can therefore never report an honest non-completion with the same
+/// code as a crash.
+fn outcome_exit_code(stop_reason: StopReason) -> std::process::ExitCode {
+    match stop_reason {
+        StopReason::Completed => std::process::ExitCode::SUCCESS,
+        StopReason::Answered
+        | StopReason::Incomplete
+        | StopReason::BudgetExhausted
+        | StopReason::TurnLimitReached
+        | StopReason::Blocked
+        | StopReason::Stalled => std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
+    }
 }
 
 /// Render the final summary and pick an exit code, handling cancellation
@@ -2249,12 +1656,7 @@ fn finish(
                     "modified_files": outcome.modified_files,
                 }));
             }
-            let ok = outcome.stop_reason == StopReason::Completed;
-            Ok(if ok {
-                std::process::ExitCode::SUCCESS
-            } else {
-                std::process::ExitCode::FAILURE
-            })
+            Ok(outcome_exit_code(outcome.stop_reason))
         }
         Err(leveler_app::AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
             if output == OutputFormat::Text {
@@ -2784,9 +2186,10 @@ mod daemon_bind_tests {
         );
         assert_eq!(
             bridge.local_waiter_count().await.unwrap(),
-            2,
-            "the daemon sees the bridge's global and per-session subscriptions; \
-             returning the facade default of one would hide both"
+            0,
+            "the count must come from the daemon, not the facade default of one; \
+             a TCP peer is never a trusted local waiter, whatever ClientKind it \
+             declares (see `tcp_forged_local_kind_cannot_disarm_remote_approval_timeout`)"
         );
 
         shutdown.cancel();
@@ -3746,5 +3149,46 @@ mod handover_recovery_tests {
             ..Default::default()
         };
         assert!(stalled_turn_sessions(&health).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod outcome_exit_code_tests {
+    use super::{NOT_COMPLETED_EXIT_CODE, outcome_exit_code};
+    use leveler_agent::StopReason;
+
+    fn code(reason: StopReason) -> std::process::ExitCode {
+        outcome_exit_code(reason)
+    }
+
+    /// The one contract an external caller depends on: an honest refusal is
+    /// never reported with the generic failure code, so it cannot be confused
+    /// with a crash.
+    #[test]
+    fn honest_non_completion_is_distinct_from_failure() {
+        for reason in [
+            StopReason::Blocked,
+            StopReason::Stalled,
+            StopReason::Incomplete,
+            StopReason::Answered,
+            StopReason::BudgetExhausted,
+            StopReason::TurnLimitReached,
+        ] {
+            assert_eq!(
+                code(reason),
+                std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
+                "{reason:?}"
+            );
+            assert_ne!(
+                code(reason),
+                std::process::ExitCode::FAILURE,
+                "{reason:?} must not look like a crash"
+            );
+        }
+    }
+
+    #[test]
+    fn only_completed_is_success() {
+        assert_eq!(code(StopReason::Completed), std::process::ExitCode::SUCCESS);
     }
 }

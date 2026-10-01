@@ -95,12 +95,8 @@ fn default_true() -> bool {
 
 /// `memory:` — whether durable project memory is part of this project at all.
 ///
-/// This is the ONE user-visible switch for the memory capability. It is
-/// deliberately separate from `work_profile`: economy is a cost/surface
-/// decision, not a privacy decision, and it used to be the only way to stop
-/// memory. Default is ON because that is the behaviour every existing session
-/// already had (memory was admitted for every non-economy turn), so an absent
-/// block cannot silently change what a user's memory store does.
+/// Default is ON. When disabled, loading memory is not permitted; existing
+/// durable entries remain stored. Tool exposure is controlled per goal.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MemoryConfig {
     /// When false: no turn is admitted to memory extraction, no background

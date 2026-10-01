@@ -46,7 +46,9 @@ fn state() -> AppState {
 fn snapshot() -> UiSessionSnapshot {
     UiSessionSnapshot {
         id: SessionId::new("s1"),
-        repository: "/repo".to_string(),
+        repository: Some("/repo".to_string()),
+        task_status: None,
+        task_terminal: None,
         goal: "interactive session".to_string(),
         model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
         mode: leveler_client_protocol::PermissionProfile::Assisted,
@@ -555,6 +557,7 @@ fn a_cross_turn_background_task_keeps_running_into_the_next_turn() {
             task_id: "bg1".into(),
             program: "cargo".into(),
             args: vec!["test".into()],
+            pid: None,
         }),
     );
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
@@ -580,6 +583,7 @@ fn reconnect_rebuilds_only_registry_active_background_tasks() {
             task_id: "terminal-before-reconnect".into(),
             program: "false".into(),
             args: vec![],
+            pid: None,
         }),
     );
     let mut snap = snapshot();
@@ -588,6 +592,7 @@ fn reconnect_rebuilds_only_registry_active_background_tasks() {
         program: "cargo".into(),
         args: vec!["test".into()],
         elapsed_ms: 4_000,
+        pid: None,
     }];
 
     reduce(
@@ -615,6 +620,7 @@ fn lifecycle_lag_reconciliation_replaces_stale_active_background_tasks() {
             task_id: "missed-terminal".into(),
             program: "false".into(),
             args: vec![],
+            pid: None,
         }),
     );
     s.activity_selected = Some(leveler_tui::activity::ActivityId::Background(
@@ -631,6 +637,7 @@ fn lifecycle_lag_reconciliation_replaces_stale_active_background_tasks() {
                 program: "cargo".into(),
                 args: vec!["check".into()],
                 elapsed_ms: 2_000,
+                pid: None,
             }],
         }),
     );
@@ -727,6 +734,7 @@ fn switching_sessions_drops_the_previous_activity_detail() {
             task_id: "bg-2".into(),
             program: "cargo".into(),
             args: vec!["test".into()],
+            pid: None,
         }),
     );
     s.activity_selected = Some(leveler_tui::activity::ActivityId::Background("bg-2".into()));
@@ -740,6 +748,7 @@ fn switching_sessions_drops_the_previous_activity_detail() {
         program: "cargo".into(),
         args: vec!["test".into()],
         elapsed_ms: 1_000,
+        pid: None,
     }];
     reduce(
         &mut s,

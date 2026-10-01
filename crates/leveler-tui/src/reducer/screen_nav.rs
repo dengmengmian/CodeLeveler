@@ -202,21 +202,45 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             KeyCode::End | KeyCode::Char('G') => crate::activity::to_bottom(state),
             _ => {}
         },
-        Screen::ActivityList => match key.code {
-            KeyCode::Esc => crate::activity::close_background_list(state),
-            KeyCode::Up | KeyCode::Char('k') => crate::activity::move_list_selection(state, -1),
-            KeyCode::Down | KeyCode::Char('j') => crate::activity::move_list_selection(state, 1),
-            KeyCode::Enter => return crate::activity::open_list_selected(state),
-            // `x` stops exactly the selected running task, through the runtime's
-            // own cancellation path. A terminal row advertises nothing to stop.
-            KeyCode::Char('x') | KeyCode::Char('X') => {
-                let Some(task_id) = crate::activity::selected_list_task(state) else {
-                    return Vec::new();
-                };
-                return cancel_background_task(state, &task_id);
+        Screen::ActivityList => {
+            use crate::activity::BackgroundPane;
+            match key.code {
+                KeyCode::Esc => {
+                    // Two levels of back: leave the log first, then the page.
+                    if state.background_list_focus == BackgroundPane::Output {
+                        crate::activity::focus_background_list(state);
+                    } else {
+                        crate::activity::close_background_list(state);
+                    }
+                }
+                KeyCode::Tab | KeyCode::BackTab => crate::activity::toggle_background_focus(state),
+                KeyCode::Up | KeyCode::Char('k') => match state.background_list_focus {
+                    BackgroundPane::List => crate::activity::move_list_selection(state, -1),
+                    BackgroundPane::Output => crate::activity::scroll_selected_output(state, -1),
+                },
+                KeyCode::Down | KeyCode::Char('j') => match state.background_list_focus {
+                    BackgroundPane::List => crate::activity::move_list_selection(state, 1),
+                    BackgroundPane::Output => crate::activity::scroll_selected_output(state, 1),
+                },
+                KeyCode::PageUp => crate::activity::page_selected_output(state, -1),
+                KeyCode::PageDown => crate::activity::page_selected_output(state, 1),
+                KeyCode::Home | KeyCode::Char('g') => crate::activity::top_selected_output(state),
+                KeyCode::End | KeyCode::Char('G') => crate::activity::bottom_selected_output(state),
+                // Enter takes the user into the selected task's log; Tab moves
+                // back. The page never leaves this screen on its own.
+                KeyCode::Enter => crate::activity::focus_background_output(state),
+                // `x` stops exactly the selected running task, through the
+                // runtime's own cancellation path. A terminal row advertises
+                // nothing to stop.
+                KeyCode::Char('x') | KeyCode::Char('X') => {
+                    let Some(task_id) = crate::activity::selected_list_task(state) else {
+                        return Vec::new();
+                    };
+                    return cancel_background_task(state, &task_id);
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
         Screen::Plan => {
             if key.code == KeyCode::Esc {
                 close_screen(state);

@@ -50,11 +50,13 @@ impl ApprovalRequest {
 pub enum ApprovalDecision {
     /// Allow this one action.
     ApproveOnce,
-    /// Allow this action and similar ones for the rest of the current turn
+    /// Allow this exact proposed call for the rest of the current turn
     /// (the executor run that asked). The wire name predates that scope.
+    /// The call identity includes explicit args/cwd, not resolved resources.
     ApproveSession,
     /// Allow this action and persist a project permission rule so matching
-    /// actions auto-allow in future sessions too (SEC-1). Falls back to
+    /// actions auto-allow in future sessions too (SEC-1). Command rules match
+    /// exact command identities, not cwd or resolved resources. Falls back to
     /// session-only when the call cannot be expressed as a safe rule.
     ApproveAlways,
     /// Reject the action.
@@ -328,6 +330,15 @@ pub fn shell_c_script(args: &[String]) -> Option<&str> {
 /// Classify a command by its program and arguments. Deliberately conservative:
 /// deletion, privilege escalation, and network access are all "dangerous".
 pub fn classify_command(cmd: &CommandView) -> CommandClass {
+    // Git is decided by EFFECT, but its verdict can only ever ADD a reason to
+    // ask. A `Safe` Git reading must not mask the command that shares the
+    // script with it: `git status; open /tmp/file` is Dangerous because of
+    // `open`, and `git status > /etc/hosts` because of the redirect. Falling
+    // through keeps the strictest verdict, which is what every other rule in
+    // this function already does.
+    if git_command_class(cmd.program, cmd.args) == Some(CommandClass::Dangerous) {
+        return CommandClass::Dangerous;
+    }
     let program = basename(cmd.program);
 
     // A shell wrapper (`sh -c "..."`, `cmd /C "..."`) must not launder a
@@ -347,7 +358,40 @@ pub fn classify_command(cmd: &CommandView) -> CommandClass {
         return classify_shell_script(script);
     }
 
-    classify_program(program, cmd.args.first().map(String::as_str))
+    classify_program(program, cmd.args)
+}
+
+/// Danger verdict for a Git invocation, decided from its EFFECTS rather than
+/// from the word `git`.
+///
+/// `None` when nothing in the call is Git. `Dangerous` when the call has an
+/// effect a person has to authorize: a change to the checkout's state
+/// (`git pull`, `git switch`, `git reset --hard`), a remote side effect
+/// (`git push`), a repository-identity rewrite (`git remote set-url`,
+/// `git config`), irreversible history loss (`git clean -fd`,
+/// `git push --force`), an invocation whose effects could not be read, or a
+/// sync against a remote the repository does not configure (`git fetch
+/// https://…`) — that last one is what stops a sync command from being turned
+/// into an arbitrary fetch target.
+///
+/// Everything else — including `git fetch origin`, which writes repository
+/// metadata but neither the checkout's state, repository identity, nor a
+/// remote — stays Safe. Its metadata write is a mechanical PRECONDITION,
+/// granted from the effects in [`crate::git_effects`], not an authority
+/// question in itself.
+fn git_command_class(program: &str, args: &[String]) -> Option<CommandClass> {
+    let executed = crate::shell_ast::executed_commands(program, args);
+    let effects = executed.git_effects();
+    if !effects.any_git {
+        return None;
+    }
+    if effects.gated() {
+        return Some(CommandClass::Dangerous);
+    }
+    // Git owns its own effects, not the verdict of other commands in the
+    // same script. Let the shell classifier aggregate those commands and
+    // redirections before declaring a mixed invocation safe.
+    effects.fully_git.then_some(CommandClass::Safe)
 }
 
 /// Host UI / LaunchServices openers. These fail under the workspace seatbelt
@@ -481,6 +525,13 @@ pub fn command_is_destructive(cmd: &CommandView) -> bool {
     if DESTRUCTIVE.contains(&basename(cmd.program)) {
         return true;
     }
+    // Git states its own irreversible effects (`git reset --hard`,
+    // `git clean -fd`, `git push --force`) from argv; the literal walk below
+    // cannot see them because `git` is not a destructive PROGRAM.
+    let executed = crate::shell_ast::executed_commands(cmd.program, cmd.args);
+    if executed.git_effects().effects.irreversible {
+        return true;
+    }
     match shell_c_script(cmd.args) {
         Some(script) if is_shell_wrapper_program(cmd.program) => script_is_destructive(script),
         _ => false,
@@ -499,7 +550,13 @@ fn script_is_destructive(script: &str) -> bool {
     })
 }
 
-pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> CommandClass {
+pub(crate) fn classify_program(program: &str, args: &[String]) -> CommandClass {
+    // Git is a single owner (`git_effects`) even on the fallback path, so a
+    // `git push` inside an unparseable script cannot read as harmless. As in
+    // [`classify_command`], Git only ever escalates the verdict.
+    if git_command_class(program, args) == Some(CommandClass::Dangerous) {
+        return CommandClass::Dangerous;
+    }
     // Privilege escalation.
     const PRIVILEGED: &[&str] = &["sudo", "su", "doas"];
 
@@ -520,7 +577,7 @@ pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> Comman
     // Host openers leave the workspace sandbox (Finder/browser side effects).
     if is_host_escape_program(program) {
         if program == "gio" {
-            if first_arg == Some("open") {
+            if args.first().map(String::as_str) == Some("open") {
                 return CommandClass::Dangerous;
             }
         } else {
@@ -528,9 +585,9 @@ pub(crate) fn classify_program(program: &str, first_arg: Option<&str>) -> Comman
         }
     }
 
-    // `first_arg` retained for future command-specific danger lists; publish/push
+    // `args` retained for future command-specific danger lists; publish/push
     // are intentionally Safe (sandbox-first + user-driven Always rules).
-    let _ = first_arg;
+    let _ = args;
     CommandClass::Safe
 }
 
@@ -573,11 +630,10 @@ fn classify_shell_script_fallback(script: &str) -> CommandClass {
             }
             continue;
         }
-        if let Some((prog, rest)) = tokens.split_first() {
-            let first = rest.first().map(String::as_str);
-            if classify_program(basename(prog), first) == CommandClass::Dangerous {
-                return CommandClass::Dangerous;
-            }
+        if let Some((prog, rest)) = tokens.split_first()
+            && classify_program(basename(prog), rest) == CommandClass::Dangerous
+        {
+            return CommandClass::Dangerous;
         }
     }
     CommandClass::Safe
@@ -1051,9 +1107,17 @@ mod tests {
             classify_command(&view("/usr/bin/sudo", &[])),
             CommandClass::Dangerous
         );
-        // Push/publish auto under Assisted (sandbox-first); only deletion/etc. prompt.
+        // Git automation is decided by EFFECT, not by the program name: a
+        // remote write, an identity rewrite, or irreversible history loss is
+        // Dangerous whatever the profile; a repository metadata write that
+        // touches neither is not (see the git effect matrix below).
         let push = ["push".to_string(), "origin".to_string()];
-        assert_eq!(classify_command(&view("git", &push)), CommandClass::Safe);
+        assert_eq!(
+            classify_command(&view("git", &push)),
+            CommandClass::Dangerous
+        );
+        let status = ["status".to_string()];
+        assert_eq!(classify_command(&view("git", &status)), CommandClass::Safe);
         assert_eq!(
             classify_command(&view("cargo", &["publish".into()])),
             CommandClass::Safe
@@ -1206,40 +1270,46 @@ mod tests {
         );
     }
 
+    /// Two claims at once, and they are different claims:
+    ///
+    /// - `git push` is a REMOTE side effect. It must never ride on the fetch
+    ///   decision, whatever the profile.
+    /// - A remote fetch that only writes repository metadata is not an
+    ///   authority question under a profile that already grants the network
+    ///   and workspace writes.
+    ///
+    /// `cargo publish` is not Git and keeps its long-standing sandbox-first
+    /// verdict.
     #[test]
-    fn assisted_git_push_and_publish_are_auto() {
-        // Product policy: under Assisted, only deletion/privilege/host-escape
-        // prompt — not network shell or git push (screenshot: `git push` spam).
+    fn git_remote_write_prompts_while_a_repository_sync_does_not() {
         let policy = ApprovalPolicy::default();
-        let push = ["push".to_string()];
-        assert_eq!(
+        let evaluate = |tool: &str, program: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
             policy.evaluate(
                 PermissionProfile::Assisted,
-                "run_command",
+                tool,
                 RiskLevel::WorkspaceWrite,
-                Some(view("git", &push)),
-            ),
-            Requirement::Auto
+                Some(view(program, &args)),
+            )
+        };
+        assert_eq!(
+            evaluate("run_command", "git", &["push"]),
+            Requirement::NeedApproval,
+            "git push changes a remote and must be authorized"
         );
-        let shell_push = ["-c".to_string(), "git push".to_string()];
         assert_eq!(
-            policy.evaluate(
-                PermissionProfile::Assisted,
-                "shell_command",
-                RiskLevel::WorkspaceWrite,
-                Some(view("sh", &shell_push)),
-            ),
+            evaluate("shell_command", "sh", &["-c", "git push"]),
+            Requirement::NeedApproval,
+            "a shell wrapper must not launder the push verdict"
+        );
+        assert_eq!(
+            evaluate("run_command", "git", &["push", "--force"]),
+            Requirement::NeedApproval
+        );
+        assert_eq!(
+            evaluate("run_command", "cargo", &["publish"]),
             Requirement::Auto,
-            "shell_command git push must not prompt under Assisted"
-        );
-        assert_eq!(
-            policy.evaluate(
-                PermissionProfile::Assisted,
-                "run_command",
-                RiskLevel::WorkspaceWrite,
-                Some(view("cargo", &["publish".to_string()])),
-            ),
-            Requirement::Auto
+            "publish stays sandbox-first: not Git's decision to make"
         );
     }
 

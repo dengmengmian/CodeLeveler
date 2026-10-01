@@ -36,6 +36,13 @@ pub enum RestartReason {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientCommand {
+    /// Read local durable sources; never starts their runtimes.
+    QueryGlobalTasks {
+        requester_session_id: SessionId,
+        query_id: String,
+        #[serde(default)]
+        include_archived: bool,
+    },
     /// Ask the runtime for one best-effort prediction of the user's next
     /// prompt. The request is advisory UI chrome: it starts no task, persists
     /// no message, and may produce no event when there is insufficient context.
@@ -193,9 +200,8 @@ pub enum ClientCommand {
         session_id: SessionId,
         mode: PermissionProfile,
     },
-    /// Set product session axes (work profile × collaboration). Wire strings:
-    /// work_profile = economy|balanced (legacy `delivery` reads as `balanced`);
-    /// collaboration = chat|plan|goal.
+    /// Set collaboration (`chat | plan | goal`). `work_profile` is a deprecated
+    /// compatibility field accepted from old clients and ignored by the runtime.
     SetProductAxes {
         session_id: SessionId,
         work_profile: String,
@@ -505,7 +511,8 @@ impl ClientCommand {
             | ClientCommand::DeleteAgent { session_id, .. }
             | ClientCommand::QueryObservability { session_id, .. }
             | ClientCommand::QueryContext { session_id, .. } => Some(session_id),
-            ClientCommand::RequestSessionListFor {
+            ClientCommand::QueryGlobalTasks { requester_session_id, .. }
+            | ClientCommand::RequestSessionListFor {
                 requester_session_id,
             }
             | ClientCommand::NewSessionFor {

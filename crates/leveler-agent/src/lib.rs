@@ -13,6 +13,7 @@
 
 pub mod agent_registry;
 mod authorization;
+pub mod capability;
 mod child_profile;
 pub mod coding;
 pub mod executor;
@@ -52,7 +53,6 @@ pub use leveler_execution::{
 pub use leveler_lifecycle::{
     ChildLimit, ChildStop, CollaborationMode, EvidenceLedger, ObjectiveAnchor, ObjectiveSource,
     PlanOrigin, PlanState, PlanStep, ProgressCaps, ProgressLedger, StopReason, TurnPhase,
-    WorkProfile,
 };
 pub use memory_extract::{
     BatchCandidateRejection, BatchCandidateValidation, BatchSemanticCandidate, BatchSourceTurn,
@@ -63,7 +63,9 @@ pub use memory_extract::{
 };
 pub use sub_agent::{ChildResult, ChildStatus, RUNTIME_NOTICE_HEADERS, SettledChildNotice};
 pub use sub_agent::{multi_agent_steer_hint, should_inject_delegation_hint};
-pub use update_plan::{UpdatePlanTool, register_harness_controls};
+pub use update_plan::{
+    HarnessControls, UpdatePlanTool, register_harness_controls, register_harness_controls_with,
+};
 
 /// Recover the task budget before a host-initiated paid auxiliary request.
 pub use coding::turn::load_auxiliary_budget_progress;

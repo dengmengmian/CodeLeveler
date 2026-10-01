@@ -311,6 +311,10 @@ pub(crate) async fn cmd_sessions(
             render_session_show(&db, &sid, &session).await?;
         }
         SessionsCommand::Delete { id } => {
+            app.background_tasks()
+                .kill_session(&id)
+                .await
+                .map_err(anyhow::Error::msg)?;
             if repo
                 .delete(&leveler_core::SessionId::new(id.clone()))
                 .await?

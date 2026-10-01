@@ -204,6 +204,11 @@ pub enum UiCommandStop {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    GlobalTasksLoaded {
+        requester_session_id: crate::SessionId,
+        query_id: String,
+        index: crate::UiGlobalTaskIndex,
+    },
     /// The runtime finished booting and is ready for commands.
     RuntimeReady,
     /// A session was opened / its snapshot refreshed.
@@ -579,6 +584,11 @@ pub enum RuntimeEvent {
         task_id: String,
         program: String,
         args: Vec<String>,
+        /// The process-group leader's OS pid, when the runtime observed one.
+        /// A read-only fact for a detail view; it carries no authority.
+        /// Additive; older clients ignore the unknown field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
     },
     /// A live chunk of a background task's combined stdout/stderr, already
     /// sanitized and capped by the runtime. Additive; older clients ignore the
@@ -773,7 +783,9 @@ mod tests {
     fn session_snapshot() -> UiSessionSnapshot {
         UiSessionSnapshot {
             id: SessionId::new("sess-1"),
-            repository: "repo".to_string(),
+            repository: Some("repo".to_string()),
+            task_status: None,
+            task_terminal: None,
             goal: "goal".to_string(),
             model: Some(ModelRef::new("openai", "gpt-4o")),
             mode: crate::PermissionProfile::Assisted,
@@ -840,7 +852,7 @@ mod tests {
             session: crate::UiSessionObservation {
                 session_id: SessionId::new("s1"),
                 goal: "g".into(),
-                repository: "/repo".into(),
+                repository: Some("/repo".into()),
                 created_at: "t".into(),
                 updated_at: "t".into(),
                 status: "idle".into(),
@@ -1156,6 +1168,8 @@ mod tests {
         roundtrip(
             RuntimeEvent::SessionList {
                 sessions: vec![UiSessionSummary {
+                    task_status: None,
+                    task_terminal: None,
                     id: SessionId::new("s1"),
                     goal: "g".to_string(),
                     status: "done".to_string(),
@@ -1338,6 +1352,7 @@ mod tests {
                 task_id: "bg-1".into(),
                 program: "sleep".into(),
                 args: vec!["1".into()],
+                pid: Some(4242),
             },
             "background_task_started",
         );

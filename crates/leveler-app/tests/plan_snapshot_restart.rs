@@ -220,3 +220,41 @@ async fn a_plan_updated_after_the_latest_terminal_is_active_on_restart() {
     assert_eq!(plan.steps[0].description, "current");
     assert_eq!(plan.steps[0].status, PlanStepStatus::Running);
 }
+
+#[tokio::test]
+async fn a_cold_running_session_has_the_same_status_in_list_and_snapshot() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+    let app = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
+    let id = app
+        .create_session(&ModelRef::new("mock", "m"), "cold running")
+        .await
+        .unwrap();
+    let db = app.open_database().await.unwrap();
+    leveler_storage::SessionRepository::new(&db)
+        .update_status(
+            &id,
+            leveler_lifecycle::SessionStatus::Running,
+            leveler_lifecycle::AgentState::Plan,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    let runtime = client(app);
+    let snapshot = runtime.snapshot(&id).await.unwrap();
+    let mut events = runtime.subscribe();
+    runtime
+        .send(leveler_client_protocol::ClientCommand::RequestSessionList)
+        .await
+        .unwrap();
+    let list = loop {
+        if let leveler_client_protocol::RuntimeEvent::SessionList { sessions } =
+            events.recv().await.unwrap()
+        {
+            break sessions;
+        }
+    };
+    let summary = list.into_iter().find(|row| row.id == id).unwrap();
+    assert_eq!(summary.status, snapshot.status);
+    assert_ne!(summary.status, "running");
+}

@@ -142,6 +142,9 @@ struct TabInput {
 
 #[async_trait]
 impl Tool for BrowserTabTool {
+    fn requires_workspace(&self) -> bool {
+        false
+    }
     fn name(&self) -> &'static str {
         "browser_tab"
     }
@@ -319,6 +322,9 @@ struct ActInput {
 
 #[async_trait]
 impl Tool for BrowserActTool {
+    fn requires_workspace(&self) -> bool {
+        false
+    }
     fn name(&self) -> &'static str {
         "browser_act"
     }
@@ -429,6 +435,9 @@ struct InspectInput {
 
 #[async_trait]
 impl Tool for BrowserInspectTool {
+    fn requires_workspace(&self) -> bool {
+        false
+    }
     fn name(&self) -> &'static str {
         "browser_inspect"
     }

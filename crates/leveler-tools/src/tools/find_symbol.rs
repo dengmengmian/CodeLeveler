@@ -66,7 +66,7 @@ impl Tool for FindSymbolTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let root = context.execution.workspace.root().to_path_buf();
+        let root = context.require_workspace()?.root().to_path_buf();
 
         // Precise path: ask a language server (session reused across calls).
         if let Some(located) = self.lsp.locate(&root, &input.symbol).await {

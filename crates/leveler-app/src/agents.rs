@@ -58,7 +58,10 @@ impl AgentEnvironment for AppEnvironment {
 impl Application {
     /// The roots this project's agents are read from and written to.
     pub fn agent_roots(&self) -> AgentRoots {
-        AgentRoots::for_project(&self.layout.repo_root)
+        self.layout
+            .primary_workspace()
+            .map(AgentRoots::for_project)
+            .unwrap_or_default()
     }
 
     pub fn agent_registry(&self) -> AgentRegistry {
@@ -90,14 +93,11 @@ impl Application {
         AppEnvironment {
             profiles,
             session_model: session_model.cloned(),
-            skills: leveler_skills::SkillRegistry::load(
-                &leveler_skills::SkillRoots::for_project_in(&self.layout.repo_root, &|key| {
-                    self.environment.var_os(key)
-                }),
-            )
-            .available_names()
-            .into_iter()
-            .collect(),
+            skills: self
+                .skill_registry()
+                .available_names()
+                .into_iter()
+                .collect(),
         }
     }
 
