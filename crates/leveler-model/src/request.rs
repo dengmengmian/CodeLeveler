@@ -76,10 +76,51 @@ pub struct ControlContext {
 }
 
 impl ControlContext {
-    /// Render the wire text without discarding the structured source blocks.
+    /// Render the whole control channel without discarding the structured
+    /// source blocks.
+    ///
+    /// This is the route-agnostic render: every block, in assembly order, no
+    /// matter where a protocol ends up putting it. It is what the context
+    /// accounting and the pressure estimate measure, so the split below can
+    /// never change the cost of a request. Use [`Self::prefix_text`] and
+    /// [`Self::trailing_text`] for the provider-visible two positions.
     pub fn text(&self) -> String {
-        self.blocks
-            .iter()
+        self.render_blocks(self.blocks.iter())
+    }
+
+    /// The blocks that belong AHEAD of the transcript: the request's stable
+    /// prefix.
+    ///
+    /// A block with [`SegmentLifecycle::RequestEphemeral`] is excluded. That
+    /// lifecycle means "attached to a single model request", so its text is
+    /// rebuilt on every round; putting it ahead of the conversation would
+    /// invalidate the provider's prefix cache for the entire transcript on
+    /// every round (measured: a ~4% hit rate that decayed as the session
+    /// grew, instead of ~95%).
+    pub fn prefix_text(&self) -> String {
+        self.render_blocks(
+            self.blocks
+                .iter()
+                .filter(|block| block.lifecycle != SegmentLifecycle::RequestEphemeral),
+        )
+    }
+
+    /// The blocks attached AFTER the transcript: content that exists only for
+    /// this one request.
+    ///
+    /// Position is the only thing that changes. The block keeps its source,
+    /// authority and lifecycle, and it still travels on the control channel,
+    /// so a runtime fact does not become user intent by moving.
+    pub fn trailing_text(&self) -> String {
+        self.render_blocks(
+            self.blocks
+                .iter()
+                .filter(|block| block.lifecycle == SegmentLifecycle::RequestEphemeral),
+        )
+    }
+
+    fn render_blocks<'a>(&self, blocks: impl Iterator<Item = &'a PromptSegment>) -> String {
+        blocks
             .map(|segment| segment.text.as_str())
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -289,6 +330,61 @@ mod tests {
         encoded.as_object_mut().unwrap().remove("control_context");
         let legacy: ModelRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(legacy.control_context, ControlContext::default());
+    }
+
+    /// A block that only exists for one request must not sit in the stable
+    /// prefix, and the split must not lose or duplicate any block.
+    #[test]
+    fn single_request_control_is_partitioned_out_of_the_stable_prefix() {
+        let mut control = ControlContext::default();
+        control.push(PromptSegment::control(
+            "core_contract",
+            PromptSource::BasePrompt,
+            PromptAuthority::CoreContract,
+            SegmentLifecycle::SessionPrefix,
+            true,
+            "A",
+        ));
+        control.push(PromptSegment::control(
+            "execution_state",
+            PromptSource::ExecutionState,
+            PromptAuthority::RuntimeFact,
+            SegmentLifecycle::RequestEphemeral,
+            false,
+            "B",
+        ));
+        control.push(PromptSegment::control(
+            "memory_recall",
+            PromptSource::MemoryRecall { ids: vec![] },
+            PromptAuthority::AdvisoryContext,
+            SegmentLifecycle::Turn,
+            false,
+            "C",
+        ));
+
+        // The accounting/estimate view keeps every block, in assembly order.
+        assert_eq!(control.text(), "A\n\nB\n\nC");
+        assert_eq!(control.prefix_text(), "A\n\nC");
+        assert_eq!(control.trailing_text(), "B");
+        // Nothing is lost and nothing is written twice.
+        assert_eq!(control.blocks.len(), 3);
+        let prefix = control.prefix_text();
+        let trailing = control.trailing_text();
+        let mut all: Vec<&str> = prefix
+            .split("\n\n")
+            .chain(trailing.split("\n\n"))
+            .filter(|s| !s.is_empty())
+            .collect();
+        all.sort_unstable();
+        assert_eq!(all, vec!["A", "B", "C"]);
+
+        // Lifecycles the split does not touch are unaffected.
+        assert_eq!(control.blocks[0].lifecycle, SegmentLifecycle::SessionPrefix);
+        assert_eq!(
+            control.blocks[1].lifecycle,
+            SegmentLifecycle::RequestEphemeral
+        );
+        assert_eq!(control.blocks[2].lifecycle, SegmentLifecycle::Turn);
     }
 
     #[test]

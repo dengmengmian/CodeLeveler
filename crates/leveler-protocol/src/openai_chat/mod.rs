@@ -298,17 +298,23 @@ impl ProtocolAdapter for OpenAiChatAdapter {
 /// This function carries NO replay policy: whether a turn's reasoning reaches
 /// the wire was decided by [`leveler_model::RequestProjection`], and what this
 /// encoder does is spell the decision.
+///
+/// The control channel has two positions here, and which block goes where was
+/// decided by the projection:
+///
+/// ```text
+/// [system: stable control][transcript...][system: single-request control]
+/// ```
+///
+/// Both are `system` messages, so authority is unchanged. The single-request
+/// blocks trail the transcript because they are rebuilt every round: ahead of
+/// the history they would break the provider's prefix cache on the first
+/// differing byte, which is the whole transcript.
 fn convert_messages(projection: &RequestProjection) -> Vec<ChatMessage> {
     let mut out = Vec::new();
-    let control = projection.control_text();
+    let control = projection.control_prefix_text();
     if !control.is_empty() {
-        out.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(wire::ChatContent::Text(control)),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        });
+        out.push(system_message(control));
     }
     for msg in projection.messages() {
         // Tool-result messages map to one `role: tool` message per result.
@@ -372,7 +378,23 @@ fn convert_messages(projection: &RequestProjection) -> Vec<ChatMessage> {
             tool_call_id: None,
         });
     }
+
+    // Attached after the transcript, never before it: see the doc comment.
+    let trailing = projection.control_trailing_text();
+    if !trailing.is_empty() {
+        out.push(system_message(trailing));
+    }
     out
+}
+
+fn system_message(text: String) -> ChatMessage {
+    ChatMessage {
+        role: "system".to_string(),
+        content: Some(wire::ChatContent::Text(text)),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    }
 }
 
 /// Render an image source as an OpenAI `image_url` value (URL or data URI).
@@ -417,7 +439,8 @@ fn request_id_from(id: &Option<String>) -> leveler_core::RequestId {
 mod tests {
     use super::*;
     use leveler_model::{
-        ModelRef, ReasoningConfig, ReasoningEffort, ReasoningStyle, ToolDefinition,
+        ModelRef, ReasoningConfig, ReasoningEffort, ReasoningStyle, ToolCall, ToolDefinition,
+        ToolResultContent,
     };
 
     /// The DeepSeek-shaped route contract: captured reasoning is carried on
@@ -1764,6 +1787,196 @@ mod tests {
         assert_eq!(
             json["content"][1]["image_url"]["url"],
             "data:image/png;base64,abc"
+        );
+    }
+
+    /// Byte offset of the first difference between two wire strings.
+    fn first_divergence(a: &str, b: &str) -> usize {
+        a.bytes()
+            .zip(b.bytes())
+            .position(|(x, y)| x != y)
+            .unwrap_or_else(|| a.len().min(b.len()))
+    }
+
+    /// A request whose control channel carries both stable session blocks and
+    /// one per-request observation, the shape the coding harness builds.
+    fn request_with_execution_state(
+        transcript: Vec<Message>,
+        execution_state: &str,
+    ) -> ModelRequest {
+        use leveler_model::{
+            ControlContext, PromptAuthority, PromptSegment, PromptSource, SegmentLifecycle,
+        };
+        let mut control = ControlContext::default();
+        control.push(PromptSegment::control(
+            "core_contract",
+            PromptSource::BasePrompt,
+            PromptAuthority::CoreContract,
+            SegmentLifecycle::SessionPrefix,
+            true,
+            "Core contract body.",
+        ));
+        control.push(PromptSegment::control(
+            "project_rules",
+            PromptSource::ProjectRules {
+                paths: vec!["AGENTS.md".into()],
+            },
+            PromptAuthority::ProjectInstruction,
+            SegmentLifecycle::SessionPrefix,
+            true,
+            "Root rule.",
+        ));
+        control.push(PromptSegment::control(
+            "execution_state",
+            PromptSource::ExecutionState,
+            PromptAuthority::RuntimeFact,
+            SegmentLifecycle::RequestEphemeral,
+            false,
+            execution_state,
+        ));
+        let mut req = ModelRequest::new(ModelRef::new("deepseek", "deepseek-flash"), transcript);
+        req.control_context = control;
+        req.tools = vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }];
+        req
+    }
+
+    fn assistant_tool_call() -> Message {
+        Message::from_parts(
+            Role::Assistant,
+            vec![ContentPart::ToolCall {
+                call: ToolCall {
+                    id: leveler_core::ToolCallId::new("c1"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            }],
+            None,
+        )
+    }
+
+    fn tool_result() -> Message {
+        Message::from_parts(
+            Role::Tool,
+            vec![ContentPart::ToolResult {
+                result: ToolResultContent {
+                    call_id: leveler_core::ToolCallId::new("c1"),
+                    content: "pub fn old() {}".into(),
+                    is_error: false,
+                },
+            }],
+            None,
+        )
+    }
+
+    /// A per-request control block changes on every round. It must not sit
+    /// before the transcript, or the provider's prefix cache can never match
+    /// past it and the whole history is re-processed every round.
+    #[test]
+    fn volatile_request_control_does_not_break_the_transcript_prefix() {
+        let round1 = request_with_execution_state(
+            vec![Message::text(Role::User, "goal")],
+            "Execution state:\n{\"step\":1}",
+        );
+        let round2 = request_with_execution_state(
+            vec![
+                Message::text(Role::User, "goal"),
+                assistant_tool_call(),
+                tool_result(),
+            ],
+            "Execution state:\n{\"step\":2}",
+        );
+
+        let body1 = OpenAiChatAdapter::new()
+            .encode_request(&round1, &ctx(), true)
+            .unwrap()
+            .body;
+        let body2 = OpenAiChatAdapter::new()
+            .encode_request(&round2, &ctx(), true)
+            .unwrap()
+            .body;
+        let m1 = body1["messages"].as_array().unwrap();
+        let m2 = body2["messages"].as_array().unwrap();
+
+        // The leading system message is the stable prefix.
+        assert_eq!(m1[0]["role"], "system");
+        assert_eq!(
+            m1[0], m2[0],
+            "the leading system prefix changed between rounds"
+        );
+        assert!(
+            !m1[0]["content"].as_str().unwrap().contains("step"),
+            "a single-request observation must not be in the leading prefix: {}",
+            m1[0]["content"]
+        );
+
+        // Everything both rounds share is byte-identical, and the wire must not
+        // diverge inside it.
+        let shared = m1.len().min(m2.len());
+        let shared = (0..shared).take_while(|i| m1[*i] == m2[*i]).count();
+        assert!(
+            shared >= 2,
+            "leading prefix and the shared transcript must match; shared={shared}"
+        );
+        let shared_json = serde_json::to_string(&m1[..shared]).unwrap();
+        let shared_end = shared_json.len() - 2; // drop the enclosing brackets
+        let wire1 = serde_json::to_string(m1).unwrap();
+        let wire2 = serde_json::to_string(m2).unwrap();
+        assert!(
+            first_divergence(&wire1, &wire2) > shared_end,
+            "the wire diverged inside the shared transcript (offset {} of {} bytes); \
+             a per-request block is ahead of it again",
+            first_divergence(&wire1, &wire2),
+            shared_end
+        );
+
+        // The observation is attached after the transcript, still on the
+        // system channel so its authority is unchanged.
+        let tail1 = m1.last().unwrap();
+        let tail2 = m2.last().unwrap();
+        assert_eq!(tail1["role"], "system");
+        assert_eq!(tail2["role"], "system");
+        assert!(tail1["content"].as_str().unwrap().contains("\"step\":1"));
+        assert!(tail2["content"].as_str().unwrap().contains("\"step\":2"));
+
+        // The stable prefix really is stable, not merely equal by accident.
+        assert!(
+            m1[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Core contract body.")
+        );
+        assert!(m1[0]["content"].as_str().unwrap().contains("Root rule."));
+    }
+
+    /// Encoding one decision twice must be byte-identical: no map iteration or
+    /// discovery order may leak into the wire.
+    #[test]
+    fn encoding_the_same_request_is_byte_deterministic() {
+        let build = || {
+            request_with_execution_state(
+                vec![
+                    Message::text(Role::User, "goal"),
+                    assistant_tool_call(),
+                    tool_result(),
+                ],
+                "Execution state:\n{\"step\":3}",
+            )
+        };
+        let a = OpenAiChatAdapter::new()
+            .encode_request(&build(), &ctx(), true)
+            .unwrap()
+            .body;
+        let b = OpenAiChatAdapter::new()
+            .encode_request(&build(), &ctx(), true)
+            .unwrap()
+            .body;
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
         );
     }
 }

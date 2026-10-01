@@ -277,6 +277,12 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
 /// turn) but that wire choice does not assign it contract authority — the
 /// projection's segment authority is unchanged. Tool results become
 /// `tool_result` blocks inside a user message.
+///
+/// This route has ONE system position (a top-level field), so every control
+/// block lands in it, including the projection's single-request blocks. That
+/// is a representation difference, not a second decision: the projection still
+/// owns which block is single-request, and this protocol simply has no second
+/// control position to place it in.
 fn convert_messages(
     projection: &leveler_model::RequestProjection,
 ) -> (Option<String>, Vec<ReqMessage>) {

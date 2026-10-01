@@ -9123,3 +9123,94 @@ async fn a_turn_advertises_the_harness_control_protocol_it_can_actually_use() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The per-request execution observation is rebuilt every round. It must be
+/// attached AFTER the transcript, not folded into the leading control prefix:
+/// ahead of the history, its own per-round change breaks the provider's prefix
+/// cache for the whole transcript (`https://api-docs.deepseek.com/guides/kv_cache`).
+#[tokio::test]
+async fn volatile_execution_state_trails_the_transcript_on_the_projected_wire() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-execution-state-tail-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "Root rule.").unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::with_environment(
+        workspace,
+        PermissionProfile::Assisted,
+        Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            std::env::current_dir().unwrap_or_default(),
+            std::env::temp_dir(),
+        )),
+    );
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_tool_call("c1", "read_file", serde_json::json!({"path": "src/lib.rs"})),
+        assistant_text("done"),
+    ]));
+    let executor = Executor::new(
+        runtime.clone(),
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+    executor
+        .run(
+            "read lib",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = runtime.recorded_requests();
+    assert_eq!(requests.len(), 2);
+    let projection = |i: usize| {
+        requests[i]
+            .projection
+            .as_ref()
+            .expect("the kernel decides the projection before the request leaves the loop")
+    };
+    let (p1, p2) = (projection(0), projection(1));
+
+    // The leading prefix is byte-stable across rounds and carries no
+    // single-request observation.
+    assert_eq!(
+        p1.control_prefix_text(),
+        p2.control_prefix_text(),
+        "the leading control prefix must not change between rounds"
+    );
+    assert!(p1.control_prefix_text().contains("Root rule."));
+    assert!(
+        !p1.control_prefix_text().contains("Execution state"),
+        "a per-request observation must not be in the leading prefix"
+    );
+
+    // The observation is attached after the transcript, once per request, and
+    // it really did change (so the test is not vacuous).
+    assert!(p1.control_trailing_text().contains("Execution state"));
+    assert!(p2.control_trailing_text().contains("Execution state"));
+    assert_ne!(
+        p1.control_trailing_text(),
+        p2.control_trailing_text(),
+        "the observation is what changes each round; that is why it trails"
+    );
+
+    // The accounting reads the same projection and still sees every block, so
+    // the split cannot change a request's cost or its compaction pressure.
+    assert_eq!(
+        p1.control_text(),
+        requests[0].control_context.text(),
+        "the split must not drop or rewrite a control block"
+    );
+
+    // History only grew: it stays the cached prefix.
+    assert!(p2.messages().len() > p1.messages().len());
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -679,6 +679,10 @@ mod tests {
         };
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.cached_input_tokens, 90);
+        // `prompt_cache_miss_tokens` is the complement, already inside
+        // `prompt_tokens`: it is never added on top of the input count.
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cache_hit_rate(), 0.9);
     }
 
     /// OpenAI reports the same thing under `prompt_tokens_details.cached_tokens`.

@@ -670,8 +670,16 @@ async fn stream_round(
                 usage: latest_usage,
             }) => {
                 on_event(AgentEvent::Usage(latest_usage));
-                usage = latest_usage;
-                *observed_usage = Some(latest_usage);
+                // A zero report is the ABSENCE of a measurement, not a
+                // measurement of zero. A gateway that emits an empty `usage`
+                // object after the real one must not erase it, or the round
+                // would be billed as free and its cache line lost. A later
+                // non-zero report always wins: the provider's final word is
+                // the authoritative one.
+                if latest_usage.total() > 0 || usage.total() == 0 {
+                    usage = latest_usage;
+                    *observed_usage = Some(latest_usage);
+                }
             }
             // Start / partial tool-call fragments, or content after
             // completion — no assembly state we need here.
@@ -2101,6 +2109,49 @@ mod attempt_contract_tests {
                 ..Default::default()
             },
         }
+    }
+    fn cached_usage(input: u64, output: u64, cached: u64) -> ModelEvent {
+        ModelEvent::UsageUpdated {
+            usage: TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+                cached_input_tokens: cached,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The provider's final word wins; a zero report after a real one is
+    /// "unreported", never "zero".
+    #[tokio::test]
+    async fn a_later_zero_usage_report_does_not_erase_an_observed_one() {
+        let order = Arc::new(Mutex::new(vec![]));
+        let runtime = Runtime {
+            scripts: Mutex::new(vec![vec![
+                cached_usage(100, 10, 90),
+                usage(0, 0),
+                ModelEvent::MessageCompleted {
+                    finish_reason: FinishReason::Stop,
+                },
+            ]]),
+            order,
+        };
+        let mut observer = Observer {
+            attempts: vec![],
+            order: Arc::new(Mutex::new(vec![])),
+            reject: false,
+        };
+        let round = run_model_round_observed(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut observer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(round.usage.input_tokens, 100);
+        assert_eq!(round.usage.cached_input_tokens, 90);
+        assert_eq!(round.usage.cache_hit_rate(), 0.9);
     }
     fn error() -> ModelEvent {
         ModelEvent::Error {

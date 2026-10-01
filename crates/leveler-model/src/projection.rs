@@ -779,6 +779,24 @@ impl RequestProjection {
         &self.control_context
     }
 
+    /// The control text an encoder places ahead of the transcript.
+    pub fn control_prefix_text(&self) -> String {
+        self.control_context.prefix_text()
+    }
+
+    /// The control text an encoder attaches after the transcript.
+    ///
+    /// Single-request blocks live here, after the conversation rather than in
+    /// front of it, so their per-round change cannot invalidate the provider's
+    /// prefix cache for the history. Which blocks these are is decided once,
+    /// in [`crate::ControlContext`], and every consumer reads that decision.
+    pub fn control_trailing_text(&self) -> String {
+        self.control_context.trailing_text()
+    }
+
+    /// Every control block, in assembly order. The accounting and the pressure
+    /// estimate measure this, so splitting a request across two wire positions
+    /// cannot change its cost.
     pub fn control_text(&self) -> String {
         self.control_context.text()
     }
