@@ -1,11 +1,10 @@
 //! Shell writes and Git formatting flags cannot borrow metadata authority.
-use leveler_execution::{
-    CommandClass, CommandRunner, CommandView, classify_command, executed_commands,
-};
-// Only the two Unix-gated tests below build a request with a write scope, so on
-// Windows these would be unused imports under `-D warnings`.
+use leveler_execution::{CommandClass, CommandView, classify_command, executed_commands};
+// Only the two Unix-gated tests below build a request with a write scope, and
+// only the `runner` helper below names a `CommandRunner`, so on Windows these
+// would be unused imports under `-D warnings`.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use leveler_execution::{ProcessRequest, WriteScope};
+use leveler_execution::{CommandRunner, ProcessRequest, WriteScope};
 use leveler_test_support::git;
 
 fn effects(script: &str) -> leveler_execution::CallGitEffects {
