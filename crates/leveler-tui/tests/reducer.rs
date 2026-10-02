@@ -7931,6 +7931,29 @@ fn typed_placeholder_text_is_delivered_literally() {
     );
 }
 
+/// Folding is paste semantics, not a length heuristic. A chip says "this
+/// arrived as a paste"; text the user typed must never become one, however
+/// long the line gets — and it must not be confused with one on the way out.
+#[test]
+fn typed_text_is_never_folded_however_long_it_is() {
+    let line = "这件".repeat(300);
+    let mut s = state();
+    reduce(&mut s, Action::TextInput(line.clone()));
+    assert_eq!(s.composer.text(), line);
+    assert!(
+        !s.composer.text().contains("[Pasted"),
+        "a long line is not a paste: {}",
+        s.composer.text()
+    );
+    // The same through the single-key path, one character at a time.
+    let mut s = state();
+    for _ in 0..400 {
+        reduce(&mut s, key(KeyCode::Char('好')));
+    }
+    assert_eq!(s.composer.text().chars().count(), 400);
+    assert!(!s.composer.text().contains("[Pasted"));
+}
+
 // ── R004 F2: input while a clarification is on screen answers the question ──
 
 #[test]
@@ -7975,6 +7998,82 @@ fn paste_while_clarification_overlay_open_fills_the_answer() {
         !text.contains("[Pasted: 6 lines]"),
         "the chip is presentation, never the answer: {effects:?}"
     );
+}
+
+/// A picker with a query owns typing just as a question does. Before this,
+/// text pasted at a searchable picker went into the composer hidden behind it:
+/// the user saw nothing happen, and the filter they typed for sat in a draft
+/// they could not see.
+#[test]
+fn a_paste_filters_a_searchable_picker_and_not_the_composer_behind_it() {
+    let mut s = searchable_model_picker();
+    reduce(&mut s, Action::Paste("model-3".into()));
+    let Some(Overlay::ModelPicker(m)) = &s.overlay else {
+        panic!("the picker closed");
+    };
+    assert_eq!(m.query(), "model-3");
+    assert_eq!(m.visible_rows().len(), 1, "the query is the filter");
+    assert!(
+        s.composer.is_empty(),
+        "the paste must not reach the composer behind the picker: {}",
+        s.composer.text()
+    );
+    // The picker still confirms with Enter, on the row the query left.
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        format!("{effects:?}").contains("model-3"),
+        "Enter picks the filtered row: {effects:?}"
+    );
+}
+
+/// Typing arrives coalesced, and a burst is text like any other key.
+#[test]
+fn a_typing_burst_reaches_a_searchable_picker_s_query() {
+    let mut s = searchable_model_picker();
+    reduce(&mut s, Action::TextInput("model-3".into()));
+    let Some(Overlay::ModelPicker(m)) = &s.overlay else {
+        panic!("the picker closed");
+    };
+    assert_eq!(m.query(), "model-3");
+    assert!(s.composer.is_empty(), "{}", s.composer.text());
+}
+
+/// A list with no query must not swallow text aimed at it — a picker the user
+/// just opened is not a text field, and the paste still belongs somewhere.
+#[test]
+fn a_paste_with_a_list_only_picker_still_goes_to_the_composer() {
+    let mut s = opened();
+    reduce(&mut s, ctrl('m'));
+    let Some(Overlay::ModelPicker(m)) = &s.overlay else {
+        panic!("the picker did not open");
+    };
+    assert!(!m.is_searchable(), "two models do not need a filter");
+    reduce(&mut s, Action::Paste("hello".into()));
+    assert_eq!(s.composer.text(), "hello");
+    let Some(Overlay::ModelPicker(m)) = &s.overlay else {
+        panic!("the picker closed");
+    };
+    assert_eq!(m.query(), "");
+}
+
+/// Open the model picker the way a user with many models gets one: the filter
+/// only exists past six rows, so the threshold is part of the fixture.
+fn searchable_model_picker() -> AppState {
+    let mut session = snapshot();
+    session.available_models = (1..=8)
+        .map(|i| leveler_client_protocol::ModelRef::parse(&format!("vendor/model-{i}")).unwrap())
+        .collect();
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session }),
+    );
+    reduce(&mut s, ctrl('m'));
+    let Some(Overlay::ModelPicker(m)) = &s.overlay else {
+        panic!("the picker did not open");
+    };
+    assert!(m.is_searchable(), "eight models offer a filter");
+    s
 }
 
 /// F1: a plan transition must be on screen in the very next frame. Waiting

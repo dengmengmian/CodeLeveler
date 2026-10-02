@@ -953,4 +953,48 @@ mod tests {
         ov.insert_text("中文\n第二行\n第三行\n第四行\n第五行");
         assert_eq!(ov.active_text(), "[Pasted: 5 lines]");
     }
+
+    /// The field inherits the editor's grapheme accounting, including the case
+    /// that used to drift: a combining mark arriving as its own key event joins
+    /// the character before it, and the caret counts the text, not the keys.
+    #[test]
+    fn a_combining_mark_is_one_cluster_in_the_field() {
+        // Backspace takes the whole cluster, not a mark left standing alone.
+        let mut ov = single_text();
+        type_str(&mut ov, "e");
+        type_str(&mut ov, "\u{301}");
+        assert_eq!(ov.active_text(), "e\u{301}");
+        ov.on_key(key(KeyCode::Backspace));
+        assert_eq!(ov.active_text(), "");
+        // Moving over it moves over the cluster: two Lefts from the end land
+        // before `e`, so the next character goes in front of both halves.
+        let mut ov = single_text();
+        type_str(&mut ov, "e\u{301}x");
+        ov.on_key(key(KeyCode::Left));
+        ov.on_key(key(KeyCode::Left));
+        type_str(&mut ov, "A");
+        assert_eq!(ov.active_text(), "Ae\u{301}x");
+        ov.on_key(ctrl('e'));
+        assert_eq!(ov.active_text(), "Ae\u{301}x");
+    }
+
+    /// A folded paste comes back exactly as it went in — combining marks, CJK,
+    /// emoji, a ZWJ sequence and all. The grapheme-cursor work touched the same
+    /// path that stores a paste payload, so this is the regression that would
+    /// matter most: silently rewriting what the model is about to read.
+    #[test]
+    fn a_unicode_paste_is_delivered_byte_for_byte() {
+        let payload = "修复 e\u{301} 的重入\n\u{1f44d}\u{1f3fd} emoji\n\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466} family\n中文行\n\u{1f1e8}\u{1f1f3} flag";
+        let mut ov = single_text();
+        type_str(&mut ov, "请分析：");
+        ov.insert_text(payload);
+        assert_eq!(ov.active_text(), "请分析：[Pasted: 5 lines]");
+        let answer = submit(ov);
+        assert_eq!(answer, format!("请分析：{payload}"));
+        // Nothing was normalized away, and nothing was flattened into the chip.
+        assert!(answer.contains("e\u{301}"));
+        assert!(answer.contains("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}"));
+        assert!(answer.contains('\n'));
+        assert!(!answer.contains("[Pasted:"), "{answer}");
+    }
 }

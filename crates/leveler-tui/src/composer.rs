@@ -27,6 +27,28 @@ fn byte_of_grapheme(s: &str, g: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// The grapheme index of `byte`: how many graphemes begin before it.
+///
+/// This is where a cursor may come from after a mutation, because it is a count
+/// of real grapheme starts inside the buffer: it always lands on a boundary and
+/// can never exceed the grapheme count. Counting the graphemes an insertion
+/// *added* is a different number, and the wrong one whenever the inserted text
+/// joins the cluster beside it — a combining mark, the base it attaches to, a
+/// second regional indicator, an emoji modifier, a ZWJ. `e` then `U+0301` is two
+/// insertions of one grapheme each and one grapheme of text; a cursor that
+/// believed the sum would point between the two halves of a cluster that the
+/// segmenter reports as one, and every later edit at that cursor would be off
+/// by one.
+///
+/// A byte inside a cluster resolves to the boundary after it: the cursor rests
+/// after the whole thing that was just written.
+fn grapheme_index_of(s: &str, byte: usize) -> usize {
+    let byte = byte.min(s.len());
+    s.grapheme_indices(true)
+        .take_while(|(i, _)| *i < byte)
+        .count()
+}
+
 /// The image-token template when none has been set: `[image #1]`.
 const DEFAULT_IMAGE_TOKEN: &str = "[image #{}]";
 const DEFAULT_FILE_TOKEN: &str = "[file #{}]";
@@ -195,7 +217,7 @@ impl Composer {
         let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
         let at = byte_of_grapheme(&self.buffer, self.cursor);
         self.buffer.insert_str(at, &normalized);
-        self.cursor += grapheme_count(&normalized);
+        self.cursor = grapheme_index_of(&self.buffer, at + normalized.len());
     }
 
     /// Insert pasted text. Large pastes are represented by a short placeholder
@@ -356,7 +378,7 @@ impl Composer {
             .map(|(index, ch)| index + ch.len_utf8())
             .unwrap_or(0);
         self.buffer.replace_range(start..end, replacement);
-        self.cursor = grapheme_count(&self.buffer[..start]) + grapheme_count(replacement);
+        self.cursor = grapheme_index_of(&self.buffer, start + replacement.len());
     }
 
     /// Insert a newline (soft submit: `Ctrl+J` / `Alt+Enter`, ).
@@ -747,7 +769,7 @@ impl Composer {
             .count();
         let token = self.image_token.replace("{}", &(index + 1).to_string());
         self.buffer.insert_str(at, &format!("{token} "));
-        self.cursor += grapheme_count(&token) + 1;
+        self.cursor = grapheme_index_of(&self.buffer, at + token.len() + 1);
         self.renumber_image_tokens();
         index
     }
@@ -856,8 +878,10 @@ impl Composer {
     }
 
     /// Replace the buffer and place the cursor at a byte offset within it.
+    /// The offset is resolved through [`grapheme_index_of`], so an edit that
+    /// merged the text around the cursor still leaves it on a boundary.
     fn rewrite(&mut self, text: String, cursor_byte: usize) {
-        self.cursor = grapheme_count(&text[..cursor_byte.min(text.len())]);
+        self.cursor = grapheme_index_of(&text, cursor_byte);
         self.buffer = text;
     }
 
@@ -1014,5 +1038,221 @@ mod history_tests {
                 "/btw 为什么这样设计".to_string()
             ]
         );
+    }
+
+    // ---- grapheme-cursor invariant (the editor's correctness contract) ------
+
+    /// Type each character as its OWN key event.
+    ///
+    /// This is how a terminal without the Kitty keyboard protocol delivers a
+    /// combining mark: the base arrives, then the mark arrives as its own
+    /// event. One event is not one grapheme, which is exactly the assumption
+    /// the cursor arithmetic used to make.
+    fn type_each(c: &mut Composer, s: &str) {
+        for ch in s.chars() {
+            c.apply_editing_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+    }
+
+    /// The invariant every mutation has to leave behind: the cursor is a real
+    /// grapheme boundary, so it is inside `[0, grapheme_count]` and the byte it
+    /// names is the START of the grapheme it is numbered after.
+    fn assert_cursor_on_boundary(c: &Composer) {
+        let text = c.text();
+        let count = grapheme_count(text);
+        assert!(
+            c.cursor() <= count,
+            "cursor {} is past the {count} graphemes of {text:?}",
+            c.cursor()
+        );
+        let byte = byte_of_grapheme(text, c.cursor());
+        assert_eq!(
+            grapheme_index_of(text, byte),
+            c.cursor(),
+            "cursor {} is not on a grapheme boundary in {text:?}",
+            c.cursor()
+        );
+    }
+
+    #[test]
+    fn plain_latin_edits_one_character_at_a_time() {
+        let mut c = Composer::new();
+        type_each(&mut c, "abc");
+        assert_eq!(c.cursor(), 3);
+        c.backspace();
+        assert_eq!(c.text(), "ab");
+        c.move_left();
+        c.delete();
+        assert_eq!(c.text(), "a");
+        assert_eq!(c.cursor(), 1);
+        assert_cursor_on_boundary(&c);
+    }
+
+    #[test]
+    fn a_hanzi_backspaces_as_one_character() {
+        let mut c = Composer::new();
+        type_each(&mut c, "中文输入");
+        assert_cursor_on_boundary(&c);
+        assert_eq!(c.cursor(), 4);
+        c.backspace();
+        assert_eq!(c.text(), "中文输");
+        c.backspace();
+        assert_eq!(c.text(), "中文");
+        assert_eq!(c.cursor(), 2);
+    }
+
+    #[test]
+    fn a_lone_combining_mark_does_not_move_the_cursor_off_the_cluster() {
+        let mut c = Composer::new();
+        type_each(&mut c, "e");
+        assert_eq!(c.cursor(), 1);
+        // The mark alone is one grapheme to the segmenter; with the `e` it is
+        // one grapheme of text. The cursor must count the text, not the keys.
+        type_each(&mut c, "\u{301}");
+        assert_eq!(c.text(), "e\u{301}");
+        assert_eq!(grapheme_count(c.text()), 1);
+        assert_eq!(c.cursor(), 1);
+        assert_cursor_on_boundary(&c);
+        // Which is what makes the next edit land on real text.
+        c.backspace();
+        assert_eq!(c.text(), "");
+        assert_eq!(c.cursor(), 0);
+    }
+
+    #[test]
+    fn a_combining_cluster_moves_and_deletes_as_one_grapheme() {
+        let mut c = Composer::new();
+        type_each(&mut c, "e\u{301}x");
+        assert_eq!(grapheme_count(c.text()), 2);
+        assert_eq!(c.cursor(), 2);
+        assert_cursor_on_boundary(&c);
+        c.move_left();
+        assert_eq!(c.cursor(), 1, "one step crosses the whole cluster");
+        c.move_left();
+        assert_eq!(c.cursor(), 0);
+        c.move_right();
+        assert_eq!(c.cursor(), 1);
+        c.move_to_line_end();
+        assert_eq!(c.cursor(), 2);
+        c.backspace();
+        assert_eq!(c.text(), "e\u{301}");
+        assert_eq!(c.cursor(), 1);
+        c.move_to_line_start();
+        c.delete();
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn an_emoji_modifier_edits_as_one_grapheme() {
+        let mut c = Composer::new();
+        type_each(&mut c, "\u{1f44d}\u{1f3fd}");
+        assert_eq!(grapheme_count(c.text()), 1);
+        assert_eq!(c.cursor(), 1);
+        assert_cursor_on_boundary(&c);
+        c.backspace();
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn a_zwj_sequence_edits_as_one_grapheme() {
+        let mut c = Composer::new();
+        type_each(
+            &mut c,
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+        );
+        assert_eq!(grapheme_count(c.text()), 1, "the family is one grapheme");
+        assert_eq!(c.cursor(), 1);
+        assert_cursor_on_boundary(&c);
+        c.backspace();
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn a_variation_selector_edits_as_one_grapheme() {
+        let mut c = Composer::new();
+        type_each(&mut c, "\u{2764}\u{fe0f}");
+        assert_eq!(grapheme_count(c.text()), 1);
+        assert_eq!(c.cursor(), 1);
+        assert_cursor_on_boundary(&c);
+        c.backspace();
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn a_regional_indicator_pair_edits_as_one_grapheme() {
+        let mut c = Composer::new();
+        type_each(&mut c, "\u{1f1e8}\u{1f1f3}");
+        assert_eq!(grapheme_count(c.text()), 1, "the flag is one grapheme");
+        assert_eq!(c.cursor(), 1);
+        assert_cursor_on_boundary(&c);
+        c.backspace();
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn no_edit_leaves_the_cursor_inside_a_grapheme() {
+        let mut c = Composer::new();
+        for chunk in [
+            "修",
+            "复",
+            "e",
+            "\u{301}",
+            "\u{1f44d}",
+            "\u{1f3fd}",
+            "\u{1f468}\u{200d}\u{1f469}",
+            "x",
+            "\n",
+            "中",
+            "\u{1f1e8}\u{1f1f3}",
+        ] {
+            type_each(&mut c, chunk);
+            assert_cursor_on_boundary(&c);
+        }
+        // Walk back over every position, then delete forward over every one.
+        c.move_to_line_end();
+        for _ in 0..24 {
+            c.backspace();
+            assert_cursor_on_boundary(&c);
+        }
+        assert_eq!(c.text(), "");
+        c.move_to_line_start();
+        for _ in 0..4 {
+            c.delete();
+            assert_cursor_on_boundary(&c);
+        }
+    }
+
+    #[test]
+    fn inserted_tokens_leave_the_cursor_on_a_boundary() {
+        let mut c = Composer::new();
+        type_each(&mut c, "e\u{301}");
+        // A token written next to a cluster that a mark joined.
+        c.insert_image_token();
+        assert_cursor_on_boundary(&c);
+        assert_eq!(c.text(), "e\u{301}[image #1] ");
+        c.insert_file_reference("/tmp/notes.txt", "notes.txt");
+        assert_cursor_on_boundary(&c);
+        c.insert_paste("line1\nline2\nline3\nline4\nline5");
+        assert_cursor_on_boundary(&c);
+        // Editing back through the chip, the reference, the token and the
+        // cluster still holds — a token comes out as one step, a grapheme as
+        // one step, and the cursor stays on a boundary after each.
+        for _ in 0..40 {
+            if c.text().is_empty() {
+                break;
+            }
+            c.backspace();
+            assert_cursor_on_boundary(&c);
+        }
+        assert_eq!(c.text(), "", "every grapheme and every token can come out");
+    }
+
+    #[test]
+    fn a_wrapped_field_maps_the_caret_of_a_cluster() {
+        let mut c = Composer::new();
+        type_each(&mut c, "e\u{301}");
+        // One grapheme is one display column, so the caret is after it.
+        assert_eq!(c.cursor_row_col_display(), (0, 1));
+        assert_eq!(c.text_before_cursor(), "e\u{301}");
     }
 }

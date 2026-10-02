@@ -71,6 +71,37 @@ impl Overlay {
             | Overlay::ConfirmSessionDelete(_) => None,
         }
     }
+
+    /// Hand pasted or burst text to this overlay when it owns a text field, and
+    /// answer whether it took it.
+    ///
+    /// A question and a searchable picker are both places the user types; a
+    /// list that filters nothing is not, and text aimed at it must not be
+    /// swallowed. `false` means "not mine": the caller falls back to the
+    /// composer, which is where a paste that belongs to no field has always
+    /// gone.
+    pub(crate) fn insert_text(&mut self, text: &str) -> bool {
+        match self {
+            Overlay::Clarification(ov) => {
+                ov.insert_text(text);
+                true
+            }
+            Overlay::ModelPicker(m)
+            | Overlay::ModePicker(m)
+            | Overlay::ThemePicker(m)
+            | Overlay::CollabPicker(m)
+            | Overlay::UnsupportedMedia(m)
+            | Overlay::CheckpointPicker(m)
+            | Overlay::ConfirmSessionDelete(m) => {
+                if !m.is_searchable() {
+                    return false;
+                }
+                m.insert_query_text(text);
+                true
+            }
+            Overlay::Approval(_) => false,
+        }
+    }
 }
 
 /// Everything a renderer needs to draw an overlay: its title, its fully
@@ -273,7 +304,7 @@ fn build_content(
         | Overlay::CollabPicker(model)
         | Overlay::UnsupportedMedia(model)
         | Overlay::CheckpointPicker(model)
-        | Overlay::ConfirmSessionDelete(model) => selection_content(model, theme, locale),
+        | Overlay::ConfirmSessionDelete(model) => selection_content(model, theme, width, locale),
         Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
     }
@@ -834,10 +865,12 @@ fn clarification_content(
     let mut cursor_row: Option<usize> = None;
     if active.kind == ClarificationQuestionKind::Text {
         // The field owns its own plane. "Where do I type" has to be answered
-        // before the words are read, so the rows take the input surface between
-        // two focused separators instead of being the same grey as everything
-        // around them — and `>` stays the only accent inside them.
-        let separator = Style::default().fg(theme.border.focus);
+        // before the words are read, so the rows take the input surface and
+        // their edges are the ordinary border — a region, the same weight as
+        // every other boundary in this TUI. The focus cue is inside: `>` and the
+        // caret in the accent. Two bright rules would read as a selected button
+        // and out-shout the question they belong to.
+        let separator = Style::default().fg(theme.border.normal);
         let edge = "─".repeat(width.max(1));
         lines.push(Line::from(Span::styled(edge.clone(), separator)));
         let (field, caret) = active.field_cursor();
@@ -1020,6 +1053,7 @@ fn clarification_content(
 fn selection_content(
     model: &SelectionModel,
     theme: &Theme,
+    width: usize,
     locale: crate::i18n::Locale,
 ) -> RawContent {
     let t = locale.text();
@@ -1043,11 +1077,40 @@ fn selection_content(
         lines.push(Line::from(""));
     }
     if model.is_searchable() {
-        cursor = Some((lines.len(), 8 + UnicodeWidthStr::width(model.query())));
-        lines.push(Line::from(vec![
-            Span::styled(t.picker_search, Style::default().fg(theme.text.secondary)),
-            Span::raw(model.query().to_string()),
-        ]));
+        // The search box is this picker's editor, so it is drawn the way every
+        // other editor in this TUI is drawn: on its own input surface, with the
+        // caret at the column the caret is actually on. It used to be pinned a
+        // fixed eight columns past the end of the text, which put it in the
+        // wrong place for any query and off the card for a long one.
+        let prefix = t.picker_search;
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        let field = Style::default()
+            .fg(theme.text.primary)
+            .bg(theme.surface.input);
+        let label = Style::default()
+            .fg(theme.text.secondary)
+            .bg(theme.surface.input);
+        let avail = width.saturating_sub(prefix_w).max(1);
+        let (text, caret) = model.query_field();
+        // One query, one row: the window follows the caret, so a query longer
+        // than the card stays usable instead of running off it.
+        let (rows, caret_row) = wrap_with_caret(text, caret, avail, 0, 0);
+        let shown = rows.get(caret_row);
+        let row = lines.len();
+        let typed = shown.map(|r| r.text.clone()).unwrap_or_default();
+        let used = prefix_w + UnicodeWidthStr::width(typed.as_str());
+        let mut spans = vec![Span::styled(prefix, label)];
+        spans.push(Span::styled(typed, field));
+        if used < width {
+            // The lane runs to the edge of the card: a field is a place, not a
+            // highlight behind the characters currently in it.
+            spans.push(Span::styled(" ".repeat(width - used), field));
+        }
+        lines.push(Line::from(spans));
+        if let Some(col) = shown.and_then(|r| r.caret_col) {
+            cursor = Some((row, prefix_w + col));
+            cursor_row = Some(row);
+        }
         lines.push(Line::from(""));
     }
 
@@ -1994,5 +2057,162 @@ mod layout_tests {
                 );
             }
         }
+    }
+
+    /// The field is a region, not a focus ring. Its edges are the ordinary
+    /// border — a boundary on the same footing as every other in the TUI — and
+    /// the only thing in the accent is the prompt marker and the caret. Two
+    /// bright rules read as a selected button and out-shout the question.
+    #[test]
+    fn the_field_s_edges_are_not_a_focus_signal() {
+        let theme = Theme::default();
+        let (_, lines, _) = content_lines(&text_overlay("hi"), &theme, 40, crate::i18n::Locale::Zh);
+        let edges: Vec<&Line> = lines
+            .iter()
+            .filter(|line| {
+                !line.spans.is_empty()
+                    && line
+                        .spans
+                        .iter()
+                        .all(|span| span.content.chars().all(|c| c == '─'))
+            })
+            .collect();
+        assert_eq!(edges.len(), 2, "top and bottom edge: {lines:?}");
+        for edge in edges {
+            for span in &edge.spans {
+                assert_eq!(
+                    span.style.fg,
+                    Some(theme.border.normal),
+                    "the edge is an ordinary boundary: {edge:?}"
+                );
+                assert_ne!(span.style.fg, Some(theme.border.focus));
+            }
+        }
+        // The focus cue that is meant to be seen: the prompt marker.
+        let field = field_rows(&lines, &theme);
+        assert!(field[0].starts_with("> "), "{}", field[0]);
+        let marker = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "> ")
+            .expect("the prompt marker");
+        assert_eq!(marker.style.fg, Some(theme.accent.primary));
+    }
+
+    // ── The search box ──────────────────────────────────────────────────────
+
+    fn searchable_picker(query: &str) -> Overlay {
+        let mut model = SelectionModel::new(
+            "选择模型",
+            vec![
+                SelectionOption::new("deepseek/v3", "deepseek/v3"),
+                SelectionOption::new("glm/5", "glm/5"),
+            ],
+            true,
+        );
+        model.insert_query_text(query);
+        Overlay::ModelPicker(Box::new(model))
+    }
+
+    /// The caret is where the caret is. It used to be pinned a fixed eight
+    /// columns past the end of the query, which is the wrong column for every
+    /// query and off the card for a long one.
+    #[test]
+    fn a_search_box_places_the_caret_where_it_is() {
+        let theme = Theme::default();
+        let prefix_w = UnicodeWidthStr::width(crate::i18n::Locale::Zh.text().picker_search);
+        let (_, _, cursor) = content_lines(
+            &searchable_picker("glm"),
+            &theme,
+            40,
+            crate::i18n::Locale::Zh,
+        );
+        assert_eq!(cursor, Some((1, prefix_w + 3)), "after the query text");
+        // Each Chinese character is two columns, and the label is not eight
+        // columns wide in this locale either.
+        let (_, _, cursor) = content_lines(
+            &searchable_picker("模型"),
+            &theme,
+            40,
+            crate::i18n::Locale::Zh,
+        );
+        assert_eq!(cursor, Some((1, prefix_w + 4)));
+        // The caret follows the caret, not the end of the text.
+        let mut model = SelectionModel::new(
+            "选择模型",
+            vec![SelectionOption::new("deepseek/v3", "deepseek/v3")],
+            true,
+        );
+        model.insert_query_text("ab");
+        model.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        let (_, _, cursor) = content_lines(
+            &Overlay::ModelPicker(Box::new(model)),
+            &theme,
+            40,
+            crate::i18n::Locale::Zh,
+        );
+        assert_eq!(cursor, Some((1, prefix_w + 1)), "between a and b");
+    }
+
+    /// A query longer than the card stays on one row, keeps its caret on
+    /// screen, and never overflows.
+    #[test]
+    fn a_long_search_query_stays_on_one_row_with_its_caret_on_screen() {
+        let theme = Theme::default();
+        let width = 40;
+        let (_, lines, cursor) = content_lines(
+            &searchable_picker(&"很长的搜索词".repeat(20)),
+            &theme,
+            width,
+            crate::i18n::Locale::Zh,
+        );
+        for line in &lines {
+            assert!(
+                line.width() <= width,
+                "a row fits the card: {:?}",
+                line.to_string()
+            );
+        }
+        let (row, col) = cursor.expect("the search box always has a caret");
+        assert_eq!(row, 1, "the query is one row: {lines:?}");
+        assert!(col < width, "the caret stays on the card: col {col}");
+    }
+
+    /// The search box is an editor surface like the others: its own plane, so
+    /// "where do I type" is answered before the query is read.
+    #[test]
+    fn a_search_box_is_an_input_surface() {
+        let theme = Theme::default();
+        let (_, lines, _) = content_lines(
+            &searchable_picker("glm"),
+            &theme,
+            40,
+            crate::i18n::Locale::Zh,
+        );
+        let lane = &lines[1];
+        assert!(
+            lane.spans
+                .iter()
+                .any(|span| span.style.bg == Some(theme.surface.input)),
+            "the query sits on the input surface: {lane:?}"
+        );
+        let painted: usize = lane
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        assert_eq!(painted, 40, "the lane runs to the edge of the card");
+        // A picker without a query has no lane at all.
+        let (_, lines, _) = content_lines(&mode_picker(), &theme, 40, crate::i18n::Locale::Zh);
+        assert!(
+            !lines.iter().any(|line| line
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(theme.surface.input))),
+            "a list with no query paints no editor surface"
+        );
     }
 }

@@ -284,11 +284,16 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     path: image.path,
                     name: image.name,
                 })]
-            } else if let Some(crate::overlay::Overlay::Clarification(ov)) = state.overlay.as_mut()
+            } else if state
+                .overlay
+                .as_mut()
+                .is_some_and(|ov| ov.insert_text(&text))
             {
-                // A paste while a question is on screen answers the question;
-                // it must not vanish into the composer behind the overlay.
-                ov.insert_text(&text);
+                // A paste while an interaction owns typing answers that
+                // interaction — an open question, or the query of a searchable
+                // picker. It must not vanish into the composer behind the
+                // overlay; and a picker with no query must not swallow it,
+                // which is why a refusal falls through to the composer below.
                 Vec::new()
             } else {
                 if !insert_file_references(state, &text) {
@@ -302,11 +307,15 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             state.disarm_ctrlc();
             clear_quit_confirm_notification(state);
             if !text.is_empty()
-                && let Some(crate::overlay::Overlay::Clarification(ov)) = state.overlay.as_mut()
+                && state
+                    .overlay
+                    .as_mut()
+                    .is_some_and(|ov| ov.insert_text(&text))
             {
-                // Coalesced typing/paste bursts answer the open question, same
-                // as the single-key Char path (R004 F2).
-                ov.insert_text(&text);
+                // A coalesced typing/paste burst is text like any other: it
+                // belongs to whichever surface owns typing — the open question
+                // (same as the single-key Char path, R004 F2), or a searchable
+                // picker's query — not to the composer behind the overlay.
                 return Vec::new();
             }
             if !text.is_empty()

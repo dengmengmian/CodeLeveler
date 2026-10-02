@@ -287,22 +287,6 @@ fn fit_status(parts: &[String], width: usize) -> String {
     truncate_to_width(&out, width)
 }
 
-fn turn_marker(
-    text: String,
-    color: ratatui::style::Color,
-    width: usize,
-    state: &AppState,
-) -> Line<'static> {
-    Line::from(Span::styled(
-        truncate_to_width(&text, width),
-        Style::default().fg(color).add_modifier(if state.is_busy() {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        }),
-    ))
-}
-
 /// Coarse status-strip phase for honesty checks (tests + render).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusPhase {
@@ -360,15 +344,12 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
         StatusPhase::AwaitingUser => {
             if let Some(overlay) = &state.overlay {
                 if matches!(overlay, crate::overlay::Overlay::Clarification(_)) {
-                    // Quiet copy: the interaction's own header carries the accent,
-                    // and two accent lines saying the same thing only split the
-                    // reader's attention between them.
-                    return vec![turn_marker(
-                        state.t().waiting_reply.to_string(),
-                        theme.text.secondary,
-                        width,
-                        state,
-                    )];
+                    // The interaction card says what it is waiting for, with the
+                    // accent that goes with it, so the strip must not say it a
+                    // second time — not even quietly. What is left for the
+                    // strip here is the ordinary state it reports when nothing
+                    // it owns is moving.
+                    return idle_status_lines(state);
                 }
                 // Interrupting overlays: static waiting copy, no spinner.
                 // Pickers return None and fall through to the normal strip.
@@ -387,19 +368,25 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
     // transient notice and persistent execution state stay separate rows.
     match state.status {
         RuntimeStatus::Busy => busy_status_lines(state, width),
-        RuntimeStatus::Error | RuntimeStatus::Idle => {
-            if state.team.active().next().is_some() {
-                return Vec::new();
-            }
-            if let Some(label) = &state.activity {
-                vec![Line::from(Span::styled(
-                    format!("… {label}"),
-                    Style::default().fg(theme.text.secondary),
-                ))]
-            } else {
-                vec![Line::from("")]
-            }
-        }
+        RuntimeStatus::Error | RuntimeStatus::Idle => idle_status_lines(state),
+    }
+}
+
+/// The strip when this TUI is not driving a turn: the activity label if there
+/// is one, otherwise an empty row. Also the strip's content while a question is
+/// on screen, where the interaction card already carries the wait.
+fn idle_status_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = &state.theme;
+    if state.team.active().next().is_some() {
+        return Vec::new();
+    }
+    if let Some(label) = &state.activity {
+        vec![Line::from(Span::styled(
+            format!("… {label}"),
+            Style::default().fg(theme.text.secondary),
+        ))]
+    } else {
+        vec![Line::from("")]
     }
 }
 
@@ -1043,10 +1030,11 @@ mod tests {
     }
 
     #[test]
-    fn clarification_overlay_is_awaiting_user() {
+    fn a_clarification_says_the_wait_once_and_only_in_the_card() {
         use leveler_client_protocol::{ClarificationId, UiClarificationRequest};
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
+        state.activity = None;
         state.overlay = Some(crate::overlay::Overlay::Clarification(Box::new(
             crate::overlay::ClarificationOverlay::new(UiClarificationRequest::single(
                 ClarificationId::new("c1"),
@@ -1056,15 +1044,25 @@ mod tests {
         )));
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);
         let text = status_line_content(&state, 120).to_string();
+        // The interaction card carries the wait, with the accent to match. The
+        // strip must not say it a second time — which is why the copy it used
+        // to print is gone from the locale too — and it must not imply the
+        // model is still working while the turn is blocked on the user.
         assert!(
-            text.contains(state.t().waiting_reply)
-                || text.contains("等待")
-                || text.contains("waiting"),
-            "clarification wait copy: {text}"
+            !text.contains("等待") && !text.contains("waiting"),
+            "the strip repeats the card's wait: {text}"
         );
         for frame in SPINNER {
-            assert!(!text.contains(frame), "no spinner: {text}");
+            assert!(!text.contains(frame), "no spinner while awaiting: {text}");
         }
+        assert_eq!(text.trim(), "", "otherwise an ordinary idle strip: {text}");
+
+        // What the strip still owns: an activity label, which says nothing
+        // about the pending question.
+        state.activity = Some("checking the lockfile".into());
+        let text = status_line_content(&state, 120).to_string();
+        assert!(text.contains("checking the lockfile"), "{text}");
+        assert!(!text.contains("等待"), "{text}");
     }
 
     /// A reasoning model can spend 90+ seconds and thousands of tokens on a

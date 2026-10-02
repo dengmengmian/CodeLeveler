@@ -118,7 +118,6 @@ pub struct UiText {
     pub finalizing_terminal: &'static str,
     pub goal_mode: &'static str,
     pub ctrl_c_cancel: &'static str,
-    pub waiting_reply: &'static str,
     pub back_to_bottom: &'static str,
 
     // Context gauge
@@ -1081,7 +1080,6 @@ static ZH: UiText = UiText {
     finalizing_terminal: "正在发布结果",
     goal_mode: "目标模式",
     ctrl_c_cancel: "Ctrl+C 取消",
-    waiting_reply: "◇ 等待你的回复",
     back_to_bottom: "已回到底部",
     context_label: "上下文",
     context_tokens_only: "上下文 {} tokens",
@@ -1806,7 +1804,6 @@ static EN: UiText = UiText {
     finalizing_terminal: "publishing result",
     goal_mode: "goal mode",
     ctrl_c_cancel: "Ctrl+C cancel",
-    waiting_reply: "◇ waiting for your reply",
     back_to_bottom: "Back at bottom",
     context_label: "context",
     context_tokens_only: "context {} tokens",
