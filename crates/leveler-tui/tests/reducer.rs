@@ -2571,6 +2571,76 @@ fn overlay_captures_keys_away_from_composer() {
     assert!(s.composer.is_empty(), "overlay must capture key input");
 }
 
+fn clarification_open() -> AppState {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ClarificationRequested {
+            request: leveler_client_protocol::UiClarificationRequest::single(
+                leveler_client_protocol::ClarificationId::new("c1"),
+                "把日志发我",
+                vec![],
+            ),
+        }),
+    );
+    s
+}
+
+fn clarification_text(s: &AppState) -> String {
+    match &s.overlay {
+        Some(Overlay::Clarification(ov)) => ov.active_text().to_string(),
+        other => panic!("expected a clarification, got {other:?}"),
+    }
+}
+
+/// The answer field is the composer's editor, so the editing keys edit an
+/// answer here too — and none of them falls through to the composer
+/// underneath.
+#[test]
+fn the_clarification_field_edits_with_the_composer_editing_keys() {
+    let mut s = clarification_open();
+    typed(&mut s, "hello world");
+    assert_eq!(clarification_text(&s), "hello world");
+
+    reduce(&mut s, ctrl('w'));
+    assert_eq!(clarification_text(&s), "hello ");
+    reduce(&mut s, ctrl('a'));
+    reduce(&mut s, ctrl('k'));
+    assert_eq!(clarification_text(&s), "");
+    assert!(
+        s.composer.is_empty(),
+        "an editing key never reaches the composer"
+    );
+}
+
+/// A global binding is not reachable while the interaction owns the keys; the
+/// interaction's own keys still work.
+#[test]
+fn a_clarification_keeps_editing_keys_from_global_bindings() {
+    let mut s = clarification_open();
+    let effects = reduce(&mut s, ctrl('m'));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(
+        matches!(s.overlay, Some(Overlay::Clarification(_))),
+        "a global picker must not open behind the interaction: {:?}",
+        s.overlay
+    );
+    typed(&mut s, "x");
+    assert_eq!(clarification_text(&s), "x");
+}
+
+/// `Esc` resolves the interaction as a skip, and the global bindings it held
+/// are back on the next key.
+#[test]
+fn global_bindings_return_after_the_clarification_closes() {
+    let mut s = clarification_open();
+    let effects = reduce(&mut s, key(KeyCode::Esc));
+    assert!(!effects.is_empty(), "Esc resolves the interaction");
+    assert!(s.overlay.is_none());
+    reduce(&mut s, ctrl('m'));
+    assert!(matches!(s.overlay, Some(Overlay::ModelPicker(_))));
+}
+
 #[test]
 fn slash_new_starts_a_fresh_session() {
     let mut s = opened();
@@ -7881,26 +7951,29 @@ fn paste_while_clarification_overlay_open_fills_the_answer() {
         &mut s,
         Action::Paste("line a\nline b\nline c\nline d\nline e\nline f".into()),
     );
-    // The paste must land in the overlay's answer, not the composer.
+    // The paste must land in the overlay's answer, not the composer — and it
+    // lands folded exactly as the composer folds one, because the field is the
+    // composer's editor.
     let Some(Overlay::Clarification(ov)) = &s.overlay else {
         panic!("overlay closed unexpectedly");
     };
-    assert!(
-        ov.active_text().contains("line a") && ov.active_text().contains("line f"),
-        "{}",
-        ov.active_text()
-    );
+    assert_eq!(ov.active_text(), "[Pasted: 6 lines]");
     assert!(
         s.composer.is_empty(),
         "composer must not swallow the paste: {}",
         s.composer.text()
     );
-    // Enter submits the pasted answer, not an empty skip.
+    // Enter submits the pasted answer, not an empty skip — and what it submits
+    // is the text that was pasted, never the chip that stood in for it.
     let effects = reduce(&mut s, key(KeyCode::Enter));
     let text = format!("{effects:?}");
     assert!(
-        text.contains("AnswerClarification") && text.contains("line a"),
+        text.contains("AnswerClarification") && text.contains("line a") && text.contains("line f"),
         "{effects:?}"
+    );
+    assert!(
+        !text.contains("[Pasted: 6 lines]"),
+        "the chip is presentation, never the answer: {effects:?}"
     );
 }
 

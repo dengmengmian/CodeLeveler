@@ -519,11 +519,14 @@ pub struct UiText {
     pub approval_hint_plain: &'static str,
     /// Clarification overlay.
     pub clarify_title: &'static str,
+    /// The state shown at the far end of the interaction's header: the
+    /// interaction is asking, and what it is waiting for is the whole point of
+    /// putting it on screen.
+    pub clarify_waiting_input: &'static str,
+    pub clarify_waiting_choice: &'static str,
     pub clarify_hint: &'static str,
-    /// Multi-question clarification: the headline with its two `{}` slots
-    /// (answered, total), the tab glyphs, the free-text row label, the
-    /// multi-choice hint and the two selection limits.
-    pub clarify_headline: &'static str,
+    /// Multi-question clarification: the tab glyphs, the free-text row label,
+    /// the multi-choice hint and the two selection limits.
     pub clarify_tab_answered: &'static str,
     pub clarify_tab_current: &'static str,
     pub clarify_tab_pending: &'static str,
@@ -1380,8 +1383,9 @@ static ZH: UiText = UiText {
     approval_hint_collapse: "  ↑↓ 选择 · Enter 确认 · Ctrl+O 收起 · Esc 取消",
     approval_hint_plain: "  ↑↓ 选择 · Enter 确认 · Esc 取消",
     clarify_title: "需要澄清",
+    clarify_waiting_input: "等待输入",
+    clarify_waiting_choice: "等待选择",
     clarify_hint: "1-9 选项 · 输入自定义 · Enter 提交 · Esc 跳过",
-    clarify_headline: "需要你的选择 · {}/{} 已完成",
     clarify_tab_answered: "✓",
     clarify_tab_current: "●",
     clarify_tab_pending: "○",
@@ -2104,8 +2108,9 @@ static EN: UiText = UiText {
     approval_hint_collapse: "  ↑↓ select · Enter confirm · Ctrl+O collapse · Esc cancel",
     approval_hint_plain: "  ↑↓ select · Enter confirm · Esc cancel",
     clarify_title: "Needs clarification",
+    clarify_waiting_input: "waiting for input",
+    clarify_waiting_choice: "waiting for a choice",
     clarify_hint: "1-9 options · type your own · Enter submit · Esc skip",
-    clarify_headline: "Your call · {}/{} answered",
     clarify_tab_answered: "✓",
     clarify_tab_current: "●",
     clarify_tab_pending: "○",

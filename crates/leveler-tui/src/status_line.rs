@@ -360,9 +360,12 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
         StatusPhase::AwaitingUser => {
             if let Some(overlay) = &state.overlay {
                 if matches!(overlay, crate::overlay::Overlay::Clarification(_)) {
+                    // Quiet copy: the interaction's own header carries the accent,
+                    // and two accent lines saying the same thing only split the
+                    // reader's attention between them.
                     return vec![turn_marker(
                         state.t().waiting_reply.to_string(),
-                        theme.accent.primary,
+                        theme.text.secondary,
                         width,
                         state,
                     )];

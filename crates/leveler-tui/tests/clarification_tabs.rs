@@ -170,8 +170,11 @@ fn a_multi_question_request_shows_tabs_with_current_and_pending_states() {
     let mut s = state();
     open(&mut s, three_questions());
     let frame = rendered(&mut s, 100, 30);
-    assert!(frame.contains("需要你的选择"), "headline missing:\n{frame}");
-    assert!(frame.contains("0/3"), "progress missing:\n{frame}");
+    // One header, two ends: what is being asked, and that it is waiting on the
+    // user. Per-question progress is the tab marks below, not a second accent
+    // line above the field.
+    assert!(frame.contains("◇ 需要澄清"), "headline missing:\n{frame}");
+    assert!(frame.contains("等待选择"), "wait state missing:\n{frame}");
     for header in ["数据策略", "验证范围", "未登录态"] {
         assert!(frame.contains(header), "tab {header} missing:\n{frame}");
     }
@@ -195,7 +198,7 @@ fn answering_a_question_marks_its_tab_done_and_advances() {
         "Enter advances to the next question"
     );
     let frame = rendered(&mut s, 100, 30);
-    assert!(frame.contains("1/3"), "{frame}");
+    assert!(frame.contains("◇ 需要澄清"), "{frame}");
     assert_eq!(frame.matches('✓').count(), 1, "the settled tab: {frame}");
     assert_eq!(
         frame.matches('○').count(),

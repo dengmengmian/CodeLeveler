@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthStr;
 
 use leveler_client_protocol::ClarificationQuestionKind;
 
-use crate::render::text::truncate_display;
+use crate::render::text::{row_window, truncate_display, wrap_with_caret};
 use crate::theme::Theme;
 
 pub use approval::{ApprovalOutcome, ApprovalOverlay};
@@ -736,6 +736,13 @@ fn push_wrapped_row(
     }
 }
 
+/// How many rows of an answer the interaction shows at once.
+///
+/// The editor behind the field is the composer's, so the wrapping and the caret
+/// rule are the composer's too; how much of it is on screen is this surface's
+/// own choice — a clarification is one answer, not a whole message draft.
+const FIELD_MAX_ROWS: usize = 4;
+
 fn clarification_content(
     ov: &ClarificationOverlay,
     theme: &Theme,
@@ -744,19 +751,33 @@ fn clarification_content(
 ) -> RawContent {
     let t = locale.text();
     let mut lines: Vec<Line> = Vec::new();
-    let headline = if ov.legacy() {
-        t.clarify_title.to_string()
-    } else {
-        t.clarify_headline
-            .replacen("{}", &ov.answered_count().to_string(), 1)
-            .replacen("{}", &ov.len().to_string(), 1)
+    // One header, two ends: what is being asked, and the fact that it is waiting
+    // on the user. The progress it replaced is already legible in the tab
+    // strip's marks, and a second accent line above the field only competed with
+    // the field for the eye.
+    let headline = format!("◇ {}", t.clarify_title);
+    let waiting = match ov.questions().get(ov.active()) {
+        Some(question) if question.typing() => t.clarify_waiting_input,
+        Some(_) => t.clarify_waiting_choice,
+        None => "",
     };
-    lines.push(Line::from(Span::styled(
-        headline,
+    let mut header = vec![Span::styled(
+        headline.clone(),
         Style::default()
             .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
-    )));
+    )];
+    let used = UnicodeWidthStr::width(headline.as_str());
+    if !waiting.is_empty() && used + UnicodeWidthStr::width(waiting) < width {
+        header.push(Span::styled(
+            format!(
+                "{}{waiting}",
+                " ".repeat(width - used - UnicodeWidthStr::width(waiting))
+            ),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    lines.push(Line::from(header));
     // A strip of one tab is chrome, not information: the legacy single-question
     // shape renders exactly as it always did.
     if !ov.legacy() {
@@ -812,13 +833,52 @@ fn clarification_content(
     let mut option_rows: Vec<(usize, usize)> = Vec::new();
     let mut cursor_row: Option<usize> = None;
     if active.kind == ClarificationQuestionKind::Text {
-        let row = lines.len();
-        lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(theme.accent.primary)),
-            Span::raw(active.text.clone()),
-        ]));
-        cursor_at = Some((row, 2 + UnicodeWidthStr::width(active.text.as_str())));
-        cursor_row = Some(row);
+        // The field owns its own plane. "Where do I type" has to be answered
+        // before the words are read, so the rows take the input surface between
+        // two focused separators instead of being the same grey as everything
+        // around them — and `>` stays the only accent inside them.
+        let separator = Style::default().fg(theme.border.focus);
+        let edge = "─".repeat(width.max(1));
+        lines.push(Line::from(Span::styled(edge.clone(), separator)));
+        let (field, caret) = active.field_cursor();
+        let prompt = "> ";
+        let cont = "  ";
+        // The editor's own wrapping and caret mapping, so a wrapped answer and
+        // a wrapped draft place the insertion point identically.
+        let (rows, caret_row) = wrap_with_caret(
+            field,
+            caret,
+            width,
+            UnicodeWidthStr::width(prompt),
+            UnicodeWidthStr::width(cont),
+        );
+        let (scroll, shown) = row_window(rows.len(), caret_row, FIELD_MAX_ROWS);
+        let field_style = Style::default()
+            .fg(theme.text.primary)
+            .bg(theme.surface.input);
+        for (offset, row) in rows.into_iter().skip(scroll).take(shown).enumerate() {
+            let prefix = if scroll + offset == 0 { prompt } else { cont };
+            let mut spans = vec![Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme.accent.primary)
+                    .bg(theme.surface.input),
+            )];
+            let used = UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(row.text.as_str());
+            spans.push(Span::styled(row.text, field_style));
+            if used < width {
+                // Paint the rest of the row: a surface has to read as a field,
+                // not as a highlight behind three words.
+                spans.push(Span::styled(" ".repeat(width - used), field_style));
+            }
+            let line = lines.len();
+            lines.push(Line::from(spans));
+            if let Some(col) = row.caret_col {
+                cursor_at = Some((line, col));
+                cursor_row = Some(line);
+            }
+        }
+        lines.push(Line::from(Span::styled(edge, separator)));
     } else {
         let recorded = match active.answer.as_ref() {
             Some(crate::overlay::clarification::Answer::Picks(picks)) => picks.first().copied(),
@@ -878,16 +938,23 @@ fn clarification_content(
                 Style::default().fg(theme.text.primary)
             };
             let row = lines.len();
-            let text = active.text.clone();
             let mut spans = prefix;
             spans.push(Span::styled(format!("{} ", t.clarify_other), label_style));
-            spans.push(Span::raw(text.clone()));
+            // The typed answer stays on its row whether or not the cursor is on
+            // it. A list row shows the row the insertion point is on, so the
+            // text is visible where it is being written.
+            let (field, caret) = active.field_cursor();
+            let typed_at = prefix_w + UnicodeWidthStr::width(t.clarify_other) + 1;
+            let avail = width.saturating_sub(typed_at).max(8);
+            let (rows, caret_row) = wrap_with_caret(field, caret, avail, 0, 0);
+            let shown = rows.get(caret_row);
+            let caret_col = shown.and_then(|row| row.caret_col);
+            spans.push(Span::styled(
+                shown.map(|row| row.text.clone()).unwrap_or_default(),
+                Style::default().fg(theme.text.primary),
+            ));
             if focused {
-                let col = prefix_w
-                    + UnicodeWidthStr::width(t.clarify_other)
-                    + 1
-                    + UnicodeWidthStr::width(text.as_str());
-                cursor_at = Some((row, col));
+                cursor_at = Some((row, typed_at + caret_col.unwrap_or(0)));
                 cursor_row = Some(row);
             }
             lines.push(Line::from(spans));
@@ -1790,5 +1857,142 @@ mod layout_tests {
             hint.contains("Tab"),
             "multi-question hint keeps Tab: {hint:?}"
         );
+    }
+
+    // ── The answer field ────────────────────────────────────────────────────
+
+    fn text_overlay(field: &str) -> Overlay {
+        let mut overlay = ClarificationOverlay::new(UiClarificationRequest {
+            id: ClarificationId::new("c-field"),
+            question: "把日志发我".into(),
+            options: Vec::new(),
+            questions: vec![UiClarificationQuestion {
+                header: "补充要求".into(),
+                question: "把日志发我".into(),
+                kind: leveler_client_protocol::ClarificationQuestionKind::Text,
+                options: Vec::new(),
+                allow_other: false,
+                min_choices: 0,
+                max_choices: None,
+            }],
+        });
+        if !field.is_empty() {
+            overlay.insert_text(field);
+        }
+        Overlay::Clarification(Box::new(overlay))
+    }
+
+    /// The rows painted with the field's own surface: the answer's plane.
+    fn field_rows(lines: &[Line<'static>], theme: &Theme) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(theme.surface.input))
+            })
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn flat(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The answer is typed into a surface of its own, between two separators,
+    /// and the prompt's internals are nowhere in it.
+    #[test]
+    fn a_clarification_field_is_a_surface_of_its_own() {
+        let theme = Theme::default();
+        let (_, lines, _) = content_lines(
+            &text_overlay("看看 runtime handover"),
+            &theme,
+            40,
+            crate::i18n::Locale::Zh,
+        );
+        let field = field_rows(&lines, &theme);
+        assert_eq!(field.len(), 1, "one answer row: {lines:?}");
+        assert!(
+            field[0].starts_with("> 看看 runtime handover"),
+            "{}",
+            field[0]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.spans.iter().any(|span| span.content.contains('─')))
+                .count(),
+            2,
+            "the field is separated above and below: {lines:?}"
+        );
+        let screen = flat(&lines);
+        for leaked in ["Project:", "Capability:", "sha256", "{"] {
+            assert!(!screen.contains(leaked), "{leaked} leaked:\n{screen}");
+        }
+    }
+
+    /// A folded paste is one row: a pasted log never becomes the whole modal.
+    #[test]
+    fn a_folded_paste_takes_one_row() {
+        let theme = Theme::default();
+        let payload: String = (1..=977).map(|line| format!("line {line}\n")).collect();
+        let (_, lines, _) =
+            content_lines(&text_overlay(&payload), &theme, 40, crate::i18n::Locale::Zh);
+        let field = field_rows(&lines, &theme);
+        assert_eq!(field.len(), 1, "{lines:?}");
+        assert!(field[0].contains("[Pasted: 977 lines]"), "{}", field[0]);
+    }
+
+    /// However long the answer is, the field shows its cap and keeps the caret
+    /// on a row that is on screen.
+    #[test]
+    fn a_long_answer_is_capped_and_keeps_its_caret_visible() {
+        let theme = Theme::default();
+        let (_, lines, cursor) = content_lines(
+            &text_overlay(&"word ".repeat(200)),
+            &theme,
+            40,
+            crate::i18n::Locale::Zh,
+        );
+        let field = field_rows(&lines, &theme);
+        assert!(
+            (1..=FIELD_MAX_ROWS).contains(&field.len()),
+            "the field shows at most its cap, got {}: {field:?}",
+            field.len()
+        );
+        let (row, col) = cursor.expect("a text field needs a caret");
+        assert!(row < lines.len(), "caret row {row} is on screen");
+        assert!(col < 40, "caret column {col} stays inside the width");
+    }
+
+    /// A narrow terminal wraps the answer instead of overflowing the row.
+    #[test]
+    fn a_narrow_field_wraps_within_its_width() {
+        for width in [10usize, 16, 24] {
+            let theme = Theme::default();
+            let (_, lines, _) = content_lines(
+                &text_overlay("中文和 latin 混排的答案"),
+                &theme,
+                width,
+                crate::i18n::Locale::Zh,
+            );
+            for row in field_rows(&lines, &theme) {
+                let cols: usize = UnicodeWidthStr::width(row.as_str());
+                assert!(
+                    cols <= width,
+                    "a {cols}-column row in a {width}-column field: {row:?}"
+                );
+            }
+        }
     }
 }

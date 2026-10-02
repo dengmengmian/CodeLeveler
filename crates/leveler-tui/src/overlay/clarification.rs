@@ -17,11 +17,12 @@
 //! keystroke.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use unicode_segmentation::UnicodeSegmentation;
 
 use leveler_client_protocol::{
     ClarificationQuestionKind, UiClarificationQuestion, UiClarificationRequest,
 };
+
+use crate::composer::Composer;
 
 /// Result of a key press on the clarification interaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +61,9 @@ pub(crate) struct Question {
     /// Index into the rendered rows: the options, then the "其他…" row.
     pub(crate) cursor: usize,
     pub(crate) selected: Vec<bool>,
-    pub(crate) text: String,
+    /// The field this question is answered in. The composer's editor, not a
+    /// second one: what edits a draft has to edit an answer the same way.
+    pub(crate) text: Composer,
     pub(crate) answer: Option<Answer>,
 }
 
@@ -85,7 +88,7 @@ impl Question {
             min_choices: q.min_choices,
             max_choices: q.max_choices,
             cursor: 0,
-            text: String::new(),
+            text: Composer::new(),
             answer: None,
         }
     }
@@ -111,7 +114,7 @@ impl Question {
             min_choices: 0,
             max_choices: None,
             cursor: 0,
-            text: String::new(),
+            text: Composer::new(),
             answer: None,
         }
     }
@@ -133,6 +136,12 @@ impl Question {
 
     pub(crate) fn is_multi(&self) -> bool {
         self.kind == ClarificationQuestionKind::Multi
+    }
+
+    /// The field's text and the caret's `(row, display column)` within it, in
+    /// the shape the shared wrapping and caret rule takes.
+    pub(crate) fn field_cursor(&self) -> (&str, (usize, usize)) {
+        (self.text.text(), self.text.cursor_row_col_display())
     }
 
     /// The tab label: the model's, or a short read of the prompt when it sent
@@ -163,7 +172,7 @@ impl Question {
     /// Space: a multi-choice toggle, or a literal space in a text field.
     fn space(&mut self) -> Option<ClarificationNotice> {
         if self.typing() {
-            self.text.push(' ');
+            self.text.insert_char(' ');
             return None;
         }
         if !self.is_multi() || self.cursor >= self.options.len() {
@@ -259,7 +268,7 @@ impl ClarificationOverlay {
     pub fn active_text(&self) -> &str {
         self.questions
             .get(self.active)
-            .map(|q| q.text.as_str())
+            .map(|q| q.text.text())
             .unwrap_or("")
     }
 
@@ -268,28 +277,37 @@ impl ClarificationOverlay {
     /// "其他…") has nowhere to put it, and the text is not an answer — it is
     /// left alone rather than smuggled to the composer hidden behind the
     /// overlay.
+    ///
+    /// The paste goes in exactly as the composer takes one: a large paste is
+    /// shown as a chip and kept whole underneath it, so the answer that is sent
+    /// is the text that was pasted. Nothing is flattened here — a pasted log has
+    /// to arrive with its line breaks.
     pub fn insert_text(&mut self, s: &str) {
-        let normalized = s
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .replace('\n', " ");
         let Some(question) = self.questions.get_mut(self.active) else {
             return;
         };
         if question.kind == ClarificationQuestionKind::Text {
-            question.text.push_str(&normalized);
+            question.text.insert_paste(s);
             return;
         }
         if question.allow_other {
             // Move the cursor onto the row the text lands in, so a paste is
             // visible instead of appearing to do nothing.
             question.cursor = question.options.len();
-            question.text.push_str(&normalized);
+            question.text.insert_paste(s);
         }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> ClarificationOutcome {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Editing first. While a field is focused, the keys that edit a draft
+        // belong to the editor; the interaction's own keys — Enter, Esc, Tab,
+        // the arrows, Space on a choice row — are matched below and are
+        // untouched. A Ctrl key the editor does not claim falls through to
+        // this match, which ignores it, rather than typing its letter.
+        if let Some(question) = self.questions.get_mut(self.active)
+            && question.typing()
+            && question.text.apply_editing_key(key)
+        {
             return ClarificationOutcome::None;
         }
         match key.code {
@@ -325,22 +343,6 @@ impl ClarificationOverlay {
                 ClarificationOutcome::None
             }
             KeyCode::Enter => self.confirm_active(),
-            KeyCode::Backspace => {
-                if let Some(q) = self.questions.get_mut(self.active)
-                    && q.typing()
-                {
-                    pop_grapheme(&mut q.text);
-                }
-                ClarificationOutcome::None
-            }
-            KeyCode::Char(c) => {
-                if let Some(q) = self.questions.get_mut(self.active)
-                    && q.typing()
-                {
-                    q.text.push(c);
-                }
-                ClarificationOutcome::None
-            }
             _ => ClarificationOutcome::None,
         }
     }
@@ -368,7 +370,10 @@ impl ClarificationOverlay {
             return ClarificationOutcome::Answer(String::new());
         };
         if q.typing() {
-            let text = q.text.trim().to_string();
+            // The editor may be holding a paste chip; the answer is the text it
+            // stands for, never the chip.
+            let text = q.text.canonical_text();
+            let text = text.trim().to_string();
             // An empty "其他…" entry is not an answer — there is nothing to
             // record. Leaving the question unanswered is the honest outcome;
             // Esc leaves the field, Enter stays until something is typed.
@@ -459,12 +464,6 @@ fn answer_text(answer: &Answer, options: &[String]) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         }
-    }
-}
-
-fn pop_grapheme(s: &mut String) {
-    if let Some((idx, _)) = s.grapheme_indices(true).next_back() {
-        s.truncate(idx);
     }
 }
 
@@ -737,10 +736,10 @@ mod tests {
             ov.on_key(key(KeyCode::Char(c)));
         }
         ov.on_key(key(KeyCode::Backspace));
-        assert_eq!(ov.questions()[2].text, "ab");
+        assert_eq!(ov.questions()[2].text.text(), "ab");
         // Space is a literal space in a text field.
         ov.on_key(key(KeyCode::Char(' ')));
-        assert_eq!(ov.questions()[2].text, "ab ");
+        assert_eq!(ov.questions()[2].text.text(), "ab ");
     }
 
     /// An empty "其他…" entry is not an answer; Enter does not record one.
@@ -762,7 +761,7 @@ mod tests {
         ov.on_key(key(KeyCode::Char('a')));
         ov.on_key(key(KeyCode::Char('b')));
         ov.on_key(key(KeyCode::Backspace));
-        assert_eq!(ov.questions()[0].text, "a");
+        assert_eq!(ov.questions()[0].text.text(), "a");
     }
 
     /// A paste lands in the active question's text field, and on a choice it
@@ -771,7 +770,7 @@ mod tests {
     fn pasted_text_lands_in_the_active_questions_field() {
         let mut ov = legacy(vec!["A", "B"]);
         ov.insert_text("需要保留旧字段");
-        assert_eq!(ov.questions()[0].text, "需要保留旧字段");
+        assert_eq!(ov.questions()[0].text.text(), "需要保留旧字段");
         assert!(ov.questions()[0].on_other_row());
     }
 
@@ -790,7 +789,7 @@ mod tests {
         let mut ov = three();
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert_eq!(ov.on_key(ctrl_d), ClarificationOutcome::None);
-        assert_eq!(ov.questions()[0].text, "");
+        assert_eq!(ov.questions()[0].text.text(), "");
     }
 
     /// A choice question with no options can only be answered by typing.
@@ -832,5 +831,126 @@ mod tests {
             UnicodeWidthStr::width(ov.questions()[0].display_header().as_str()) <= 8,
             "a derived tab label stays short"
         );
+    }
+
+    // ── The field is the composer's editor ──────────────────────────────────
+
+    fn single_text() -> ClarificationOverlay {
+        ClarificationOverlay::new(UiClarificationRequest::single(
+            ClarificationId::new("c1"),
+            "把日志发我",
+            Vec::new(),
+        ))
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn type_str(ov: &mut ClarificationOverlay, s: &str) {
+        for c in s.chars() {
+            ov.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn submit(mut ov: ClarificationOverlay) -> String {
+        match ov.on_key(key(KeyCode::Enter)) {
+            ClarificationOutcome::Answer(answer) => answer,
+            other => panic!("expected a submitted answer, got {other:?}"),
+        }
+    }
+
+    /// Typing, deleting and moving use the composer's own editing commands —
+    /// readline's kill pair included — because the field is the composer's
+    /// editor and not a second, smaller one.
+    #[test]
+    fn the_field_edits_with_the_composer_s_editing_keys() {
+        let mut ov = single_text();
+        type_str(&mut ov, "hello world");
+        ov.on_key(ctrl('w'));
+        assert_eq!(ov.active_text(), "hello ");
+
+        ov.on_key(ctrl('a'));
+        ov.on_key(ctrl('k'));
+        assert_eq!(ov.active_text(), "");
+
+        type_str(&mut ov, "abc");
+        ov.on_key(key(KeyCode::Left));
+        ov.on_key(ctrl('u'));
+        assert_eq!(ov.active_text(), "c");
+
+        ov.on_key(ctrl('e'));
+        ov.on_key(key(KeyCode::Delete));
+        assert_eq!(ov.active_text(), "c");
+
+        ov.on_key(key(KeyCode::Home));
+        ov.on_key(key(KeyCode::Delete));
+        assert_eq!(ov.active_text(), "");
+    }
+
+    /// Backspace removes a whole grapheme: a combining mark goes with the
+    /// letter it belongs to, never on its own.
+    #[test]
+    fn the_field_deletes_a_whole_grapheme() {
+        let mut ov = single_text();
+        type_str(&mut ov, "中文");
+        ov.on_key(key(KeyCode::Backspace));
+        assert_eq!(ov.active_text(), "中");
+
+        // A combining sequence arrives as one burst and leaves as one
+        // grapheme: the accent goes with the letter it belongs to.
+        let mut combining = single_text();
+        combining.insert_text("e\u{301}x");
+        combining.on_key(key(KeyCode::Backspace));
+        assert_eq!(combining.active_text(), "e\u{301}");
+        combining.on_key(key(KeyCode::Backspace));
+        assert_eq!(combining.active_text(), "");
+    }
+
+    /// A large paste is folded for display and delivered whole: the chip is
+    /// presentation, and the payload behind it is what the runtime receives.
+    #[test]
+    fn a_large_paste_is_folded_for_display_and_delivered_whole() {
+        let mut ov = single_text();
+        let payload: String = (1..=977).map(|line| format!("log line {line}\n")).collect();
+        ov.insert_text(&payload);
+        assert_eq!(ov.active_text(), "[Pasted: 977 lines]");
+        let answer = submit(ov);
+        assert_eq!(answer, payload.trim_end());
+    }
+
+    /// Normal text and a paste are delivered together, in the order they were
+    /// put into the sentence.
+    #[test]
+    fn normal_text_and_a_paste_are_both_delivered() {
+        let mut ov = single_text();
+        type_str(&mut ov, "请分析：");
+        let payload: String = (0..300).map(|line| format!("line {line}\n")).collect();
+        ov.insert_text(&payload);
+        assert_eq!(ov.active_text(), "请分析：[Pasted: 300 lines]");
+        type_str(&mut ov, "重点看 runtime lifecycle");
+        let answer = submit(ov);
+        assert!(answer.starts_with("请分析：line 0\n"), "{answer}");
+        assert!(answer.contains("line 299"), "{answer}");
+        assert!(answer.ends_with("重点看 runtime lifecycle"), "{answer}");
+    }
+
+    /// Below the fold threshold the paste is inserted as written, line breaks
+    /// and all — nothing is flattened on the way in.
+    #[test]
+    fn a_small_paste_keeps_its_own_text() {
+        let mut ov = single_text();
+        ov.insert_text("第一行\n第二行");
+        assert_eq!(ov.active_text(), "第一行\n第二行");
+        assert_eq!(submit(ov), "第一行\n第二行");
+    }
+
+    /// The chip counts pasted lines, not bytes: the same script counts the same
+    /// whether it is ASCII or CJK.
+    #[test]
+    fn a_paste_is_counted_in_lines_not_bytes() {
+        let mut ov = single_text();
+        ov.insert_text("中文\n第二行\n第三行\n第四行\n第五行");
+        assert_eq!(ov.active_text(), "[Pasted: 5 lines]");
     }
 }

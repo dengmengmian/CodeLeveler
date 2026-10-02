@@ -10,7 +10,7 @@ use crate::screen::Screen;
 use crate::state::AppState;
 use crate::transcript::TranscriptItem;
 
-use super::text::{take_display_prefix, truncate_display};
+use super::text::{row_window, take_display_prefix, truncate_display, wrap_with_caret};
 
 pub(crate) const COMPOSER_MAX_ROWS: usize = 8;
 pub(crate) const COMPOSER_PROMPT: &str = "› ";
@@ -300,47 +300,22 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
     // Images are `[图片 #N]` inside the buffer, where the user put them, so
     // nothing is painted ahead of the text: the sentence already reads the way
     // it will be sent.
-    let (crow, ccol) = state.composer.cursor_row_col_display();
-    let logical = state.composer.lines();
-    let mut vis: Vec<ComposerVisRow> = Vec::new();
-
-    for (li, line_text) in logical.iter().enumerate() {
-        let mut rest = *line_text;
-        let mut first_of_logical = true;
-        // At least one visual row per logical line (empty line still paints).
-        loop {
-            let prompt = if li == 0 && first_of_logical {
-                COMPOSER_PROMPT
-            } else {
-                COMPOSER_CONT
-            };
-            let prefix_w = UnicodeWidthStr::width(prompt);
-            let room = inner_w.saturating_sub(prefix_w).max(1);
-            let start_byte = line_text.len() - rest.len();
-            let start_col = UnicodeWidthStr::width(&line_text[..start_byte]);
-            let (piece, next) = if rest.is_empty() && first_of_logical {
-                (String::new(), "")
-            } else if rest.is_empty() {
-                break;
-            } else {
-                take_display_prefix(rest, room)
-            };
-
-            // Map caret onto display columns [start_col, start_col + piece_w].
-            let piece_w = UnicodeWidthStr::width(piece.as_str());
-            let caret = if li == crow && ccol >= start_col && ccol <= start_col + piece_w {
-                // Caret exactly at the wrap boundary with more text remaining →
-                // paint it at column 0 of the next visual row.
-                if ccol == start_col + piece_w && !next.is_empty() && piece_w >= room {
-                    None
-                } else {
-                    Some(ccol - start_col)
-                }
-            } else {
-                None
-            };
-
-            let first_row = li == 0 && first_of_logical;
+    let caret = state.composer.cursor_row_col_display();
+    // Wrapping the buffer and mapping the caret onto a row is the editor's own
+    // mechanics, shared with every other surface that shows a `Composer`; the
+    // decorations below belong to this box.
+    let (rows, _) = wrap_with_caret(
+        state.composer.text(),
+        caret,
+        inner_w,
+        UnicodeWidthStr::width(COMPOSER_PROMPT),
+        UnicodeWidthStr::width(COMPOSER_CONT),
+    );
+    let mut vis: Vec<ComposerVisRow> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let first_row = index == 0;
             // The ghost owns the empty first row when it is showing; the
             // first-run hint stands down rather than stacking behind it.
             let suggestion = (first_row && crate::suggestion::is_visible(state))
@@ -348,32 +323,28 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
                 .flatten();
             let placeholder =
                 show_placeholder && first_row && state.composer.is_empty() && suggestion.is_none();
-            let ghost = if li == crow
-                && first_of_logical
-                && li == 0
+            let ghost = if first_row
+                && caret.0 == 0
                 && state.composer.cursor() >= state.composer.text().len()
             {
                 crate::screen::slash_arg_ghost(state.composer.text(), state.t())
             } else {
                 None
             };
-
-            vis.push(ComposerVisRow {
-                prompt,
-                text: piece,
-                caret_col: caret,
+            ComposerVisRow {
+                prompt: if first_row {
+                    COMPOSER_PROMPT
+                } else {
+                    COMPOSER_CONT
+                },
+                text: row.text,
+                caret_col: row.caret_col,
                 placeholder,
                 ghost,
                 suggestion,
-            });
-
-            rest = next;
-            first_of_logical = false;
-            if rest.is_empty() {
-                break;
             }
-        }
-    }
+        })
+        .collect();
 
     if vis.is_empty() {
         vis.push(ComposerVisRow {
@@ -394,8 +365,7 @@ fn composer_visual_rows(state: &AppState, width: usize) -> (Vec<ComposerVisRow>,
     }
 
     let caret_idx = vis.iter().position(|r| r.caret_col.is_some()).unwrap_or(0);
-    let rows = vis.len().clamp(1, COMPOSER_MAX_ROWS);
-    let scroll = vis.len().saturating_sub(rows).min(caret_idx);
+    let (scroll, rows) = row_window(vis.len(), caret_idx, COMPOSER_MAX_ROWS);
     let window: Vec<ComposerVisRow> = vis.into_iter().skip(scroll).take(rows).collect();
     let caret_in_window = caret_idx.saturating_sub(scroll);
     (window, caret_in_window)

@@ -5,6 +5,7 @@
 //! marks edit and cursor correctly . Display columns are computed with
 //! Unicode width, so full-width characters occupy two cells.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -301,6 +302,47 @@ impl Composer {
     pub fn insert_char(&mut self, c: char) {
         let mut buf = [0u8; 4];
         self.insert_str(c.encode_utf8(&mut buf));
+    }
+
+    /// Apply one of the editing keys, and report whether it was one.
+    ///
+    /// This is the editor's own keymap. A key that edits a draft has to mean the
+    /// same thing on every surface that shows this editor, so the mapping lives
+    /// with the editor instead of being restated by each host. `false` means the
+    /// key is not an editing key and belongs to the host's contract — Enter,
+    /// Esc, Tab, an arrow that moves a list, a modifier the host claimed first.
+    ///
+    /// `Ctrl+A` / `Ctrl+E` also arrive as the raw `SOH` / `ENQ` codes from
+    /// terminals without the Kitty keyboard protocol, which is why both forms
+    /// are matched.
+    pub fn apply_editing_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('a') if ctrl => self.move_to_line_start(),
+            KeyCode::Char('\u{1}') => self.move_to_line_start(),
+            KeyCode::Char('e') if ctrl => self.move_to_line_end(),
+            KeyCode::Char('\u{5}') => self.move_to_line_end(),
+            KeyCode::Char('u') if ctrl => self.kill_to_line_start(),
+            KeyCode::Char('k') if ctrl => self.kill_to_line_end(),
+            KeyCode::Char('w') if ctrl => self.delete_word_back(),
+            KeyCode::Char('b') if alt => self.move_word_left(),
+            KeyCode::Char('f') if alt => self.move_word_right(),
+            KeyCode::Left if alt => self.move_word_left(),
+            KeyCode::Right if alt => self.move_word_right(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.move_to_line_start(),
+            KeyCode::End => self.move_to_line_end(),
+            KeyCode::Backspace if alt => self.delete_word_back(),
+            KeyCode::Backspace | KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}') => {
+                self.backspace()
+            }
+            KeyCode::Delete => self.delete(),
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => self.insert_char(c),
+            _ => return false,
+        }
+        true
     }
 
     /// Replace the whitespace-delimited token immediately before the cursor.
