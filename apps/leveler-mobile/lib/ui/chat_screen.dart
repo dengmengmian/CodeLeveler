@@ -154,16 +154,19 @@ class _ChatScreenState extends State<ChatScreen> {
                           padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
                           itemCount: session.timeline.length,
                           itemBuilder: (context, index) {
-                            final item = session.timeline[session.timeline.length - 1 - index];
-                            final artifact = item.kind == TimelineKind.attachment
-                                ? _artifactById(session, item.id)
-                                : null;
+                            final item = session
+                                .timeline[session.timeline.length - 1 - index];
+                            final artifact =
+                                item.kind == TimelineKind.attachment
+                                    ? _artifactById(session, item.id)
+                                    : null;
                             return TimelineRow(
                               item: item,
                               artifact: artifact,
                               onOpenArtifact: artifact == null
                                   ? null
-                                  : () => _openArtifact(context, artifact, controller),
+                                  : () => _openArtifact(
+                                      context, artifact, controller),
                             );
                           },
                         ),
@@ -178,9 +181,12 @@ class _ChatScreenState extends State<ChatScreen> {
               if (approval != null)
                 _ApprovalCard(
                   approval: approval,
-                  onDecision: (choice) => controller.answerApproval(approval.id, choice),
+                  onDecision: (choice) =>
+                      controller.answerApproval(approval.id, choice),
                 ),
-              SafeArea(child: _Composer(controller: controller, input: _input, onSend: _send)),
+              SafeArea(
+                  child: _Composer(
+                      controller: controller, input: _input, onSend: _send)),
             ],
           ),
         );
@@ -200,7 +206,8 @@ class _ChildrenStrip extends StatelessWidget {
   Widget build(BuildContext context) {
     final open = session.openChildren.length;
     final total = session.children.length;
-    final label = open == 0 ? '子 Agent · 共 $total' : '子 Agent · $open 未结束 · 共 $total';
+    final label =
+        open == 0 ? '子 Agent · 共 $total' : '子 Agent · $open 未结束 · 共 $total';
     return Material(
       child: InkWell(
         onTap: onOpen,
@@ -210,7 +217,8 @@ class _ChildrenStrip extends StatelessWidget {
             children: [
               const Icon(Icons.hub_outlined, size: 16),
               const SizedBox(width: 8),
-              Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
+              Expanded(
+                  child: Text(label, style: const TextStyle(fontSize: 13))),
               const Icon(Icons.chevron_right, size: 18),
             ],
           ),
@@ -242,7 +250,8 @@ class _EmptySession extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.task_alt_outlined, size: 36, color: theme.colorScheme.outline),
+            Icon(Icons.task_alt_outlined,
+                size: 36, color: theme.colorScheme.outline),
             const SizedBox(height: 16),
             Text(
               goal.isEmpty ? '还没有开始' : '任务已经建立',
@@ -270,7 +279,8 @@ Artifact? _artifactById(SessionState session, String id) {
   return null;
 }
 
-void _openArtifact(BuildContext context, Artifact artifact, AppController controller) {
+void _openArtifact(
+    BuildContext context, Artifact artifact, AppController controller) {
   Navigator.of(context).push(
     MaterialPageRoute<void>(
       builder: (_) => ArtifactPreviewPage(
@@ -299,7 +309,8 @@ class _ApprovalCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(Icons.pan_tool_outlined, size: 18, color: theme.colorScheme.onErrorContainer),
+                Icon(Icons.pan_tool_outlined,
+                    size: 18, color: theme.colorScheme.onErrorContainer),
                 const SizedBox(width: 8),
                 Text('需要你批准', style: theme.textTheme.titleMedium),
               ],
@@ -310,7 +321,8 @@ class _ApprovalCard extends StatelessWidget {
               const SizedBox(height: 10),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                 decoration: BoxDecoration(
                   color: theme.colorScheme.surface,
                   borderRadius: BorderRadius.circular(10),
@@ -325,6 +337,11 @@ class _ApprovalCard extends StatelessWidget {
               const SizedBox(height: 10),
               Text(approval.hostNote!, style: theme.textTheme.bodySmall),
             ],
+            for (final detail in approval.resourceDetails)
+              Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child:
+                      SelectableText(detail, style: theme.textTheme.bodySmall)),
             for (final risk in approval.risks)
               Padding(
                 padding: const EdgeInsets.only(top: 6),
@@ -334,7 +351,8 @@ class _ApprovalCard extends StatelessWidget {
                     Icon(Icons.warning_amber_rounded,
                         size: 15, color: theme.colorScheme.onErrorContainer),
                     const SizedBox(width: 6),
-                    Expanded(child: Text(risk, style: theme.textTheme.bodySmall)),
+                    Expanded(
+                        child: Text(risk, style: theme.textTheme.bodySmall)),
                   ],
                 ),
               ),
@@ -350,17 +368,23 @@ class _ApprovalCard extends StatelessWidget {
               spacing: 8,
               runSpacing: 8,
               children: [
-                for (final choice in ApprovalChoice.values)
+                for (final choice in ApprovalChoice.values.where((choice) =>
+                    choice != ApprovalChoice.approveSession ||
+                    approval.canApproveSession))
                   ConstrainedBox(
                     constraints: const BoxConstraints(minHeight: 44),
                     child: choice == ApprovalChoice.approveOnce
                         ? FilledButton(
                             onPressed: () => onDecision(choice),
-                            child: Text(choice.label),
+                            child: Text(choice == ApprovalChoice.approveSession
+                                ? approval.sessionLabel
+                                : choice.label),
                           )
                         : OutlinedButton(
                             onPressed: () => onDecision(choice),
-                            child: Text(choice.label),
+                            child: Text(choice == ApprovalChoice.approveSession
+                                ? approval.sessionLabel
+                                : choice.label),
                           ),
                   ),
               ],
@@ -378,7 +402,8 @@ class _ApprovalCard extends StatelessWidget {
 }
 
 class _ClarificationCard extends StatefulWidget {
-  const _ClarificationCard({required this.clarification, required this.onAnswer});
+  const _ClarificationCard(
+      {required this.clarification, required this.onAnswer});
   final PendingClarification clarification;
   final void Function(String) onAnswer;
 
@@ -438,7 +463,8 @@ class _ClarificationCardState extends State<_ClarificationCard> {
 }
 
 class _Composer extends StatelessWidget {
-  const _Composer({required this.controller, required this.input, required this.onSend});
+  const _Composer(
+      {required this.controller, required this.input, required this.onSend});
   final AppController controller;
   final TextEditingController input;
   final VoidCallback onSend;
@@ -456,7 +482,9 @@ class _Composer extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
       decoration: BoxDecoration(
         color: theme.colorScheme.surface,
-        border: Border(top: BorderSide(color: theme.colorScheme.outlineVariant, width: 0.5)),
+        border: Border(
+            top: BorderSide(
+                color: theme.colorScheme.outlineVariant, width: 0.5)),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,

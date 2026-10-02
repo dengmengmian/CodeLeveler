@@ -68,7 +68,7 @@ impl CommandExecution {
         let reg = &self.background_tasks;
         let rel = cwd_rel.unwrap_or(".").to_string();
         let cwd = context
-            .require_workspace()?
+            .execution_workspace()?
             .resolve_command_cwd(&rel, &context.write_scope())?;
 
         // Pre-spawn baseline for namespace accounting after process-group exit.
@@ -103,7 +103,8 @@ impl CommandExecution {
         };
         // Write-capable scoped tasks require an accounting baseline. Read-only
         // tasks can run without one because the sandbox denies their writes.
-        if context.policy.command_write_allowlist.is_some()
+        if !context.policy.unrestricted_execution()
+            && context.policy.command_write_allowlist.is_some()
             && !context.policy.has_zero_write_authority()
             && mutation_baseline.is_none()
             && !context.policy.read_only
@@ -113,7 +114,49 @@ impl CommandExecution {
             ));
         }
 
-        let req = Self::background_process_request(program, args.clone(), cwd, &context);
+        let isolation = Self::frozen_git_invocation(program, &args, &cwd, &context).await?;
+        // A detached process outlives this call, so its frozen directory cannot
+        // be reaped when the call returns. The directory is not a secret, but an
+        // approved credential staged inside it is; the runtime cannot bound that
+        // value's lifetime to the task, so it refuses instead of leaving it on
+        // disk for the operating system's temp cleanup. Run the effect in the
+        // foreground, where the guard reaps it when the process exits.
+        if isolation
+            .as_ref()
+            .is_some_and(|iso| iso.carries_credential())
+        {
+            return Ok(ToolOutput::error(
+                "Refused: an approved Git credential is bound to one foreground \
+                 execution and cannot be used by a detached background task. Run \
+                 this remote Git command in the foreground.\n",
+            ));
+        }
+        let (program, args, authority_env, isolation_deny) = match &isolation {
+            Some(iso) => (
+                iso.program().to_string(),
+                iso.args().to_vec(),
+                iso.authority_env().to_vec(),
+                iso.deny_env().to_vec(),
+            ),
+            None => (program.to_string(), args, Vec::new(), Vec::new()),
+        };
+        let isolation_write_roots = isolation
+            .as_ref()
+            .map(|iso| vec![iso.root().to_path_buf()])
+            .unwrap_or_default();
+        // A detached process outlives this call, so its frozen directory must too.
+        if let Some(iso) = isolation {
+            let _ = iso.keep();
+        }
+        let req = Self::background_process_request(
+            &program,
+            args.clone(),
+            cwd,
+            &context,
+            authority_env,
+            isolation_deny,
+            isolation_write_roots,
+        );
         // Always session-owned so the creator can observe and stop it. Lifetime
         // decides whether goal terminal cleanup includes it; daemon-scoped
         // spawning remains reserved for runtime-internal services.
@@ -141,6 +184,30 @@ impl CommandExecution {
         }
     }
 
+    /// Resolve the frozen execution target for a Git resource grant. `Ok(None)`
+    /// means this policy carries no Git grant; a grant that cannot be reproduced
+    /// from frozen bytes is an error, so the command never falls back to live
+    /// mutable configuration.
+    async fn frozen_git_invocation(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        context: &ToolContext,
+    ) -> Result<Option<leveler_execution::GitIsolation>, ToolError> {
+        let Some(grant) = context.policy.resource_grant() else {
+            return Ok(None);
+        };
+        let Some(target) =
+            leveler_execution::approved_git_target(grant, program, args).map_err(ToolError::Io)?
+        else {
+            return Ok(None);
+        };
+        leveler_execution::isolate_git_command(&target, args, cwd, &context.execution.environment)
+            .await
+            .map(Some)
+            .map_err(|reason| ToolError::Io(format!("frozen Git execution refused: {reason}")))
+    }
+
     /// Build a [`ProcessRequest`] for background spawn with the same sandbox fields
     /// as [`Self::run_foreground`] (PR-3a). Non-FullAccess / non-turn-unrestricted
     /// → write confinement; network follows `context.policy.network_denied()`.
@@ -149,10 +216,18 @@ impl CommandExecution {
         args: Vec<String>,
         cwd: std::path::PathBuf,
         context: &ToolContext,
+        authority_env: Vec<(String, String)>,
+        isolation_deny: Vec<String>,
+        isolation_write_roots: Vec<std::path::PathBuf>,
     ) -> ProcessRequest {
         let mut req = ProcessRequest::new(program, args, cwd);
-        req.deny_network = context.policy.network_denied();
+        req.network_scope = context.policy.network_scope();
+        req.deny_network = matches!(req.network_scope, leveler_execution::NetworkScope::None);
+        req.unrestricted_execution = context.policy.unrestricted_execution();
         req.deny_env = context.policy.deny_env.as_ref().clone();
+        req.deny_env.extend(isolation_deny);
+        req.authority_env = authority_env;
+        req.sandbox_write_roots = isolation_write_roots;
         req.write_scope = context.write_scope();
         req
     }
@@ -175,17 +250,41 @@ impl CommandExecution {
         };
         let rel = cwd_rel.unwrap_or(".").to_string();
         let cwd = context
-            .require_workspace()?
+            .execution_workspace()?
             .resolve_command_cwd(&rel, &context.write_scope())?;
         let executed_commands = leveler_execution::proven_executed_commands(program, &args);
 
+        // A Git resource grant executes its frozen approved target instead of the
+        // live command line. The guard owns the private git directory until the
+        // process has finished.
+        let isolation = Self::frozen_git_invocation(program, &args, &cwd, &context).await?;
+        let (program, args, authority_env, isolation_deny) = match &isolation {
+            Some(iso) => (
+                iso.program().to_string(),
+                iso.args().to_vec(),
+                iso.authority_env().to_vec(),
+                iso.deny_env().to_vec(),
+            ),
+            None => (program.to_string(), args, Vec::new(), Vec::new()),
+        };
+
         let scope = context.write_scope();
-        let mut request = ProcessRequest::new(program.to_string(), args, cwd);
+        let mut request = ProcessRequest::new(program, args, cwd);
         let timeout = resolve_timeout(timeout_seconds);
         request.timeout = timeout;
-        let network_denied = context.policy.network_denied();
-        request.deny_network = network_denied;
+        let network_scope = context.policy.network_scope();
+        let network_denied = matches!(network_scope, leveler_execution::NetworkScope::None);
+        request.network_scope = network_scope.clone();
+        request.deny_network =
+            matches!(request.network_scope, leveler_execution::NetworkScope::None);
+        request.unrestricted_execution = context.policy.unrestricted_execution();
         request.deny_env = context.policy.deny_env.as_ref().clone();
+        request.deny_env.extend(isolation_deny);
+        request.authority_env = authority_env;
+        request.sandbox_write_roots = isolation
+            .as_ref()
+            .map(|iso| vec![iso.root().to_path_buf()])
+            .unwrap_or_default();
         // OS confinement from the one write boundary (`WriteScope`):
         // - `Workspace`: broad reads on every host, writes limited to
         //   workspace + temp + toolchain caches.
@@ -231,8 +330,9 @@ impl CommandExecution {
         // (see above) rather than unavailable. Demanding one here would refuse
         // pre-claim exploration outright — the capability the read-only workspace
         // exists to preserve.
-        let constrained = (context.policy.command_write_allowlist.is_some()
-            || context.policy.command_modified_files_remaining.is_some())
+        let constrained = !context.policy.unrestricted_execution()
+            && (context.policy.command_write_allowlist.is_some()
+                || context.policy.command_modified_files_remaining.is_some())
             && !context.policy.has_zero_write_authority();
         if constrained && snapshot.is_none() && !context.policy.read_only {
             return Ok(ToolOutput::error(
@@ -290,7 +390,7 @@ impl CommandExecution {
         }
 
         let mut mutation_error = None;
-        if snapshot.is_some() {
+        if snapshot.is_some() && !context.policy.unrestricted_execution() {
             let newly_modified = command_modified
                 .iter()
                 .filter(|path| !context.policy.command_previously_modified.contains(path))
@@ -406,6 +506,7 @@ impl CommandExecution {
             metadata: serde_json::json!({
                 "exit_code": output.exit_code,
                 "network_denied": network_denied,
+                "network_scope": network_scope.label(),
                 "filesystem_confined": sandboxed,
                 "timed_out": output.timed_out,
                 // Whether the RUNNER completed, independent of the exit code: a

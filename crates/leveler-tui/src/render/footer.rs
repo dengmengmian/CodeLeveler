@@ -995,6 +995,8 @@ mod p1_tests {
         assert!(!hints(&s).contains("Esc"), "{}", hints(&s));
         s.overlay = Some(crate::overlay::Overlay::Approval(Box::new(
             crate::overlay::ApprovalOverlay::new(UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: ApprovalId::new("a1"),
                 tool: "run_command".into(),
                 summary: "rm -rf tmp".into(),

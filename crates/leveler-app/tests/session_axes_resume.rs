@@ -141,3 +141,30 @@ async fn a_side_question_has_only_base_observation_tools() {
         "bounded side questions must not disclose optional packs implicitly"
     );
 }
+
+#[tokio::test]
+async fn full_side_question_retains_available_mutating_and_optional_tools() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+    let app = Application::assemble(layout(&tmp)).unwrap();
+    let (registry, ctx) = app
+        .side_question_tools(
+            &ModelRef::new("mock", "m"),
+            leveler_execution::PermissionProfile::FullAccess,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(ctx.policy.unrestricted_execution());
+    for name in ["apply_patch", "run_command", "web_fetch"] {
+        assert!(
+            registry.get(name).is_some(),
+            "Full side question omitted {name}"
+        );
+    }
+    assert!(
+        registry.get("spawn_agent").is_none(),
+        "composition must not invent harness handles"
+    );
+}

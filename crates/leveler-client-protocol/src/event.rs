@@ -962,6 +962,8 @@ mod tests {
         roundtrip(
             RuntimeEvent::ApprovalRequested {
                 request: UiApprovalRequest {
+                    grant: None,
+                    requires_human_consent: false,
                     id: ApprovalId::new("a1"),
                     tool: "run_command".to_string(),
                     summary: "run ls".to_string(),

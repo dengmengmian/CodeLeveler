@@ -20,7 +20,7 @@ use tokio::{
     sync::Mutex,
 };
 
-pub const PROTOCOL_MAJOR: u32 = 1;
+pub const PROTOCOL_MAJOR: u32 = 2;
 pub const PROTOCOL_MINOR: u32 = 0;
 pub const REQUIRED_CAPABILITIES: &[&str] = &[
     "process.spawn",
@@ -79,6 +79,8 @@ enum Request {
     Acknowledge {
         id: String,
         owner: String,
+        #[serde(default)]
+        unrestricted: bool,
     },
     Spawn {
         id: String,
@@ -92,14 +94,20 @@ enum Request {
     Get {
         id: String,
         owner: String,
+        #[serde(default)]
+        unrestricted: bool,
     },
     Stop {
         id: String,
         owner: String,
+        #[serde(default)]
+        unrestricted: bool,
     },
     Observe {
         id: String,
         owner: String,
+        #[serde(default)]
+        unrestricted: bool,
         cursor: Option<u64>,
         max_bytes: usize,
         wait_ms: u64,
@@ -428,6 +436,20 @@ impl ExecutionHostClient {
             .call(Request::Acknowledge {
                 id: id.into(),
                 owner: owner.into(),
+                unrestricted: false,
+            })
+            .await?
+        {
+            Reply::Acknowledged => Ok(()),
+            _ => Err("invalid process fact acknowledgement".into()),
+        }
+    }
+    pub async fn acknowledge_unrestricted(&self, id: &str) -> Result<(), String> {
+        match self
+            .call(Request::Acknowledge {
+                id: id.into(),
+                owner: String::new(),
+                unrestricted: true,
             })
             .await?
         {
@@ -440,6 +462,20 @@ impl ExecutionHostClient {
             .call(Request::Get {
                 id: id.into(),
                 owner: owner.into(),
+                unrestricted: false,
+            })
+            .await?
+        {
+            Reply::Task(t) => Ok(t),
+            _ => Err("invalid Execution Host inspect reply".into()),
+        }
+    }
+    pub async fn get_unrestricted(&self, id: &str) -> Result<BackgroundTaskSnapshot, String> {
+        match self
+            .call(Request::Get {
+                id: id.into(),
+                owner: String::new(),
+                unrestricted: true,
             })
             .await?
         {
@@ -456,6 +492,20 @@ impl ExecutionHostClient {
             .call(Request::Stop {
                 id: id.into(),
                 owner: owner.into(),
+                unrestricted: false,
+            })
+            .await?
+        {
+            Reply::Task(t) => Ok(t),
+            _ => Err("invalid Execution Host stop reply".into()),
+        }
+    }
+    pub async fn kill_unrestricted(&self, id: &str) -> Result<BackgroundTaskSnapshot, String> {
+        match self
+            .call(Request::Stop {
+                id: id.into(),
+                owner: String::new(),
+                unrestricted: true,
             })
             .await?
         {
@@ -475,6 +525,30 @@ impl ExecutionHostClient {
             .call(Request::Observe {
                 id: id.into(),
                 owner: owner.into(),
+                unrestricted: false,
+                cursor,
+                max_bytes,
+                wait_ms: wait.as_millis().min(30_000) as u64,
+            })
+            .await?
+        {
+            Reply::Observation(t) => Ok(t),
+            _ => Err("invalid Execution Host observe reply".into()),
+        }
+    }
+    pub async fn observe_unrestricted(
+        &self,
+        id: &str,
+
+        cursor: Option<u64>,
+        max_bytes: usize,
+        wait: Duration,
+    ) -> Result<BackgroundTaskObservation, String> {
+        match self
+            .call(Request::Observe {
+                id: id.into(),
+                owner: String::new(),
+                unrestricted: true,
                 cursor,
                 max_bytes,
                 wait_ms: wait.as_millis().min(30_000) as u64,
@@ -572,12 +646,12 @@ impl Host {
         self.persisted_tasks().await.map(|_| ())
     }
 
-    async fn local(&self, id: &str, owner: &str) -> Result<String, String> {
+    async fn local(&self, id: &str, owner: &str, unrestricted: bool) -> Result<String, String> {
         let entries = self.entries.lock().await;
         let e = entries
             .get(id)
             .ok_or_else(|| format!("unknown hosted task `{id}`"))?;
-        if e.owner != owner {
+        if !unrestricted && e.owner != owner {
             return Err("hosted task belongs to another session".into());
         }
         Ok(e.local_id.clone())
@@ -608,10 +682,14 @@ impl Host {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(Reply::Acknowledged)
             }
-            Request::Acknowledge { id, owner } => {
+            Request::Acknowledge {
+                id,
+                owner,
+                unrestricted,
+            } => {
                 let records = self.archive.lock().await;
                 let task = records.get(&id).ok_or("unknown process fact")?;
-                if task.snapshot.owner_scope.as_deref() != Some(&owner)
+                if (!unrestricted && task.snapshot.owner_scope.as_deref() != Some(&owner))
                     || matches!(
                         task.snapshot.status,
                         BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
@@ -765,19 +843,27 @@ impl Host {
                     .ok_or("missing spawn fact")?;
                 Ok(Reply::Task(t.snapshot))
             }
-            Request::Get { id, owner } => {
+            Request::Get {
+                id,
+                owner,
+                unrestricted,
+            } => {
                 let task = self
                     .persisted_tasks()
                     .await?
                     .into_iter()
                     .find(|t| t.snapshot.id == id)
                     .ok_or("unknown hosted task")?;
-                if task.snapshot.owner_scope.as_deref() != Some(&owner) {
+                if !unrestricted && task.snapshot.owner_scope.as_deref() != Some(&owner) {
                     return Err("hosted task belongs to another session".into());
                 }
                 Ok(Reply::Task(task.snapshot))
             }
-            Request::Stop { id, owner } => {
+            Request::Stop {
+                id,
+                owner,
+                unrestricted,
+            } => {
                 let persisted = self.persisted_tasks().await?;
                 if let Some(task) = persisted.iter().find(|t| {
                     t.snapshot.id == id
@@ -786,13 +872,16 @@ impl Host {
                             BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
                         )
                 }) {
-                    if task.snapshot.owner_scope.as_deref() != Some(&owner) {
+                    if !unrestricted && task.snapshot.owner_scope.as_deref() != Some(&owner) {
                         return Err("hosted task belongs to another session".into());
                     }
                     return Ok(Reply::Task(task.snapshot.clone()));
                 }
-                let local = self.local(&id, &owner).await?;
-                let mut t = self.registry.kill_owned(&local, &owner).await?;
+                let local = self.local(&id, &owner, unrestricted).await?;
+                let mut t = self
+                    .registry
+                    .kill_authorized(&local, &owner, unrestricted)
+                    .await?;
                 t.id = id;
                 self.persist().await?;
                 Ok(Reply::Task(t))
@@ -800,6 +889,7 @@ impl Host {
             Request::Observe {
                 id,
                 owner,
+                unrestricted,
                 cursor,
                 max_bytes,
                 wait_ms,
@@ -812,7 +902,7 @@ impl Host {
                             BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
                         )
                 }) {
-                    if task.snapshot.owner_scope.as_deref() != Some(&owner) {
+                    if !unrestricted && task.snapshot.owner_scope.as_deref() != Some(&owner) {
                         return Err("hosted task belongs to another session".into());
                     }
                     let mut position = cursor.unwrap_or(0);
@@ -836,12 +926,13 @@ impl Host {
                         log_remaining: position < task.log_end,
                     }));
                 }
-                let local = self.local(&id, &owner).await?;
+                let local = self.local(&id, &owner, unrestricted).await?;
                 let mut t = self
                     .registry
-                    .observe_owned(
+                    .observe_authorized(
                         &local,
                         &owner,
+                        unrestricted,
                         cursor,
                         max_bytes.min(256 * 1024),
                         Duration::from_millis(wait_ms.min(30_000)),
@@ -991,6 +1082,139 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrestricted_host_task_control_crosses_sessions_without_owner_spoofing() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let config = ExecutionHostConfig {
+            state_dir: root.path().join("host"),
+            repo_root: repo.clone(),
+            executable: PathBuf::from("unused"),
+        };
+        let server = tokio::spawn(serve(config.clone()));
+        let client = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(client) = ExecutionHostClient::connect(config.clone()).await {
+                    break client;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            repo.clone(),
+            std::env::temp_dir(),
+        ));
+        let registry = crate::BackgroundTaskRegistry::with_environment(environment)
+            .with_execution_host(config);
+        let id = registry
+            .spawn_owned_with_lifetime(
+                ProcessRequest::new(
+                    "sh",
+                    vec!["-c".into(), "printf admin-log; sleep 30".into()],
+                    repo,
+                ),
+                None,
+                Some("owner-session"),
+                BackgroundTaskLifetime::Persistent,
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .get_authorized(&id, "foreign", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .kill_authorized(&id, "foreign", false)
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .observe_authorized(
+                    &id,
+                    "foreign",
+                    false,
+                    Some(0),
+                    1024,
+                    Duration::ZERO,
+                    &tokio_util::sync::CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        let snapshot = registry.get_authorized(&id, "foreign", true).await.unwrap();
+        assert_eq!(snapshot.owner_scope.as_deref(), Some("owner-session"));
+        let observed = registry
+            .observe_authorized(
+                &id,
+                "foreign",
+                true,
+                Some(0),
+                1024,
+                Duration::from_secs(2),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(observed.snapshot.log.contains("admin-log"));
+        registry
+            .kill_authorized(&id, "foreign", true)
+            .await
+            .unwrap();
+        let snapshot = registry
+            .wait_authorized(
+                &id,
+                "foreign",
+                true,
+                Some(Duration::from_secs(5)),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            snapshot.status,
+            BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
+        ));
+        let observed = registry
+            .observe_authorized(
+                &id,
+                "foreign",
+                true,
+                Some(0),
+                1024,
+                Duration::ZERO,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(observed.snapshot.log.contains("admin-log"));
+        registry
+            .take_settlement_authorized(&id, "foreign", true)
+            .await
+            .unwrap();
+        client.acknowledge_unrestricted(&id).await.unwrap();
+        assert!(client.get_owned(&id, "foreign").await.is_err());
+        assert_eq!(
+            client
+                .get_unrestricted(&id)
+                .await
+                .unwrap()
+                .owner_scope
+                .as_deref(),
+            Some("owner-session")
+        );
+        client.shutdown_if_idle().await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     use super::*;
     #[test]
     fn incompatible_major_and_missing_capability_are_rejected() {

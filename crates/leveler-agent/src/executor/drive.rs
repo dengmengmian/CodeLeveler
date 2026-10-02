@@ -311,10 +311,12 @@ fn log_compaction_summary_failure(
 
 impl Executor {
     pub(crate) fn request_tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut tools = self.registry.definitions();
+        let mut tools = self.projected_tool_registry().definitions();
         // A child clarifier is unattended. Only the top-level turn can ask
         // the user. `ask_user` remains a parser alias of this tool.
-        if self.depth == 0 && self.policy.allow_host_input {
+        if self.depth == 0
+            && (self.tool_context.policy.unrestricted_execution() || self.policy.allow_host_input)
+        {
             tools.push(request_user_input_tool_definition());
         }
         // Nothing to request under 完全访问 — the elevation it asks for is
@@ -339,7 +341,9 @@ impl Executor {
         }
         // A sub-agent shouldn't spawn its own sub-agents; product kill-switch
         // can also hide spawn_agent entirely.
-        if self.policy.allow_delegation && self.depth < MAX_SUB_AGENT_DEPTH {
+        if (self.tool_context.policy.unrestricted_execution() || self.policy.allow_delegation)
+            && self.depth < MAX_SUB_AGENT_DEPTH
+        {
             tools.push(spawn_agent_tool_definition());
         }
         // Late-bound ownership: a spawned child starts read-capable and
@@ -358,7 +362,9 @@ impl Executor {
         }
 
         if let Some(state) = &self.capabilities {
-            tools.retain(|tool| state.permits_tool(&tool.name));
+            if !self.tool_context.policy.unrestricted_execution() {
+                tools.retain(|tool| state.permits_tool(&tool.name));
+            }
             tools.push(crate::capability::control_definition());
         }
         tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -430,7 +436,7 @@ impl Executor {
         // evaluate bounded Worker work.
         let context_diverged = false;
         if should_inject_delegation_hint(
-            self.policy.allow_delegation
+            (self.tool_context.policy.unrestricted_execution() || self.policy.allow_delegation)
                 && self.capability_exposed(crate::capability::CapabilityId::MultiAgent, true),
             self.depth,
         ) && !messages.iter().any(|m| {
@@ -2057,14 +2063,14 @@ impl AgentHarness for Drive<'_> {
                     Err("capability expects action and optional id only".to_string())
                 } else {
                     match action {
-                        Some("list" | "status") => Ok((state.catalog().to_string(), false)),
+                        Some("list" | "status") => Ok((state.catalog_with_authority(self.executor.tool_context.policy.unrestricted_execution()).to_string(), false)),
                         Some("enable") => match call
                             .arguments
                             .get("id")
                             .and_then(|value| value.as_str())
                         {
                             Some(id) => match crate::capability::CapabilityId::parse(id) {
-                                Ok(id) => state.enable(id).await.map(|changed| {
+                                Ok(id) => state.enable_with_authority(id, self.executor.tool_context.policy.unrestricted_execution()).await.map(|changed| {
                                     (
                                         format!(
                                             "{} enabled; tools available on the following request.",
@@ -2676,10 +2682,12 @@ impl AgentHarness for Drive<'_> {
             // request_permissions is answered by the user, not the registry.
             if call.name == REQUEST_PERMISSIONS_TOOL {
                 let (_, _, requested) = parse_permission_request(&call.arguments);
-                if self.progress.covers_denied_request(
-                    requested.network,
-                    requested.repository_git || requested.unrestricted_fs,
-                ) {
+                if !self.executor.tool_context.policy.unrestricted_execution()
+                    && self.progress.covers_denied_request(
+                        requested.network,
+                        requested.repository_git || requested.unrestricted_fs,
+                    )
+                {
                     results[index] = Some(ContentPart::ToolResult {
                         result: ToolResultContent {
                             call_id: call.id,
@@ -2820,82 +2828,21 @@ impl AgentHarness for Drive<'_> {
                 results[index] = Some(deny_call(&mut *self.observer, call, msg));
                 continue;
             }
-            // Write-ownership fence: a live claim is EXCLUSIVE against
-            // everyone, the parent included. The registry is the one
-            // authority, so this covers a late-bound child's own
-            // claim_write_scope grant as well as a legacy Worker's
-            // pre-claim — an edit there would race the child this agent
-            // delegated to; integration waits for the settlement notice.
-            //
-            // A writer at depth 0 checks and commits in ONE locked
-            // registry operation and holds the guard for the rest of the
-            // call. Asking `conflicts_for` here and taking the guard later
-            // left a window in which a background child — a separate task,
-            // genuinely parallel on the multi-thread runtime — claimed the
-            // same path: its claim saw an empty `parent_active` and was
-            // granted, and the later guard marked without re-checking, so
-            // both wrote one file.
-            let mut _mutation_guard = None;
-            if self.executor.registry.mutates_files(&call.name) {
-                let owner_key = match (&self.executor.agent_id, self.executor.depth) {
-                    (Some(id), _) => id.clone(),
-                    (None, 0) => "parent".to_string(),
-                    (None, depth) => format!("child-depth-{depth}"),
-                };
-                let targets = crate::authorization::mutation_targets(&call);
-                let hits = if self.executor.depth == 0 {
-                    match self
-                        .executor
-                        .ownership
-                        .try_mutation_guard(&owner_key, &targets)
-                    {
-                        Ok(guard) => {
-                            _mutation_guard = Some(guard);
-                            Vec::new()
-                        }
-                        Err(conflicts) => conflicts,
-                    }
-                } else {
-                    self.executor.ownership.conflicts_for(&targets, &owner_key)
-                };
-                if !hits.is_empty() {
-                    let inside: Vec<String> = hits.iter().map(|c| c.path.clone()).collect();
-                    let mut owners: Vec<String> = hits.iter().map(|c| c.owner.clone()).collect();
-                    owners.dedup();
-                    let msg = format!(
-                        "Edit refused: {} belongs to the exclusive scope of \
-                             still-running sub-agent(s) {}. Wait for the settlement \
-                             notice and integrate its result instead of editing its \
-                             files while it works; continue on other work meanwhile.",
-                        inside.join(", "),
-                        owners.join(", ")
-                    );
-                    denied_calls_this_round += 1;
-                    results[index] = Some(deny_call(&mut *self.observer, call, msg));
-                    continue;
-                }
-            }
-
-            // Write authority (late-bound ownership): a child's effective
-            // allowlist is what it has CLAIMED (plus any legacy pre-claim);
-            // before its first grant that set is empty and EVERY mutating
-            // tool is refused — do not wait to parse patch paths
-            // (PB2_B_ORCH_1: Update File landed because an empty-target
-            // miss skipped this fence). The parent stays unrestricted
-            // (fenced above by others' claims).
-            // An MCP tool's effect lands in a separate, unsandboxed
-            // process and cannot be bounded by a claimed scope, so a
-            // delegated agent may not reach one at all.
-            if let Some(msg) = self.executor.refuse_unboundable_delegated_tool(&call) {
-                denied_calls_this_round += 1;
-                results[index] = Some(deny_call(&mut *self.observer, call, msg));
-                continue;
-            }
-            if let Some(msg) = self.executor.refuse_unscoped_mutation(&call) {
-                denied_calls_this_round += 1;
-                results[index] = Some(deny_call(&mut *self.observer, call, msg));
-                continue;
-            }
+            // Keep the claim/mutation race synchronized when no foreign claim
+            // exists. Conflicts are approval reasons at the sole ToolHost
+            // admission boundary, never a second refusal in the drive loop.
+            let owner_key = self.executor.agent_id.as_deref().unwrap_or("parent");
+            let _mutation_guard = if !self.executor.tool_context.policy.unrestricted_execution()
+                && self.executor.depth == 0
+                && self.executor.registry.mutates_files(&call.name)
+            {
+                self.executor
+                    .ownership
+                    .try_mutation_guard(owner_key, &crate::authorization::mutation_targets(&call))
+                    .ok()
+            } else {
+                None
+            };
 
             // Read-only, side-effect-free tools are deferred to the
             // concurrent batch below; mark the event so a UI can render them
@@ -2918,7 +2865,8 @@ impl AgentHarness for Drive<'_> {
             // it here — between the call event and the context — is what
             // makes approval and execution one round trip instead of two.
             let mut call_grants = TurnPermissionGrants::default();
-            if is_escalatable_tool(&call.name)
+            if !self.executor.tool_context.policy.unrestricted_execution()
+                && is_escalatable_tool(&call.name)
                 && let Some((reason, requested)) = parse_escalation(&call.arguments)
                 // Already allowed for this turn: the user answered this
                 // question, so the call runs under the turn grant unasked.
@@ -3036,11 +2984,8 @@ impl AgentHarness for Drive<'_> {
             // requires the AdmittedCall it returns; `parallel` (computed
             // above) decides deferral to the batch — every other admitted
             // call runs here, in order.
-            // §19: while the parent executes a mutation, an overlapping
-            // child claim is denied retryably. The guard was acquired
-            // atomically with the ownership check above and lives until
-            // this call resolves — taking it here instead would reopen the
-            // window it exists to close.
+            // A non-conflicting mutation guard remains held through dispatch;
+            // ownership conflicts have already been resolved by host admission.
             let (
                 content,
                 is_error,

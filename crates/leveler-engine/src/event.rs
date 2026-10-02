@@ -537,6 +537,9 @@ pub enum EngineEvent {
 
     // ── kernel: approvals / clarifications ──────────────────────────────
     ApprovalRequested {
+        /// Frozen host-resolved capability/resource projection for audit only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant: Option<leveler_core::GrantRequest>,
         id: ApprovalId,
         /// The call this approval gates, and the agent that made it. Recovery
         /// pairs on both: call ids are local to their agent, so two concurrent
@@ -1212,6 +1215,7 @@ mod contract_tests {
         );
         assert_eq!(
             EngineEvent::ApprovalRequested {
+                grant: None,
                 id: leveler_core::ApprovalId::generate(),
                 call_id: Some("call-1".into()),
                 agent_id: None,
@@ -1253,6 +1257,7 @@ mod contract_tests {
                 warnings: Vec::new(),
             },
             EngineEvent::ApprovalRequested {
+                grant: None,
                 id: ApprovalId::new("approval-safe"),
                 call_id: Some(secret.into()),
                 agent_id: Some(secret.into()),

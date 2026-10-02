@@ -46,6 +46,9 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, 
 
 /// A live connection to one MCP server.
 pub struct McpClient {
+    config: McpServerConfig,
+    environment: leveler_core::EnvSnapshot,
+    unrestricted: bool,
     stdin: Mutex<ChildStdin>,
     pending: Pending,
     next_id: AtomicU64,
@@ -55,6 +58,16 @@ pub struct McpClient {
 impl McpClient {
     /// Spawn the server and complete the `initialize` handshake.
     pub async fn connect(cfg: &McpServerConfig) -> Result<Arc<Self>, String> {
+        Self::connect_with_authority(cfg, leveler_core::environment(), false).await
+    }
+
+    /// The application owns this launch authority; MCP configuration cannot
+    /// promote its own inherited environment to FullAccess.
+    pub async fn connect_with_authority(
+        cfg: &McpServerConfig,
+        environment: &leveler_core::EnvSnapshot,
+        unrestricted: bool,
+    ) -> Result<Arc<Self>, String> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args)
             .stdin(Stdio::piped())
@@ -62,9 +75,12 @@ impl McpClient {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         cmd.env_clear();
-        cmd.envs(leveler_core::scrubbed_environment());
-        // Explicit MCP configuration is the only way to grant a credential to
-        // the server; apply it after removing inherited secrets.
+        if unrestricted {
+            cmd.envs(environment.vars_os());
+        } else {
+            cmd.envs(environment.scrubbed_vars_os());
+        }
+        // Explicit configuration overrides either inherited authority environment.
         for (k, v) in &cfg.env {
             cmd.env(k, v);
         }
@@ -112,6 +128,9 @@ impl McpClient {
         }
 
         let client = Arc::new(Self {
+            config: cfg.clone(),
+            environment: environment.clone(),
+            unrestricted,
             stdin: Mutex::new(stdin),
             pending,
             next_id: AtomicU64::new(1),
@@ -300,10 +319,36 @@ impl Tool for McpTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: ToolContext,
+        context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let call = self.client.call_tool(&self.remote_name, input);
+        if !context.policy.unrestricted_execution()
+            && !matches!(
+                context.policy.network_scope(),
+                leveler_execution::NetworkScope::Internet
+            )
+        {
+            return Ok(ToolOutput::error(
+                "UnsupportedNetworkScope: MCP server processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+            ));
+        }
+        let unrestricted = context.policy.unrestricted_execution();
+        let call = async {
+            // A frozen exact-call approval must not mutate the authority of the
+            // cached, process-lived server. A mismatch gets a call-owned server
+            // with the same configured program; dropping it ends that authority.
+            let client = if self.client.unrestricted == unrestricted {
+                self.client.clone()
+            } else {
+                McpClient::connect_with_authority(
+                    &self.client.config,
+                    &self.client.environment,
+                    unrestricted,
+                )
+                .await?
+            };
+            client.call_tool(&self.remote_name, input).await
+        };
         let out = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Ok(ToolOutput::error("MCP 调用已取消。")),
@@ -319,9 +364,19 @@ impl Tool for McpTool {
 /// Connect to each configured server and return its tools. Servers that fail to
 /// start or list are skipped (logged), never aborting the caller.
 pub async fn connect_all(configs: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
+    connect_all_with_authority(configs, leveler_core::environment(), false).await
+}
+
+/// Connect under application-owned startup authority, preserving credential
+/// inheritance only for a FullAccess launch.
+pub async fn connect_all_with_authority(
+    configs: &[McpServerConfig],
+    environment: &leveler_core::EnvSnapshot,
+    unrestricted: bool,
+) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for cfg in configs {
-        match McpClient::connect(cfg).await {
+        match McpClient::connect_with_authority(cfg, environment, unrestricted).await {
             Ok(client) => match client.list_tools().await {
                 Ok(infos) => {
                     for info in infos {
@@ -339,6 +394,154 @@ pub async fn connect_all(configs: &[McpServerConfig]) -> Vec<Arc<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn full_mcp_launch_preserves_inherited_credentials_scoped_launch_scrubs() {
+        let dir = tempfile::tempdir().unwrap();
+        let environment = leveler_core::EnvSnapshot::new(
+            [("SERVICE_API_KEY".into(), "synthetic-test-key".into())],
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        for unrestricted in [false, true] {
+            let observed = dir.path().join(format!("{unrestricted}.txt"));
+            let script = r#"import json,os,sys
+with open(sys.argv[1], 'w') as f: f.write(os.environ.get('SERVICE_API_KEY', 'absent'))
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' in request: print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{}}), flush=True)
+"#;
+            let cfg = McpServerConfig {
+                name: "authority-test".into(),
+                command: "/usr/bin/python3".into(),
+                args: vec![
+                    "-u".into(),
+                    "-c".into(),
+                    script.into(),
+                    observed.to_string_lossy().into_owned(),
+                ],
+                env: vec![],
+            };
+            let client = McpClient::connect_with_authority(&cfg, &environment, unrestricted)
+                .await
+                .unwrap();
+            let value = std::fs::read_to_string(observed).unwrap();
+            assert_eq!(
+                value,
+                if unrestricted {
+                    "synthetic-test-key"
+                } else {
+                    "absent"
+                }
+            );
+            drop(client);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn approved_mcp_call_inherits_credentials_without_elevating_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let environment = leveler_core::EnvSnapshot::new(
+            [("SERVICE_API_KEY".into(), "synthetic-test-key".into())],
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        let script = r#"import json,os,sys
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' in request:
+        result={'content':[{'type':'text','text':os.environ.get('SERVICE_API_KEY','absent')}]} if request['method']=='tools/call' else {}
+        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#;
+        let cfg = McpServerConfig {
+            name: "approved-authority".into(),
+            command: "/usr/bin/python3".into(),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            env: vec![],
+        };
+        let client = McpClient::connect_with_authority(&cfg, &environment, false)
+            .await
+            .unwrap();
+        let tool = McpTool::new(
+            client,
+            "test",
+            McpToolInfo {
+                name: "probe".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({}),
+            },
+        );
+        let ctx = ToolContext::new(
+            leveler_execution::Workspace::new(dir.path()).unwrap(),
+            leveler_execution::PermissionProfile::Assisted,
+        );
+        let approved =
+            ctx.clone()
+                .with_resolved_policy(leveler_execution::ResolvedExecutionPolicy::new(
+                    leveler_execution::WriteScope::Unrestricted,
+                    leveler_execution::NetworkScope::Internet,
+                    leveler_execution::AuthorizationEvidence::ApprovedOnce,
+                ));
+        let output = tool
+            .execute(serde_json::json!({}), approved, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content, "synthetic-test-key");
+        let next = tool
+            .execute(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!next.is_error, "{}", next.content);
+        assert_eq!(
+            next.content, "absent",
+            "approveonce must not mutate cached server authority"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn direct_mcp_call_refuses_loopback_scope_before_rpc() {
+        let mut child = Command::new("/usr/bin/true")
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let client = Arc::new(McpClient {
+            config: McpServerConfig {
+                name: "test".into(),
+                command: "/usr/bin/true".into(),
+                args: vec![],
+                env: vec![],
+            },
+            environment: leveler_core::EnvSnapshot::default(),
+            unrestricted: false,
+            stdin: Mutex::new(child.stdin.take().unwrap()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            _child: child,
+        });
+        let tool = McpTool::new(
+            client.clone(),
+            "test",
+            McpToolInfo {
+                name: "probe".into(),
+                description: "probe".into(),
+                input_schema: serde_json::json!({}),
+            },
+        );
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let out = tool
+            .execute(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("UnsupportedNetworkScope"));
+        assert_eq!(client.next_id.load(Ordering::SeqCst), 1, "no RPC was sent");
+    }
 
     #[test]
     fn parses_tools_list() {

@@ -61,6 +61,11 @@ impl Tool for ListFilesTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        let path = input.get("path")?.as_str()?;
+        crate::workspace::path_approval_reason(context, path, false)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -70,7 +75,7 @@ impl Tool for ListFilesTool {
         let input: Input = super::parse_input(self.name(), input)?;
         let rel = input.path.unwrap_or_else(|| ".".to_string());
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
-        let base = context.require_workspace()?.resolve_for_read(&rel)?;
+        let base = context.execution_workspace()?.resolve_for_read(&rel)?;
 
         let listing = match WorkspaceSearch::list_dir(&base, limit) {
             Ok(listing) => listing,

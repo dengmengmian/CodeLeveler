@@ -69,7 +69,7 @@ impl WriteScope {
 /// |---------|------------|----------|
 /// | [`RequestApproval`] | read broad, write confined | network and high-risk actions are usually prompted |
 /// | [`Assisted`] | read broad, write confined | irreversible or boundary-crossing actions are prompted |
-/// | [`FullAccess`] | unrestricted | prompts are exceptional (memory remains protected) |
+/// | [`FullAccess`] | unrestricted | no permission prompts or sandbox restrictions |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionProfile {
@@ -110,11 +110,12 @@ impl PermissionProfile {
     /// it at the registry (approval may still be required).
     pub fn permits(self, risk: RiskLevel) -> bool {
         match self {
-            // Confined profiles: no destructive / privileged tools at all.
-            Self::RequestApproval | Self::Assisted => {
+            // Restricted can refuse inherently privileged tools. Auto routes
+            // high-risk tools to approval instead of hard denial.
+            Self::RequestApproval => {
                 !matches!(risk, RiskLevel::Privileged | RiskLevel::Destructive)
             }
-            Self::FullAccess => true,
+            Self::Assisted | Self::FullAccess => true,
         }
     }
 
@@ -237,13 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn assisted_blocks_destructive_at_registry() {
+    fn assisted_routes_destructive_tools_to_approval_instead_of_registry_denial() {
         assert!(PermissionProfile::Assisted.permits(RiskLevel::WorkspaceWrite));
-        assert!(!PermissionProfile::Assisted.permits(RiskLevel::Destructive));
+        assert!(PermissionProfile::Assisted.permits(RiskLevel::Destructive));
     }
 
     #[test]
-    fn request_approval_same_registry_gate_as_assisted() {
+    fn restricted_registry_can_refuse_privileged_tools() {
         assert!(PermissionProfile::RequestApproval.permits(RiskLevel::Safe));
         assert!(PermissionProfile::RequestApproval.permits(RiskLevel::Network));
         assert!(!PermissionProfile::RequestApproval.permits(RiskLevel::Privileged));

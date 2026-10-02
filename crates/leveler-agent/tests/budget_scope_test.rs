@@ -178,6 +178,9 @@ async fn fixture() -> Fixture {
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime: runtime.clone(),
             registry: Arc::new(registry),
             tool_context: context,

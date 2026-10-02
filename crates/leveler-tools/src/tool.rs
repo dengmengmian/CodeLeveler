@@ -7,8 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_context::FileStateTracker;
 use leveler_execution::{
-    Checkpoint, CommandRunner, PermissionProfile, ProcessError, ResolvedExecutionPolicy, RiskLevel,
-    SharedPermissionProfile, Workspace, WorkspaceError, WriteScope,
+    Checkpoint, CommandRunner, NetworkScope, PermissionProfile, ProcessError,
+    ResolvedExecutionPolicy, RiskLevel, SharedPermissionProfile, Workspace, WorkspaceError,
+    WriteScope,
 };
 
 /// Shared, cheaply-cloneable context handed to every tool invocation:
@@ -150,15 +151,58 @@ impl ToolPolicy {
         &self.permission_profile
     }
 
+    /// The single Full-mode execution path. An admitted call uses frozen
+    /// authority, so a later profile switch cannot widen or narrow that call.
+    pub fn unrestricted_execution(&self) -> bool {
+        self.resolved.as_ref().map_or_else(
+            || self.mode() == PermissionProfile::FullAccess,
+            ResolvedExecutionPolicy::unrestricted_execution,
+        )
+    }
+
+    /// Exact resource bindings frozen by the admission owner.
+    pub fn resource_grant(&self) -> Option<&leveler_core::GrantRequest> {
+        self.resolved
+            .as_ref()
+            .and_then(ResolvedExecutionPolicy::resource_grant)
+    }
+
+    /// True only for the exact capability and host-resolved identity admitted.
+    pub fn allows_resource(
+        &self,
+        capability: leveler_core::Capability,
+        resource: &leveler_core::ResourceIdentity,
+    ) -> bool {
+        self.resolved
+            .as_ref()
+            .is_some_and(|policy| policy.allows_resource(capability, resource))
+    }
+
     /// Whether this execution runs with network access denied: the frozen
     /// policy of an admitted call, else no grant and either an explicit
     /// denial or a profile that does not reach the network by default. Reads
     /// the live profile, so a switch lands on the next call.
     pub fn network_denied(&self) -> bool {
-        if let Some(resolved) = &self.resolved {
-            return !resolved.network_allowed;
+        !matches!(self.network_scope(), NetworkScope::Internet)
+    }
+
+    /// The destination boundary, frozen by admission. Legacy `network_denied`
+    /// means unrestricted networking is unavailable; scoped consumers must use
+    /// this contract rather than converting it back to an allow-network bool.
+    pub fn network_scope(&self) -> NetworkScope {
+        if self.unrestricted_execution() {
+            return NetworkScope::Internet;
         }
-        !self.network_granted && (self.deny_network || !self.mode().network_by_default())
+        if let Some(resolved) = &self.resolved {
+            return resolved.network_scope.clone();
+        }
+        if self.network_explicitly_denied() {
+            NetworkScope::None
+        } else if self.network_granted || self.mode().network_by_default() {
+            NetworkScope::Internet
+        } else {
+            NetworkScope::Loopback
+        }
     }
 
     /// Whether the run itself denies the network (`--deny-network`), as
@@ -166,7 +210,7 @@ impl ToolPolicy {
     /// (an MCP server) is refused under an explicit denial; under the profile
     /// default it goes to the user like any other network use.
     pub fn network_explicitly_denied(&self) -> bool {
-        self.deny_network && !self.network_granted
+        !self.unrestricted_execution() && self.deny_network && !self.network_granted
     }
 
     /// The frozen per-call policy, when this context belongs to an admitted
@@ -188,6 +232,9 @@ impl ToolPolicy {
     /// same, it is just one answer now. Reads the live profile cell, so a
     /// mid-turn switch lands on the next call.
     pub fn write_scope(&self, workspace_root: &std::path::Path) -> WriteScope {
+        if self.unrestricted_execution() {
+            return WriteScope::Unrestricted;
+        }
         if let Some(resolved) = &self.resolved {
             return resolved.write.clone();
         }
@@ -251,6 +298,9 @@ impl ToolPolicy {
     /// `None` allowlist = unrestricted. An empty allowlist is zero authority:
     /// every path is denied (late-bound child before `claim_write_scope`).
     pub fn write_path_denied(&self, path: &str) -> Option<String> {
+        if self.unrestricted_execution() {
+            return None;
+        }
         let allow = self.command_write_allowlist.as_deref()?;
         let path = path.trim().trim_start_matches("./").trim_end_matches('/');
         if allow.iter().any(|a| {
@@ -278,9 +328,11 @@ impl ToolPolicy {
     /// that can mutate the workspace must not run (git-after-the-fact cannot
     /// see empty-directory removals).
     pub fn has_zero_write_authority(&self) -> bool {
-        self.command_write_allowlist
-            .as_deref()
-            .is_some_and(|allow| allow.is_empty())
+        !self.unrestricted_execution()
+            && self
+                .command_write_allowlist
+                .as_deref()
+                .is_some_and(|allow| allow.is_empty())
             && !self.read_only
     }
 }
@@ -356,6 +408,39 @@ impl ToolContext {
             .ok_or(ToolError::WorkspaceUnavailable)
     }
 
+    /// Workspace access carrying this call's frozen host authority.
+    pub fn execution_workspace(&self) -> Result<Workspace, ToolError> {
+        Ok(self
+            .require_workspace()?
+            .clone()
+            .with_unrestricted_access(self.policy.unrestricted_execution())
+            .with_resource_bindings(
+                self.policy
+                    .resource_grant()
+                    .map(|request| request.bindings.clone())
+                    .unwrap_or_default(),
+            ))
+    }
+
+    /// Preserve ownership fences except for an exact admitted filesystem write.
+    pub fn write_path_denied(&self, path: &str) -> Option<String> {
+        self.mutation_path_denied(path, leveler_core::Capability::FilesystemWrite)
+    }
+
+    /// Preserve ownership except for this exact admitted mutation capability.
+    pub fn mutation_path_denied(
+        &self,
+        path: &str,
+        capability: leveler_core::Capability,
+    ) -> Option<String> {
+        if self.execution_workspace().is_ok_and(|workspace| {
+            workspace.allows_resource_path(capability, std::path::Path::new(path))
+        }) {
+            return None;
+        }
+        self.policy.write_path_denied(path)
+    }
+
     /// Point this context at a permission profile the SESSION owns, instead
     /// of the private cell the constructor made.
     ///
@@ -372,6 +457,13 @@ impl ToolContext {
     /// Freeze this context to one admitted call's policy (PR 5). The ToolHost
     /// is the only caller; a tool never widens its own policy.
     pub fn with_resolved_policy(mut self, resolved: ResolvedExecutionPolicy) -> Self {
+        if resolved.unrestricted_execution() {
+            self.policy.read_only = false;
+            self.policy.command_write_allowlist = None;
+            self.policy.command_foreign_paths = Arc::new(Vec::new());
+            self.policy.command_modified_files_remaining = None;
+            self.policy.max_files_per_step = 0;
+        }
         self.policy.resolved = Some(resolved);
         self
     }
@@ -559,6 +651,53 @@ pub trait Tool: Send + Sync {
     /// The risk class of this tool.
     fn risk(&self) -> RiskLevel;
 
+    /// Mechanical preflight for an action that needs explicit consent in Auto.
+    /// It is evaluated only at admission; an approved call bypasses the guard.
+    fn approval_reason(
+        &self,
+        _input: &serde_json::Value,
+        _context: &ToolContext,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Async preflight for runtime-owned resources such as an existing task.
+    async fn admission_reason(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<String> {
+        self.approval_reason(input, context)
+    }
+
+    /// Commands resolve approval from the same typed input used at execution.
+    async fn command_grant_request(
+        &self,
+        _input: &serde_json::Value,
+        _context: &ToolContext,
+    ) -> Result<Option<leveler_core::GrantRequest>, String> {
+        Ok(None)
+    }
+
+    /// Host-resolved capability bindings for reusable approval of this action.
+    async fn grant_bindings(
+        &self,
+        _input: &serde_json::Value,
+        _context: &ToolContext,
+    ) -> Result<Option<Vec<leveler_core::GrantBinding>>, String> {
+        Ok(None)
+    }
+
+    /// Optional destination evidence for admission. It does not grant access:
+    /// the execution broker must resolve, validate and pin the actual socket.
+    /// Opaque clients (browsers/MCP) cannot claim one URL bounds their traffic.
+    async fn network_resource(
+        &self,
+        _input: &serde_json::Value,
+    ) -> Result<Option<leveler_execution::NetworkResource>, String> {
+        Ok(None)
+    }
+
     /// Whether this tool is a pure, read-only lookup that is safe to run
     /// concurrently with other parallel-safe tools requested in the same round.
     /// Defaults to `false` (serialized). Any tool with side effects — edits,
@@ -646,7 +785,7 @@ mod write_scope_tests {
 
     /// The network half of the profile: request-approval runs commands with
     /// the network denied until a grant; the others allow; an explicit
-    /// `--deny-network` denies under every profile.
+    /// `--deny-network` is bypassed by Full.
     #[test]
     fn the_effective_network_follows_the_live_profile_and_grants() {
         let (c, _d) = ctx(PermissionProfile::RequestApproval);
@@ -672,8 +811,11 @@ mod write_scope_tests {
 
         let (c, _d) = ctx(PermissionProfile::FullAccess);
         let c = c.with_sandbox(true);
-        assert!(c.policy.network_denied());
-        assert!(c.policy.network_explicitly_denied());
+        assert!(
+            !c.policy.network_denied(),
+            "Full bypasses explicit sandbox settings"
+        );
+        assert!(!c.policy.network_explicitly_denied());
         let mut c = c;
         c.policy.grant_network();
         assert!(

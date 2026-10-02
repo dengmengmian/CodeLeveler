@@ -276,6 +276,52 @@ pub fn git_command_effects(args: &[String]) -> Option<GitCommandEffects> {
     Some(effects)
 }
 
+/// A reusable grant target resolved by the same argv parser as Git effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitGrantSelection {
+    pub effects: GitEffects,
+    pub remote_name: Option<String>,
+}
+
+pub fn git_grant_selection(args: &[String]) -> Option<GitGrantSelection> {
+    // A caller-selected executable named `git` is not proof it is Git.
+    // PATH/environment overrides are additionally rejected by host admission.
+    if args.first()?.as_str() != "git" {
+        return None;
+    }
+    let effects = git_command_effects(args)?;
+    if !effects.resolved || effects.explicit_remote {
+        return None;
+    }
+    let parsed = split_subcommand(&args[1..])?;
+    if !effects.effects.remote_read && !effects.effects.remote_write {
+        return Some(GitGrantSelection {
+            effects: effects.effects,
+            remote_name: None,
+        });
+    }
+    if !matches!(parsed.subcommand.as_str(), "fetch" | "ls-remote" | "push") {
+        return None;
+    }
+    let transport = transport_arguments(&parsed.subcommand, &parsed.args);
+    if !transport.resolved
+        || transport.multiple
+        || parsed.args.iter().any(|arg| {
+            matches!(arg.as_str(), "--all" | "--stdin") || arg.starts_with("--recurse-submodules")
+        })
+    {
+        return None;
+    }
+    let name = transport.positional.first()?;
+    if name.is_empty() || names_explicit_remote(&[name]) {
+        return None;
+    }
+    Some(GitGrantSelection {
+        effects: effects.effects,
+        remote_name: Some((*name).clone()),
+    })
+}
+
 struct ParsedInvocation {
     subcommand: String,
     args: Vec<String>,
@@ -664,16 +710,24 @@ fn classify_subcommand(subcommand: &str, args: &[String]) -> GitCommandEffects {
                 || any_prefix("--force-if-includes")
                 || has("--mirror")
                 || has("--delete")
-                || positional.iter().any(|a| a.starts_with('+'));
+                || has("-d")
+                || has("--prune")
+                || positional
+                    .iter()
+                    .any(|a| a.starts_with('+') || a.starts_with(':'));
             let sets_upstream = has("-u") || has("--set-upstream");
-            GitCommandEffects::resolved(GitEffects {
+            let mut out = GitCommandEffects::resolved(GitEffects {
                 metadata_read: true,
                 metadata_write: true,
                 remote_write: true,
                 config_write: sets_upstream,
                 irreversible: force,
                 ..GitEffects::default()
-            })
+            });
+            let parsed = transport_arguments("push", args);
+            out.resolved = parsed.resolved;
+            out.explicit_remote = names_explicit_remote(&parsed.positional);
+            out
         }
         // `clone` creates a repository BESIDE the current one; it never writes
         // the current repository's metadata, so there is no configured remote
@@ -811,7 +865,10 @@ fn transport_arguments<'a>(subcommand: &str, args: &'a [String]) -> TransportArg
         if matches!(kind, TransportOption::Value) && value.is_none_or(str::is_empty) {
             out.resolved = false;
         }
-        if matches!(name, "--upload-pack" | "--exec") {
+        if matches!(
+            name,
+            "--upload-pack" | "--receive-pack" | "--exec" | "--repo"
+        ) {
             // A caller-selected executable is a separate authority expansion,
             // even when its value and the repository are mechanically readable.
             out.resolved = false;
@@ -837,6 +894,39 @@ fn transport_option(subcommand: &str, name: &str) -> Option<TransportOption> {
         return transport_option(subcommand, &positive).map(|_| Flag);
     }
     match (subcommand, name) {
+        ("push", "--repo" | "--receive-pack" | "--exec" | "--push-option" | "-o") => Some(Value),
+        ("push", "--force-with-lease" | "--recurse-submodules" | "--signed") => Some(OptionalValue),
+        (
+            "push",
+            "--all"
+            | "--branches"
+            | "--prune"
+            | "--mirror"
+            | "--tags"
+            | "--follow-tags"
+            | "--dry-run"
+            | "-n"
+            | "--porcelain"
+            | "--delete"
+            | "-d"
+            | "--force"
+            | "-f"
+            | "--force-if-includes"
+            | "--set-upstream"
+            | "-u"
+            | "--thin"
+            | "--atomic"
+            | "--verbose"
+            | "-v"
+            | "--quiet"
+            | "-q"
+            | "--progress"
+            | "--ipv4"
+            | "-4"
+            | "--ipv6"
+            | "-6"
+            | "--verify",
+        ) => Some(Flag),
         (
             "fetch" | "pull",
             "--depth" | "--deepen" | "--shallow-since" | "--shallow-exclude" | "--refmap"
@@ -971,4 +1061,48 @@ fn basename(program: &str) -> &str {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(program)
+}
+
+#[cfg(test)]
+mod grant_selection_tests {
+    use super::*;
+    fn selection(command: &[&str]) -> Option<GitGrantSelection> {
+        git_grant_selection(
+            &command
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+    #[test]
+    fn named_transport_targets_and_force_have_distinct_effects() {
+        let read = selection(&["git", "fetch", "--depth", "1", "origin"]).unwrap();
+        assert_eq!(read.remote_name.as_deref(), Some("origin"));
+        assert!(read.effects.remote_read && !read.effects.remote_write);
+        let push = selection(&["git", "push", "origin", "main"]).unwrap();
+        let force = selection(&["git", "push", "--force-with-lease", "origin", "main"]).unwrap();
+        assert_eq!(push.remote_name.as_deref(), Some("origin"));
+        assert!(!push.effects.irreversible);
+        assert!(force.effects.irreversible);
+        for command in [
+            vec!["git", "push", "origin", ":main"],
+            vec!["git", "push", "-d", "origin", "main"],
+            vec!["git", "push", "--prune", "origin", "main"],
+        ] {
+            assert!(selection(&command).unwrap().effects.irreversible);
+        }
+    }
+    #[test]
+    fn unknown_targets_overrides_and_multiple_transports_are_not_reusable() {
+        for command in [
+            vec!["git", "fetch", "https://example.com/repo"],
+            vec!["git", "-c", "x=y", "fetch", "origin"],
+            vec!["git", "fetch", "--multiple", "origin", "other"],
+            vec!["git", "fetch", "--recurse-submodules", "origin"],
+            vec!["git", "push", "--receive-pack=evil", "origin"],
+            vec!["/tmp/selected/git", "push", "origin"],
+        ] {
+            assert!(selection(&command).is_none(), "{command:?}");
+        }
+    }
 }

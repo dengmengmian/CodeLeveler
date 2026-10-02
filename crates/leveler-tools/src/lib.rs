@@ -8,6 +8,7 @@
 
 pub mod capabilities;
 pub mod mcp;
+pub(crate) mod network;
 pub mod recoverable;
 pub mod registry;
 pub mod tool;

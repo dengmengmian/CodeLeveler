@@ -211,6 +211,7 @@ impl Approver for RecordingApprover {
         let mut request = request.clone();
         request.turn_id = Some(self.turn_id.clone());
         self.events.emit(EngineEvent::ApprovalRequested {
+            grant: request.grant.clone(),
             id: request.id.clone(),
             call_id: Some(request.call_id.clone()),
             agent_id: request.agent_id.clone(),
@@ -227,6 +228,7 @@ impl Approver for RecordingApprover {
             decision: match decision {
                 ApprovalDecision::ApproveOnce => "approve_once".to_string(),
                 ApprovalDecision::ApproveSession => "approve_session".to_string(),
+                ApprovalDecision::ApproveProject => "approve_project".to_string(),
                 ApprovalDecision::ApproveAlways => "approve_always".to_string(),
                 ApprovalDecision::Deny => "deny".to_string(),
             },
@@ -267,6 +269,65 @@ impl Clarifier for RecordingClarifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ProjectApprover;
+    #[async_trait]
+    impl Approver for ProjectApprover {
+        async fn decide(&self, _: &ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::ApproveProject
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_approval_audit_uses_the_exact_host_request_binding() {
+        let (events, mut receiver, _) =
+            EventEmitter::channel(4, tokio_util::sync::CancellationToken::new());
+        let approver = RecordingApprover {
+            inner: Arc::new(ProjectApprover),
+            events,
+            turn_id: TurnId::new("turn-a"),
+        };
+        let request = ApprovalRequest {
+            id: leveler_core::ApprovalId::new("approval-a"),
+            turn_id: None,
+            call_id: "call-a".into(),
+            agent_id: None,
+            action_fingerprint: "fp".into(),
+            tool: "run_command".into(),
+            risk: leveler_execution::RiskLevel::Network,
+            description: "model description is not authority".into(),
+            command: Some("git push origin main".into()),
+            paths: Vec::new(),
+            grant: Some(leveler_core::GrantRequest {
+                project_identity: "project-a".into(),
+                bindings: vec![leveler_core::GrantBinding {
+                    capability: leveler_core::Capability::RemoteMutate,
+                    resource: leveler_core::ResourceIdentity::ConfiguredRemote {
+                        repository: "repo-a".into(),
+                        remote_name: "origin".into(),
+                        canonical_url: "https://example.test/a.git".into(),
+                        transport: "https".into(),
+                    },
+                }],
+            }),
+        };
+        assert_eq!(
+            approver.decide(&request).await,
+            ApprovalDecision::ApproveProject
+        );
+        match receiver.recv().await.unwrap() {
+            PumpItem::Event(EngineEvent::ApprovalRequested { grant, .. }) => {
+                assert_eq!(grant, request.grant)
+            }
+            _ => panic!("unexpected event"),
+        }
+        match receiver.recv().await.unwrap() {
+            PumpItem::Event(EngineEvent::ApprovalResolved { decision, .. }) => {
+                assert_eq!(decision, "approve_project")
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
 
     #[tokio::test]
     async fn transient_overflow_is_lossy_without_failing_the_turn() {

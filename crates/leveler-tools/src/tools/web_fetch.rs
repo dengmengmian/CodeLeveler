@@ -1,10 +1,14 @@
 //! `web_fetch` — fetch a public HTTP(S) document into the agent context.
 //!
-//! No API key. SSRF-hardened: only http(s), blocks private/link-local/metadata
-//! addresses (checked after DNS resolve and on each redirect hop). Output is
-//! size-capped plain text.
+//! No API key. Host socket mediation enforces the admitted scope on pinned DNS
+//! addresses and every redirect hop. Internet requests retain SSRF exclusions;
+//! explicit local scopes permit development endpoints. FullAccess bypasses
+//! destination/SSRF restrictions. Output is size-capped.
 
-use std::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+use crate::network::is_blocked_ip;
+#[cfg(test)]
+use std::net::IpAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,10 +21,8 @@ use leveler_execution::RiskLevel;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
-const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_BYTES: usize = 512 * 1024;
 const HARD_MAX_BYTES: usize = 2 * 1024 * 1024;
-const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Input {
@@ -43,8 +45,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a public HTTP or HTTPS URL and return its text. Refuses private, \
-         link-local, and metadata addresses. Fails when network is denied for \
+        "Fetch an HTTP or HTTPS URL and return its text. Loopback URLs support local development; other private destinations require local network authority or approval. Fails when network is denied for \
          this turn. Does not use a search API key. Optional `max_bytes` caps \
          the returned body."
     }
@@ -57,6 +58,43 @@ impl Tool for WebFetchTool {
         RiskLevel::Network
     }
 
+    async fn admission_reason(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<String> {
+        if context.policy.unrestricted_execution()
+            || !matches!(
+                context.policy.network_scope(),
+                leveler_execution::NetworkScope::Internet
+            )
+        {
+            return None;
+        }
+        let url = input.get("url")?.as_str()?;
+        let resource = crate::network::resolve_target(url.trim()).await.ok()?;
+        let loopback = leveler_execution::NetworkScope::Loopback
+            .validate_resource(&resource)
+            .is_ok();
+        (!loopback
+            && resource
+                .resolved_addresses
+                .iter()
+                .any(|address| crate::network::is_blocked_ip(address.ip())))
+        .then(|| "HTTP access to LAN/private destinations requires explicit approval".to_string())
+    }
+
+    async fn network_resource(
+        &self,
+        input: &serde_json::Value,
+    ) -> Result<Option<leveler_execution::NetworkResource>, String> {
+        let url = input
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("web_fetch needs a URL")?;
+        crate::network::resolve_target(url.trim()).await.map(Some)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -64,7 +102,9 @@ impl Tool for WebFetchTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        if context.policy.network_denied() {
+        let network_scope = context.policy.network_scope();
+        let unrestricted = context.policy.unrestricted_execution();
+        if !unrestricted && matches!(network_scope, leveler_execution::NetworkScope::None) {
             return Ok(ToolOutput::error(
                 "web_fetch 不可用:当前模式/沙箱已禁用网络。",
             ));
@@ -83,7 +123,7 @@ impl Tool for WebFetchTool {
             _ = cancellation.cancelled() => {
                 return Ok(ToolOutput::error("web_fetch 已取消。"));
             }
-            r = fetch_url(&url, max_bytes) => r,
+            r = fetch_url(&url, max_bytes, &network_scope, unrestricted) => r,
         };
 
         match result {
@@ -95,180 +135,32 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// Synchronous first-gate: scheme, `localhost`, and any *literal* IP in the
-/// host — the checks that need no DNS. Hostnames pass here and get their
-/// DNS-resolved addresses validated in [`resolve_and_validate`].
-pub(crate) fn assert_url_safe_for_fetch(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("unsupported scheme `{scheme}` (only http/https)"));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "url missing host".to_string())?;
-    if host.eq_ignore_ascii_case("localhost") {
-        return Err("blocked host: localhost".to_string());
-    }
-    if let Some(ip) = parse_host_ip(host)
-        && is_blocked_ip(ip)
-    {
-        return Err(format!("blocked address: {ip}"));
-    }
-    Ok(())
-}
-
-/// Parse a URL host as a literal IP, tolerating the `[...]` brackets a URL puts
-/// around IPv6 literals (`[::1]`). `None` for a real domain name.
-fn parse_host_ip(host: &str) -> Option<IpAddr> {
-    let inner = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    inner.parse::<IpAddr>().ok()
-}
-
-/// A validated fetch target: the URL's host plus the exact public-routable IPs
-/// it resolved to. Pinning the connection to these addresses (instead of letting
-/// the HTTP client re-resolve the hostname) closes the DNS-rebinding window
-/// between our validation and the actual connect.
-pub(crate) struct SafeTarget {
-    host: String,
-    /// Empty for a literal-IP host — there is no DNS name to pin.
-    addrs: Vec<SocketAddr>,
-}
-
-/// Full validation: the sync gate above, then (for a hostname) resolve every
-/// A/AAAA and fail closed if any is private/link-local/metadata. DNS runs off
-/// the async worker so a slow resolver can't stall the executor.
-pub(crate) async fn resolve_and_validate(url: &str) -> Result<SafeTarget, String> {
-    assert_url_safe_for_fetch(url)?;
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "url missing host".to_string())?
-        .to_string();
-    if parse_host_ip(&host).is_some() {
-        // Literal IP: already validated by the sync gate; nothing to resolve.
-        return Ok(SafeTarget {
-            host,
-            addrs: Vec::new(),
-        });
-    }
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let dns_host = host.clone();
-    let addrs = resolve_with_timeout(
-        async move {
-            tokio::net::lookup_host((dns_host.as_str(), port))
-                .await
-                .map(|addresses| addresses.collect::<Vec<_>>())
-        },
-        DNS_TIMEOUT,
+async fn fetch_url(
+    url: &str,
+    max_bytes: usize,
+    scope: &leveler_execution::NetworkScope,
+    unrestricted: bool,
+) -> Result<String, String> {
+    let response = crate::network::send(
+        scope,
+        unrestricted,
+        url,
+        reqwest::Method::GET,
+        None,
+        None,
+        TIMEOUT,
     )
-    .await
-    .map_err(|e| format!("dns resolve failed for `{host}`: {e}"))?;
-    if addrs.is_empty() {
-        return Err(format!("dns resolve returned no addresses for `{host}`"));
+    .await?;
+    let status = response.status();
+    let final_url = response.url().to_string();
+    if !status.is_success() {
+        return Err(format!("HTTP {status} for {final_url}"));
     }
-    for addr in &addrs {
-        if is_blocked_ip(addr.ip()) {
-            return Err(format!("blocked address after resolve: {}", addr.ip()));
-        }
+    let (mut body, truncated) = read_body_capped(response, max_bytes).await?;
+    if truncated {
+        body.push_str(&format!("\n\n[web_fetch truncated at {max_bytes} bytes]"));
     }
-    Ok(SafeTarget { host, addrs })
-}
-
-async fn resolve_with_timeout<F>(future: F, timeout: Duration) -> Result<Vec<SocketAddr>, String>
-where
-    F: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
-{
-    tokio::time::timeout(timeout, future)
-        .await
-        .map_err(|_| format!("timed out after {}s", timeout.as_secs_f64()))?
-        .map_err(|error| error.to_string())
-}
-
-/// True for loopback, private, link-local, and cloud metadata ranges.
-pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 0
-                // CGNAT 100.64.0.0/10
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
-                // 169.254.0.0/16 already link_local; metadata 169.254.169.254 covered
-                || v4.octets() == [169, 254, 169, 254]
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                || v6.is_multicast()
-                // IPv4-mapped: re-check embedded v4
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
-        }
-    }
-}
-
-async fn fetch_url(url: &str, max_bytes: usize) -> Result<String, String> {
-    let mut current = url.to_string();
-    let mut hops = 0usize;
-    loop {
-        // Resolve + validate this hop, then pin the client to the validated IPs
-        // so reqwest cannot re-resolve the hostname to a rebound internal
-        // address between the check and the connect (DNS-rebinding SSRF).
-        let target = resolve_and_validate(&current).await?;
-        let mut builder = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(format!(
-                "CodeLeveler-web_fetch/{}",
-                env!("CARGO_PKG_VERSION")
-            ));
-        if !target.addrs.is_empty() {
-            builder = builder.resolve_to_addrs(&target.host, &target.addrs);
-        }
-        let client = builder.build().map_err(|e| format!("http client: {e}"))?;
-
-        let resp = client
-            .get(&current)
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        let status = resp.status();
-        if status.is_redirection() {
-            hops += 1;
-            if hops > MAX_REDIRECTS {
-                return Err(format!("too many redirects (>{MAX_REDIRECTS})"));
-            }
-            let loc = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| "redirect without Location".to_string())?;
-            let next = reqwest::Url::parse(&current)
-                .and_then(|base| base.join(loc))
-                .map_err(|e| format!("bad redirect: {e}"))?;
-            current = next.to_string();
-            continue;
-        }
-        if !status.is_success() {
-            return Err(format!("HTTP {status} for {current}"));
-        }
-        let (mut body, truncated) = read_body_capped(resp, max_bytes).await?;
-        if truncated {
-            body.push_str(&format!("\n\n[web_fetch truncated at {max_bytes} bytes]"));
-        }
-        return Ok(format!("URL: {current}\n\n{body}"));
-    }
+    Ok(format!("URL: {final_url}\n\n{body}"))
 }
 
 /// Read the response body a chunk at a time, stopping once `max_bytes` are
@@ -355,43 +247,137 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_resolution_has_an_explicit_deadline() {
-        let pending = std::future::pending::<std::io::Result<Vec<SocketAddr>>>();
-        let error = resolve_with_timeout(pending, Duration::from_millis(1))
+    async fn loopback_scope_tool_fetches_live_localhost() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 1024];
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        let output = WebFetchTool
+            .execute(
+                serde_json::json!({"url": format!("http://localhost:{}/health", address.port())}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
             .await
-            .unwrap_err();
-        assert!(error.contains("timed out"), "{error}");
-    }
-
-    #[test]
-    fn rejects_non_http_schemes_and_localhost() {
-        assert!(assert_url_safe_for_fetch("file:///etc/passwd").is_err());
-        assert!(assert_url_safe_for_fetch("ftp://example.com/a").is_err());
-        assert!(assert_url_safe_for_fetch("http://localhost/x").is_err());
-        assert!(assert_url_safe_for_fetch("http://127.0.0.1/x").is_err());
-        assert!(assert_url_safe_for_fetch("http://192.168.0.1/x").is_err());
-        assert!(assert_url_safe_for_fetch("http://[::1]/x").is_err());
-    }
-
-    #[test]
-    fn allows_public_literal_ip_shape() {
-        // 8.8.8.8 is public; no DNS needed.
-        assert!(assert_url_safe_for_fetch("https://8.8.8.8/resolve").is_ok());
+            .unwrap();
+        if output.is_error {
+            server.abort();
+        }
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.ends_with("ok"));
+        server.await.unwrap();
+        for url in ["http://8.8.8.8/", "http://192.168.1.10/"] {
+            let denied = WebFetchTool
+                .execute(
+                    serde_json::json!({"url": url}),
+                    ctx.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(denied.is_error);
+            assert!(denied.content.contains("scope"), "{}", denied.content);
+        }
     }
 
     #[tokio::test]
-    async fn resolve_and_validate_gate_and_pinning_for_literal_ips() {
-        // A public literal IP validates with nothing to pin (no DNS name).
-        let ok = resolve_and_validate("https://8.8.8.8/x").await.unwrap();
-        assert!(ok.addrs.is_empty(), "literal IP needs no DNS pinning");
-        // The async path must still fail closed on private / metadata / v6 loopback.
-        assert!(
-            resolve_and_validate("http://169.254.169.254/latest/meta-data")
+    async fn auto_private_http_requires_consent_but_loopback_and_public_do_not() {
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        for url in [
+            "http://192.168.1.10/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/",
+        ] {
+            let reason = WebFetchTool
+                .admission_reason(&serde_json::json!({"url": url}), &ctx)
+                .await;
+            assert!(reason.is_some(), "{url} must request consent");
+        }
+        for url in ["http://127.0.0.1/", "http://[::1]/", "http://8.8.8.8/"] {
+            assert!(
+                WebFetchTool
+                    .admission_reason(&serde_json::json!({"url": url}), &ctx)
+                    .await
+                    .is_none(),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_internet_scope_fetches_live_localhost_without_approval() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 1024];
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .await
-                .is_err()
-        );
-        assert!(resolve_and_validate("http://[::1]/x").await.is_err());
-        assert!(resolve_and_validate("http://10.0.0.1/x").await.is_err());
+                .unwrap();
+        });
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::Assisted);
+        let out = WebFetchTool
+            .execute(
+                serde_json::json!({"url": format!("http://localhost:{}/health", address.port())}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        if out.is_error {
+            server.abort();
+        }
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.ends_with("ok"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_access_tool_fetches_localhost_despite_explicit_network_denial() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 1024];
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::FullAccess)
+            .with_sandbox(true);
+        let output = WebFetchTool
+            .execute(
+                serde_json::json!({"url": format!("http://localhost:{}/health", address.port())}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        if output.is_error {
+            server.abort();
+        }
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.ends_with("ok"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

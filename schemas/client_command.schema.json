@@ -1500,6 +1500,7 @@
       "enum": [
         "approve_once",
         "approve_session",
+        "approve_project",
         "approve_always",
         "deny"
       ]

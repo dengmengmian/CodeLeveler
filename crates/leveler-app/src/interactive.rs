@@ -77,6 +77,7 @@ fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalD
     match value {
         UiApprovalDecision::ApproveOnce => leveler_execution::ApprovalDecision::ApproveOnce,
         UiApprovalDecision::ApproveSession => leveler_execution::ApprovalDecision::ApproveSession,
+        UiApprovalDecision::ApproveProject => leveler_execution::ApprovalDecision::ApproveProject,
         UiApprovalDecision::ApproveAlways => leveler_execution::ApprovalDecision::ApproveAlways,
         UiApprovalDecision::Deny => leveler_execution::ApprovalDecision::Deny,
     }

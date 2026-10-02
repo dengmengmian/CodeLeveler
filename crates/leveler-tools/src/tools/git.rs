@@ -118,6 +118,11 @@ impl Tool for GitDiffTool {
         RiskLevel::Safe
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        let path = input.get("path")?.as_str()?;
+        crate::workspace::path_approval_reason(context, path, false)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -132,7 +137,7 @@ impl Tool for GitDiffTool {
         // Refuse credential paths before handing the path to git.
         let path_owned;
         if let Some(p) = &input.path {
-            context.require_workspace()?.resolve_for_read(p)?;
+            context.execution_workspace()?.resolve_for_read(p)?;
             args.push("--");
             path_owned = p.clone();
             args.push(&path_owned);

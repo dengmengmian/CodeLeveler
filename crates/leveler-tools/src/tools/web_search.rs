@@ -87,13 +87,10 @@ impl Tool for WebSearchTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
-        // NOT a duplicate of Host admission. The ToolHost freezes
-        // `network_allowed` into the resolved policy, but only the OS sandbox
-        // enforces it, and that covers `run_command` children — not an
-        // in-process `reqwest` call. For a network tool that dials directly
-        // this check is the ONLY enforcement point, exactly as in `web_fetch`
-        // and the browser tools.
-        if context.policy.network_denied() {
+        // Socket mediation also protects direct tool calls outside admission.
+        let network_scope = context.policy.network_scope();
+        let unrestricted = context.policy.unrestricted_execution();
+        if !unrestricted && matches!(network_scope, leveler_execution::NetworkScope::None) {
             return Ok(ToolOutput::error(
                 "web_search 不可用:当前模式/沙箱已禁用网络。",
             ));
@@ -110,7 +107,7 @@ impl Tool for WebSearchTool {
             _ = cancellation.cancelled() => {
                 return Ok(ToolOutput::error("web_search 已取消。"));
             }
-            r = search(&self.api_key, &query, count) => r,
+            r = search(&self.api_key, &query, count, &network_scope, unrestricted) => r,
         };
 
         match result {
@@ -134,18 +131,23 @@ fn request_body(query: &str, count: usize) -> serde_json::Value {
 }
 
 /// One request, one answer. No retry, no fallback.
-async fn search(api_key: &str, query: &str, count: usize) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(ENDPOINT)
-        .bearer_auth(api_key)
-        .json(&request_body(query, count))
-        .send()
-        .await
-        .map_err(net_reason)?;
+async fn search(
+    api_key: &str,
+    query: &str,
+    count: usize,
+    scope: &leveler_execution::NetworkScope,
+    unrestricted: bool,
+) -> Result<String, String> {
+    let resp = crate::network::send(
+        scope,
+        unrestricted,
+        ENDPOINT,
+        reqwest::Method::POST,
+        Some(&request_body(query, count)),
+        Some(api_key),
+        TIMEOUT,
+    )
+    .await?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -153,17 +155,6 @@ async fn search(api_key: &str, query: &str, count: usize) -> Result<String, Stri
     }
     let json: serde_json::Value = resp.json().await.map_err(|_| "响应无法解析".to_string())?;
     Ok(format_results(&json, count))
-}
-
-/// Explain a transport failure in plain terms (offline vs timeout vs other).
-fn net_reason(e: reqwest::Error) -> String {
-    if e.is_timeout() {
-        "请求超时".to_string()
-    } else if e.is_connect() {
-        "无法连接".to_string()
-    } else {
-        e.to_string()
-    }
 }
 
 /// Format the top `count` results as `N. title\n   url\n   snippet`.

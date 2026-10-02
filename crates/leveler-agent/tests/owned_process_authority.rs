@@ -287,7 +287,7 @@ async fn main_agent_rejects_foreign_and_unknown_owned_task_targets() {
     let h = Harness::new();
     let (id, pids, _) = h.spawn_tree().await;
     for (session, target, reason) in [
-        ("stranger", id.as_str(), "not owned by this session"),
+        ("stranger", id.as_str(), "denied by user"),
         ("owner", "bg-unknown", "unknown task"),
     ] {
         for name in ["get_task", "kill_task"] {
@@ -363,8 +363,8 @@ async fn read_only_side_surface_observes_owned_task_but_cannot_stop_it() {
     assert!(!error, "observation remains permitted: {output}");
     let (error, output) = tool_result(&events, "kill_task");
     assert!(
-        error && output.contains("read-only"),
-        "Host must deny control under read-only overlay: {output}"
+        error && output.contains("denied by user"),
+        "Unapproved control must not run under the read-only overlay: {output}"
     );
     assert!(
         pids.iter().all(|pid| alive(*pid)),

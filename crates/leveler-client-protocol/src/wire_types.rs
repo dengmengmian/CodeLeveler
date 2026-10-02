@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub enum ApprovalDecision {
     ApproveOnce,
     ApproveSession,
+    ApproveProject,
     ApproveAlways,
     Deny,
 }

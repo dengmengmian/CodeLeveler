@@ -723,6 +723,42 @@ provider 的响应外壳漏进会话记录。
 
 任何工具、插件、子智能体或产品，都不能建立第二条路径绕开宿主执行权威。
 
+### 9.0 Permission Mode 顶层产品契约
+
+`FullAccess`（Full）由宿主在 admission 之前选择 unrestricted 执行路径，绕过 CodeLeveler 权限规则、审批、sandbox、资源范围、凭据过滤和任务所有权限制。Full 下的文件、HOME、凭据、任意 Git remote、loopback / LAN / Internet、进程控制及已实现的未来能力均不产生权限 ASK / DENY。实际能力缺失、无效工具参数、OS / 程序或外部服务失败仍是失败；进程取消、超时、日志持久化和资源回收仍是运行时职责。
+
+`Assisted`（Auto）默认允许普通读写、构建、测试、正常 commit / fetch、localhost 及 owned task 操作；危险删除、push、破坏性 Git、敏感凭据和控制其他任务在 admission 请求批准。Full 和明确批准动作的执行 authority 冻结在本次 `ResolvedExecutionPolicy`，`ProcessRequest`、文件工具、HTTP、MCP、任务控制统一消费；批准后的同一动作不再经第二套权限拒绝。单次批准不修改 session profile，也不扩大随后未批准的调用。
+
+`RequestApproval`（Restricted）使用受限资源契约。`NetworkScope` 和 `NetworkResource` 描述目的地与已解析地址；HTTP broker 禁用环境代理、pin 地址，并逐跳校验 redirect。Full / 明确批准调用直接走 unrestricted HTTP 路径。范围分类本身不构成执行证据。
+
+当前子进程后端支持矩阵：macOS 的 None 断网；Loopback **PARTIAL**，只保证 `127.0.0.1` / `::1` outbound，拒绝所有 listen（包括 loopback），不支持完整 `127/8`。实测 seatbelt 的 localhost inbound 条件仍允许 wildcard listener 接收 LAN 流量，因此不能使用。Linux None 使用 bwrap network namespace，宿主 Loopback / LAN / ConfiguredRemote 显式 Unsupported；Windows 受限网络范围显式 Unsupported。macOS LAN / ConfiguredRemote 也显式 Unsupported。Internet 与 Full 保留网络开放语义。ConfiguredRemote 的身份记录尚未接入真实 Git remote resolver / socket broker，不能声称已完成该范围。
+
+Browser / MCP 无可靠目的地级进程隔离，拒绝部分网络范围，只在 Internet 或 unrestricted authority 下执行操作；旧浏览器 / MCP 进程自主出站仍是未闭环的生命周期边界。MCP 继承凭据的 launch authority 由宿主决定，不由服务器配置提升。模型 Provider、固定本地 RuntimeHost / ExecutionHost transport、用户配置 remote relay 与更新服务是独立基础设施用途，不因工具 scope 取得任意出站权。
+
+Phase 3 / Phase 4 必须继续遵守本节：资源 grant 和 credential broker 只能约束 Auto / Restricted，不能给 Full 或同一已批准动作增加权限拦截。
+
+**Permission Architecture Mainline：CLOSED。** Permission Mode 契约、NetworkScope、Resource Grant、Credential Broker、`ApprovedGitTarget`、文件系统对象绑定与 Full bypass 不变量均已实现，并有真实执行验收。仍然 remaining、但不阻塞 mainline 的只有：Restricted 网络加固（loopback-only listen、`ConfiguredRemote` 的地址 pin / redirect、Linux host-loopback）、Windows / Linux 真实宿主 qualification、可选的更深 SSH brokering，以及非阻断的 release advisory。
+
+#### Phase 3：可复用资源授权
+
+**当前验收：CLOSED。** 存储与资源解析已经建立。文件写入与删除使用对象绑定事务：提交本身是一次 `renameat2` / `renameatx_np` 的 `RENAME_EXCHANGE` / `RENAME_SWAP`（删除则为一次性 rename 移出），随后的判定基于真正被换出的那个对象，而不是提交前重新读取的名字。因此替换无法被静默提交：一旦发现条目已不是获批对象就恢复原对象并 fail closed，且永远不会 unlink 未经创建与验证的对象。对抗 race 测试（替换、删除、symlink、父目录替换）已验证该契约。可 grant 的 Git remote 命令（`fetch` / `ls-remote` / `push`）执行的是冻结目标：admission 解析出的 `ConfiguredRemote` 绑定（repository identity、remote name、canonical URL、transport、capability）在执行层被还原为 `ApprovedGitTarget`；执行时对已验证的 git 目录只读取一次 config 字节并验证（无 effect-critical key、解析出的 remote URL 与获批一致），中和仓库自带的 credential helper，随后对私有 mirror git 目录运行 Git：冻结 config、空白 global/system config、禁用 hooks、显式 pin remote URL、清空 `GIT_*` 环境覆盖。此后 Git 重读 `.git/config`、global/system config 或环境都不能改变获批目标；无法从冻结字节复现目标时 fail closed。真实 HTTP Git probe 证明在批准后修改 remote URL、pushurl、`insteadOf`、credential helper、SSH override 或替换 repository 时，服务端只会看到获批 URL，或根本没有请求。生产 admission 现在接受执行层可绑定的文件／仓库／remote 绑定（Unix），拒绝无法绑定的组合。Windows 的文件与 Git 复用仍为 UNSUPPORTED / fail-closed。以下类型与持久语义描述框架。
+
+`ToolHost` 是资源授权的执行 owner：从真实工具输入和宿主资源解析器生成 `GrantRequest`，冻结 capability 与 resource 的精确绑定，并在真实副作用发生处约束该身份（存在已证明执行绑定的消费者），使获批资源与实际作用资源一致。客户端只展示这份请求并返回选择；描述文本、模型参数中的身份声明和 UI 状态都不能生成 authority。`ResourceGrantStore` 负责授权记录的校验、匹配与持久化，生产实现使用现有数据库。记录落库必须晚于批准事件的 durable barrier；存储或解析失败要求重新批准，不默认放行。
+
+Once 仅用于当前调用，不落库；Session 绑定持久会话的真实 `SessionId`，不是 turn id、agent id 或展示名称，子执行器沿用其所属会话；Project 绑定 canonical checkout 和 Git common directory 的对象 incarnation，非 Git 项目绑定 canonical 目录对象。文件授权绑定精确 canonical path 与现存对象（新目标绑定现存父目录），不是目录前缀。后台任务绑定 runtime incarnation、任务编号、不可变 owner 和进程身份；重启后的同号任务不能重放旧授权。对象、配置或 remote 身份变化后，旧记录不能替代新批准。
+
+capability 与 resource 分开匹配：远端读写、文件读写删除、后台任务观察和控制、凭据使用和原文读写彼此不隐含授权。资源授权不产生 unrestricted authority，也不扩大 `NetworkScope`。Full 在解析与存储查询前直接进入 unrestricted 分支；Auto 的普通已允许动作不查询授权存储，仅需要批准的动作尝试精确复用。旧 session/always 规则保留原有语义，但不迁移或冒充资源授权。
+
+无法证明真实资源或执行效果时，不提供可复用资源授权，回到现有 exact-call 审批：包括 SSH remote、未经归因的 credential helper、opaque shell 包装（包括 `sh -c "git …"`，Auto / Restricted 下保留 exact-call 审批而不是自动运行）、替代 PATH 和 Git 环境或命令配置 override。External PID 尚无可信进程出生证明，因此不生成持久授权。Phase 3 的 `CredentialUse` / raw capability 类型由下述 Phase 4 broker 实现。`ConfiguredRemote` 的网络层地址 pin 仍属 Phase 2：冻结 Git 执行目标证明的是实际网络目的地为获批 URL，不声称 redirect 已被网络层完全隔离。
+
+#### Phase 4：凭据隔离 / Credential Broker
+
+**当前验收：CLOSED。** “使用凭据”与“读取凭据明文”在同一套 Phase 3 grant store、resource identity 与 scope 上是两个 capability。宿主侧 broker 在 scratch 目录中运行用户自己的 global Git credential helper 来解析目的地凭据，并过滤掉调用方提供的所有 `GIT_*` / askpass override，因此仓库自带的 helper 与调用环境都不能成为来源；broker 从不经过 agent shell。凭据值不会成为模型输入、工具结果、日志行或命令行：它被写入冻结 Git 目标私有目录内 owner-only（0600）文件，由生成的 helper 只输出给已批准的 Git 进程。grant 绑定凭据的单向 incarnation commitment（对 username 与 value 的 `sha256`）；token 轮换会改变 commitment，复用的 Session/Project grant 因此 fail closed，而不会用新凭据认证。
+
+`credential.use` 与 `NetworkScope`、文件系统读取相互正交：获批凭据既不授予出站网络，也不授予 `~/.git-credentials` / `~/.ssh` 访问；原文凭据路径（`read_file`、`cat .git-credentials`、`security find-generic-password -w`、`secret-tool lookup`、`pass show`、`git credential fill`）需要各自的决定。Auto 与 Restricted 下，目的地存在已存凭据的 Git remote 即使 `git fetch` 本身是只读也会升级为真实决定；没有已存凭据的目的地（公共仓库）不产生 credential binding，也不弹窗。Full 完全绕过 broker：无 ASK、无 DENY、无注入。
+
+凭据授权之所以可复用，只因为冻结 Git 目标在执行时重新解析凭据并在 incarnation 变化时拒绝——与 remote URL 相同的 execution-bound 规则。SSH agent 认证（`SSH_AUTH_SOCK`）仍为 **PARTIAL**：只使用 agent，不经 broker，私钥文件保持拒绝。SSH identity 本身的 brokering，以及 Windows/Linux 真实宿主的凭据验证，仍为 remaining。detached（background）已认证 Git 命令为 fail-closed UNSUPPORTED：脱离进程无法在任务结算时回收私有 isolation 目录，运行时因此直接拒绝，而不是把凭据文件留在磁盘上等待 OS 临时区清理。需要该效果的调用必须在前台运行；前台执行在进程结束时回收目录与凭据文件。
+
 ### 9.1 为什么只有一个执行权威
 
 如果文件修改由一套规则控制、命令执行由另一套规则控制、子智能体又有第三套规则，那么系统实际上没有统一安全边界。
@@ -842,7 +878,7 @@ Terminal（TaskFinished）
 
 后台进程的清理边界必须在启动时显式确定。默认的 `goal` 生命周期随创建它的目标终态回收；`runtime` 跳过目标终态清理，但仍随当前 Runtime 退出回收，保留原有契约。`session` 和 `persistent` 进程从启动时起由独立 Execution Host 托管，保留创建会话作为访问归属；`session` 在显式删除会话时停止，`persistent` 用于用户明确要求跨 Runtime 重启继续运行的服务或 watcher，在进程自行结束或用户显式停止时结束。Execution Host 异常退出的结果按独立故障域处理，不保证服务随宿主退出。Runtime 更新不停止托管服务，也不将已有本地任务自动转换为托管任务。所有生命周期继续使用统一后台任务接口观测和停止。
 
-写入归属在执行前转换为操作系统执行边界，包含允许路径及其他执行者独占的排除路径。无法执行该限制的平台必须拒绝，不能退回全 workspace 写入。mutation 只从已执行限制的范围内结算，不使用全树 diff、过滤其他执行者变更或全树 rollback 补偿权限。后台 workload 必须整体结束后再结算 mutation，最后发布进程终态；父 shell 退出不满足这个边界。读日志、等待与停止都校验创建会话，允许同会话跨 turn 使用，其他会话不能只凭 task id 操作。
+写入归属在执行前转换为操作系统执行边界，包含允许路径及其他执行者独占的排除路径。无法执行该限制的平台必须拒绝，不能退回全 workspace 写入。mutation 只从已执行限制的范围内结算，不使用全树 diff、过滤其他执行者变更或全树 rollback 补偿权限。后台 workload 必须整体结束后再结算 mutation，最后发布进程终态；父 shell 退出不满足这个边界。Auto / Restricted 读日志、等待与停止校验创建会话，允许同会话跨 turn 使用；跨会话操作需要批准，Full / 已批准调用通过宿主显式 unrestricted authority 执行，不伪造创建者身份。
 
 stdout/stderr 的实时通道和行缓冲都有容量上限。消费者变慢时仍持续读取 pipe，避免子进程被堵死；丢弃字节必须显式标记 truncated，最终输出不得伪装完整。工具结果保留退出码、错误和沙箱等执行事实，不把 connection refused 解释成非代码问题，也不指示下一步必须提权或执行某个工具。
 
@@ -1143,14 +1179,17 @@ RuntimeHost 的 start/adopt/revive/handoff 共用生命周期，仅 transport、
 detached process 配置具有平台差异。安全失败必须显式失败，不回退 trusted TCP。
 当前 Windows 实现与交叉编译证据不等于 Windows 实机验收，状态见
 [`DESKTOP_PHASE2_WINDOWS_TRANSPORT.md`](../DESKTOP_PHASE2_WINDOWS_TRANSPORT.md)。
-桌面 Shell 接入时应复用已有协议、Runtime Host 与运行时，而不复制进程编排或业务状态；
-这里不预设或创建 Electron 实现。
+Phase 3C 的 Electron 骨架位于 `apps/leveler-desktop`。Renderer 通过受限 preload IPC
+连接 Main；Main 只启动 `leveler desktop-bridge` 薄 Rust 适配入口。bridge 复用上述
+Runtime Host 的 detached 接入、跨来源连接和 revive，以及现有客户端协议；不复制
+进程编排或业务状态。关窗只断开 bridge，不取消回合或关闭 Runtime；Runtime 保留
+既有空闲回收策略。
 
 ### 13.2.1 Optional Workspace 与全局历史契约
 
 Session、TaskEngine 和 Runtime 只有一套实现。Session 的 `repository` 是持久的 optional primary workspace：已有项目为 `Some(path)`，No Workspace 为 `None`。Application state 始终存在；执行工作目录由执行能力和授权决定。三者不能通过 HOME、启动 cwd、上次项目或内部 scratch 路径互相替代。
 
-`Layout::no_workspace` 使用独立的 `state/no-workspace` source、socket identity 和 app-owned 配置。项目 runtime 拒绝显式 None；No Workspace runtime 拒绝其他项目关联。创建请求区分省略的 `RuntimeDefault`、显式 `None` 与 `Workspace`。原 CLI/TUI/Web 项目请求仍默认绑定原项目。No Workspace 复用同一 runtime，但不加载项目配置、rules/hooks、skills、MCP、Git/LSP、文件检查点或 shell context。工具 dispatch 在执行前检查真实 workspace 资源，默认要求 workspace 的工具即使被直接调用、权限为 FullAccess 或传入 HOME 绝对路径也必须拒绝。Web/search/browser 的独立能力仍遵守原权限机制。
+`Layout::no_workspace` 使用独立的 `state/no-workspace` source、socket identity 和 app-owned 配置。项目 runtime 拒绝显式 None；No Workspace runtime 拒绝其他项目关联。创建请求区分省略的 `RuntimeDefault`、显式 `None` 与 `Workspace`。原 CLI/TUI/Web 项目请求仍默认绑定原项目。No Workspace 复用同一 runtime，但不加载项目配置、rules/hooks、skills、MCP、Git/LSP、文件检查点或 shell context。工具 dispatch 在执行前检查真实 workspace 资源，默认要求 workspace 的工具即使被直接调用、权限为 FullAccess 或传入 HOME 绝对路径也必须拒绝。Web/search/browser 的独立能力遵守 §9.0 的 Permission Mode 契约。
 
 `leveler-app` 的 Global Task Index 通过 SQLite read-only 连接扫描已有 project stores 和 No Workspace store。它聚合持久事实，不创建数据库、不运行 migration、不启动 daemon、不维护第二份任务账本。source 错误随 partial result 返回；checkout 缺失保留历史并标记 workspace unavailable。打开跨来源 Session 时先解析 index 中的真实 owner，再由 Runtime Host 连接该 source；Web 的在线多项目 Router 保留原职责。全局扫描只向可信本地客户端开放，项目 Remote/Web 授权不能自动获得其他来源历史。
 

@@ -259,6 +259,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     SessionRepository::new(&db).create(&record).await.unwrap();
     let session = SessionId::new(record.id);
     let factory = ExecutorFactory {
+        resource_grants: std::sync::Arc::new(leveler_storage::MemoryResourceGrantStore::default()),
         runtime: Arc::new(MockRuntime::new(responses)),
         registry: Arc::new(default_registry()),
         tool_context,

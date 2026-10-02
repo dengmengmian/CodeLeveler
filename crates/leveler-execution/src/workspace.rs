@@ -5,6 +5,8 @@
 //! `.git` internals, `~/.ssh`, ...). Writes are bounded by exactly one
 //! [`WriteScope`]: [`Workspace::resolve_for_write`] refuses anything outside
 //! it, including `..` escapes and symlinks that point out of it.
+//! A per-call unrestricted execution view bypasses these permission fences;
+//! filesystem scope alone does not grant that authority.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -82,6 +84,8 @@ pub struct Workspace {
     /// case-sensitive volumes are supported, and a Linux root can sit on a
     /// case-insensitive mount.
     case_insensitive: bool,
+    unrestricted_access: bool,
+    resource_bindings: Vec<leveler_core::GrantBinding>,
 }
 
 /// Probe the root's actual case semantics WITHOUT writing to the user's
@@ -176,6 +180,8 @@ impl Workspace {
             #[cfg(windows)]
             root_dir: std::sync::Arc::new(root_dir),
             case_insensitive,
+            unrestricted_access: false,
+            resource_bindings: Vec::new(),
         })
     }
 
@@ -188,6 +194,56 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Bind the host's execution authority to this per-call workspace view.
+    /// A filesystem scope alone does not imply unrestricted execution authority.
+    pub fn with_unrestricted_access(mut self, unrestricted: bool) -> Self {
+        self.unrestricted_access = unrestricted;
+        self
+    }
+
+    /// Exact bindings attached to this call by admission, never a tree grant.
+    pub fn with_resource_bindings(mut self, bindings: Vec<leveler_core::GrantBinding>) -> Self {
+        self.resource_bindings = bindings;
+        self
+    }
+
+    /// Re-resolve the object before using the exact frozen resource permission.
+    pub fn allows_resource_path(&self, capability: leveler_core::Capability, path: &Path) -> bool {
+        use leveler_core::{Capability, ResourceIdentity};
+        let path = self.normalize(path);
+        let Ok(resource) = crate::resource_identity::resolve_filesystem_resource(&path) else {
+            return false;
+        };
+        let contains = |capability| {
+            self.resource_bindings
+                .iter()
+                .any(|binding| binding.capability == capability && binding.resource == resource)
+        };
+        if !contains(capability) {
+            return false;
+        }
+        let canonical_sensitive = match &resource {
+            ResourceIdentity::FilesystemPath { canonical_path, .. } => {
+                is_credential_path(Path::new(canonical_path))
+            }
+            _ => false,
+        };
+        if is_credential_path(&path) || canonical_sensitive {
+            match capability {
+                Capability::FilesystemRead => contains(Capability::CredentialRawRead),
+                Capability::FilesystemWrite | Capability::FilesystemDelete => {
+                    contains(Capability::CredentialRawWrite)
+                        && (!path.exists()
+                            || (contains(Capability::FilesystemRead)
+                                && contains(Capability::CredentialRawRead)))
+                }
+                _ => true,
+            }
+        } else {
+            true
+        }
     }
 
     #[cfg(unix)]
@@ -212,6 +268,13 @@ impl Workspace {
     pub fn resolve_for_read(&self, input: impl AsRef<Path>) -> Result<PathBuf, WorkspaceError> {
         let input = input.as_ref();
         let normalized = self.normalize(input);
+        if self.allows_resource_path(leveler_core::Capability::FilesystemRead, input) {
+            return self.clone().with_unrestricted_access(true).resolve_bounded(
+                input,
+                None,
+                PathAccess::Read,
+            );
+        }
         self.check_sensitive(&normalized, input, PathAccess::Read)?;
         if let Ok(real) = std::fs::canonicalize(&normalized) {
             self.check_sensitive(&real, input, PathAccess::Read)?;
@@ -235,7 +298,39 @@ impl Workspace {
         input: impl AsRef<Path>,
         scope: &WriteScope,
     ) -> Result<PathBuf, WorkspaceError> {
-        let input = input.as_ref();
+        self.resolve_for_mutation(
+            input.as_ref(),
+            scope,
+            leveler_core::Capability::FilesystemWrite,
+        )
+    }
+
+    /// Resolve a deletion under its independent capability.
+    pub fn resolve_for_delete(
+        &self,
+        input: impl AsRef<Path>,
+        scope: &WriteScope,
+    ) -> Result<PathBuf, WorkspaceError> {
+        self.resolve_for_mutation(
+            input.as_ref(),
+            scope,
+            leveler_core::Capability::FilesystemDelete,
+        )
+    }
+
+    fn resolve_for_mutation(
+        &self,
+        input: &Path,
+        scope: &WriteScope,
+        capability: leveler_core::Capability,
+    ) -> Result<PathBuf, WorkspaceError> {
+        if self.unrestricted_access || self.allows_resource_path(capability, input) {
+            return self.clone().with_unrestricted_access(true).resolve_bounded(
+                input,
+                None,
+                PathAccess::Write,
+            );
+        }
         let bound = match scope {
             WriteScope::None => return Err(WorkspaceError::no_write_scope(input)),
             WriteScope::Workspace { root } | WriteScope::WorkspaceWithGit { root } => {
@@ -292,6 +387,19 @@ impl Workspace {
         Ok(())
     }
 
+    /// Revalidate the exact deletion resource at the mutation boundary.
+    pub fn revalidate_delete_path(
+        &self,
+        resolved: &Path,
+        scope: &WriteScope,
+    ) -> Result<(), WorkspaceError> {
+        let checked = self.resolve_for_delete(resolved, scope)?;
+        if checked != resolved {
+            return Err(WorkspaceError::outside(resolved, self.root()));
+        }
+        Ok(())
+    }
+
     /// Resolve a command's working directory.
     ///
     /// Not a write, but a confined scope (`Workspace` or `None`) keeps the
@@ -302,7 +410,7 @@ impl Workspace {
         input: impl AsRef<Path>,
         scope: &WriteScope,
     ) -> Result<PathBuf, WorkspaceError> {
-        let bound = scope.confines().then_some(self.root.as_path());
+        let bound = (scope.confines() && !self.unrestricted_access).then_some(self.root.as_path());
         self.resolve_bounded(input.as_ref(), bound, PathAccess::Read)
     }
 
@@ -325,6 +433,23 @@ impl Workspace {
         access: PathAccess,
     ) -> Result<PathBuf, WorkspaceError> {
         let normalized = self.normalize(input);
+        if self.unrestricted_access {
+            let mut ancestor = normalized.as_path();
+            loop {
+                if let Ok(real) = ancestor.canonicalize() {
+                    let suffix = normalized.strip_prefix(ancestor).unwrap();
+                    return Ok(if suffix.as_os_str().is_empty() {
+                        real
+                    } else {
+                        real.join(suffix)
+                    });
+                }
+                let Some(parent) = ancestor.parent() else {
+                    return Ok(normalized);
+                };
+                ancestor = parent;
+            }
+        }
         // On macOS, `/var/...` and `/private/var/...` differ lexically but are
         // the same tree after canonicalize — probe with the real ancestor too.
         let ancestor = canonicalize_existing_ancestor(&normalized);
@@ -366,6 +491,9 @@ impl Workspace {
         original: &Path,
         access: PathAccess,
     ) -> Result<(), WorkspaceError> {
+        if self.unrestricted_access {
+            return Ok(());
+        }
         let denied = |p: &Path| WorkspaceError::Denied(p.display().to_string());
 
         // Writing these would let the agent pick its own hooks and its own
@@ -459,6 +587,7 @@ pub fn is_sensitive_file_name(name: &str) -> bool {
     matches!(
         name,
         "credentials.json"
+            | ".git-credentials"
             | ".netrc"
             | "_netrc"
             | ".npmrc"
@@ -469,6 +598,13 @@ pub fn is_sensitive_file_name(name: &str) -> bool {
             | "id_ecdsa"
             | "id_ed25519"
     )
+}
+
+/// Classify raw credential files using the workspace's existing denylist.
+/// This is metadata classification, never credential discovery or loading.
+pub fn is_credential_path(path: &Path) -> bool {
+    path.components().any(|component| matches!(component, Component::Normal(name) if name == ".ssh" || name == ".aws"))
+        || path.file_name().and_then(|name| name.to_str()).is_some_and(is_sensitive_file_name)
 }
 
 /// Normalize `.` and `..` components lexically, without touching the filesystem.
@@ -506,6 +642,49 @@ fn canonicalize_existing_ancestor(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_authority_allows_credentials_external_paths_and_trusted_config() {
+        let (ws, dir) = workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let credential = outside.path().join(".env");
+        std::fs::write(&credential, "private fixture").unwrap();
+        assert!(ws.resolve_for_read(&credential).is_err());
+        assert!(
+            ws.resolve_for_write(&credential, &WriteScope::Unrestricted)
+                .is_err()
+        );
+        let full = ws.clone().with_unrestricted_access(true);
+        assert_eq!(
+            full.resolve_for_read(&credential).unwrap(),
+            credential.canonicalize().unwrap()
+        );
+        assert_eq!(
+            full.resolve_for_write(&credential, &WriteScope::None)
+                .unwrap(),
+            credential.canonicalize().unwrap()
+        );
+        for name in [
+            ".env",
+            ".git/config",
+            ".leveler/hooks.yaml",
+            ".leveler/agents/a.md",
+        ] {
+            assert!(
+                full.resolve_for_write(name, &WriteScope::None).is_ok(),
+                "{name}"
+            );
+        }
+        assert!(
+            full.resolve_command_cwd(outside.path(), &WriteScope::None)
+                .is_ok()
+        );
+        assert!(
+            ws.resolve_for_write(".env", &WriteScope::Unrestricted)
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn ws_scope(ws: &Workspace) -> WriteScope {
         WriteScope::Workspace {
@@ -608,6 +787,7 @@ mod tests {
             ".npmrc",
             ".pgpass",
             ".htpasswd",
+            ".git-credentials",
             "config/credentials.json",
         ] {
             assert!(
@@ -1092,5 +1272,73 @@ mod scope_split_tests {
             excluded: Vec::new(),
         };
         assert!(ws.resolve_for_write("owned/alias", &scope).is_err());
+    }
+}
+
+#[cfg(test)]
+mod resource_path_tests {
+    use super::*;
+    use leveler_core::{Capability, GrantBinding};
+    #[test]
+    fn exact_external_resource_never_grants_neighbor_or_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("approved.txt");
+        let neighbor = external.path().join("other.txt");
+        std::fs::write(&target, "original").unwrap();
+        std::fs::write(&neighbor, "other").unwrap();
+        let resource = crate::resource_identity::resolve_filesystem_resource(&target).unwrap();
+        let workspace = Workspace::new(root.path())
+            .unwrap()
+            .with_resource_bindings(vec![GrantBinding {
+                capability: Capability::FilesystemWrite,
+                resource,
+            }]);
+        assert!(
+            workspace
+                .resolve_for_write(&target, &WriteScope::None)
+                .is_ok()
+        );
+        assert!(
+            workspace
+                .resolve_for_write(&neighbor, &WriteScope::None)
+                .is_err()
+        );
+        std::fs::rename(&target, external.path().join("old.txt")).unwrap();
+        std::fs::write(&target, "replacement").unwrap();
+        assert!(
+            workspace
+                .resolve_for_write(&target, &WriteScope::None)
+                .is_err()
+        );
+    }
+    #[test]
+    fn ordinary_file_grant_and_credential_use_do_not_authorize_raw_secret() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join(".env");
+        std::fs::write(&target, "synthetic-fixture").unwrap();
+        let resource = crate::resource_identity::resolve_filesystem_resource(&target).unwrap();
+        let ordinary = GrantBinding {
+            capability: Capability::FilesystemRead,
+            resource: resource.clone(),
+        };
+        let workspace = Workspace::new(root.path())
+            .unwrap()
+            .with_resource_bindings(vec![
+                ordinary.clone(),
+                GrantBinding {
+                    capability: Capability::CredentialUse,
+                    resource: resource.clone(),
+                },
+            ]);
+        assert!(workspace.resolve_for_read(&target).is_err());
+        let raw = workspace.with_resource_bindings(vec![
+            ordinary,
+            GrantBinding {
+                capability: Capability::CredentialRawRead,
+                resource,
+            },
+        ]);
+        assert!(raw.resolve_for_read(&target).is_ok());
     }
 }

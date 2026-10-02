@@ -655,6 +655,16 @@ fn approve_always_is_refused_while_other_decisions_pass() {
     );
 }
 
+#[test]
+fn approve_project_is_refused_remotely_because_it_outlives_pairing() {
+    let verdict = interactive().evaluate(&ClientCommand::ApprovalDecision {
+        request_id: ApprovalId::new("a-resource"),
+        decision: ApprovalDecision::ApproveProject,
+    });
+    assert!(!verdict.is_allowed());
+    assert_eq!(verdict.code(), Some("approval_decision_not_allowed_remote"));
+}
+
 /// `FullAccess` disarms the approval prompt, so it needs a local opt-in that a
 /// remote client cannot perform for itself.
 #[test]

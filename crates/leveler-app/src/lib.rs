@@ -347,6 +347,11 @@ fn combine_independent_review(
     }
 }
 
+struct McpToolCache {
+    unrestricted: bool,
+    tools: Vec<Arc<dyn leveler_tools::tool::Tool>>,
+}
+
 /// A fully-assembled application.
 pub struct Application {
     pub layout: Layout,
@@ -355,8 +360,8 @@ pub struct Application {
     /// Configuration generation loaded by this process. Immutable for the
     /// process lifetime; a changed generation gets a replacement daemon.
     config_fingerprint: String,
-    /// Lazily-connected MCP tools, shared across executors (connect once).
-    mcp_tools: Arc<tokio::sync::Mutex<Option<Vec<Arc<dyn leveler_tools::tool::Tool>>>>>,
+    /// MCP tools cached under the credential inheritance authority of their launch.
+    mcp_tools: Arc<tokio::sync::Mutex<Option<McpToolCache>>>,
     /// The session database pool, opened once per process.
     database: Arc<tokio::sync::Mutex<Option<Database>>>,
     /// One project-scoped durable memory worker. Runtime composition roots
@@ -906,15 +911,31 @@ impl Application {
 
     /// Connect to the configured MCP servers once and cache their tools, so
     /// every turn reuses the same connections instead of respawning processes.
-    async fn mcp_tools(&self) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
+    async fn mcp_tools(&self, mode: PermissionProfile) -> Vec<Arc<dyn leveler_tools::tool::Tool>> {
         if self.layout.primary_workspace().is_none() || self.config.mcp_servers.is_empty() {
             return Vec::new();
         }
+        let unrestricted = mode == PermissionProfile::FullAccess;
         let mut guard = self.mcp_tools.lock().await;
-        if guard.is_none() {
-            *guard = Some(leveler_tools::mcp::connect_all(&self.config.mcp_servers).await);
+        if guard
+            .as_ref()
+            .is_none_or(|cache| cache.unrestricted != unrestricted)
+        {
+            let tools = leveler_tools::mcp::connect_all_with_authority(
+                &self.config.mcp_servers,
+                &self.environment,
+                unrestricted,
+            )
+            .await;
+            *guard = Some(McpToolCache {
+                unrestricted,
+                tools,
+            });
         }
-        guard.clone().unwrap_or_default()
+        guard
+            .as_ref()
+            .map(|cache| cache.tools.clone())
+            .unwrap_or_default()
     }
 
     /// Compose one turn's model-visible tool surface from what this host can
@@ -995,11 +1016,12 @@ impl Application {
 
     /// The read-only tool surface a `/btw` side question may use.
     ///
-    /// Same composition owner as a normal turn, physically narrowed to the
-    /// observe-class tools: no mutating tool and no harness control
+    /// Same composition owner as a normal turn. Confined profiles narrow it
+    /// to observe-class tools: no mutating tool and no harness control
     /// (`update_plan`, delegation, permissions) is present, so a side question
     /// cannot change the workspace or steer the main task. The returned
-    /// [`ToolContext`] additionally carries the read-only overlay.
+    /// [`ToolContext`] additionally carries the read-only overlay. FullAccess
+    /// retains actual available tools; side-question intent remains in its prompt.
     pub async fn side_question_tools(
         &self,
         model: &ModelRef,
@@ -1010,6 +1032,9 @@ impl Application {
         let (_available, tool_context, registry) = self
             .compose_tool_surface(model, mode, sandbox, true, session_scope)
             .await?;
+        if tool_context.policy.unrestricted_execution() {
+            return Ok((registry, tool_context));
+        }
         // A bounded side question has no goal or capability loading protocol.
         // It may inspect base primitives without implicitly exposing packs.
         let registry = registry.read_only_subset();
@@ -1095,13 +1120,14 @@ impl Application {
         let (available_packs, tool_context, mut registry) = self
             .compose_tool_surface(model, mode, sandbox, read_only, session_scope)
             .await?;
+        let unrestricted = tool_context.policy.unrestricted_execution();
         // Register available controls; exposure is owned by CapabilityDisclosure.
         leveler_agent::register_harness_controls_with(
             &mut registry,
             leveler_agent::HarnessControls::ALL,
         );
         // Attach external MCP tools (connect once, cached across turns).
-        for tool in self.mcp_tools().await {
+        for tool in self.mcp_tools(tool_context.policy.mode()).await {
             registry.register(tool);
         }
         use leveler_agent::capability::{CapabilityDisclosure, CapabilityId};
@@ -1138,13 +1164,16 @@ impl Application {
         let permitted = available
             .iter()
             .copied()
-            .filter(|id| match id {
-                CapabilityId::Memory => self.memory.enabled(),
-                CapabilityId::MultiAgent => {
-                    self.project_config().agents.delegation && self.config.agents_delegation
-                }
-                CapabilityId::Authoring => !read_only,
-                _ => true,
+            .filter(|id| {
+                unrestricted
+                    || match id {
+                        CapabilityId::Memory => self.memory.enabled(),
+                        CapabilityId::MultiAgent => {
+                            self.project_config().agents.delegation && self.config.agents_delegation
+                        }
+                        CapabilityId::Authoring => !read_only,
+                        _ => true,
+                    }
             })
             .collect();
         let capabilities = Arc::new(
@@ -1195,14 +1224,15 @@ impl Application {
                 memory_root: Some(self.layout.memory_dir()),
                 background_tasks: self.background_tasks.clone(),
                 permission_rules,
+                resource_grants: Arc::new(db.clone()),
                 permission_rules_path: Some(self.layout.permissions_path()),
                 hook_runner,
                 // Per-session; attached by the caller that knows the session
                 // (see `CodingRuntime::with_steering`).
                 steering: None,
                 // Project config wins over global when set; both default true.
-                allow_delegation: self.project_config().agents.delegation
-                    && self.config.agents_delegation,
+                allow_delegation: unrestricted
+                    || (self.project_config().agents.delegation && self.config.agents_delegation),
                 allow_host_input: true,
                 independent_review: combine_independent_review(
                     self.config.agents_independent_review,

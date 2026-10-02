@@ -112,6 +112,55 @@ fn format_wait_delta(
     text
 }
 
+async fn task_resource_authority(
+    tasks: &BackgroundTaskRegistry,
+    id: &str,
+    context: &ToolContext,
+    capability: leveler_core::Capability,
+) -> bool {
+    context.policy.unrestricted_execution()
+        || tasks
+            .resource_identity(id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|resource| context.policy.allows_resource(capability, &resource))
+}
+
+async fn task_grant_bindings(
+    tasks: &BackgroundTaskRegistry,
+    input: &serde_json::Value,
+    capability: leveler_core::Capability,
+) -> Result<Option<Vec<leveler_core::GrantBinding>>, String> {
+    let Some(id) = input.get("task_id").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    Ok(tasks.resource_identity(id.trim()).await?.map(|resource| {
+        vec![leveler_core::GrantBinding {
+            capability,
+            resource,
+        }]
+    }))
+}
+
+async fn task_admission_reason(
+    tasks: &BackgroundTaskRegistry,
+    input: &serde_json::Value,
+    context: &ToolContext,
+    capability: leveler_core::Capability,
+) -> Option<String> {
+    if context.policy.unrestricted_execution() {
+        return None;
+    }
+    let id = input.get("task_id")?.as_str()?.trim();
+    if task_resource_authority(tasks, id, context, capability).await {
+        return None;
+    }
+    let owner = tasks.peek_task_owner(id).await.ok()?;
+    (owner.as_deref() != Some(context.session_scope())).then(||
+        format!("task `{id}` belongs to another session or the runtime; explicit approval is required for this exact action"))
+}
+
 pub struct GetTaskTool {
     tasks: Arc<BackgroundTaskRegistry>,
 }
@@ -141,6 +190,33 @@ impl Tool for GetTaskTool {
         RiskLevel::Safe
     }
 
+    async fn admission_reason(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<String> {
+        task_admission_reason(
+            &self.tasks,
+            input,
+            context,
+            leveler_core::Capability::BackgroundTaskObserve,
+        )
+        .await
+    }
+
+    async fn grant_bindings(
+        &self,
+        input: &serde_json::Value,
+        _context: &ToolContext,
+    ) -> Result<Option<Vec<leveler_core::GrantBinding>>, String> {
+        task_grant_bindings(
+            &self.tasks,
+            input,
+            leveler_core::Capability::BackgroundTaskObserve,
+        )
+        .await
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -150,7 +226,17 @@ impl Tool for GetTaskTool {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
         let reg = &self.tasks;
         match reg
-            .get_owned(input.task_id.trim(), context.session_scope())
+            .get_authorized(
+                input.task_id.trim(),
+                context.session_scope(),
+                task_resource_authority(
+                    &self.tasks,
+                    input.task_id.trim(),
+                    &context,
+                    leveler_core::Capability::BackgroundTaskObserve,
+                )
+                .await,
+            )
             .await
         {
             Ok(snap) => Ok(ToolOutput::ok(format_snap(&snap))),
@@ -197,6 +283,33 @@ impl Tool for WaitTaskTool {
         RiskLevel::WorkspaceWrite
     }
 
+    async fn admission_reason(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<String> {
+        task_admission_reason(
+            &self.tasks,
+            input,
+            context,
+            leveler_core::Capability::BackgroundTaskObserve,
+        )
+        .await
+    }
+
+    async fn grant_bindings(
+        &self,
+        input: &serde_json::Value,
+        _context: &ToolContext,
+    ) -> Result<Option<Vec<leveler_core::GrantBinding>>, String> {
+        task_grant_bindings(
+            &self.tasks,
+            input,
+            leveler_core::Capability::BackgroundTaskObserve,
+        )
+        .await
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -221,9 +334,16 @@ impl Tool for WaitTaskTool {
         // parent token, so this blocks without spinning and without owning the
         // task. Only once the wait has resolved is the log delta read.
         if let Err(e) = reg
-            .wait_owned(
+            .wait_authorized(
                 &task_id,
                 context.session_scope(),
+                task_resource_authority(
+                    &self.tasks,
+                    input.task_id.trim(),
+                    &context,
+                    leveler_core::Capability::BackgroundTaskObserve,
+                )
+                .await,
                 Some(timeout),
                 &cancellation,
             )
@@ -232,9 +352,16 @@ impl Tool for WaitTaskTool {
             return Ok(ToolOutput::error(e));
         }
         let wait_result = reg
-            .observe_owned(
+            .observe_authorized(
                 &task_id,
                 context.session_scope(),
+                task_resource_authority(
+                    &self.tasks,
+                    input.task_id.trim(),
+                    &context,
+                    leveler_core::Capability::BackgroundTaskObserve,
+                )
+                .await,
                 input.cursor,
                 log_budget,
                 std::time::Duration::ZERO,
@@ -273,7 +400,17 @@ impl Tool for WaitTaskTool {
                 // This reads that result — it does not produce it.
                 let settlement = observation.settlement;
                 let report = match reg
-                    .take_settlement_owned(&task_id, context.session_scope())
+                    .take_settlement_authorized(
+                        &task_id,
+                        context.session_scope(),
+                        task_resource_authority(
+                            &self.tasks,
+                            input.task_id.trim(),
+                            &context,
+                            leveler_core::Capability::BackgroundTaskObserve,
+                        )
+                        .await,
+                    )
                     .await
                 {
                     Ok(report) => report,
@@ -352,6 +489,33 @@ impl Tool for KillTaskTool {
         RiskLevel::WorkspaceWrite
     }
 
+    async fn admission_reason(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<String> {
+        task_admission_reason(
+            &self.tasks,
+            input,
+            context,
+            leveler_core::Capability::BackgroundTaskControl,
+        )
+        .await
+    }
+
+    async fn grant_bindings(
+        &self,
+        input: &serde_json::Value,
+        _context: &ToolContext,
+    ) -> Result<Option<Vec<leveler_core::GrantBinding>>, String> {
+        task_grant_bindings(
+            &self.tasks,
+            input,
+            leveler_core::Capability::BackgroundTaskControl,
+        )
+        .await
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -361,7 +525,17 @@ impl Tool for KillTaskTool {
         let input: TaskIdInput = super::parse_input(self.name(), input)?;
         let reg = &self.tasks;
         match reg
-            .kill_owned(input.task_id.trim(), context.session_scope())
+            .kill_authorized(
+                input.task_id.trim(),
+                context.session_scope(),
+                task_resource_authority(
+                    &self.tasks,
+                    input.task_id.trim(),
+                    &context,
+                    leveler_core::Capability::BackgroundTaskControl,
+                )
+                .await,
+            )
             .await
         {
             Ok(snap) => Ok(ToolOutput::ok(format_snap(&snap))),
@@ -375,6 +549,282 @@ impl Tool for KillTaskTool {
 // canary tests.
 #[cfg(all(test, unix))]
 mod tests {
+    #[tokio::test]
+    async fn resource_session_grant_controls_only_the_bound_foreign_task() {
+        let dir = scratch_repo();
+        let (ctx, registry, commands) = ctx_with_reg(dir.path());
+        let owner = ctx.clone().with_session_scope("owner");
+        let target = spawn_background(&commands, &owner, "sleep 30").await;
+        let other = spawn_background(&commands, &owner, "sleep 30").await;
+        let resource = registry.resource_identity(&target).await.unwrap().unwrap();
+        let policy = leveler_execution::ResolvedExecutionPolicy::new(
+            leveler_execution::WriteScope::None,
+            leveler_execution::NetworkScope::None,
+            leveler_execution::AuthorizationEvidence::ResourceGrant {
+                request: leveler_core::GrantRequest {
+                    project_identity: "p".into(),
+                    bindings: vec![
+                        leveler_core::GrantBinding {
+                            capability: leveler_core::Capability::BackgroundTaskControl,
+                            resource: resource.clone(),
+                        },
+                        leveler_core::GrantBinding {
+                            capability: leveler_core::Capability::BackgroundTaskObserve,
+                            resource,
+                        },
+                    ],
+                },
+                scope: leveler_core::GrantScope::Session,
+            },
+        );
+        let approved = ctx
+            .with_session_scope("foreign")
+            .with_resolved_policy(policy);
+        assert!(!approved.policy.unrestricted_execution());
+        let (_new_context, new_registry, new_commands) = ctx_with_reg(dir.path());
+        let replacement_task = spawn_background(&new_commands, &owner, "sleep 30").await;
+        assert_eq!(
+            target, replacement_task,
+            "fixture exercises reused local task number"
+        );
+        assert_ne!(
+            registry.resource_identity(&target).await.unwrap(),
+            new_registry
+                .resource_identity(&replacement_task)
+                .await
+                .unwrap()
+        );
+        let replay = GetTaskTool::new(new_registry.clone())
+            .execute(
+                serde_json::json!({"task_id":replacement_task}),
+                approved.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let _ = new_registry.kill(&replacement_task).await;
+        assert!(
+            replay.is_error,
+            "same number in a new registry must not replay a grant"
+        );
+        let killer = KillTaskTool::new(registry.clone());
+        let mut observe_request = approved.policy.resource_grant().unwrap().clone();
+        observe_request.bindings.retain(|binding| {
+            binding.capability == leveler_core::Capability::BackgroundTaskObserve
+        });
+        let observe_only =
+            approved
+                .clone()
+                .with_resolved_policy(leveler_execution::ResolvedExecutionPolicy::new(
+                    leveler_execution::WriteScope::None,
+                    leveler_execution::NetworkScope::None,
+                    leveler_execution::AuthorizationEvidence::ResourceGrant {
+                        request: observe_request,
+                        scope: leveler_core::GrantScope::Session,
+                    },
+                ));
+        let cannot_kill = killer
+            .execute(
+                serde_json::json!({"task_id":target}),
+                observe_only,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(cannot_kill.is_error);
+        assert_eq!(
+            registry.get(&target).await.unwrap().status,
+            BackgroundTaskStatus::Running
+        );
+        let getter = GetTaskTool::new(registry.clone());
+        assert_ne!(
+            getter
+                .grant_bindings(&serde_json::json!({"task_id":target}), &approved)
+                .await
+                .unwrap(),
+            killer
+                .grant_bindings(&serde_json::json!({"task_id":target}), &approved)
+                .await
+                .unwrap()
+        );
+        let target_result = killer
+            .execute(
+                serde_json::json!({"task_id":target}),
+                approved.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let other_result = killer
+            .execute(
+                serde_json::json!({"task_id":other}),
+                approved.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let other_status = registry.get(&other).await.unwrap().status;
+        let target_status = registry.get(&target).await.unwrap().status;
+        let owner_after = registry.peek_task_owner(&target).await.unwrap();
+        let _ = registry.kill(&other).await;
+        assert!(!target_result.is_error, "{}", target_result.content);
+        assert!(other_result.is_error);
+        assert!(matches!(
+            target_status,
+            BackgroundTaskStatus::Killed | BackgroundTaskStatus::Killing
+        ));
+        assert_eq!(other_status, BackgroundTaskStatus::Running);
+        assert_eq!(owner_after.as_deref(), Some("owner"));
+        let repeated = GetTaskTool::new(registry)
+            .execute(
+                serde_json::json!({"task_id":target}),
+                approved,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!repeated.is_error, "same resource remains authorized");
+    }
+
+    #[tokio::test]
+    async fn foreign_task_admission_requests_approval_without_consuming_owner_evidence() {
+        let dir = scratch_repo();
+        let (ctx, registry, commands) = ctx_with_reg(dir.path());
+        let owner = ctx.clone().with_session_scope("owner");
+        let foreign = ctx.clone().with_session_scope("foreign");
+        let id = spawn_background(
+            &commands,
+            &owner,
+            "printf retained-log; printf changed > own.txt",
+        )
+        .await;
+        registry
+            .wait(&id, Some(Duration::from_secs(5)), &CancellationToken::new())
+            .await
+            .unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(GetTaskTool::new(registry.clone())),
+            Box::new(WaitTaskTool::new(registry.clone())),
+            Box::new(KillTaskTool::new(registry.clone())),
+        ];
+        for tool in tools {
+            assert!(
+                tool.admission_reason(&serde_json::json!({"task_id":id}), &foreign)
+                    .await
+                    .is_some(),
+                "{} must ask for foreign control",
+                tool.name()
+            );
+            assert!(
+                tool.admission_reason(&serde_json::json!({"task_id":id}), &owner)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                tool.admission_reason(&serde_json::json!({"task_id":"missing"}), &foreign)
+                    .await
+                    .is_none()
+            );
+        }
+        let observation = registry
+            .observe_owned(
+                &id,
+                "owner",
+                None,
+                1024,
+                Duration::ZERO,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(observation.snapshot.log.contains("retained-log"));
+        let settlement = registry
+            .take_settlement_owned(&id, "owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(settlement.modified.iter().any(|path| path == "own.txt"));
+    }
+
+    #[tokio::test]
+    async fn full_task_tools_control_other_session_and_scoped_tools_still_refuse() {
+        let dir = scratch_repo();
+        let (ctx, registry, commands) = ctx_with_reg(dir.path());
+        let owner = ctx.clone().with_session_scope("owner");
+        let id = spawn_background(&commands, &owner, "printf other-session-log; sleep 30").await;
+        let scoped = ctx.clone().with_session_scope("foreign");
+        let full = ToolContext::with_environment(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::FullAccess,
+            ctx.execution.environment.clone(),
+        )
+        .with_session_scope("foreign");
+        let getter = GetTaskTool::new(registry.clone());
+        assert!(
+            getter
+                .execute(
+                    serde_json::json!({"task_id":id}),
+                    scoped.clone(),
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !getter
+                .execute(
+                    serde_json::json!({"task_id":id}),
+                    full.clone(),
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        let killer = KillTaskTool::new(registry.clone());
+        assert!(
+            killer
+                .execute(
+                    serde_json::json!({"task_id":id}),
+                    scoped,
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !killer
+                .execute(
+                    serde_json::json!({"task_id":id}),
+                    full.clone(),
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        let output = WaitTaskTool::new(registry)
+            .execute(
+                serde_json::json!({"task_id":id,"cursor":0,"timeout_seconds":5}),
+                full,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !output.content.contains("another session"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("status: killed") || output.content.contains("status: exited"),
+            "{}",
+            output.content
+        );
+    }
+
     use super::*;
     use crate::tool::{Tool, ToolContext};
     use crate::tools::RunCommandTool;

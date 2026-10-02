@@ -518,6 +518,8 @@ mod tests {
         state.status = RuntimeStatus::Busy;
         state.overlay = Some(Overlay::Approval(Box::new(
             crate::overlay::ApprovalOverlay::new(UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: ApprovalId::new("a1"),
                 tool: "run_command".into(),
                 summary: "git push".into(),

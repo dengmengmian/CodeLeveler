@@ -143,7 +143,8 @@ class ChildAgent {
     return ending == null ? result : '$result · $ending';
   }
 
-  void _settle({required bool ok, String? outcome, String? stop, String? summary}) {
+  void _settle(
+      {required bool ok, String? outcome, String? stop, String? summary}) {
     state = 'settled';
     this.ok = ok;
     this.outcome = outcome;
@@ -165,7 +166,9 @@ class ChildAgent {
       ..stop = json['stop'] as String?
       ..summary = json['summary'] as String?
       ..background = json['background'] as bool?
-      ..scope = (json['scope'] as List<dynamic>? ?? const []).map((path) => '$path').toList()
+      ..scope = (json['scope'] as List<dynamic>? ?? const [])
+          .map((path) => '$path')
+          .toList()
       ..resumes = (json['resumes'] as num?)?.toInt() ?? 0
       ..inputTokens = (json['input_tokens'] as num?)?.toInt() ?? 0
       ..outputTokens = (json['output_tokens'] as num?)?.toInt() ?? 0
@@ -182,6 +185,8 @@ class PendingApproval {
     required this.summary,
     this.command,
     this.risks = const [],
+    this.grant,
+    this.requiresHumanConsent = false,
   });
 
   final String id;
@@ -189,6 +194,20 @@ class PendingApproval {
   final String summary;
   final String? command;
   final List<String> risks;
+  final Map<String, dynamic>? grant;
+  final bool requiresHumanConsent;
+  bool get canApproveSession => !requiresHumanConsent;
+  String get sessionLabel => grant == null ? '本轮对话内允许' : '此会话内允许此能力访问此资源';
+  List<String> get resourceDetails {
+    final bindings = grant?['bindings'] as List<dynamic>? ?? const [];
+    return [
+      if (grant != null) 'Project: ${grant!['project_identity']}',
+      for (final binding in bindings.whereType<Map<String, dynamic>>()) ...[
+        'Capability: ${(binding['capability'] as String? ?? '').replaceAll('_', '.')}',
+        'Resource: ${jsonEncode(binding['resource'])}',
+      ]
+    ];
+  }
 
   /// What the host is asking for, in this app's own words.
   ///
@@ -214,6 +233,8 @@ class PendingApproval {
   }
 
   static PendingApproval fromJson(Map<String, dynamic> json) => PendingApproval(
+        grant: json['grant'] as Map<String, dynamic>?,
+        requiresHumanConsent: json['requires_human_consent'] as bool? ?? false,
         id: json['id'] as String? ?? '',
         tool: json['tool'] as String? ?? '',
         summary: json['summary'] as String? ?? '',
@@ -226,7 +247,8 @@ class PendingApproval {
 
 /// A clarification the agent is waiting on. An empty answer means "skip".
 class PendingClarification {
-  PendingClarification({required this.id, required this.question, this.options = const []});
+  PendingClarification(
+      {required this.id, required this.question, this.options = const []});
   final String id;
   final String question;
   final List<String> options;
@@ -283,7 +305,8 @@ class SessionState extends ChangeNotifier {
   bool needsResync = false;
 
   void applySnapshot(Map<String, dynamic> session) {
-    final messages = (session['messages'] as List<dynamic>? ?? const []).map((raw) {
+    final messages =
+        (session['messages'] as List<dynamic>? ?? const []).map((raw) {
       final message = raw as Map<String, dynamic>;
       return TranscriptEntry(
         id: message['id'] as String? ?? '',
@@ -316,10 +339,12 @@ class SessionState extends ChangeNotifier {
 
     approvals.clear();
     clarifications.clear();
-    for (final raw in session['pending_interactions'] as List<dynamic>? ?? const []) {
+    for (final raw
+        in session['pending_interactions'] as List<dynamic>? ?? const []) {
       final interaction = raw as Map<String, dynamic>;
       // The request is nested under `request`, not flattened into the wrapper.
-      final request = interaction['request'] as Map<String, dynamic>? ?? const {};
+      final request =
+          interaction['request'] as Map<String, dynamic>? ?? const {};
       switch (interaction['type']) {
         case 'approval':
           final approval = PendingApproval.fromJson(request);
@@ -427,7 +452,8 @@ class SessionState extends ChangeNotifier {
           detail: _planDetail(event['plan']),
         ));
       case 'attachment_added':
-        final attachment = event['attachment'] as Map<String, dynamic>? ?? const {};
+        final attachment =
+            event['attachment'] as Map<String, dynamic>? ?? const {};
         final artifact = Artifact.fromAttachment(sessionId, attachment);
         artifacts.add(artifact);
         timeline.add(TimelineItem(
@@ -471,8 +497,10 @@ class SessionState extends ChangeNotifier {
         final row = _timelineById('sub-$id');
         if (event['type'] == 'sub_agent_progress') {
           if (child != null) {
-            child.inputTokens = (event['input_tokens'] as num?)?.toInt() ?? child.inputTokens;
-            child.outputTokens = (event['output_tokens'] as num?)?.toInt() ?? child.outputTokens;
+            child.inputTokens =
+                (event['input_tokens'] as num?)?.toInt() ?? child.inputTokens;
+            child.outputTokens =
+                (event['output_tokens'] as num?)?.toInt() ?? child.outputTokens;
           }
         } else {
           final tool = event['tool'] as String? ?? '';
@@ -480,7 +508,8 @@ class SessionState extends ChangeNotifier {
           if (tool.isNotEmpty) {
             final step = preview.isEmpty ? tool : '$tool · $preview';
             child?.recentStep = step;
-            if (row != null && (child == null || child.isOpen)) row.detail = step;
+            if (row != null && (child == null || child.isOpen))
+              row.detail = step;
           }
         }
       case 'verification_updated':
@@ -523,7 +552,8 @@ class SessionState extends ChangeNotifier {
         // Something the host wanted to say. It is not part of the conversation,
         // so it gets its own row rather than an assistant bubble — but it must
         // not vanish, which is what happened before.
-        final text = (event['message'] ?? event['error'] ?? event['detail']) as String?;
+        final text =
+            (event['message'] ?? event['error'] ?? event['detail']) as String?;
         if (text != null && text.isNotEmpty) {
           transcript.add(TranscriptEntry(id: '', role: 'notice', text: text));
           timeline.add(TimelineItem(
@@ -680,15 +710,18 @@ class SessionState extends ChangeNotifier {
     return null;
   }
 
-  static TimelineItem _itemFromMessage(TranscriptEntry entry) => switch (entry.role) {
-        'user' => TimelineItem(id: entry.id, kind: TimelineKind.user, detail: entry.text),
+  static TimelineItem _itemFromMessage(TranscriptEntry entry) =>
+      switch (entry.role) {
+        'user' => TimelineItem(
+            id: entry.id, kind: TimelineKind.user, detail: entry.text),
         'notice' => TimelineItem(
             id: entry.id,
             kind: TimelineKind.notice,
             title: _noticeTitle(entry.text),
             detail: entry.text,
           ),
-        _ => TimelineItem(id: entry.id, kind: TimelineKind.assistant, detail: entry.text),
+        _ => TimelineItem(
+            id: entry.id, kind: TimelineKind.assistant, detail: entry.text),
       };
 
   /// The registered header line a runtime notice opens with, without its
@@ -713,7 +746,13 @@ class SessionState extends ChangeNotifier {
     try {
       final decoded = jsonDecode(arguments);
       if (decoded is Map) {
-        for (final key in const ['path', 'file', 'query', 'pattern', 'command']) {
+        for (final key in const [
+          'path',
+          'file',
+          'query',
+          'pattern',
+          'command'
+        ]) {
           final value = decoded[key];
           if (value is String && value.isNotEmpty) return value;
         }
@@ -721,7 +760,9 @@ class SessionState extends ChangeNotifier {
     } on FormatException {
       // Fall through to the truncated raw arguments.
     }
-    return arguments.length > 120 ? '${arguments.substring(0, 117)}…' : arguments;
+    return arguments.length > 120
+        ? '${arguments.substring(0, 117)}…'
+        : arguments;
   }
 
   void _rememberPlan(Object? plan) {
@@ -841,7 +882,8 @@ class SessionState extends ChangeNotifier {
         ? '子 Agent ${child.displayName}'
         : '子 Agent ${child.displayName} · ${child.label}';
     final text = child.isOpen ? child.purpose : (child.summary ?? '');
-    final body = text.isEmpty ? child.statusLabel : '${child.statusLabel}\n$text';
+    final body =
+        text.isEmpty ? child.statusLabel : '${child.statusLabel}\n$text';
     final ok = child.isOpen ? null : child.ok;
     final existing = _timelineById('sub-${child.id}');
     if (existing == null) {

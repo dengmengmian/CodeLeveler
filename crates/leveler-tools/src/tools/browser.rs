@@ -11,11 +11,10 @@
 //! [`leveler_browser::Browser`]; what is added here is the tool boundary —
 //! input parsing, cancellation, and a structured `ToolOutput`.
 //!
-//! **The browser is a network-authorised capability.** Exposing it IS the
-//! authorisation, so there is no per-navigation network gate here: localhost,
-//! LAN dev servers and the public internet are all reachable, and a click that
-//! navigates, a page's `fetch`, a WebSocket and a subresource all behave the
-//! way they do in the user's own browser.
+//! Browser processes cannot yet enforce destination-scoped sockets. Calls
+//! require Internet scope or unrestricted call authority; narrower scopes fail
+//! closed, including actions
+//! that can indirectly navigate or start subresource/WebSocket requests.
 
 use std::sync::Arc;
 
@@ -174,9 +173,21 @@ impl Tool for BrowserTabTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        if !context.policy.unrestricted_execution()
+            && !matches!(
+                context.policy.network_scope(),
+                leveler_execution::NetworkScope::Internet
+            )
+        {
+            return Ok(ToolOutput::error(
+                "UnsupportedNetworkScope: browser processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+            ));
+        }
         let input: TabInput = super::parse_input(self.name(), input)?;
         let session = scope(&context);
-        let b = &self.browser;
+        let b = self
+            .browser
+            .with_call_authority(context.policy.unrestricted_execution());
         let tab = target(input.tab);
 
         let product = match input
@@ -350,8 +361,21 @@ impl Tool for BrowserActTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        if !context.policy.unrestricted_execution()
+            && !matches!(
+                context.policy.network_scope(),
+                leveler_execution::NetworkScope::Internet
+            )
+        {
+            return Ok(ToolOutput::error(
+                "UnsupportedNetworkScope: browser processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+            ));
+        }
         let input: ActInput = super::parse_input(self.name(), input)?;
         let session = scope(&context);
+        let browser = self
+            .browser
+            .with_call_authority(context.policy.unrestricted_execution());
         let tab = target(input.tab);
         let element = input.element.as_deref().filter(|r| !r.is_empty());
         let values = input.values.unwrap_or_default();
@@ -406,7 +430,7 @@ impl Tool for BrowserActTool {
         };
 
         Ok(
-            match cancellable!(cancellation, self.browser.act(&session, tab, act)) {
+            match cancellable!(cancellation, browser.act(&session, tab, act)) {
                 Ok(o) => ToolOutput::ok(describe(&o)),
                 Err(e) => failed(e),
             },
@@ -467,8 +491,21 @@ impl Tool for BrowserInspectTool {
         context: ToolContext,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        if !context.policy.unrestricted_execution()
+            && !matches!(
+                context.policy.network_scope(),
+                leveler_execution::NetworkScope::Internet
+            )
+        {
+            return Ok(ToolOutput::error(
+                "UnsupportedNetworkScope: browser processes require Internet scope or unrestricted call authority; destination confinement is unavailable.",
+            ));
+        }
         let input: InspectInput = super::parse_input(self.name(), input)?;
         let session = scope(&context);
+        let browser = self
+            .browser
+            .with_call_authority(context.policy.unrestricted_execution());
         let tab = target(input.tab);
         let kind = match input.what {
             InspectWhat::Console => InspectKind::Console,
@@ -477,7 +514,7 @@ impl Tool for BrowserInspectTool {
         };
 
         Ok(
-            match cancellable!(cancellation, self.browser.inspect(&session, tab, kind)) {
+            match cancellable!(cancellation, browser.inspect(&session, tab, kind)) {
                 Ok(InspectReport::Console(entries)) if entries.is_empty() => {
                     ToolOutput::ok(format!("no {} entries", kind.as_str()))
                 }
@@ -507,5 +544,42 @@ impl Tool for BrowserInspectTool {
                 Err(e) => failed(e),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod network_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_browser_calls_refuse_scoped_network_before_launch() {
+        let browser = Arc::new(Browser::new(
+            leveler_core::environment().clone(),
+            std::env::temp_dir().join("leveler-browser-scope-test"),
+            None,
+        ));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(BrowserTabTool::new(browser.clone())),
+            Box::new(BrowserActTool::new(browser.clone())),
+            Box::new(BrowserInspectTool::new(browser.clone())),
+        ];
+        let ws = leveler_execution::Workspace::new(std::env::temp_dir()).unwrap();
+        let ctx = ToolContext::new(ws, leveler_execution::PermissionProfile::RequestApproval);
+        for tool in tools {
+            let out = tool
+                .execute(serde_json::json!({}), ctx.clone(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(out.is_error);
+            assert!(
+                out.content.contains("UnsupportedNetworkScope"),
+                "{}",
+                out.content
+            );
+        }
+        assert!(matches!(
+            browser.status().await,
+            leveler_browser::BrowserStatus::NotStarted
+        ));
     }
 }

@@ -144,6 +144,7 @@ async fn run_spawn(dir: &std::path::Path, script: Vec<ModelResponse>) -> Vec<Age
         ModelRef::new("mock", "m"),
         8,
     )
+    .with_approver(std::sync::Arc::new(leveler_execution::AutoDeny))
     .run(
         "delegate",
         &mut |e| events.push(e),

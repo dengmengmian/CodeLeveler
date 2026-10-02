@@ -401,6 +401,8 @@ fn renders_approval_overlay_with_deny_visible() {
         &mut state,
         Action::Runtime(RuntimeEvent::ApprovalRequested {
             request: UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: ApprovalId::new("r1"),
                 tool: "run_command".into(),
                 summary: "run git push".into(),
@@ -1335,6 +1337,8 @@ fn the_approval_overlay_sits_where_the_composer_was() {
         &mut state,
         Action::Runtime(RuntimeEvent::ApprovalRequested {
             request: UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: ApprovalId::new("r1"),
                 tool: "run_command".into(),
                 summary: "run git push".into(),

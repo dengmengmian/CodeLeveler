@@ -494,8 +494,15 @@
             "null"
           ]
         },
+        "grant": {
+          "description": "Exact host-resolved capability/resource metadata, never inferred from text."
+        },
         "id": {
           "$ref": "#/definitions/ApprovalId"
+        },
+        "requires_human_consent": {
+          "description": "A human-only consent operation offers Once and Deny exclusively.",
+          "type": "boolean"
         },
         "risks": {
           "description": "Human-readable risk bullets (paths touched, network, etc.).",

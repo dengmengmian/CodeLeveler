@@ -8,7 +8,7 @@
 //! Two commands are allowed while carrying values that are not, so the payload
 //! is inspected rather than just the discriminant:
 //!
-//! - `ApprovalDecision::ApproveAlways` is persisted by the agent executor as a
+//! - `ApprovalDecision::ApproveProject` and legacy `ApproveAlways` are persisted by the agent executor as a
 //!   rule in the repository's `permissions.yaml`. Allowing it remotely would let
 //!   a phone grant standing local permission that outlives the session and the
 //!   pairing.
@@ -357,10 +357,12 @@ impl RemotePolicy {
             | ApprovalDecision::Deny => RemoteVerdict::Allow,
             // Persisted to the repository's permissions.yaml by the executor,
             // so it would outlive both the session and the pairing.
-            ApprovalDecision::ApproveAlways => RemoteVerdict::Deny {
-                code: DENIED_DECISION,
-                reason: "a remote client cannot grant standing permission",
-            },
+            ApprovalDecision::ApproveProject | ApprovalDecision::ApproveAlways => {
+                RemoteVerdict::Deny {
+                    code: DENIED_DECISION,
+                    reason: "a remote client cannot grant standing permission",
+                }
+            }
         }
     }
 

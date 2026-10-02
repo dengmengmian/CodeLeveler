@@ -13,6 +13,7 @@ mod cli;
 mod common;
 mod completions_cmd;
 mod crash;
+mod desktop_bridge;
 mod eval_cmd;
 mod eval_commitment;
 mod eval_signals;
@@ -196,6 +197,9 @@ fn warn_untrusted_project_config(layout: &leveler_project::Layout) {
 }
 
 async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
+    if matches!(&args.command, Some(Command::DesktopBridge)) {
+        return desktop_bridge::run(args.config_dir).await;
+    }
     let config_overridden = args.config_dir.is_some();
     let no_workspace = matches!(
         &args.command,
@@ -246,6 +250,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
     };
 
     match command {
+        Command::DesktopBridge => unreachable!("desktop bridge dispatched before project layout"),
         Command::ExecutionHost { state_dir } => {
             let mut config = leveler_app::execution_host_config(&layout)?;
             config.state_dir = state_dir;

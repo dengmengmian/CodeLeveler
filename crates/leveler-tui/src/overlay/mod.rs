@@ -1105,6 +1105,31 @@ fn approval_content(
             lines.push(Line::from(Span::raw(format!("  {piece}"))));
         }
     }
+    if let Some(grant) = &req.grant {
+        for piece in crate::render::text::wrap(
+            &format!("Project: {}", grant.project_identity),
+            width.saturating_sub(2).max(8),
+        ) {
+            lines.push(Line::from(Span::raw(format!("  {piece}"))));
+        }
+        for binding in &grant.bindings {
+            let resource =
+                serde_json::to_string(&binding.resource).expect("typed resource serializes");
+            let capability =
+                serde_json::to_string(&binding.capability).expect("typed capability serializes");
+            for detail in [
+                format!(
+                    "Capability: {}",
+                    capability.trim_matches('"').replace('_', ".")
+                ),
+                format!("Resource: {resource}"),
+            ] {
+                for piece in crate::render::text::wrap(&detail, width.saturating_sub(2).max(8)) {
+                    lines.push(Line::from(Span::raw(format!("  {piece}"))));
+                }
+            }
+        }
+    }
     for risk in &req.risks {
         lines.push(Line::from(Span::styled(
             format!("  ⚠ {risk}"),
@@ -1186,6 +1211,8 @@ mod layout_tests {
 
     fn overlay(summary: &str) -> Overlay {
         Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
             id: ApprovalId::new("r1"),
             tool: "shell_command".into(),
             summary: summary.into(),
@@ -1325,6 +1352,8 @@ mod layout_tests {
         // simply ends mid-path reads as the whole command.
         let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(6) + "target";
         let ov = Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
             id: ApprovalId::new("r1"),
             tool: "shell_command".into(),
             summary: String::new(),
@@ -1366,6 +1395,8 @@ mod layout_tests {
     fn expanding_shows_the_whole_command() {
         let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(6) + "target";
         let mut ap = ApprovalOverlay::new(UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
             id: ApprovalId::new("r1"),
             tool: "shell_command".into(),
             summary: String::new(),
@@ -1389,6 +1420,8 @@ mod layout_tests {
         // Tools without a command line (memory writes, MCP calls) still need a
         // headline that says what is about to happen.
         let ov = Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
             id: ApprovalId::new("r1"),
             tool: "remember".into(),
             summary: "记住用户偏好".into(),
@@ -1539,6 +1572,8 @@ mod layout_tests {
     fn a_tall_approval_keeps_its_decision_block_and_hint_visible() {
         let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(20) + "target";
         let mut ap = ApprovalOverlay::new(UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
             id: ApprovalId::new("r1"),
             tool: "shell_command".into(),
             summary: String::new(),

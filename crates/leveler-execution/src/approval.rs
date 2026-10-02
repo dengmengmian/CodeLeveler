@@ -15,7 +15,7 @@ use crate::risk::{PermissionProfile, RiskLevel};
 use crate::shell_ast;
 
 /// A request for the user to approve a risky action.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: ApprovalId,
     /// Filled by the engine recorder once the persisted turn exists.
@@ -32,13 +32,55 @@ pub struct ApprovalRequest {
     pub description: String,
     pub command: Option<String>,
     pub paths: Vec<PathBuf>,
+    /// Exact host-resolved resources; absent requests retain legacy call rules.
+    #[serde(default)]
+    pub grant: Option<leveler_core::GrantRequest>,
 }
 
 impl ApprovalRequest {
+    /// Reuse the command effect parser for commands invoking the human consent
+    /// surface. A reviewer or headless approver must not sign that consent.
+    pub fn requires_human_consent(&self) -> bool {
+        needs_human_consent(&self.tool)
+            || self.command.as_ref().is_some_and(|command| {
+                let (program, args) = crate::shell_invocation(command);
+                is_self_consent_command(&program, &args)
+            })
+    }
+
+    /// Resource-bound requests can reuse only the explicitly offered scopes.
+    pub fn project_available(&self) -> bool {
+        !self.requires_human_consent()
+            && self.grant.as_ref().is_some_and(|grant| {
+                !grant.project_identity.is_empty() && !grant.bindings.is_empty()
+            })
+    }
+
+    /// Human-only consent never creates reusable permission.
+    pub fn decisions(&self) -> Vec<ApprovalDecision> {
+        if self.requires_human_consent() {
+            return vec![ApprovalDecision::ApproveOnce, ApprovalDecision::Deny];
+        }
+        let mut choices = vec![
+            ApprovalDecision::ApproveOnce,
+            ApprovalDecision::ApproveSession,
+        ];
+        if self.project_available() {
+            choices.push(ApprovalDecision::ApproveProject);
+        } else if self.always_persists() {
+            choices.push(ApprovalDecision::ApproveAlways);
+        }
+        choices.push(ApprovalDecision::Deny);
+        choices
+    }
+
     /// Whether an `ApproveAlways` answer would persist a standing permission
     /// rule. `false` means the runtime can only honour it for this turn
     /// (consent tools, calls with no safe rule shape), so no prompt may offer it.
     pub fn always_persists(&self) -> bool {
+        if self.grant.is_some() || self.requires_human_consent() {
+            return false;
+        }
         let paths: Vec<String> = self.paths.iter().map(|p| p.display().to_string()).collect();
         !crate::always_rules_for(&self.tool, self.command.as_deref(), &paths).is_empty()
     }
@@ -50,10 +92,12 @@ impl ApprovalRequest {
 pub enum ApprovalDecision {
     /// Allow this one action.
     ApproveOnce,
-    /// Allow this exact proposed call for the rest of the current turn
-    /// (the executor run that asked). The wire name predates that scope.
-    /// The call identity includes explicit args/cwd, not resolved resources.
+    /// Reuse bound capability/resources for this durable session. Legacy
+    /// requests without resources retain exact-call approval for this turn.
     ApproveSession,
+    /// Reuse this capability-resource binding in the same project.
+    ApproveProject,
+    /// Legacy command rule approval, never a resource grant.
     /// Allow this action and persist a project permission rule so matching
     /// actions auto-allow in future sessions too (SEC-1). Command rules match
     /// exact command identities, not cwd or resolved resources. Falls back to
@@ -93,7 +137,7 @@ impl Approver for AutoApprove {
     }
 
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        if needs_human_consent(&request.tool) {
+        if request.requires_human_consent() {
             return ApprovalDecision::Deny;
         }
         ApprovalDecision::ApproveOnce
@@ -128,7 +172,7 @@ impl Approver for EvalApprove {
     }
 
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        if needs_human_consent(&request.tool) {
+        if request.requires_human_consent() {
             return ApprovalDecision::Deny;
         }
         // Escalation, by the request's own classification — not by what it says
@@ -195,8 +239,8 @@ pub fn is_memory_write_tool(tool: &str) -> bool {
 
 /// Tools that write an agent or skill definition (`save_agent`, `delete_agent`,
 /// `save_skill`, `delete_skill`). Like a memory write, a definition changes what
-/// future sessions do, so only a person may approve one — never an
-/// auto-approver, a standing rule, or the full-access shortcut.
+/// future sessions do. Auto and Restricted require a human confirmation;
+/// Full bypasses this consent gate along with all other permission gates.
 pub fn is_agent_definition_write_tool(tool: &str) -> bool {
     matches!(
         tool,
@@ -204,7 +248,7 @@ pub fn is_agent_definition_write_tool(tool: &str) -> bool {
     )
 }
 
-/// Tools only a person may approve.
+/// Tools requiring human confirmation under Auto and Restricted.
 pub fn needs_human_consent(tool: &str) -> bool {
     is_memory_write_tool(tool) || is_agent_definition_write_tool(tool)
 }
@@ -386,6 +430,15 @@ fn git_command_class(program: &str, args: &[String]) -> Option<CommandClass> {
         return None;
     }
     if effects.gated() {
+        return Some(CommandClass::Dangerous);
+    }
+    // A remote transfer that runs through anything other than a direct `git`
+    // invocation cannot be bound to an approved remote and credential: the
+    // frozen-target execution path reproduces a directly invoked `git` only.
+    // Classified Safe, the wrapper would run against the user's live Git
+    // credential store with no approval — the ambient-credential use the broker
+    // exists to prevent. It keeps exact-call approval instead.
+    if basename(program) != "git" && (effects.effects.remote_read || effects.effects.remote_write) {
         return Some(CommandClass::Dangerous);
     }
     // Git owns its own effects, not the verdict of other commands in the
@@ -587,8 +640,36 @@ pub(crate) fn classify_program(program: &str, args: &[String]) -> CommandClass {
 
     // `args` retained for future command-specific danger lists; publish/push
     // are intentionally Safe (sandbox-first + user-driven Always rules).
-    let _ = args;
+    // Reading a credential store's raw value is never an ordinary command in a
+    // profile that confines credentials: it asks, and a `credential.use` grant
+    // for Git does not stand in for it. Full bypasses classification entirely.
+    if is_credential_store_read(stem, args) {
+        return CommandClass::Dangerous;
+    }
     CommandClass::Safe
+}
+
+/// Whether this call reads a credential store's raw value (`security
+/// find-generic-password -w`, `secret-tool lookup`, `pass show`, `git
+/// credential fill`, a `git-credential-*` helper).
+fn is_credential_store_read(program: &str, args: &[String]) -> bool {
+    let first = args.first().map(String::as_str);
+    match program {
+        "security" => matches!(
+            first,
+            Some(
+                "find-generic-password"
+                    | "find-internet-password"
+                    | "dump-keychain"
+                    | "find-key"
+                    | "export"
+            )
+        ),
+        "secret-tool" => first == Some("lookup"),
+        "pass" => matches!(first, Some("show" | "grep")),
+        "git" => first.is_some_and(|arg| arg == "credential" || arg.starts_with("credential-")),
+        _ => program.starts_with("git-credential-"),
+    }
 }
 
 /// Classify a shell script, taking the strictest verdict across every command
@@ -732,23 +813,13 @@ impl ApprovalPolicy {
         risk: RiskLevel,
         command: Option<CommandView>,
     ) -> Requirement {
-        // Durable memory writes need a human in EVERY profile, full-access
-        // included, so this is checked before the full-access shortcut.
-        //
-        // Full access is authority over this machine and this workspace: run
-        // any command, write any file, reach the network. It is not authority
-        // to change what future sessions will believe. A wrong long-term
-        // memory is read back silently, turn after turn, long after the run
-        // that wrote it is forgotten — so the user confirms it, whatever they
-        // opted into for execution.
-        if needs_human_consent(tool) {
-            return Requirement::NeedApproval;
-        }
-
-        // 完全访问 means no prompts for execution — the user has explicitly
-        // opted into an unrestricted session, destructive commands included.
+        // Full is a top-level product invariant, including current and future
+        // tools: consent and sandbox enforcement are bypassed entirely.
         if profile == PermissionProfile::FullAccess {
             return Requirement::Auto;
+        }
+        if needs_human_consent(tool) {
+            return Requirement::NeedApproval;
         }
 
         // MCP tools bypass the execution sandbox entirely (external process);
@@ -785,7 +856,7 @@ impl ApprovalPolicy {
 
         // 替我审批 (default / "auto"): sandbox-first — only destruction,
         // privilege escalation, and host escape prompt. Network + ordinary
-        // shell (including `git push`) auto-run; OS sandbox still confines
+        // shell auto-run; Git remote mutation still asks through effects. OS sandbox confines
         // workspace writes. RequestApproval is the "ask more" profile.
         if is_command_tool(tool) {
             return match command.map(|c| classify_command(&c)) {
@@ -868,6 +939,7 @@ mod tests {
     #[tokio::test]
     async fn eval_approver_denies_privileged_escalation() {
         let request = |tool: &str, risk: RiskLevel| ApprovalRequest {
+            grant: None,
             id: ApprovalId::generate(),
             turn_id: None,
             call_id: "c1".into(),
@@ -907,6 +979,7 @@ mod tests {
     #[tokio::test]
     async fn eval_approver_ignores_the_stated_reason() {
         let mut request = ApprovalRequest {
+            grant: None,
             id: ApprovalId::generate(),
             turn_id: None,
             call_id: "c1".into(),
@@ -928,6 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn eval_approver_keeps_ordinary_tool_work_flowing() {
         let ordinary = |tool: &str, risk: RiskLevel| ApprovalRequest {
+            grant: None,
             id: ApprovalId::generate(),
             turn_id: None,
             call_id: "c".into(),
@@ -973,6 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn production_auto_approve_is_unchanged() {
         let request = ApprovalRequest {
+            grant: None,
             id: ApprovalId::generate(),
             turn_id: None,
             call_id: "c".into(),
@@ -1000,6 +1075,7 @@ mod tests {
         for (decision, wire) in [
             (ApprovalDecision::ApproveOnce, "approve_once"),
             (ApprovalDecision::ApproveSession, "approve_session"),
+            (ApprovalDecision::ApproveProject, "approve_project"),
             (ApprovalDecision::ApproveAlways, "approve_always"),
             (ApprovalDecision::Deny, "deny"),
         ] {
@@ -1024,15 +1100,13 @@ mod tests {
         assert!(AutoDeny.has_human());
     }
 
-    /// Full access is execution authority, not authority over what future
-    /// sessions believe. Memory writes are confirmed in every profile.
+    /// Full includes current and future tools; Auto/Restricted retain consent.
     #[test]
-    fn memory_writes_need_a_human_in_every_profile() {
+    fn memory_writes_need_consent_except_in_full() {
         let policy = ApprovalPolicy {
             network_allowed: true,
         };
         for profile in [
-            PermissionProfile::FullAccess,
             PermissionProfile::Assisted,
             PermissionProfile::RequestApproval,
         ] {
@@ -1043,6 +1117,23 @@ mod tests {
                     "{profile:?} / {tool}"
                 );
             }
+        }
+        for tool in [
+            "remember",
+            "forget",
+            "save_agent",
+            "delete_agent",
+            "future_capability",
+        ] {
+            assert_eq!(
+                policy.evaluate(
+                    PermissionProfile::FullAccess,
+                    tool,
+                    RiskLevel::Privileged,
+                    None
+                ),
+                Requirement::Auto
+            );
         }
         // Ordinary execution under full access still prompts for nothing.
         assert_eq!(
@@ -1073,6 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn auto_approve_denies_memory_writes() {
         let req = ApprovalRequest {
+            grant: None,
             id: leveler_core::ApprovalId::generate(),
             turn_id: None,
             call_id: "c1".into(),
@@ -1724,5 +1816,64 @@ mod remote_publish_tests {
         assert!(!is_remote_publish_command(&view("git", &status)));
         let build = ["build".to_string()];
         assert!(!is_remote_publish_command(&view("cargo", &build)));
+    }
+}
+
+#[cfg(test)]
+mod credential_store_tests {
+    use super::*;
+
+    fn words(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// Reading a credential store's raw value is never ordinary, including from
+    /// inside a shell wrapper. Reading the *configuration* that names the source
+    /// stays ordinary so the agent can reason about it.
+    #[test]
+    fn raw_credential_store_reads_are_dangerous_but_config_reads_are_not() {
+        for (program, args) in [
+            (
+                "security",
+                words(&["find-generic-password", "-w", "-s", "github.com"]),
+            ),
+            ("security", words(&["find-internet-password", "-w"])),
+            ("security", words(&["dump-keychain"])),
+            ("/usr/bin/security", words(&["find-generic-password", "-w"])),
+            ("secret-tool", words(&["lookup", "service", "git"])),
+            ("pass", words(&["show", "github.com"])),
+            ("git", words(&["credential", "fill"])),
+            ("git-credential-osxkeychain", words(&["get"])),
+            (
+                "sh",
+                words(&["-c", "security find-generic-password -w -s x"]),
+            ),
+        ] {
+            let view = CommandView {
+                program,
+                args: args.as_slice(),
+            };
+            assert_eq!(
+                classify_command(&view),
+                CommandClass::Dangerous,
+                "{program} {args:?} must ask before reading a raw credential"
+            );
+        }
+        for (program, args) in [
+            ("git", words(&["config", "--get", "credential.helper"])),
+            ("git", words(&["status"])),
+            ("security", words(&["list-keychains"])),
+            ("gh", words(&["auth", "status"])),
+        ] {
+            let view = CommandView {
+                program,
+                args: args.as_slice(),
+            };
+            assert_eq!(
+                classify_command(&view),
+                CommandClass::Safe,
+                "{program} {args:?} must stay ordinary"
+            );
+        }
     }
 }

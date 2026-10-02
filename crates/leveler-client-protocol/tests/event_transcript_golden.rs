@@ -64,6 +64,8 @@ fn snapshot() -> UiSessionSnapshot {
             },
         ],
         pending_interactions: vec![UiPendingInteraction::Approval(UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
             id: ApprovalId::new("a_pending"),
             tool: "run_command".to_string(),
             summary: "删除 build 目录".to_string(),

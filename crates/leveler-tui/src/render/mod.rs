@@ -3160,6 +3160,8 @@ mod tests {
         let mut s = test_state();
         s.overlay = Some(crate::overlay::Overlay::Approval(Box::new(
             crate::overlay::ApprovalOverlay::new(leveler_client_protocol::UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: leveler_client_protocol::ApprovalId::new("r1"),
                 tool: "run_command".into(),
                 summary: "git push".into(),

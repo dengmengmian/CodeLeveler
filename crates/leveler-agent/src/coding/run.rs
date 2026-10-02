@@ -2956,6 +2956,7 @@ async fn run_harness_child(
         .build(profile, None)
         .await
         .map_err(ReviewRunError::Launch)?
+        .with_approver(runner.approver.clone())
         .with_execution_fence(runner.ownership_fence())
         .with_budget_scope(budget_scope.to_string())
         .with_model_request_store(

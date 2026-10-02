@@ -1,9 +1,8 @@
 //! Skill authoring through the conversation.
 //!
 //! The model proposes a skill with `save_skill` / `delete_skill`; the proposal
-//! is validated before anyone is asked, a human decides whether it is written,
-//! and the store writes it atomically. Nothing the model says can skip either
-//! step, in any permission profile.
+//! is validated before the store writes it atomically. Auto requires human
+//! approval; Full bypasses permission approval while retaining validation.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -254,7 +253,7 @@ async fn a_confirmed_skill_is_written_and_previewed() {
     let human = Human::new(ApprovalDecision::ApproveOnce);
     let (results, tools) = env
         .run(
-            PermissionProfile::FullAccess,
+            PermissionProfile::Assisted,
             human.clone(),
             vec![call(
                 "save_skill",
@@ -305,7 +304,7 @@ async fn nothing_is_written_without_a_human_yes() {
         let env = Env::new();
         let (results, _) = env
             .run(
-                PermissionProfile::FullAccess,
+                PermissionProfile::Assisted,
                 approver,
                 vec![call(
                     "save_skill",
@@ -344,7 +343,7 @@ async fn updating_a_native_skill_replaces_it_after_confirmation() {
     let env = Env::new();
     let human = Human::new(ApprovalDecision::ApproveOnce);
     env.run(
-        PermissionProfile::FullAccess,
+        PermissionProfile::Assisted,
         human.clone(),
         vec![call(
             "save_skill",
@@ -358,7 +357,7 @@ async fn updating_a_native_skill_replaces_it_after_confirmation() {
     update["files"] = serde_json::json!([]);
     let (results, _) = env
         .run(
-            PermissionProfile::FullAccess,
+            PermissionProfile::Assisted,
             human.clone(),
             vec![call("save_skill", update)],
         )
@@ -377,7 +376,7 @@ async fn delete_requires_confirmation_and_removes_the_skill() {
     let env = Env::new();
     let human = Human::new(ApprovalDecision::ApproveOnce);
     env.run(
-        PermissionProfile::FullAccess,
+        PermissionProfile::Assisted,
         human.clone(),
         vec![call(
             "save_skill",
@@ -388,7 +387,7 @@ async fn delete_requires_confirmation_and_removes_the_skill() {
     let human = Human::new(ApprovalDecision::ApproveOnce);
     let (results, _) = env
         .run(
-            PermissionProfile::FullAccess,
+            PermissionProfile::Assisted,
             human.clone(),
             vec![call(
                 "delete_skill",

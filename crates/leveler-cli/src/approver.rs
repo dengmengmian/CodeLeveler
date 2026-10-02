@@ -22,8 +22,7 @@ impl Approver for CliApprover {
         if !details.is_empty() {
             eprintln!("{details}");
         }
-        let persists = request.always_persists();
-        eprint!("  Approve? {}: ", choices_prompt(persists));
+        eprint!("  Approve? {}: ", request_choices_prompt(request));
 
         let line = tokio::task::spawn_blocking(|| {
             use std::io::BufRead;
@@ -35,7 +34,7 @@ impl Approver for CliApprover {
         .await
         .unwrap_or_default();
 
-        parse_answer(&line, persists)
+        request_answer(&line, request)
     }
 }
 
@@ -52,10 +51,54 @@ fn request_details(request: &ApprovalRequest) -> String {
     if let Some(cmd) = &request.command {
         lines.push(format!("    {}", style(cmd).bold()));
     }
+    if let Some(grant) = &request.grant {
+        lines.push(format!("    Project: {}", grant.project_identity));
+        for binding in &grant.bindings {
+            let capability =
+                serde_json::to_string(&binding.capability).expect("typed capability serializes");
+            lines.push(format!(
+                "    Capability: {}",
+                capability.trim_matches('"').replace('_', ".")
+            ));
+            lines.push(format!(
+                "    Resource: {}",
+                serde_json::to_string(&binding.resource).expect("typed resource serializes")
+            ));
+        }
+    }
     for path in &request.paths {
         lines.push(format!("    path: {}", path.display()));
     }
     lines.join("\n")
+}
+
+fn request_choices_prompt(request: &ApprovalRequest) -> String {
+    if request.requires_human_consent() {
+        return "[y]es once / [N]o (default)".into();
+    }
+    if request.project_available() {
+        return "[y]es once / this [s]ession (resource grant) / this [p]roject (resource grant) / [N]o (default)".into();
+    }
+    choices_prompt(request.always_persists())
+}
+
+fn request_answer(line: &str, request: &ApprovalRequest) -> ApprovalDecision {
+    let answer = line.trim().to_ascii_lowercase();
+    let decision = if request.grant.is_some() {
+        match answer.as_str() {
+            "y" | "yes" | "once" => ApprovalDecision::ApproveOnce,
+            "s" | "session" => ApprovalDecision::ApproveSession,
+            "p" | "project" => ApprovalDecision::ApproveProject,
+            _ => ApprovalDecision::Deny,
+        }
+    } else {
+        parse_answer(line, request.always_persists())
+    };
+    if request.decisions().contains(&decision) {
+        decision
+    } else {
+        ApprovalDecision::Deny
+    }
 }
 
 /// The answers offered. "Always" only when the runtime would persist a rule
@@ -90,8 +133,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bound_resource_offers_only_resource_scopes_and_renders_identity() {
+        let mut request = ApprovalRequest {
+            id: leveler_core::ApprovalId::new("grant-test"),
+            turn_id: None,
+            call_id: "call".into(),
+            agent_id: None,
+            action_fingerprint: "fp".into(),
+            tool: "run_command".into(),
+            risk: leveler_execution::RiskLevel::Destructive,
+            description: "push origin".into(),
+            command: Some("git push origin main".into()),
+            paths: Vec::new(),
+            grant: Some(leveler_core::GrantRequest {
+                project_identity: "project-a".into(),
+                bindings: vec![leveler_core::GrantBinding {
+                    capability: leveler_core::Capability::RemoteMutate,
+                    resource: leveler_core::ResourceIdentity::ConfiguredRemote {
+                        repository: "repo-a".into(),
+                        remote_name: "origin".into(),
+                        canonical_url: "https://example.test/a.git".into(),
+                        transport: "https".into(),
+                    },
+                }],
+            }),
+        };
+        let details = request_details(&request);
+        assert!(
+            details.contains("remote.mutate")
+                && details.contains("repo-a")
+                && details.contains("https://example.test/a.git"),
+            "{details}"
+        );
+        assert!(request_choices_prompt(&request).contains("[p]roject"));
+        assert_eq!(
+            request_answer("p", &request),
+            ApprovalDecision::ApproveProject
+        );
+        assert_eq!(request_answer("w", &request), ApprovalDecision::Deny);
+        assert_eq!(request_answer("t", &request), ApprovalDecision::Deny);
+        request.tool = "save_agent".into();
+        assert!(!request_choices_prompt(&request).contains("ession"));
+        assert_eq!(request_answer("s", &request), ApprovalDecision::Deny);
+        assert_eq!(request_answer("p", &request), ApprovalDecision::Deny);
+        assert_eq!(request_answer("y", &request), ApprovalDecision::ApproveOnce);
+    }
+
+    #[test]
     fn privileged_approval_displays_scope_command_and_reason_from_description() {
         let mut request = ApprovalRequest {
+            grant: None,
             id: leveler_core::ApprovalId::new("test"),
             turn_id: None,
             call_id: "call".into(),

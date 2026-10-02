@@ -3599,7 +3599,8 @@ async fn a_whole_file_write_outside_the_allowlist_is_rejected_before_running() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_write_allowlist(Some(vec!["src".to_string()]));
+    .with_write_allowlist(Some(vec!["src".to_string()]))
+    .with_approver(Arc::new(AutoDeny));
 
     let mut events = Vec::new();
     executor
@@ -3621,9 +3622,9 @@ async fn a_whole_file_write_outside_the_allowlist_is_rejected_before_running() {
         events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolResult { id, is_error, preview, .. }
-                if id == "c1" && *is_error && preview.contains("src")
+                if id == "c1" && *is_error && preview.contains("denied by user")
         )),
-        "the rejection must name the allowed paths: {events:?}"
+        "the requested out-of-scope write must be denied: {events:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -3660,7 +3661,8 @@ async fn apply_patch_outside_write_allowlist_is_rejected_before_running() {
         ModelRef::new("mock", "m"),
         10,
     )
-    .with_write_allowlist(Some(vec!["src".to_string()]));
+    .with_write_allowlist(Some(vec!["src".to_string()]))
+    .with_approver(Arc::new(AutoDeny));
 
     let outcome = executor
         .run(
@@ -6306,8 +6308,8 @@ async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The same out-of-scope write every round. The write allowlist refuses it
-    // before it runs, every time, so no round makes progress.
+    // The same out-of-scope write asks each round. The approver refuses it
+    // before execution, so no round makes progress.
     let blocked = || {
         assistant_tool_call(
             "c1",
@@ -6332,7 +6334,8 @@ async fn all_denied_rounds_count_as_no_progress_and_hard_stop() {
         ModelRef::new("mock", "m"),
         20,
     )
-    .with_write_allowlist(Some(vec!["src".to_string()]));
+    .with_write_allowlist(Some(vec!["src".to_string()]))
+    .with_approver(Arc::new(AutoDeny));
 
     let outcome = executor
         .run(
@@ -8372,7 +8375,7 @@ async fn an_approved_escalation_runs_the_command_in_the_same_round() {
 /// without asking. "仅允许本次" opens it for that one command only.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_turn_approval_of_an_escalation_keeps_the_network_for_the_turn() {
+async fn session_escalation_keeps_network_while_once_returns_to_explicit_denial() {
     let have_curl = std::process::Command::new("sh")
         .args(["-c", "command -v curl"])
         .output()
@@ -8400,7 +8403,8 @@ async fn a_turn_approval_of_an_escalation_keeps_the_network_for_the_turn() {
         let tool_context = ToolContext::new(
             Workspace::new(&dir).unwrap(),
             PermissionProfile::RequestApproval,
-        );
+        )
+        .with_sandbox(true);
         let asks = Arc::new(Mutex::new(0usize));
         let runtime = Arc::new(MockRuntime::new(vec![
             assistant_tool_call(
@@ -8432,10 +8436,15 @@ async fn a_turn_approval_of_an_escalation_keeps_the_network_for_the_turn() {
             decision,
         }));
 
+        let mut tool_evidence = Vec::new();
         executor
             .run(
                 "fetch",
-                &mut |_| {},
+                &mut |event| {
+                    if let AgentEvent::ToolResult { preview, .. } = event {
+                        tool_evidence.push(preview);
+                    }
+                },
                 &mut NoopSink,
                 CancellationToken::new(),
             )
@@ -8448,8 +8457,7 @@ async fn a_turn_approval_of_an_escalation_keeps_the_network_for_the_turn() {
                 .recv_timeout(std::time::Duration::from_secs(if reaches { 5 } else { 1 }))
                 .is_ok(),
             reaches,
-            "{decision:?}: {:?}",
-            runtime.requests.lock().unwrap()
+            "{decision:?}: only a session escalation grants the next call network access after explicit denial: {tool_evidence:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

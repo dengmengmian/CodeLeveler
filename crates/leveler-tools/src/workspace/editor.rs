@@ -22,9 +22,68 @@ pub(crate) struct WorkspaceEditor;
 /// turns each into the right model-facing message (CAS staleness vs. a path
 /// that left the workspace), so every edit tool phrases it identically.
 pub(crate) enum Commit {
-    Written,
+    Written(Option<leveler_core::ResourceIdentity>),
     Stale,
     Rejected(String),
+}
+
+// Keep descriptor-relative CAS writes while selecting the filesystem root
+// authorized by this exact call. A workspace root cannot address external files.
+fn editing_workspace(
+    context: &ToolContext,
+    resolved: &std::path::Path,
+    capability: leveler_core::Capability,
+) -> Result<leveler_execution::Workspace, ToolError> {
+    let exact = context
+        .execution_workspace()?
+        .allows_resource_path(capability, resolved);
+    if context.policy.unrestricted_execution() || exact {
+        let root = resolved
+            .ancestors()
+            .last()
+            .ok_or_else(|| ToolError::Io("target has no filesystem root".into()))?;
+        if context.policy.unrestricted_execution() {
+            Ok(leveler_execution::Workspace::new(root)?.with_unrestricted_access(true))
+        } else {
+            Ok(
+                leveler_execution::Workspace::new(root)?.with_resource_bindings(
+                    context
+                        .policy
+                        .resource_grant()
+                        .map(|request| request.bindings.clone())
+                        .unwrap_or_default(),
+                ),
+            )
+        }
+    } else {
+        context.execution_workspace()
+    }
+}
+
+#[cfg(unix)]
+fn descriptor_resource_authority(
+    context: &ToolContext,
+    resolved: &std::path::Path,
+    capability: leveler_core::Capability,
+) -> Option<leveler_core::ResourceIdentity> {
+    context
+        .policy
+        .resource_grant()?
+        .bindings
+        .iter()
+        .find_map(|binding| {
+            if binding.capability != capability {
+                return None;
+            }
+            match &binding.resource {
+                leveler_core::ResourceIdentity::FilesystemPath { canonical_path, .. }
+                    if std::path::Path::new(canonical_path) == resolved =>
+                {
+                    Some(binding.resource.clone())
+                }
+                _ => None,
+            }
+        })
 }
 
 impl WorkspaceEditor {
@@ -43,6 +102,8 @@ impl WorkspaceEditor {
         expected: &str,
         replacement: &str,
     ) -> Result<Commit, ToolError> {
+        let workspace =
+            editing_workspace(context, resolved, leveler_core::Capability::FilesystemWrite)?;
         let lock_path =
             leveler_project::layout::target_lock_path(&context.execution.environment, resolved);
         let lock = tokio::task::spawn_blocking({
@@ -53,20 +114,19 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-        if let Err(e) = context
-            .require_workspace()?
-            .revalidate_write_path(resolved, &context.write_scope())
-        {
+        if let Err(e) = workspace.revalidate_write_path(resolved, &context.write_scope()) {
             drop(lock);
             return Ok(Commit::Rejected(e.to_string()));
         }
         #[cfg(not(windows))]
         let unique = unique_temp_name(resolved);
         let committed_permissions: Option<std::fs::Permissions>;
+        #[allow(unused_mut)]
+        let mut receipt = None;
         #[cfg(unix)]
         {
-            let root = context.require_workspace()?.root().to_path_buf();
-            let root_fd = context.require_workspace()?.root_fd();
+            let root = workspace.root().to_path_buf();
+            let root_fd = workspace.root_fd();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| {
@@ -78,17 +138,39 @@ impl WorkspaceEditor {
                 .to_path_buf();
             let expected = expected.to_string();
             let replacement = replacement.to_string();
-            committed_permissions = tokio::task::spawn_blocking(move || {
-                descriptor_relative_replace(&root_fd, &relative, &unique, &expected, &replacement)
+            let resource = descriptor_resource_authority(
+                context,
+                resolved,
+                leveler_core::Capability::FilesystemWrite,
+            );
+            let target = resolved.to_path_buf();
+            let committed = tokio::task::spawn_blocking(move || {
+                descriptor_relative_replace(
+                    &root_fd,
+                    &relative,
+                    &unique,
+                    &expected,
+                    &replacement,
+                    resource
+                        .as_ref()
+                        .map(|resource| (target.as_path(), resource)),
+                )
             })
             .await
             .map_err(|e| ToolError::Io(format!("join descriptor write: {e}")))?
             .map_err(|e| ToolError::Io(format!("descriptor-relative replace: {e}")))?;
+            committed_permissions = committed.map(|(permissions, metadata)| {
+                receipt = leveler_execution::resource_identity::filesystem_resource_from_metadata(
+                    resolved, &metadata,
+                )
+                .ok();
+                permissions
+            });
         }
         #[cfg(windows)]
         {
-            let root = context.require_workspace()?.root().to_path_buf();
-            let root_dir = context.require_workspace()?.root_dir();
+            let root = workspace.root().to_path_buf();
+            let root_dir = workspace.root_dir();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| ToolError::Io("target left workspace".into()))?
@@ -164,7 +246,7 @@ impl WorkspaceEditor {
                     expected.as_bytes().to_vec(),
                     permissions,
                 );
-                Ok(Commit::Written)
+                Ok(Commit::Written(receipt))
             }
             None => Ok(Commit::Stale),
         }
@@ -194,6 +276,8 @@ impl WorkspaceEditor {
                 .await
                 .map_err(|e| ToolError::Io(format!("mkdir {}: {e}", parent.display())))?;
         }
+        let workspace =
+            editing_workspace(context, resolved, leveler_core::Capability::FilesystemWrite)?;
         let lock_path =
             leveler_project::layout::target_lock_path(&context.execution.environment, resolved);
         let lock = tokio::task::spawn_blocking({
@@ -204,17 +288,14 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-        if let Err(e) = context
-            .require_workspace()?
-            .revalidate_write_path(resolved, &context.write_scope())
-        {
+        if let Err(e) = workspace.revalidate_write_path(resolved, &context.write_scope()) {
             drop(lock);
             return Ok(Commit::Rejected(e.to_string()));
         }
         #[cfg(unix)]
-        let result: Result<bool, ToolError> = {
-            let root = context.require_workspace()?.root().to_path_buf();
-            let root_fd = context.require_workspace()?.root_fd();
+        let result: Result<(bool, Option<std::fs::Metadata>), ToolError> = {
+            let root = workspace.root().to_path_buf();
+            let root_fd = workspace.root_fd();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| {
@@ -226,15 +307,31 @@ impl WorkspaceEditor {
                 .to_path_buf();
             let temp_name = unique_temp_name(resolved);
             let content = content.to_string();
+            let resource = descriptor_resource_authority(
+                context,
+                resolved,
+                leveler_core::Capability::FilesystemWrite,
+            );
+            let target = resolved.to_path_buf();
             tokio::task::spawn_blocking(move || {
-                descriptor_relative_create(&root_fd, &relative, &temp_name, &content, permissions)
+                descriptor_relative_create(
+                    &root_fd,
+                    &relative,
+                    &temp_name,
+                    &content,
+                    permissions,
+                    resource
+                        .as_ref()
+                        .map(|resource| (target.as_path(), resource)),
+                )
             })
             .await
             .map_err(|e| ToolError::Io(format!("join descriptor create: {e}")))?
             .map_err(|e| ToolError::Io(format!("descriptor-relative create: {e}")))
+            .map(|metadata| (metadata.is_some(), metadata))
         };
         #[cfg(not(unix))]
-        let result: Result<bool, ToolError> = {
+        let result: Result<(bool, Option<std::fs::Metadata>), ToolError> = {
             let parent = resolved
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
@@ -272,14 +369,20 @@ impl WorkspaceEditor {
             };
             let result = write.await;
             let _ = tokio::fs::remove_file(&tmp).await;
-            result
+            result.map(|created| (created, None))
         };
         let outcome = match result {
-            Ok(true) => {
+            Ok((true, metadata)) => {
                 context.execution.checkpoint.record_absent(resolved);
-                Ok(Commit::Written)
+                let receipt = metadata.and_then(|metadata| {
+                    leveler_execution::resource_identity::filesystem_resource_from_metadata(
+                        resolved, &metadata,
+                    )
+                    .ok()
+                });
+                Ok(Commit::Written(receipt))
             }
-            Ok(false) => Ok(Commit::Stale),
+            Ok((false, _)) => Ok(Commit::Stale),
             Err(e) => Err(e),
         };
         drop(lock);
@@ -292,6 +395,11 @@ impl WorkspaceEditor {
         resolved: &std::path::Path,
         expected: &str,
     ) -> Result<Commit, ToolError> {
+        let workspace = editing_workspace(
+            context,
+            resolved,
+            leveler_core::Capability::FilesystemDelete,
+        )?;
         let lock_path =
             leveler_project::layout::target_lock_path(&context.execution.environment, resolved);
         let lock = tokio::task::spawn_blocking({
@@ -302,17 +410,14 @@ impl WorkspaceEditor {
         .map_err(|e| ToolError::Io(format!("join file-lock task: {e}")))?
         .map_err(|e| ToolError::Io(format!("lock {}: {e}", lock_path.display())))?;
 
-        if let Err(e) = context
-            .require_workspace()?
-            .revalidate_write_path(resolved, &context.write_scope())
-        {
+        if let Err(e) = workspace.revalidate_delete_path(resolved, &context.write_scope()) {
             drop(lock);
             return Ok(Commit::Rejected(e.to_string()));
         }
         #[cfg(unix)]
         {
-            let root = context.require_workspace()?.root().to_path_buf();
-            let root_fd = context.require_workspace()?.root_fd();
+            let root = workspace.root().to_path_buf();
+            let root_fd = workspace.root_fd();
             let relative = resolved
                 .strip_prefix(&root)
                 .map_err(|_| {
@@ -323,13 +428,28 @@ impl WorkspaceEditor {
                 })?
                 .to_path_buf();
             let expected_owned = expected.to_string();
+            let resource = descriptor_resource_authority(
+                context,
+                resolved,
+                leveler_core::Capability::FilesystemDelete,
+            );
+            let target = resolved.to_path_buf();
+            let temp_name = unique_temp_name(resolved);
             let permissions = tokio::task::spawn_blocking(move || {
-                descriptor_relative_remove(&root_fd, &relative, &expected_owned)
+                descriptor_relative_remove(
+                    &root_fd,
+                    &relative,
+                    &temp_name,
+                    &expected_owned,
+                    resource
+                        .as_ref()
+                        .map(|resource| (target.as_path(), resource)),
+                )
             })
             .await
             .map_err(|e| ToolError::Io(format!("join descriptor remove: {e}")))?
             .map_err(|e| ToolError::Io(format!("descriptor-relative remove: {e}")))?;
-            let Some(permissions) = permissions else {
+            let Some((permissions, parent_metadata)) = permissions else {
                 drop(lock);
                 return Ok(Commit::Stale);
             };
@@ -339,7 +459,12 @@ impl WorkspaceEditor {
                 permissions,
             );
             drop(lock);
-            Ok(Commit::Written)
+            let receipt = leveler_execution::resource_identity::filesystem_resource_from_metadata(
+                resolved,
+                &parent_metadata,
+            )
+            .ok();
+            Ok(Commit::Written(receipt))
         }
         #[cfg(not(unix))]
         {
@@ -371,7 +496,7 @@ impl WorkspaceEditor {
                 permissions,
             );
             drop(lock);
-            Ok(Commit::Written)
+            Ok(Commit::Written(None))
         }
     }
 }
@@ -496,14 +621,81 @@ fn windows_std_permissions_matching(readonly: bool) -> std::io::Result<std::fs::
 /// each parent descriptor makes later ancestor renames/symlink swaps irrelevant
 /// to the final read/create/rename operations.
 #[cfg(unix)]
+fn validate_descriptor_resource(
+    metadata: &std::fs::Metadata,
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+) -> std::io::Result<()> {
+    if let Some((path, frozen)) = authorization {
+        let actual = leveler_execution::filesystem_resource_from_metadata(path, metadata)
+            .map_err(std::io::Error::other)?;
+        if &actual != frozen {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "descriptor object does not match frozen resource authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A filesystem object's incarnation key within one process. Used to compare
+/// the object an exchange actually displaced against the object the caller
+/// verified, without re-resolving the mutable directory entry.
+#[cfg(unix)]
+fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+/// Identity of whatever the given name currently resolves to, never following
+/// a final symlink. `None` when the object cannot be opened read-only (for
+/// example a substituted symlink or a directory we must not read).
+#[cfg(unix)]
+fn current_identity<P: rustix::path::Arg>(
+    directory: &impl std::os::fd::AsFd,
+    name: P,
+) -> Option<(u64, u64)> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let fd = openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let metadata = std::fs::File::from(fd).metadata().ok()?;
+    Some(metadata_identity(&metadata))
+}
+
+/// Test-only rendezvous at the exact window an external process would use to
+/// swap the directory entry between the identity check and the commit. Only
+/// the object-binding race tests arm it, and `take()` makes it single-shot.
+#[cfg(all(test, unix))]
+static COMMIT_BARRIER: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(unix)]
+fn run_commit_barrier() {
+    #[cfg(test)]
+    if let Ok(mut slot) = COMMIT_BARRIER.lock()
+        && let Some(run) = slot.take()
+    {
+        run();
+    }
+}
+
+#[cfg(unix)]
 fn descriptor_relative_replace(
     root: &impl std::os::fd::AsFd,
     relative: &std::path::Path,
     temp_name: &str,
     expected: &str,
     replacement: &str,
-) -> std::io::Result<Option<std::fs::Permissions>> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+) -> std::io::Result<Option<(std::fs::Permissions, std::fs::Metadata)>> {
+    use rustix::fs::{
+        AtFlags, Mode, OFlags, RenameFlags, openat, renameat, renameat_with, unlinkat,
+    };
     use std::io::{Read, Write};
 
     let (directory, file_name) = open_relative_parent(root, relative, false)?;
@@ -514,12 +706,15 @@ fn descriptor_relative_replace(
         Mode::empty(),
     )?;
     let mut target = std::fs::File::from(target_fd);
-    let target_permissions = target.metadata()?.permissions();
+    let target_metadata = target.metadata()?;
+    validate_descriptor_resource(&target_metadata, authorization)?;
+    let target_permissions = target_metadata.permissions();
     let mut current = String::new();
     target.read_to_string(&mut current)?;
     if current != expected {
         return Ok(None);
     }
+    let approved_identity = metadata_identity(&target_metadata);
 
     let temp_fd = openat(
         &directory,
@@ -536,12 +731,55 @@ fn descriptor_relative_replace(
         let _ = unlinkat(&directory, temp_name, AtFlags::empty());
         return Err(error);
     }
-    drop(temp);
-    if let Err(error) = renameat(&directory, temp_name, &directory, &file_name) {
-        let _ = unlinkat(&directory, temp_name, AtFlags::empty());
-        return Err(error.into());
+    let receipt_metadata = temp.metadata()?;
+    let staged_identity = metadata_identity(&receipt_metadata);
+
+    if authorization.is_none() {
+        // Ordinary cooperative CAS commit: verify-then-rename under the
+        // advisory target lock, with no resource binding to preserve.
+        if let Err(error) = renameat(&directory, temp_name, &directory, &file_name) {
+            let _ = unlinkat(&directory, temp_name, AtFlags::empty());
+            return Err(error.into());
+        }
+        return Ok(Some((target_permissions, receipt_metadata)));
     }
-    Ok(Some(target_permissions))
+
+    // Object-bound commit. ONE atomic exchange both publishes the staged
+    // content and detaches the previous entry, and the decision is then made
+    // from the object that was actually displaced. No name is re-resolved
+    // between proving identity and causing the effect, so a substitution can
+    // only be observed, never silently committed.
+    run_commit_barrier();
+    renameat_with(
+        &directory,
+        temp_name,
+        &directory,
+        &file_name,
+        RenameFlags::EXCHANGE,
+    )?;
+    if current_identity(&directory, temp_name) == Some(approved_identity) {
+        // The approved object left the name; unlinking it is exactly the
+        // authorized effect.
+        unlinkat(&directory, temp_name, AtFlags::empty())?;
+        return Ok(Some((target_permissions, receipt_metadata)));
+    }
+    // The entry no longer named the approved object. Restore it and remove
+    // only our own staged content; an object we did not stage and verify is
+    // never unlinked.
+    let _ = renameat_with(
+        &directory,
+        temp_name,
+        &directory,
+        &file_name,
+        RenameFlags::EXCHANGE,
+    );
+    if current_identity(&directory, temp_name) == Some(staged_identity) {
+        let _ = unlinkat(&directory, temp_name, AtFlags::empty());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "directory entry changed during commit; resource binding refused",
+    ))
 }
 
 #[cfg(unix)]
@@ -551,11 +789,15 @@ fn descriptor_relative_create(
     temp_name: &str,
     content: &str,
     permissions: Option<std::fs::Permissions>,
-) -> std::io::Result<bool> {
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+) -> std::io::Result<Option<std::fs::Metadata>> {
     use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
     use std::io::Write;
 
-    let (directory, file_name) = open_relative_parent(root, relative, true)?;
+    // Resource grants cannot invent authority for new parent directories.
+    let (directory, file_name) = open_relative_parent(root, relative, authorization.is_none())?;
+    let parent_metadata = std::fs::File::from(rustix::io::dup(&directory)?).metadata()?;
+    validate_descriptor_resource(&parent_metadata, authorization)?;
     let temp_fd = openat(
         &directory,
         temp_name,
@@ -573,7 +815,7 @@ fn descriptor_relative_create(
         let _ = unlinkat(&directory, temp_name, AtFlags::empty());
         return Err(error);
     }
-    drop(temp);
+    let receipt_metadata = temp.metadata()?;
     let linked = match linkat(
         &directory,
         temp_name,
@@ -589,16 +831,20 @@ fn descriptor_relative_create(
         }
     };
     let _ = unlinkat(&directory, temp_name, AtFlags::empty());
-    Ok(linked)
+    Ok(linked.then_some(receipt_metadata))
 }
 
 #[cfg(unix)]
 fn descriptor_relative_remove(
     root: &impl std::os::fd::AsFd,
     relative: &std::path::Path,
+    temp_name: &str,
     expected: &str,
-) -> std::io::Result<Option<std::fs::Permissions>> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
+    authorization: Option<(&std::path::Path, &leveler_core::ResourceIdentity)>,
+) -> std::io::Result<Option<(std::fs::Permissions, std::fs::Metadata)>> {
+    use rustix::fs::{
+        AtFlags, Mode, OFlags, RenameFlags, openat, renameat, renameat_with, unlinkat,
+    };
     use std::io::Read;
 
     let (directory, file_name) = open_relative_parent(root, relative, false)?;
@@ -613,14 +859,44 @@ fn descriptor_relative_remove(
         Err(error) => return Err(error.into()),
     };
     let mut target = std::fs::File::from(target_fd);
-    let permissions = target.metadata()?.permissions();
+    let target_metadata = target.metadata()?;
+    validate_descriptor_resource(&target_metadata, authorization)?;
+    let permissions = target_metadata.permissions();
     let mut current = String::new();
     target.read_to_string(&mut current)?;
     if current != expected {
         return Ok(None);
     }
-    unlinkat(&directory, &file_name, AtFlags::empty())?;
-    Ok(Some(permissions))
+    let parent_metadata = std::fs::File::from(rustix::io::dup(&directory)?).metadata()?;
+
+    if authorization.is_none() {
+        unlinkat(&directory, &file_name, AtFlags::empty())?;
+        return Ok(Some((permissions, parent_metadata)));
+    }
+
+    // Object-bound delete: ONE atomic rename detaches the entry, and the
+    // decision is made from the object that was actually detached. An entry
+    // substituted after verification is restored, never unlinked.
+    let approved_identity = metadata_identity(&target_metadata);
+    run_commit_barrier();
+    renameat(&directory, &file_name, &directory, temp_name)?;
+    if current_identity(&directory, temp_name) == Some(approved_identity) {
+        unlinkat(&directory, temp_name, AtFlags::empty())?;
+        return Ok(Some((permissions, parent_metadata)));
+    }
+    // Never clobber whatever now owns the approved name; if it reappeared the
+    // detached object stays at the private name rather than being destroyed.
+    let _ = renameat_with(
+        &directory,
+        temp_name,
+        &directory,
+        &file_name,
+        RenameFlags::NOREPLACE,
+    );
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "directory entry changed during commit; resource binding refused",
+    ))
 }
 
 #[cfg(unix)]
@@ -807,6 +1083,274 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn descriptor_resource_check_rejects_swap_after_path_revalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let target = parent.join("victim");
+        std::fs::write(&target, "same-content").unwrap();
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let workspace = leveler_execution::Workspace::new(&parent).unwrap();
+        // Deterministically model the gap before spawn_blocking opens the target.
+        let granted = workspace
+            .clone()
+            .with_resource_bindings(vec![leveler_core::GrantBinding {
+                capability: leveler_core::Capability::FilesystemWrite,
+                resource: frozen.clone(),
+            }]);
+        granted
+            .revalidate_write_path(&target, &leveler_execution::WriteScope::None)
+            .unwrap();
+        std::fs::rename(&target, parent.join("old-object")).unwrap();
+        std::fs::write(&target, "same-content").unwrap();
+        let replaced = descriptor_relative_replace(
+            &workspace.root_fd(),
+            std::path::Path::new("victim"),
+            ".temp-replace",
+            "same-content",
+            "bad",
+            Some((&target, &frozen)),
+        );
+        assert!(replaced.is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "same-content");
+        let removed = descriptor_relative_remove(
+            &workspace.root_fd(),
+            std::path::Path::new("victim"),
+            ".temp-delete",
+            "same-content",
+            Some((&target, &frozen)),
+        );
+        assert!(removed.is_err());
+        assert!(target.exists());
+        let missing = parent.join("child/new");
+        std::fs::create_dir(parent.join("child")).unwrap();
+        let frozen_missing = leveler_execution::resolve_filesystem_resource(&missing).unwrap();
+        std::fs::rename(parent.join("child"), parent.join("old-parent")).unwrap();
+        std::fs::create_dir(parent.join("child")).unwrap();
+        let created = descriptor_relative_create(
+            &workspace.root_fd(),
+            std::path::Path::new("child/new"),
+            ".temp-create",
+            "bad",
+            None,
+            Some((&missing, &frozen_missing)),
+        );
+        assert!(created.is_err());
+        assert!(!missing.exists());
+    }
+
+    /// Phase 3B Case A: a substitute swapped into the entry *after* the
+    /// identity check must not be modified, and the commit must fail closed.
+    /// The rendezvous runs at the real window a hostile process would use.
+    #[cfg(unix)]
+    #[test]
+    fn granted_replace_refuses_a_substitute_swapped_after_verification() {
+        let _serial = OBJECT_BINDING_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let target = parent.join("config.json");
+        std::fs::write(&target, "approved\n").unwrap();
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let workspace = leveler_execution::Workspace::new(&parent).unwrap();
+        let substitute = parent.join("substitute");
+        std::fs::write(&substitute, "substitute\n").unwrap();
+        let ran = arm_swap_substitute(substitute, target.clone());
+
+        let result = descriptor_relative_replace(
+            &workspace.root_fd(),
+            std::path::Path::new("config.json"),
+            ".config.json.tmp",
+            "approved\n",
+            "replacement\n",
+            Some((&target, &frozen)),
+        );
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "race window not exercised"
+        );
+        assert!(result.is_err(), "a substituted entry must be refused");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "substitute\n");
+        assert!(
+            !parent.join(".config.json.tmp").exists(),
+            "staged content must be cleaned up"
+        );
+    }
+
+    /// Phase 3B Case B: a substitute swapped into the entry *after* the
+    /// identity check must not be deleted.
+    #[cfg(unix)]
+    #[test]
+    fn granted_delete_refuses_a_substitute_swapped_after_verification() {
+        let _serial = OBJECT_BINDING_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let target = parent.join("config.json");
+        std::fs::write(&target, "approved\n").unwrap();
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let workspace = leveler_execution::Workspace::new(&parent).unwrap();
+        let substitute = parent.join("substitute");
+        std::fs::write(&substitute, "substitute\n").unwrap();
+        let ran = arm_swap_substitute(substitute, target.clone());
+
+        let result = descriptor_relative_remove(
+            &workspace.root_fd(),
+            std::path::Path::new("config.json"),
+            ".config.json.del",
+            "approved\n",
+            Some((&target, &frozen)),
+        );
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "race window not exercised"
+        );
+        assert!(result.is_err(), "a substituted entry must not be deleted");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "substitute\n");
+        assert!(!parent.join(".config.json.del").exists());
+    }
+
+    /// The unracy path still publishes atomically, verifies content, and leaves
+    /// no staged name behind.
+    #[cfg(unix)]
+    #[test]
+    fn granted_replace_and_delete_commit_on_the_verified_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let target = parent.join("config.json");
+        std::fs::write(&target, "approved\n").unwrap();
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let workspace = leveler_execution::Workspace::new(&parent).unwrap();
+
+        let replaced = descriptor_relative_replace(
+            &workspace.root_fd(),
+            std::path::Path::new("config.json"),
+            ".config.json.tmp",
+            "approved\n",
+            "replacement\n",
+            Some((&target, &frozen)),
+        );
+        assert!(replaced.unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "replacement\n");
+        assert!(!parent.join(".config.json.tmp").exists());
+
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let removed = descriptor_relative_remove(
+            &workspace.root_fd(),
+            std::path::Path::new("config.json"),
+            ".config.json.del",
+            "replacement\n",
+            Some((&target, &frozen)),
+        );
+        assert!(removed.unwrap().is_some());
+        assert!(!target.exists());
+        assert!(!parent.join(".config.json.del").exists());
+    }
+
+    /// Phase 3B Case C: a symlink substituted for the approved file must not
+    /// redirect the commit outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn granted_replace_refuses_a_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let target = parent.join("config.json");
+        std::fs::write(&target, "approved\n").unwrap();
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let workspace = leveler_execution::Workspace::new(&parent).unwrap();
+        let outside = parent.join("outside.txt");
+        std::fs::write(&outside, "outside\n").unwrap();
+        std::fs::remove_file(&target).unwrap();
+        symlink(&outside, &target).unwrap();
+
+        let result = descriptor_relative_replace(
+            &workspace.root_fd(),
+            std::path::Path::new("config.json"),
+            ".config.json.tmp",
+            "approved\n",
+            "replacement\n",
+            Some((&target, &frozen)),
+        );
+        assert!(
+            result.is_err(),
+            "NOFOLLOW must refuse the substituted symlink"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
+        assert!(!parent.join(".config.json.tmp").exists());
+    }
+
+    /// Phase 3B Case D: a parent directory renamed away and recreated with a
+    /// substitute must not receive the commit. The pinned parent descriptor
+    /// keeps the effect on the directory (and object) that was verified.
+    #[cfg(unix)]
+    #[test]
+    fn granted_replace_binds_the_pinned_parent_when_the_path_is_swapped() {
+        let _serial = OBJECT_BINDING_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap().join("src");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("config.json");
+        std::fs::write(&target, "approved\n").unwrap();
+        let frozen = leveler_execution::resolve_filesystem_resource(&target).unwrap();
+        let workspace = leveler_execution::Workspace::new(&parent).unwrap();
+        let moved_parent = parent.with_file_name("src-old");
+        let renamed_to = moved_parent.clone();
+        let pinned_parent = parent.clone();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        *COMMIT_BARRIER.lock().unwrap() = Some(Box::new(move || {
+            std::fs::rename(&pinned_parent, &renamed_to).unwrap();
+            std::fs::create_dir(&pinned_parent).unwrap();
+            std::fs::write(pinned_parent.join("config.json"), "substitute\n").unwrap();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let result = descriptor_relative_replace(
+            &workspace.root_fd(),
+            std::path::Path::new("config.json"),
+            ".config.json.tmp",
+            "approved\n",
+            "replacement\n",
+            Some((&target, &frozen)),
+        );
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "race window not exercised"
+        );
+        assert!(
+            result.is_ok(),
+            "the verified object's own directory is still authoritative"
+        );
+        assert_eq!(
+            std::fs::read_to_string(moved_parent.join("config.json")).unwrap(),
+            "replacement\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent.join("config.json")).unwrap(),
+            "substitute\n"
+        );
+    }
+
+    /// The object-binding barrier tests share one process-wide rendezvous.
+    #[cfg(unix)]
+    static OBJECT_BINDING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Arm the commit rendezvous to move `substitute` over `target`, the exact
+    /// substitution a hostile process would attempt.
+    #[cfg(unix)]
+    fn arm_swap_substitute(
+        substitute: std::path::PathBuf,
+        target: std::path::PathBuf,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        *COMMIT_BARRIER.lock().unwrap() = Some(Box::new(move || {
+            std::fs::rename(&substitute, &target).unwrap();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        ran
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn descriptor_commit_refuses_symlinked_parent_and_never_touches_outside() {
         use std::os::unix::fs::symlink;
         let root = std::env::temp_dir().join(format!(
@@ -830,6 +1374,7 @@ mod tests {
             ".victim.tmp",
             "outside",
             "compromised",
+            None,
         );
         assert!(
             result.is_err(),

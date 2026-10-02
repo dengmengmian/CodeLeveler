@@ -100,15 +100,18 @@ enum Applied {
         path: PathBuf,
         before: String,
         after: String,
+        receipt: Option<leveler_core::ResourceIdentity>,
     },
     Created {
         path: PathBuf,
         content: String,
+        receipt: Option<leveler_core::ResourceIdentity>,
     },
     Removed {
         path: PathBuf,
         content: String,
         permissions: std::fs::Permissions,
+        receipt: Option<leveler_core::ResourceIdentity>,
     },
 }
 
@@ -126,10 +129,11 @@ async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailu
         } => match crate::workspace::WorkspaceEditor::replace(context, &path, &expected, &content)
             .await
         {
-            Ok(crate::workspace::Commit::Written) => Ok(Applied::Replaced {
+            Ok(crate::workspace::Commit::Written(receipt)) => Ok(Applied::Replaced {
                 path,
                 before: expected,
                 after: content,
+                receipt,
             }),
             Ok(crate::workspace::Commit::Stale) => Err(CommitFailure::Model(format!(
                 "{} changed on disk between planning and writing this patch — another process or \
@@ -141,7 +145,11 @@ async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailu
         },
         Op::Create { path, content } => {
             match crate::workspace::WorkspaceEditor::create(context, &path, &content).await {
-                Ok(crate::workspace::Commit::Written) => Ok(Applied::Created { path, content }),
+                Ok(crate::workspace::Commit::Written(receipt)) => Ok(Applied::Created {
+                    path,
+                    content,
+                    receipt,
+                }),
                 Ok(crate::workspace::Commit::Stale) => Err(CommitFailure::Model(format!(
                     "{} was created by another writer while this patch was being committed",
                     path.display()
@@ -157,10 +165,11 @@ async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailu
             expected,
             permissions,
         } => match crate::workspace::WorkspaceEditor::remove(context, &path, &expected).await {
-            Ok(crate::workspace::Commit::Written) => Ok(Applied::Removed {
+            Ok(crate::workspace::Commit::Written(receipt)) => Ok(Applied::Removed {
                 path,
                 content: expected,
                 permissions,
+                receipt,
             }),
             Ok(crate::workspace::Commit::Stale) => Err(CommitFailure::Model(format!(
                 "{} changed on disk between planning and deleting it — another process or \
@@ -175,16 +184,66 @@ async fn commit_op(context: &ToolContext, op: Op) -> Result<Applied, CommitFailu
 
 async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<(), ToolError> {
     for operation in applied.iter().rev() {
+        let (target, receipt) = match operation {
+            Applied::Replaced { path, receipt, .. }
+            | Applied::Created { path, receipt, .. }
+            | Applied::Removed { path, receipt, .. } => (path, receipt),
+        };
+        let rollback_context;
+        let context = if let Some(request) = context.policy.resource_grant() {
+            let receipt = receipt.as_ref().ok_or_else(|| {
+                ToolError::Io("resource rollback has no descriptor mutation receipt".into())
+            })?;
+            let current =
+                leveler_execution::resolve_filesystem_resource(target).map_err(ToolError::Io)?;
+            if &current != receipt {
+                return Err(ToolError::Io(
+                    "rollback refused: target no longer matches this call's mutation receipt"
+                        .into(),
+                ));
+            }
+            use leveler_core::{Capability, GrantBinding, GrantRequest, GrantScope};
+            let bindings = [
+                Capability::FilesystemRead,
+                Capability::FilesystemWrite,
+                Capability::FilesystemDelete,
+                Capability::CredentialRawRead,
+                Capability::CredentialRawWrite,
+            ]
+            .into_iter()
+            .map(|capability| GrantBinding {
+                capability,
+                resource: receipt.clone(),
+            })
+            .collect();
+            rollback_context = context.clone().with_resolved_policy(
+                leveler_execution::ResolvedExecutionPolicy::new(
+                    context.write_scope(),
+                    context.policy.network_scope(),
+                    leveler_execution::AuthorizationEvidence::ResourceGrant {
+                        request: GrantRequest {
+                            project_identity: request.project_identity.clone(),
+                            bindings,
+                        },
+                        scope: GrantScope::Once,
+                    },
+                ),
+            );
+            &rollback_context
+        } else {
+            context
+        };
         let (path, outcome) = match operation {
             Applied::Replaced {
                 path,
                 before,
                 after,
+                ..
             } => (
                 path,
                 crate::workspace::WorkspaceEditor::replace(context, path, after, before).await?,
             ),
-            Applied::Created { path, content } => (
+            Applied::Created { path, content, .. } => (
                 path,
                 crate::workspace::WorkspaceEditor::remove(context, path, content).await?,
             ),
@@ -192,6 +251,7 @@ async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<
                 path,
                 content,
                 permissions,
+                ..
             } => (
                 path,
                 crate::workspace::WorkspaceEditor::create_with_permissions(
@@ -204,7 +264,7 @@ async fn rollback_applied(context: &ToolContext, applied: &[Applied]) -> Result<
             ),
         };
         match outcome {
-            crate::workspace::Commit::Written => {}
+            crate::workspace::Commit::Written(_) => {}
             crate::workspace::Commit::Stale => {
                 return Err(ToolError::Io(format!(
                     "rollback refused to overwrite a concurrent change at {}",
@@ -246,6 +306,74 @@ impl Tool for ApplyPatchTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        if context.policy.unrestricted_execution() {
+            return None;
+        }
+        let patch = input.get("patch")?.as_str()?;
+        let changes = parse_patch(patch).ok()?;
+        for change in changes {
+            let (path, destination) = match change {
+                FileChange::Add { path, .. } | FileChange::Delete { path } => (path, None),
+                FileChange::Update { path, move_to, .. } => (path, move_to),
+            };
+            if let Some(reason) = crate::workspace::path_approval_reason(context, &path, true) {
+                return Some(reason);
+            }
+            if let Some(destination) = destination
+                && let Some(reason) =
+                    crate::workspace::path_approval_reason(context, &destination, true)
+            {
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    async fn grant_bindings(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<Option<Vec<leveler_core::GrantBinding>>, String> {
+        use leveler_core::Capability::{FilesystemDelete, FilesystemRead, FilesystemWrite};
+        let Some(patch) = input.get("patch").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Ok(changes) = parse_patch(patch) else {
+            return Ok(None);
+        };
+        let mut bindings = Vec::new();
+        for change in changes {
+            let effects = match change {
+                FileChange::Add { path, .. } => vec![(path, vec![FilesystemWrite])],
+                FileChange::Delete { path } => vec![(path, vec![FilesystemRead, FilesystemDelete])],
+                FileChange::Update {
+                    path,
+                    move_to: None,
+                    ..
+                } => vec![(path, vec![FilesystemRead, FilesystemWrite])],
+                FileChange::Update {
+                    path,
+                    move_to: Some(destination),
+                    ..
+                } => vec![
+                    (path, vec![FilesystemRead, FilesystemDelete]),
+                    (destination, vec![FilesystemWrite]),
+                ],
+            };
+            for (path, capabilities) in effects {
+                for binding in
+                    crate::workspace::filesystem_grant_bindings(context, &path, &capabilities)?
+                {
+                    if !bindings.contains(&binding) {
+                        bindings.push(binding);
+                    }
+                }
+            }
+        }
+        Ok((!bindings.is_empty()).then_some(bindings))
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -268,14 +396,21 @@ impl Tool for ApplyPatchTool {
                 | FileChange::Delete { path }
                 | FileChange::Update { path, .. } => path.as_str(),
             };
-            if let Some(denied) = context.policy.write_path_denied(path) {
+            let capability = match change {
+                FileChange::Delete { .. }
+                | FileChange::Update {
+                    move_to: Some(_), ..
+                } => leveler_core::Capability::FilesystemDelete,
+                _ => leveler_core::Capability::FilesystemWrite,
+            };
+            if let Some(denied) = context.mutation_path_denied(path, capability) {
                 return Ok(ToolOutput::error(denied));
             }
             if let FileChange::Update {
                 move_to: Some(dest),
                 ..
             } = change
-                && let Some(denied) = context.policy.write_path_denied(dest)
+                && let Some(denied) = context.write_path_denied(dest)
             {
                 return Ok(ToolOutput::error(denied));
             }
@@ -296,7 +431,7 @@ impl Tool for ApplyPatchTool {
             match change {
                 FileChange::Add { path, content } => {
                     let resolved = match context
-                        .require_workspace()?
+                        .execution_workspace()?
                         .resolve_for_write(&path, &scope)
                     {
                         Ok(p) => p,
@@ -323,8 +458,8 @@ impl Tool for ApplyPatchTool {
                 }
                 FileChange::Delete { path } => {
                     let resolved = match context
-                        .require_workspace()?
-                        .resolve_for_write(&path, &scope)
+                        .execution_workspace()?
+                        .resolve_for_delete(&path, &scope)
                     {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
@@ -358,10 +493,13 @@ impl Tool for ApplyPatchTool {
                     move_to,
                     chunks,
                 } => {
-                    let resolved = match context
-                        .require_workspace()?
-                        .resolve_for_write(&path, &scope)
-                    {
+                    let workspace = context.execution_workspace()?;
+                    let resolution = if move_to.is_some() {
+                        workspace.resolve_for_delete(&path, &scope)
+                    } else {
+                        workspace.resolve_for_write(&path, &scope)
+                    };
+                    let resolved = match resolution {
                         Ok(p) => p,
                         Err(e) => return Ok(ToolOutput::error(e.to_string())),
                     };
@@ -408,7 +546,7 @@ impl Tool for ApplyPatchTool {
                     match move_to {
                         Some(dest) => {
                             let dest_resolved = match context
-                                .require_workspace()?
+                                .execution_workspace()?
                                 .resolve_for_write(&dest, &scope)
                             {
                                 Ok(p) => p,
@@ -457,7 +595,7 @@ impl Tool for ApplyPatchTool {
 
         // Enforce the caller's per-step file cap (spec §17). Unlimited by
         // default; a caller that wants small, reviewable edits sets a budget.
-        if context.policy.max_files_per_step > 0 {
+        if !context.policy.unrestricted_execution() && context.policy.max_files_per_step > 0 {
             let distinct: std::collections::BTreeSet<&String> = modified.iter().collect();
             if distinct.len() > context.policy.max_files_per_step {
                 return Ok(ToolOutput::error(format!(
@@ -525,7 +663,7 @@ impl Tool for ApplyPatchTool {
         // like an outside change to its next patch. A path we can no longer read
         // was deleted here; forget it so a recreated file starts clean.
         for rel in &modified {
-            match context.require_workspace()?.resolve_for_read(rel) {
+            match context.execution_workspace()?.resolve_for_read(rel) {
                 Ok(resolved) => match tokio::fs::read(&resolved).await {
                     Ok(bytes) => context.execution.file_state.record(rel, &bytes),
                     Err(_) => context.execution.file_state.forget(rel),
@@ -576,6 +714,211 @@ mod tests {
 
     /// PB_B_ORCH_1: a child with zero claimed paths reached apply_patch and
     /// created files. The tool itself must refuse, not only the drive loop.
+    #[tokio::test]
+    async fn resource_patch_failure_restores_own_commit_but_preserves_third_party_replacement() {
+        use leveler_core::{Capability, GrantBinding, GrantRequest, GrantScope};
+        use leveler_execution::{
+            AuthorizationEvidence, NetworkScope, PermissionProfile, ResolvedExecutionPolicy,
+            WriteScope,
+        };
+        let (context, _root) = super::super::test_ctx(PermissionProfile::Assisted, &[]);
+        let external = tempfile::tempdir().unwrap();
+        let first = external.path().join("first");
+        let second = external.path().join("second");
+        std::fs::write(&first, "before").unwrap();
+        std::fs::write(&second, "second-before").unwrap();
+        let first = first.canonicalize().unwrap();
+        let second = second.canonicalize().unwrap();
+        let freeze = || {
+            context
+                .clone()
+                .with_resolved_policy(ResolvedExecutionPolicy::new(
+                    WriteScope::None,
+                    NetworkScope::None,
+                    AuthorizationEvidence::ResourceGrant {
+                        request: GrantRequest {
+                            project_identity: "p".into(),
+                            bindings: [&first, &second]
+                                .into_iter()
+                                .map(|path| GrantBinding {
+                                    capability: Capability::FilesystemWrite,
+                                    resource: leveler_execution::resolve_filesystem_resource(path)
+                                        .unwrap(),
+                                })
+                                .collect(),
+                        },
+                        scope: GrantScope::Session,
+                    },
+                ))
+        };
+        // Create and remove receipts bind the exact resulting file or absence.
+        let created = first.parent().unwrap().join("created");
+        let freeze_one = |path: &std::path::Path, capability| {
+            context
+                .clone()
+                .with_resolved_policy(ResolvedExecutionPolicy::new(
+                    WriteScope::None,
+                    NetworkScope::None,
+                    AuthorizationEvidence::ResourceGrant {
+                        request: GrantRequest {
+                            project_identity: "p".into(),
+                            bindings: vec![GrantBinding {
+                                capability,
+                                resource: leveler_execution::resolve_filesystem_resource(path)
+                                    .unwrap(),
+                            }],
+                        },
+                        scope: GrantScope::Session,
+                    },
+                ))
+        };
+        let create_context = freeze_one(&created, Capability::FilesystemWrite);
+        let result = commit_op(
+            &create_context,
+            Op::Create {
+                path: created.clone(),
+                content: "own-create".into(),
+            },
+        )
+        .await
+        .ok()
+        .unwrap();
+        rollback_applied(&create_context, &[result]).await.unwrap();
+        assert!(!created.exists());
+        let remove_context = freeze_one(&first, Capability::FilesystemDelete);
+        let permissions = std::fs::metadata(&first).unwrap().permissions();
+        let result = commit_op(
+            &remove_context,
+            Op::Remove {
+                path: first.clone(),
+                expected: "before".into(),
+                permissions,
+            },
+        )
+        .await
+        .ok()
+        .unwrap();
+        rollback_applied(&remove_context, &[result]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "before");
+        let approved = freeze();
+        let applied = commit_op(
+            &approved,
+            Op::Replace {
+                path: first.clone(),
+                expected: "before".into(),
+                content: "after".into(),
+            },
+        )
+        .await
+        .ok()
+        .unwrap();
+        std::fs::write(&second, "competing-content").unwrap();
+        assert!(
+            commit_op(
+                &approved,
+                Op::Replace {
+                    path: second.clone(),
+                    expected: "second-before".into(),
+                    content: "changed".into()
+                }
+            )
+            .await
+            .is_err()
+        );
+        rollback_applied(&approved, &[applied]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "before");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "competing-content"
+        );
+        let approved = freeze();
+        let applied = commit_op(
+            &approved,
+            Op::Replace {
+                path: first.clone(),
+                expected: "before".into(),
+                content: "after".into(),
+            },
+        )
+        .await
+        .ok()
+        .unwrap();
+        std::fs::rename(&first, external.path().join("owned-result")).unwrap();
+        // Identical contents do not prove that this is still our object.
+        std::fs::write(&first, "after").unwrap();
+        assert!(rollback_applied(&approved, &[applied]).await.is_err());
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "after");
+        assert_eq!(
+            std::fs::read_to_string(external.path().join("owned-result")).unwrap(),
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_patch_delete_does_not_reuse_write_only_consent() {
+        use leveler_core::{Capability, GrantRequest, GrantScope};
+        use leveler_execution::{
+            AuthorizationEvidence, NetworkScope, PermissionProfile, ResolvedExecutionPolicy,
+            WriteScope,
+        };
+        let (context, _root) = super::super::test_ctx(PermissionProfile::Assisted, &[]);
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("delete.txt");
+        let neighbor = external.path().join("neighbor.txt");
+        std::fs::write(&target, "original").unwrap();
+        std::fs::write(&neighbor, "keep").unwrap();
+        let input = serde_json::json!({"patch":format!("*** Begin Patch\n*** Delete File: {}\n*** End Patch", target.display())});
+        let bindings = ApplyPatchTool
+            .grant_bindings(&input, &context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.capability == Capability::FilesystemDelete)
+        );
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| binding.capability == Capability::FilesystemWrite)
+        );
+        let mut write_only = bindings.clone();
+        for binding in &mut write_only {
+            if binding.capability == Capability::FilesystemDelete {
+                binding.capability = Capability::FilesystemWrite;
+            }
+        }
+        let freeze = |bindings| {
+            context
+                .clone()
+                .with_resolved_policy(ResolvedExecutionPolicy::new(
+                    WriteScope::None,
+                    NetworkScope::None,
+                    AuthorizationEvidence::ResourceGrant {
+                        request: GrantRequest {
+                            project_identity: "p".into(),
+                            bindings,
+                        },
+                        scope: GrantScope::Session,
+                    },
+                ))
+        };
+        let denied = ApplyPatchTool
+            .execute(input.clone(), freeze(write_only), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(denied.is_error);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        let deleted = ApplyPatchTool
+            .execute(input, freeze(bindings), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!deleted.is_error, "{}", deleted.content);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_to_string(neighbor).unwrap(), "keep");
+    }
+
     #[tokio::test]
     async fn empty_write_allowlist_refuses_the_patch_before_any_write() {
         let (context, dir) = ctx();

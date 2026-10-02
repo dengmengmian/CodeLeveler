@@ -444,7 +444,8 @@ async fn explorer_role_cannot_modify_files() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run(
             "explore read-only",
@@ -511,7 +512,8 @@ async fn worker_ownership_rejects_out_of_scope_edit() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run(
             "delegate to a worker",
@@ -4652,7 +4654,8 @@ async fn a_running_workers_scope_fences_the_parent_and_new_workers() {
         tool_context,
         ModelRef::new("mock", "m"),
         12,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     let mut events = Vec::new();
     executor
         .run(
@@ -4680,8 +4683,8 @@ async fn a_running_workers_scope_fences_the_parent_and_new_workers() {
     };
     let parent_edit = refusal("e1");
     assert!(
-        parent_edit.contains("exclusive scope") && parent_edit.contains("still-running"),
-        "parent edit inside an active child scope must be refused: {parent_edit}"
+        parent_edit.contains("denied by user"),
+        "parent edit inside an active child scope must require consent and be rejected: {parent_edit}"
     );
     let overlap_spawn = refusal("s2");
     assert!(
@@ -5353,7 +5356,8 @@ async fn a_default_spawned_child_starts_without_write_authority() {
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run(
             "update b",
@@ -5488,7 +5492,8 @@ async fn a_child_write_outside_its_claim_is_denied() {
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run("edit", &mut |_| {}, &mut NoopSink, CancellationToken::new())
         .await
@@ -5836,7 +5841,8 @@ async fn an_unclaimed_child_cannot_update_a_file_the_parent_created() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run(
             "rewrite",
@@ -5903,7 +5909,8 @@ async fn an_unclaimed_child_cannot_mutate_through_a_shell_command() {
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run("tidy", &mut |_| {}, &mut NoopSink, CancellationToken::new())
         .await
@@ -5963,7 +5970,8 @@ async fn an_unclaimed_child_cannot_create_new_files_either() {
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run(
             "scaffold",
@@ -6033,7 +6041,8 @@ async fn an_unclaimed_child_cannot_update_an_existing_file_either() {
         tool_context,
         ModelRef::new("mock", "m"),
         8,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     executor
         .run("docs", &mut |_| {}, &mut NoopSink, CancellationToken::new())
         .await
@@ -6106,7 +6115,8 @@ async fn a_late_bound_child_claim_fences_the_parent() {
         tool_context,
         ModelRef::new("mock", "m"),
         10,
-    );
+    )
+    .with_approver(Arc::new(leveler_execution::AutoDeny));
     let mut events = Vec::new();
     executor
         .run(
@@ -6132,8 +6142,8 @@ async fn a_late_bound_child_claim_fences_the_parent() {
     );
     let refusal = refusal.unwrap();
     assert!(
-        refusal.contains("exclusive scope"),
-        "the refusal must name the ownership reason: {refusal}"
+        refusal.contains("denied by user"),
+        "the parent's edit must require consent and be rejected: {refusal}"
     );
     assert_eq!(
         std::fs::read_to_string(dir.join("b.txt")).unwrap(),
@@ -6394,10 +6404,11 @@ mod mcp_ownership_boundary {
         Executor::new(
             runtime,
             registry_with_fake_mcp(touched.clone()),
-            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ToolContext::new(workspace, PermissionProfile::Assisted),
             ModelRef::new("mock", "m"),
             10,
         )
+        .with_approver(Arc::new(leveler_execution::AutoDeny))
         .run(
             "delegate",
             &mut |_| {},
@@ -6462,10 +6473,11 @@ mod mcp_ownership_boundary {
         Executor::new(
             runtime,
             registry_with_fake_mcp(touched.clone()),
-            ToolContext::new(workspace, PermissionProfile::FullAccess),
+            ToolContext::new(workspace, PermissionProfile::Assisted),
             ModelRef::new("mock", "m"),
             10,
         )
+        .with_approver(Arc::new(leveler_execution::AutoDeny))
         .run(
             "delegate",
             &mut |_| {},

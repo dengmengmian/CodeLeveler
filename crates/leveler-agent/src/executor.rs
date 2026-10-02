@@ -1531,6 +1531,8 @@ pub struct Executor {
     /// Project permission-rules file; `ApproveAlways` persists new rules here.
     /// `None` degrades `ApproveAlways` to session-only.
     permission_rules_path: Option<std::path::PathBuf>,
+    resource_grants: Arc<dyn leveler_storage::ResourceGrantStore>,
+    standalone_grant_session: leveler_core::SessionId,
     /// Optional Pre/Post tool hooks (SEC-8).
     hook_runner: leveler_execution::HookRunner,
     /// Side-effect barrier: canonical tool events must be durable before a
@@ -1557,6 +1559,8 @@ pub struct Executor {
     /// A child spawned from a declarative agent: its instructions and bound
     /// skills, rendered into its system prompt. `None` for every other executor.
     agent_brief: Option<String>,
+    /// Named-agent tool permission; the registry always retains actual handles.
+    agent_tool_allowlist: Option<Arc<Vec<String>>>,
     /// The most a child spawned from a declarative agent may ever claim
     /// (`workspace.write_roots`). Empty: no definition-level bound.
     write_roots: Vec<String>,
@@ -1646,6 +1650,8 @@ impl Executor {
                 leveler_execution::PermissionRuleSet::default(),
             ),
             permission_rules_path: None,
+            resource_grants: Arc::new(leveler_storage::MemoryResourceGrantStore::default()),
+            standalone_grant_session: leveler_core::SessionId::generate(),
             hook_runner: leveler_execution::HookRunner::empty(
                 leveler_core::environment().current_dir().to_path_buf(),
             ),
@@ -1656,6 +1662,7 @@ impl Executor {
             agent_id: None,
             agent_roots: None,
             agent_brief: None,
+            agent_tool_allowlist: None,
             write_roots: Vec::new(),
         }
     }
@@ -1678,6 +1685,23 @@ impl Executor {
     pub fn with_permission_rules_path(mut self, path: Option<std::path::PathBuf>) -> Self {
         self.permission_rules_path = path;
         self
+    }
+
+    /// Attach the session/project resource authorization store.
+    pub fn with_resource_grants(
+        mut self,
+        store: Arc<dyn leveler_storage::ResourceGrantStore>,
+    ) -> Self {
+        self.resource_grants = store;
+        self
+    }
+
+    pub(crate) fn grant_session_id(&self) -> &str {
+        self.model_request_store
+            .as_ref()
+            .map(|(_, session)| session.as_str())
+            .or(self.tool_context.session_scope.as_deref())
+            .unwrap_or(self.standalone_grant_session.as_str())
     }
 
     /// Install Pre/Post tool hooks.
@@ -1743,9 +1767,46 @@ impl Executor {
     }
 
     fn capability_exposed(&self, id: crate::capability::CapabilityId, legacy: bool) -> bool {
+        if self.tool_context.policy.unrestricted_execution() {
+            return self
+                .capabilities
+                .as_ref()
+                .is_none_or(|state| state.available(id));
+        }
         self.capabilities
             .as_ref()
             .map_or(legacy, |state| state.exposed(id))
+    }
+
+    /// Project permissions without discarding actual handles. A profile switch
+    /// can expose those same handles on the next call, including in children.
+    fn projected_tool_registry(&self) -> ToolRegistry {
+        if self.tool_context.policy.unrestricted_execution() {
+            return self.registry.named_subset(&[]);
+        }
+        let registry = if self.depth > 0 {
+            crate::sub_agent::ChildProfile::resolve(self.agent_role)
+                .apply_to_registry(&self.registry)
+        } else {
+            self.registry.named_subset(&[])
+        };
+        match &self.agent_tool_allowlist {
+            Some(names) => registry.named_subset(names),
+            None => registry,
+        }
+    }
+
+    /// Evidence for ToolHost approval, rather than a second admission boundary.
+    pub(crate) fn role_permission_reason(&self, call: &leveler_model::ToolCall) -> Option<String> {
+        (!self.tool_context.policy.unrestricted_execution()
+            && self.registry.get(&call.name).is_some()
+            && self.projected_tool_registry().get(&call.name).is_none())
+        .then(|| {
+            format!(
+                "工具 {} 超出当前智能体角色/定义的工具权限，需要批准本次调用",
+                call.name
+            )
+        })
     }
 
     pub fn with_memory_expose(mut self, expose: bool) -> Self {
@@ -1804,8 +1865,8 @@ impl Executor {
     /// grant — so every mutation is refused until it claims.
     pub(crate) fn effective_write_allowlist(&self) -> Option<Vec<String>> {
         if crate::sub_agent::ChildProfile::resolve(self.agent_role).read_only() {
-            // Structurally read-only: no write tools exist; an empty list is
-            // a consistent answer for the command pipeline.
+            // The role is read-only under confined authority; actual handles
+            // remain present so an approved call or Full can use them.
             return Some(Vec::new());
         }
         // Any executor stamped with a delegated identity is governed by the
@@ -1921,11 +1982,12 @@ impl Executor {
     /// write tool into existence.
     pub(crate) fn apply_agent_policy(&mut self, tools: &[String], max_model_steps: u32) {
         if !tools.is_empty() {
-            // Harness controls are not capabilities a definition narrows:
-            // a child keeps its plan like every other child.
             let mut allowed = tools.to_vec();
             allowed.push("update_plan".to_string());
-            self.registry = Arc::new(self.registry.named_subset(&allowed));
+            if let Some(inherited) = &self.agent_tool_allowlist {
+                allowed.retain(|name| inherited.contains(name));
+            }
+            self.agent_tool_allowlist = Some(Arc::new(allowed));
         }
         if max_model_steps > 0 {
             self.continuation = ContinuationPolicy::bounded(max_model_steps);
@@ -1965,12 +2027,11 @@ impl Executor {
         files: Vec<String>,
         model_override: Option<ModelRef>,
     ) -> Executor {
-        // The role's capability profile decides the toolset shape in ONE
-        // place: read-only roles get a registry that physically holds no
-        // write tools; a writer drops MCP proxies whose effect no claimed
-        // scope can bound. See [`crate::child_profile::ChildProfile`].
+        // Keep one source of actual handles. Role permissions are projected
+        // for each model request and resolved by ToolHost at admission, so a
+        // live switch to Full never needs to reconstruct discarded handles.
         let profile = crate::sub_agent::ChildProfile::resolve(role);
-        let registry = Arc::new(profile.apply_to_registry(&self.registry));
+        let registry = self.registry.clone();
         let write_allowlist = (!profile.read_only() && !files.is_empty()).then_some(files);
         let child_policy = self.sub_agent_policies.map_or(
             SubAgentExecutionPolicy {
@@ -1997,10 +2058,7 @@ impl Executor {
         Executor {
             commit_co_author: self.commit_co_author,
             runtime: self.runtime.clone(),
-            capabilities: self
-                .capabilities
-                .as_ref()
-                .map(|state| Arc::new(state.for_child(&registry.definitions()))),
+            capabilities: self.capabilities.clone(),
             registry,
             tool_context: self.tool_context.clone(),
             model: model_override.unwrap_or_else(|| self.model.clone()),
@@ -2077,6 +2135,8 @@ impl Executor {
                     .clone(),
             ),
             permission_rules_path: self.permission_rules_path.clone(),
+            resource_grants: self.resource_grants.clone(),
+            standalone_grant_session: self.standalone_grant_session.clone(),
             hook_runner: self.hook_runner.clone(),
             // A child shares the parent's barrier: its tool events are
             // recorded on the SAME ordered queue the barrier flushes, so a
@@ -2092,6 +2152,7 @@ impl Executor {
             agent_id: None,
             agent_roots: None,
             agent_brief: None,
+            agent_tool_allowlist: self.agent_tool_allowlist.clone(),
             write_roots: Vec::new(),
         }
     }
@@ -2278,8 +2339,7 @@ impl Executor {
                 .turn_context(TurnContext {
                     model: self.model.clone(),
                     mode: self.tool_context.policy.mode(),
-                    network_allowed: self.approval_policy.network_allowed,
-                    deny_network: self.tool_context.policy.network_denied(),
+                    network_scope: self.tool_context.policy.network_scope(),
                     cwd: root.map(std::path::Path::to_path_buf),
                     project_rules,
                     user_language: crate::prompt::user_language(request),
@@ -2719,7 +2779,7 @@ impl Executor {
     /// prefix is untouched.
     fn agent_catalog_injection(&self) -> Option<String> {
         (self.depth == 0
-            && self.policy.allow_delegation
+            && (self.tool_context.policy.unrestricted_execution() || self.policy.allow_delegation)
             && self.capability_exposed(crate::capability::CapabilityId::MultiAgent, true))
         .then(|| self.load_agent_registry().render_catalog())
     }
@@ -3087,6 +3147,227 @@ mod ownership_authority_tests {
         )
     }
 
+    #[test]
+    fn full_tool_surface_bypasses_capability_and_product_permission_flags() {
+        use crate::capability::{CapabilityDisclosure, CapabilityId};
+        let mut exec = executor().with_delegation(false).with_host_input(false);
+        let mut registry = leveler_tools::default_registry();
+        registry.register(Arc::new(leveler_tools::tools::WebFetchTool));
+        exec.registry = Arc::new(registry);
+        exec.capabilities = Some(Arc::new(
+            CapabilityDisclosure::new(
+                vec![
+                    CapabilityId::Web,
+                    CapabilityId::MultiAgent,
+                    CapabilityId::HostInteraction,
+                ],
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        ));
+        let scoped = exec.request_tool_definitions();
+        for name in ["web_fetch", "spawn_agent", "request_user_input"] {
+            assert!(!scoped.iter().any(|t| t.name == name));
+        }
+        exec.tool_context
+            .policy
+            .permission_profile()
+            .set(leveler_execution::PermissionProfile::FullAccess);
+        let full = exec.request_tool_definitions();
+        for name in ["web_fetch", "spawn_agent", "request_user_input"] {
+            assert!(
+                full.iter().any(|t| t.name == name),
+                "{name} still restricted in Full"
+            );
+        }
+        assert!(exec.capability_exposed(CapabilityId::Web, false));
+        assert!(
+            !exec.capability_exposed(CapabilityId::Browser, false),
+            "Full must not invent unavailable capabilities"
+        );
+    }
+
+    #[test]
+    fn full_child_inherits_actual_tools_without_role_permission_filter() {
+        let exec = executor();
+        let scoped = exec.child_for_role_on(AgentRole::Explorer, vec![], None);
+        assert!(
+            !scoped
+                .request_tool_definitions()
+                .iter()
+                .any(|tool| tool.name == "apply_patch")
+        );
+        exec.tool_context
+            .policy
+            .permission_profile()
+            .set(leveler_execution::PermissionProfile::FullAccess);
+        let full = exec.child_for_role_on(AgentRole::Explorer, vec![], None);
+        assert!(full.registry.get("apply_patch").is_some());
+        assert_eq!(
+            full.registry.definitions().len(),
+            exec.registry.definitions().len()
+        );
+    }
+
+    #[test]
+    fn existing_explorer_auto_to_full_recovers_actual_write_and_optional_handles() {
+        use crate::capability::{CapabilityDisclosure, CapabilityId};
+        let mut parent = executor();
+        let mut registry = leveler_tools::default_registry();
+        registry.register(Arc::new(leveler_tools::tools::WebFetchTool));
+        parent.registry = Arc::new(registry);
+        parent.capabilities = Some(Arc::new(
+            CapabilityDisclosure::new(vec![CapabilityId::Web], vec![], vec![]).unwrap(),
+        ));
+        let child = parent.child_for_role_on(AgentRole::Explorer, vec![], None);
+        assert!(
+            !child
+                .request_tool_definitions()
+                .iter()
+                .any(|t| t.name == "apply_patch")
+        );
+        parent
+            .tool_context
+            .policy
+            .permission_profile()
+            .set(leveler_execution::PermissionProfile::FullAccess);
+        for name in ["apply_patch", "web_fetch"] {
+            assert!(
+                child
+                    .request_tool_definitions()
+                    .iter()
+                    .any(|t| t.name == name),
+                "existing child lost actual {name} handle"
+            );
+        }
+        assert!(child.capability_exposed(CapabilityId::Web, false));
+    }
+
+    struct WriteDriveRuntime(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl ModelRuntime for WriteDriveRuntime {
+        async fn generate(
+            &self,
+            _: leveler_model::ModelRequest,
+            _: CancellationToken,
+        ) -> Result<leveler_model::ModelResponse, ModelError> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            _: leveler_model::ModelRequest,
+            _: CancellationToken,
+        ) -> Result<leveler_model::ModelEventStream, ModelError> {
+            use leveler_model::{FinishReason, ModelEvent};
+            let first = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let body = if first {
+                ModelEvent::ToolCallCompleted {
+                    call: leveler_model::ToolCall {
+                        id: leveler_core::ToolCallId::new("write"),
+                        name: "apply_patch".into(),
+                        arguments: serde_json::json!({"patch":"*** Begin Patch\n*** Add File: owned.txt\nwritten\n*** End Patch"}),
+                    },
+                }
+            } else {
+                ModelEvent::TextDelta {
+                    delta: "done".into(),
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::generate(),
+                }),
+                Ok(body),
+                Ok(ModelEvent::MessageCompleted {
+                    finish_reason: if first {
+                        FinishReason::ToolCalls
+                    } else {
+                        FinishReason::Stop
+                    },
+                }),
+            ])))
+        }
+        async fn profile(
+            &self,
+            model: &ModelRef,
+        ) -> Result<leveler_model::ModelProfile, ModelError> {
+            Ok(serde_json::from_value(serde_json::json!({
+                "id":model.to_string(), "provider":model.provider, "model_id":model.model, "protocol":"openai_chat",
+                "capabilities":{"streaming":true,"tool_calling":true,"parallel_tool_calls":false,"structured_output":false,"reasoning":false,"vision":false},
+                "limits":{"context_window":131072,"reliable_context":65536,"max_output_tokens":8192,"max_tool_schema_bytes":32768,"max_parallel_tool_calls":1}
+            })).unwrap())
+        }
+    }
+
+    struct CountDriveApproval(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl Approver for CountDriveApproval {
+        async fn decide(
+            &self,
+            _: &leveler_execution::ApprovalRequest,
+        ) -> leveler_execution::ApprovalDecision {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            leveler_execution::ApprovalDecision::ApproveOnce
+        }
+    }
+
+    fn write_drive(dir: &std::path::Path, mode: leveler_execution::PermissionProfile) -> Executor {
+        Executor::new(
+            Arc::new(WriteDriveRuntime(std::sync::atomic::AtomicUsize::new(0))),
+            Arc::new(leveler_tools::default_registry()),
+            ToolContext::new(leveler_execution::Workspace::new(dir).unwrap(), mode),
+            ModelRef::new("mock", "m"),
+            4,
+        )
+    }
+
+    #[tokio::test]
+    async fn full_child_drive_executes_mutation_with_zero_claimed_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut exec = write_drive(dir.path(), leveler_execution::PermissionProfile::FullAccess);
+        exec.depth = 1;
+        exec.agent_id = Some("unclaimed-child".into());
+        assert!(exec.ownership.owned_by("unclaimed-child").is_empty());
+        exec.run(
+            "write",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("owned.txt")).unwrap(),
+            "written\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_drive_other_owner_mutation_asks_once_then_executes_approved_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exec = write_drive(dir.path(), leveler_execution::PermissionProfile::Assisted)
+            .with_approver(Arc::new(CountDriveApproval(asks.clone())));
+        exec.ownership
+            .try_claim("other-worker", &["owned.txt".into()])
+            .unwrap();
+        exec.run(
+            "write",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("owned.txt")).unwrap(),
+            "written\n"
+        );
+    }
+
     /// Verification productionized after the three-arm experiment: neither the
     /// Goal-Mode prompt nor the `update_goal` description names a proof tool or
     /// a last-edit build/test rule. State the work is done; do not mandate how
@@ -3354,18 +3635,21 @@ mod ownership_authority_tests {
         );
 
         // A sync against the repository's own remote writes fetched metadata
-        // only: it runs unsealed and still asks nobody.
+        // only. A DIRECT `git fetch` runs unsealed and asks nobody; the same
+        // command through a shell wrapper keeps exact-call approval, because the
+        // wrapper cannot be bound to a frozen approved target and would
+        // otherwise run against the user's live Git credential store unchecked.
         assert_eq!(
             resolve(&executor, &ctx, "git fetch origin").await,
-            (false, unsealed.clone())
+            (true, unsealed.clone())
         );
         assert_eq!(
             resolve(&executor, &ctx, "git fetch --prune origin").await,
-            (false, unsealed.clone())
+            (true, unsealed.clone())
         );
         assert_eq!(
             resolve(&executor, &ctx, "git ls-remote origin").await,
-            (false, sealed.clone())
+            (true, sealed.clone())
         );
 
         // A remote the repository does not configure is asked for.

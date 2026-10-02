@@ -206,6 +206,9 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime,
             registry: Arc::new(tool_registry),
             tool_context,

@@ -38,6 +38,22 @@ pub struct UiApprovalRequest {
     /// so a client must not offer it.
     #[serde(default)]
     pub always_persists: bool,
+    /// Exact host-resolved capability/resource metadata, never inferred from text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+    pub grant: Option<leveler_core::GrantRequest>,
+    /// A human-only consent operation offers Once and Deny exclusively.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_human_consent: bool,
+}
+
+impl UiApprovalRequest {
+    pub fn project_available(&self) -> bool {
+        !self.requires_human_consent
+            && self.grant.as_ref().is_some_and(|grant| {
+                !grant.project_identity.is_empty() && !grant.bindings.is_empty()
+            })
+    }
 }
 
 /// How one question in a clarification is answered.
@@ -134,6 +150,35 @@ pub enum UiPendingInteraction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_approval_roundtrips_and_legacy_does_not_offer_project() {
+        let legacy = r#"{"id":"a1","tool":"run_command","summary":"push","command":null,"risks":[],"always_persists":true}"#;
+        let mut req: UiApprovalRequest = serde_json::from_str(legacy).unwrap();
+        assert!(!req.project_available());
+        assert!(!req.requires_human_consent);
+        req.grant = Some(leveler_core::GrantRequest {
+            project_identity: "project-a".into(),
+            bindings: vec![leveler_core::GrantBinding {
+                capability: leveler_core::Capability::RemoteMutate,
+                resource: leveler_core::ResourceIdentity::ConfiguredRemote {
+                    repository: "repo-a".into(),
+                    remote_name: "origin".into(),
+                    canonical_url: "https://example.test/a.git".into(),
+                    transport: "https".into(),
+                },
+            }],
+        });
+        assert!(req.project_available());
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            serde_json::from_str::<UiApprovalRequest>(&json).unwrap(),
+            req
+        );
+        assert!(json.contains("remote_mutate") && json.contains("configured_remote"));
+        let project = serde_json::to_string(&crate::ApprovalDecision::ApproveProject).unwrap();
+        assert_eq!(project, "\"approve_project\"");
+    }
 
     /// A request recorded before `questions` existed still parses: clients and
     /// runtimes of different vintages must interoperate.

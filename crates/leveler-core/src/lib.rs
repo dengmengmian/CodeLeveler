@@ -13,6 +13,7 @@ pub mod environment;
 pub mod home;
 pub mod ids;
 pub mod ownership;
+pub mod resource_grant;
 pub mod secret;
 pub mod text;
 pub mod time;
@@ -40,3 +41,5 @@ pub use text::{
     truncate_tail_bytes,
 };
 pub use time::{Timestamp, now};
+
+pub use resource_grant::{Capability, GrantBinding, GrantRequest, GrantScope, ResourceIdentity};

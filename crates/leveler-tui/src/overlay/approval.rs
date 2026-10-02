@@ -33,6 +33,7 @@ pub(crate) fn decision_label(decision: ApprovalDecision, t: &crate::i18n::UiText
     match decision {
         ApprovalDecision::ApproveOnce => t.approval_once,
         ApprovalDecision::ApproveSession => t.approval_session,
+        ApprovalDecision::ApproveProject => t.approval_project,
         ApprovalDecision::ApproveAlways => t.approval_always,
         ApprovalDecision::Deny => t.approval_deny,
     }
@@ -86,7 +87,17 @@ impl ApprovalOverlay {
         choices(&self.request)
             .iter()
             .enumerate()
-            .map(|(i, decision)| (decision_label(*decision, t), i == self.cursor))
+            .map(|(i, decision)| {
+                (
+                    if *decision == ApprovalDecision::ApproveSession && self.request.grant.is_some()
+                    {
+                        t.approval_resource_session
+                    } else {
+                        decision_label(*decision, t)
+                    },
+                    i == self.cursor,
+                )
+            })
             .collect()
     }
 
@@ -105,10 +116,19 @@ impl ApprovalOverlay {
             KeyCode::Esc => ApprovalOutcome::Decide(ApprovalDecision::Deny),
             KeyCode::Char('y') => ApprovalOutcome::Decide(ApprovalDecision::ApproveOnce),
             // `a` kept for muscle memory; prompt prefers `s`.
-            KeyCode::Char('a') | KeyCode::Char('s') => {
+            KeyCode::Char('s') if choices.contains(&ApprovalDecision::ApproveSession) => {
                 ApprovalOutcome::Decide(ApprovalDecision::ApproveSession)
             }
-            KeyCode::Char('w') if self.request.always_persists => {
+            KeyCode::Char('a')
+                if self.request.grant.is_none()
+                    && choices.contains(&ApprovalDecision::ApproveSession) =>
+            {
+                ApprovalOutcome::Decide(ApprovalDecision::ApproveSession)
+            }
+            KeyCode::Char('p') if choices.contains(&ApprovalDecision::ApproveProject) => {
+                ApprovalOutcome::Decide(ApprovalDecision::ApproveProject)
+            }
+            KeyCode::Char('w') if choices.contains(&ApprovalDecision::ApproveAlways) => {
                 ApprovalOutcome::Decide(ApprovalDecision::ApproveAlways)
             }
             KeyCode::Char('d') | KeyCode::Char('n') => {
@@ -137,9 +157,23 @@ impl ApprovalOverlay {
 /// The rows this request offers. "Always" is shown only when the runtime
 /// would persist a rule for it; otherwise it would promise what never happens.
 fn choices(request: &UiApprovalRequest) -> Vec<ApprovalDecision> {
+    if request.requires_human_consent {
+        return vec![ApprovalDecision::ApproveOnce, ApprovalDecision::Deny];
+    }
+    if request.project_available() {
+        return vec![
+            ApprovalDecision::ApproveOnce,
+            ApprovalDecision::ApproveSession,
+            ApprovalDecision::ApproveProject,
+            ApprovalDecision::Deny,
+        ];
+    }
     OPTIONS
         .into_iter()
-        .filter(|d| request.always_persists || *d != ApprovalDecision::ApproveAlways)
+        .filter(|decision| {
+            *decision != ApprovalDecision::ApproveAlways
+                || (request.grant.is_none() && request.always_persists)
+        })
         .collect()
 }
 
@@ -148,8 +182,55 @@ mod tests {
     use super::*;
     use leveler_client_protocol::ApprovalId;
 
+    #[test]
+    fn resource_bound_choices_offer_project_and_session_and_human_consent_does_not() {
+        let mut req = request();
+        req.grant = Some(leveler_core::GrantRequest {
+            project_identity: "project-a".into(),
+            bindings: vec![leveler_core::GrantBinding {
+                capability: leveler_core::Capability::RemoteMutate,
+                resource: leveler_core::ResourceIdentity::ConfiguredRemote {
+                    repository: "repo-a".into(),
+                    remote_name: "origin".into(),
+                    canonical_url: "https://example.test/repo.git".into(),
+                    transport: "https".into(),
+                },
+            }],
+        });
+        assert_eq!(
+            choices(&req),
+            vec![
+                ApprovalDecision::ApproveOnce,
+                ApprovalDecision::ApproveSession,
+                ApprovalDecision::ApproveProject,
+                ApprovalDecision::Deny
+            ]
+        );
+        let mut overlay = ApprovalOverlay::new(req.clone());
+        assert_eq!(
+            overlay.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            ApprovalOutcome::Decide(ApprovalDecision::ApproveProject)
+        );
+        req.requires_human_consent = true;
+        assert_eq!(
+            choices(&req),
+            vec![ApprovalDecision::ApproveOnce, ApprovalDecision::Deny]
+        );
+        let mut overlay = ApprovalOverlay::new(req);
+        assert_eq!(
+            overlay.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            ApprovalOutcome::None
+        );
+        assert_eq!(
+            overlay.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            ApprovalOutcome::None
+        );
+    }
+
     fn request() -> UiApprovalRequest {
         UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
             id: ApprovalId::new("r1"),
             tool: "run_command".into(),
             summary: "run git push".into(),

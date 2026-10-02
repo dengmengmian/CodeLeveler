@@ -58,6 +58,11 @@ impl Tool for ViewImageTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        let path = input.get("path")?.as_str()?;
+        crate::workspace::path_approval_reason(context, path, false)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -65,7 +70,9 @@ impl Tool for ViewImageTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context.require_workspace()?.resolve_for_read(&input.path)?;
+        let path = context
+            .execution_workspace()?
+            .resolve_for_read(&input.path)?;
         // Check the size before reading, so a huge file is rejected instead of
         // pulled fully into memory first.
         match tokio::fs::metadata(&path).await {

@@ -25,6 +25,28 @@ Widget _app(AppController controller) =>
     MaterialApp(home: ChatScreen(controller: controller));
 
 void main() {
+  testWidgets('human-only approval offers once and deny without reusable scope',
+      (tester) async {
+    final session = SessionState('s-human')
+      ..applyEvent({
+        'type': 'approval_requested',
+        'request': {
+          'id': 'a-human',
+          'tool': 'save_agent',
+          'summary': 'save definition',
+          'requires_human_consent': true,
+          'risks': []
+        },
+      });
+    await tester.pumpWidget(_app(_controllerWith(session)));
+    await tester.pumpAndSettle();
+    expect(find.text('允许一次'), findsOneWidget);
+    expect(find.text('拒绝'), findsOneWidget);
+    expect(find.text('本轮对话内允许'), findsNothing);
+    expect(find.textContaining('此项目内允许'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('an assistant answer is rendered as Markdown, not as its source',
       (tester) async {
     final session = SessionState('s1')
@@ -62,7 +84,8 @@ void main() {
     expect(find.byType(MarkdownBody), findsNothing);
   });
 
-  testWidgets('a session with nothing in it shows what it is for', (tester) async {
+  testWidgets('a session with nothing in it shows what it is for',
+      (tester) async {
     // Not a blank screen. A user who has just typed a goal and landed here
     // needs to see that it arrived; the old empty state showed nothing at all,
     // which reads as a failure rather than as a fresh session.
@@ -140,7 +163,8 @@ void main() {
         'message_id': 'm1',
         'delta': '好的。',
       })
-      ..applyEvent({'type': 'notification', 'level': 'warning', 'message': '磁盘快满了'});
+      ..applyEvent(
+          {'type': 'notification', 'level': 'warning', 'message': '磁盘快满了'});
 
     await tester.pumpWidget(_app(_controllerWith(session)));
     await tester.pumpAndSettle();
@@ -150,7 +174,8 @@ void main() {
     expect(find.byType(MarkdownBody), findsOneWidget);
   });
 
-  testWidgets('a long host notice wraps instead of overflowing a phone-width row',
+  testWidgets(
+      'a long host notice wraps instead of overflowing a phone-width row',
       (tester) async {
     // Seen on an iPhone simulator: a notice longer than the screen overflowed
     // its divider row by 92px.
@@ -161,7 +186,8 @@ void main() {
       ..applyEvent({
         'type': 'notification',
         'level': 'warning',
-        'message': '子 Agent Euclid 已结束或不存在,无需停止 — this notice is deliberately longer than a phone is wide',
+        'message':
+            '子 Agent Euclid 已结束或不存在,无需停止 — this notice is deliberately longer than a phone is wide',
       });
 
     await tester.pumpWidget(_app(_controllerWith(session)));
@@ -186,7 +212,8 @@ void main() {
     expect(field.decoration?.hintText, '干预当前回合（立刻生效）');
   });
 
-  testWidgets('an idle composer still says it will start a follow-up', (tester) async {
+  testWidgets('an idle composer still says it will start a follow-up',
+      (tester) async {
     final session = SessionState('s1')
       ..applySnapshot({
         'status': 'idle',
@@ -217,7 +244,9 @@ void main() {
     expect(find.text('秘密推理过程'), findsOneWidget);
   });
 
-  testWidgets('the task header shows plan progress without inventing a percentage', (tester) async {
+  testWidgets(
+      'the task header shows plan progress without inventing a percentage',
+      (tester) async {
     final session = SessionState('s1')
       ..goal = '实现 Browser Capability'
       ..applyEvent({
@@ -240,7 +269,9 @@ void main() {
     expect(find.textContaining('60%'), findsNothing);
   });
 
-  testWidgets('the task header opens a task workspace that shares session state', (tester) async {
+  testWidgets(
+      'the task header opens a task workspace that shares session state',
+      (tester) async {
     final session = SessionState('s1')
       ..goal = 'Implement Browser Capability'
       ..applyEvent({

@@ -63,6 +63,12 @@ pub struct ProcessRequest {
     /// enforce it; Windows cannot, and refuses the request rather than running
     /// it with the network open.
     pub deny_network: bool,
+    /// Frozen destination scope. Legacy denial always takes precedence.
+    #[serde(default = "default_process_network_scope")]
+    pub network_scope: crate::NetworkScope,
+    /// Trusted host authority; tool input schemas never expose this field.
+    #[serde(default)]
+    pub unrestricted_execution: bool,
     /// The one write boundary this process runs under. The OS wrappers
     /// (seatbelt / bwrap / `leveler-confine.exe`) enforce it: `Workspace` confines
     /// writes to that root plus temp/toolchain caches, `None` mounts the
@@ -80,10 +86,24 @@ pub struct ProcessRequest {
     /// Credential-like variables intentionally granted to this trusted child.
     /// Tool/model-controlled requests must leave this empty.
     pub allow_env: Vec<String>,
+    /// Host-authority environment applied last, after the immutable snapshot and
+    /// the deny/allow policy, so the host can pin a child's configuration (for
+    /// example Git config isolation). Never derived from tool or model input.
+    #[serde(default)]
+    pub authority_env: Vec<(String, String)>,
+    /// Extra write roots the host authorizes for this confined command, on top
+    /// of the scope's own roots (for example a frozen Git execution target).
+    /// Never derived from tool or model input.
+    #[serde(default)]
+    pub sandbox_write_roots: Vec<PathBuf>,
 }
 
 /// Default per-stream output cap (1 MiB).
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn default_process_network_scope() -> crate::NetworkScope {
+    crate::NetworkScope::Internet
+}
 
 impl ProcessRequest {
     pub fn new(program: impl Into<String>, args: Vec<String>, cwd: PathBuf) -> Self {
@@ -93,15 +113,29 @@ impl ProcessRequest {
             cwd,
             timeout: Duration::from_secs(600),
             deny_network: false,
+            network_scope: crate::NetworkScope::Internet,
+            unrestricted_execution: false,
             write_scope: WriteScope::Unrestricted,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             deny_env: Vec::new(),
             allow_env: Vec::new(),
+            authority_env: Vec::new(),
+            sandbox_write_roots: Vec::new(),
         }
     }
 }
 
 impl ProcessRequest {
+    pub fn effective_network_scope(&self) -> crate::NetworkScope {
+        if self.unrestricted_execution {
+            crate::NetworkScope::Internet
+        } else if self.deny_network {
+            crate::NetworkScope::None
+        } else {
+            self.network_scope.clone()
+        }
+    }
+
     /// The Windows backend contract for this request, derived from the write
     /// scope. Never model-chosen: the scope comes from host policy.
     pub fn filesystem_intent(&self) -> crate::windows_sandbox::FilesystemIntent {
@@ -124,13 +158,15 @@ pub(crate) fn sandbox_anchor(request: &ProcessRequest) -> &Path {
 /// Windows has no host-cache overlay (it would need a symlink), so the answer
 /// is only consulted there to be discarded — see `prepare_cargo_home`.
 pub(crate) fn should_read_host_caches(request: &ProcessRequest) -> bool {
-    request.deny_network
-        || request.args.iter().any(|arg| {
-            arg == "--offline"
-                || arg
-                    .split_ascii_whitespace()
-                    .any(|token| token == "--offline")
-        })
+    !matches!(
+        request.effective_network_scope(),
+        crate::NetworkScope::Internet
+    ) || request.args.iter().any(|arg| {
+        arg == "--offline"
+            || arg
+                .split_ascii_whitespace()
+                .any(|token| token == "--offline")
+    })
 }
 
 /// Network policy when building a verify / acceptance [`ProcessRequest`].
@@ -999,6 +1035,36 @@ impl CommandRunner {
     /// ordinary spawn, so a background command is no less confined than a
     /// foreground one.
     pub async fn spawn(&self, request: &ProcessRequest) -> Result<ManagedProcess, ProcessError> {
+        let normalized;
+        let request = if request.unrestricted_execution {
+            normalized = {
+                let mut request = request.clone();
+                request.deny_network = false;
+                request.network_scope = crate::NetworkScope::Internet;
+                request.write_scope = WriteScope::Unrestricted;
+                request
+            };
+            &normalized
+        } else {
+            request
+        };
+        let network_scope = request.effective_network_scope();
+        match &network_scope {
+            crate::NetworkScope::None | crate::NetworkScope::Internet => {}
+            crate::NetworkScope::Loopback if cfg!(target_os = "macos") => {}
+            unsupported => {
+                let name = match unsupported {
+                    crate::NetworkScope::Loopback => "loopback",
+                    crate::NetworkScope::LocalLan => "local_lan",
+                    crate::NetworkScope::ConfiguredRemote(_) => "configured_remote",
+                    _ => unreachable!(),
+                };
+                return Err(ProcessError::SandboxPolicy(format!(
+                    "UnsupportedNetworkScope: {name}; this process backend cannot enforce destinations"
+                )));
+            }
+        }
+        let deny_network = !matches!(network_scope, crate::NetworkScope::Internet);
         if matches!(request.write_scope, WriteScope::ScopedWorkspace { .. }) {
             let scope = request.write_scope.clone();
             tokio::task::spawn_blocking(move || validate_scoped_write_boundary(&scope))
@@ -1010,8 +1076,7 @@ impl CommandRunner {
                 })??;
         }
         let intent = request.filesystem_intent();
-        if let Err(err) =
-            crate::windows_sandbox::assert_intent_spawn_allowed(&intent, request.deny_network)
+        if let Err(err) = crate::windows_sandbox::assert_intent_spawn_allowed(&intent, deny_network)
         {
             return Err(ProcessError::SandboxPolicy(err.to_string()));
         }
@@ -1033,10 +1098,14 @@ impl CommandRunner {
                 ))
             })?;
         let sandbox_scratch_root = sandbox_paths.as_ref().map(SandboxPaths::scratch_path);
-        let sandbox_cache_write_roots = sandbox_paths
+        // The host may authorize one extra writable root for this command (a
+        // frozen Git execution target); it is exactly as trusted as the
+        // host-built cache roots and never comes from tool input.
+        let mut sandbox_write_roots: Vec<PathBuf> = sandbox_paths
             .as_ref()
-            .map(SandboxPaths::cache_write_roots)
-            .unwrap_or(&[]);
+            .map(|paths| paths.cache_write_roots().to_vec())
+            .unwrap_or_default();
+        sandbox_write_roots.extend(request.sandbox_write_roots.iter().cloned());
 
         // Windows has no per-process filesystem view to confine writes with, so
         // the authorized write roots carry a Low integrity label for exactly as
@@ -1049,7 +1118,7 @@ impl CommandRunner {
                 let roots = writable_roots_for_scope(
                     &request.write_scope,
                     sandbox_scratch_root,
-                    sandbox_cache_write_roots,
+                    &sandbox_write_roots,
                 );
                 crate::windows_confine::lease_write_roots(&self.environment, &roots)
             })
@@ -1059,14 +1128,28 @@ impl CommandRunner {
                     "label the authorized Windows write roots: {source}"
                 ))
             })?;
-        let (program, args) = sandbox_command(
-            &request.program,
-            &request.args,
-            request.deny_network,
-            &request.write_scope,
-            sandbox_scratch_root,
-            sandbox_cache_write_roots,
-        );
+        let (program, mut args) = if request.unrestricted_execution {
+            (request.program.clone(), request.args.clone())
+        } else {
+            sandbox_command(
+                &request.program,
+                &request.args,
+                deny_network,
+                &request.write_scope,
+                sandbox_scratch_root,
+                &sandbox_write_roots,
+            )
+        };
+
+        // Seatbelt's localhost inbound predicate ALSO admits wildcard listeners
+        // reachable through LAN interfaces. Never emit it. This backend supports
+        // canonical loopback outbound only; every listener remains denied.
+        #[cfg(target_os = "macos")]
+        if matches!(network_scope, crate::NetworkScope::Loopback) {
+            args[1].push_str("\n(allow network-outbound (remote ip \"localhost:*\"))\n");
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = &mut args;
 
         let mut cmd = Command::new(&program);
         apply_common_command_env(&mut cmd, request, &program, &args, &self.environment);
@@ -1691,7 +1774,7 @@ fn apply_common_command_env(
             .allow_env
             .iter()
             .any(|allowed| allowed == &name_text);
-        if !credential || explicitly_allowed {
+        if request.unrestricted_execution || !credential || explicitly_allowed {
             cmd.env(name, value);
         }
     }
@@ -1706,6 +1789,11 @@ fn apply_common_command_env(
     // ANSI even into a redirected file the agent later greps. A `dumb` term
     // makes `tput colors` report no color at the source.
     cmd.env("TERM", "dumb");
+    // Host-authority overrides win over the snapshot: they pin configuration
+    // the host resolved and approved (for example a frozen Git config root).
+    for (name, value) in &request.authority_env {
+        cmd.env(name, value);
+    }
 }
 
 /// Upper bound for waiting after kill/timeout. Without this, a child that
@@ -1794,6 +1882,193 @@ async fn read_capped(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_execution_preserves_credentials_and_ignores_scoped_restrictions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("full-marker");
+        let environment = leveler_core::EnvSnapshot::new(
+            [(
+                std::ffi::OsString::from("TEST_FULL_API_KEY"),
+                std::ffi::OsString::from("fake-only"),
+            )],
+            workspace.path().to_path_buf(),
+            std::env::temp_dir(),
+        );
+        let runner = super::CommandRunner::with_environment(std::sync::Arc::new(environment));
+        let script = format!(
+            "import os,socket; s=socket.socket(); s.bind(('0.0.0.0',0)); s.listen(); c=socket.create_connection(('127.0.0.1',s.getsockname()[1])); open({:?},'w').write('done'); assert os.environ['TEST_FULL_API_KEY']=='fake-only'; print('full-ok')",
+            marker.to_string_lossy()
+        );
+        let mut request = super::ProcessRequest::new(
+            "/usr/bin/python3",
+            vec!["-c".into(), script],
+            workspace.path().to_path_buf(),
+        );
+        request.deny_network = true;
+        request.network_scope = crate::NetworkScope::None;
+        request.write_scope = crate::WriteScope::None;
+        request.deny_env = vec!["TEST_FULL_API_KEY".into()];
+        let mut wire = serde_json::to_value(request).unwrap();
+        wire["unrestricted_execution"] = serde_json::json!(true);
+        let result = runner
+            .run(
+                serde_json::from_value(wire).unwrap(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "done");
+        assert!(result.stdout.contains("full-ok"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn loopback_scope_real_sockets_allow_canonical_hosts_and_reject_destinations() {
+        use std::net::TcpListener;
+        for host in ["127.0.0.1", "::1"] {
+            let listener = match TcpListener::bind((host, 0)) {
+                Ok(listener) => listener,
+                Err(error) if host == "::1" => {
+                    eprintln!("SKIP IPv6 unavailable: {error}");
+                    continue;
+                }
+                Err(error) => panic!("IPv4 fixture failed: {error}"),
+            };
+            let port = listener.local_addr().unwrap().port();
+            let script = format!(
+                "import socket; s=socket.create_connection(('{host}',{port}),timeout=1); print('connected')"
+            );
+            let mut request = super::ProcessRequest::new(
+                "/usr/bin/python3",
+                vec!["-c".into(), script],
+                std::env::temp_dir(),
+            );
+            request.network_scope = crate::NetworkScope::Loopback;
+            let result = super::CommandRunner::new()
+                .run(request, tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(result.exit_code, Some(0), "{host}: {}", result.stderr);
+            assert!(result.stdout.contains("connected"));
+        }
+        for host in ["1.1.1.1", "192.168.1.10", "10.0.0.1", "127.0.0.2"] {
+            for script in [
+                format!("import socket; socket.create_connection(('{host}',443),timeout=0.2)"),
+                format!(
+                    "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b'x',('{host}',443))"
+                ),
+            ] {
+                let mut request = super::ProcessRequest::new(
+                    "/usr/bin/python3",
+                    vec!["-c".into(), script],
+                    std::env::temp_dir(),
+                );
+                request.network_scope = crate::NetworkScope::Loopback;
+                let result = super::CommandRunner::new()
+                    .run(request, tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap();
+                assert_ne!(result.exit_code, Some(0), "{host}");
+                assert!(
+                    result.stderr.contains("Operation not permitted"),
+                    "must prove sandbox denial, {host}: {}",
+                    result.stderr
+                );
+            }
+        }
+        for host in ["0.0.0.0", "::1", "::"] {
+            let script = format!(
+                "import socket; s=socket.socket({}); s.bind(('{host}',0)); s.listen()",
+                if host.contains(':') {
+                    "socket.AF_INET6"
+                } else {
+                    "socket.AF_INET"
+                }
+            );
+            let mut request = super::ProcessRequest::new(
+                "/usr/bin/python3",
+                vec!["-c".into(), script],
+                std::env::temp_dir(),
+            );
+            request.network_scope = crate::NetworkScope::Loopback;
+            let result = super::CommandRunner::new()
+                .run(request, tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            assert_ne!(result.exit_code, Some(0), "{host}");
+            assert!(
+                result.stderr.contains("Operation not permitted"),
+                "{}",
+                result.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn process_network_legacy_denial_cannot_be_widened() {
+        let mut request = super::ProcessRequest::new("true", vec![], std::env::temp_dir());
+        request.network_scope = crate::NetworkScope::Loopback;
+        request.deny_network = true;
+        assert_eq!(request.effective_network_scope(), crate::NetworkScope::None);
+        let mut wire = serde_json::to_value(request).unwrap();
+        wire.as_object_mut().unwrap().remove("network_scope");
+        let restored: super::ProcessRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            restored.effective_network_scope(),
+            crate::NetworkScope::None
+        );
+    }
+
+    #[tokio::test]
+    async fn process_scoped_destinations_fail_closed_when_backend_unsupported() {
+        for scope in [
+            crate::NetworkScope::LocalLan,
+            crate::NetworkScope::ConfiguredRemote(vec![]),
+        ] {
+            let mut request = super::ProcessRequest::new("true", vec![], std::env::temp_dir());
+            request.network_scope = scope;
+            let error = super::CommandRunner::new()
+                .spawn(&request)
+                .await
+                .err()
+                .expect("must reject before spawn");
+            assert!(error.to_string().contains("UnsupportedNetworkScope"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn loopback_scope_refuses_even_local_listen_until_safe_backend_exists() {
+        let request = super::ProcessRequest::new(
+            "/usr/bin/python3",
+            vec![
+                "-c".into(),
+                "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen()".into(),
+            ],
+            std::env::temp_dir(),
+        );
+        let mut wire = serde_json::to_value(request).unwrap();
+        wire["network_scope"] = serde_json::json!("Loopback");
+        let request = serde_json::from_value(wire).unwrap();
+        let result = super::CommandRunner::new()
+            .run(request, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(
+            result.exit_code,
+            Some(0),
+            "unsafe scoped listen must fail closed"
+        );
+        assert!(
+            result.stderr.contains("Operation not permitted"),
+            "{}",
+            result.stderr
+        );
+    }
+
     use super::*;
 
     /// C2: execution status and command outcome are separate axes. A non-zero

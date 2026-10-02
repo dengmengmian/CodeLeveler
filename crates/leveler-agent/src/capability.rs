@@ -126,6 +126,26 @@ impl CapabilityDisclosure {
             enable_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
+    pub fn available(&self, id: CapabilityId) -> bool {
+        self.available.contains(&id)
+    }
+
+    pub async fn enable_with_authority(
+        &self,
+        id: CapabilityId,
+        unrestricted: bool,
+    ) -> Result<bool, String> {
+        if unrestricted {
+            if !self.available(id) {
+                return Err(format!("capability unavailable: {}", id.as_str()));
+            }
+            // Full already exposes every mechanically available capability;
+            // bypassing permission must not manufacture a persisted grant.
+            return Ok(false);
+        }
+        self.enable(id).await
+    }
+
     pub fn active(&self) -> Vec<CapabilityId> {
         self.active
             .read()
@@ -173,6 +193,22 @@ impl CapabilityDisclosure {
         )
         .expect("empty active set")
     }
+    pub fn catalog_with_authority(&self, unrestricted: bool) -> serde_json::Value {
+        if !unrestricted {
+            return self.catalog();
+        }
+        serde_json::json!(
+            CapabilityId::ALL
+                .into_iter()
+                .map(|id| serde_json::json!({
+                    "id": id.as_str(), "description": id.description(),
+                    "available": self.available(id), "permitted": self.available(id),
+                    "exposed": self.available(id),
+                }))
+                .collect::<Vec<_>>()
+        )
+    }
+
     pub fn catalog(&self) -> serde_json::Value {
         serde_json::json!(Self::catalog_entries(self))
     }
@@ -268,6 +304,34 @@ mod tests {
         assert!(!state.enable(CapabilityId::Browser).await.unwrap());
         assert!(state.fresh().active().is_empty());
     }
+    #[tokio::test]
+    async fn full_capability_authority_bypasses_permission_but_not_availability() {
+        let state = CapabilityDisclosure::new(vec![CapabilityId::Memory], vec![], vec![]).unwrap();
+        assert!(
+            state
+                .enable_with_authority(CapabilityId::Memory, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            !state
+                .enable_with_authority(CapabilityId::Memory, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            state
+                .enable_with_authority(CapabilityId::Browser, true)
+                .await
+                .unwrap_err()
+                .contains("unavailable")
+        );
+        assert!(
+            state.active().is_empty(),
+            "Full permission bypass must not persist a grant"
+        );
+    }
+
     #[tokio::test]
     async fn availability_and_permission_both_gate_enable() {
         let state = CapabilityDisclosure::new(vec![CapabilityId::Memory], vec![], vec![]).unwrap();

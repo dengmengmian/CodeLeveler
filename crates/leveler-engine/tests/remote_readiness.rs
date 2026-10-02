@@ -22,6 +22,7 @@ async fn pending_approval_survives_a_restart_via_the_event_log() {
         log.append(
             None,
             EngineEvent::ApprovalRequested {
+                grant: None,
                 id: ApprovalId::generate(),
                 call_id: Some("c1".into()),
                 agent_id: None,

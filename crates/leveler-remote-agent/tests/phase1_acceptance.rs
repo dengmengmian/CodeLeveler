@@ -505,6 +505,8 @@ async fn a_phone_pairs_switches_projects_gets_a_timeout_reconnects_and_is_revoke
         .events
         .send(RuntimeEvent::ApprovalRequested {
             request: UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: ApprovalId::new("a1"),
                 tool: "run_command".to_string(),
                 summary: "rm -rf build".to_string(),

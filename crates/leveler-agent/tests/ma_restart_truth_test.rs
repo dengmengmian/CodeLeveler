@@ -174,6 +174,9 @@ fn engine_on(db: &Database, dir: &Path, responses: Vec<ModelResponse>) -> Coding
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime: Arc::new(MockRuntime::new(responses)),
             registry: Arc::new(default_registry()),
             tool_context,
@@ -1660,7 +1663,7 @@ async fn a_restarted_agent_child_keeps_its_spawn_time_definition() {
         "V2_INSTRUCTIONS_AFTER_EDIT",
     );
     let db = Database::connect_in_memory().await.unwrap();
-    let (engine, runtime) = routed_engine(
+    let (mut engine, runtime) = routed_engine(
         &db,
         dir.path(),
         vec![
@@ -1672,6 +1675,8 @@ async fn a_restarted_agent_child_keeps_its_spawn_time_definition() {
             text("reviewed"),
         ],
     );
+    // Test the frozen scope without granting permission to exceed it.
+    engine.approver = Arc::new(leveler_execution::AutoDeny);
     let spec = gated_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
     seed_interrupted_agent_child(
@@ -1750,7 +1755,7 @@ async fn a_restarted_agent_child_survives_deletion_and_keeps_its_write_roots() {
     let dir = workspace_dir();
     std::fs::create_dir_all(dir.path().join("web")).unwrap();
     let db = Database::connect_in_memory().await.unwrap();
-    let (engine, runtime) = routed_engine(
+    let (mut engine, runtime) = routed_engine(
         &db,
         dir.path(),
         vec![
@@ -1777,6 +1782,8 @@ async fn a_restarted_agent_child_survives_deletion_and_keeps_its_write_roots() {
             text("done"),
         ],
     );
+    // Test the frozen scope without granting permission to exceed it.
+    engine.approver = Arc::new(leveler_execution::AutoDeny);
     let spec = gated_spec(dir.path());
     let session = engine.create_task(&spec).await.unwrap();
     // No definition on disk at all: it was deleted after the spawn.

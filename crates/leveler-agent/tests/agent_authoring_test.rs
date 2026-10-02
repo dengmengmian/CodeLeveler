@@ -1,9 +1,8 @@
 //! Agent Extensibility — authoring through the conversation.
 //!
 //! The model proposes a definition with `save_agent`; the validator decides
-//! whether it is well-formed, a human decides whether it is written, and the
-//! store writes it atomically. Nothing the model says can skip either step,
-//! in any permission profile.
+//! whether it is well-formed, and the store writes it atomically. Auto requires
+//! human approval; Full bypasses permission approval while retaining validation.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -250,7 +249,7 @@ async fn a_confirmed_proposal_is_written_validated_and_previewed() {
     let human = Human::new(ApprovalDecision::ApproveOnce);
     let (results, tools) = env
         .run(
-            PermissionProfile::FullAccess,
+            PermissionProfile::Assisted,
             human.clone(),
             vec![call("save_agent", reviewer_proposal("project"))],
         )
@@ -266,7 +265,11 @@ async fn a_confirmed_proposal_is_written_validated_and_previewed() {
     assert!(!is_error, "{preview}");
 
     let asked = human.asked();
-    assert_eq!(asked.len(), 1, "a human confirms even under full access");
+    assert_eq!(
+        asked.len(),
+        1,
+        "Auto requires a human to confirm the proposal"
+    );
     let d = &asked[0].description;
     for needle in [
         "security-reviewer",
@@ -301,7 +304,7 @@ async fn nothing_is_written_without_a_human_yes() {
         let env = Env::new();
         let (results, _) = env
             .run(
-                PermissionProfile::FullAccess,
+                PermissionProfile::Assisted,
                 approver,
                 vec![call("save_agent", reviewer_proposal("project"))],
             )
@@ -310,6 +313,27 @@ async fn nothing_is_written_without_a_human_yes() {
         assert!(*is_error, "{label}");
         assert!(!env.project_agent("security-reviewer").exists(), "{label}");
     }
+}
+
+#[tokio::test]
+async fn full_access_writes_a_valid_proposal_without_human_approval() {
+    let env = Env::new();
+    let human = Human::headless();
+    let (results, _) = env
+        .run(
+            PermissionProfile::FullAccess,
+            human.clone(),
+            vec![call("save_agent", reviewer_proposal("project"))],
+        )
+        .await;
+    let (_, is_error, preview) = result_of(&results, "save_agent");
+    assert!(!is_error, "{preview}");
+    assert!(human.asked().is_empty());
+    assert!(
+        env.project_agent("security-reviewer")
+            .join("agent.yaml")
+            .is_file()
+    );
 }
 
 #[tokio::test]
@@ -365,7 +389,7 @@ async fn a_session_approval_does_not_carry_over_to_a_different_proposal() {
     second["capability"] = serde_json::json!("writer");
     second["tools"] = serde_json::json!(["read_file", "apply_patch", "run_command"]);
     env.run(
-        PermissionProfile::FullAccess,
+        PermissionProfile::Assisted,
         human.clone(),
         vec![
             call("save_agent", reviewer_proposal("project")),
@@ -438,7 +462,7 @@ async fn delete_needs_confirmation_and_then_removes_the_definition() {
     let env = Env::new();
     let human = Human::new(ApprovalDecision::ApproveOnce);
     env.run(
-        PermissionProfile::FullAccess,
+        PermissionProfile::Assisted,
         human.clone(),
         vec![
             call("save_agent", reviewer_proposal("project")),
@@ -455,36 +479,42 @@ async fn delete_needs_confirmation_and_then_removes_the_definition() {
 }
 
 #[tokio::test]
-async fn delegated_children_are_never_offered_the_authoring_tools() {
-    let env = Env::new();
-    let human = Human::new(ApprovalDecision::ApproveOnce);
-    let (_, tools) = env
-        .run(
-            PermissionProfile::FullAccess,
-            human,
-            vec![call(
-                "spawn_agent",
-                serde_json::json!({"task": "look around", "run_in_background": false}),
-            )],
-        )
-        .await;
-    let child: Vec<&Vec<String>> = tools
-        .iter()
-        .filter(|t| t.iter().any(|n| n == "report_finding"))
-        .collect();
-    assert!(!child.is_empty(), "the child ran");
-    for t in child {
-        for authoring in [
-            "list_agents",
-            "save_agent",
-            "delete_agent",
-            "save_skill",
-            "delete_skill",
-        ] {
-            assert!(
-                !t.iter().any(|n| n == authoring),
-                "{authoring} reached a child: {t:?}"
-            );
+async fn delegated_authoring_tools_follow_the_permission_profile() {
+    for (profile, authoring_exposed) in [
+        (PermissionProfile::Assisted, false),
+        (PermissionProfile::FullAccess, true),
+    ] {
+        let env = Env::new();
+        let human = Human::new(ApprovalDecision::ApproveOnce);
+        let (_, tools) = env
+            .run(
+                profile,
+                human,
+                vec![call(
+                    "spawn_agent",
+                    serde_json::json!({"task": "look around", "run_in_background": false}),
+                )],
+            )
+            .await;
+        let child: Vec<&Vec<String>> = tools
+            .iter()
+            .filter(|t| t.iter().any(|n| n == "report_finding"))
+            .collect();
+        assert!(!child.is_empty(), "the child ran");
+        for t in child {
+            for authoring in [
+                "list_agents",
+                "save_agent",
+                "delete_agent",
+                "save_skill",
+                "delete_skill",
+            ] {
+                assert_eq!(
+                    t.iter().any(|n| n == authoring),
+                    authoring_exposed,
+                    "{authoring} exposure for {profile:?}: {t:?}"
+                );
+            }
         }
     }
 }

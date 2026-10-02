@@ -62,7 +62,7 @@ impl Tool for ReadFileTool {
          relative path is resolved from the workspace root. An absolute path \
          is read as given; reads are not confined to the workspace. A `~` \
          prefix is not home-expanded. Credential files such as `.env` and \
-         private keys are refused. A directory path is an error; this tool \
+         private keys require approval outside full-access mode. A directory path is an error; this tool \
          does not list directories. `start_line`/`end_line` return that \
          inclusive range; omitting both returns the whole file. A result too \
          large for one call is cut at a line boundary and names the line to \
@@ -87,6 +87,11 @@ impl Tool for ReadFileTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        let path = input.get("path")?.as_str()?;
+        crate::workspace::path_approval_reason(context, path, false)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -94,7 +99,9 @@ impl Tool for ReadFileTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
-        let path = context.require_workspace()?.resolve_for_read(&input.path)?;
+        let path = context
+            .execution_workspace()?
+            .resolve_for_read(&input.path)?;
 
         // Page at the budget the registry will enforce, less the room the
         // marker needs. `saturating_sub` keeps a pathologically small budget

@@ -64,6 +64,11 @@ impl Tool for FindFilesTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        let path = input.get("path")?.as_str()?;
+        crate::workspace::path_approval_reason(context, path, false)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -72,7 +77,9 @@ impl Tool for FindFilesTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
         let base_label = input.path.as_deref().unwrap_or(".");
-        let base = context.require_workspace()?.resolve_for_read(base_label)?;
+        let base = context
+            .execution_workspace()?
+            .resolve_for_read(base_label)?;
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, HARD_LIMIT);
 
         let found = match WorkspaceSearch::find(

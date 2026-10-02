@@ -53,6 +53,11 @@ impl Tool for WriteFileTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        let path = input.get("path")?.as_str()?;
+        crate::workspace::path_approval_reason(context, path, true)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -61,11 +66,11 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolOutput, ToolError> {
         let input: Input = super::parse_input(self.name(), input)?;
 
-        if let Some(denied) = context.policy.write_path_denied(&input.path) {
+        if let Some(denied) = context.write_path_denied(&input.path) {
             return Ok(ToolOutput::error(denied));
         }
         let resolved = match context
-            .require_workspace()?
+            .execution_workspace()?
             .resolve_for_write(&input.path, &context.write_scope())
         {
             Ok(resolved) => resolved,
@@ -107,7 +112,7 @@ impl Tool for WriteFileTool {
         };
 
         match commit {
-            Commit::Written => {}
+            Commit::Written(_) => {}
             Commit::Stale => {
                 return Ok(ToolOutput::error(format!(
                     "{} changed on disk while this write was being committed — \
@@ -145,6 +150,139 @@ impl Tool for WriteFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resource_grant_writes_exact_external_file_without_global_authority() {
+        use leveler_core::{Capability, GrantBinding, GrantRequest, GrantScope};
+        use leveler_execution::{
+            AuthorizationEvidence, NetworkScope, PermissionProfile, ResolvedExecutionPolicy,
+            WriteScope,
+        };
+        let (ctx, _root) = super::super::test_ctx(PermissionProfile::Assisted, &[]);
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("approved.txt");
+        let other = outside.path().join("other.txt");
+        std::fs::write(&path, "original").unwrap();
+        std::fs::write(&other, "original-other").unwrap();
+        let resource = leveler_execution::resolve_filesystem_resource(&path).unwrap();
+        let approved = ctx.with_resolved_policy(ResolvedExecutionPolicy::new(
+            WriteScope::None,
+            NetworkScope::None,
+            AuthorizationEvidence::ResourceGrant {
+                request: GrantRequest {
+                    project_identity: "p".into(),
+                    bindings: vec![GrantBinding {
+                        capability: Capability::FilesystemWrite,
+                        resource,
+                    }],
+                },
+                scope: GrantScope::Session,
+            },
+        ));
+        let result = run(
+            approved.clone(),
+            serde_json::json!({"path":path,"content":"approved-change"}),
+        )
+        .await;
+        let other_result = run(
+            approved.clone(),
+            serde_json::json!({"path":other,"content":"unauthorized-change"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(other_result.is_error);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "approved-change");
+        assert_eq!(std::fs::read_to_string(other).unwrap(), "original-other");
+        assert!(!approved.policy.unrestricted_execution());
+        assert_eq!(approved.policy.network_scope(), NetworkScope::None);
+    }
+
+    #[tokio::test]
+    async fn sensitive_and_external_file_actions_request_exact_approval() {
+        use leveler_execution::{
+            AuthorizationEvidence, NetworkScope, PermissionProfile, ResolvedExecutionPolicy,
+            WriteScope,
+        };
+        let (ctx, dir) = super::super::test_ctx(PermissionProfile::Assisted, &[]);
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join(".env");
+        let input = serde_json::json!({"path":path,"content":"approved-fixture\n"});
+        assert!(WriteFileTool.approval_reason(&input, &ctx).is_some());
+        assert!(
+            super::super::read_file::ReadFileTool
+                .approval_reason(&input, &ctx)
+                .is_some()
+        );
+        assert!(run(ctx.clone(), input.clone()).await.is_error);
+        let approved = ctx
+            .clone()
+            .with_resolved_policy(ResolvedExecutionPolicy::new(
+                WriteScope::None,
+                NetworkScope::None,
+                AuthorizationEvidence::ApprovedOnce,
+            ));
+        let written = run(approved, input).await;
+        assert!(!written.is_error, "{}", written.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "approved-fixture\n"
+        );
+        assert!(
+            WriteFileTool
+                .approval_reason(&serde_json::json!({"path":path,"content":"next"}), &ctx)
+                .is_some()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_reads_creates_updates_and_patches_external_credentials() {
+        let (ctx, dir) =
+            super::super::test_ctx(leveler_execution::PermissionProfile::FullAccess, &[]);
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("nested/.env");
+        let create = run(
+            ctx.clone(),
+            serde_json::json!({"path":path,"content":"before\n"}),
+        )
+        .await;
+        assert!(!create.is_error, "{}", create.content);
+        let read = super::super::read_file::ReadFileTool
+            .execute(
+                serde_json::json!({"path":path}),
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !read.is_error && read.content.contains("before"),
+            "{}",
+            read.content
+        );
+        let update = run(
+            ctx.clone(),
+            serde_json::json!({"path":path,"content":"after\n"}),
+        )
+        .await;
+        assert!(!update.is_error, "{}", update.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-after\n+patched\n*** End Patch",
+            path.display()
+        );
+        let patched = super::super::apply_patch::ApplyPatchTool
+            .execute(
+                serde_json::json!({"patch":patch}),
+                ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!patched.is_error, "{}", patched.content);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "patched\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     async fn run(ctx: ToolContext, args: serde_json::Value) -> ToolOutput {
         WriteFileTool

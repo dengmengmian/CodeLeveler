@@ -254,6 +254,7 @@ struct TaskInner {
 /// Process-backed background task registry shared via [`Arc`] on tool context.
 #[derive(Clone)]
 pub struct BackgroundTaskRegistry {
+    instance_identity: Arc<str>,
     inner: Arc<Mutex<RegistryState>>,
     /// Spawn reservations live outside the async mutex so dropping a
     /// cancelled spawn future can release its slot synchronously.
@@ -384,6 +385,7 @@ impl BackgroundTaskRegistry {
     pub fn with_environment(environment: Arc<leveler_core::EnvSnapshot>) -> Self {
         let (lifecycle_events, _) = broadcast::channel(256);
         Self {
+            instance_identity: Arc::from(leveler_core::new_uuid_string()),
             inner: Arc::new(Mutex::new(RegistryState::default())),
             pending_spawns: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -978,13 +980,77 @@ impl BackgroundTaskRegistry {
         st.tasks.get(id).map(snapshot)
     }
 
+    /// Inspect ownership without reconciling terminal facts, acknowledging them,
+    /// advancing a log cursor, or consuming a settlement report.
+    pub async fn peek_task_owner(&self, id: &str) -> Result<Option<String>, String> {
+        if id.starts_with("host-") {
+            return Ok(self
+                .host_client()
+                .await?
+                .get_unrestricted(id)
+                .await?
+                .owner_scope);
+        }
+        let state = self.inner.lock().await;
+        state
+            .tasks
+            .get(id)
+            .map(|task| task.owner_scope.clone())
+            .ok_or_else(|| format!("unknown task `{id}`"))
+    }
+
+    /// Resolve local task creation and ownership proof without consuming output.
+    /// Hosted tasks require host incarnation proof and currently earn no grant.
+    pub async fn resource_identity(
+        &self,
+        id: &str,
+    ) -> Result<Option<leveler_core::ResourceIdentity>, String> {
+        if id.starts_with("host-") {
+            return Ok(None);
+        }
+        let state = self.inner.lock().await;
+        let task = state
+            .tasks
+            .get(id)
+            .ok_or_else(|| format!("unknown task `{id}`"))?;
+        let Some(pid) = task.pid else {
+            return Ok(None);
+        };
+        Ok(Some(leveler_core::ResourceIdentity::BackgroundTask {
+            runtime: self.instance_identity.to_string(),
+            task_id: task.id.clone(),
+            owner: task
+                .owner_scope
+                .clone()
+                .unwrap_or_else(|| format!("runtime:{}", self.instance_identity)),
+            process_identity: format!("{}:{}:{pid}", self.instance_identity, task.id),
+        }))
+    }
+
     pub async fn get_owned(&self, id: &str, owner: &str) -> Result<BackgroundTaskSnapshot, String> {
+        self.get_authorized(id, owner, false).await
+    }
+
+    pub async fn get_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+    ) -> Result<BackgroundTaskSnapshot, String> {
         if id.starts_with("host-") {
             let client = self.host_client().await?;
-            let task = client.get_owned(id, owner).await?;
+            let task = if unrestricted {
+                client.get_unrestricted(id).await?
+            } else {
+                client.get_owned(id, owner).await?
+            };
             if task.status.is_terminal() {
                 self.journal()?.reconcile(id).await?;
-                client.acknowledge(id, owner).await?;
+                if unrestricted {
+                    client.acknowledge_unrestricted(id).await?;
+                } else {
+                    client.acknowledge(id, owner).await?;
+                };
             }
             return Ok(task);
         }
@@ -993,7 +1059,9 @@ impl BackgroundTaskRegistry {
             .tasks
             .get(id)
             .ok_or_else(|| format!("unknown task `{id}`"))?;
-        check_owner(task, owner)?;
+        if !unrestricted {
+            check_owner(task, owner)?;
+        }
         Ok(snapshot(task))
     }
 
@@ -1004,10 +1072,22 @@ impl BackgroundTaskRegistry {
         timeout: Option<Duration>,
         cancellation: &CancellationToken,
     ) -> Result<BackgroundTaskSnapshot, String> {
+        self.wait_authorized(id, owner, false, timeout, cancellation)
+            .await
+    }
+
+    pub async fn wait_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+        timeout: Option<Duration>,
+        cancellation: &CancellationToken,
+    ) -> Result<BackgroundTaskSnapshot, String> {
         if id.starts_with("host-") {
             let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
             loop {
-                let task = self.get_owned(id, owner).await?;
+                let task = self.get_authorized(id, owner, unrestricted).await?;
                 if task.status.is_terminal()
                     || deadline.is_some_and(|d| tokio::time::Instant::now() >= d)
                 {
@@ -1019,7 +1099,7 @@ impl BackgroundTaskRegistry {
         // Task IDs are never reused and owner_scope is immutable. The wait
         // subscribes only after this locked authorization; observation checks
         // ownership again before delivering bytes or advancing a cursor.
-        self.get_owned(id, owner).await?;
+        self.get_authorized(id, owner, unrestricted).await?;
         self.wait(id, timeout, cancellation).await
     }
 
@@ -1028,8 +1108,17 @@ impl BackgroundTaskRegistry {
         id: &str,
         owner: &str,
     ) -> Result<Option<BackgroundSettlement>, String> {
+        self.take_settlement_authorized(id, owner, false).await
+    }
+
+    pub async fn take_settlement_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+    ) -> Result<Option<BackgroundSettlement>, String> {
         if id.starts_with("host-") {
-            let task = self.get_owned(id, owner).await?;
+            let task = self.get_authorized(id, owner, unrestricted).await?;
             if !task.status.is_terminal() {
                 return Ok(None);
             }
@@ -1040,7 +1129,9 @@ impl BackgroundTaskRegistry {
             .tasks
             .get_mut(id)
             .ok_or_else(|| format!("unknown task `{id}`"))?;
-        check_owner(task, owner)?;
+        if !unrestricted {
+            check_owner(task, owner)?;
+        }
         if task.settlement_reported {
             return Ok(None);
         }
@@ -1298,6 +1389,27 @@ impl BackgroundTaskRegistry {
             .await
     }
 
+    pub async fn observe_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+        cursor: Option<u64>,
+        max_bytes: usize,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<BackgroundTaskObservation, String> {
+        self.observe_scoped(
+            id,
+            if unrestricted { None } else { Some(owner) },
+            cursor,
+            max_bytes,
+            timeout,
+            cancellation,
+        )
+        .await
+    }
+
     async fn observe_scoped(
         &self,
         id: &str,
@@ -1308,15 +1420,17 @@ impl BackgroundTaskRegistry {
         cancellation: &CancellationToken,
     ) -> Result<BackgroundTaskObservation, String> {
         if id.starts_with("host-") {
-            let owner = owner.ok_or("hosted task requires session authorization")?;
             let client = self.host_client().await?;
             let mut result = tokio::select! {
                 _ = cancellation.cancelled() => return Err("wait cancelled".into()),
-                result = client.observe_owned(id, owner, cursor, max_bytes, timeout) => result?,
+                result = async { match owner { Some(owner) => client.observe_owned(id, owner, cursor, max_bytes, timeout).await, None => client.observe_unrestricted(id, cursor, max_bytes, timeout).await } } => result?,
             };
             if result.snapshot.status.is_terminal() {
                 result.settlement = Some(self.journal()?.reconcile(id).await?);
-                client.acknowledge(id, owner).await?;
+                match owner {
+                    Some(owner) => client.acknowledge(id, owner).await?,
+                    None => client.acknowledge_unrestricted(id).await?,
+                };
             }
             return Ok(result);
         }
@@ -1519,18 +1633,33 @@ impl BackgroundTaskRegistry {
         self.kill_scoped(id, Some(owner)).await
     }
 
+    pub async fn kill_authorized(
+        &self,
+        id: &str,
+        owner: &str,
+        unrestricted: bool,
+    ) -> Result<BackgroundTaskSnapshot, String> {
+        self.kill_scoped(id, if unrestricted { None } else { Some(owner) })
+            .await
+    }
+
     async fn kill_scoped(
         &self,
         id: &str,
         owner: Option<&str>,
     ) -> Result<BackgroundTaskSnapshot, String> {
         if id.starts_with("host-") {
-            let owner = owner.ok_or("hosted task requires session authorization")?;
             let client = self.host_client().await?;
-            let task = client.kill_owned(id, owner).await?;
+            let task = match owner {
+                Some(owner) => client.kill_owned(id, owner).await?,
+                None => client.kill_unrestricted(id).await?,
+            };
             if task.status.is_terminal() {
                 self.journal()?.reconcile(id).await?;
-                client.acknowledge(id, owner).await?;
+                match owner {
+                    Some(owner) => client.acknowledge(id, owner).await?,
+                    None => client.acknowledge_unrestricted(id).await?,
+                };
             }
             return Ok(task);
         }

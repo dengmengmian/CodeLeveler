@@ -11,6 +11,15 @@ CodeLeveler 的架构权威是：
 
 如果本文件与架构文档冲突，以架构文档为准，并修正本文件。
 
+## Permission Mode 产品契约
+
+这是稳定产品语义，不是阶段性计划。实现机制的 owner 与当前支持限制见 `docs/ARCHITECTURE.zh-CN.md`。
+
+- **Full**（代码名 `FullAccess`）：完全放开。CodeLeveler **MUST NOT ASK、DENY 或施加权限 / sandbox 限制**。文件、外部路径、HOME、凭据、Git remote、网络、进程控制及未来已可用能力均适用；不得逐项补 allow。实际能力不存在、参数无效、OS / 程序 / 远程服务失败仍应如实报错。审批次数必须为 0。
+- **Auto**（代码名 `Assisted`）：普通开发动作默认允许。危险、高风险、敏感凭据或控制外部进程的动作在执行前 ASK；批准冻结在这次明确动作上，执行层不得再次以权限或 sandbox 拒绝该动作，也不得扩展到之后未经批准的调用。Once / Session / Project 只对可被执行层重新绑定并校验的 resource 复用。
+- **Restricted**（代码名 `RequestApproval`）：使用目的地和资源边界。平台无法可靠 enforce 的范围必须显式 ASK / DENY / Unsupported，**永不静默扩权**。
+- Full 优先于 NetworkScope、Resource Grant、Credential Broker、Git Effect、进程所有权、只读权限 overlay 与 capability permission。工具未实现或未配置不等于权限拒绝。
+
 这份规则分三层：
 
 1. **通用 Agent 工程规则**：适用于日常开发、修复、评审、文档和协作。

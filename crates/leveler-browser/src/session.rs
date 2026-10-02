@@ -54,7 +54,8 @@ pub struct Browser {
     profile_dir: PathBuf,
     /// `[browser].default`, when the user set one.
     configured: Option<BrowserProduct>,
-    live: Mutex<Option<Live>>,
+    live: Arc<Mutex<Option<Live>>>,
+    unrestricted: bool,
 }
 
 impl Browser {
@@ -63,7 +64,20 @@ impl Browser {
             env,
             profile_dir,
             configured,
-            live: Mutex::new(None),
+            live: Arc::new(Mutex::new(None)),
+            unrestricted: false,
+        }
+    }
+
+    /// Derive a per-call handle from frozen host authority. Shared browser state
+    /// keeps its owners; the permission bypass expires when this handle drops.
+    pub fn with_call_authority(&self, unrestricted: bool) -> Self {
+        Self {
+            env: self.env.clone(),
+            profile_dir: self.profile_dir.clone(),
+            configured: self.configured,
+            live: self.live.clone(),
+            unrestricted,
         }
     }
 
@@ -208,7 +222,7 @@ impl Browser {
             .as_ref()
             .ok_or_else(|| BrowserError::Unavailable("no browser started".into()))?
             .tabs;
-        own_tab(tabs, session, tab)
+        own_tab(tabs, session, tab, self.unrestricted)
     }
 
     async fn generation(&self, tab: &TabId) -> BrowserResult<u64> {
@@ -241,7 +255,9 @@ impl Browser {
         explicit: Option<BrowserProduct>,
         url: &str,
     ) -> BrowserResult<ActionOutcome> {
-        refuse_metadata_target(url)?;
+        if !self.unrestricted {
+            refuse_metadata_target(url)?;
+        }
         self.ensure_live(explicit).await?;
         let backend = self.backend().await?;
         let tab = match self.active_tab(session).await {
@@ -319,7 +335,7 @@ impl Browser {
     }
 
     /// The tabs this session owns, reconciled against what the browser still
-    /// has. A session never sees another session's tabs (§19).
+    /// has. Scoped calls see only this session's tabs (§19).
     pub async fn tabs(&self, session: &BrowserSessionId) -> BrowserResult<Vec<TabInfo>> {
         let backend = self.backend().await?;
         let live = self.guarded(backend.list_tabs().await).await?;
@@ -331,7 +347,13 @@ impl Browser {
         l.tabs.retain(|id, _| ids.contains(id));
         l.active.retain(|_, t| ids.contains(t));
         let current = l.active.get(session).cloned();
-        Ok(owned_tabs(&l.tabs, &live, session, current.as_ref()))
+        Ok(owned_tabs(
+            &l.tabs,
+            &live,
+            session,
+            current.as_ref(),
+            self.unrestricted,
+        ))
     }
 
     /// A bounded semantic snapshot. Mints a new generation, so the refs it
@@ -523,33 +545,35 @@ fn parse_ref(s: &str) -> Option<(u64, u64)> {
     Some((generation.parse().ok()?, rest.parse().ok()?))
 }
 
-/// A session may only act on tabs it owns.
+/// Scoped calls may only act on tabs they own. Existence remains mechanical.
 fn own_tab(
     tabs: &HashMap<TabId, TabState>,
     session: &BrowserSessionId,
     tab: &TabId,
+    unrestricted: bool,
 ) -> BrowserResult<()> {
     match tabs.get(tab) {
         None => Err(BrowserError::TabClosed(format!("unknown tab {tab}"))),
-        Some(s) if &s.session != session => Err(BrowserError::TabClosed(format!(
+        Some(s) if !unrestricted && &s.session != session => Err(BrowserError::TabClosed(format!(
             "tab {tab} belongs to another session"
         ))),
         Some(_) => Ok(()),
     }
 }
 
-/// The tabs one session may see. Pure, so isolation is tested without a
-/// browser.
+/// Apply call authority to existing tab visibility. Pure, so scoped isolation
+/// and unrestricted access are tested without a browser.
 fn owned_tabs(
     tabs: &HashMap<TabId, TabState>,
     live: &[crate::backend::RawTab],
     session: &BrowserSessionId,
     current: Option<&TabId>,
+    unrestricted: bool,
 ) -> Vec<TabInfo> {
     let mut out = Vec::new();
     for raw in live {
         match tabs.get(&raw.tab) {
-            Some(state) if &state.session == session => out.push(TabInfo {
+            Some(state) if unrestricted || &state.session == session => out.push(TabInfo {
                 tab: raw.tab.clone(),
                 url: raw.url.clone(),
                 title: raw.title.clone(),
@@ -660,12 +684,12 @@ mod tests {
         tabs.insert(TabId::new("t2"), state("B"));
         let live = [raw("t1", "http://a", "A"), raw("t2", "http://b", "B")];
 
-        let a = owned_tabs(&tabs, &live, &BrowserSessionId::new("A"), None);
+        let a = owned_tabs(&tabs, &live, &BrowserSessionId::new("A"), None, false);
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].tab.as_str(), "t1");
         assert!(a.iter().all(|t| t.url != "http://b" && t.title != "B"));
 
-        let b = owned_tabs(&tabs, &live, &BrowserSessionId::new("B"), None);
+        let b = owned_tabs(&tabs, &live, &BrowserSessionId::new("B"), None, false);
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].tab.as_str(), "t2");
     }
@@ -676,7 +700,7 @@ mod tests {
         tabs.insert(TabId::new("t1"), state("A"));
         tabs.insert(TabId::new("t2"), state("A"));
         let live = [raw("t1", "http://a", "A")];
-        let a = owned_tabs(&tabs, &live, &BrowserSessionId::new("A"), None);
+        let a = owned_tabs(&tabs, &live, &BrowserSessionId::new("A"), None, false);
         assert_eq!(a.len(), 1);
     }
 
@@ -687,7 +711,7 @@ mod tests {
         tabs.insert(TabId::new("t3"), state("A"));
         let live = [raw("t1", "u1", "x"), raw("t3", "u3", "y")];
         let cur = TabId::new("t3");
-        let a = owned_tabs(&tabs, &live, &BrowserSessionId::new("A"), Some(&cur));
+        let a = owned_tabs(&tabs, &live, &BrowserSessionId::new("A"), Some(&cur), false);
         let active: Vec<_> = a
             .iter()
             .filter(|t| t.active)
@@ -697,16 +721,29 @@ mod tests {
     }
 
     #[test]
+    fn unrestricted_call_accesses_foreign_tabs_without_transferring_ownership() {
+        let mut tabs = HashMap::new();
+        tabs.insert(TabId::new("t1"), state("A"));
+        let session = BrowserSessionId::new("B");
+        assert!(own_tab(&tabs, &session, &TabId::new("t1"), true).is_ok());
+        let live = [raw("t1", "http://a", "A")];
+        assert_eq!(owned_tabs(&tabs, &live, &session, None, true).len(), 1);
+        assert_eq!(tabs[&TabId::new("t1")].session, BrowserSessionId::new("A"));
+        assert!(own_tab(&tabs, &session, &TabId::new("unknown"), true).is_err());
+        assert!(own_tab(&tabs, &session, &TabId::new("t1"), false).is_err());
+    }
+
+    #[test]
     fn another_sessions_tab_is_refused() {
         let mut tabs = HashMap::new();
         tabs.insert(TabId::new("t1"), state("A"));
-        assert!(own_tab(&tabs, &BrowserSessionId::new("A"), &TabId::new("t1")).is_ok());
+        assert!(own_tab(&tabs, &BrowserSessionId::new("A"), &TabId::new("t1"), false).is_ok());
         assert!(matches!(
-            own_tab(&tabs, &BrowserSessionId::new("B"), &TabId::new("t1")),
+            own_tab(&tabs, &BrowserSessionId::new("B"), &TabId::new("t1"), false),
             Err(BrowserError::TabClosed(_))
         ));
         assert!(matches!(
-            own_tab(&tabs, &BrowserSessionId::new("A"), &TabId::new("t9")),
+            own_tab(&tabs, &BrowserSessionId::new("A"), &TabId::new("t9"), false),
             Err(BrowserError::TabClosed(_))
         ));
     }

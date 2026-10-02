@@ -291,6 +291,8 @@ impl Host {
         self.events
             .send(RuntimeEvent::ApprovalRequested {
                 request: UiApprovalRequest {
+                    grant: None,
+                    requires_human_consent: false,
                     id: ApprovalId::new(APPROVAL_ID),
                     tool: "run_command".to_string(),
                     summary: "rm -rf /tmp/x".to_string(),
@@ -455,6 +457,8 @@ async fn an_observe_stream_does_not_arm_the_countdown() {
     host.events
         .send(RuntimeEvent::ApprovalRequested {
             request: UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: ApprovalId::new(APPROVAL_ID),
                 tool: "run_command".to_string(),
                 summary: "rm -rf /tmp/x".to_string(),

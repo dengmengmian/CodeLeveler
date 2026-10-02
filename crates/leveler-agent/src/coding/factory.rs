@@ -93,6 +93,8 @@ pub struct ExecutorFactory {
     pub background_tasks: Arc<leveler_execution::BackgroundTaskRegistry>,
     /// SEC-1 permission rules (may be empty).
     pub permission_rules: leveler_execution::PermissionRuleSet,
+    /// Shared session/project resource grant persistence.
+    pub resource_grants: Arc<dyn leveler_storage::ResourceGrantStore>,
     /// Project permission-rules file; `ApproveAlways` persists new rules here.
     pub permission_rules_path: Option<std::path::PathBuf>,
     /// SEC-8 tool hooks (may be empty).
@@ -181,6 +183,7 @@ impl ExecutorFactory {
         .with_post_edit_action_throughput(resolved.post_edit_action_throughput)
         .with_reasoning_retention(resolved.reasoning_retention)
         .with_permission_rules(self.permission_rules.clone())
+        .with_resource_grants(self.resource_grants.clone())
         .with_permission_rules_path(self.permission_rules_path.clone())
         .with_hook_runner(self.hook_runner.clone())
         .with_steering_opt(self.steering.clone())

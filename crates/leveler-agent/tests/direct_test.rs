@@ -202,6 +202,9 @@ async fn harness_with(
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime,
             registry: Arc::new(default_registry()),
             tool_context,
@@ -1653,6 +1656,9 @@ async fn interrupted_direct_task_resumes_from_the_persisted_transcript() {
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime: Arc::new(MockRuntime::new(patch_then_resolve())),
             registry: Arc::new(default_registry()),
             tool_context: ToolContext::with_environment(
@@ -2070,6 +2076,7 @@ async fn harness_reviewer_cannot_modify_the_code_it_reviews() {
     responses.push(text("reviewed src/auth.rs: login() has no rate limiting"));
 
     let mut h = harness(responses).await;
+    h.engine.approver = Arc::new(leveler_execution::AutoDeny);
     h.engine.factory.independent_review = leveler_agent::coding::IndependentReviewPolicy::Required;
     let s = spec(&h);
     let session = h.engine.create_task(&s).await.unwrap();
@@ -2276,6 +2283,9 @@ async fn unlaunchable_review_leaves_a_persisted_trace() {
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime,
             registry: Arc::new(default_registry()),
             tool_context,
@@ -3212,6 +3222,9 @@ async fn the_step_ceiling_is_per_drive_and_resume_continues_task_spend() {
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime: Arc::new(MockRuntime::new(vec![
                 patch_add("p1", "src/added.rs", "pub fn added() {}"),
                 tool_call(

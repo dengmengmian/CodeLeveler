@@ -20,6 +20,7 @@ mod message_repo;
 mod message_store;
 mod model_request_repo;
 mod ownership_store;
+mod resource_grant_store;
 mod session_facts;
 mod session_repo;
 mod session_store;
@@ -85,3 +86,5 @@ pub(crate) fn redact_json_payload_for_session(
         ))
     })
 }
+
+pub use resource_grant_store::{MemoryResourceGrantStore, ResourceGrantStore};

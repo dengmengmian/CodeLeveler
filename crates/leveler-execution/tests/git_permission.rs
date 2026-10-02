@@ -93,7 +93,7 @@ fn a_git_verdict_never_masks_the_rest_of_the_call() {
     // And an all-harmless script stays harmless.
     for script in [
         "git status; echo done",
-        "git fetch origin && printf done",
+        "git status && printf done",
         "git status; curl https://example.com",
     ] {
         assert_eq!(
@@ -532,5 +532,60 @@ fn push_never_rides_on_the_fetch_decision() {
         push.effects.capabilities(),
         fetch.effects.capabilities(),
         "push and fetch must not share a capability set"
+    );
+}
+
+/// P0-1: a remote Git transfer laundered through a shell wrapper cannot be bound
+/// to an approved remote and credential, so it keeps exact-call approval under
+/// Assisted instead of inheriting the direct `git fetch` auto-run. Full still
+/// never asks.
+#[test]
+fn assisted_asks_for_a_wrapper_remote_git_transfer() {
+    use leveler_execution::{ApprovalPolicy, PermissionProfile, Requirement, RiskLevel};
+    let policy = ApprovalPolicy::default();
+    for script in [
+        "git fetch origin",
+        "git ls-remote origin",
+        "git status && git fetch origin",
+    ] {
+        let args = vec!["-c".to_string(), script.to_string()];
+        let view = CommandView {
+            program: "sh",
+            args: &args,
+        };
+        assert_eq!(
+            policy.evaluate(
+                PermissionProfile::Assisted,
+                "shell_command",
+                RiskLevel::WorkspaceWrite,
+                Some(view),
+            ),
+            Requirement::NeedApproval,
+            "Assisted must ask: {script}"
+        );
+        assert_eq!(
+            policy.evaluate(
+                PermissionProfile::FullAccess,
+                "shell_command",
+                RiskLevel::WorkspaceWrite,
+                Some(view),
+            ),
+            Requirement::Auto,
+            "Full must never ask: {script}"
+        );
+    }
+    // The direct invocation keeps the bindable, grant-eligible auto-run.
+    let args = vec!["fetch".to_string(), "origin".to_string()];
+    assert_eq!(
+        policy.evaluate(
+            PermissionProfile::Assisted,
+            "run_command",
+            RiskLevel::WorkspaceWrite,
+            Some(CommandView {
+                program: "git",
+                args: &args,
+            }),
+        ),
+        Requirement::Auto
     );
 }

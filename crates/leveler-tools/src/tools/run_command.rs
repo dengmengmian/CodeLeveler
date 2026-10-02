@@ -164,6 +164,62 @@ impl Tool for RunCommandTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        if context.policy.unrestricted_execution() {
+            return None;
+        }
+        let input: Input = serde_json::from_value(input.clone()).ok()?;
+        let program = input.program.as_deref()?.trim();
+        if program.is_empty() {
+            return None;
+        }
+        let args = normalize_args(program, input.args);
+        super::shell_guard::refuse_sensitive_args(&args)
+            .or_else(|| super::shell_guard::refuse_run_command_shell_bypass(program, &args))
+            .or_else(|| crate::workspace::cwd_approval_reason(context, input.cwd.as_deref()))
+    }
+
+    async fn command_grant_request(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<Option<leveler_core::GrantRequest>, String> {
+        if input
+            .get("env")
+            .is_some_and(|v| v.as_object().is_none_or(|vars| !vars.is_empty()))
+        {
+            return Ok(None);
+        }
+        let input: Input = serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
+        let root = context
+            .execution
+            .workspace
+            .as_ref()
+            .ok_or("no project resource is attached")?
+            .root();
+        let cwd = input
+            .cwd
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .map(|p| if p.is_absolute() { p } else { root.join(p) })
+            .unwrap_or_else(|| root.to_path_buf());
+        let Some(program) = input
+            .program
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            return Ok(None);
+        };
+        leveler_execution::resolve_git_grant_with_environment(
+            program,
+            &input.args,
+            &cwd,
+            &context.execution.environment,
+        )
+        .await
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -202,7 +258,9 @@ impl Tool for RunCommandTool {
         // Same product semantics as the workspace layer: read_file(".env") is
         // Denied, so `cat .env` via argv must not be the workaround. Applies to
         // background commands too.
-        if let Some(reason) = super::shell_guard::refuse_sensitive_args(&args) {
+        if !context.policy.unrestricted_execution()
+            && let Some(reason) = super::shell_guard::refuse_sensitive_args(&args)
+        {
             return Ok(ToolOutput::error(reason));
         }
         if input.background.unwrap_or(false) {
@@ -221,7 +279,10 @@ impl Tool for RunCommandTool {
             ));
         }
         // Close the `sh -c 'python app.py & …'` bypass of shell_command guards.
-        if let Some(reason) = super::shell_guard::refuse_run_command_shell_bypass(program, &args) {
+        if !context.policy.unrestricted_execution()
+            && let Some(reason) =
+                super::shell_guard::refuse_run_command_shell_bypass(program, &args)
+        {
             return Ok(ToolOutput::error(reason));
         }
         self.commands
@@ -899,6 +960,7 @@ mod tests {
     async fn run_under(
         mode: leveler_execution::PermissionProfile,
         grant_network: bool,
+        deny_network: bool,
         program: &str,
         args: Vec<String>,
     ) -> ToolOutput {
@@ -909,7 +971,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let ws = leveler_execution::Workspace::new(&dir).unwrap();
-        let mut ctx = ToolContext::new(ws, mode);
+        let mut ctx = ToolContext::new(ws, mode).with_sandbox(deny_network);
         if grant_network {
             ctx.policy.grant_network();
         }
@@ -925,12 +987,12 @@ mod tests {
         out
     }
 
-    /// 请求批准: curl, a Python socket and a Node socket are all stopped by
+    /// Explicit network denial: curl, Python and Node sockets are stopped by
     /// the sandbox — nothing connects — and the result says the command needs
     /// network permission, whatever program asked for it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn request_approval_blocks_every_client_and_names_the_network_permission() {
+    async fn explicit_denial_blocks_every_client_and_names_the_network_permission() {
         let clients: Vec<(&str, Box<dyn Fn(u16) -> Vec<String>>)> = vec![
             (
                 "curl",
@@ -974,6 +1036,7 @@ mod tests {
             let out = run_under(
                 leveler_execution::PermissionProfile::RequestApproval,
                 false,
+                true,
                 program,
                 args(port),
             )
@@ -1012,6 +1075,7 @@ mod tests {
             let out = run_under(
                 mode,
                 grant,
+                false,
                 "curl",
                 vec![
                     "-sS".into(),
@@ -1190,6 +1254,9 @@ mod tests {
             vec!["1".into()],
             root.clone(),
             &ctx,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         assert_eq!(req.write_scope.root(), Some(root.as_path()));
         assert!(req.deny_network);
@@ -1209,6 +1276,9 @@ mod tests {
             vec!["1".into()],
             root,
             &ctx,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         assert!(!req.write_scope.confines());
         std::fs::remove_dir_all(&dir).ok();
@@ -1228,6 +1298,9 @@ mod tests {
             vec!["1".into()],
             root,
             &ctx,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         assert!(!req.write_scope.confines());
         std::fs::remove_dir_all(&dir).ok();

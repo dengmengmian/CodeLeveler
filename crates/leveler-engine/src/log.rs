@@ -766,6 +766,7 @@ mod tests {
         log.append(
             Some(&turn),
             EngineEvent::ApprovalRequested {
+                grant: None,
                 id: leveler_core::ApprovalId::generate(),
                 call_id: Some("c2".into()),
                 agent_id: None,
@@ -891,6 +892,7 @@ mod tests {
         log.append(
             Some(&turn_id),
             EngineEvent::ApprovalRequested {
+                grant: None,
                 id: leveler_core::ApprovalId::generate(),
                 call_id: Some("call-1".into()),
                 agent_id: Some("alpha".into()),
@@ -954,6 +956,7 @@ mod tests {
         log.append(
             Some(&turn_id),
             EngineEvent::ApprovalRequested {
+                grant: None,
                 id: leveler_core::ApprovalId::generate(),
                 call_id: None,
                 agent_id: None,

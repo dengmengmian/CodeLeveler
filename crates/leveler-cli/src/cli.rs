@@ -33,6 +33,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Internal JSONL adapter for the desktop shell.
+    #[command(hide = true)]
+    DesktopBridge,
     /// Internal stable owner for project background services.
     #[command(hide = true)]
     ExecutionHost {

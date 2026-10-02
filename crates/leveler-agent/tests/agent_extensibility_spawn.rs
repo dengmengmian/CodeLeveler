@@ -2,9 +2,9 @@
 //!
 //! A `.leveler/agents/<name>/{agent.yaml,instructions.md}` definition spawns
 //! through `spawn_agent(agent=...)` under an existing capability class. Every
-//! bound it declares is enforced by the runtime — toolset, write scope, model,
-//! reasoning effort, rounds — and nothing it or its caller writes can widen the
-//! class. The child runs on the definition as resolved at spawn.
+//! bound it declares is enforced in Auto mode without an explicit user grant.
+//! These fixtures deny permission requests; Full and approved calls have their
+//! own authority regressions. The child runs on the definition resolved at spawn.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -323,7 +323,7 @@ impl Run {
 
 async fn run(repo: &Repo, rt: Rt) -> Run {
     let workspace = Workspace::new(&repo.root).unwrap();
-    let tool_context = ToolContext::new(workspace, PermissionProfile::FullAccess);
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let rt = Arc::new(rt);
     let mut events = Vec::new();
     let mut sink = Records::default();
@@ -334,6 +334,7 @@ async fn run(repo: &Repo, rt: Rt) -> Run {
         ModelRef::new("mock", "m"),
         10,
     )
+    .with_approver(Arc::new(leveler_execution::AutoDeny))
     .with_agent_roots(AgentRoots {
         project_root: Some(repo.root.clone()),
         user_agents_dir: Some(repo.user.clone()),

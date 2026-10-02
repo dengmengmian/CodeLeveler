@@ -1557,6 +1557,8 @@ fn an_approval_request_stops_its_call_reading_as_running() {
         &mut s,
         Action::Runtime(RuntimeEvent::ApprovalRequested {
             request: UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
                 id: ApprovalId::new("a1"),
                 tool: "run_command".into(),
                 summary: String::new(),
@@ -1915,6 +1917,8 @@ fn typed(s: &mut AppState, text: &str) -> Vec<Effect> {
 
 fn approval_req() -> UiApprovalRequest {
     UiApprovalRequest {
+        grant: None,
+        requires_human_consent: false,
         id: ApprovalId::new("r1"),
         tool: "run_command".into(),
         summary: "git push".into(),
@@ -2322,6 +2326,8 @@ fn second_approval_queues_and_advances_after_first_resolved() {
     );
     // Second approval arrives while the first is unanswered → must not clobber it.
     let second = UiApprovalRequest {
+        grant: None,
+        requires_human_consent: false,
         id: ApprovalId::new("r2"),
         tool: "run_command".into(),
         summary: "rm -rf tmp".into(),

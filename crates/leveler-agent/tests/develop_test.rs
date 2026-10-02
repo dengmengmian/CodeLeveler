@@ -168,6 +168,9 @@ async fn harness_with(
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime,
             registry: Arc::new(default_registry()),
             tool_context,
@@ -555,7 +558,8 @@ async fn analyze_cannot_write_to_the_workspace() {
     ];
     responses.extend(coding_stage("added"));
     responses.push(text("DECISION: PASS"));
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.approver = Arc::new(leveler_execution::AutoDeny);
 
     let spec = spec(&h, "add a function");
     let session = h.engine.create_task(&spec).await.unwrap();
@@ -606,7 +610,8 @@ async fn review_cannot_write_to_the_workspace() {
         }),
     ));
     responses.push(text("DECISION: PASS"));
-    let h = harness(responses).await;
+    let mut h = harness(responses).await;
+    h.engine.approver = Arc::new(leveler_execution::AutoDeny);
 
     let spec = spec(&h, "add a function");
     let session = h.engine.create_task(&spec).await.unwrap();

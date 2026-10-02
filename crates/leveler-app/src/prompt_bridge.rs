@@ -305,6 +305,8 @@ impl Approver for ChannelApprover {
 /// The approval as a client shows it.
 fn ui_approval_request(request: &ApprovalRequest) -> UiApprovalRequest {
     UiApprovalRequest {
+        grant: request.grant.clone(),
+        requires_human_consent: request.requires_human_consent(),
         id: request.id.clone(),
         tool: request.tool.clone(),
         summary: request.description.clone(),
@@ -336,8 +338,32 @@ fn risk_bullets(request: &ApprovalRequest) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn approval_projection_preserves_typed_resource_and_human_only_semantics() {
+        let mut request = approval_request();
+        request.grant = Some(leveler_core::GrantRequest {
+            project_identity: "project-a".into(),
+            bindings: vec![leveler_core::GrantBinding {
+                capability: leveler_core::Capability::FilesystemWrite,
+                resource: leveler_core::ResourceIdentity::FilesystemPath {
+                    canonical_path: "/fixture/file".into(),
+                    object_identity: "object-a".into(),
+                },
+            }],
+        });
+        let projected = ui_approval_request(&request);
+        assert_eq!(projected.grant, request.grant);
+        assert!(projected.project_available());
+        assert!(!projected.always_persists);
+        request.tool = "save_agent".into();
+        let projected = ui_approval_request(&request);
+        assert!(projected.requires_human_consent);
+        assert!(!projected.project_available());
+    }
+
     fn approval_request() -> ApprovalRequest {
         ApprovalRequest {
+            grant: None,
             id: ApprovalId::new("approval-disconnect"),
             turn_id: Some(leveler_core::TurnId::new("turn-a")),
             agent_id: None,
@@ -399,6 +425,8 @@ mod tests {
             PendingApproval {
                 binding: PendingBinding::for_approval(SessionId::new("session-a"), &request),
                 request: UiApprovalRequest {
+                    grant: None,
+                    requires_human_consent: false,
                     id: request.id.clone(),
                     tool: request.tool.clone(),
                     summary: request.description.clone(),

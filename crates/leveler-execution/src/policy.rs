@@ -7,8 +7,10 @@
 //! turn-scoped flag: the tool sees the frozen policy, so a profile switch or a
 //! grant made after admission lands on the NEXT call, never this one.
 
+use crate::NetworkScope;
 use crate::approval::ApprovalRequest;
 use crate::risk::{PermissionProfile, WriteScope};
+use leveler_core::{Capability, GrantRequest, GrantScope, ResourceIdentity};
 
 /// Why this call is allowed to run. Recorded on the admitted call so a reader
 /// can tell a profile auto-allow from a human decision.
@@ -26,20 +28,69 @@ pub enum AuthorizationEvidence {
     SessionGrant { signature: String },
     /// The user approved it and asked for a standing rule.
     ApprovedAlways,
+    /// Exact resource bindings approved for reuse; never global authority.
+    ResourceGrant {
+        request: GrantRequest,
+        scope: GrantScope,
+    },
 }
 
 /// The immutable policy an admitted call executes under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedExecutionPolicy {
-    /// The one write boundary. A session grant or a rule never widens it on
-    /// its own — they only skip the prompt — but the boundary a Git call
-    /// carries is derived from that call's own mechanical EFFECTS (a command
-    /// that writes repository metadata runs with the repository's `.git`
-    /// unsealed), and the same derivation applies however the call was
-    /// authorized. See `executor::host::resolve_policy`.
+    /// Auto and resource-granted calls retain their execution boundaries.
+    /// Full and approval of an entire exact call execute unrestricted; reusable
+    /// resource consent only authorizes its listed capabilities and identities.
     pub write: WriteScope,
-    pub network_allowed: bool,
+    pub network_scope: NetworkScope,
     pub authorization: AuthorizationEvidence,
+}
+
+impl ResolvedExecutionPolicy {
+    /// Full and exact-call consent authorize unrestricted execution.
+    /// Reusable resource consent never widens filesystem or network scopes.
+    pub fn unrestricted_execution(&self) -> bool {
+        match self.authorization {
+            AuthorizationEvidence::ResourceGrant { .. } => false,
+            AuthorizationEvidence::Policy { profile } => profile == PermissionProfile::FullAccess,
+            _ => true,
+        }
+    }
+
+    /// Frozen bindings matched by admission for this action only.
+    pub fn resource_grant(&self) -> Option<&GrantRequest> {
+        match &self.authorization {
+            AuthorizationEvidence::ResourceGrant { request, .. } => Some(request),
+            _ => None,
+        }
+    }
+
+    /// Check one exact capability and current host-resolved identity.
+    pub fn allows_resource(&self, capability: Capability, resource: &ResourceIdentity) -> bool {
+        self.resource_grant().is_some_and(|request| {
+            request
+                .bindings
+                .iter()
+                .any(|binding| binding.capability == capability && &binding.resource == resource)
+        })
+    }
+
+    pub fn new(
+        write: WriteScope,
+        network_scope: NetworkScope,
+        authorization: AuthorizationEvidence,
+    ) -> Self {
+        let mut policy = Self {
+            write,
+            network_scope,
+            authorization,
+        };
+        if policy.unrestricted_execution() {
+            policy.write = WriteScope::Unrestricted;
+            policy.network_scope = NetworkScope::Internet;
+        }
+        policy
+    }
 }
 
 /// A decision still to be made: the request to put to the reviewer / human,
@@ -50,7 +101,7 @@ pub struct PendingApproval {
     /// Stable "approve for the session" key for this action.
     pub signature: String,
     pub write: WriteScope,
-    pub network_allowed: bool,
+    pub network_scope: NetworkScope,
     /// The rendered command line, for a durable "always" rule.
     pub command_line: Option<String>,
     /// Paths the call touches, for a durable "always" rule.
@@ -60,11 +111,11 @@ pub struct PendingApproval {
 impl PendingApproval {
     /// The policy this call runs under once `evidence` says it may.
     pub fn allowed(&self, authorization: AuthorizationEvidence) -> ResolvedExecutionPolicy {
-        ResolvedExecutionPolicy {
-            write: self.write.clone(),
-            network_allowed: self.network_allowed,
+        ResolvedExecutionPolicy::new(
+            self.write.clone(),
+            self.network_scope.clone(),
             authorization,
-        }
+        )
     }
 }
 
@@ -81,4 +132,44 @@ pub enum PolicyResolution {
     /// Boxed: the pending request carries the full approval prompt.
     Ask(Box<PendingApproval>),
     Deny(PolicyDenial),
+}
+
+#[cfg(test)]
+mod resource_grant_tests {
+    use super::*;
+    use leveler_core::GrantBinding;
+    #[test]
+    fn resource_consent_preserves_execution_boundaries() {
+        let resource = ResourceIdentity::Repository {
+            identity: "repo".into(),
+        };
+        let request = GrantRequest {
+            project_identity: "p".into(),
+            bindings: vec![GrantBinding {
+                capability: Capability::RepositoryRead,
+                resource: resource.clone(),
+            }],
+        };
+        for scope in [GrantScope::Session, GrantScope::Project] {
+            let policy = ResolvedExecutionPolicy::new(
+                WriteScope::None,
+                NetworkScope::Loopback,
+                AuthorizationEvidence::ResourceGrant {
+                    request: request.clone(),
+                    scope,
+                },
+            );
+            assert!(!policy.unrestricted_execution());
+            assert_eq!(policy.write, WriteScope::None);
+            assert_eq!(policy.network_scope, NetworkScope::Loopback);
+            assert!(policy.allows_resource(Capability::RepositoryRead, &resource));
+            assert!(!policy.allows_resource(Capability::RepositoryMutate, &resource));
+            assert!(!policy.allows_resource(
+                Capability::RepositoryRead,
+                &ResourceIdentity::Repository {
+                    identity: "other".into()
+                }
+            ));
+        }
+    }
 }

@@ -244,10 +244,13 @@ pub fn assert_intent_spawn_allowed(
     }
     #[cfg(windows)]
     {
+        let caps = probe_sandbox_capabilities();
+        if deny_network && !caps.network_deny {
+            return Err(WindowsSandboxError::NetworkDenyUnsupported);
+        }
         if intent.is_unrestricted() {
             return Ok(());
         }
-        let caps = probe_sandbox_capabilities();
         match intent {
             FilesystemIntent::Unrestricted => Ok(()),
             FilesystemIntent::ReadOnly { .. } => {
@@ -534,6 +537,10 @@ mod background_gate_tests {
     #[cfg(windows)]
     #[test]
     fn a_network_deny_request_is_refused_on_windows_rather_than_run_open() {
+        assert!(matches!(
+            assert_intent_spawn_allowed(&FilesystemIntent::Unrestricted, true),
+            Err(WindowsSandboxError::NetworkDenyUnsupported)
+        ));
         let confined = FilesystemIntent::WorkspaceWrite {
             write_root: PathBuf::from("C:\\ws"),
         };

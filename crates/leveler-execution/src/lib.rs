@@ -20,12 +20,16 @@ pub mod background;
 pub mod checkpoint;
 mod clarify;
 pub mod command;
+pub mod credential;
 pub mod execution_host;
 pub mod git_effects;
+pub mod git_isolation;
 pub mod hooks;
 pub mod host_settlement;
+pub mod network;
 pub mod permission_rules;
 pub mod policy;
+pub mod resource_identity;
 pub mod risk;
 mod shell_ast;
 pub use shell_ast::{
@@ -64,10 +68,18 @@ pub use command::{
     credential_env_names, is_credential_env_name, looks_like_absolute_path_arg,
     process_request_for_verify_check, seal_read_denials, shell_invocation,
 };
+pub use credential::{CredentialMaterial, fill_http_credential};
 pub use git_effects::{
     CallGitEffects, GitCommandEffects, GitEffects, call_git_effects, git_command_effects,
 };
+pub use git_isolation::{
+    ApprovedGitTarget, GitIsolation, approved_git_target, isolate_git_command,
+};
 pub use hooks::{HookRunner, LifecycleEvent, PreHookResult};
+pub use network::{
+    ConfiguredRemoteIdentity, NetworkError, NetworkResource, NetworkScope, NetworkTransport,
+    is_local_lan, is_loopback, is_ordinary_destination, normalize_ip, resolve_network_resource,
+};
 pub use permission_rules::{
     MergedRules, PROJECT_RULES_RELATIVE, PermissionRule, PermissionRuleSet, RuleDecision,
     RuleEffect, RuleMatch, always_rules_for, append_project_rule, append_rule_file,
@@ -90,3 +102,9 @@ pub use windows_sandbox::{
     probe_sandbox_capabilities, process_tree_backend_available, validate_acl_root,
 };
 pub use workspace::{Workspace, WorkspaceError, is_sensitive_file_name};
+
+pub use resource_identity::{
+    filesystem_resource_from_metadata, resolve_filesystem_resource, resolve_git_grant,
+    resolve_git_grant_with_environment, resolve_project_identity,
+    resolve_project_identity_with_environment,
+};

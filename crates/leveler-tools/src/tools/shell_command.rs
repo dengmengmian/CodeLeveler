@@ -58,8 +58,8 @@ impl Tool for ShellCommandTool {
          files written to the system `/tmp` are not writable in the sandbox; \
          the workspace and `$TMPDIR` are. Reads of system and toolchain paths \
          are allowed. Writes outside the workspace, other user directories, \
-         and readonly roots are refused unless the mode is full access. \
-         Default timeout 120s. `&` and nohup are refused. A `#` comment does \
+         and readonly roots require approval outside full-access mode. \
+         Default timeout 120s. `&` and nohup require approval outside full-access mode. A `#` comment does \
          not hide a following command from the shell."
     }
 
@@ -75,6 +75,49 @@ impl Tool for ShellCommandTool {
         true
     }
 
+    fn approval_reason(&self, input: &serde_json::Value, context: &ToolContext) -> Option<String> {
+        if context.policy.unrestricted_execution() {
+            return None;
+        }
+        let input: Input = serde_json::from_value(input.clone()).ok()?;
+        refuse_shell_script(input.cmd.trim())
+            .or_else(|| crate::workspace::cwd_approval_reason(context, input.cwd.as_deref()))
+    }
+
+    async fn command_grant_request(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<Option<leveler_core::GrantRequest>, String> {
+        if input
+            .get("env")
+            .is_some_and(|v| v.as_object().is_none_or(|vars| !vars.is_empty()))
+        {
+            return Ok(None);
+        }
+        let input: Input = serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
+        let root = context
+            .execution
+            .workspace
+            .as_ref()
+            .ok_or("no project resource is attached")?
+            .root();
+        let cwd = input
+            .cwd
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .map(|p| if p.is_absolute() { p } else { root.join(p) })
+            .unwrap_or_else(|| root.to_path_buf());
+        let (program, args) = leveler_execution::shell_invocation(input.cmd.trim());
+        leveler_execution::resolve_git_grant_with_environment(
+            &program,
+            &args,
+            &cwd,
+            &context.execution.environment,
+        )
+        .await
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -86,7 +129,9 @@ impl Tool for ShellCommandTool {
         if cmd.is_empty() {
             return Ok(ToolOutput::error("cmd must not be empty"));
         }
-        if let Some(reason) = refuse_shell_script(cmd) {
+        if !context.policy.unrestricted_execution()
+            && let Some(reason) = refuse_shell_script(cmd)
+        {
             return Ok(ToolOutput::error(reason));
         }
         let (program, args) = leveler_execution::shell_invocation(cmd);
@@ -108,6 +153,104 @@ mod tests {
     use super::super::shell_guard::HANG_ANTI_PATTERN;
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn external_cwd_is_an_approval_reason_for_both_command_tools() {
+        let (ctx, dir) =
+            super::super::test_ctx(leveler_execution::PermissionProfile::Assisted, &[]);
+        let outside = tempfile::tempdir().unwrap();
+        assert!(
+            ShellCommandTool::new(crate::tools::test_commands())
+                .approval_reason(&serde_json::json!({"cmd":"pwd","cwd":outside.path()}), &ctx)
+                .is_some()
+        );
+        assert!(
+            super::super::run_command::RunCommandTool::new(crate::tools::test_commands())
+                .approval_reason(
+                    &serde_json::json!({"program":"pwd","cwd":outside.path()}),
+                    &ctx
+                )
+                .is_some()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_credential_commands_request_approval_before_execution() {
+        let (ctx, dir) =
+            super::super::test_ctx(leveler_execution::PermissionProfile::Assisted, &[]);
+        let shell = ShellCommandTool::new(crate::tools::test_commands());
+        let argv = super::super::run_command::RunCommandTool::new(crate::tools::test_commands());
+        let shell_args = serde_json::json!({"cmd":"cat .env"});
+        let argv_args = serde_json::json!({"program":"cat","args":[".env"]});
+        assert!(shell.approval_reason(&shell_args, &ctx).is_some());
+        assert!(argv.approval_reason(&argv_args, &ctx).is_some());
+        assert!(
+            shell
+                .execute(shell_args, ctx.clone(), CancellationToken::new())
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            argv.execute(argv_args, ctx, CancellationToken::new())
+                .await
+                .unwrap()
+                .is_error
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_calls_read_credentials_through_both_command_tools() {
+        use leveler_execution::{
+            AuthorizationEvidence, NetworkScope, PermissionProfile, ResolvedExecutionPolicy,
+            WriteScope,
+        };
+        let (full, dir) = super::super::test_ctx(PermissionProfile::FullAccess, &[]);
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join(".env");
+        std::fs::write(&path, "credential-fixture-visible\n").unwrap();
+        let mut contexts = vec![full];
+        let (auto, auto_dir) = super::super::test_ctx(PermissionProfile::Assisted, &[]);
+        contexts.push(auto.with_resolved_policy(ResolvedExecutionPolicy {
+            write: WriteScope::Unrestricted,
+            network_scope: NetworkScope::Internet,
+            authorization: AuthorizationEvidence::ApprovedOnce,
+        }));
+        for ctx in contexts {
+            let shell = ShellCommandTool::new(crate::tools::test_commands())
+                .execute(
+                    serde_json::json!({"cmd":format!("cat '{}'", path.display())}),
+                    ctx.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !shell.is_error && shell.content.contains("credential-fixture-visible"),
+                "{}",
+                shell.content
+            );
+            let argv =
+                super::super::run_command::RunCommandTool::new(crate::tools::test_commands())
+                    .execute(
+                        serde_json::json!({"program":"cat", "args":[path]}),
+                        ctx,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+            assert!(
+                !argv.is_error && argv.content.contains("credential-fixture-visible"),
+                "{}",
+                argv.content
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(auto_dir).unwrap();
+    }
 
     #[test]
     fn shell_invocation_uses_platform_shell() {

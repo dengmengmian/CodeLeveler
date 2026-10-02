@@ -165,6 +165,9 @@ async fn harness(
             },
         },
         factory: ExecutorFactory {
+            resource_grants: std::sync::Arc::new(
+                leveler_storage::MemoryResourceGrantStore::default(),
+            ),
             runtime: Arc::new(MockRuntime::new(responses)),
             registry: Arc::new(default_registry()),
             tool_context,
@@ -280,6 +283,7 @@ async fn seed_pending_approval_call(
     log.append(
         Some(&turn_id),
         EngineEvent::ApprovalRequested {
+            grant: None,
             id: ApprovalId::generate(),
             call_id: Some("c1".into()),
             agent_id: None,

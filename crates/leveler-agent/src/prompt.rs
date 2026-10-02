@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use leveler_context::{ProjectInstruction, render_instructions};
-use leveler_execution::PermissionProfile;
+use leveler_execution::{NetworkScope, PermissionProfile};
 use leveler_model::{ModelRef, PromptAuthority, PromptSegment, PromptSource, SegmentLifecycle};
 
 /// The default system prompt. Lives in `prompts/base.md` rather than a string
@@ -21,11 +21,10 @@ the project's own instructions) and the current code both outrank it.\n\
 - `/remember` is the user's OWN command. It writes directly and never reaches \
 you, so when a user says they have saved something, do not call `remember` to \
 save it again.\n\
-- Your `remember` / `forget` calls are PROPOSALS. Every permission profile, \
-full access included, needs a reachable human to approve them: full access is \
-authority over this machine, not over what future sessions will believe.\n\
-- With nobody to ask, a `remember` may be kept as a pending candidate for the \
-user to review later. Report that it is waiting. Do NOT try to adopt it \
+- In Auto and Restricted, `remember` / `forget` require approval. Full permits \
+them without a separate permission prompt.\n\
+- In modes requiring approval, with nobody to ask a `remember` may be kept as \
+a pending candidate for the user to review later. Report that it is waiting. Do NOT try to adopt it \
 yourself through a shell command, the CLI, or by editing state files.\n\
 - Choose a kind. `preference` is injected into every future turn, so it is for \
 lasting how-to-work instructions; `decision` and `note` are found by relevance \
@@ -69,8 +68,7 @@ impl Default for PromptBuilder {
 pub(crate) struct TurnContext {
     pub(crate) model: ModelRef,
     pub(crate) mode: PermissionProfile,
-    pub(crate) network_allowed: bool,
-    pub(crate) deny_network: bool,
+    pub(crate) network_scope: NetworkScope,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) project_rules: Vec<ProjectInstruction>,
     /// The language the user is writing in, when we can name it. `None` falls
@@ -320,12 +318,10 @@ impl TurnContext {
     /// The turn context as named slices, in delivery order. The first slice
     /// carries the `\n\n` separator the system prompt inserts before it.
     fn segments(&self) -> Vec<PromptSegment> {
-        let network = if self.mode == PermissionProfile::FullAccess
-            || (self.network_allowed && !self.deny_network)
-        {
-            "allowed"
-        } else {
-            "denied"
+        let network = match &self.network_scope {
+            NetworkScope::Internet => "allowed",
+            NetworkScope::None => "denied",
+            scope => scope.label(),
         };
         let language = match self.user_language {
             Some(named) => format!("- language: {named}"),
@@ -403,6 +399,10 @@ impl TurnContext {
     /// more permission. It does not choose the next edit, retry, or tool.
     fn operating_rules(&self, network_allowed: bool) -> String {
         let mut rules = String::from("Operating rules for this mode:\n");
+        if self.mode == PermissionProfile::FullAccess {
+            rules.push_str("- Full bypasses all CodeLeveler permission and sandbox restrictions. File tools accept external absolute paths, HOME and credentials. Git remotes, network and process control require no approval.\n");
+            return rules;
+        }
         rules.push_str(
             "- File tools take workspace-relative paths. `.` means the cwd. \
              When the user names the absolute cwd, the tool path is `.`. \
@@ -437,20 +437,30 @@ impl TurnContext {
             ),
         }
         if !network_allowed {
-            rules.push_str(
-                "- Network access is denied by the current permission boundary. A command \
+            if !matches!(self.network_scope, NetworkScope::None) {
+                rules.push_str(
+                    "- Network destinations are restricted to the displayed scope. Local HTTP \
+                     requests are checked and pinned by the host broker. On macOS, commands \
+                     can connect to 127.0.0.1 and ::1, but local listen is unsupported and \
+                     rejected. Other process platforms may reject this scope entirely. \
+                     Internet access requires a separate approval.\n",
+                );
+            } else {
+                rules.push_str(
+                    "- Network access is denied by the current permission boundary. A command \
                  that fails on DNS resolution, a package registry, or a dependency download \
                  is failing because of that boundary.\n\
                  - A command can request network by setting `escalate` (`network` = true, \
                  plus `filesystem` = `unrestricted` when the command also writes outside \
                  the workspace). The approval prompt is the consent mechanism. Prose does \
                  not grant the permission.\n",
-            );
+                );
+            }
             // Under request-approval a network tool asks the user itself; a
             // `request_permissions` first would ask the same thing twice.
             rules.push_str(if self.mode == PermissionProfile::RequestApproval {
-                "- Network tools that are not commands (`web_fetch`, `web_search`, MCP tools) \
-                 raise their own approval prompt.\n"
+                "- Network tools raise their own approval prompt when they need broader access. \
+                 `web_fetch` within the current destination scope needs no Internet grant.\n"
             } else {
                 "- For a network tool that is not a command (`web_fetch`, `web_search`), \
                  `request_permissions` with `network` = true is the permission mechanism. \
@@ -492,8 +502,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
+                network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/w")),
                 project_rules: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级工具库"),
@@ -519,8 +528,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
+                network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: None,
@@ -543,8 +551,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
+                network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: None,
@@ -560,8 +567,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
+                network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/Users/example/project")),
                 project_rules: Vec::new(),
                 user_language: None,
@@ -580,8 +586,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::FullAccess,
-                network_allowed: false,
-                deny_network: false,
+                network_scope: NetworkScope::Internet,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: None,
@@ -896,8 +901,11 @@ mod tests {
         TurnContext {
             model: leveler_model::ModelRef::new("mock", "m"),
             mode,
-            network_allowed,
-            deny_network: !network_allowed,
+            network_scope: if network_allowed || mode == PermissionProfile::FullAccess {
+                NetworkScope::Internet
+            } else {
+                NetworkScope::None
+            },
             cwd: Some(std::path::PathBuf::from("/repo")),
             project_rules: Vec::new(),
             user_language: None,
@@ -1129,8 +1137,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("mock", "m"),
                 mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
+                network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: vec![ProjectInstruction {
                     source: "src/AGENTS.md".to_string(),
@@ -1158,8 +1165,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
+                network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: user_language("把这个仓库改造成生产级的 Go 工具库"),
@@ -1183,8 +1189,7 @@ mod tests {
             .turn_context(TurnContext {
                 model: leveler_model::ModelRef::new("deepseek", "deepseek-chat"),
                 mode: leveler_execution::PermissionProfile::Assisted,
-                network_allowed: false,
-                deny_network: true,
+                network_scope: NetworkScope::None,
                 cwd: Some(std::path::PathBuf::from("/repo")),
                 project_rules: Vec::new(),
                 user_language: user_language("make this repo production ready"),

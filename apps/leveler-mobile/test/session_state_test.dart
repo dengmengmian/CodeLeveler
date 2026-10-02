@@ -10,12 +10,53 @@ import 'package:leveler_mobile/protocol/pairing.dart';
 import 'package:leveler_mobile/protocol/wire.dart';
 
 void main() {
+  test(
+      'resource approval preserves identity and human consent cannot reuse session',
+      () {
+    final approval = PendingApproval.fromJson({
+      'id': 'a-resource',
+      'tool': 'run_command',
+      'summary': 'push',
+      'grant': {
+        'project_identity': 'project-a',
+        'bindings': [
+          {
+            'capability': 'remote_mutate',
+            'resource': {
+              'kind': 'configured_remote',
+              'repository': 'repo-a',
+              'remote_name': 'origin',
+              'canonical_url': 'https://example.test/a.git',
+              'transport': 'https'
+            }
+          },
+        ]
+      },
+    });
+    expect(approval.resourceDetails.join(' '), contains('remote.mutate'));
+    expect(approval.resourceDetails.join(' '), contains('repo-a'));
+    expect(approval.resourceDetails.join(' '),
+        contains('https://example.test/a.git'));
+    expect(approval.sessionLabel, contains('会话'));
+    expect(approval.canApproveSession, isTrue);
+    final consent = PendingApproval.fromJson({
+      'id': 'a-human',
+      'tool': 'save_agent',
+      'summary': 'save',
+      'requires_human_consent': true,
+    });
+    expect(consent.canApproveSession, isFalse);
+  });
+
   group('session state', () {
     test('deltas append to the message they name', () {
       final state = SessionState('s1');
-      state.applyEvent({'type': 'assistant_message_started', 'message_id': 'm1'});
-      state.applyEvent({'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '你'});
-      state.applyEvent({'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '好'});
+      state.applyEvent(
+          {'type': 'assistant_message_started', 'message_id': 'm1'});
+      state.applyEvent(
+          {'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '你'});
+      state.applyEvent(
+          {'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '好'});
 
       expect(state.transcript.single.text, '你好');
     });
@@ -50,8 +91,10 @@ void main() {
 
     test('a snapshot replaces the transcript rather than adding to it', () {
       final state = SessionState('s1');
-      state.applyEvent({'type': 'assistant_message_started', 'message_id': 'm1'});
-      state.applyEvent({'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '半句'});
+      state.applyEvent(
+          {'type': 'assistant_message_started', 'message_id': 'm1'});
+      state.applyEvent(
+          {'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '半句'});
 
       state.applySnapshot({
         'status': 'idle',
@@ -68,10 +111,19 @@ void main() {
 
     test('a retry clears the transient message instead of appending to it', () {
       final state = SessionState('s1');
-      state.applyEvent({'type': 'assistant_message_started', 'message_id': 'm1'});
-      state.applyEvent({'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '错的开头'});
+      state.applyEvent(
+          {'type': 'assistant_message_started', 'message_id': 'm1'});
+      state.applyEvent({
+        'type': 'assistant_text_delta',
+        'message_id': 'm1',
+        'delta': '错的开头'
+      });
       state.applyEvent({'type': 'assistant_attempt_reset', 'message_id': 'm1'});
-      state.applyEvent({'type': 'assistant_text_delta', 'message_id': 'm1', 'delta': '对的开头'});
+      state.applyEvent({
+        'type': 'assistant_text_delta',
+        'message_id': 'm1',
+        'delta': '对的开头'
+      });
 
       expect(state.transcript.single.text, '对的开头');
     });
@@ -80,7 +132,11 @@ void main() {
       final state = SessionState('s1');
       state.applyEvent({
         'type': 'approval_requested',
-        'request': {'id': 'a1', 'tool': 'run_command', 'summary': 'rm -rf build'},
+        'request': {
+          'id': 'a1',
+          'tool': 'run_command',
+          'summary': 'rm -rf build'
+        },
       });
       expect(state.approvals, contains('a1'));
 
@@ -89,11 +145,15 @@ void main() {
       expect(state.approvals, isEmpty);
     });
 
-    test('an unknown event is counted, never rendered, and does not force a resync', () {
+    test(
+        'an unknown event is counted, never rendered, and does not force a resync',
+        () {
       final state = SessionState('s1');
-      state.applyEvent({'type': 'something_this_build_never_heard_of', 'payload': 1});
+      state.applyEvent(
+          {'type': 'something_this_build_never_heard_of', 'payload': 1});
 
-      expect(state.transcript, isEmpty, reason: 'nothing unreadable may appear as content');
+      expect(state.transcript, isEmpty,
+          reason: 'nothing unreadable may appear as content');
       expect(state.unknownEvents['something_this_build_never_heard_of'], 1);
       // This assertion used to demand the opposite, and the opposite is what
       // shipped: an ordinary turn carries kinds this build has no use for, and
@@ -105,11 +165,13 @@ void main() {
 
     test('a kind we know but do not render is not counted as unknown', () {
       final state = SessionState('s1');
-      state.applyEvent({'type': 'token_usage', 'input_tokens': 1, 'output_tokens': 2});
+      state.applyEvent(
+          {'type': 'token_usage', 'input_tokens': 1, 'output_tokens': 2});
       state.applyEvent({'type': 'turn_progress'});
 
       expect(state.unknownEvents, isEmpty,
-          reason: '"chose not to show" and "never heard of" are different states');
+          reason:
+              '"chose not to show" and "never heard of" are different states');
       expect(state.transcript, isEmpty);
       expect(state.timeline, isEmpty);
     });
@@ -204,7 +266,8 @@ void main() {
         final state = SessionState('s1');
         state.applyEvent(event);
         final type = event['type'] as String;
-        expect(state.unknownEvents, isEmpty, reason: '$type counted as unknown');
+        expect(state.unknownEvents, isEmpty,
+            reason: '$type counted as unknown');
         expect(
           state.timeline.isNotEmpty || state.approvals.isNotEmpty,
           isTrue,
@@ -213,7 +276,9 @@ void main() {
       }
     });
 
-    test('sub-agent progress updates the same row instead of flooding the timeline', () {
+    test(
+        'sub-agent progress updates the same row instead of flooding the timeline',
+        () {
       final state = SessionState('s1');
       state.applyEvent({
         'type': 'sub_agent_updated',
@@ -250,12 +315,14 @@ void main() {
         'detail': '改完了',
       });
 
-      expect(state.timeline.where((item) => item.kind == TimelineKind.subAgent), hasLength(1));
+      expect(state.timeline.where((item) => item.kind == TimelineKind.subAgent),
+          hasLength(1));
       expect(state.timeline.single.ok, isTrue);
       expect(state.timeline.single.detail, contains('改完了'));
     });
 
-    test('reasoning_delta accumulates on one thinking row, not the transcript', () {
+    test('reasoning_delta accumulates on one thinking row, not the transcript',
+        () {
       final state = SessionState('s1');
       state.applyEvent({'type': 'reasoning_delta', 'delta': '先'});
       state.applyEvent({'type': 'reasoning_delta', 'delta': '看测试'});
@@ -265,7 +332,9 @@ void main() {
       expect(state.timeline.single.detail, '先看测试');
     });
 
-    test('a local steer is recorded as a user line and not doubled if the host echoes it', () {
+    test(
+        'a local steer is recorded as a user line and not doubled if the host echoes it',
+        () {
       final state = SessionState('s1')..status = 'running';
       state.noteLocalUser('保持 API 兼容，不改库');
       state.applyEvent({
@@ -273,7 +342,8 @@ void main() {
         'message': {'id': 'u9', 'role': 'user', 'text': '保持 API 兼容，不改库'},
       });
 
-      expect(state.timeline.where((item) => item.kind == TimelineKind.user), hasLength(1));
+      expect(state.timeline.where((item) => item.kind == TimelineKind.user),
+          hasLength(1));
     });
 
     test('tool arguments prefer a path over raw JSON', () {
@@ -304,7 +374,8 @@ void main() {
       expect(state.timeline.single.detail, contains('查 Trait'));
     });
 
-    test('tool calls land on the timeline, not only in the activity spinner', () {
+    test('tool calls land on the timeline, not only in the activity spinner',
+        () {
       final state = SessionState('s1');
       state.applyEvent({
         'type': 'tool_call_started',
@@ -352,9 +423,11 @@ void main() {
       expect(state.status, 'idle');
     });
 
-    test('a delta for a message we never saw start is kept but marked suspect', () {
+    test('a delta for a message we never saw start is kept but marked suspect',
+        () {
       final state = SessionState('s1');
-      state.applyEvent({'type': 'assistant_text_delta', 'message_id': 'm9', 'delta': '孤儿'});
+      state.applyEvent(
+          {'type': 'assistant_text_delta', 'message_id': 'm9', 'delta': '孤儿'});
 
       expect(state.transcript.single.text, '孤儿');
       expect(state.needsResync, isTrue);
@@ -367,12 +440,14 @@ void main() {
       // `codeUnits` gives UTF-16 units — identical for ASCII, wrong the moment
       // a payload contains anything else, which every Chinese label does.
       final event = DownstreamMessage.decode(
-        utf8.encode('{"type":"event","event":{"type":"agent_activity","label":"跑测试"}}'),
+        utf8.encode(
+            '{"type":"event","event":{"type":"agent_activity","label":"跑测试"}}'),
       );
       expect(event, isA<RuntimeEventMessage>());
       expect((event as RuntimeEventMessage).kind, 'agent_activity');
 
-      final unknown = DownstreamMessage.decode(utf8.encode('{"type":"from_the_future"}'));
+      final unknown =
+          DownstreamMessage.decode(utf8.encode('{"type":"from_the_future"}'));
       expect(unknown, isA<UnknownDownstream>());
     });
 

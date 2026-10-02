@@ -134,10 +134,16 @@ pub async fn reconcile(
 /// An `ApproveAlways` decision waiting to become a durable permission rule.
 /// Held until the barrier confirms the approval resolution is on disk, so a
 /// crash can never leave a permanent grant that the event log does not explain.
-pub(crate) struct PendingStandingGrant {
-    tool: String,
-    command_line: Option<String>,
-    paths: Vec<String>,
+pub(crate) enum PendingStandingGrant {
+    Legacy {
+        tool: String,
+        command_line: Option<String>,
+        paths: Vec<String>,
+    },
+    Resource {
+        request: leveler_core::GrantRequest,
+        scope: leveler_core::GrantScope,
+    },
 }
 
 /// Why admission did not produce an [`AdmittedCall`].
@@ -174,10 +180,11 @@ impl Executor {
                 call,
             });
         }
-        if self
-            .capabilities
-            .as_ref()
-            .is_some_and(|state| !state.permits_tool(&call.name))
+        if !ctx.policy.unrestricted_execution()
+            && self
+                .capabilities
+                .as_ref()
+                .is_some_and(|state| !state.permits_tool(&call.name))
         {
             return Err(AdmitError::Refused {
                 reason: format!("tool {} capability is not exposed", call.name),
@@ -190,36 +197,22 @@ impl Executor {
                 _ = cancellation.cancelled() => return Err(AdmitError::Fatal(AgentError::Cancelled)),
             };
             ctx = ctx.with_command_lease(lease);
-            // Ownership may have changed while this command waited for the gate.
-            ctx.policy.command_write_allowlist =
-                self.effective_write_allowlist().map(std::sync::Arc::new);
-            let owner = self.agent_id.as_deref().unwrap_or("parent");
-            let mut foreign = self.ownership.paths_owned_by_others(owner);
-            if let Some(tasks) = &self.background_tasks {
-                let background_foreign = tasks
-                    .foreign_write_paths(ctx.session_scope(), ctx.writer_scope())
-                    .await;
-                if !self.registry.runs_command(&call.name)
-                    && self.registry.mutates_files(&call.name)
-                    && (background_foreign
-                        .iter()
-                        .any(|path| path == "." || path.is_empty())
-                        || crate::sub_agent::scopes_overlap(
-                            &crate::authorization::mutation_targets(&call),
-                            &background_foreign,
-                        ))
-                {
-                    return Err(AdmitError::Refused {
-                        call,
-                        reason: "a live background writer retains ownership of this path"
-                            .to_string(),
-                    });
+            if !ctx.policy.unrestricted_execution() {
+                // Ownership may have changed while this command waited for the gate.
+                ctx.policy.command_write_allowlist =
+                    self.effective_write_allowlist().map(std::sync::Arc::new);
+                let owner = self.agent_id.as_deref().unwrap_or("parent");
+                let mut foreign = self.ownership.paths_owned_by_others(owner);
+                if let Some(tasks) = &self.background_tasks {
+                    let background_foreign = tasks
+                        .foreign_write_paths(ctx.session_scope(), ctx.writer_scope())
+                        .await;
+                    foreign.extend(background_foreign);
                 }
-                foreign.extend(background_foreign);
+                foreign.sort();
+                foreign.dedup();
+                ctx = ctx.with_foreign_owned_paths(foreign);
             }
-            foreign.sort();
-            foreign.dedup();
-            ctx = ctx.with_foreign_owned_paths(foreign);
         }
         // A delegated agent's call has no canonical event of its own — the
         // parent loop announced nothing for it — so record one, attributed,
@@ -244,12 +237,6 @@ impl Executor {
             && let Err(error) = barrier.flush().await
         {
             return Err(AdmitError::Fatal(error.into()));
-        }
-        if let Some(reason) = self.refuse_unboundable_delegated_tool(&call) {
-            return Err(AdmitError::Refused { call, reason });
-        }
-        if let Some(reason) = self.refuse_unscoped_mutation(&call) {
-            return Err(AdmitError::Refused { call, reason });
         }
         let mut pending_always: Option<PendingStandingGrant> = None;
         let mut resolved = match self
@@ -277,6 +264,12 @@ impl Executor {
         {
             return Err(AdmitError::Fatal(error.into()));
         }
+        if let Some(expected) = resolved.resource_grant() {
+            match self.resolve_resource_request(&call, &ctx).await {
+                Ok(Some(current)) if &current == expected => {},
+                _ => return Err(AdmitError::Refused { call, reason: "resource identity changed while authorization was pending; request fresh approval".into() }),
+            }
+        }
         // The approval outcome is durable now, so a standing "always" grant can
         // be written without the risk of outliving an unresolved approval in
         // the log. Parallel-batch calls take the same order: they are
@@ -288,7 +281,24 @@ impl Executor {
             {
                 return Err(AdmitError::Fatal(error.into()));
             }
-            self.remember_always(&grant.tool, grant.command_line.as_deref(), &grant.paths);
+            match grant {
+                PendingStandingGrant::Legacy {
+                    tool,
+                    command_line,
+                    paths,
+                } => self.remember_always(&tool, command_line.as_deref(), &paths),
+                PendingStandingGrant::Resource { request, scope } => {
+                    self.resource_grants
+                        .grant(
+                            &request.project_identity,
+                            self.grant_session_id(),
+                            scope,
+                            &request.bindings,
+                        )
+                        .await
+                        .map_err(|e| AdmitError::Fatal(AgentError::Persistence(e.to_string())))?;
+                }
+            }
         }
         // OWNERSHIP FENCE — last gate before an AdmittedCall can exist. The
         // announcing/approval facts are durable (barriers above); now prove
@@ -385,6 +395,18 @@ impl Executor {
         });
         let command_line = command_line_for_match(call, program.as_deref(), &args);
 
+        // Highest-priority product contract: Full bypasses CodeLeveler
+        // permission rules, hooks, Git gates and sandbox boundaries entirely.
+        if ctx.policy.unrestricted_execution() {
+            return PolicyResolution::Allow(ResolvedExecutionPolicy::new(
+                WriteScope::Unrestricted,
+                leveler_execution::NetworkScope::Internet,
+                AuthorizationEvidence::Policy {
+                    profile: leveler_execution::PermissionProfile::FullAccess,
+                },
+            ));
+        }
+
         // Git states its own mechanical effects from argv. Two things follow
         // from that ONE parse, so they can never drift apart: which repository
         // metadata capability the call runs with (the same answer whether it
@@ -415,7 +437,8 @@ impl Executor {
                 "git capability resolution"
             );
         }
-        let network_allowed = !ctx.policy.network_denied();
+        let network_scope = ctx.policy.network_scope();
+        let network_allowed = matches!(network_scope, leveler_execution::NetworkScope::Internet);
         // Denied only because the profile does not reach the network by
         // default (请求批准), not by the run itself: a user approval of a call
         // whose need is the network is the grant for that call.
@@ -429,11 +452,11 @@ impl Executor {
             && self.registry.runs_command(&call.name);
         let deny = |reason: String| PolicyResolution::Deny(PolicyDenial { reason });
         let allow = |authorization: AuthorizationEvidence| {
-            PolicyResolution::Allow(ResolvedExecutionPolicy {
-                write: write.clone(),
-                network_allowed,
+            PolicyResolution::Allow(ResolvedExecutionPolicy::new(
+                write.clone(),
+                network_scope.clone(),
                 authorization,
-            })
+            ))
         };
 
         let args_json = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
@@ -451,6 +474,29 @@ impl Executor {
             .get(&call.name)
             .map(|t| t.risk())
             .unwrap_or(RiskLevel::Safe);
+        let approval_reason = if let Some(tool) = self.registry.get(&call.name) {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return deny("cancelled".into()),
+                reason = tool.admission_reason(&call.arguments, ctx) => reason,
+            }
+        } else {
+            None
+        };
+        let mut approval_reason = approval_reason
+            .or_else(|| self.role_permission_reason(call))
+            .or_else(|| self.refuse_unboundable_delegated_tool(call))
+            .or_else(|| self.refuse_unscoped_mutation(call))
+            .or_else(|| {
+                let foreign = &ctx.policy.command_foreign_paths;
+                (self.registry.mutates_files(&call.name)
+                    && (foreign.iter().any(|path| path == "." || path.is_empty())
+                        || crate::sub_agent::scopes_overlap(
+                            &crate::authorization::mutation_targets(call),
+                            foreign,
+                        )))
+                .then(|| "修改其他执行者当前拥有的路径，需要批准本次操作".into())
+            });
 
         // An MCP server is a separate process CodeLeveler launches with no OS
         // sandbox, so a network denial cannot be applied to it. Refuse rather
@@ -468,7 +514,14 @@ impl Executor {
         // The read-only overlay (`leveler plan` / plan collaboration) admits
         // Safe tools only, whatever the profile would otherwise allow. It is
         // orthogonal to the three-tier profile, so it is its own gate.
-        if ctx.policy.read_only && risk != RiskLevel::Safe {
+        if ctx.policy.read_only
+            && risk != RiskLevel::Safe
+            && ctx.policy.mode() == leveler_execution::PermissionProfile::Assisted
+        {
+            approval_reason.get_or_insert_with(|| {
+                "read-only turn requires approval for this exact action".into()
+            });
+        } else if ctx.policy.read_only && risk != RiskLevel::Safe {
             return deny(format!(
                 "tool `{}` is not permitted in a read-only (plan) turn (risk {risk:?}): \
                  only observation tools run here",
@@ -493,19 +546,14 @@ impl Executor {
             ));
         }
 
-        // CodeLeveler's own consent surface is not a capability the agent
-        // holds. `leveler memory accept|reject|remember|forget` IS the human
-        // acting (K36), so running it from a tool would let the model sign its
-        // own approval — which a real run did, after `remember` was correctly
-        // parked for consent. Refused here, BEFORE permission rules, because a
-        // standing allow rule for `run_command` must not reopen it either.
-        if let Some(program) = program.as_deref()
-            && leveler_execution::is_self_consent_command(program, &args)
-        {
-            return deny(format!(
-                "`{}` would run CodeLeveler's own consent command. Adopting or                  discarding a memory is the user's decision, not an action this                  run can take — leave the pending candidate for them to review.",
-                call.name
-            ));
+        let self_consent = program
+            .as_deref()
+            .is_some_and(|program| leveler_execution::is_self_consent_command(program, &args));
+        if self_consent {
+            if profile != leveler_execution::PermissionProfile::Assisted {
+                return deny("CodeLeveler's consent commands require direct human action under Restricted authority".into());
+            }
+            approval_reason.get_or_insert_with(|| "This exact command invokes CodeLeveler's human consent surface; a human must approve it".into());
         }
 
         // An agent or skill definition changes what future sessions run, so a
@@ -546,10 +594,11 @@ impl Executor {
                     description,
                     command: None,
                     paths: Vec::new(),
+                    grant: None,
                 },
                 signature,
                 write,
-                network_allowed,
+                network_scope: network_scope.clone(),
                 command_line: None,
                 scoped_paths: Vec::new(),
             }));
@@ -584,32 +633,149 @@ impl Executor {
             }
             // A standing rule is the user's consent; where the network cannot
             // be denied it is also consent to run the command open.
-            leveler_execution::RuleDecision::Allow => {
-                return PolicyResolution::Allow(ResolvedExecutionPolicy {
+            leveler_execution::RuleDecision::Allow if !self_consent => {
+                return PolicyResolution::Allow(ResolvedExecutionPolicy::new(
                     write,
-                    network_allowed: network_allowed || network_unenforceable,
-                    authorization: AuthorizationEvidence::Rule,
-                });
+                    network_scope.clone(),
+                    AuthorizationEvidence::Rule,
+                ));
             }
-            leveler_execution::RuleDecision::Ask | leveler_execution::RuleDecision::NoMatch => {}
+            leveler_execution::RuleDecision::Allow
+            | leveler_execution::RuleDecision::Ask
+            | leveler_execution::RuleDecision::NoMatch => {}
         }
 
+        // A destination hint can reduce the prompt only when the execution
+        // path also enforces this scope. Opaque clients remain Internet calls.
+        let network_resource = if risk == RiskLevel::Network
+            && !matches!(network_scope, leveler_execution::NetworkScope::None)
+        {
+            if let Some(tool) = self.registry.get(&call.name) {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return deny("cancelled".into()),
+                    resource = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tool.network_resource(&call.arguments),
+                    ) => match resource {
+                        Ok(Ok(resource)) => resource,
+                        Ok(Err(reason)) => {
+                            tracing::debug!(tool = %call.name, %reason, "network resource unresolved; broader access requires consent");
+                            None
+                        }
+                        Err(error) => {
+                            tracing::debug!(tool = %call.name, %error, "network resource resolution timed out; broader access requires consent");
+                            None
+                        }
+                    },
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let scoped_network_call = network_resource
+            .as_ref()
+            .is_some_and(|resource| network_scope.validate_resource(resource).is_ok());
+        let needs_internet =
+            !scoped_network_call && (risk == RiskLevel::Network || call.name.starts_with("mcp__"));
+        tracing::debug!(
+            tool = %call.name,
+            network_scope = ?network_scope,
+            network_resource = ?network_resource,
+            "network destination resolution"
+        );
         let requirement =
             match self
                 .approval_policy
                 .evaluate(profile, &call.name, risk, command_view)
             {
-                Requirement::Auto if network_unenforceable => Requirement::NeedApproval,
+                Requirement::Auto if network_unenforceable || approval_reason.is_some() => {
+                    Requirement::NeedApproval
+                }
+                // Only a known, scoped HTTP destination can avoid the Network prompt.
+                Requirement::NeedApproval
+                    if scoped_network_call
+                        && approval_reason.is_none()
+                        && risk == RiskLevel::Network
+                        && matches!(rule_decision, leveler_execution::RuleDecision::NoMatch) =>
+                {
+                    Requirement::Auto
+                }
                 requirement => requirement,
             };
+        // Phase 4: using a stored credential is not an ordinary auto-run even
+        // when the command's mechanical effect classifies as read-only. A
+        // command whose host-resolved target needs a credential escalates to a
+        // real decision; an existing Session/Project grant for the exact
+        // destination still short-circuits that decision below. Full never
+        // reaches here as Auto-with-interception: it bypasses admission first.
+        let requirement = if requirement == Requirement::Auto
+            && profile != leveler_execution::PermissionProfile::FullAccess
+            && command_view.is_some()
+        {
+            match self.resolve_resource_request(call, ctx).await {
+                Ok(Some(request))
+                    if request.bindings.iter().any(|binding| {
+                        binding.capability == leveler_core::Capability::CredentialUse
+                    }) =>
+                {
+                    Requirement::NeedApproval
+                }
+                Ok(_) => requirement,
+                Err(reason) => {
+                    tracing::debug!(
+                        tool = %call.name,
+                        %reason,
+                        "credential requirement unresolved; keeping the profile decision"
+                    );
+                    requirement
+                }
+            }
+        } else {
+            requirement
+        };
         match requirement {
             Requirement::Auto => allow(AuthorizationEvidence::Policy { profile }),
             Requirement::Forbidden => deny("forbidden by policy".to_string()),
             Requirement::NeedApproval => {
+                let grant = match self.resolve_resource_request(call, ctx).await {
+                    Ok(request) => request,
+                    Err(reason) => {
+                        tracing::debug!(tool = %call.name, %reason, "resource identity unavailable; reusable authorization disabled");
+                        None
+                    }
+                };
+                if let Some(request) = &grant {
+                    match self
+                        .resource_grants
+                        .covers(
+                            &request.project_identity,
+                            self.grant_session_id(),
+                            &request.bindings,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            return allow(AuthorizationEvidence::ResourceGrant {
+                                request: request.clone(),
+                                scope: leveler_core::GrantScope::Once,
+                            });
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "resource grant store unavailable; requiring fresh consent")
+                        }
+                    }
+                }
                 // Only say something the tool name and command do not already
                 // say. "<tool> requested by the model" is filler, and filler in
                 // a decision prompt trains people to stop reading it.
                 let mut notes = Vec::new();
+                if let Some(reason) = &approval_reason {
+                    notes.push(reason.clone());
+                }
                 if let Some(git) = git_effects.as_ref().filter(|git| git.any_git) {
                     notes.push(crate::authorization::git_capability_note(git));
                 }
@@ -623,8 +789,7 @@ impl Executor {
                 // Approving a call whose need is the network grants it.
                 let network_allowed = network_allowed
                     || network_unenforceable
-                    || (network_by_profile_default
-                        && (risk == RiskLevel::Network || call.name.starts_with("mcp__")));
+                    || (network_by_profile_default && needs_internet);
                 PolicyResolution::Ask(Box::new(PendingApproval {
                     request: ApprovalRequest {
                         id: ApprovalId::generate(),
@@ -637,15 +802,136 @@ impl Executor {
                         description,
                         command: command_line.clone(),
                         paths: rule_paths,
+                        grant,
                     },
                     signature: approval_signature(call),
                     write,
-                    network_allowed,
+                    network_scope: if network_allowed {
+                        leveler_execution::NetworkScope::Internet
+                    } else {
+                        network_scope.clone()
+                    },
                     command_line,
                     scoped_paths,
                 }))
             }
         }
+    }
+
+    async fn resolve_resource_request(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> Result<Option<leveler_core::GrantRequest>, String> {
+        use leveler_core::GrantRequest;
+        let Some(tool) = self.registry.get(&call.name) else {
+            return Ok(None);
+        };
+        // A command resolves its own typed target (a Git remote effect); other
+        // tools expose host-resolved path bindings. Both become one exact
+        // capability-resource request.
+        let request = match tool.command_grant_request(&call.arguments, ctx).await? {
+            Some(request) => request,
+            None => {
+                let Some(bindings) = tool.grant_bindings(&call.arguments, ctx).await? else {
+                    return Ok(None);
+                };
+                let root = ctx
+                    .execution
+                    .workspace
+                    .as_ref()
+                    .ok_or("no project resource is attached")?
+                    .root();
+                GrantRequest {
+                    project_identity: leveler_execution::resolve_project_identity_with_environment(
+                        root,
+                        &ctx.execution.environment,
+                    )
+                    .await?,
+                    bindings,
+                }
+            }
+        };
+        // Reusable consent is offered only for consumers whose execution layer
+        // binds the approved identity to the real side effect. Everything else
+        // keeps exact-call approval.
+        if !Self::execution_bound_request(&request) {
+            return Ok(None);
+        }
+        Ok(Some(request))
+    }
+
+    /// Whether every binding is covered by a proven execution boundary, so a
+    /// Session/Project grant is safe to offer for this action. A Git request is
+    /// anchored by its approved remote; the accompanying repository bindings are
+    /// covered by the same frozen repository identity. Filesystem object binding
+    /// and frozen Git targets exist on unix only; Windows keeps exact-call
+    /// approval rather than pretending the binding holds.
+    fn execution_bound_request(request: &leveler_core::GrantRequest) -> bool {
+        use leveler_core::{Capability, ResourceIdentity};
+        if request.bindings.is_empty() {
+            return false;
+        }
+        let all = |pred: fn(&Capability, &ResourceIdentity) -> bool| {
+            request
+                .bindings
+                .iter()
+                .all(|binding| pred(&binding.capability, &binding.resource))
+        };
+        let background = |capability: &Capability, resource: &ResourceIdentity| {
+            matches!(
+                (capability, resource),
+                (
+                    Capability::BackgroundTaskObserve | Capability::BackgroundTaskControl,
+                    ResourceIdentity::BackgroundTask { .. }
+                )
+            )
+        };
+        if all(background) {
+            return true;
+        }
+        if !cfg!(unix) {
+            return false;
+        }
+        let filesystem = |capability: &Capability, resource: &ResourceIdentity| {
+            matches!(
+                (capability, resource),
+                (
+                    Capability::FilesystemRead
+                        | Capability::FilesystemWrite
+                        | Capability::FilesystemDelete
+                        | Capability::CredentialRawRead
+                        | Capability::CredentialRawWrite,
+                    ResourceIdentity::FilesystemPath { .. }
+                )
+            )
+        };
+        if all(filesystem) {
+            return true;
+        }
+        let git = |capability: &Capability, resource: &ResourceIdentity| match resource {
+            ResourceIdentity::ConfiguredRemote { .. } => matches!(
+                capability,
+                Capability::RemoteRead | Capability::RemoteMutate | Capability::RemoteForce
+            ),
+            // A credential binding is execution-bound: the frozen Git target
+            // re-resolves the credential and refuses when its incarnation
+            // changed, so a Session/Project grant cannot outlive the secret.
+            ResourceIdentity::Credential { .. } => matches!(capability, Capability::CredentialUse),
+            ResourceIdentity::Repository { .. } => matches!(
+                capability,
+                Capability::RepositoryRead
+                    | Capability::RepositoryMutate
+                    | Capability::RepositoryMetadataWrite
+                    | Capability::RepositoryConfigWrite
+                    | Capability::RepositoryDestroy
+            ),
+            _ => false,
+        };
+        all(git)
+            && request.bindings.iter().any(|binding| {
+                matches!(&binding.resource, ResourceIdentity::ConfiguredRemote { .. })
+            })
     }
 
     /// The one place a decision is put to the reviewer and then the human
@@ -662,19 +948,30 @@ impl Executor {
         pending_always: Option<&mut Option<PendingStandingGrant>>,
         cancellation: &CancellationToken,
     ) -> AskOutcome {
+        let human_only = pending.request.requires_human_consent();
+        if human_only && !self.approver.has_human() {
+            return AskOutcome::DeniedUnattended(
+                "this consent action requires an actual human approver".into(),
+            );
+        }
         let mut session_approved = session_approved;
-        if session_approved
-            .as_ref()
-            .is_some_and(|set| set.contains(&pending.signature))
+        if !human_only
+            && session_approved
+                .as_ref()
+                .is_some_and(|set| set.contains(&pending.signature))
         {
             return AskOutcome::Allowed(AuthorizationEvidence::SessionGrant {
                 signature: pending.signature.clone(),
             });
         }
-        let review = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return AskOutcome::Cancelled,
-            verdict = self.auto_reviewer.review(&pending.request) => verdict,
+        let review = if human_only {
+            ReviewVerdict::NeedUser
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return AskOutcome::Cancelled,
+                verdict = self.auto_reviewer.review(&pending.request) => verdict,
+            }
         };
         match review {
             ReviewVerdict::Allow => return AskOutcome::Allowed(AuthorizationEvidence::Reviewer),
@@ -686,7 +983,44 @@ impl Executor {
             _ = cancellation.cancelled() => return AskOutcome::Cancelled,
             decision = self.approver.decide(&pending.request) => decision,
         };
+        if human_only {
+            return match decision {
+                ApprovalDecision::Deny => AskOutcome::DeniedByUser,
+                _ => AskOutcome::Allowed(AuthorizationEvidence::ApprovedOnce),
+            };
+        }
+        if let Some(request) = &pending.request.grant {
+            let scope = match decision {
+                ApprovalDecision::ApproveOnce => leveler_core::GrantScope::Once,
+                ApprovalDecision::ApproveSession => leveler_core::GrantScope::Session,
+                ApprovalDecision::ApproveProject => leveler_core::GrantScope::Project,
+                ApprovalDecision::ApproveAlways => {
+                    return AskOutcome::DeniedUnattended(
+                        "legacy rule approval cannot create a resource grant".into(),
+                    );
+                }
+                ApprovalDecision::Deny => return AskOutcome::DeniedByUser,
+            };
+            if scope != leveler_core::GrantScope::Once {
+                let Some(slot) = pending_always else {
+                    return AskOutcome::DeniedUnattended(
+                        "this execution surface cannot persist a resource grant".into(),
+                    );
+                };
+                *slot = Some(PendingStandingGrant::Resource {
+                    request: request.clone(),
+                    scope,
+                });
+            }
+            return AskOutcome::Allowed(AuthorizationEvidence::ResourceGrant {
+                request: request.clone(),
+                scope,
+            });
+        }
         match decision {
+            ApprovalDecision::ApproveProject => AskOutcome::DeniedUnattended(
+                "project approval requires a resolved resource identity".into(),
+            ),
             ApprovalDecision::ApproveOnce => {
                 AskOutcome::Allowed(AuthorizationEvidence::ApprovedOnce)
             }
@@ -708,7 +1042,7 @@ impl Executor {
                 // `admit` writes it after the barrier confirms the resolution
                 // landed.
                 if let Some(slot) = pending_always {
-                    *slot = Some(PendingStandingGrant {
+                    *slot = Some(PendingStandingGrant::Legacy {
                         tool: pending.request.tool.clone(),
                         command_line: pending.command_line.clone(),
                         paths: pending.scoped_paths.clone(),
@@ -754,7 +1088,23 @@ impl Executor {
         // The inline tests assert on the durable rule file, so apply what a
         // real run would apply after its barrier.
         if let Some(grant) = pending {
-            self.remember_always(&grant.tool, grant.command_line.as_deref(), &grant.paths);
+            match grant {
+                PendingStandingGrant::Legacy {
+                    tool,
+                    command_line,
+                    paths,
+                } => self.remember_always(&tool, command_line.as_deref(), &paths),
+                PendingStandingGrant::Resource { request, scope } => self
+                    .resource_grants
+                    .grant(
+                        &request.project_identity,
+                        self.grant_session_id(),
+                        scope,
+                        &request.bindings,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+            }
         }
         result
     }
@@ -958,7 +1308,7 @@ impl Executor {
         tracing::debug!(
             tool = %call.name,
             write_scope = ?resolved.write,
-            network_allowed = resolved.network_allowed,
+            network_scope = ?resolved.network_scope,
             authorization = ?resolved.authorization,
             "executing admitted call"
         );
@@ -1180,51 +1530,148 @@ mod authorize_tests {
         .with_approver(approver)
     }
 
-    /// The read-only overlay is a DENIAL, decided at the host, not a question
-    /// for the user and not a second check inside the registry.
-    ///
-    /// The registry used to enforce this too, so a build had two owners for
-    /// the answer. It moved here with the rest of the authorization; this
-    /// pins that the answer did not move with it.
     #[tokio::test]
-    async fn the_read_only_overlay_denies_a_write_tool_at_the_host() {
+    async fn auto_read_only_action_asks_once_executes_and_does_not_elevate_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
         let executor = read_only_executor(dir.path(), approver.clone());
-
-        let reason = executor
-            .authorize(&grep_call(), &mut HashSet::new())
+        let action = call(
+            "apply_patch",
+            serde_json::json!({"patch":"*** Begin Patch\n*** Add File: approved.txt\naccepted\n*** End Patch"}),
+        );
+        assert!(matches!(
+            resolve(&executor, &action).await,
+            PolicyResolution::Ask(_)
+        ));
+        let admitted = executor
+            .admit(
+                action.clone(),
+                executor.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
             .await
-            .expect_err("run_command is WorkspaceWrite; a read-only turn refuses it");
-        assert!(
-            reason.contains("read-only"),
-            "the refusal must name the overlay, not a profile: {reason}"
-        );
+            .ok()
+            .expect("human can approve Auto readonly action");
+        let (_, error, _) = executor
+            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .await;
+        assert!(!error);
         assert_eq!(
-            approver.asks(),
-            0,
-            "a structural denial must never become an approval prompt"
+            std::fs::read_to_string(dir.path().join("approved.txt")).unwrap(),
+            "accepted\n"
         );
-
-        // An observation tool is unaffected: the overlay filters by risk, and
-        // `read_file` is Safe.
+        assert_eq!(approver.asks(), 1);
+        assert!(executor.tool_context.policy.read_only);
         executor
             .authorize(&read_file_call(), &mut HashSet::new())
             .await
-            .expect("a read-only turn still observes");
+            .unwrap();
+        assert!(matches!(
+            resolve(&executor, &action).await,
+            PolicyResolution::Ask(_)
+        ));
+        executor
+            .tool_context
+            .policy
+            .permission_profile()
+            .set(PermissionProfile::RequestApproval);
+        assert!(matches!(
+            resolve(&executor, &action).await,
+            PolicyResolution::Deny(_)
+        ));
     }
 
-    /// A network denial that cannot be enforced is not a denial. An MCP
-    /// server runs outside the sandbox, so the call is refused rather than
-    /// run under an authority this runtime cannot apply to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_self_consent_requires_real_human_then_executes_exact_call() {
+        struct AllowAll;
+        #[async_trait::async_trait]
+        impl leveler_execution::AutoReviewer for AllowAll {
+            async fn review(&self, _: &ApprovalRequest) -> ReviewVerdict {
+                ReviewVerdict::Allow
+            }
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("leveler");
+        let marker = dir.path().join("human-marker");
+        std::fs::write(&executable, "#!/bin/sh\nprintf approved > \"$3\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let executor =
+            executor_for(dir.path(), approver.clone()).with_auto_reviewer(Arc::new(AllowAll));
+        let action = call(
+            "run_command",
+            serde_json::json!({"program":executable,"args":["memory","accept",marker]}),
+        );
+        assert!(matches!(
+            resolve(&executor, &action).await,
+            PolicyResolution::Ask(_)
+        ));
+        let mut sessions = HashSet::new();
+        let admitted = executor
+            .admit(
+                action.clone(),
+                executor.tool_context.clone(),
+                false,
+                &mut sessions,
+                &CancellationToken::new(),
+            )
+            .await
+            .ok()
+            .expect("human approval admits self-consent exact command");
+        assert!(matches!(
+            admitted.resolved().authorization,
+            AuthorizationEvidence::ApprovedOnce
+        ));
+        let (_, error, _) = executor
+            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .await;
+        assert!(!error);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "approved");
+        assert_eq!(
+            approver.asks(),
+            1,
+            "auto reviewer must not approve self consent"
+        );
+        assert!(sessions.is_empty());
+        assert!(matches!(
+            resolve(&executor, &action).await,
+            PolicyResolution::Ask(_)
+        ));
+        let unattended = executor_for(
+            dir.path(),
+            Arc::new(FixedApprover::new(ApprovalDecision::Deny)),
+        )
+        .with_auto_reviewer(Arc::new(AllowAll))
+        .with_approver(Arc::new(leveler_execution::AutoApprove));
+        assert!(
+            unattended
+                .authorize(&action, &mut HashSet::new())
+                .await
+                .is_err()
+        );
+        executor
+            .tool_context
+            .policy
+            .permission_profile()
+            .set(PermissionProfile::RequestApproval);
+        assert!(matches!(
+            resolve(&executor, &action).await,
+            PolicyResolution::Deny(_)
+        ));
+    }
+
     #[tokio::test]
     async fn a_network_denied_run_refuses_an_mcp_tool_instead_of_pretending() {
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
         let workspace = Workspace::new(dir.path()).unwrap();
-        // 完全访问 would otherwise auto-approve it; the denial is what refuses.
+        // An explicit Restricted denial cannot be implemented by MCP.
         let tool_context =
-            ToolContext::new(workspace, PermissionProfile::FullAccess).with_sandbox(true);
+            ToolContext::new(workspace, PermissionProfile::RequestApproval).with_sandbox(true);
         let executor = Executor::new(
             Arc::new(StubRuntime),
             Arc::new(default_registry()),
@@ -1414,50 +1861,35 @@ mod authorize_tests {
         assert_eq!(approver.asks(), 1);
     }
 
-    /// 完全访问 removes the PROMPT, never the structure. A read-only child
-    /// holds no write authority at any profile, and refusing it is a denial —
-    /// it must not become a question for the user.
     #[tokio::test]
-    async fn full_access_never_buys_a_read_only_child_write_authority() {
+    async fn full_access_bypasses_child_role_and_claim_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let session =
             leveler_execution::SharedPermissionProfile::new(PermissionProfile::FullAccess);
-        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
         let main = executor_sharing(dir.path(), &session, approver.clone());
-        let explorer = main
-            .child_for_role_on(crate::sub_agent::AgentRole::Explorer, Vec::new(), None)
-            .with_agent_id("explorer-1");
-
-        // 完全访问 does not put a write tool back into a read-only role: the
-        // child's registry physically does not hold one.
-        assert!(
-            !explorer.registry.mutates_files("apply_patch"),
-            "an explorer must hold no write tool at any profile"
-        );
-
-        // And a writer that has claimed nothing is refused outright, rather
-        // than being turned into a question for the user.
-        let writer = main
-            .child_for_role_on(crate::sub_agent::AgentRole::Default, Vec::new(), None)
-            .with_agent_id("writer-unclaimed");
-        let write = ToolCall {
-            id: ToolCallId::new("w"),
-            name: "apply_patch".into(),
-            arguments: serde_json::json!({ "patch": ["not", "a", "string"] }),
-        };
-        let refusal = writer
-            .refuse_unscoped_mutation(&write)
-            .expect("an unclaimed child holds no write authority under any profile");
-        assert!(refusal.contains("no write scope"), "{refusal}");
-        assert_eq!(
-            approver.asks(),
-            0,
-            "a structural denial must never be turned into an approval prompt"
-        );
+        for role in [
+            crate::sub_agent::AgentRole::Explorer,
+            crate::sub_agent::AgentRole::Default,
+        ] {
+            let child = main
+                .child_for_role_on(role, Vec::new(), None)
+                .with_agent_id("unclaimed");
+            assert!(child.registry.mutates_files("apply_patch"));
+            let action = call(
+                "apply_patch",
+                serde_json::json!({"patch":"*** Begin Patch\n*** Add File: full.txt\n+x\n*** End Patch"}),
+            );
+            match resolve(&child, &action).await {
+                PolicyResolution::Allow(policy) => assert!(policy.unrestricted_execution()),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(approver.asks(), 0);
     }
 
     #[tokio::test]
-    async fn host_opener_cannot_widen_a_childs_owned_scope() {
+    async fn full_host_opener_bypasses_a_childs_owned_scope() {
         let dir = tempfile::tempdir().unwrap();
         let session =
             leveler_execution::SharedPermissionProfile::new(PermissionProfile::FullAccess);
@@ -1488,8 +1920,8 @@ mod authorize_tests {
             )
             .await;
         assert!(
-            matches!(result, Err(AdmitError::Refused { .. })),
-            "host escape must preserve structural scope"
+            result.is_ok(),
+            "Full host opener must bypass task scope permissions"
         );
     }
 
@@ -1831,7 +2263,7 @@ mod authorize_tests {
     }
 
     #[tokio::test]
-    async fn approve_always_memory_write_stays_session_only() {
+    async fn memory_consent_does_not_persist_standing_or_session_grants() {
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveAlways));
         let executor = executor_for(dir.path(), approver.clone())
@@ -1845,6 +2277,9 @@ mod authorize_tests {
         };
         executor.authorize(&remember, &mut session).await.unwrap();
         assert_eq!(approver.asks(), 1, "K36: memory writes always ask");
+        executor.authorize(&remember, &mut session).await.unwrap();
+        assert_eq!(approver.asks(), 2, "human consent remains exact-call only");
+        assert!(session.is_empty());
         assert!(
             !leveler_execution::project_rules_path(dir.path()).exists(),
             "K36: memory writes never get standing permission"
@@ -2019,9 +2454,481 @@ mod authorize_tests {
         );
     }
 
-    // ---- Network authority follows the profile; the sandbox enforces it ----
+    #[tokio::test]
+    async fn full_product_contract_bypasses_every_representative_permission_gate() {
+        use leveler_execution::{
+            NetworkScope, PermissionRule, PermissionRuleSet, RuleEffect, RuleMatch,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let mut exec = executor_at(dir.path(), PermissionProfile::FullAccess, approver.clone());
+        exec.tool_context = exec.tool_context.clone().with_sandbox(true);
+        exec.tool_context.policy.read_only = true;
+        exec.tool_context.policy.command_write_allowlist = Some(Arc::new(Vec::new()));
+        *exec.permission_rules.write().unwrap() = PermissionRuleSet::from_rules(
+            [
+                "run_command",
+                "write_file",
+                "read_file",
+                "remember",
+                "save_agent",
+            ]
+            .iter()
+            .map(|name| PermissionRule {
+                match_: RuleMatch {
+                    tool: Some((*name).into()),
+                    ..Default::default()
+                },
+                effect: RuleEffect::Deny,
+            })
+            .collect(),
+        );
+        let actions = [
+            call(
+                "write_file",
+                serde_json::json!({"path":"ordinary.txt","content":"x"}),
+            ),
+            call("read_file", serde_json::json!({"path":"/tmp/.env"})),
+            call(
+                "run_command",
+                serde_json::json!({"program":"git","args":["fetch","https://unknown.example/repo"]}),
+            ),
+            call(
+                "run_command",
+                serde_json::json!({"program":"git","args":["push","--force","origin","HEAD"]}),
+            ),
+            call(
+                "run_command",
+                serde_json::json!({"program":"curl","args":["https://example.com"]}),
+            ),
+            call(
+                "run_command",
+                serde_json::json!({"program":"curl","args":["http://localhost:3000"]}),
+            ),
+            call(
+                "run_command",
+                serde_json::json!({"program":"kill","args":["12345"]}),
+            ),
+            call(
+                "run_command",
+                serde_json::json!({"program":"git","args":["credential","fill"]}),
+            ),
+            call("remember", serde_json::json!({"title":"x","body":"y"})),
+            call("save_agent", serde_json::json!({})),
+        ];
+        for action in actions {
+            let admitted = exec
+                .admit(
+                    action.clone(),
+                    exec.tool_context.clone(),
+                    false,
+                    &mut HashSet::new(),
+                    &CancellationToken::new(),
+                )
+                .await;
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(AdmitError::Refused { reason, .. }) => panic!("{}: {reason}", action.name),
+                Err(AdmitError::Fatal(error)) => panic!("{error}"),
+            };
+            assert!(admitted.resolved().unrestricted_execution());
+            assert_eq!(admitted.resolved().write, WriteScope::Unrestricted);
+            assert_eq!(admitted.resolved().network_scope, NetworkScope::Internet);
+        }
+        assert_eq!(approver.asks(), 0);
+    }
 
-    /// A tool whose whole job is the network (`web_fetch`-shaped).
+    #[tokio::test]
+    async fn auto_product_contract_allows_development_and_asks_for_danger() {
+        let dir = tempfile::tempdir().unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone());
+        for args in [
+            vec!["status"],
+            vec!["fetch", "origin"],
+            vec!["commit", "-m", "normal"],
+        ] {
+            let action = call(
+                "run_command",
+                serde_json::json!({"program":"git","args":args}),
+            );
+            assert!(
+                matches!(resolve(&exec, &action).await, PolicyResolution::Allow(_)),
+                "{args:?}"
+            );
+        }
+        for args in [
+            vec!["push", "origin", "HEAD"],
+            vec!["reset", "--hard"],
+            vec!["clean", "-fd"],
+        ] {
+            let action = call(
+                "run_command",
+                serde_json::json!({"program":"git","args":args}),
+            );
+            assert!(
+                matches!(resolve(&exec, &action).await, PolicyResolution::Ask(_)),
+                "{args:?}"
+            );
+        }
+        assert_eq!(approver.asks(), 0, "resolution does not invoke approval");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_approved_exact_call_executes_outside_workspace_without_second_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("approved-target");
+        std::fs::write(&victim, "fixture").unwrap();
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let mut exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone());
+        exec.tool_context = exec.tool_context.clone().with_sandbox(true);
+        let action = call(
+            "run_command",
+            serde_json::json!({"program":"rm","args":["-rf",victim]}),
+        );
+        let admitted = match exec
+            .admit(
+                action,
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("approved exact call must be admitted"),
+        };
+        assert_eq!(approver.asks(), 1);
+        assert!(admitted.resolved().unrestricted_execution());
+        let (content, failed, _) = exec
+            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .await;
+        assert!(!failed, "{content}");
+        assert!(
+            !victim.exists(),
+            "observable approved effect must actually occur"
+        );
+        drop(admitted);
+        let next = call("run_command", serde_json::json!({"program":"ls","args":[]}));
+        match resolve(&exec, &next).await {
+            PolicyResolution::Allow(policy) => assert!(!policy.unrestricted_execution()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_foreign_task_asks_once_and_approved_stop_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks = Arc::new(leveler_execution::BackgroundTaskRegistry::new());
+        let request = leveler_execution::ProcessRequest::new(
+            "sleep",
+            vec!["30".into()],
+            dir.path().to_path_buf(),
+        );
+        let id = tasks
+            .spawn_owned(request, None, Some("creator"))
+            .await
+            .unwrap();
+        let mut registry = default_registry();
+        registry.register(Arc::new(leveler_tools::tools::KillTaskTool::new(
+            tasks.clone(),
+        )));
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
+        let mut exec = executor_at(dir.path(), PermissionProfile::Assisted, approver.clone());
+        exec.registry = Arc::new(registry);
+        exec.tool_context = exec.tool_context.clone().with_session_scope("creator");
+        let action = call("kill_task", serde_json::json!({"task_id":id}));
+        assert!(matches!(
+            resolve(&exec, &action).await,
+            PolicyResolution::Allow(_)
+        ));
+        exec.tool_context = exec
+            .tool_context
+            .clone()
+            .with_session_scope("another-session");
+        assert!(matches!(
+            resolve(&exec, &action).await,
+            PolicyResolution::Ask(_)
+        ));
+        let admitted = match exec
+            .admit(
+                action,
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("approved foreign task control must be admitted"),
+        };
+        let (content, failed, _) = exec
+            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .await;
+        assert!(!failed, "{content}");
+        assert_eq!(approver.asks(), 1);
+        let snapshot = tasks.get(&id).await.unwrap();
+        assert_eq!(
+            snapshot.status,
+            leveler_execution::BackgroundTaskStatus::Killed
+        );
+        assert_eq!(snapshot.owner_scope.as_deref(), Some("creator"));
+    }
+
+    fn resource_repo(root: &std::path::Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "credential.helper", ""],
+            vec!["remote", "add", "origin", "https://example.com/a.git"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(root)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+    }
+
+    fn resource_executor(
+        dir: &std::path::Path,
+        mode: PermissionProfile,
+        network_enforceable: bool,
+    ) -> Executor {
+        let mut executor = net_executor(dir, mode, network_enforceable);
+        executor.tool_context = ToolContext::with_environment(
+            Workspace::new(dir).unwrap(),
+            mode,
+            Arc::new(leveler_core::environment().clone()),
+        );
+        executor
+    }
+
+    async fn admit_resource(exec: &Executor, action: ToolCall) -> AdmittedCall {
+        match exec
+            .admit(
+                action,
+                exec.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(AdmitError::Refused { reason, .. }) => panic!("{reason}"),
+            Err(AdmitError::Fatal(error)) => panic!("{error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_store_restart_reuses_only_the_approved_git_target() {
+        use leveler_storage::ResourceGrantStore;
+        let dir = tempfile::tempdir().unwrap();
+        resource_repo(dir.path());
+        let path = dir.path().join("grants.db");
+        let request = leveler_execution::resolve_git_grant(
+            "git",
+            &["fetch".into(), "origin".into()],
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let store = Arc::new(leveler_storage::Database::connect(&path).await.unwrap());
+        store
+            .grant(
+                &request.project_identity,
+                "real-session-A",
+                leveler_core::GrantScope::Session,
+                &request.bindings,
+            )
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = Arc::new(leveler_storage::Database::connect(&path).await.unwrap());
+        assert!(
+            reopened
+                .covers(
+                    &request.project_identity,
+                    "real-session-A",
+                    &request.bindings
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .covers(
+                    &request.project_identity,
+                    "real-session-B",
+                    &request.bindings
+                )
+                .await
+                .unwrap()
+        );
+        let mut resumed = resource_executor(dir.path(), PermissionProfile::RequestApproval, false)
+            .with_resource_grants(reopened);
+        resumed.tool_context = resumed
+            .tool_context
+            .clone()
+            .with_session_scope("real-session-A");
+        let fetch = call(
+            "run_command",
+            serde_json::json!({"program":"git","args":["fetch","origin"]}),
+        );
+        // The stored exact grant covers the same repository and remote.
+        match resolve(&resumed, &fetch).await {
+            PolicyResolution::Allow(policy) => assert!(
+                policy.resource_grant().is_some(),
+                "the stored exact Git grant must authorize the same call"
+            ),
+            other => panic!("the stored exact Git grant must authorize the same call: {other:?}"),
+        }
+        // A changed remote is a different resource: the old grant must not cover
+        // it, and the new target is offered for a fresh decision.
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["remote", "set-url", "origin", "https://example.com/b.git"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let changed = leveler_execution::resolve_git_grant(
+            "git",
+            &["fetch".into(), "origin".into()],
+            dir.path(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(request, changed);
+        match resolve(&resumed, &fetch).await {
+            PolicyResolution::Ask(pending) => {
+                let offered = pending
+                    .request
+                    .grant
+                    .as_ref()
+                    .expect("the changed target is offered for a fresh decision");
+                assert_eq!(offered, &changed);
+                assert_ne!(offered, &request);
+            }
+            other => panic!("a changed Git remote must require fresh consent: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_shell_wrapped_git_keeps_exact_call_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        resource_repo(dir.path());
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        resource_repo(&nested);
+        let exec = resource_executor(dir.path(), PermissionProfile::Assisted, true);
+        // A shell command is opaque: it cannot consume a frozen Git target, so it
+        // never offers one, whatever workdir it names.
+        for arguments in [
+            serde_json::json!({"cmd":"git push origin main","workdir":"nested"}),
+            serde_json::json!({"cmd":"git push origin main"}),
+        ] {
+            let action = call("shell_command", arguments);
+            assert!(
+                exec.registry
+                    .get("shell_command")
+                    .unwrap()
+                    .command_grant_request(&action.arguments, &exec.tool_context)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a shell-wrapped Git command must keep exact-call approval"
+            );
+        }
+        // The argv tool still resolves its target against the directory it runs in.
+        let action = call(
+            "run_command",
+            serde_json::json!({"program":"git","args":["fetch","origin"],"cwd":"nested"}),
+        );
+        let request = exec
+            .registry
+            .get("run_command")
+            .unwrap()
+            .command_grant_request(&action.arguments, &exec.tool_context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request.project_identity,
+            leveler_execution::resolve_project_identity(&nested)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_unproven_filesystem_consumers_do_not_offer_reusable_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target");
+        std::fs::write(&target, "before").unwrap();
+        let exec = resource_executor(dir.path(), PermissionProfile::Assisted, true);
+        let action = call(
+            "write_file",
+            serde_json::json!({"path":target,"content":"after"}),
+        );
+        match resolve(&exec, &action).await {
+            PolicyResolution::Ask(pending) => assert!(
+                pending.request.grant.is_none(),
+                "path checks alone cannot authorize the subsequently opened/replaced object"
+            ),
+            other => panic!("expected approval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_git_consumers_offer_only_the_approved_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        resource_repo(dir.path());
+        let exec = resource_executor(dir.path(), PermissionProfile::Assisted, true);
+        for args in [
+            vec!["push", "origin", "main"],
+            vec!["push", "--force", "origin", "main"],
+        ] {
+            let action = call(
+                "run_command",
+                serde_json::json!({"program":"git","args":args}),
+            );
+            match resolve(&exec, &action).await {
+                PolicyResolution::Ask(pending) => {
+                    let grant = pending
+                        .request
+                        .grant
+                        .as_ref()
+                        .expect("a dangerous Git remote action offers its approved target");
+                    assert!(grant.bindings.iter().any(|binding| matches!(
+                        &binding.resource,
+                        leveler_core::ResourceIdentity::ConfiguredRemote { .. }
+                    )));
+                    assert!(
+                        pending
+                            .request
+                            .decisions()
+                            .contains(&ApprovalDecision::ApproveProject)
+                    );
+                }
+                other => panic!("a dangerous Git push must ask: {other:?}"),
+            }
+        }
+    }
+
     struct NetworkTool;
 
     #[async_trait::async_trait]
@@ -2055,6 +2962,7 @@ mod authorize_tests {
     ) -> Executor {
         let mut registry = default_registry();
         registry.register(Arc::new(NetworkTool));
+        registry.register(Arc::new(leveler_tools::tools::WebFetchTool));
         Executor::new(
             Arc::new(StubRuntime),
             Arc::new(registry),
@@ -2095,7 +3003,11 @@ mod authorize_tests {
         ] {
             match resolve(&exec, &call("run_command", arguments.clone())).await {
                 PolicyResolution::Allow(resolved) => {
-                    assert!(!resolved.network_allowed, "{arguments}")
+                    assert_eq!(
+                        resolved.network_scope,
+                        leveler_execution::NetworkScope::Loopback,
+                        "{arguments}"
+                    )
                 }
                 other => panic!("{arguments}: {other:?}"),
             }
@@ -2114,7 +3026,11 @@ mod authorize_tests {
                 serde_json::json!({"program": "curl", "args": ["-sI", "https://example.com"]}),
             );
             match resolve(&exec, &curl).await {
-                PolicyResolution::Allow(resolved) => assert!(resolved.network_allowed, "{mode:?}"),
+                PolicyResolution::Allow(resolved) => assert_eq!(
+                    resolved.network_scope,
+                    leveler_execution::NetworkScope::Internet,
+                    "{mode:?}"
+                ),
                 other => panic!("{mode:?}: {other:?}"),
             }
         }
@@ -2128,13 +3044,19 @@ mod authorize_tests {
         let dir = tempfile::tempdir().unwrap();
         let exec = net_executor(dir.path(), PermissionProfile::RequestApproval, true);
         match resolve(&exec, &call("net_probe", serde_json::json!({}))).await {
-            PolicyResolution::Ask(pending) => assert!(pending.network_allowed),
+            PolicyResolution::Ask(pending) => assert_eq!(
+                pending.network_scope,
+                leveler_execution::NetworkScope::Internet
+            ),
             other => panic!("{other:?}"),
         }
         // An MCP server is outside the sandbox: under the profile default it
         // is asked like any network use...
         match resolve(&exec, &call("mcp__srv__fetch", serde_json::json!({}))).await {
-            PolicyResolution::Ask(pending) => assert!(pending.network_allowed),
+            PolicyResolution::Ask(pending) => assert_eq!(
+                pending.network_scope,
+                leveler_execution::NetworkScope::Internet
+            ),
             other => panic!("{other:?}"),
         }
         // ...and refused outright when the run itself denies the network.
@@ -2164,7 +3086,10 @@ mod authorize_tests {
         .await
         {
             PolicyResolution::Ask(pending) => {
-                assert!(pending.network_allowed);
+                assert_eq!(
+                    pending.network_scope,
+                    leveler_execution::NetworkScope::Internet
+                );
                 assert!(
                     pending.request.description.contains("无法断网"),
                     "{}",
@@ -2212,7 +3137,10 @@ mod authorize_tests {
                     resolved.authorization
                 );
                 assert_eq!(resolved.write, WriteScope::Workspace { root: root.clone() });
-                assert!(resolved.network_allowed);
+                assert_eq!(
+                    resolved.network_scope,
+                    leveler_execution::NetworkScope::Internet
+                );
             }
             other => panic!("grep under assisted must resolve to Allow: {other:?}"),
         }
@@ -2263,9 +3191,9 @@ mod authorize_tests {
         );
     }
 
-    /// "Don't ask again" skips the prompt. It never widens the write scope.
+    /// Session approval executes that exact action without a second scope gate.
     #[tokio::test]
-    async fn approve_session_skips_the_prompt_but_does_not_widen_the_write_scope() {
+    async fn approve_session_executes_the_exact_action_without_another_permission_gate() {
         use leveler_execution::{AuthorizationEvidence, WriteScope};
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveSession));
@@ -2286,8 +3214,8 @@ mod authorize_tests {
             .expect("first admitted after approval");
         assert_eq!(
             first.resolved().write,
-            WriteScope::Workspace { root: root.clone() },
-            "a session grant skips approval; it does not lift write confinement"
+            WriteScope::Unrestricted,
+            "explicit approval must not be rejected by another scope gate"
         );
         // A command admission holds the execution gate until the call is
         // released, so the first must be dropped before the second can be
@@ -2308,13 +3236,19 @@ mod authorize_tests {
         assert_eq!(approver.asks(), 1, "the second call must not re-prompt");
         assert_eq!(
             second.resolved().write,
-            WriteScope::Workspace { root: root.clone() },
-            "a session grant skips approval; it does not lift write confinement"
+            WriteScope::Unrestricted,
+            "explicit approval must not be rejected by another scope gate"
         );
         assert!(matches!(
             second.resolved().authorization,
             AuthorizationEvidence::SessionGrant { .. }
         ));
+        match resolve(&exec, &grep_call()).await {
+            PolicyResolution::Allow(policy) => {
+                assert_eq!(policy.write, WriteScope::Workspace { root })
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// `request_permissions` goes through the host's ask path. An allowing
@@ -2353,6 +3287,228 @@ mod authorize_tests {
             approver.asks(),
             0,
             "the reviewer settled it; the human was never asked"
+        );
+    }
+    #[derive(Default)]
+    struct PoisonedResourceStore {
+        covers: std::sync::atomic::AtomicUsize,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl leveler_storage::ResourceGrantStore for PoisonedResourceStore {
+        async fn covers(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[leveler_core::GrantBinding],
+        ) -> Result<bool, leveler_storage::StorageError> {
+            self.covers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(leveler_storage::StorageError::InvalidData(
+                "synthetic corrupted grant store".into(),
+            ))
+        }
+        async fn grant(
+            &self,
+            _: &str,
+            _: &str,
+            _: leveler_core::GrantScope,
+            _: &[leveler_core::GrantBinding],
+        ) -> Result<(), leveler_storage::StorageError> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(leveler_storage::StorageError::InvalidData(
+                "synthetic unavailable grant store".into(),
+            ))
+        }
+    }
+
+    struct FullGrantProbe;
+    #[async_trait::async_trait]
+    impl leveler_tools::Tool for FullGrantProbe {
+        fn name(&self) -> &'static str {
+            "full_grant_probe"
+        }
+        fn description(&self) -> &'static str {
+            "Test Full bypass across the resource capability matrix."
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn risk(&self) -> RiskLevel {
+            RiskLevel::Privileged
+        }
+        fn approval_reason(&self, _: &serde_json::Value, _: &ToolContext) -> Option<String> {
+            panic!("Full must bypass resource approval preflight")
+        }
+        async fn grant_bindings(
+            &self,
+            _: &serde_json::Value,
+            _: &ToolContext,
+        ) -> Result<Option<Vec<leveler_core::GrantBinding>>, String> {
+            panic!("Full must not resolve reusable resource identities")
+        }
+        async fn execute(
+            &self,
+            _: serde_json::Value,
+            _: ToolContext,
+            _: CancellationToken,
+        ) -> Result<leveler_tools::ToolOutput, leveler_tools::ToolError> {
+            unreachable!("this matrix tests admission, real Full effects have separate coverage")
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_full_capability_matrix_bypasses_poisoned_store_and_approval() {
+        use leveler_core::Capability::*;
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PoisonedResourceStore::default());
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let mut executor = resource_executor(dir.path(), PermissionProfile::FullAccess, true)
+            .with_resource_grants(store.clone())
+            .with_approver(approver.clone());
+        let mut registry = default_registry();
+        registry.register(Arc::new(FullGrantProbe));
+        executor.registry = Arc::new(registry);
+        for capability in [
+            RepositoryRead,
+            RepositoryMutate,
+            RepositoryMetadataWrite,
+            RepositoryConfigWrite,
+            RepositoryDestroy,
+            RemoteRead,
+            RemoteMutate,
+            RemoteForce,
+            FilesystemRead,
+            FilesystemWrite,
+            FilesystemDelete,
+            BackgroundTaskObserve,
+            BackgroundTaskControl,
+            ExternalProcessControl,
+            CredentialUse,
+            CredentialRawRead,
+            CredentialRawWrite,
+        ] {
+            let action = call(
+                "full_grant_probe",
+                serde_json::json!({"capability":capability}),
+            );
+            let admitted = admit_resource(&executor, action).await;
+            assert!(
+                admitted.resolved().unrestricted_execution(),
+                "{capability:?}"
+            );
+        }
+        assert_eq!(store.covers.load(Ordering::SeqCst), 0);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(approver.asks(), 0);
+    }
+
+    #[tokio::test]
+    async fn resource_auto_ordinary_write_ignores_poisoned_store_and_dangerous_action_still_asks() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        resource_repo(dir.path());
+        let store = Arc::new(PoisonedResourceStore::default());
+        let approver = Arc::new(FixedApprover::new(ApprovalDecision::Deny));
+        let executor = resource_executor(dir.path(), PermissionProfile::Assisted, true)
+            .with_resource_grants(store.clone())
+            .with_approver(approver.clone());
+        let ordinary = call(
+            "write_file",
+            serde_json::json!({"path":"ordinary.txt","content":"actual-auto-write"}),
+        );
+        let admitted = admit_resource(&executor, ordinary).await;
+        let (content, failed, _) = executor
+            .dispatch_raw(&admitted, &CancellationToken::new(), None)
+            .await;
+        assert!(!failed, "{content}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ordinary.txt")).unwrap(),
+            "actual-auto-write"
+        );
+        assert_eq!(store.covers.load(Ordering::SeqCst), 0);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(approver.asks(), 0);
+        drop(admitted);
+        let dangerous = call(
+            "run_command",
+            serde_json::json!({"program":"git","args":["push","origin","main"]}),
+        );
+        let result = executor
+            .admit(
+                dangerous,
+                executor.tool_context.clone(),
+                false,
+                &mut HashSet::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(AdmitError::Refused { .. })));
+        assert_eq!(approver.asks(), 1);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+    }
+
+    /// Phase 4: a credential binding is reusable only because the frozen Git
+    /// target re-verifies the credential incarnation at execution. On its own
+    /// it authorizes nothing — a credential is never a remote-effect grant.
+    #[test]
+    fn a_credential_binding_is_execution_bound_but_never_authorizes_alone() {
+        use leveler_core::{Capability, GrantBinding, GrantRequest, ResourceIdentity};
+        let remote = GrantBinding {
+            capability: Capability::RemoteRead,
+            resource: ResourceIdentity::ConfiguredRemote {
+                repository: "repo-epoch".into(),
+                remote_name: "origin".into(),
+                canonical_url: "https://example.com/private.git".into(),
+                transport: "https".into(),
+            },
+        };
+        let credential = GrantBinding {
+            capability: Capability::CredentialUse,
+            resource: ResourceIdentity::Credential {
+                project: "repo-epoch".into(),
+                host: "example.com".into(),
+                identity: "sha256:0123456789abcdef".into(),
+                transport: "https".into(),
+            },
+        };
+        let with_remote = GrantRequest {
+            project_identity: "repo-epoch".into(),
+            bindings: vec![remote.clone(), credential.clone()],
+        };
+        assert!(
+            Executor::execution_bound_request(&with_remote),
+            "the frozen Git target is the credential binding's execution owner"
+        );
+        let credential_only = GrantRequest {
+            project_identity: "repo-epoch".into(),
+            bindings: vec![credential],
+        };
+        assert!(
+            !Executor::execution_bound_request(&credential_only),
+            "a credential alone must not authorize a remote effect"
+        );
+        let raw_read = GrantRequest {
+            project_identity: "repo-epoch".into(),
+            bindings: vec![
+                remote,
+                GrantBinding {
+                    capability: Capability::CredentialRawRead,
+                    resource: ResourceIdentity::Credential {
+                        project: "repo-epoch".into(),
+                        host: "example.com".into(),
+                        identity: "sha256:0123456789abcdef".into(),
+                        transport: "https".into(),
+                    },
+                },
+            ],
+        };
+        assert!(
+            !Executor::execution_bound_request(&raw_read),
+            "credential.raw.read is never a reusable Git grant"
         );
     }
 }

@@ -340,6 +340,7 @@ impl Executor {
         // instead put it outside the approval policy, so `--auto-approve` (whose
         // whole purpose is unattended driving) still stopped dead on a human.
         let request = ApprovalRequest {
+            grant: None,
             id: ApprovalId::generate(),
             turn_id: None,
             call_id: call.id.to_string(),
@@ -357,7 +358,7 @@ impl Executor {
         let pending = leveler_execution::PendingApproval {
             signature: action_fingerprint(call),
             write: self.tool_context.write_scope(),
-            network_allowed: !self.tool_context.policy.network_denied(),
+            network_scope: self.tool_context.policy.network_scope(),
             command_line: Some(action.to_string()),
             scoped_paths: Vec::new(),
             request,

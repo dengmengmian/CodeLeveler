@@ -34,7 +34,7 @@ fn git_reads_do_not_authorize_other_shell_effects() {
 fn mixed_safe_commands_keep_their_actual_effect_verdict() {
     for script in [
         "git status; echo done",
-        "git fetch origin && printf done",
+        "git status && printf done",
         "git status; curl https://example.com",
     ] {
         assert_eq!(
@@ -70,6 +70,38 @@ fn partially_readable_git_call_does_not_authorize_opaque_effects() {
         assert!(!executed.complete, "{script}");
         assert!(executed.git_effects().gated(), "{script}");
     }
+}
+
+/// A remote Git transfer that a shell wrapper launders cannot be bound to a
+/// frozen approved remote and credential: only a directly invoked `git` can.
+/// It must keep exact-call approval instead of auto-running against the user's
+/// live Git credential store.
+#[test]
+fn wrapper_remote_git_keeps_exact_call_approval() {
+    for script in [
+        "git fetch origin",
+        "git ls-remote origin",
+        "git fetch origin && git status",
+        "git remote show origin",
+        "git archive --remote=origin HEAD",
+    ] {
+        assert_eq!(
+            classify("sh", &["-c", script]),
+            CommandClass::Dangerous,
+            "{script}"
+        );
+    }
+    // A direct `git` invocation keeps the bindable, grant-eligible path.
+    assert_eq!(classify("git", &["fetch", "origin"]), CommandClass::Safe);
+    assert_eq!(
+        classify("git", &["ls-remote", "origin"]),
+        CommandClass::Safe
+    );
+    // A local-only wrapper is unaffected: no remote transfer, no credential.
+    assert_eq!(
+        classify("sh", &["-c", "git status && git log --oneline"]),
+        CommandClass::Safe
+    );
 }
 
 fn git_effects(words: &[&str]) -> leveler_execution::GitCommandEffects {
