@@ -27,6 +27,7 @@ pub mod request;
 pub mod response;
 pub mod retention;
 pub mod runtime;
+pub mod thinking;
 pub mod tool_exchange;
 
 pub use authority::{
@@ -71,4 +72,5 @@ pub use request::{
 pub use response::ModelResponse;
 pub use retention::ReasoningRetention;
 pub use runtime::{ModelEventStream, ModelRuntime, stream_from_response};
+pub use thinking::{ThinkingAccess, ThinkingCapabilities, ThinkingLevel, ThinkingProjection};
 pub use tool_exchange::{ToolExchangeViolation, validate_tool_exchange};

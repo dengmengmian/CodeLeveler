@@ -56,7 +56,7 @@ use toml_edit::{DocumentMut, value};
 
 use leveler_model::{
     CompatibilityConfig, ModelCapabilities, ModelLimits, ModelProfile, ProtocolKind,
-    ReasoningConfig, ReasoningEffort, ReasoningStyle,
+    ReasoningConfig, ReasoningEffort, ReasoningStyle, ThinkingLevel,
 };
 use leveler_provider::{ModelConfigFile, ProviderConfig};
 use leveler_tools::mcp::McpServerConfig;
@@ -68,6 +68,15 @@ pub struct GlobalConfig {
     /// Default model reference (`provider/model`) when none is given.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Default Thinking Level for every model, in CodeLeveler's own words:
+    /// `auto` (the default), `off`, `minimal`, `low`, `medium`, `high`, `max`.
+    ///
+    /// This is the only reasoning setting a user writes. A model may override
+    /// it in `[models.<id>]`, and `/thinking` overrides either for one session.
+    /// The provider's own spelling (`xhigh`, a thinking budget) is capability,
+    /// declared by the model entry below, and never appears here.
+    #[serde(default)]
+    pub thinking: Option<ThinkingLevel>,
     /// TUI language: `zh` or `en`. Overridden by `LEVELER_LANG` when set.
     #[serde(default)]
     pub lang: Option<String>,
@@ -332,8 +341,16 @@ struct GlobalModel {
     instructions: Option<toml::Value>,
     /// CodeLeveler default: `minimal` | `low` | `medium` | `high` | `xhigh` | `max`.
     /// This is **not** the provider default. A knob-style model must set it.
+    ///
+    /// This is the route's spelling of the level, kept for the model registry
+    /// that ships with the binary. A user writes [`GlobalModel::thinking`]
+    /// instead, which names the level rather than the string a provider reads.
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
+    /// This model's Thinking Level, overriding the global `thinking`. Absent →
+    /// the global default, then the model's own declared default.
+    #[serde(default)]
+    pub thinking: Option<ThinkingLevel>,
     #[serde(default)]
     context_window: Option<u32>,
     /// Usable context before compaction. Defaults to half the hard window.
@@ -550,8 +567,59 @@ impl GlobalConfig {
                     "model `{id}` has invalid reasoning config: {reason}"
                 )));
             }
+            // A per-model level is a statement about THAT model, so an
+            // impossible one is an error rather than a silent rounding. The
+            // global default is a preference across models and is rounded per
+            // model instead — a default nobody can satisfy everywhere would be
+            // useless.
+            if let Some(level) = model.thinking {
+                let caps = leveler_model::ThinkingCapabilities::of(model.reasoning, &config);
+                if !caps.accepts(level) {
+                    let available = match caps.access() {
+                        leveler_model::ThinkingAccess::Unsupported => {
+                            "this model does not reason".to_string()
+                        }
+                        leveler_model::ThinkingAccess::Fixed => {
+                            "this model's thinking cannot be adjusted".to_string()
+                        }
+                        leveler_model::ThinkingAccess::Adjustable => format!(
+                            "available levels: {}",
+                            caps.levels()
+                                .iter()
+                                .map(|level| level.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    };
+                    return Err(GlobalConfigError::Parse(format!(
+                        "model `{id}` cannot use thinking = \"{level}\" — {available}; \
+                         the provider's own spelling belongs in `reasoning_effort`"
+                    )));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The configured Thinking Level for a model, before any session override:
+    /// the model's own setting, else the global default, else `auto`.
+    ///
+    /// `auto` is a real answer here — "no preference" — not a missing value.
+    pub fn thinking_level_for(&self, model: &str) -> ThinkingLevel {
+        let id = model
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(model);
+        self.models
+            .get(id)
+            .and_then(|m| m.thinking)
+            .or(self.thinking)
+            .unwrap_or(ThinkingLevel::Auto)
+    }
+
+    /// The global Thinking Level default, before any model override.
+    pub fn thinking_level(&self) -> ThinkingLevel {
+        self.thinking.unwrap_or(ThinkingLevel::Auto)
     }
 
     /// Effective CodeLeveler default for `[models.<id>]` (`provider/model` or
@@ -1139,6 +1207,118 @@ fn parse_protocol(s: &str) -> ProtocolKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Thinking Level: one vocabulary, three places it can be set ──────────
+
+    /// The global default is `auto` when nobody sets one, and `auto` is what a
+    /// model falls back to when it has no setting of its own.
+    #[test]
+    fn the_thinking_default_is_auto() {
+        let cfg: GlobalConfig = toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
+        assert_eq!(cfg.thinking_level(), ThinkingLevel::Auto);
+        assert_eq!(cfg.thinking_level_for("m"), ThinkingLevel::Auto);
+        assert_eq!(cfg.thinking_level_for("p/m"), ThinkingLevel::Auto);
+    }
+
+    /// The global default is read, and reaches every model that does not set
+    /// its own.
+    #[test]
+    fn a_global_level_reaches_a_model_that_sets_none() {
+        let cfg: GlobalConfig =
+            toml::from_str("thinking = \"max\"\n[models.m]\nprovider = \"p\"\n").unwrap();
+        assert_eq!(cfg.thinking_level(), ThinkingLevel::Max);
+        assert_eq!(cfg.thinking_level_for("m"), ThinkingLevel::Max);
+    }
+
+    /// A model's own level wins, including when it says `auto`: `auto` is a
+    /// choice, not an absence, so it overrides a stricter global default.
+    #[test]
+    fn a_model_level_overrides_the_global_one() {
+        let toml = "thinking = \"medium\"\n\
+                    [models.low]\nprovider = \"p\"\nthinking = \"low\"\n\
+                    [models.auto]\nprovider = \"p\"\nthinking = \"auto\"\n";
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.thinking_level_for("low"), ThinkingLevel::Low);
+        assert_eq!(cfg.thinking_level_for("auto"), ThinkingLevel::Auto);
+    }
+
+    /// The provider's own spelling is not a public value: a user writing
+    /// `xhigh` is told the real vocabulary instead of getting a parse error
+    /// about an internal enum.
+    #[test]
+    fn the_providers_own_level_is_not_a_user_value() {
+        let err = toml::from_str::<GlobalConfig>("thinking = \"xhigh\"\n").unwrap_err();
+        let text = err.to_string();
+        for level in ThinkingLevel::ALL {
+            assert!(text.contains(level.as_str()), "{text}");
+        }
+        assert!(text.contains("unknown variant"), "{text}");
+    }
+
+    /// A per-model level that the model cannot express is a configuration
+    /// error naming the levels it can — not a silent rounding.
+    #[test]
+    fn an_impossible_model_level_names_the_real_options() {
+        let toml = r#"
+            [models."deepseek-chat"]
+            provider = "deepseek"
+            reasoning = true
+            reasoning_style = "thinking_flag"
+            supported_efforts = ["low", "high"]
+            reasoning_effort = "high"
+            thinking = "minimal"
+        "#;
+        let err = GlobalConfig::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("cannot use thinking = \"minimal\""), "{err}");
+        assert!(err.contains("auto, off, low, high, max"), "{err}");
+    }
+
+    /// A model with no reasoning at all says so in its own words.
+    #[test]
+    fn a_model_that_cannot_think_says_so() {
+        let toml = "[models.m]\nprovider = \"p\"\nthinking = \"max\"\n";
+        let err = GlobalConfig::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("does not reason"), "{err}");
+    }
+
+    /// A level the model has to round is accepted for the *global* default: a
+    /// preference that has to hold for every model cannot be an error on one.
+    #[test]
+    fn the_global_default_may_round_on_a_model_that_lacks_it() {
+        let toml = r#"
+            thinking = "medium"
+
+            [models."deepseek-chat"]
+            provider = "deepseek"
+            reasoning = true
+            reasoning_style = "thinking_flag"
+            supported_efforts = ["low", "high"]
+            reasoning_effort = "high"
+        "#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.thinking_level_for("deepseek-chat"),
+            ThinkingLevel::Medium
+        );
+    }
+
+    /// The canonical words survive a config round-trip: the file a user writes
+    /// holds `max`, never the provider's string.
+    #[test]
+    fn the_canonical_words_are_what_serializes() {
+        let toml = "thinking = \"max\"\n[models.m]\nprovider = \"p\"\nthinking = \"off\"\n";
+        let value: toml::Value = toml::from_str(toml).unwrap();
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.thinking_level(), ThinkingLevel::Max);
+        // The file a user writes and the file they get back hold the canonical
+        // word, never the provider's spelling.
+        assert_eq!(value["thinking"].as_str(), Some("max"));
+        assert_eq!(value["models"]["m"]["thinking"].as_str(), Some("off"));
+        assert_eq!(
+            serde_json::to_string(&cfg.thinking_level_for("m")).unwrap(),
+            "\"off\""
+        );
+    }
 
     /// The retired per-model `instructions` key must be parsed (old configs
     /// keep loading) but never change behaviour, and it must be reportable so

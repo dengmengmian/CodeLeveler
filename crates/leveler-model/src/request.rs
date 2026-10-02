@@ -267,6 +267,15 @@ pub struct ModelRequest {
     /// `None` falls back to the model profile's recommendation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Ask the route to turn thinking off for this request.
+    ///
+    /// This is the one thing an effort cannot express: a level asks for *more*
+    /// or *less* thinking, and `off` asks for none. Only a route whose declared
+    /// style has a word for it (`thinking: {"type": "disabled"}`, or a
+    /// Messages request that simply carries no thinking block) can honour it;
+    /// elsewhere the canonical layer never offers `off`, so this stays false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thinking_disabled: bool,
     #[serde(default)]
     pub stop: Vec<String>,
     #[serde(default)]
@@ -303,6 +312,7 @@ impl ModelRequest {
             max_output_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            thinking_disabled: false,
             stop: Vec::new(),
             metadata: RequestMetadata::default(),
             deadline: None,

@@ -71,25 +71,33 @@ impl ProtocolAdapter for AnthropicMessagesAdapter {
             })
             .collect();
 
-        let thinking = match context.reasoning.style {
-            leveler_model::ReasoningStyle::None => None,
-            leveler_model::ReasoningStyle::AdaptiveThinking => {
-                Some(serde_json::json!({"type":"adaptive"}))
-            }
-            leveler_model::ReasoningStyle::BudgetedThinking { budget_tokens } => {
-                if budget_tokens < 1024
-                    || budget_tokens >= request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS)
-                {
+        let thinking = if request.thinking_disabled {
+            // An explicit `off` from the canonical Thinking Level: the Messages
+            // route says "no thinking" by carrying no thinking block, and the
+            // effort goes with it.
+            None
+        } else {
+            match context.reasoning.style {
+                leveler_model::ReasoningStyle::None => None,
+                leveler_model::ReasoningStyle::AdaptiveThinking => {
+                    Some(serde_json::json!({"type":"adaptive"}))
+                }
+                leveler_model::ReasoningStyle::BudgetedThinking { budget_tokens } => {
+                    if budget_tokens < 1024
+                        || budget_tokens >= request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS)
+                    {
+                        return Err(ProtocolError::Encode(
+                            "thinking budget must be at least 1024 and below max_output_tokens"
+                                .into(),
+                        ));
+                    }
+                    Some(serde_json::json!({"type":"enabled", "budget_tokens":budget_tokens}))
+                }
+                _ => {
                     return Err(ProtocolError::Encode(
-                        "thinking budget must be at least 1024 and below max_output_tokens".into(),
+                        "thinking style is not supported by the Messages protocol".into(),
                     ));
                 }
-                Some(serde_json::json!({"type":"enabled", "budget_tokens":budget_tokens}))
-            }
-            _ => {
-                return Err(ProtocolError::Encode(
-                    "thinking style is not supported by the Messages protocol".into(),
-                ));
             }
         };
         if thinking.is_some() && request.tool_choice.forces_tool_call() {
@@ -467,6 +475,33 @@ mod tests {
         req.reasoning_effort = Some(ReasoningEffort::High);
         let enc = AnthropicMessagesAdapter::new()
             .encode_request(&req, &ctx(), true)
+            .unwrap();
+        assert!(enc.body.get("thinking").is_none(), "{}", enc.body);
+        assert!(enc.body.get("output_config").is_none(), "{}", enc.body);
+        assert!(enc.body.get("reasoning_effort").is_none(), "{}", enc.body);
+    }
+
+    #[test]
+    fn an_explicit_off_carries_no_thinking_block_on_a_messages_route() {
+        // The canonical `off` level on a Messages route: no thinking block, so
+        // the request asks for no thinking at all, and the effort is gone with
+        // the block it belonged to.
+        let context = ProtocolContext {
+            reasoning: ReasoningConfig {
+                style: leveler_model::ReasoningStyle::AdaptiveThinking,
+                supported_efforts: vec![
+                    leveler_model::ReasoningEffort::Low,
+                    leveler_model::ReasoningEffort::High,
+                ],
+                default_effort: Some(leveler_model::ReasoningEffort::High),
+            },
+            ..ctx()
+        };
+        let mut req = user_req("hi");
+        req.reasoning_effort = Some(leveler_model::ReasoningEffort::High);
+        req.thinking_disabled = true;
+        let enc = AnthropicMessagesAdapter::new()
+            .encode_request(&req, &context, true)
             .unwrap();
         assert!(enc.body.get("thinking").is_none(), "{}", enc.body);
         assert!(enc.body.get("output_config").is_none(), "{}", enc.body);

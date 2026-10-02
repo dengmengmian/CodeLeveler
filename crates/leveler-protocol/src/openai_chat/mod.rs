@@ -68,7 +68,21 @@ impl ProtocolAdapter for OpenAiChatAdapter {
         // Effective effort is resolved before encode. The adapter does not
         // fall back to the profile or remap levels.
         let effort = request.reasoning_effort;
-        let (thinking, reasoning_effort) = if !context.thinking_supports_forced_tool_choice
+        let (thinking, reasoning_effort) = if request.thinking_disabled {
+            // An explicit `off` from the canonical Thinking Level. Only the
+            // thinking-flag style has a word for it; the others have no way to
+            // say "no thinking", which is why the canonical layer does not
+            // offer `off` on them in the first place.
+            match context.reasoning.style {
+                ReasoningStyle::ThinkingFlag => (Some(Thinking { kind: "disabled" }), None),
+                ReasoningStyle::OpenAiEffort | ReasoningStyle::None => (None, None),
+                ReasoningStyle::AdaptiveThinking | ReasoningStyle::BudgetedThinking { .. } => {
+                    return Err(ProtocolError::Encode(
+                        "thinking style requires a Messages protocol route".into(),
+                    ));
+                }
+            }
+        } else if !context.thinking_supports_forced_tool_choice
             && request.tool_choice.forces_tool_call()
         {
             // The provider rejects a forced tool_choice while thinking, and for
@@ -1526,6 +1540,47 @@ mod tests {
             .unwrap()
             .body;
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn an_explicit_off_disables_thinking_and_drops_the_effort_with_it() {
+        // The canonical `off` level reaches the wire as the route's own
+        // disable, with no effort beside it: a disabled thinking mode has no
+        // strength, and sending one anyway is a request the provider rejects.
+        let context = ctx_reasoning(ReasoningStyle::ThinkingFlag, Some(ReasoningEffort::Max));
+        let mut request = ModelRequest::new(
+            ModelRef::new("deepseek", "deepseek-v4-pro"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        request.reasoning_effort = Some(ReasoningEffort::Max);
+        request.thinking_disabled = true;
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&request, &context, true)
+            .unwrap()
+            .body;
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "effort goes with the thinking knob: {body}"
+        );
+    }
+
+    #[test]
+    fn an_effort_style_has_no_way_to_say_off_and_sends_nothing() {
+        // Which is why the canonical layer does not offer `off` on this style.
+        let context = ctx_reasoning(ReasoningStyle::OpenAiEffort, Some(ReasoningEffort::High));
+        let mut request = ModelRequest::new(
+            ModelRef::new("openai", "gpt-5"),
+            vec![Message::text(Role::User, "hi")],
+        );
+        request.reasoning_effort = Some(ReasoningEffort::High);
+        request.thinking_disabled = true;
+        let body = OpenAiChatAdapter::new()
+            .encode_request(&request, &context, true)
+            .unwrap()
+            .body;
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 
     #[test]
