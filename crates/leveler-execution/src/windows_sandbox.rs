@@ -327,13 +327,21 @@ mod tests {
         }
     }
 
+    /// Full access is not confined, so the gate never refuses it for its write
+    /// scope. It also clears the network deny before the gate: `CommandRunner::spawn`
+    /// normalizes `unrestricted_execution` to `NetworkScope::Internet`, so the
+    /// state the gate is actually asked about is an unrestricted intent with no
+    /// deny request. `WriteScope::Unrestricted` is not itself proof of Full
+    /// access — it is `ProcessRequest::new`'s default — which is why the deny
+    /// refusal below stays ahead of the scope check and is asserted separately
+    /// by `a_network_deny_request_is_refused_on_windows_rather_than_run_open`.
     #[test]
     fn full_access_always_allowed() {
         let intent = FilesystemIntent::from_write_scope(
             &crate::WriteScope::Unrestricted,
             Path::new("C:\\ws"),
         );
-        assert!(assert_intent_spawn_allowed(&intent, true).is_ok());
+        assert!(assert_intent_spawn_allowed(&intent, false).is_ok());
     }
 
     /// Both confined intents are allowed on Windows exactly when the launcher
@@ -533,7 +541,10 @@ mod background_gate_tests {
 
     /// Windows cannot deny a process the network without AppContainer, and
     /// AppContainer cannot leave the toolchain readable. A request that asks
-    /// for a network deny is refused rather than run with the network open.
+    /// for a network deny is refused rather than run with the network open,
+    /// whatever its write scope: an unconfined write scope is not a claim of
+    /// Full access (`WriteScope::Unrestricted` is the request default), and a
+    /// deny request that cannot be enforced must never be silently widened.
     #[cfg(windows)]
     #[test]
     fn a_network_deny_request_is_refused_on_windows_rather_than_run_open() {
