@@ -401,10 +401,12 @@ impl AgentBridge {
         let waited = tokio::time::timeout(deadline, async {
             loop {
                 match events.recv().await {
-                    Ok(RuntimeEvent::AttachmentAdded { attachment }) if attachment.name == name => {
+                    Ok(RuntimeEvent::AttachmentAdded { attachment, .. })
+                        if attachment.name == name =>
+                    {
                         return Ok(attachment);
                     }
-                    Ok(RuntimeEvent::AttachmentProcessingFailed { error }) => {
+                    Ok(RuntimeEvent::AttachmentProcessingFailed { error, .. }) => {
                         return Err(AdmissionError::Runtime(error));
                     }
                     Ok(_) => continue,

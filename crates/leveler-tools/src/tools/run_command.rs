@@ -63,10 +63,11 @@ struct Input {
     /// Cleanup boundary for a background process. Defaults to `goal`, which
     /// stops it when the current goal finishes. Use `runtime` only when the
     /// user explicitly asks a dev server or watcher to remain running after
-    /// task completion; it then runs until explicitly stopped or runtime exit.
-    /// `session` survives runtime updates until its creating session is deleted.
-    /// `persistent` is explicitly owned by the independent execution host and
-    /// survives runtime updates until it exits or the user stops it.
+    /// task completion; it is owned by the independent execution host and runs
+    /// until explicitly stopped, surviving CodeLeveler version updates.
+    /// `session` is the same but is also stopped when its creating session is
+    /// deleted. `persistent` is the same as `runtime` and is the explicit name
+    /// for a user-requested service.
     #[serde(default)]
     background_lifetime: Option<BackgroundLifetimeInput>,
 }

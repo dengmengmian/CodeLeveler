@@ -173,16 +173,13 @@ fn hit_after_turn_started_test_barrier() {}
 #[cfg(not(feature = "test-crash-barrier"))]
 fn hit_before_receipt_settled_test_barrier() {}
 
-/// Pending candidates as UI entries. Kept next to the listing handlers so the
-/// three places that emit `MemoryList` cannot drift on what "pending" means.
-/// Pending candidates with the body, kind and source the user needs in order
-/// to decide. A title alone is not informed consent.
+/// Pending candidates include the body, kind and source needed for informed
+/// consent. Preserve store errors rather than presenting them as no candidates.
 fn pending_entries(
     store: &leveler_memory::MemoryStore,
-) -> Vec<leveler_client_protocol::UiMemoryCandidate> {
-    store
-        .list_pending()
-        .unwrap_or_default()
+) -> Result<Vec<leveler_client_protocol::UiMemoryCandidate>, leveler_memory::MemoryError> {
+    Ok(store
+        .list_pending()?
         .into_iter()
         .map(|c| leveler_client_protocol::UiMemoryCandidate {
             id: c.id,
@@ -191,7 +188,7 @@ fn pending_entries(
             kind: format!("{:?}", c.kind).to_lowercase(),
             source: format!("{:?}", c.source).to_lowercase(),
         })
-        .collect()
+        .collect())
 }
 
 fn project_memory_consolidation_event(
@@ -260,40 +257,39 @@ fn memory_row(entry: &leveler_memory::MemoryEntry) -> leveler_client_protocol::U
     }
 }
 
-/// Push the current listing to this session's clients. One sender, so every
-/// memory command refreshes the same way.
+/// A complete listing is evidence only when every requested store read succeeds.
+/// Pending reads retain MemoryStore's existing crash-residue healing semantics.
 fn send_memory_list(
     events: &tokio::sync::broadcast::Sender<RuntimeEvent>,
     memory_dir: &std::path::Path,
     include_archived: bool,
     query_id: Option<leveler_core::CommandId>,
 ) {
-    let Ok(store) = leveler_memory::MemoryStore::open(memory_dir) else {
-        return;
+    let listing = (|| -> Result<RuntimeEvent, leveler_memory::MemoryError> {
+        let store = leveler_memory::MemoryStore::open(memory_dir)?;
+        let active = store.list_active()?.iter().map(memory_row).collect();
+        let archived = if include_archived {
+            store.list_archived()?.iter().map(memory_row).collect()
+        } else {
+            Vec::new()
+        };
+        let pending = pending_entries(&store)?;
+        Ok(RuntimeEvent::MemoryList {
+            query_id,
+            memory_dir: memory_dir.display().to_string(),
+            active,
+            archived,
+            pending,
+        })
+    })();
+    let event = match listing {
+        Ok(event) => event,
+        Err(error) => RuntimeEvent::Notification {
+            level: leveler_client_protocol::NotificationLevel::Warning,
+            message: format!("memory list failed: {error}"),
+        },
     };
-    let active = store
-        .list_active()
-        .unwrap_or_default()
-        .iter()
-        .map(memory_row)
-        .collect();
-    let archived = if include_archived {
-        store
-            .list_archived()
-            .unwrap_or_default()
-            .iter()
-            .map(memory_row)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let _ = events.send(RuntimeEvent::MemoryList {
-        query_id,
-        memory_dir: memory_dir.display().to_string(),
-        active,
-        archived,
-        pending: pending_entries(&store),
-    });
+    let _ = events.send(event);
 }
 
 fn execution_mode(value: leveler_client_protocol::PermissionProfile) -> PermissionProfile {
@@ -3482,6 +3478,63 @@ impl InProcessRuntimeClient {
         self.active.finish(&admission);
         Ok(())
     }
+    // The import result is asynchronous; carry this envelope's immutable
+    // identity into the worker rather than keeping a shared current-command id.
+    fn import_attachment_data(
+        &self,
+        session_id: SessionId,
+        name: String,
+        data_base64: String,
+        command_id: Option<CommandId>,
+    ) -> Result<(), ClientError> {
+        let media_root = self.media_root.clone();
+        let events = self.events_for(&session_id);
+        tokio::task::spawn_blocking(move || {
+            let store = MediaStore::new(&media_root);
+            let result = match store.import_base64(&data_base64) {
+                Ok(stored) => Ok(AttachmentRef {
+                    id: AttachmentId::new(leveler_core::new_uuid_string()),
+                    kind: AttachmentKind::Image,
+                    name,
+                    mime_type: stored.mime_type,
+                    size_bytes: stored.size_bytes,
+                    sha256: stored.sha256,
+                    width: Some(stored.width),
+                    height: Some(stored.height),
+                }),
+                Err(MediaError::Unsupported(_)) => {
+                    let mime = mime_from_name(&name);
+                    match store.put_base64(&data_base64, &mime) {
+                        Ok((sha256, size_bytes)) => Ok(AttachmentRef {
+                            id: AttachmentId::new(leveler_core::new_uuid_string()),
+                            kind: kind_from_mime(&mime),
+                            name,
+                            mime_type: mime,
+                            size_bytes,
+                            sha256,
+                            width: None,
+                            height: None,
+                        }),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            match result {
+                Ok(attachment) => {
+                    let _ = events.send(RuntimeEvent::AttachmentAdded {
+                        attachment,
+                        command_id,
+                    });
+                }
+                Err(error) => {
+                    let _ =
+                        events.send(RuntimeEvent::AttachmentProcessingFailed { error, command_id });
+                }
+            }
+        });
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -3660,6 +3713,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     match store.import_path(&source) {
                         Ok(stored) => {
                             let _ = events.send(RuntimeEvent::AttachmentAdded {
+                                command_id: None,
                                 attachment: AttachmentRef {
                                     id: AttachmentId::new(leveler_core::new_uuid_string()),
                                     kind: AttachmentKind::Image,
@@ -3674,6 +3728,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                         }
                         Err(e) => {
                             let _ = events.send(RuntimeEvent::AttachmentProcessingFailed {
+                                command_id: None,
                                 error: e.to_string(),
                             });
                         }
@@ -3685,51 +3740,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 name,
                 data_base64,
-            } => {
-                let media_root = self.media_root.clone();
-                let events = self.events_for(&session_id);
-                tokio::task::spawn_blocking(move || {
-                    let store = MediaStore::new(&media_root);
-                    let result = match store.import_base64(&data_base64) {
-                        Ok(stored) => Ok(AttachmentRef {
-                            id: AttachmentId::new(leveler_core::new_uuid_string()),
-                            kind: AttachmentKind::Image,
-                            name,
-                            mime_type: stored.mime_type,
-                            size_bytes: stored.size_bytes,
-                            sha256: stored.sha256,
-                            width: Some(stored.width),
-                            height: Some(stored.height),
-                        }),
-                        Err(MediaError::Unsupported(_)) => {
-                            let mime = mime_from_name(&name);
-                            match store.put_base64(&data_base64, &mime) {
-                                Ok((sha256, size_bytes)) => Ok(AttachmentRef {
-                                    id: AttachmentId::new(leveler_core::new_uuid_string()),
-                                    kind: kind_from_mime(&mime),
-                                    name,
-                                    mime_type: mime,
-                                    size_bytes,
-                                    sha256,
-                                    width: None,
-                                    height: None,
-                                }),
-                                Err(error) => Err(error.to_string()),
-                            }
-                        }
-                        Err(error) => Err(error.to_string()),
-                    };
-                    match result {
-                        Ok(attachment) => {
-                            let _ = events.send(RuntimeEvent::AttachmentAdded { attachment });
-                        }
-                        Err(error) => {
-                            let _ = events.send(RuntimeEvent::AttachmentProcessingFailed { error });
-                        }
-                    }
-                });
-                Ok(())
-            }
+            } => self.import_attachment_data(session_id, name, data_base64, None),
             ClientCommand::AddClipboardImage { session_id } => {
                 let media_root = self.media_root.clone();
                 let events = self.events_for(&session_id);
@@ -3753,10 +3764,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     })();
                     match result {
                         Ok(attachment) => {
-                            let _ = events.send(RuntimeEvent::AttachmentAdded { attachment });
+                            let _ = events.send(RuntimeEvent::AttachmentAdded {
+                                attachment,
+                                command_id: None,
+                            });
                         }
                         Err(e) => {
                             let _ = events.send(RuntimeEvent::AttachmentProcessingFailed {
+                                command_id: None,
                                 error: format!("剪贴板图片：{e}"),
                             });
                         }
@@ -3860,13 +3875,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let memory_dir = self.app.layout.memory_dir();
                 let events = self.events_for(&session_id);
-                if let Err(err) = leveler_memory::MemoryStore::open(&memory_dir) {
-                    let _ = events.send(RuntimeEvent::Notification {
-                        level: leveler_client_protocol::NotificationLevel::Warning,
-                        message: format!("memory open failed: {err}"),
-                    });
-                    return Ok(());
-                }
                 send_memory_list(&events, &memory_dir, include_archived, query_id);
                 Ok(())
             }
@@ -4684,9 +4692,11 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 self.reap_running_turns(None, leveler_engine::ReapScope::OwnBoot)
                     .await;
                 // Runtime-owned OS resources must not outlive the runtime:
-                // background tasks (dev servers) and the browser tree are
+                // local (goal-scoped) background tasks and the browser tree are
                 // reaped explicitly — Drop never runs on exit paths that call
-                // `std::process::exit` or die to SIGTERM (R004 F7).
+                // `std::process::exit` or die to SIGTERM (R004 F7). Tasks owned
+                // by the persistent Execution Host are deliberately left
+                // running: they are the user's services, not this generation's.
                 let killed = self.app.background_tasks().kill_all().await;
                 if killed > 0 {
                     tracing::info!("shutdown reaped {killed} background task(s)");
@@ -4847,7 +4857,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         }
 
         let command_id = envelope.command_id.clone();
-        match self.send(envelope.command).await {
+        let dispatched = match envelope.command {
+            ClientCommand::AddAttachmentData {
+                session_id,
+                name,
+                data_base64,
+            } => {
+                self.import_attachment_data(session_id, name, data_base64, Some(command_id.clone()))
+            }
+            command => self.send(command).await,
+        };
+        match dispatched {
             Ok(()) => {
                 hit_before_receipt_settled_test_barrier();
                 let settled = receipts.mark_completed(&command_id).await;
@@ -5099,9 +5119,12 @@ fn spawn_retire_drain(runtime: &InProcessRuntimeClient) {
     let active = runtime.active.clone();
     let background = runtime.app.background_tasks().clone();
     tokio::spawn(async move {
-        // Idle means nothing is still owed: no turn running and no background
-        // task alive. A turn ending is not enough — a background build
-        // outliving its turn is exactly the work a replacement would destroy.
+        // Idle means nothing is still owed: no turn running and no
+        // runtime-owned background task alive. A turn ending is not enough — a
+        // local background build outliving its turn is exactly the work a
+        // replacement would destroy. A task owned by the persistent Execution
+        // Host (a dev server or watcher) is NOT part of this: it outlives the
+        // generation that launched it, so the replacement keeps it alive.
         // The SAME reading `runtime_info` reports, so a client that keeps
         // asking sees the drain reach zero.
         loop {
@@ -5121,8 +5144,9 @@ fn spawn_retire_drain(runtime: &InProcessRuntimeClient) {
 ///
 /// Unlike [`spawn_retire_drain`], this does NOT wait for main turns to reach a
 /// terminal: the user has decided a turn that will never terminate must not
-/// block the update. It DOES still wait for background work — a handover must
-/// never silently destroy a user-launched process. The replacement generation
+/// block the update. It DOES still wait for runtime-owned background work — a
+/// handover must never silently destroy a user-launched local process. Only the
+/// persistent Execution Host's own services survive the replacement. The replacement generation
 /// reconciles the persisted `running` turn left behind (the existing
 /// ended-boot reaper), so nothing is lost that a clean exit would have kept.
 fn spawn_force_retire_drain(runtime: &InProcessRuntimeClient) {
@@ -6680,6 +6704,111 @@ mod session_declaration_tests {
                 summaries[0].status, "completed",
                 "projection must not rewrite session lifecycle"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_listing_tests {
+    use super::*;
+
+    #[test]
+    fn memory_listing_real_empty_preserves_shape_and_query_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+        for include_archived in [false, true] {
+            send_memory_list(
+                &events,
+                directory.path(),
+                include_archived,
+                Some("memory-query".into()),
+            );
+            match receiver.try_recv().unwrap() {
+                RuntimeEvent::MemoryList {
+                    query_id,
+                    active,
+                    archived,
+                    pending,
+                    ..
+                } => {
+                    assert_eq!(query_id.unwrap().as_str(), "memory-query");
+                    assert!(active.is_empty() && archived.is_empty() && pending.is_empty());
+                }
+                other => panic!("expected genuine empty listing, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn memory_listing_corrupt_active_archive_pending_never_emit_fake_empty() {
+        for folder in ["active", "archive", "pending"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = leveler_memory::MemoryStore::open(directory.path()).unwrap();
+            std::fs::write(
+                directory.path().join(folder).join("broken.json"),
+                b"not JSON",
+            )
+            .unwrap();
+            let failure = match folder {
+                "active" => store.list_active().is_err(),
+                "archive" => store.list_archived().is_err(),
+                _ => store.list_pending().is_err(),
+            };
+            assert!(failure, "existing store rejects malformed {folder} data");
+            let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+            send_memory_list(&events, directory.path(), true, Some("memory-query".into()));
+            assert!(
+                matches!(
+                    receiver.try_recv().unwrap(),
+                    RuntimeEvent::Notification {
+                        level: leveler_client_protocol::NotificationLevel::Warning,
+                        ..
+                    }
+                ),
+                "{folder} failure must be visible"
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "failed listing must not emit MemoryList"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_listing_directory_read_errors_are_not_empty_results() {
+        use std::os::unix::fs::PermissionsExt;
+        for folder in ["active", "archive", "pending"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = leveler_memory::MemoryStore::open(directory.path()).unwrap();
+            let path = directory.path().join(folder);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+            let open_ok = leveler_memory::MemoryStore::open(directory.path()).is_ok();
+            let failed = match folder {
+                "active" => store.list_active().is_err(),
+                "archive" => store.list_archived().is_err(),
+                _ => store.list_pending().is_err(),
+            };
+            let (events, mut receiver) = tokio::sync::broadcast::channel(4);
+            send_memory_list(
+                &events,
+                directory.path(),
+                true,
+                Some("directory-query".into()),
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                open_ok && failed,
+                "fixture must mechanically prove directory read failure; a privileged OS user cannot establish this fixture"
+            );
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    ..
+                }
+            ));
+            assert!(receiver.try_recv().is_err());
         }
     }
 }

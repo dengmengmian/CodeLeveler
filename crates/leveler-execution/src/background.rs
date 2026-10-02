@@ -73,14 +73,17 @@ pub enum BackgroundTaskStatus {
 
 /// How long the runtime retains ownership of a background process.
 ///
-/// Every lifetime retains its creating session. Goal/Runtime are legacy local
-/// ownership; Session/Persistent run in the independent execution substrate.
+/// Every lifetime retains its creating session. Goal is local, turn-scoped
+/// work. Runtime, Session and Persistent run in the independent execution
+/// substrate, so a dev server or watcher outlives the runtime generation that
+/// launched it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackgroundTaskLifetime {
     /// Default: stop the process when the creating goal reaches a terminal state.
     Goal,
-    /// Keep the process until it exits, is explicitly stopped, or the runtime
-    /// shuts down. Intended for user-requested dev servers and watchers.
+    /// Keep the process until it exits or is explicitly stopped. Intended for
+    /// user-requested dev servers and watchers. Owned by the independent
+    /// Execution Host, so it survives a runtime generation handover intact.
     Runtime,
     /// Hosted work recoverable across runtime replacement; session deletion stops it.
     Session,
@@ -736,10 +739,21 @@ impl BackgroundTaskRegistry {
         writer_scope: &str,
         lifetime: BackgroundTaskLifetime,
     ) -> Result<String, String> {
-        if matches!(
+        // A dev server / watcher belongs to the persistent execution substrate,
+        // not to the generation that happened to launch it: `Runtime` is
+        // therefore hosted exactly like `Session`/`Persistent`. That is what
+        // lets a handover retire the runtime without destroying the process,
+        // and what lets the next runtime re-attach to it.
+        let hosted_lifetime = matches!(
             lifetime,
-            BackgroundTaskLifetime::Persistent | BackgroundTaskLifetime::Session
-        ) {
+            BackgroundTaskLifetime::Persistent
+                | BackgroundTaskLifetime::Session
+                | BackgroundTaskLifetime::Runtime
+        );
+        if hosted_lifetime
+            && (self.execution_host.is_some()
+                || !matches!(lifetime, BackgroundTaskLifetime::Runtime))
+        {
             return self
                 .spawn_hosted(
                     request,

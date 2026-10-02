@@ -227,9 +227,18 @@ pub enum RuntimeEvent {
     /// A pending clarification was resolved (by any client, timeout, or cancel).
     ClarificationResolved { id: ClarificationId },
     /// An imported attachment was processed and stored (spec §39).
-    AttachmentAdded { attachment: AttachmentRef },
+    AttachmentAdded {
+        attachment: AttachmentRef,
+        /// Original delivery identity; absent for legacy raw-send imports.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<CommandId>,
+    },
     /// Importing an attachment failed.
-    AttachmentProcessingFailed { error: String },
+    AttachmentProcessingFailed {
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<CommandId>,
+    },
     /// A user message was appended to the transcript.
     UserMessageAdded { message: UiMessage },
     /// A new assistant message began; deltas will target this id.
@@ -995,6 +1004,7 @@ mod tests {
     fn attachment_added_roundtrips() {
         roundtrip(
             RuntimeEvent::AttachmentAdded {
+                command_id: None,
                 attachment: AttachmentRef {
                     id: AttachmentId::new("att-1"),
                     kind: AttachmentKind::Image,
@@ -1014,10 +1024,24 @@ mod tests {
     fn attachment_processing_failed_roundtrips() {
         roundtrip(
             RuntimeEvent::AttachmentProcessingFailed {
+                command_id: None,
                 error: "bad mime".to_string(),
             },
             "attachment_processing_failed",
         );
+    }
+
+    #[test]
+    fn attachment_result_preserves_command_id_and_accepts_legacy_events() {
+        let legacy = serde_json::json!({"type":"attachment_processing_failed","error":"bad image"});
+        let old: RuntimeEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(old).unwrap(), legacy);
+        let correlated = serde_json::json!({"type":"attachment_processing_failed","error":"bad image","command_id":"upload-1"});
+        let new: RuntimeEvent = serde_json::from_value(correlated.clone()).unwrap();
+        assert_eq!(serde_json::to_value(new).unwrap(), correlated);
+        let success = serde_json::json!({"type":"attachment_added","command_id":"upload-2","attachment":{"id":"att","kind":"text_file","name":"note.txt","mime_type":"text/plain","size_bytes":5,"sha256":"a","width":null,"height":null}});
+        let new: RuntimeEvent = serde_json::from_value(success.clone()).unwrap();
+        assert_eq!(serde_json::to_value(new).unwrap(), success);
     }
 
     #[test]

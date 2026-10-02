@@ -106,7 +106,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 crate::reducer::overlay_keys::advance_overlay(state);
             }
         }
-        RuntimeEvent::AttachmentAdded { attachment } => {
+        RuntimeEvent::AttachmentAdded { attachment, .. } => {
             // Staging an attachment is the start of a new message, however the
             // user got here (clipboard image, `/image`, `/attach`). The last
             // turn's next step no longer describes what they are composing.
@@ -118,7 +118,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let index = index.min(state.pending_attachments.len());
             state.pending_attachments.insert(index, attachment);
         }
-        RuntimeEvent::AttachmentProcessingFailed { error } => {
+        RuntimeEvent::AttachmentProcessingFailed { error, .. } => {
             state.notification = Some(Notification {
                 level: NotificationLevel::Error,
                 message: format!("附件处理失败: {error}"),

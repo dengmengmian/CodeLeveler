@@ -1058,6 +1058,7 @@ fn c8_staging_a_clipboard_image_dismisses_the_ghost() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: image_attachment(),
         }),
     );

@@ -169,6 +169,17 @@
         "attachment": {
           "$ref": "#/definitions/AttachmentRef"
         },
+        "command_id": {
+          "description": "Original delivery identity; absent for legacy raw-send imports.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "type": {
           "type": "string",
           "enum": [
@@ -185,6 +196,16 @@
         "type"
       ],
       "properties": {
+        "command_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "error": {
           "type": "string"
         },
@@ -3192,6 +3213,17 @@
             "attachment": {
               "$ref": "#/definitions/AttachmentRef"
             },
+            "command_id": {
+              "description": "Original delivery identity; absent for legacy raw-send imports.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -3208,6 +3240,16 @@
             "type"
           ],
           "properties": {
+            "command_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CommandId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "error": {
               "type": "string"
             },

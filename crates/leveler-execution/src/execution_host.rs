@@ -22,6 +22,15 @@ use tokio::{
 
 pub const PROTOCOL_MAJOR: u32 = 2;
 pub const PROTOCOL_MINOR: u32 = 0;
+/// Older majors this build can still talk to.
+///
+/// The Execution Host is a persistent owner: a runtime upgrade must not strand
+/// a service that an earlier host is still running. Major 1 speaks the same
+/// owner-scoped control plane (`list`/`get`/`observe`/`stop`/`acknowledge`); it
+/// predates the major-2 `unrestricted` control flag, which requires an explicit
+/// capability this build refuses to assume. Everything else is unchanged, so a
+/// legacy host keeps managing its own tasks and exits on its own once drained.
+pub const SUPPORTED_LEGACY_MAJORS: &[u32] = &[1];
 pub const REQUIRED_CAPABILITIES: &[&str] = &[
     "process.spawn",
     "process.list",
@@ -130,8 +139,37 @@ enum Reply {
     Error(String),
 }
 
+/// The lifetime a peer that speaks `peer_major` is told about.
+///
+/// A legacy host predates the `Runtime` owner tag and only admits
+/// `Session`/`Persistent`. `Persistent` is its exact name for the same contract
+/// — host-owned, survives runtime replacement, ended only by an explicit stop —
+/// so a Runtime service must not be refused just because the persistent owner
+/// has not been upgraded yet.
+fn hosted_wire_lifetime(
+    peer_major: u32,
+    lifetime: BackgroundTaskLifetime,
+) -> BackgroundTaskLifetime {
+    if peer_major < PROTOCOL_MAJOR && lifetime == BackgroundTaskLifetime::Runtime {
+        BackgroundTaskLifetime::Persistent
+    } else {
+        lifetime
+    }
+}
+
+/// Whether a request asks for control outside its owner scope.
+fn request_is_unrestricted(request: &Request) -> bool {
+    match request {
+        Request::Acknowledge { unrestricted, .. }
+        | Request::Get { unrestricted, .. }
+        | Request::Stop { unrestricted, .. }
+        | Request::Observe { unrestricted, .. } => *unrestricted,
+        _ => false,
+    }
+}
+
 fn check_compatibility(major: u32, capabilities: &[String]) -> Result<(), String> {
-    if major != PROTOCOL_MAJOR {
+    if major != PROTOCOL_MAJOR && !SUPPORTED_LEGACY_MAJORS.contains(&major) {
         return Err(format!(
             "Execution Host protocol major {major} is incompatible with {PROTOCOL_MAJOR}; existing services were preserved"
         ));
@@ -266,6 +304,10 @@ impl std::error::Error for SpawnError {}
 pub struct ExecutionHostClient {
     config: ExecutionHostConfig,
     ready: Ready,
+    /// The major the connected host declared. A legacy host has no
+    /// `unrestricted` control plane, so that path stays refused rather than
+    /// silently degrading to an owner-scoped permission check.
+    peer_major: u32,
 }
 impl ExecutionHostClient {
     pub async fn probe(config: &ExecutionHostConfig) -> Result<Option<Self>, String> {
@@ -276,7 +318,11 @@ impl ExecutionHostClient {
     }
     pub async fn connect(config: ExecutionHostConfig) -> Result<Self, String> {
         let r = ready(&config)?;
-        let c = Self { config, ready: r };
+        let c = Self {
+            peer_major: r.major,
+            config,
+            ready: r,
+        };
         match c.call(Request::Hello).await? {
             Reply::Hello {
                 major,
@@ -288,10 +334,29 @@ impl ExecutionHostClient {
                 if instance != c.ready.instance {
                     return Err("Execution Host instance changed".into());
                 }
+                if major != c.peer_major {
+                    return Err("Execution Host major changed since readiness".into());
+                }
                 Ok(c)
             }
             _ => Err("invalid Execution Host handshake".into()),
         }
+    }
+
+    /// The major the connected host speaks.
+    pub fn peer_major(&self) -> u32 {
+        self.peer_major
+    }
+
+    fn require_unrestricted_control(&self) -> Result<(), String> {
+        if self.peer_major < PROTOCOL_MAJOR {
+            return Err(format!(
+                "Execution Host protocol major {} has no unrestricted control; \
+                 the task must be managed by its owner",
+                self.peer_major
+            ));
+        }
+        Ok(())
     }
     pub async fn ensure(config: ExecutionHostConfig) -> Result<Self, String> {
         secure_dir(&config.state_dir)?;
@@ -375,7 +440,7 @@ impl ExecutionHostClient {
                 &mut s,
                 &Envelope {
                     token: self.ready.token.clone(),
-                    major: PROTOCOL_MAJOR,
+                    major: self.peer_major,
                     request,
                 },
             )
@@ -404,6 +469,13 @@ impl ExecutionHostClient {
         writer: &str,
         lifetime: BackgroundTaskLifetime,
     ) -> Result<BackgroundTaskSnapshot, SpawnError> {
+        // A legacy host predates the `Runtime` owner tag and only admits
+        // `Session`/`Persistent`. `Persistent` is its exact name for the same
+        // contract — host-owned, survives runtime replacement, ended only by an
+        // explicit stop — so a Runtime service must not be refused (or silently
+        // fall back to a runtime-local process) just because the persistent
+        // owner has not been upgraded yet.
+        let lifetime = hosted_wire_lifetime(self.peer_major, lifetime);
         match self
             .call(Request::Spawn {
                 id: id.into(),
@@ -445,6 +517,7 @@ impl ExecutionHostClient {
         }
     }
     pub async fn acknowledge_unrestricted(&self, id: &str) -> Result<(), String> {
+        self.require_unrestricted_control()?;
         match self
             .call(Request::Acknowledge {
                 id: id.into(),
@@ -471,6 +544,7 @@ impl ExecutionHostClient {
         }
     }
     pub async fn get_unrestricted(&self, id: &str) -> Result<BackgroundTaskSnapshot, String> {
+        self.require_unrestricted_control()?;
         match self
             .call(Request::Get {
                 id: id.into(),
@@ -501,6 +575,7 @@ impl ExecutionHostClient {
         }
     }
     pub async fn kill_unrestricted(&self, id: &str) -> Result<BackgroundTaskSnapshot, String> {
+        self.require_unrestricted_control()?;
         match self
             .call(Request::Stop {
                 id: id.into(),
@@ -544,6 +619,7 @@ impl ExecutionHostClient {
         max_bytes: usize,
         wait: Duration,
     ) -> Result<BackgroundTaskObservation, String> {
+        self.require_unrestricted_control()?;
         match self
             .call(Request::Observe {
                 id: id.into(),
@@ -779,9 +855,11 @@ impl Host {
                 let scope = request.write_scope.clone();
                 if !matches!(
                     lifetime,
-                    BackgroundTaskLifetime::Session | BackgroundTaskLifetime::Persistent
+                    BackgroundTaskLifetime::Runtime
+                        | BackgroundTaskLifetime::Session
+                        | BackgroundTaskLifetime::Persistent
                 ) {
-                    return Err("only Session/Persistent lifetimes may be hosted".into());
+                    return Err("only Runtime/Session/Persistent lifetimes may be hosted".into());
                 }
                 let started_at_ms = wall_ms();
                 // Intent is durable before any OS spawn. A crash here is explicitly unknown,
@@ -1062,8 +1140,19 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
                 return;
             }
             let shutdown_requested = matches!(&envelope.request, Request::ShutdownIfIdle);
-            let reply = if envelope.major != PROTOCOL_MAJOR {
+            let reply = if envelope.major != PROTOCOL_MAJOR
+                && !SUPPORTED_LEGACY_MAJORS.contains(&envelope.major)
+            {
                 Reply::Error("Execution Host protocol incompatible; services preserved".into())
+            } else if envelope.major < PROTOCOL_MAJOR && request_is_unrestricted(&envelope.request)
+            {
+                // The unrestricted control plane is a current-major capability.
+                // A legacy caller is answered with the owner-scoped semantics it
+                // actually declared, never upgraded to cross-owner control.
+                Reply::Error(
+                    "unrestricted control requires the current Execution Host protocol major"
+                        .into(),
+                )
             } else {
                 match host.handle(envelope.request).await {
                     Ok(r) => r,
@@ -1225,6 +1314,18 @@ mod tests {
         assert!(check_compatibility(PROTOCOL_MAJOR, &capabilities).is_ok());
         assert!(check_compatibility(PROTOCOL_MAJOR + 1, &capabilities).is_err());
         assert!(check_compatibility(PROTOCOL_MAJOR, &[]).is_err());
+        // A legacy host keeps the SAME owner-scoped control plane, so a newer
+        // runtime must not strand the services it is still running.
+        for legacy in SUPPORTED_LEGACY_MAJORS {
+            assert!(
+                check_compatibility(*legacy, &capabilities).is_ok(),
+                "major {legacy} must stay controllable"
+            );
+            assert!(
+                check_compatibility(*legacy, &[]).is_err(),
+                "a legacy host without the control capabilities is refused"
+            );
+        }
     }
     #[test]
     fn bearer_token_comparison_rejects_partial_and_wrong_credentials() {
@@ -1567,5 +1668,260 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// A major-1 host predates the `Runtime` owner tag. The same contract is
+    /// spelled `Persistent` there, and that is what the wire must carry; the
+    /// current major keeps `Runtime` distinct.
+    #[test]
+    fn a_legacy_host_is_told_persistent_for_a_runtime_service() {
+        use BackgroundTaskLifetime::*;
+        assert_eq!(
+            hosted_wire_lifetime(SUPPORTED_LEGACY_MAJORS[0], Runtime),
+            Persistent
+        );
+        assert_eq!(
+            hosted_wire_lifetime(SUPPORTED_LEGACY_MAJORS[0], Session),
+            Session
+        );
+        assert_eq!(
+            hosted_wire_lifetime(SUPPORTED_LEGACY_MAJORS[0], Persistent),
+            Persistent
+        );
+        assert_eq!(hosted_wire_lifetime(PROTOCOL_MAJOR, Runtime), Runtime);
+    }
+
+    /// The major-1 and major-2 control messages are the same shape apart from
+    /// the `unrestricted` flag, so the two majors interoperate on the
+    /// owner-scoped control plane in both directions.
+    #[test]
+    fn legacy_and_current_control_messages_interoperate() {
+        // A major-1 request (no `unrestricted` field) is read by this build.
+        let legacy: Request =
+            serde_json::from_str(r#"{"Get":{"id":"host-1","owner":"session"}}"#).unwrap();
+        match legacy {
+            Request::Get {
+                id,
+                owner,
+                unrestricted,
+            } => {
+                assert_eq!(id, "host-1");
+                assert_eq!(owner, "session");
+                assert!(!unrestricted, "a missing flag is never an escalation");
+            }
+            _ => panic!("expected Get"),
+        }
+        // This build's owner-scoped request is exactly what a major-1 host
+        // already understands: the extra flag is additive.
+        let current = serde_json::to_value(Request::Acknowledge {
+            id: "host-1".into(),
+            owner: "session".into(),
+            unrestricted: false,
+        })
+        .unwrap();
+        assert_eq!(current["Acknowledge"]["id"], "host-1");
+        assert_eq!(current["Acknowledge"]["owner"], "session");
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        kill(Pid::from_raw(pid as i32), None).is_ok()
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: u32) {
+        for _ in 0..200 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("process {pid} was still alive after the stop");
+    }
+
+    /// A `Runtime`-lifetime service is the documented lifetime for a
+    /// user-requested dev server or watcher. It belongs to the persistent
+    /// execution substrate, not to the generation that launched it, so it must
+    /// not count as retiring runtime work, must survive the launching registry
+    /// being dropped, and must stay inspectable and stoppable from the next
+    /// generation.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_lifetime_service_survives_generation_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let config = ExecutionHostConfig {
+            state_dir: root.path().join("host"),
+            repo_root: repo.clone(),
+            executable: PathBuf::from("unused-test-executable"),
+        };
+        let server = tokio::spawn(serve(config.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if ExecutionHostClient::connect(config.clone()).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            repo.clone(),
+            std::env::temp_dir(),
+        ));
+
+        // Generation 1 launches the service.
+        let generation_1 = crate::BackgroundTaskRegistry::with_environment(environment.clone())
+            .with_execution_host(config.clone());
+        let id = generation_1
+            .spawn_for_writer(
+                ProcessRequest::new(
+                    "sh",
+                    vec!["-c".into(), "printf service-up; sleep 30".into()],
+                    repo.clone(),
+                ),
+                None,
+                Some("session-1"),
+                "parent",
+                BackgroundTaskLifetime::Runtime,
+            )
+            .await
+            .unwrap();
+        assert!(
+            id.starts_with("host-"),
+            "a Runtime service must be owned by the persistent substrate: {id}"
+        );
+        let launched = generation_1.get_owned(&id, "session-1").await.unwrap();
+        let pid = launched.pid.expect("a running service has a pid");
+        assert!(launched.log.contains("service-up"), "{}", launched.log);
+        assert!(process_alive(pid));
+        // Nothing about this service is retiring runtime work.
+        assert!(
+            generation_1.try_update_blockers().await.unwrap().is_empty(),
+            "a hosted service must not block a generation handover"
+        );
+
+        // The launching generation disappears without taking the service with it.
+        drop(generation_1);
+        assert!(
+            process_alive(pid),
+            "the service must outlive the generation that launched it"
+        );
+
+        // The next generation re-attaches and keeps full control.
+        let generation_2 = crate::BackgroundTaskRegistry::with_environment(environment)
+            .with_execution_host(config.clone());
+        generation_2.reconcile_hosted().await.unwrap();
+        let reattached = generation_2.get_owned(&id, "session-1").await.unwrap();
+        assert_eq!(reattached.status, BackgroundTaskStatus::Running);
+        assert!(reattached.log.contains("service-up"));
+        assert!(
+            generation_2
+                .try_all_snapshots()
+                .await
+                .unwrap()
+                .iter()
+                .any(|task| task.id == id),
+            "the replacement generation must see the live service"
+        );
+        generation_2.kill_owned(&id, "session-1").await.unwrap();
+        wait_until_dead(pid).await;
+        let stopped = generation_2.get_owned(&id, "session-1").await.unwrap();
+        assert!(
+            matches!(
+                stopped.status,
+                BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
+            ),
+            "stopping the service must settle it: {:?}",
+            stopped.status
+        );
+        server.abort();
+    }
+
+    /// The reported blocker shape: the root process exits (even non-zero) while
+    /// a descendant keeps the inherited log pipes open, so the task stays
+    /// unsettled. That is real live work — it must stay inspectable — but it is
+    /// owned by the persistent substrate, so it must NOT block a generation
+    /// handover the way the same shape once did while it was runtime-local.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hosted_task_with_an_exited_root_does_not_block_handover() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let config = ExecutionHostConfig {
+            state_dir: root.path().join("host"),
+            repo_root: repo.clone(),
+            executable: PathBuf::from("unused-test-executable"),
+        };
+        let server = tokio::spawn(serve(config.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if ExecutionHostClient::connect(config.clone()).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let environment = Arc::new(leveler_core::EnvSnapshot::new(
+            std::env::vars_os(),
+            repo.clone(),
+            std::env::temp_dir(),
+        ));
+        let generation = crate::BackgroundTaskRegistry::with_environment(environment)
+            .with_execution_host(config.clone());
+        let id = generation
+            .spawn_for_writer(
+                ProcessRequest::new(
+                    "sh",
+                    vec![
+                        "-c".into(),
+                        // The root `sh` exits 2 at once; the backgrounded `sleep`
+                        // inherits its stdout/stderr and keeps them open.
+                        "sleep 30 & printf root-done; exit 2".into(),
+                    ],
+                    repo.clone(),
+                ),
+                None,
+                Some("session-1"),
+                "parent",
+                BackgroundTaskLifetime::Runtime,
+            )
+            .await
+            .unwrap();
+
+        let mut exited_root = None;
+        for _ in 0..200 {
+            let snapshot = generation.get_owned(&id, "session-1").await.unwrap();
+            if snapshot.exit_code.is_some() {
+                exited_root = Some(snapshot);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = exited_root.expect("the root must report its exit code");
+        assert_eq!(snapshot.exit_code, Some(2));
+        assert_eq!(
+            snapshot.status,
+            BackgroundTaskStatus::Running,
+            "a live descendant keeps the workload unsettled"
+        );
+        assert!(snapshot.log.contains("root-done"), "{}", snapshot.log);
+        // Unsettled live work, but not retiring runtime work: the handover waits
+        // on the runtime generation's own work, not on the persistent substrate.
+        assert!(
+            generation.try_update_blockers().await.unwrap().is_empty(),
+            "an unsettled hosted task must not block the handover"
+        );
+        generation.kill_owned(&id, "session-1").await.unwrap();
+        server.abort();
     }
 }

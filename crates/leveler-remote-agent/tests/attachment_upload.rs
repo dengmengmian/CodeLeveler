@@ -60,9 +60,11 @@ impl InteractiveRuntimeClient for ImportingRuntime {
                 .expect("the agent sends base64");
             let event = match &self.reject_with {
                 Some(error) => RuntimeEvent::AttachmentProcessingFailed {
+                    command_id: None,
                     error: error.clone(),
                 },
                 None => RuntimeEvent::AttachmentAdded {
+                    command_id: None,
                     attachment: AttachmentRef {
                         id: AttachmentId::new("att_1"),
                         kind: AttachmentKind::Image,

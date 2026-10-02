@@ -230,8 +230,8 @@ async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
     let attachment = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match rx.recv().await.unwrap() {
-                RuntimeEvent::AttachmentAdded { attachment } => break attachment,
-                RuntimeEvent::AttachmentProcessingFailed { error } => panic!("{error}"),
+                RuntimeEvent::AttachmentAdded { attachment, .. } => break attachment,
+                RuntimeEvent::AttachmentProcessingFailed { error, .. } => panic!("{error}"),
                 RuntimeEvent::Notification {
                     level: NotificationLevel::Error,
                     message,
@@ -340,4 +340,120 @@ async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
         leveler_engine::decode_turn_continuation(turns[1].payload.as_deref().unwrap()).unwrap();
     assert_eq!(resumed.goal_id.as_ref(), Some(&goals[0].id));
     assert_eq!(server.request_count(), 3);
+}
+
+/// Upload acknowledgement is not the import result. Observe the authoritative
+/// event, then read the stored bytes back through the existing service seam.
+#[tokio::test]
+async fn uploaded_generic_file_is_stored_and_reported_without_claiming_model_reading() {
+    use leveler_client_protocol::{CommandEnvelope, CommandId};
+    use leveler_local_transport::LocalRuntimeService;
+    let (_tmp, client, session_id) = build_client("blind-upload", false).await;
+    let mut events = client.subscribe_session(&session_id);
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("generic-upload-1"),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::AddAttachmentData {
+            session_id: session_id.clone(),
+            name: "note.txt".into(),
+            data_base64: "aGVsbG8=".into(),
+        },
+    };
+    client.deliver(envelope.clone()).await.unwrap();
+    let attachment = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            match &event {
+                RuntimeEvent::AttachmentAdded { attachment, .. } => {
+                    assert_eq!(
+                        serde_json::to_value(&event).unwrap()["command_id"],
+                        "generic-upload-1"
+                    );
+                    break attachment.clone();
+                }
+                RuntimeEvent::AttachmentProcessingFailed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the runtime must report an actual stored upload");
+    assert_eq!(attachment.kind, AttachmentKind::TextFile);
+    assert_eq!(attachment.name, "note.txt");
+    assert_eq!(attachment.mime_type, "text/plain");
+    assert_eq!(attachment.size_bytes, 5);
+    let stored = client.fetch_attachment(&attachment.sha256).await.unwrap();
+    assert_eq!(stored.bytes, b"hello");
+    assert_eq!(stored.mime_type, "text/plain");
+    // A completed receipt acknowledges replay without re-importing or changing
+    // the original object. It does not promise to replay the result event.
+    client.deliver(envelope.clone()).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    let mut conflict = envelope;
+    if let ClientCommand::AddAttachmentData { data_base64, .. } = &mut conflict.command {
+        *data_base64 = "bmV3".into();
+    }
+    assert!(client.deliver(conflict).await.is_err());
+}
+
+#[tokio::test]
+async fn uploaded_file_failure_reports_original_command_id() {
+    use leveler_client_protocol::{CommandEnvelope, CommandId};
+    let (_tmp, client, session_id) = build_client("blind-upload-failure", false).await;
+    let mut events = client.subscribe_session(&session_id);
+    let mut envelope = CommandEnvelope {
+        command_id: CommandId::new("failed-upload-1"),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::AddAttachmentData {
+            session_id,
+            name: "invalid.png".into(),
+            data_base64: "***invalid***".into(),
+        },
+    };
+    let mut wrong_session = envelope.clone();
+    wrong_session.session_id = SessionId::new("foreign-session");
+    assert!(client.deliver(wrong_session).await.is_err());
+    client.deliver(envelope.clone()).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event, RuntimeEvent::AttachmentProcessingFailed { .. }) {
+                break event;
+            }
+            assert!(!matches!(event, RuntimeEvent::AttachmentAdded { .. }));
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&event).unwrap()["command_id"],
+        "failed-upload-1"
+    );
+    // Raw send remains compatible and explicitly has no envelope correlation.
+    envelope.command_id = CommandId::new("not-used-by-raw-send");
+    client.send(envelope.command).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event, RuntimeEvent::AttachmentProcessingFailed { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        serde_json::to_value(event)
+            .unwrap()
+            .get("command_id")
+            .is_none()
+    );
 }
