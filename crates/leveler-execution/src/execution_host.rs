@@ -1832,7 +1832,20 @@ mod tests {
         );
         generation_2.kill_owned(&id, "session-1").await.unwrap();
         wait_until_dead(pid).await;
-        let stopped = generation_2.get_owned(&id, "session-1").await.unwrap();
+        // The signal and the durable settlement are separate steps: the process
+        // is gone before the task reaches a terminal status, so read it once it
+        // has settled rather than once right after the process dies.
+        let mut stopped = generation_2.get_owned(&id, "session-1").await.unwrap();
+        for _ in 0..200 {
+            if matches!(
+                stopped.status,
+                BackgroundTaskStatus::Exited | BackgroundTaskStatus::Killed
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stopped = generation_2.get_owned(&id, "session-1").await.unwrap();
+        }
         assert!(
             matches!(
                 stopped.status,

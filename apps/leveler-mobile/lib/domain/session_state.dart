@@ -508,8 +508,9 @@ class SessionState extends ChangeNotifier {
           if (tool.isNotEmpty) {
             final step = preview.isEmpty ? tool : '$tool · $preview';
             child?.recentStep = step;
-            if (row != null && (child == null || child.isOpen))
+            if (row != null && (child == null || child.isOpen)) {
               row.detail = step;
+            }
           }
         }
       case 'verification_updated':

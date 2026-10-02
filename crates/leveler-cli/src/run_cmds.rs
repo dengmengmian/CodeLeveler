@@ -18,9 +18,14 @@ use leveler_local_transport::{CreateSessionRequest, LocalSocketRuntimeClient};
 use leveler_project::Layout;
 #[cfg(test)]
 use leveler_runtime_host::{
+    generate_daemon_token, probe_default_runtime as connect_default_runtime,
+};
+// Every user of the rest is a Unix-gated test, so they are not imported on
+// Windows, where `-D unused-imports` would reject them.
+#[cfg(all(test, unix))]
+use leveler_runtime_host::{
     RuntimeConsistency, bind_daemon_transports, classify_runtime, classify_runtime_generation,
-    force_handover_allowed, generate_daemon_token, handoff_key,
-    probe_default_runtime as connect_default_runtime, stalled_turn_sessions, verify_replacement,
+    force_handover_allowed, handoff_key, stalled_turn_sessions, verify_replacement,
 };
 
 use crate::cli::{OutputFormat, RunMode};
@@ -589,7 +594,7 @@ async fn ensure_tui_runtime(layout: &Layout) -> anyhow::Result<LocalSocketRuntim
 }
 
 #[cfg(test)]
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 async fn observe_retiring_runtime(
     client: &LocalSocketRuntimeClient,
     socket_path: &Path,
