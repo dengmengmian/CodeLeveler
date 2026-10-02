@@ -146,6 +146,45 @@ DeepSeek Flash is configured as `deepseek/deepseek-flash`. Replace the retired p
 
 For another OpenAI-compatible endpoint, run `leveler init` and edit `~/.leveler/config.toml`. [configs/example.yaml](configs/example.yaml) is an annotated schema reference only; that YAML file is not loaded as configuration.
 
+### Thinking level
+
+How hard a model thinks is one vocabulary on every model:
+
+```
+auto     no preference; the model's own default (recommended, and the default)
+off      turn extra reasoning off where the model can be asked
+minimal  the lowest usable amount
+low      light reasoning
+medium   balanced reasoning
+high     deep reasoning
+max      the strongest level this model has
+```
+
+The default is `auto`, so nothing needs configuring.
+
+To change it for one session, from the TUI:
+
+```
+/thinking high
+/thinking reset     # back to the configured default
+```
+
+To change a default, write it in `~/.leveler/config.toml`:
+
+```toml
+# every model
+thinking = "auto"
+
+# one model, overriding the global value
+[models.deepseek-chat]
+provider = "deepseek"
+thinking = "low"
+```
+
+Four examples cover it: leave it at `auto`; `low` to spend less on thinking; `high` to have it think carefully; `max` to get the most the current model can do.
+
+`high` and `max` are not the same: `max` means "the strongest this model has", so it tracks the model instead of pinning a provider's parameter, and a config file holds `max` rather than a string one provider happens to read. The provider's own values (an `xhigh`, a token budget) are a capability the model declares, not a setting a user writes. Which levels a model can distinguish is decided by what it declares; `leveler doctor` lists them per model.
+
 A clean Git worktree is recommended so changes remain easy to inspect or discard.
 
 ## Commands

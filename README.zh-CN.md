@@ -146,6 +146,45 @@ DeepSeek Flash 的模型引用是 `deepseek/deepseek-flash`。已有配置中的
 
 接入其他 OpenAI 兼容接口时，先运行 `leveler init`，再修改 `~/.leveler/config.toml`。[configs/example.yaml](configs/example.yaml) 只是带注释的配置结构参考；这个 YAML 文件本身不会被加载。
 
+### 思考强度（Thinking Level）
+
+模型想多深，用一套词表达，所有模型都一样：
+
+```
+auto     不指定，用该模型自己的默认（推荐，也就是不配置）
+off      尽量关闭额外推理
+minimal  最低可用强度
+low      轻量推理
+medium   均衡推理
+high     深度推理
+max      该模型能提供的最高强度
+```
+
+默认就是 `auto`，不需要改任何配置。
+
+想临时调整，在 TUI 里输入：
+
+```
+/thinking high
+/thinking reset     # 回到配置的默认值
+```
+
+想长期改默认值，写进 `~/.leveler/config.toml`：
+
+```toml
+# 全局默认
+thinking = "auto"
+
+# 单个模型的默认（覆盖上面的全局值）
+[models.deepseek-chat]
+provider = "deepseek"
+thinking = "low"
+```
+
+四个例子就够了：默认 `auto`；想省钱用 `low`；想让它认真想用 `high`；想拉满当前模型用 `max`。
+
+`high` 和 `max` 不同：`max` 表示"该模型最高"，会随模型能力变化，配置文件里存的是 `max` 而不是某个服务商的参数。服务商自己的取值（例如 `xhigh`、token 预算）属于模型能力声明，不写在这些字段里。当前模型能不能调、有哪些档位，由模型自身声明的能力决定；`leveler doctor` 会列出每个模型的可用档位。
+
 第一次使用建议从干净的 Git worktree 开始，改动更容易检查或丢弃。
 
 ## 命令

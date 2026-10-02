@@ -21,12 +21,23 @@
 # Most users need NOTHING here — just `~/.leveler/config.toml`:
 #
 #     default_model = "deepseek/deepseek-flash"
+#     thinking = "auto"              # optional: auto | off | minimal | low | medium | high | max
 #     [assist]                      # idle UI affordances that spend a model call
 #     prompt_suggestions = true     #   predict the next user message while idle
 #     away_summary = true           #   one-line "welcome back" recap
 #     [providers.deepseek]
 #     base_url = "https://api.deepseek.com"
 #     api_key_env = "DEEPSEEK_API_KEY"
+#     # `thinking` is the setting a USER writes, in CodeLeveler's own words:
+#     #   auto | off | minimal | low | medium | high | max
+#     # `auto` is the default, so most configs omit it entirely. A top-level
+#     # `thinking = "low"` sets it for every model; `[models.<id>] thinking`
+#     # overrides that for one model. `/thinking` overrides either for one
+#     # session. `max` means "the strongest level this model has", so it keeps
+#     # working when a model is upgraded. The provider's own spelling
+#     # (`reasoning_effort` below, an `xhigh`, a token budget) is capability
+#     # the model declares; it is not a value a user writes here.
+#     thinking = "auto"             # optional; canonical level for this model
 #     [models."deepseek-flash"]
 #     provider = "deepseek"
 #     context_window = 1048576      # official: 1M
