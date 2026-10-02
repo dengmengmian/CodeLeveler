@@ -3,7 +3,7 @@
 // （schema 由 `UPDATE_SCHEMAS=1 cargo test -p leveler-client-protocol --features schema` 守护）。
 // web 网关自有帧（UpFrame/DownFrame/REST DTO）不在此文件，见 protocol.ts。
 
-export type ApprovalDecision = 'approve_once' | 'approve_session' | 'approve_always' | 'deny';
+export type ApprovalDecision = 'approve_once' | 'approve_session' | 'approve_project' | 'approve_always' | 'deny';
 
 /** Identifies a pending permission approval request. */
 export type ApprovalId = string;
@@ -321,9 +321,9 @@ export type RuntimeEvent =
   /** A pending clarification was resolved (by any client, timeout, or cancel). */
   | { type: 'clarification_resolved'; id: ClarificationId }
   /** An imported attachment was processed and stored (spec §39). */
-  | { type: 'attachment_added'; attachment: AttachmentRef }
+  | { type: 'attachment_added'; attachment: AttachmentRef; command_id?: CommandId | null }
   /** Importing an attachment failed. */
-  | { type: 'attachment_processing_failed'; error: string }
+  | { type: 'attachment_processing_failed'; command_id?: CommandId | null; error: string }
   /** A user message was appended to the transcript. */
   | { type: 'user_message_added'; message: UiMessage }
   /** A new assistant message began; deltas will target this id. */
@@ -588,7 +588,11 @@ export interface UiApprovalRequest {
   call_id?: string | null;
   /** The concrete command, when the tool is `run_command`. */
   command?: string | null;
+  /** Exact host-resolved capability/resource metadata, never inferred from text. */
+  grant?: unknown;
   id: ApprovalId;
+  /** A human-only consent operation offers Once and Deny exclusively. */
+  requires_human_consent?: boolean;
   /** Human-readable risk bullets (paths touched, network, etc.). */
   risks: string[];
   /** A one-line summary of what will happen. */

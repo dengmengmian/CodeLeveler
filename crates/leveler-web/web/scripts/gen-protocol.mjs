@@ -10,8 +10,8 @@
 //   node scripts/gen-protocol.mjs --check  # CI/typecheck 前置校验
 //
 // 只处理 schemars draft-07 实际产出的形态（tagged oneOf / definitions /
-// ["T","null"] / anyOf-null / string enum / $ref / array / integer）。
-// 遇到没见过的形态直接抛错——宁可红，不猜。
+// ["T","null"] / anyOf-null / string enum / $ref / array / integer /
+// 无类型约束的任意值）。遇到没见过的形态直接抛错——宁可红，不猜。
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -60,6 +60,11 @@ function tsType(node, ctx) {
   if (node.oneOf) {
     return node.oneOf.map((n) => tsType(n, ctx)).join(' | ');
   }
+  // 一个只有 description、没有任何类型约束的节点，意思是"任意 JSON 值"：
+  // `schemars(with = "Option<serde_json::Value>")` 产出的就是这个形状（例如
+  // UiApprovalRequest.grant）。形状本身是 schemars 真实产出的，所以要如实翻译，
+  // 而不是当成未知形态抛错；TS 只能诚实地写成 unknown。
+  if (node.type === undefined && !node.enum) return 'unknown';
   const t = node.type;
   if (Array.isArray(t)) {
     // schemars 的 Option<T>：["T","null"]
