@@ -2,11 +2,14 @@
 //! tui, and resume, plus their shared finish/ship helpers.
 
 use std::net::SocketAddr;
-#[cfg(test)]
+
+// Both are used only by the Unix-gated test helper below, so they are not
+// imported on Windows, where `-D unused-imports` would reject them.
+#[cfg(all(test, unix))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
