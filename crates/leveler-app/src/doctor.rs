@@ -253,12 +253,52 @@ fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
     for model in &config.models {
         let profile = &model.profile;
         if !profile.capabilities.reasoning {
+            // A model that does not reason cannot take a Thinking Level. The
+            // global default reaches every model, so this is where a config that
+            // asks for one here is reported instead of being silently dropped.
+            if let Some(level) = profile.thinking {
+                results.push(CheckResult::warn(
+                    &format!("thinking: {}/{}", profile.provider, profile.id),
+                    format!(
+                        "thinking = \"{level}\" has no effect: this model does not reason.                          Remove it, or set it on a model that does."
+                    ),
+                ));
+            }
             continue;
         }
         let name = format!("reasoning: {}/{}", profile.provider, profile.id);
         if let Err(reason) = validate_reasoning_config(true, &profile.reasoning) {
             results.push(CheckResult::fail(&name, reason));
             continue;
+        }
+        // The user's configured level against what this model can actually
+        // distinguish. A level the model cannot express is never rounded into a
+        // neighbouring one, so the honest report is the real option list.
+        if let Some(level) = profile.thinking {
+            let caps = leveler_model::ThinkingCapabilities::of(
+                profile.capabilities.reasoning,
+                &profile.reasoning,
+            );
+            if !caps.accepts(level) {
+                let available = if caps.levels().is_empty() {
+                    "this model's thinking cannot be adjusted".to_string()
+                } else {
+                    format!(
+                        "available: {}",
+                        caps.levels()
+                            .iter()
+                            .map(|level| level.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                results.push(CheckResult::warn(
+                    &format!("thinking: {}/{}", profile.provider, profile.id),
+                    format!(
+                        "thinking = \"{level}\" is not available on this model ({available});                          it will use the provider's own default instead"
+                    ),
+                ));
+            }
         }
         let resolved = resolve_reasoning_effort(None, &profile.reasoning);
         match profile.reasoning.style {
@@ -575,6 +615,72 @@ mod tests {
         );
         assert!(
             results[0].detail.contains("effective=max"),
+            "{}",
+            results[0].detail
+        );
+    }
+
+    /// A Thinking Level the model cannot express is reported with the levels it
+    /// can, because the harness will not round the user's choice for them.
+    #[test]
+    fn an_unexpressible_thinking_level_is_reported_with_the_real_options() {
+        let mut model = sample_model("deepseek", "deepseek-v4-pro");
+        model.profile.capabilities.reasoning = true;
+        model.profile.reasoning = leveler_model::ReasoningConfig {
+            style: leveler_model::ReasoningStyle::OpenAiEffort,
+            supported_efforts: vec![
+                leveler_model::ReasoningEffort::Low,
+                leveler_model::ReasoningEffort::High,
+            ],
+            default_effort: Some(leveler_model::ReasoningEffort::High),
+        };
+        // A global default that this model cannot distinguish.
+        model.profile.thinking = Some(leveler_model::ThinkingLevel::Medium);
+        let config = LoadedConfig {
+            providers: vec![sample_provider("deepseek")],
+            models: vec![model],
+            ..Default::default()
+        };
+        let results = check_reasoning(&config);
+        let warning = results
+            .iter()
+            .find(|r| r.name.starts_with("thinking:"))
+            .expect("the level is reported");
+        assert_eq!(warning.status, CheckStatus::Warn, "{warning:?}");
+        assert!(
+            warning.detail.contains("thinking = \"medium\""),
+            "{}",
+            warning.detail
+        );
+        assert!(
+            warning.detail.contains("auto, low, high, max"),
+            "the real options: {}",
+            warning.detail
+        );
+        assert!(
+            warning.detail.contains("provider's own default"),
+            "and what happens instead: {}",
+            warning.detail
+        );
+    }
+
+    /// A level set against a model that does not reason at all is reported too,
+    /// rather than being dropped without a word.
+    #[test]
+    fn a_thinking_level_on_a_non_reasoning_model_is_reported() {
+        let mut model = sample_model("deepseek", "deepseek-chat");
+        model.profile.capabilities.reasoning = false;
+        model.profile.thinking = Some(leveler_model::ThinkingLevel::Max);
+        let config = LoadedConfig {
+            providers: vec![sample_provider("deepseek")],
+            models: vec![model],
+            ..Default::default()
+        };
+        let results = check_reasoning(&config);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].status, CheckStatus::Warn);
+        assert!(
+            results[0].detail.contains("does not reason"),
             "{}",
             results[0].detail
         );

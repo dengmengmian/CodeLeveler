@@ -3792,8 +3792,7 @@ mod tests {
         ] {
             let mut s = test_state();
             s.composer.replace(text);
-            let expected = COMPOSER_ORIGIN
-                + UnicodeWidthStr::width(text) as u16;
+            let expected = COMPOSER_ORIGIN + UnicodeWidthStr::width(text) as u16;
             assert_eq!(
                 composer_caret_col(&s, 80),
                 expected,
