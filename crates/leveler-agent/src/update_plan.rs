@@ -108,7 +108,9 @@ impl Tool for UpdatePlanTool {
     fn description(&self) -> &'static str {
         "Replace the task checklist with the list in this call. No workspace \
          side effect: the stored plan is exactly the items sent, and nothing \
-         else advances a status.\n\n\
+         else advances a status. This is model-owned state: when your own \
+         judgement of its top-level status changes, publish the updated full \
+         plan. Sub-agent plans are local and never change yours.\n\n\
          Arguments: optional `explanation` (a note stored with this update) and \
          `plan` (the ordered items). Each item has `step` (text) and `status` \
          (`pending`, `in_progress`, or `completed`). The list must contain at \
@@ -254,8 +256,8 @@ mod tests {
         assert!(out.content.contains("[ ] run tests"));
     }
 
-    /// The description states what the call records. It does not say when to
-    /// call the tool.
+    /// The description states what the call records and whose judgement
+    /// decides an update. It does not prescribe a call cadence.
     #[test]
     fn the_description_states_the_record_and_not_when_to_call() {
         let d = UpdatePlanTool.description();
@@ -315,6 +317,24 @@ mod tests {
         ] {
             assert!(d.contains(needle), "lost `{needle}`: {d}");
         }
+        // Semantic boundaries, not sentences: the contract must keep saying
+        // the state is the model's, that the model's own judgement is the
+        // trigger, and that a child's plan is local.
+        for (semantic, anchors) in [
+            ("model ownership", vec!["model-owned state"]),
+            (
+                "model-judged semantic change triggers re-declaration",
+                vec!["your own judgement", "publish the updated full plan"],
+            ),
+            (
+                "sub-agent plan locality",
+                vec!["Sub-agent plans are local", "never change yours"],
+            ),
+        ] {
+            for anchor in anchors {
+                assert!(d.contains(anchor), "{semantic} lost anchor `{anchor}`: {d}");
+            }
+        }
         // The de-coached description states the protocol and does not tell the
         // model when a step may be called completed.
         assert!(!d.contains("the finished step completed"), "{d}");
@@ -323,6 +343,22 @@ mod tests {
             !d.contains("rewrite the step instead of completing it"),
             "{d}"
         );
+        // Ownership is not a cadence: no activity-based or round-based rule
+        // may enter the contract, or the harness would be driving the update.
+        for cadence in [
+            "after every step",
+            "after each step",
+            "every tool call",
+            "after every tool",
+            "each round",
+            "you must update",
+            "before your final answer",
+        ] {
+            assert!(
+                !d.contains(cadence),
+                "the Plan contract must not coach an update cadence: `{cadence}`: {d}"
+            );
+        }
     }
 
     #[tokio::test]
