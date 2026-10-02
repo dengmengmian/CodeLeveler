@@ -1,0 +1,31 @@
+{
+  "name": "leveler-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "build": "node scripts/check.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:acceptance": "node scripts/acceptance.mjs",
+    "postinstall": "install-electron",
+    "test:interactions": "node scripts/interactions.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "eslint src scripts test",
+    "test:product": "node scripts/product.mjs",
+    "test:long-session": "node scripts/long-session.mjs",
+    "test:session-actions": "node scripts/session-actions.mjs",
+    "test:conversation": "node scripts/conversation.mjs",
+    "test:composer": "node scripts/composer.mjs"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "eslint": "^10.11.0",
+    "playwright": "1.63.0",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "marked": "18.0.14"
+  }
+}

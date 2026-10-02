@@ -226,3 +226,81 @@ async fn set_permission_profile_reaches_a_running_engine_before_session_updated(
         "UI ack must trail the live cell, got {event:?}"
     );
 }
+
+#[tokio::test]
+async fn delivered_permission_selection_persists_only_the_target_session_and_leaves_global_config_unchanged()
+ {
+    use leveler_client_protocol::{CommandEnvelope, CommandId};
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+    let app = std::sync::Arc::new(app(&tmp));
+    let model = leveler_model::ModelRef::new("mock", "m");
+    let session_id = app.create_session(&model, "target").await.unwrap();
+    let other = app.create_session(&model, "other").await.unwrap();
+    let client = InProcessRuntimeClient::new(
+        app.clone(),
+        model.clone(),
+        PermissionProfile::Assisted,
+        false,
+    );
+    let config_path = leveler_app::global_config::GlobalConfig::path().unwrap();
+    fn config_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+        match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("isolated config read failed: {error}"),
+        }
+    }
+    let global_before = config_bytes(&config_path);
+    let initial = client.snapshot(&session_id).await.unwrap().mode;
+    let other_before = client.snapshot(&other).await.unwrap().mode;
+    let mut events = client.subscribe_session(&session_id);
+    for (index, mode) in [
+        WirePermissionProfile::FullAccess,
+        WirePermissionProfile::RequestApproval,
+        WirePermissionProfile::Assisted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new(format!("desktop-mode-{index}")),
+            session_id: session_id.clone(),
+            expected_version: None,
+            issued_at: leveler_core::now().to_rfc3339(),
+            command: ClientCommand::SetPermissionProfile {
+                session_id: session_id.clone(),
+                mode,
+            },
+        };
+        let mut foreign = envelope.clone();
+        foreign.session_id = other.clone();
+        assert!(client.deliver(foreign).await.is_err());
+        client.deliver(envelope.clone()).await.unwrap();
+        assert_eq!(client.snapshot(&session_id).await.unwrap().mode, mode);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(event,RuntimeEvent::SessionUpdated{session} if session.id==session_id && session.mode==mode)
+        );
+        // A new client starts from a different fallback; the stored session
+        // value still wins, proving this is not merely the first client's UI.
+        let reopened = InProcessRuntimeClient::new(
+            app.clone(),
+            model.clone(),
+            PermissionProfile::RequestApproval,
+            false,
+        );
+        assert_eq!(reopened.snapshot(&session_id).await.unwrap().mode, mode);
+        assert_eq!(client.snapshot(&other).await.unwrap().mode, other_before);
+        assert_eq!(config_bytes(&config_path), global_before);
+        client.deliver(envelope).await.unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+    assert_eq!(client.snapshot(&session_id).await.unwrap().mode, initial);
+}

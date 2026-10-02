@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "skipLibCheck": true,
+    "strict": true
+  },
+  "include": ["src/browser-policy.cjs", "src/browser.cjs", "src/presentation.mjs", "src/workspace-selection.cjs", "src/attachment-ingress.cjs", "src/clipboard-write.cjs"]
+}

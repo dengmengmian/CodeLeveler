@@ -40,20 +40,79 @@ impl HandoffUi for DesktopHandoff {
 
 fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Result<()> {
     match command {
-        ClientCommand::SubmitMessage { attachments, .. } if attachments.is_empty() => {}
+        ClientCommand::SubmitMessage { attachments, .. }
+            if attachments.len() <= 16 && attachments.iter().all(valid_desktop_image) => {}
+        // Main constructs this only from bounded, native-picker-selected
+        // immutable bytes. No ambient path upload is accepted by the adapter.
+        ClientCommand::AddAttachmentData {
+            name, data_base64, ..
+        } if !name.is_empty()
+            && name.len() <= 1024
+            && data_base64.len() <= (20 * 1024 * 1024_usize).div_ceil(3) * 4 => {}
+        ClientCommand::ListMemory { query_id, .. }
+        | ClientCommand::ListAgents { query_id, .. }
+        | ClientCommand::QueryContext { query_id, .. }
+            if valid_desktop_query_id(query_id) => {}
+        ClientCommand::GetAgent { query_id, name, .. }
+            if valid_desktop_query_id(query_id)
+                && leveler_agent::agent_registry::validate_agent_name(name).is_ok() => {}
+        ClientCommand::QueryObservability {
+            query_id,
+            center_seq,
+            before,
+            after,
+            ..
+        } if valid_desktop_query_id(query_id)
+            && center_seq.is_none_or(|seq| (0..=9_007_199_254_740_991).contains(&seq))
+            && *before <= 100
+            && *after <= 100 => {}
+        ClientCommand::RequestDiff { query_id, .. }
+            if query_id
+                .as_ref()
+                .is_none_or(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256) => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::ForceCancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
         | ClientCommand::QuerySessionHistory { .. }
+        | ClientCommand::SelectModel { .. }
+        | ClientCommand::SetPermissionProfile { .. }
+        | ClientCommand::RenameSession { .. }
+        | ClientCommand::ArchiveSession { .. }
         | ClientCommand::ApprovalDecision { .. }
         | ClientCommand::AnswerClarification { .. } => {}
-        _ => anyhow::bail!("command is outside Phase 3C desktop scope"),
+        _ => anyhow::bail!("command is outside supported desktop scope"),
     }
     if command.session_id().is_some_and(|id| id != session) {
         anyhow::bail!("command session does not match envelope");
     }
     Ok(())
+}
+
+fn valid_desktop_query_id(id: &Option<leveler_core::CommandId>) -> bool {
+    id.as_ref()
+        .is_some_and(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256)
+}
+
+fn valid_desktop_image(attachment: &leveler_client_protocol::AttachmentRef) -> bool {
+    attachment.kind == leveler_client_protocol::AttachmentKind::Image
+        && attachment.mime_type == "image/png"
+        && !attachment.id.as_str().is_empty()
+        && attachment.id.as_str().len() <= 256
+        && !attachment.name.is_empty()
+        && attachment.name.len() <= 1024
+        && attachment.size_bytes <= 20 * 1024 * 1024
+        && attachment.sha256.len() == 64
+        && attachment
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && attachment
+            .width
+            .is_some_and(|width| (1..=2048).contains(&width))
+        && attachment
+            .height
+            .is_some_and(|height| (1..=2048).contains(&height))
 }
 
 struct Bridge {
@@ -343,6 +402,211 @@ mod tests {
     }
 
     #[test]
+    fn desktop_product_commands_keep_selected_session_scope() {
+        let session = SessionId::new("desktop-session");
+        for id in [session.clone(), SessionId::new("other-session")] {
+            let commands = [
+                ClientCommand::SelectModel {
+                    session_id: id.clone(),
+                    model: leveler_model::ModelRef::new("fixture", "model"),
+                },
+                ClientCommand::RenameSession {
+                    session_id: id.clone(),
+                    name: "Renamed task".into(),
+                },
+                ClientCommand::ArchiveSession {
+                    session_id: id.clone(),
+                },
+            ];
+            for command in commands {
+                assert_eq!(validate_command(&session, &command).is_ok(), id == session);
+            }
+        }
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::SetDefaultModel {
+                    session_id: session.clone(),
+                    model: leveler_model::ModelRef::new("fixture", "model"),
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_memory_listing_is_scoped_correlated_and_not_mutating() {
+        let session = SessionId::new("desktop-memory");
+        for include_archived in [false, true] {
+            let command = ClientCommand::ListMemory {
+                session_id: session.clone(),
+                query_id: Some("query".into()),
+                include_archived,
+            };
+            assert!(validate_command(&session, &command).is_ok());
+            assert!(validate_command(&SessionId::new("other"), &command).is_err());
+        }
+        for query_id in [None, Some(" ".into()), Some("a".repeat(257).into())] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::ListMemory {
+                        session_id: session.clone(),
+                        query_id,
+                        include_archived: false
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::ForgetMemory {
+                    session_id: session.clone(),
+                    id: "memory".into()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_settings_reads_keep_selected_session_and_bounded_query_scope() {
+        let session = SessionId::new("desktop-settings");
+        let id = Some("query-1".into());
+        let commands = [
+            ClientCommand::ListAgents {
+                session_id: session.clone(),
+                query_id: id.clone(),
+            },
+            ClientCommand::GetAgent {
+                session_id: session.clone(),
+                name: "reviewer".into(),
+                query_id: id.clone(),
+            },
+            ClientCommand::QueryContext {
+                session_id: session.clone(),
+                query_id: id.clone(),
+            },
+            ClientCommand::QueryObservability {
+                session_id: session.clone(),
+                query_id: id.clone(),
+                center_seq: None,
+                before: 0,
+                after: 100,
+            },
+        ];
+        for command in commands {
+            assert!(validate_command(&session, &command).is_ok());
+            assert!(validate_command(&SessionId::new("other"), &command).is_err());
+        }
+        for id in [
+            None,
+            Some("".into()),
+            Some(" ".into()),
+            Some("a".repeat(257).into()),
+        ] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::ListAgents {
+                        session_id: session.clone(),
+                        query_id: id
+                    }
+                )
+                .is_err()
+            );
+        }
+        for name in ["Upper", "../agent", "a-", "con"] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::GetAgent {
+                        session_id: session.clone(),
+                        query_id: Some("q".into()),
+                        name: name.into()
+                    }
+                )
+                .is_err()
+            );
+        }
+        for (center_seq, before, after) in [
+            (Some(-1), 0, 0),
+            (Some(9007199254740992), 0, 0),
+            (None, 101, 0),
+            (None, 0, 101),
+        ] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::QueryObservability {
+                        session_id: session.clone(),
+                        query_id: Some("q".into()),
+                        center_seq,
+                        before,
+                        after
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_diff_query_keeps_selected_session_scope() {
+        let session = SessionId::new("desktop-diff");
+        for query_id in [None, Some("query-1".into())] {
+            let command = ClientCommand::RequestDiff {
+                session_id: session.clone(),
+                query_id,
+            };
+            assert!(validate_command(&session, &command).is_ok());
+            assert!(validate_command(&SessionId::new("other"), &command).is_err());
+        }
+        for id in ["".to_string(), " ".to_string(), "a".repeat(257)] {
+            let command = ClientCommand::RequestDiff {
+                session_id: session.clone(),
+                query_id: Some(id.into()),
+            };
+            assert!(validate_command(&session, &command).is_err());
+        }
+    }
+
+    #[test]
+    fn desktop_permission_selection_is_existing_typed_session_mode_only() {
+        use leveler_client_protocol::PermissionProfile;
+        let session = SessionId::new("permission-session");
+        for mode in [
+            PermissionProfile::FullAccess,
+            PermissionProfile::Assisted,
+            PermissionProfile::RequestApproval,
+        ] {
+            let command = ClientCommand::SetPermissionProfile {
+                session_id: session.clone(),
+                mode,
+            };
+            assert!(validate_command(&session, &command).is_ok());
+            assert!(validate_command(&SessionId::new("other"), &command).is_err());
+        }
+        for mode in [
+            "full",
+            "auto",
+            "restricted",
+            "auto_approve",
+            "FullAccess",
+            "",
+        ] {
+            assert!(
+                serde_json::from_value::<ClientCommand>(
+                    json!({"type":"set_permission_profile","session_id":session,"mode":mode})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn desktop_commands_cannot_shutdown_runtime_or_cross_sessions() {
         let session = leveler_core::SessionId::new("desktop-session");
         assert!(validate_command(&session, &leveler_client_protocol::ClientCommand::Quit).is_err());
@@ -367,6 +631,88 @@ mod tests {
                 }
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn desktop_upload_and_image_submission_keep_selected_session_scope() {
+        use leveler_client_protocol::{AttachmentId, AttachmentKind, AttachmentRef};
+        let session = SessionId::new("desktop-upload");
+        let upload = ClientCommand::AddAttachmentData {
+            session_id: session.clone(),
+            name: "note.txt".into(),
+            data_base64: "aGVsbG8=".into(),
+        };
+        assert!(validate_command(&session, &upload).is_ok());
+        assert!(validate_command(&SessionId::new("other"), &upload).is_err());
+        let image = AttachmentRef {
+            id: AttachmentId::new("image"),
+            kind: AttachmentKind::Image,
+            name: "image.png".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 20,
+            sha256: "a".repeat(64),
+            width: Some(4),
+            height: Some(3),
+        };
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::SubmitMessage {
+                    session_id: session.clone(),
+                    content: String::new(),
+                    attachments: vec![image.clone()],
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_command(
+                &SessionId::new("other"),
+                &ClientCommand::SubmitMessage {
+                    session_id: session.clone(),
+                    content: "read".into(),
+                    attachments: vec![image.clone()],
+                }
+            )
+            .is_err()
+        );
+        let mut unsupported = image.clone();
+        unsupported.kind = AttachmentKind::TextFile;
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::SubmitMessage {
+                    session_id: session.clone(),
+                    content: "read".into(),
+                    attachments: vec![unsupported],
+                }
+            )
+            .is_err()
+        );
+        let mut forged = image;
+        forged.sha256 = "../secret".into();
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::SubmitMessage {
+                    session_id: session.clone(),
+                    content: "read".into(),
+                    attachments: vec![forged],
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::AddAttachment {
+                    session_id: session.clone(),
+                    path: "/arbitrary/path".into(),
+                    name: None,
+                }
+            )
+            .is_err()
         );
     }
 }
