@@ -197,17 +197,13 @@ class PendingApproval {
   final Map<String, dynamic>? grant;
   final bool requiresHumanConsent;
   bool get canApproveSession => !requiresHumanConsent;
-  String get sessionLabel => grant == null ? '本轮对话内允许' : '此会话内允许此能力访问此资源';
-  List<String> get resourceDetails {
-    final bindings = grant?['bindings'] as List<dynamic>? ?? const [];
-    return [
-      if (grant != null) 'Project: ${grant!['project_identity']}',
-      for (final binding in bindings.whereType<Map<String, dynamic>>()) ...[
-        'Capability: ${(binding['capability'] as String? ?? '').replaceAll('_', '.')}',
-        'Resource: ${jsonEncode(binding['resource'])}',
-      ]
-    ];
-  }
+  /// The wider approval's real scope, in the app's own words.
+  ///
+  /// A resource-bound request keeps it for this session; one bound only by the
+  /// tool and command lasts the turn. The runtime's binding is an authorization
+  /// match key — a project hash, a credential incarnation, a serialized resource
+  /// — and is never shown: its consequence already arrives in `risks`.
+  String get sessionLabel => grant == null ? '本轮对话内允许' : '本次会话内允许';
 
   /// What the host is asking for, in this app's own words.
   ///

@@ -419,9 +419,15 @@ fn renders_approval_overlay_with_deny_visible() {
     assert!(text.contains("允许"), "approval headline missing: {text}");
     assert!(text.contains("git push"), "command missing");
     assert!(text.contains("拒绝"), "deny option missing");
+    // The persisted option states its real scope in product words; the legacy
+    // rule it writes is an implementation detail the prompt must not name.
     assert!(
-        text.contains("始终允许") || text.contains("项目规则"),
-        "always option missing: {text}"
+        text.contains("此项目内始终允许"),
+        "project option missing: {text}"
+    );
+    assert!(
+        !text.contains("旧项目规则") && !text.contains("Project:") && !text.contains("Capability:"),
+        "internal authorization data leaked into the prompt: {text}"
     );
 }
 

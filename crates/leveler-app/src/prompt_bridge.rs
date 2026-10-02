@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_agent::{ClarificationQuestionKind, ClarificationRequest, Clarifier, ClarifyOutcome};
 use leveler_core::{ApprovalId, ClarificationId, SessionId, TurnId};
+use leveler_core::{Capability, GrantBinding, ResourceIdentity};
 use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, RiskLevel};
 
 use leveler_client_protocol::{
@@ -311,7 +312,7 @@ fn ui_approval_request(request: &ApprovalRequest) -> UiApprovalRequest {
         tool: request.tool.clone(),
         summary: request.description.clone(),
         command: request.command.clone(),
-        risks: risk_bullets(request),
+        risks: consent_bullets(request),
         // The call this decision is holding, so the UI can stop painting it
         // as work in progress while it waits on the human.
         call_id: Some(request.call_id.clone()),
@@ -319,19 +320,156 @@ fn ui_approval_request(request: &ApprovalRequest) -> UiApprovalRequest {
     }
 }
 
-/// Build human-readable risk bullets from the request's risk level and paths.
-fn risk_bullets(request: &ApprovalRequest) -> Vec<String> {
-    let mut risks = Vec::new();
+/// The bullets the approval prompt shows: the action's risk level, the paths
+/// it names, and — when the action is bound to resolved resources — what it
+/// will do to them.
+///
+/// This is where an approval stops being engine data and becomes a prompt. A
+/// [`Capability`]/[`ResourceIdentity`] pair is an authorization match key: it
+/// carries a project hash, a credential incarnation and an object identity,
+/// and its names are a policy vocabulary. The bindings stay on the wire for the
+/// clients that must decide which options to offer, but no surface renders them
+/// — the consequence is projected here, once, instead of in every renderer.
+fn consent_bullets(request: &ApprovalRequest) -> Vec<String> {
+    let mut bullets = Vec::new();
     match request.risk {
-        RiskLevel::Network => risks.push("将访问网络".to_string()),
-        RiskLevel::Destructive => risks.push("可能造成破坏性变更".to_string()),
-        RiskLevel::Privileged => risks.push("需要提升权限".to_string()),
+        RiskLevel::Network => bullets.push("将访问网络".to_string()),
+        RiskLevel::Destructive => bullets.push("可能造成破坏性变更".to_string()),
+        RiskLevel::Privileged => bullets.push("需要提升权限".to_string()),
         RiskLevel::Safe | RiskLevel::WorkspaceWrite => {}
     }
     for path in &request.paths {
-        risks.push(format!("涉及路径 {}", path.display()));
+        bullets.push(format!("涉及路径 {}", path.display()));
     }
-    risks
+    if let Some(grant) = &request.grant {
+        for binding in &grant.bindings {
+            bullets.extend(effect_lines(binding));
+        }
+    }
+    bullets
+}
+
+/// One binding as the lines a person reads: what the action does, then the
+/// destination when the resource names one a person can recognise.
+fn effect_lines(binding: &GrantBinding) -> Vec<String> {
+    let described = |verb: &str, detail: &str| format!("{verb} {detail}");
+    match (&binding.capability, &binding.resource) {
+        // A remote's name is what the command itself uses; its destination is
+        // what makes the consequence concrete.
+        (Capability::RemoteRead, ResourceIdentity::ConfiguredRemote { remote_name, .. }) => {
+            vec![described("读取远端仓库", remote_name)]
+        }
+        (
+            Capability::RemoteMutate,
+            ResourceIdentity::ConfiguredRemote {
+                remote_name,
+                canonical_url,
+                ..
+            },
+        ) => remote_lines("修改远端仓库", remote_name, canonical_url),
+        (
+            Capability::RemoteForce,
+            ResourceIdentity::ConfiguredRemote {
+                remote_name,
+                canonical_url,
+                ..
+            },
+        ) => remote_lines(
+            "强制修改远端仓库（可能覆盖他人提交）",
+            remote_name,
+            canonical_url,
+        ),
+        (Capability::FilesystemRead, ResourceIdentity::FilesystemPath { canonical_path, .. }) => {
+            vec![described("读取文件", canonical_path)]
+        }
+        (Capability::FilesystemWrite, ResourceIdentity::FilesystemPath { canonical_path, .. }) => {
+            vec![described("写入文件", canonical_path)]
+        }
+        (Capability::FilesystemDelete, ResourceIdentity::FilesystemPath { canonical_path, .. }) => {
+            vec![described("删除文件", canonical_path)]
+        }
+        (Capability::BackgroundTaskObserve, ResourceIdentity::BackgroundTask { task_id, .. }) => {
+            vec![described("观察后台任务", task_id)]
+        }
+        (Capability::BackgroundTaskControl, ResourceIdentity::BackgroundTask { task_id, .. }) => {
+            vec![described("控制后台任务", task_id)]
+        }
+        (Capability::ExternalProcessControl, ResourceIdentity::ExternalProcess { pid, .. }) => {
+            vec![described("控制外部进程", &pid.to_string())]
+        }
+        // A credential is named by the destination it authenticates to; its
+        // incarnation identity is a hash and never part of the prompt.
+        (Capability::CredentialUse, ResourceIdentity::Credential { host, .. }) => {
+            vec![format!("使用 {host} 的 Git 凭据")]
+        }
+        (Capability::CredentialRawRead, ResourceIdentity::Credential { host, .. }) => {
+            vec![format!("读取 {host} 的凭据原文")]
+        }
+        (Capability::CredentialRawWrite, ResourceIdentity::Credential { host, .. }) => {
+            vec![format!("更换 {host} 的凭据来源")]
+        }
+        // A repository identity is a hash, so the capability's own wording is
+        // the whole line — and the same fallback keeps a pair the engine does
+        // not bind today from dropping its consequence.
+        (capability, _) => vec![capability_line(*capability).to_string()],
+    }
+}
+
+fn remote_lines(verb: &str, remote_name: &str, canonical_url: &str) -> Vec<String> {
+    let mut lines = vec![format!("{verb} {remote_name}")];
+    if let Some(target) = remote_target(canonical_url) {
+        lines.push(format!("目标 {target}"));
+    }
+    lines
+}
+
+/// A remote URL as a person reads a destination: host and path, without the
+/// scheme, the userinfo or the `.git` suffix. Anything unreadable is shown as
+/// it is rather than silently dropped.
+fn remote_target(canonical_url: &str) -> Option<String> {
+    let trimmed = canonical_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `git@host:owner/repo` is the scp form; its colon separates host and path,
+    // which only holds when there is no scheme in front of it.
+    let (rest, scp_form) = match trimmed.split_once("://") {
+        Some((_, rest)) => (rest, false),
+        None => (trimmed, true),
+    };
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, rest)| rest);
+    let rest = match rest.split_once(':') {
+        Some((host, path)) if scp_form && !host.is_empty() && !host.contains('/') => {
+            format!("{host}/{path}")
+        }
+        _ => rest.to_string(),
+    };
+    let rest = rest.strip_suffix(".git").unwrap_or(&rest);
+    Some(rest.trim_end_matches('/').to_string())
+}
+
+/// One capability in the words a person consents to, for a resource that
+/// contributes no readable detail.
+fn capability_line(capability: Capability) -> &'static str {
+    match capability {
+        Capability::RepositoryRead => "读取仓库",
+        Capability::RepositoryMutate => "修改仓库内容",
+        Capability::RepositoryMetadataWrite => "修改仓库元数据（不改变工作区内容）",
+        Capability::RepositoryConfigWrite => "修改仓库配置",
+        Capability::RepositoryDestroy => "删除仓库或工作区数据",
+        Capability::RemoteRead => "读取远端仓库",
+        Capability::RemoteMutate => "修改远端仓库",
+        Capability::RemoteForce => "强制修改远端仓库",
+        Capability::FilesystemRead => "读取文件",
+        Capability::FilesystemWrite => "写入文件",
+        Capability::FilesystemDelete => "删除文件",
+        Capability::BackgroundTaskObserve => "观察后台任务",
+        Capability::BackgroundTaskControl => "控制后台任务",
+        Capability::ExternalProcessControl => "控制外部进程",
+        Capability::CredentialUse => "使用 Git 凭据",
+        Capability::CredentialRawRead => "读取凭据原文",
+        Capability::CredentialRawWrite => "更换凭据来源",
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +497,139 @@ mod tests {
         let projected = ui_approval_request(&request);
         assert!(projected.requires_human_consent);
         assert!(!projected.project_available());
+    }
+
+    /// A prompt with no resolved resource shows the risk level and the paths,
+    /// and nothing only the engine can read.
+    #[test]
+    fn a_plain_command_prompt_names_no_authorization_data() {
+        let mut destructive = approval_request();
+        destructive.risk = RiskLevel::Destructive;
+        destructive.command = None;
+        assert_eq!(
+            consent_bullets(&destructive),
+            vec!["可能造成破坏性变更".to_string()]
+        );
+
+        let mut paths = approval_request();
+        paths.risk = RiskLevel::Safe;
+        paths.paths = vec![std::path::PathBuf::from("src/lib.rs")];
+        let bullets = consent_bullets(&paths);
+        assert_eq!(bullets, vec!["涉及路径 src/lib.rs".to_string()]);
+        assert_no_authorization_data(&bullets);
+    }
+
+    /// The git-push prompt: the remote it writes to, the destination a person
+    /// can read, and the credential it authenticates with — never the hashes the
+    /// bindings match on, and never a serialized resource.
+    #[test]
+    fn a_remote_write_prompt_states_the_destination_and_the_credential() {
+        let mut request = approval_request();
+        request.risk = RiskLevel::Network;
+        request.command = Some("git push github main".into());
+        request.grant = Some(leveler_core::GrantRequest {
+            project_identity: "sha256:project-identity".into(),
+            bindings: vec![
+                leveler_core::GrantBinding {
+                    capability: leveler_core::Capability::RemoteMutate,
+                    resource: leveler_core::ResourceIdentity::ConfiguredRemote {
+                        repository: "sha256:repository-identity".into(),
+                        remote_name: "github".into(),
+                        canonical_url: "https://github.com/dengmengmian/devorder.git".into(),
+                        transport: "https".into(),
+                    },
+                },
+                leveler_core::GrantBinding {
+                    capability: leveler_core::Capability::CredentialUse,
+                    resource: leveler_core::ResourceIdentity::Credential {
+                        project: "sha256:project-identity".into(),
+                        host: "github.com".into(),
+                        identity: "sha256:credential-incarnation".into(),
+                        transport: "https".into(),
+                    },
+                },
+            ],
+        });
+        let bullets = consent_bullets(&request);
+        assert_eq!(
+            bullets,
+            vec![
+                "将访问网络".to_string(),
+                "修改远端仓库 github".to_string(),
+                "目标 github.com/dengmengmian/devorder".to_string(),
+                "使用 github.com 的 Git 凭据".to_string(),
+            ]
+        );
+        assert_no_authorization_data(&bullets);
+    }
+
+    /// A repository identity is a hash, so the capability's own wording is the
+    /// whole line rather than an identity nobody can decide with.
+    #[test]
+    fn a_repository_prompt_states_the_capability_without_its_identity() {
+        for (capability, expected) in [
+            (leveler_core::Capability::RepositoryRead, "读取仓库"),
+            (
+                leveler_core::Capability::RepositoryMetadataWrite,
+                "修改仓库元数据（不改变工作区内容）",
+            ),
+            (
+                leveler_core::Capability::RepositoryDestroy,
+                "删除仓库或工作区数据",
+            ),
+        ] {
+            let mut request = approval_request();
+            request.risk = RiskLevel::Safe;
+            request.grant = Some(leveler_core::GrantRequest {
+                project_identity: "sha256:project-identity".into(),
+                bindings: vec![leveler_core::GrantBinding {
+                    capability,
+                    resource: leveler_core::ResourceIdentity::Repository {
+                        identity: "sha256:repository-identity".into(),
+                    },
+                }],
+            });
+            let bullets = consent_bullets(&request);
+            assert_eq!(bullets, vec![expected.to_string()], "{capability:?}");
+            assert_no_authorization_data(&bullets);
+        }
+    }
+
+    #[test]
+    fn a_remote_destination_drops_the_scheme_userinfo_and_git_suffix() {
+        for (url, expected) in [
+            (
+                "https://github.com/owner/repo.git",
+                Some("github.com/owner/repo"),
+            ),
+            (
+                "git@github.com:owner/repo.git",
+                Some("github.com/owner/repo"),
+            ),
+            (
+                "ssh://git@github.com/owner/repo",
+                Some("github.com/owner/repo"),
+            ),
+            // A port belongs to the destination: only the scheme form carries it.
+            (
+                "https://github.com:8443/owner/repo.git",
+                Some("github.com:8443/owner/repo"),
+            ),
+            ("  ", None),
+        ] {
+            assert_eq!(remote_target(url).as_deref(), expected, "{url}");
+        }
+    }
+
+    /// No bullet of a consent prompt may carry an authorization match key: a
+    /// project or credential hash, a raw capability name, or a serialized
+    /// resource.
+    fn assert_no_authorization_data(bullets: &[String]) {
+        for bullet in bullets {
+            for leaked in ["Project:", "Capability:", "Resource:", "sha256", "{", "_"] {
+                assert!(!bullet.contains(leaked), "{leaked} leaked in {bullet}");
+            }
+        }
     }
 
     fn approval_request() -> ApprovalRequest {

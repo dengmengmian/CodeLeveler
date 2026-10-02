@@ -1105,31 +1105,10 @@ fn approval_content(
             lines.push(Line::from(Span::raw(format!("  {piece}"))));
         }
     }
-    if let Some(grant) = &req.grant {
-        for piece in crate::render::text::wrap(
-            &format!("Project: {}", grant.project_identity),
-            width.saturating_sub(2).max(8),
-        ) {
-            lines.push(Line::from(Span::raw(format!("  {piece}"))));
-        }
-        for binding in &grant.bindings {
-            let resource =
-                serde_json::to_string(&binding.resource).expect("typed resource serializes");
-            let capability =
-                serde_json::to_string(&binding.capability).expect("typed capability serializes");
-            for detail in [
-                format!(
-                    "Capability: {}",
-                    capability.trim_matches('"').replace('_', ".")
-                ),
-                format!("Resource: {resource}"),
-            ] {
-                for piece in crate::render::text::wrap(&detail, width.saturating_sub(2).max(8)) {
-                    lines.push(Line::from(Span::raw(format!("  {piece}"))));
-                }
-            }
-        }
-    }
+    // The action's consequences are already bulleted: the runtime projects the
+    // bound capability/resource pairs into `risks` before they reach a client,
+    // because those pairs carry project, credential and object identity hashes
+    // that a prompt must never show.
     for risk in &req.risks {
         lines.push(Line::from(Span::styled(
             format!("  ⚠ {risk}"),
@@ -1223,6 +1202,72 @@ mod layout_tests {
             call_id: None,
             always_persists: true,
         })))
+    }
+
+    /// A resource-bound approval renders the consequences the runtime projected
+    /// and nothing from the binding it matches on: the prompt ignores `grant`
+    /// even when it is present.
+    #[test]
+    fn a_resource_bound_approval_shows_consequences_and_no_authorization_data() {
+        let ov = Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
+            id: ApprovalId::new("r-grant"),
+            tool: "shell_command".into(),
+            summary: "push origin".into(),
+            command: Some("git push github main".into()),
+            risks: vec![
+                "将访问网络".into(),
+                "修改远端仓库 github".into(),
+                "目标 github.com/dengmengmian/devorder".into(),
+                "使用 github.com 的 Git 凭据".into(),
+            ],
+            call_id: None,
+            always_persists: false,
+            requires_human_consent: false,
+            grant: Some(leveler_core::GrantRequest {
+                project_identity: "sha256:project-identity".into(),
+                bindings: vec![leveler_core::GrantBinding {
+                    capability: leveler_core::Capability::RemoteMutate,
+                    resource: leveler_core::ResourceIdentity::ConfiguredRemote {
+                        repository: "sha256:repository-identity".into(),
+                        remote_name: "github".into(),
+                        canonical_url: "https://github.com/dengmengmian/devorder.git".into(),
+                        transport: "https".into(),
+                    },
+                }],
+            }),
+        })));
+        let (_, lines, _) = content_lines(&ov, &Theme::no_color(), 100, crate::i18n::Locale::Zh);
+        let screen: String = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "git push github main",
+            "修改远端仓库 github",
+            "目标 github.com/dengmengmian/devorder",
+            "使用 github.com 的 Git 凭据",
+            "此项目内始终允许",
+        ] {
+            assert!(screen.contains(expected), "{expected} missing:\n{screen}");
+        }
+        for leaked in [
+            "Project:",
+            "Capability:",
+            "Resource:",
+            "sha256",
+            "remote.mutate",
+            "remote_mutate",
+            "旧项目规则",
+            "{",
+        ] {
+            assert!(!screen.contains(leaked), "{leaked} leaked:\n{screen}");
+        }
     }
 
     fn frame_of(ov: &Overlay, w: u16, h: u16) -> Vec<String> {

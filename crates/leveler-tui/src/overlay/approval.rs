@@ -282,6 +282,53 @@ mod tests {
         );
     }
 
+    /// The rows read as product choices and never as the mechanism behind them:
+    /// the persisted row names its scope, and the legacy rule it writes is not
+    /// mentioned anywhere.
+    #[test]
+    fn every_scope_is_named_in_product_words() {
+        for (grant, expected) in [
+            (
+                None,
+                vec!["仅允许本次", "本轮对话内允许", "此项目内始终允许", "拒绝"],
+            ),
+            (
+                Some(leveler_core::GrantRequest {
+                    project_identity: "project-a".into(),
+                    bindings: vec![leveler_core::GrantBinding {
+                        capability: leveler_core::Capability::RemoteMutate,
+                        resource: leveler_core::ResourceIdentity::ConfiguredRemote {
+                            repository: "repo-a".into(),
+                            remote_name: "origin".into(),
+                            canonical_url: "https://example.test/a.git".into(),
+                            transport: "https".into(),
+                        },
+                    }],
+                }),
+                vec!["仅允许本次", "本次会话内允许", "此项目内始终允许", "拒绝"],
+            ),
+        ] {
+            let mut req = request();
+            req.always_persists = true;
+            req.grant = grant;
+            let ov = ApprovalOverlay::new(req);
+            let labels: Vec<&str> = ov
+                .options(crate::i18n::Locale::Zh.text())
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect();
+            assert_eq!(labels, expected);
+            for label in labels {
+                for internal in ["旧项目规则", "legacy", "grant", "capability", "resource"] {
+                    assert!(
+                        !label.to_lowercase().contains(internal),
+                        "{internal} is internal wording: {label}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn ctrl_o_toggles_the_full_command() {
         // The headline elides so the prompt stays one line, which means there

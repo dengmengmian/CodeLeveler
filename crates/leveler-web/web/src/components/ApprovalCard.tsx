@@ -53,7 +53,7 @@ export function ApprovalCard({
           </button>
           {request.always_persists && (
             <button className="abtn" onClick={() => bridge.decideApproval(request.id, 'approve_always')}>
-              始终允许<kbd>a</kbd>
+              此项目内始终允许<kbd>a</kbd>
             </button>
           )}
           <button className="abtn danger" onClick={() => bridge.decideApproval(request.id, 'deny')}>

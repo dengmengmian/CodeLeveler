@@ -11,7 +11,7 @@ import 'package:leveler_mobile/protocol/wire.dart';
 
 void main() {
   test(
-      'resource approval preserves identity and human consent cannot reuse session',
+      'resource approval keeps its session scope and human consent cannot reuse session',
       () {
     final approval = PendingApproval.fromJson({
       'id': 'a-resource',
@@ -33,11 +33,10 @@ void main() {
         ]
       },
     });
-    expect(approval.resourceDetails.join(' '), contains('remote.mutate'));
-    expect(approval.resourceDetails.join(' '), contains('repo-a'));
-    expect(approval.resourceDetails.join(' '),
-        contains('https://example.test/a.git'));
-    expect(approval.sessionLabel, contains('会话'));
+    // The binding is an authorization match key — a project hash, a capability
+    // name, a serialized resource — so the prompt names only the scope. What the
+    // action does arrives separately, already in the user's language.
+    expect(approval.sessionLabel, '本次会话内允许');
     expect(approval.canApproveSession, isTrue);
     final consent = PendingApproval.fromJson({
       'id': 'a-human',

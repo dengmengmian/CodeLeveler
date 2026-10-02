@@ -337,11 +337,6 @@ class _ApprovalCard extends StatelessWidget {
               const SizedBox(height: 10),
               Text(approval.hostNote!, style: theme.textTheme.bodySmall),
             ],
-            for (final detail in approval.resourceDetails)
-              Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child:
-                      SelectableText(detail, style: theme.textTheme.bodySmall)),
             for (final risk in approval.risks)
               Padding(
                 padding: const EdgeInsets.only(top: 6),

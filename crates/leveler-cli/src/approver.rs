@@ -51,21 +51,11 @@ fn request_details(request: &ApprovalRequest) -> String {
     if let Some(cmd) = &request.command {
         lines.push(format!("    {}", style(cmd).bold()));
     }
-    if let Some(grant) = &request.grant {
-        lines.push(format!("    Project: {}", grant.project_identity));
-        for binding in &grant.bindings {
-            let capability =
-                serde_json::to_string(&binding.capability).expect("typed capability serializes");
-            lines.push(format!(
-                "    Capability: {}",
-                capability.trim_matches('"').replace('_', ".")
-            ));
-            lines.push(format!(
-                "    Resource: {}",
-                serde_json::to_string(&binding.resource).expect("typed resource serializes")
-            ));
-        }
-    }
+    // The resolved capability/resource bindings are authorization match keys:
+    // they carry a project hash, a credential incarnation and an object
+    // identity, and the runtime already projects what they mean into the
+    // description the prompt opens with. Printing them here showed the user a
+    // hashed identity and a serialized resource instead of a decision.
     for path in &request.paths {
         lines.push(format!("    path: {}", path.display()));
     }
@@ -77,7 +67,7 @@ fn request_choices_prompt(request: &ApprovalRequest) -> String {
         return "[y]es once / [N]o (default)".into();
     }
     if request.project_available() {
-        return "[y]es once / this [s]ession (resource grant) / this [p]roject (resource grant) / [N]o (default)".into();
+        return "[y]es once / this [s]ession / this [p]roject / [N]o (default)".into();
     }
     choices_prompt(request.always_persists())
 }
@@ -105,7 +95,7 @@ fn request_answer(line: &str, request: &ApprovalRequest) -> ApprovalDecision {
 /// for it — otherwise the prompt would promise an effect that never happens.
 fn choices_prompt(always_persists: bool) -> String {
     let always = if always_persists {
-        format!("[{}]lways (project rule) / ", style("w").green())
+        format!("[{}]lways for this project / ", style("w").green())
     } else {
         String::new()
     };
@@ -132,8 +122,12 @@ fn parse_answer(line: &str, always_persists: bool) -> ApprovalDecision {
 mod tests {
     use super::*;
 
+    /// A resource-bound request offers exactly the resource scopes, and the
+    /// prompt prints no part of the binding it matches on: the project identity,
+    /// the capability name and the serialized resource are authorization data,
+    /// not a decision a person can read.
     #[test]
-    fn bound_resource_offers_only_resource_scopes_and_renders_identity() {
+    fn bound_resource_offers_only_resource_scopes_and_prints_no_identity() {
         let mut request = ApprovalRequest {
             id: leveler_core::ApprovalId::new("grant-test"),
             turn_id: None,
@@ -159,12 +153,18 @@ mod tests {
             }),
         };
         let details = request_details(&request);
-        assert!(
-            details.contains("remote.mutate")
-                && details.contains("repo-a")
-                && details.contains("https://example.test/a.git"),
-            "{details}"
-        );
+        assert!(details.contains("push origin"), "{details}");
+        for leaked in [
+            "project-a",
+            "remote.mutate",
+            "remote_mutate",
+            "repo-a",
+            "example.test",
+            "\"kind\"",
+            "{",
+        ] {
+            assert!(!details.contains(leaked), "{leaked} leaked: {details}");
+        }
         assert!(request_choices_prompt(&request).contains("[p]roject"));
         assert_eq!(
             request_answer("p", &request),
