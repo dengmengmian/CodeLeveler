@@ -219,7 +219,11 @@ async fn concurrent_owner(root: &Path, layout: &Layout) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
         command
             .arg("--repo")
-            .arg(&layout.repo_root)
+            .arg(
+                layout
+                    .require_workspace()
+                    .expect("this acceptance needs a workspace"),
+            )
             .args(["serve", "--ready-json"])
             .arg(ready)
             .stdin(Stdio::null())
