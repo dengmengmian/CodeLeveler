@@ -4,7 +4,7 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
-## [1.1.0] - 2026-09-29
+## [1.0.11] - 2026-10-02
 
 Reworks how a model request is assembled, folded, and paid for: the control
 context is separated from the transcript, every prompt segment has one source and
@@ -14,6 +14,7 @@ one authority, and every model attempt is recorded in the request ledger.
 
 - A single request projection that wire encoding and context statistics both read, so the reported input size and the bytes sent cannot disagree
 - Per-attempt request accounting: failures, retries, compaction summaries, and child task calls all land in the request ledger and the resource budget
+- **CodeLeveler Desktop**, an Electron client in `apps/leveler-desktop/`. The renderer reaches the Electron main process only through a sandboxed preload with a fixed IPC surface, and the main process reaches the runtime only through the internal `leveler desktop-bridge` JSONL adapter, so runtime discovery, spawn, adopt, revive and handoff stay owned by the runtime host. It is built from the repository; the release archives still contain the `leveler` binary only
 
 ### Changed
 
@@ -21,6 +22,8 @@ one authority, and every model attempt is recorded in the request ledger.
 - Context folding pressure follows the actual projected request; directory-scoped project rules survive a fold verbatim
 - Consumption after recovery is rebuilt from a scope's persisted request facts, so a background child cannot keep spending a stale balance snapshot
 - Rule delivery is budgeted against the request, so every rule stays authoritative even when only part of a rule file fits verbatim
+- An attachment import result carries the delivery identity of the command that produced it, so a client can match a stored upload, or its failure, to its own request instead of guessing by attachment name; the field is optional on the wire
+- A background task started with the `runtime` lifetime is owned by the Execution Host rather than by the runtime generation that launched it, so a dev server or watcher survives an update and the replacement generation re-attaches to it
 
 ### Fixed
 
@@ -31,6 +34,7 @@ one authority, and every model attempt is recorded in the request ledger.
 - A child task's rendered spawn brief is persisted and reused on resume
 - `/btw` read-only calls pass through the ToolHost admission pipeline
 - Background task writes are constrained to the OS execution boundary, task mutation settles only after the whole workload ends, and live stdout/stderr channels are capped with an explicit truncation marker
+- A memory listing reports the store failure that produced it instead of presenting a failed read as an empty list
 
 ## [1.0.0] - 2026-09-18
 

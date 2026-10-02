@@ -9,6 +9,26 @@ the request ledger.
 Installed stable builds can update automatically, or use `leveler update`
 or `/update`.
 
+## Added
+
+- **CodeLeveler Desktop**, an Electron client in `apps/leveler-desktop/`.
+  Tasks, conversation, tools, approvals and persistence still come from the Rust
+  runtime. The renderer reaches the Electron main process only through a
+  sandboxed preload with a fixed IPC surface, and never receives runtime
+  credentials or Node access; the main process reaches the runtime only through
+  the internal `leveler desktop-bridge` JSONL adapter, so runtime discovery,
+  spawn, adopt, revive and handoff stay owned by the runtime host. It is built
+  from the repository (`npm ci` and `npm start` in `apps/leveler-desktop`); the
+  release archives still contain the `leveler` binary only.
+- The desktop client provides task navigation, a conversation view with safe
+  Markdown, a closable workbench for plan, changes and manual browser tabs,
+  per-session model and permission menus, and bounded attachment upload.
+- The desktop bridge checks every command it forwards against its own explicit
+  bound: a PNG-only image attachment up to 20 MiB with a 64-hex digest and
+  1..=2048 pixel dimensions, a non-empty bounded query id, a bounded
+  observability window, a validated agent name, and session-scoped model,
+  permission, rename and archive commands. Anything else is refused.
+
 ## Changed
 
 - Prompt construction gives every delivered segment a single source, authority,
@@ -26,6 +46,16 @@ or `/update`.
   background child can no longer keep spending a stale balance snapshot.
 - Rule delivery is budgeted against the request: every rule stays authoritative
   even when only part of a rule file fits verbatim.
+- An attachment import result carries the delivery identity of the command that
+  produced it, so a client can match a stored upload, or its failure, to its own
+  request instead of guessing by attachment name. The field is optional on the
+  wire and absent for raw-send imports.
+- A background task started with the `runtime` lifetime is owned by the
+  Execution Host rather than by the runtime generation that launched it, so a
+  dev server or watcher survives an update: the launching generation retires
+  without stopping it, and the replacement generation re-attaches to it. An
+  Execution Host from an earlier protocol major keeps managing the services it
+  already runs; cross-owner control stays refused instead of being downgraded.
 - The repository's `./dev` development entry point is documented in the release
   archives, for local verification and release qualification.
 
@@ -52,6 +82,8 @@ or `/update`.
   mutation settles only after the whole workload ends, and the live stdout and
   stderr channels are capped with an explicit truncation marker rather than
   growing without bound.
+- A memory listing reports the store failure that produced it, instead of
+  presenting a failed read as an empty list.
 
 ## Known limits
 

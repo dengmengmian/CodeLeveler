@@ -4,7 +4,7 @@
 
 发布说明：[`docs/RELEASE.zh-CN.md`](docs/RELEASE.zh-CN.md)。
 
-## [1.1.0] - 2026-09-29
+## [1.0.11] - 2026-10-02
 
 重做了模型请求的组装、折叠和计量方式：控制上下文与会话记录分离，每一段提示词
 都有唯一的来源和权威，每一次模型尝试都记入请求账本。
@@ -13,6 +13,7 @@
 
 - 单一「已投影请求」：链路编码与上下文统计读取同一份结果，报告出的输入规模与实际发送的字节不会再互相矛盾
 - 逐次尝试的请求计量：失败、重试、压缩摘要和子任务调用都会记入请求账本和资源预算
+- **CodeLeveler Desktop**：`apps/leveler-desktop/` 下的 Electron 客户端。Renderer 只能通过 sandbox preload 的固定 IPC 面访问 Electron Main，Main 只能通过内部 `leveler desktop-bridge` JSONL 适配器访问 Runtime，因此 Runtime 的 discovery、spawn、adopt、revive 和 handoff 仍由 Runtime Host 拥有。它从仓库构建；发布包内仍只有 `leveler` 二进制
 
 ### 变更
 
@@ -20,6 +21,8 @@
 - 上下文折叠压力按真实的已投影请求判定；作用于某个目录的项目规则在折叠后被逐字保留
 - 恢复时的消费量由该作用域已持久化的请求事实重建，后台子任务不会再继续花费过期的余额快照
 - 规则投递按请求额度分配：即使规则文件只有一部分能逐字放入，每条规则仍保持权威
+- 附件导入结果携带产生它的那条命令的身份，客户端因此可以把一次成功保存或一次失败对应回自己的请求，而不必按附件名猜测；该字段在链路上可选
+- 以 `runtime` lifetime 启动的后台任务由 Execution Host 拥有，而不是由启动它的那个 runtime generation 拥有：dev server 或 watcher 因此可以跨版本更新存活，替换上来的 generation 会重新接上它
 
 ### 修复
 
@@ -30,6 +33,7 @@
 - 子任务渲染出的 spawn brief 会持久化，并在 resume 时复用
 - `/btw` 的只读调用改为通过 ToolHost 准入管线
 - 后台任务写入被限制在 OS 执行边界内，任务变更在整个工作负载结束后才结算，运行中的 stdout、stderr 通道设有上限并在截断处给出明确标记
+- 记忆列表现在会报告导致它的 store 失败，而不会把一次失败的读取当作空列表
 
 ## [1.0.0] - 2026-09-18
 

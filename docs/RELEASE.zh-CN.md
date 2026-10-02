@@ -6,6 +6,23 @@
 每一段提示词都有唯一的来源和权威，每一次模型尝试都记入请求账本。
 已安装的稳定版可以自动更新，也可以执行 `leveler update` 或 `/update`。
 
+## 新增
+
+- **CodeLeveler Desktop**：`apps/leveler-desktop/` 下的 Electron 客户端。任务、
+  对话、工具、审批和持久化仍然来自 Rust Runtime。Renderer 只能通过 sandbox
+  preload 的固定 IPC 面访问 Electron Main，拿不到 Runtime 凭据，也没有 Node
+  访问权；Main 只能通过内部 `leveler desktop-bridge` JSONL 适配器访问 Runtime，
+  因此 Runtime 的 discovery、spawn、adopt、revive 和 handoff 仍由 Runtime Host
+  拥有。它从仓库构建（在 `apps/leveler-desktop` 下 `npm ci` 后 `npm start`）；
+  发布包内仍只有 `leveler` 二进制。
+- 桌面客户端提供任务导航、支持安全 Markdown 的对话视图、可关闭的工作台
+  （Plan、Changes 和手动 Browser 标签）、按会话生效的模型与权限菜单，以及
+  有上限的附件上传。
+- Desktop bridge 对它转发的每条命令都按各自的明确上界校验：仅 PNG 的图片附件
+  上限 20 MiB、64 位十六进制摘要、边长 1..=2048 像素，非空且有界的 query id，
+  有界的可观测窗口，经校验的 agent 名，以及仅作用于所选会话的模型、权限、重命名
+  和归档命令。其余一律拒绝。
+
 ## 变更
 
 - 提示词组装让每一段投递内容都有唯一的来源、权威和生命周期。Provider 可以
@@ -19,6 +36,14 @@
   花费过期的余额快照。
 - 规则投递按请求额度分配：即使规则文件只有一部分能逐字放入，每条规则仍保持
   权威。
+- 附件导入结果现在携带产生它的那条命令的身份，客户端因此可以把一次成功保存
+  或一次失败对应回自己的请求，而不必按附件名猜测。该字段在链路上可选，raw-send
+  导入不带它。
+- 以 `runtime` lifetime 启动的后台任务由 Execution Host 拥有，而不是由启动它的
+  那个 runtime generation 拥有：dev server 或 watcher 因此可以跨版本更新存活——
+  启动它的 generation 退出时不会停掉它，替换上来的 generation 会重新接上它。
+  较早协议 major 的 Execution Host 继续管理它已经在跑的服务；跨属主控制仍然被
+  拒绝，而不是降级放行。
 - 发布产物中记录了仓库的 `./dev` 开发入口，用于本地验证和发布资格判定。
 
 ## 修复
@@ -36,6 +61,7 @@
 - `/btw` 的只读调用改为通过 ToolHost 准入管线，不再绕过它。
 - 后台任务写入被限制在 OS 执行边界内，任务变更在整个工作负载结束后才结算，
   运行中的 stdout、stderr 通道设有上限，并在截断处给出明确标记，不会无限增长。
+- 记忆列表现在会报告导致它的 store 失败，而不会把一次失败的读取当作空列表。
 
 ## 已知限制
 
