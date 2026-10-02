@@ -1312,7 +1312,7 @@ mod tests {
         "#;
         let err = GlobalConfig::from_toml_str(toml).unwrap_err().to_string();
         assert!(err.contains("cannot use thinking = \"minimal\""), "{err}");
-        assert!(err.contains("auto, off, low, high, max"), "{err}");
+        assert!(err.contains("auto, off, low, max"), "{err}");
     }
 
     /// A model with no reasoning at all says so in its own words.

@@ -81,7 +81,8 @@ struct Frame {
 fn draw(state: &mut AppState, w: u16, h: u16) -> Frame {
     state.size = (w, h);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| leveler_tui::render::render(f, state)).unwrap();
+    term.draw(|f| leveler_tui::render::render(f, state))
+        .unwrap();
     let caret = term
         .get_cursor_position()
         .map(|p| (p.x, p.y))
@@ -196,8 +197,7 @@ fn expected_composer_caret(state: &AppState, w: u16, h: u16) -> (u16, u16) {
     // interior width = box - 2 borders; content = interior - 1 inner pad;
     // per-row room = content - 2 prompt columns.
     let room = (bw as usize).saturating_sub(5).max(1);
-    let (rel_row, col) =
-        oracle_caret(state.composer.text(), state.composer.cursor(), room);
+    let (rel_row, col) = oracle_caret(state.composer.text(), state.composer.cursor(), room);
     let _ = (w, h);
     (bx + COMPOSER_TEXT_ORIGIN + col, by + 1 + rel_row)
 }
@@ -217,7 +217,12 @@ fn dogfood_empty_composer_caret_sits_before_the_placeholder() {
         let f = draw(&mut s, width, 20);
         let (bx, by, _, _) = s.input_rect.expect("composer rect");
         let expected = (bx + COMPOSER_TEXT_ORIGIN, by + 1);
-        assert_caret(&f, &s, &format!("empty placeholder w={width} {locale:?}"), expected);
+        assert_caret(
+            &f,
+            &s,
+            &format!("empty placeholder w={width} {locale:?}"),
+            expected,
+        );
         assert!(s.composer.is_empty(), "the placeholder is not the buffer");
         // The caret is immediately after the prompt, before the placeholder:
         // everything before it trims back to the `›` glyph.
@@ -350,13 +355,23 @@ fn dogfood_combining_mark_is_one_grapheme_and_one_cell() {
     reduce(&mut s, key(KeyCode::Left));
     assert_eq!(s.composer.cursor(), 0, "one grapheme: one step back");
     f = draw(&mut s, 80, 20);
-    assert_caret(&f, &s, "combining start", expected_composer_caret(&s, 80, 20));
+    assert_caret(
+        &f,
+        &s,
+        "combining start",
+        expected_composer_caret(&s, 80, 20),
+    );
     reduce(&mut s, key(KeyCode::Right));
     assert_eq!(s.composer.cursor(), 1);
     reduce(&mut s, key(KeyCode::Backspace));
     assert!(s.composer.is_empty(), "backspace removes the whole cluster");
     f = draw(&mut s, 80, 20);
-    assert_caret(&f, &s, "combining cleared", expected_composer_caret(&s, 80, 20));
+    assert_caret(
+        &f,
+        &s,
+        "combining cleared",
+        expected_composer_caret(&s, 80, 20),
+    );
 }
 
 #[test]
@@ -442,7 +457,11 @@ fn dogfood_soft_wrap_cjk_keeps_caret_on_a_legal_cell() {
     for _ in 0..(total - first_len) {
         reduce(&mut s, key(KeyCode::Left));
     }
-    assert_eq!(s.composer.cursor(), first_len, "end of the first visual row");
+    assert_eq!(
+        s.composer.cursor(),
+        first_len,
+        "end of the first visual row"
+    );
     f = draw(&mut s, 15, 20);
     let (bx, by, _, _) = s.input_rect.unwrap();
     assert_eq!(
@@ -479,8 +498,16 @@ fn dogfood_terminal_resize_preserves_buffer_cursor_and_geometry() {
 
     for width in [24u16, 14, 24] {
         let f = draw(&mut s, width, 20);
-        assert_eq!(s.composer.text(), buffer_before, "resize changed the buffer");
-        assert_eq!(s.composer.cursor(), cursor_before, "resize changed the cursor");
+        assert_eq!(
+            s.composer.text(),
+            buffer_before,
+            "resize changed the buffer"
+        );
+        assert_eq!(
+            s.composer.cursor(),
+            cursor_before,
+            "resize changed the cursor"
+        );
         assert_caret(
             &f,
             &s,
@@ -507,12 +534,22 @@ fn dogfood_large_paste_chip_keeps_caret_on_the_chip() {
         s.composer.text()
     );
     let mut f = draw(&mut s, 80, 20);
-    assert_caret(&f, &s, "paste chip end", expected_composer_caret(&s, 80, 20));
+    assert_caret(
+        &f,
+        &s,
+        "paste chip end",
+        expected_composer_caret(&s, 80, 20),
+    );
 
     // Typing after the chip keeps the caret after the real editable content.
     type_text(&mut s, "，重点看这里");
     f = draw(&mut s, 80, 20);
-    assert_caret(&f, &s, "paste chip + cjk", expected_composer_caret(&s, 80, 20));
+    assert_caret(
+        &f,
+        &s,
+        "paste chip + cjk",
+        expected_composer_caret(&s, 80, 20),
+    );
     // The chip is presentation; the canonical payload is still every line.
     let canonical = s.composer.canonical_text();
     assert!(canonical.contains(&pasted), "canonical payload lost");
@@ -561,7 +598,10 @@ fn dogfood_clarification_cleared_field_caret_returns_to_the_prompt() {
     open_text_question(&mut s);
     type_text(&mut s, "中文答案");
     reduce(&mut s, ctrl('u'));
-    assert!(s.composer.is_empty(), "the live draft is untouched by the field");
+    assert!(
+        s.composer.is_empty(),
+        "the live draft is untouched by the field"
+    );
     let f = draw(&mut s, 80, 30);
     let before = before_column(&f.row(f.caret.1), f.caret.0);
     assert!(

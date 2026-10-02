@@ -162,8 +162,13 @@ pub enum ThinkingProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingCapabilities {
     access: ThinkingAccess,
-    /// The levels this model accepts *and* a selector may offer, weakest first.
-    levels: Vec<ThinkingLevel>,
+    /// Every canonical level this model accepts, weakest first. A command may
+    /// set any of these even when the selector does not show it, because the
+    /// projection is well defined.
+    accepted: Vec<ThinkingLevel>,
+    /// The subset worth showing: one entry per effect that actually differs on
+    /// this model.
+    visible: Vec<ThinkingLevel>,
     /// Whether the route can be told to disable thinking explicitly.
     supports_disable: bool,
     /// The route's own levels, weakest first, deduplicated.
@@ -189,7 +194,8 @@ impl ThinkingCapabilities {
                 } else {
                     ThinkingAccess::Unsupported
                 },
-                levels: Vec::new(),
+                accepted: Vec::new(),
+                visible: Vec::new(),
                 supports_disable: false,
                 supported: Vec::new(),
             };
@@ -205,24 +211,49 @@ impl ThinkingCapabilities {
         supported.sort_by_key(|effort| reasoning_rank(*effort));
         supported.dedup();
 
-        let mut levels = vec![ThinkingLevel::Auto];
+        let mut accepted = vec![ThinkingLevel::Auto];
         if supports_disable {
-            levels.push(ThinkingLevel::Off);
+            accepted.push(ThinkingLevel::Off);
         }
         for effort in &supported {
             let level = canonical_for(*effort);
-            if !levels.contains(&level) {
-                levels.push(level);
+            if !accepted.contains(&level) {
+                accepted.push(level);
             }
         }
-        // `max` is always an option: it names the strongest level this model
-        // has, which is a real answer even when that level is called `high`.
-        if !levels.contains(&ThinkingLevel::Max) {
-            levels.push(ThinkingLevel::Max);
+        // `max` is always accepted: it names the strongest level this model has,
+        // which is a real answer even when that level is called `high`.
+        if !accepted.contains(&ThinkingLevel::Max) {
+            accepted.push(ThinkingLevel::Max);
+        }
+
+        // What a selector may show: one entry per effect that actually differs
+        // on this model. The strongest distinct level is `max` — "the strongest
+        // this model has" — so a route whose top level is `high` shows `max`
+        // instead of two names for the same request, while a route with `xhigh`
+        // shows both `high` and `max`, because those really are two requests.
+        // Deduplication is by projected effect, never by name.
+        let mut visible = vec![ThinkingLevel::Auto];
+        if supports_disable {
+            visible.push(ThinkingLevel::Off);
+        }
+        for (index, effort) in supported.iter().enumerate() {
+            let level = if index + 1 == supported.len() {
+                ThinkingLevel::Max
+            } else {
+                canonical_for(*effort)
+            };
+            if !visible.contains(&level) {
+                visible.push(level);
+            }
+        }
+        if !visible.contains(&ThinkingLevel::Max) {
+            visible.push(ThinkingLevel::Max);
         }
         Self {
             access: ThinkingAccess::Adjustable,
-            levels,
+            accepted,
+            visible,
             supports_disable,
             supported,
         }
@@ -236,16 +267,25 @@ impl ThinkingCapabilities {
         self.access == ThinkingAccess::Adjustable
     }
 
-    /// The levels worth offering on this model, `auto` first.
+    /// The levels a selector should show, `auto` first: distinct effects only.
+    ///
+    /// A user is never offered two names for one request. `High` and `Max` are
+    /// both canonical and both accepted, but a model that projects them to the
+    /// same level shows one of them — the strongest is `max`, because that is
+    /// what it means.
     pub fn levels(&self) -> &[ThinkingLevel] {
-        &self.levels
+        &self.visible
     }
 
     /// Whether this model can express this level — the question a command
     /// handler asks before accepting one, so an impossible request is answered
     /// with the real options instead of being silently rounded away.
+    ///
+    /// This is wider than [`ThinkingCapabilities::levels`] on purpose: typed
+    /// `/thinking high` on a model whose top level is `high` is a well-defined
+    /// request even though the selector calls that entry `max`.
     pub fn accepts(&self, level: ThinkingLevel) -> bool {
-        self.levels.contains(&level)
+        self.accepted.contains(&level)
     }
 
     /// What this level is on the wire, or `None` when this model cannot express
@@ -410,6 +450,101 @@ mod tests {
             ReasoningEffort::High
         );
         assert!(caps.accepts(ThinkingLevel::Max));
+        // The selector shows the strongest level once, under the name that
+        // means "the strongest this model has".
+        assert_eq!(
+            caps.levels(),
+            &[
+                ThinkingLevel::Auto,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::Max,
+            ]
+        );
+        assert!(!caps.levels().contains(&ThinkingLevel::High));
+        assert!(caps.accepts(ThinkingLevel::High));
+    }
+
+    /// Deduplication is by projected effect, not by name.
+    #[test]
+    fn the_visible_choices_have_one_entry_per_distinct_effect() {
+        // A boolean route: `high` and `max` are both the "on" state, so the
+        // selector offers three things and not four.
+        let boolean = adjustable(ReasoningStyle::ThinkingFlag, &[ReasoningEffort::High]);
+        assert_eq!(
+            boolean.levels(),
+            &[ThinkingLevel::Auto, ThinkingLevel::Off, ThinkingLevel::Max]
+        );
+
+        // A route whose strongest level is `high`: `high` and `max` project to
+        // it, so only one of them is offered.
+        let tops_out_at_high = adjustable(
+            ReasoningStyle::OpenAiEffort,
+            &[
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ],
+        );
+        assert_eq!(
+            tops_out_at_high.levels(),
+            &[
+                ThinkingLevel::Auto,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::Max,
+            ]
+        );
+
+        // A route with `xhigh` really does distinguish `high` from the
+        // strongest, so both are offered.
+        let has_xhigh = adjustable(
+            ReasoningStyle::OpenAiEffort,
+            &[
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ],
+        );
+        assert_eq!(
+            has_xhigh.levels(),
+            &[
+                ThinkingLevel::Auto,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::Max,
+            ]
+        );
+        assert_ne!(
+            has_xhigh.project(ThinkingLevel::High),
+            has_xhigh.project(ThinkingLevel::Max)
+        );
+    }
+
+    /// The accepted set stays wider than the visible one: a level the selector
+    /// folds into `max` is still settable by name.
+    #[test]
+    fn typing_a_folded_level_still_resolves() {
+        let caps = adjustable(
+            ReasoningStyle::OpenAiEffort,
+            &[ReasoningEffort::Low, ReasoningEffort::High],
+        );
+        assert_eq!(
+            caps.levels(),
+            &[ThinkingLevel::Auto, ThinkingLevel::Low, ThinkingLevel::Max]
+        );
+        assert!(caps.accepts(ThinkingLevel::High));
+        assert_eq!(
+            caps.project(ThinkingLevel::High),
+            Some(ThinkingProjection::Effort(ReasoningEffort::High))
+        );
+        // ...and every visible choice is accepted, so the selector can never
+        // offer something the command would refuse.
+        for level in caps.levels() {
+            assert!(caps.accepts(*level), "{level} is visible but not accepted");
+        }
     }
 
     /// A route with a single knob: `auto`, `off` (it can say disabled) and
@@ -417,14 +552,18 @@ mod tests {
     #[test]
     fn a_two_state_route_offers_three_levels() {
         let caps = adjustable(ReasoningStyle::ThinkingFlag, &[ReasoningEffort::High]);
+        // One entry per distinct effect: `high` and `max` are the same request
+        // here, so only the stronger name is shown…
         assert_eq!(
             caps.levels(),
-            &[
-                ThinkingLevel::Auto,
-                ThinkingLevel::Off,
-                ThinkingLevel::High,
-                ThinkingLevel::Max,
-            ]
+            &[ThinkingLevel::Auto, ThinkingLevel::Off, ThinkingLevel::Max,]
+        );
+        // …while `high` is still a well-defined thing to type.
+        assert!(caps.accepts(ThinkingLevel::High));
+        assert_eq!(
+            caps.project(ThinkingLevel::High),
+            caps.project(ThinkingLevel::Max),
+            "the two names are one request on this model"
         );
         assert_eq!(
             caps.project(ThinkingLevel::Off),

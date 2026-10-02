@@ -653,8 +653,8 @@ mod tests {
             warning.detail
         );
         assert!(
-            warning.detail.contains("auto, low, high, max"),
-            "the real options: {}",
+            warning.detail.contains("auto, low, max"),
+            "the real options, deduplicated exactly as the selector shows them: {}",
             warning.detail
         );
         assert!(
