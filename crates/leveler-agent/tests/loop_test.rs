@@ -459,6 +459,114 @@ async fn update_plan_tool_call_emits_a_plan_updated_event() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The whole progress protocol is a sequence of full-list declarations: every
+/// accepted `update_plan` replaces the runtime mirror and re-projects it as one
+/// event. Nothing infers a step's completion from tool activity, so the
+/// projected sequence must mirror the model's declarations exactly — create
+/// 0/3, then 1/3, 2/3, 3/3 with the single `in_progress` marker advancing each
+/// time, and the final list is the authoritative state.
+#[tokio::test]
+async fn consecutive_plan_declarations_advance_the_authoritative_state() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-plan-progression-{}",
+        std::process::id() as u64 * 31 + 13
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let runtime = Arc::new(MockRuntime::new(vec![
+        plan_call(
+            "c1",
+            &[
+                ("read the entry points", "in_progress"),
+                ("apply the fix", "pending"),
+                ("run the tests", "pending"),
+            ],
+        ),
+        plan_call(
+            "c2",
+            &[
+                ("read the entry points", "completed"),
+                ("apply the fix", "in_progress"),
+                ("run the tests", "pending"),
+            ],
+        ),
+        plan_call(
+            "c3",
+            &[
+                ("read the entry points", "completed"),
+                ("apply the fix", "completed"),
+                ("run the tests", "in_progress"),
+            ],
+        ),
+        plan_call(
+            "c4",
+            &[
+                ("read the entry points", "completed"),
+                ("apply the fix", "completed"),
+                ("run the tests", "completed"),
+            ],
+        ),
+        assistant_text("done"),
+    ]));
+
+    let executor = Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    );
+
+    let mut events: Vec<AgentEvent> = Vec::new();
+    executor
+        .run(
+            "do the thing",
+            &mut |e| events.push(e),
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let plans: Vec<Vec<String>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PlanUpdated { steps } => {
+                Some(steps.iter().map(|s| s.status.clone()).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        plans,
+        vec![
+            vec!["in_progress", "pending", "pending"],
+            vec!["completed", "in_progress", "pending"],
+            vec!["completed", "completed", "in_progress"],
+            vec!["completed", "completed", "completed"],
+        ],
+        "each accepted declaration is projected as-is, in order"
+    );
+    // The runtime mirror the final event was taken from is the authoritative
+    // state, so it must read as fully completed with no synthesized step.
+    let last = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::PlanUpdated { steps } => Some(steps.clone()),
+            _ => None,
+        })
+        .expect("a plan declaration is projected");
+    let state = leveler_agent::PlanState { steps: last };
+    assert!(state.is_fully_completed());
+    assert_eq!(state.steps.len(), 3);
+    assert!(state.steps.iter().all(|s| s.id.is_none()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Plan order is the intended order, not an execution order. A later step
 /// whose outcome is already true may be declared completed while an earlier
 /// one is still open: real work detours and returns. Refusing that honest

@@ -3727,6 +3727,7 @@ fn attachment_added_event_stages_it() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("login.png"),
         }),
     );
@@ -3739,6 +3740,7 @@ fn submit_with_image_on_non_vision_model_opens_gate() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("login.png"),
         }),
     );
@@ -3754,6 +3756,7 @@ fn unsupported_media_text_only_sends_without_images() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("login.png"),
         }),
     );
@@ -3781,6 +3784,7 @@ fn submit_with_image_on_vision_model_sends_attachment() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: att.clone(),
         }),
     );
@@ -3803,6 +3807,7 @@ fn backspace_over_an_image_token_removes_that_image() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("login.png"),
         }),
     );
@@ -3836,6 +3841,73 @@ fn plan_events_update_state() {
         }),
     );
     assert_eq!(s.plan.as_ref().unwrap().steps[0].description, "定位代码");
+}
+
+/// The top plan chrome is a plain mirror of the latest declaration. Successive
+/// `PlanUpdated` events must each land, so the mirror can advance 0/3 → 1/3 →
+/// 2/3 → 3/3 with no client-side inference about which step is done.
+#[test]
+fn successive_plan_events_advance_the_mirrored_plan() {
+    use leveler_client_protocol::{PlanStepStatus, UiPlan, UiPlanStep};
+    let plan = |statuses: [PlanStepStatus; 3]| UiPlan {
+        steps: vec![
+            UiPlanStep {
+                index: 0,
+                description: "read".into(),
+                status: statuses[0],
+            },
+            UiPlanStep {
+                index: 1,
+                description: "fix".into(),
+                status: statuses[1],
+            },
+            UiPlanStep {
+                index: 2,
+                description: "test".into(),
+                status: statuses[2],
+            },
+        ],
+    };
+    let mut s = opened();
+    for statuses in [
+        [
+            PlanStepStatus::Running,
+            PlanStepStatus::Pending,
+            PlanStepStatus::Pending,
+        ],
+        [
+            PlanStepStatus::Done,
+            PlanStepStatus::Running,
+            PlanStepStatus::Pending,
+        ],
+        [
+            PlanStepStatus::Done,
+            PlanStepStatus::Done,
+            PlanStepStatus::Running,
+        ],
+        [
+            PlanStepStatus::Done,
+            PlanStepStatus::Done,
+            PlanStepStatus::Done,
+        ],
+    ] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::PlanUpdated {
+                plan: plan(statuses),
+            }),
+        );
+    }
+    let mirrored = s.plan.as_ref().expect("the last declaration is mirrored");
+    assert_eq!(mirrored.steps.len(), 3);
+    assert!(
+        mirrored
+            .steps
+            .iter()
+            .all(|st| st.status == PlanStepStatus::Done),
+        "the terminal declaration must replace the earlier one: {:?}",
+        mirrored.steps
+    );
 }
 
 #[test]
@@ -4498,6 +4570,7 @@ fn backspace_on_empty_composer_removes_last_attachment() {
         reduce(
             &mut s,
             Action::Runtime(RuntimeEvent::AttachmentAdded {
+                command_id: None,
                 attachment: att(name),
             }),
         );
@@ -4933,6 +5006,7 @@ fn alt_backspace_deletes_word_not_attachment() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("a1"),
         }),
     );
@@ -9598,12 +9672,14 @@ fn two_pasted_images_render_as_numbered_chips_and_no_path() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("clipboard.png"),
         }),
     );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("diagram.png"),
         }),
     );
@@ -9629,6 +9705,7 @@ fn enter_with_only_an_image_sends_it() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("clipboard.png"),
         }),
     );
@@ -9663,6 +9740,7 @@ fn a_sent_image_is_visible_in_the_conversation() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("clipboard.png"),
         }),
     );
@@ -9736,6 +9814,7 @@ fn a_narrow_terminal_counts_the_attachments_instead_of_clipping_one() {
         reduce(
             &mut s,
             Action::Runtime(RuntimeEvent::AttachmentAdded {
+                command_id: None,
                 attachment: attachment("clipboard.png"),
             }),
         );
@@ -9766,6 +9845,7 @@ fn images_land_where_the_user_is_writing() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("a.png"),
         }),
     );
@@ -9773,6 +9853,7 @@ fn images_land_where_the_user_is_writing() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("b.png"),
         }),
     );
@@ -9804,6 +9885,7 @@ fn an_image_pasted_earlier_becomes_the_first_image() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("later.png"),
         }),
     );
@@ -9811,6 +9893,7 @@ fn an_image_pasted_earlier_becomes_the_first_image() {
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::AttachmentAdded {
+            command_id: None,
             attachment: attachment("earlier.png"),
         }),
     );
@@ -9829,6 +9912,7 @@ fn deleting_the_middle_image_drops_the_middle_attachment() {
         reduce(
             &mut s,
             Action::Runtime(RuntimeEvent::AttachmentAdded {
+                command_id: None,
                 attachment: attachment(name),
             }),
         );
