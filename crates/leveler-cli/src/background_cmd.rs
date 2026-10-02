@@ -270,6 +270,7 @@ mod tests {
     }
 
     async fn with_incompatible_host(
+        major: u32,
         command: BackgroundCommand,
     ) -> (anyhow::Result<std::process::ExitCode>, Vec<ClientCommand>) {
         // Keep Unix socket paths short even on macOS's long temporary root.
@@ -289,7 +290,7 @@ mod tests {
         let metadata = serde_json::json!({
             "address": "127.0.0.1:1", "token": "test", "instance": "old-host",
             "pid": std::process::id(), "repo": layout.require_workspace().unwrap(),
-            "major": 1, "minor": 0, "capabilities": []
+            "major": major, "minor": 0, "capabilities": []
         });
         std::fs::write(&ready, serde_json::to_vec(&metadata).unwrap()).unwrap();
         std::fs::set_permissions(&ready, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -317,9 +318,12 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_logs_ignore_unrelated_incompatible_host() {
-        let (result, commands) = with_incompatible_host(BackgroundCommand::Logs {
-            task_id: "bg-1".into(),
-        })
+        let (result, commands) = with_incompatible_host(
+            1,
+            BackgroundCommand::Logs {
+                task_id: "bg-1".into(),
+            },
+        )
         .await;
         assert_eq!(result.unwrap(), std::process::ExitCode::SUCCESS);
         assert!(commands.is_empty());
@@ -327,9 +331,12 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_stop_reaches_owner_despite_incompatible_host() {
-        let (result, commands) = with_incompatible_host(BackgroundCommand::Stop {
-            task_id: "bg-1".into(),
-        })
+        let (result, commands) = with_incompatible_host(
+            1,
+            BackgroundCommand::Stop {
+                task_id: "bg-1".into(),
+            },
+        )
         .await;
         assert_eq!(result.unwrap(), std::process::ExitCode::SUCCESS);
         assert!(
@@ -339,23 +346,30 @@ mod tests {
 
     #[tokio::test]
     async fn host_inventory_errors_remain_explicit() {
-        for command in [
-            BackgroundCommand::List { json: true },
-            BackgroundCommand::Logs {
-                task_id: "host-task".into(),
-            },
-            BackgroundCommand::Stop {
-                task_id: "host-task".into(),
-            },
+        // A legacy host is controllable only when it advertises the control-plane
+        // capabilities, and a host from a major this build does not know is not
+        // controllable at all. Both must fail explicitly, naming the real cause,
+        // rather than reporting an empty inventory.
+        for (major, expected) in [
+            (1u32, "missing capability process.spawn"),
+            (99u32, "protocol major 99 is incompatible with 2"),
         ] {
-            let (result, commands) = with_incompatible_host(command).await;
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("protocol major 1 is incompatible with 2")
-            );
-            assert!(commands.is_empty());
+            for command in [
+                BackgroundCommand::List { json: true },
+                BackgroundCommand::Logs {
+                    task_id: "host-task".into(),
+                },
+                BackgroundCommand::Stop {
+                    task_id: "host-task".into(),
+                },
+            ] {
+                let (result, commands) = with_incompatible_host(major, command).await;
+                assert!(
+                    result.unwrap_err().to_string().contains(expected),
+                    "major {major} must fail explicitly"
+                );
+                assert!(commands.is_empty());
+            }
         }
     }
 }

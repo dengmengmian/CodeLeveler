@@ -6782,7 +6782,7 @@ mod memory_listing_tests {
             let directory = tempfile::tempdir().unwrap();
             let store = leveler_memory::MemoryStore::open(directory.path()).unwrap();
             let path = directory.path().join(folder);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
             let open_ok = leveler_memory::MemoryStore::open(directory.path()).is_ok();
             let failed = match folder {
                 "active" => store.list_active().is_err(),
