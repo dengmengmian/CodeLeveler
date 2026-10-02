@@ -3763,6 +3763,80 @@ mod tests {
         );
     }
 
+    /// The caret's terminal column inside a rendered composer box. The
+    /// editable buffer starts after `│` + inner pad + `› ` (column 4), so the
+    /// caret column is that origin plus the buffer's DISPLAY width up to the
+    /// cursor. Placeholder, ghost and suggestion are presentation and are not
+    /// part of this number.
+    fn composer_caret_col(state: &AppState, width: usize) -> u16 {
+        let (_, (cx, _)) = super::composer_box_lines(state, width);
+        cx
+    }
+
+    /// `│` (1) + inner pad (1) + `› ` (2): where the editable buffer begins.
+    const COMPOSER_ORIGIN: u16 = 4;
+
+    #[test]
+    fn composer_caret_follows_the_buffer_by_display_width() {
+        for text in [
+            "",
+            "a",
+            "abc",
+            "中",
+            "中文",
+            "这是什么意思",
+            "abc中文def",
+            "e\u{301}",
+            "👍\u{1f3fd}",
+            "👨\u{200d}👩\u{200d}👧\u{200d}👦",
+        ] {
+            let mut s = test_state();
+            s.composer.replace(text);
+            let expected = COMPOSER_ORIGIN
+                + UnicodeWidthStr::width(text) as u16;
+            assert_eq!(
+                composer_caret_col(&s, 80),
+                expected,
+                "caret for {text:?} must sit at the buffer end, measured in \
+                 terminal display columns"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_placeholder_never_moves_the_empty_caret() {
+        // Empty buffer means caret grapheme 0: immediately after the prompt and
+        // before the placeholder. Neither the placeholder's content nor the
+        // terminal width may shift it.
+        let s = test_state();
+        assert!(s.composer.is_empty());
+        assert_eq!(composer_caret_col(&s, 80), COMPOSER_ORIGIN);
+        assert_eq!(composer_caret_col(&s, 48), COMPOSER_ORIGIN);
+        assert_eq!(composer_caret_col(&s, 24), COMPOSER_ORIGIN);
+    }
+
+    #[test]
+    fn composer_caret_never_splits_a_wide_glyph() {
+        let mut s = test_state();
+        s.composer.replace("中");
+        // End of the buffer: after both cells of the wide glyph.
+        assert_eq!(composer_caret_col(&s, 80), COMPOSER_ORIGIN + 2);
+        // Back to the start: before the glyph, on the other legal boundary.
+        s.composer.move_left();
+        assert_eq!(composer_caret_col(&s, 80), COMPOSER_ORIGIN);
+    }
+
+    #[test]
+    fn composer_caret_tracks_the_wrapped_row_and_column() {
+        let mut s = test_state();
+        s.composer.replace("中文中文中文");
+        // 12 cols: inner 10, minus pad 1 → content 9, minus `› ` → room 7 per
+        // row, so the line wraps as `中文中` / `文中文`.
+        let (_, (cx, cy)) = super::composer_box_lines(&s, 12);
+        assert_eq!(cy, 2, "caret belongs to the continuation row");
+        assert_eq!(cx, COMPOSER_ORIGIN + 6, "caret ends the continuation row");
+    }
+
     #[test]
     fn empty_composer_shows_a_visual_hint_without_mutating_the_buffer() {
         let s = test_state();

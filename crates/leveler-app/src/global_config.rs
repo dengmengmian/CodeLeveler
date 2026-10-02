@@ -1000,6 +1000,7 @@ impl GlobalConfig {
 
     /// Expand into provider/model/policy configs with sensible defaults filled.
     pub fn into_bundle(self) -> GlobalBundle {
+        let global_thinking = self.thinking;
         let retired = self.retired_model_instructions();
         if !retired.is_empty() {
             tracing::warn!(
@@ -1068,6 +1069,10 @@ impl GlobalConfig {
                             max_tool_output_bytes: m.max_tool_output_bytes,
                         },
                         context_quality: None,
+                        // The user's level for this model: its own, else the
+                        // global default. `None` here means `auto` — no level
+                        // at all — which is a real answer, not a missing value.
+                        thinking: m.thinking.or(global_thinking),
                         reasoning,
                         compatibility: CompatibilityConfig {
                             supports_temperature: m.supports_temperature,
@@ -1218,6 +1223,43 @@ mod tests {
         assert_eq!(cfg.thinking_level(), ThinkingLevel::Auto);
         assert_eq!(cfg.thinking_level_for("m"), ThinkingLevel::Auto);
         assert_eq!(cfg.thinking_level_for("p/m"), ThinkingLevel::Auto);
+    }
+
+    /// The configured level reaches the model profile the harness resolves
+    /// against: a model's own value wins over the global default, and the level
+    /// is the canonical word rather than a provider string.
+    #[test]
+    fn the_configured_level_reaches_the_profile() {
+        let toml = r#"
+            thinking = "low"
+
+            [models.inherit]
+            provider = "p"
+            reasoning = true
+            reasoning_style = "thinking_flag"
+            supported_efforts = ["low", "high"]
+            reasoning_effort = "high"
+
+            [models.own]
+            provider = "p"
+            reasoning = true
+            reasoning_style = "thinking_flag"
+            supported_efforts = ["low", "high"]
+            reasoning_effort = "high"
+            thinking = "high"
+        "#;
+        let bundle = GlobalConfig::from_toml_str(toml).unwrap().into_bundle();
+        let level = |id: &str| {
+            bundle
+                .models
+                .iter()
+                .find(|m| m.profile.id == id)
+                .unwrap()
+                .profile
+                .thinking
+        };
+        assert_eq!(level("inherit"), Some(ThinkingLevel::Low));
+        assert_eq!(level("own"), Some(ThinkingLevel::High));
     }
 
     /// The global default is read, and reaches every model that does not set

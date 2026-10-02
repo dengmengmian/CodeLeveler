@@ -79,6 +79,7 @@ fn model_profile(model_id: &str) -> ModelProfile {
             default_effort: Some(ReasoningEffort::Low),
         },
         compatibility: Default::default(),
+        thinking: None,
         pricing: Some(ModelPricing {
             input_usd_per_mtok: 0.1389,
             output_usd_per_mtok: 0.2778,

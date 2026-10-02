@@ -474,6 +474,7 @@ mod tests {
                 reasoning: Default::default(),
                 compatibility: Default::default(),
                 pricing: None,
+                thinking: None,
             },
             policy: None,
         }

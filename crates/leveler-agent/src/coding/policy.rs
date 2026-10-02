@@ -7,7 +7,7 @@
 //! is pure and deterministic: min-composition for concurrency, a precedence
 //! chain for reasoning effort, and no runtime auto-tuning in v1.
 
-use leveler_model::{ModelProfile, ReasoningEffort, ReasoningRetention};
+use leveler_model::{ModelProfile, ReasoningEffort, ReasoningRetention, ThinkingLevel};
 
 use crate::coding::factory::TurnProfile;
 
@@ -88,6 +88,16 @@ pub struct ExecutionOverrides {
     /// Reasoning effort for the top-level seat only; delegated seats keep
     /// `reasoning_effort` / the model default. MA4-C parent-budget ablation.
     pub main_reasoning_effort: Option<ReasoningEffort>,
+    /// The Thinking Level the user chose, in CodeLeveler's own vocabulary, or
+    /// `None` for `auto`.
+    ///
+    /// `auto` is not a level: it means no override at all, so the provider's own
+    /// reasoning behaviour applies to the main seat. That is why nothing below
+    /// falls back to the profile's declared `default_effort` when this is `None`
+    /// — that value is the harness's own default for the calls it makes by
+    /// itself, and letting it answer for `auto` would have CodeLeveler silently
+    /// choosing `max` while the user was told `auto`.
+    pub main_thinking: Option<ThinkingLevel>,
     pub max_tool_output_bytes: Option<usize>,
     /// Measurement knob: persist the model context after every round
     /// (`ContextSnapshot`), not only when it diverges from the transcript.
@@ -343,6 +353,10 @@ pub struct ResolvedExecutionPolicy {
     pub max_parallel_tools: usize,
     pub max_files_per_step: usize,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Ask the provider to turn reasoning off for this seat's requests. The
+    /// user's `off` level, and nothing else: a level cannot express it, and a
+    /// route that declares no word for it never receives it.
+    pub thinking_disabled: bool,
     /// Byte budget for a single tool result (the central output cap).
     pub max_tool_output_bytes: usize,
     /// Persist the model context every round (eval measurement seam).
@@ -418,14 +432,54 @@ pub fn resolve_execution_policy(
         max_parallel_tools,
         max_files_per_step: o.max_files_per_step.unwrap_or(DEFAULT_FILES_PER_STEP),
         // Safety rail: only the eval seam may lower it.
-        reasoning_effort: leveler_model::resolve_reasoning_effort(
-            match role {
-                ExecutionRole::Main => o.main_reasoning_effort.or(o.reasoning_effort),
-                _ => o.reasoning_effort,
-            },
-            &profile.reasoning,
-        )
-        .effective,
+        //
+        // The user's Thinking Level owns the main seat. A named level is
+        // projected exactly, or not at all; `auto` (and no level) carries no
+        // override, so the provider's own default rules. An explicit native
+        // effort — the eval seam, an agent manifest — still applies when the
+        // user has expressed no level, because that is a harness decision rather
+        // than a user preference.
+        reasoning_effort: {
+            let user_level = match role {
+                // A session override wins over the configured level, which is
+                // what the user set for this model or globally.
+                ExecutionRole::Main => o.main_thinking.or(profile.thinking),
+                _ => None,
+            };
+            match user_level.map(|level| {
+                leveler_model::ThinkingCapabilities::of(
+                    profile.capabilities.reasoning,
+                    &profile.reasoning,
+                )
+                .request(level)
+            }) {
+                Some(leveler_model::ThinkingProjection::Effort(effort)) => Some(effort),
+                Some(_) => None,
+                None => match match role {
+                    ExecutionRole::Main => o.main_reasoning_effort.or(o.reasoning_effort),
+                    _ => o.reasoning_effort,
+                } {
+                    Some(requested) => {
+                        leveler_model::resolve_reasoning_effort(Some(requested), &profile.reasoning)
+                            .effective
+                    }
+                    None => None,
+                },
+            }
+        },
+        thinking_disabled: match role {
+            ExecutionRole::Main => o.main_thinking.or(profile.thinking).is_some_and(|level| {
+                matches!(
+                    leveler_model::ThinkingCapabilities::of(
+                        profile.capabilities.reasoning,
+                        &profile.reasoning,
+                    )
+                    .request(level),
+                    leveler_model::ThinkingProjection::Disabled
+                )
+            }),
+            _ => false,
+        },
         // Explicit configuration only (no auto-tuning in v1): eval seam, then
         // the model profile, then the global default cap.
         max_tool_output_bytes: o
@@ -451,7 +505,9 @@ mod tests {
     use super::*;
     use crate::coding::factory::TurnProfile;
     use crate::{ContinuationPolicy, StepLimits};
-    use leveler_model::{ModelProfile, ReasoningEffort, ReasoningRetention};
+    use leveler_model::{
+        ModelProfile, ReasoningEffort, ReasoningRetention, ReasoningStyle, ThinkingLevel,
+    };
 
     fn profile() -> ModelProfile {
         serde_json::from_value(serde_json::json!({
@@ -815,13 +871,17 @@ mod tests {
         assert_eq!(r.max_parallel_tools, 2);
     }
 
+    /// `auto` is no override: it must not quietly become the profile's
+    /// recommendation, which is the harness's own default for the calls it
+    /// makes by itself. An explicit native effort still applies.
     #[test]
-    fn reasoning_effort_prefers_override_then_profile_recommendation() {
+    fn auto_does_not_read_the_profile_default_and_a_native_override_still_applies() {
         let mut p = profile();
         p.reasoning.default_effort = Some(ReasoningEffort::Low);
         p.reasoning.supported_efforts = vec![ReasoningEffort::Low, ReasoningEffort::High];
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
-        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(r.reasoning_effort, None, "auto means no override");
+        assert!(!r.thinking_disabled);
 
         let task = ExecutionOverrides {
             reasoning_effort: Some(ReasoningEffort::High),
@@ -829,6 +889,131 @@ mod tests {
         };
         let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&task));
         assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    /// The user's Thinking Level is the only thing that overrides the provider's
+    /// own behaviour, and it is projected exactly — never rounded into a
+    /// neighbouring level, and never turned into the declared default.
+    #[test]
+    fn the_user_thinking_level_is_projected_exactly() {
+        let mut p = profile();
+        p.capabilities.reasoning = true;
+        p.reasoning.style = ReasoningStyle::OpenAiEffort;
+        p.reasoning.default_effort = Some(ReasoningEffort::Low);
+        p.reasoning.supported_efforts = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ];
+        let level = |level| ExecutionOverrides {
+            main_thinking: Some(level),
+            ..ExecutionOverrides::default()
+        };
+        // `high` is `high`; `max` is the strongest this model declares.
+        let r = resolve_execution_policy(
+            &p,
+            ExecutionRole::Main,
+            &goal_turn(),
+            Some(&level(ThinkingLevel::High)),
+        );
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+        let r = resolve_execution_policy(
+            &p,
+            ExecutionRole::Main,
+            &goal_turn(),
+            Some(&level(ThinkingLevel::Max)),
+        );
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::XHigh));
+        // `auto` sends nothing, even though the profile declares a default.
+        let r = resolve_execution_policy(
+            &p,
+            ExecutionRole::Main,
+            &goal_turn(),
+            Some(&level(ThinkingLevel::Auto)),
+        );
+        assert_eq!(r.reasoning_effort, None);
+        assert!(!r.thinking_disabled);
+        // A level this model does not declare is not rounded into one it does.
+        let r = resolve_execution_policy(
+            &p,
+            ExecutionRole::Main,
+            &goal_turn(),
+            Some(&level(ThinkingLevel::Medium)),
+        );
+        assert_eq!(r.reasoning_effort, None);
+        // A session level applies to the main seat only, like an effort override.
+        let r = resolve_execution_policy(
+            &p,
+            ExecutionRole::Worker,
+            &goal_turn(),
+            Some(&level(ThinkingLevel::High)),
+        );
+        assert_eq!(r.reasoning_effort, None, "a delegated seat keeps its own");
+    }
+
+    /// The configured level applies to the main seat, and a session level wins
+    /// over it — including an explicit `auto`, which is not the same thing as
+    /// clearing the session's choice.
+    #[test]
+    fn a_session_level_wins_over_the_configured_one() {
+        let mut p = profile();
+        p.capabilities.reasoning = true;
+        p.reasoning.style = ReasoningStyle::OpenAiEffort;
+        p.reasoning.supported_efforts = vec![ReasoningEffort::Low, ReasoningEffort::High];
+        p.reasoning.default_effort = Some(ReasoningEffort::Low);
+        p.thinking = Some(ThinkingLevel::High);
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(
+            r.reasoning_effort,
+            Some(ReasoningEffort::High),
+            "the configured level applies"
+        );
+
+        let session = ExecutionOverrides {
+            main_thinking: Some(ThinkingLevel::Low),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&session));
+        assert_eq!(
+            r.reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "the session wins over the config"
+        );
+
+        let auto = ExecutionOverrides {
+            main_thinking: Some(ThinkingLevel::Auto),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&auto));
+        assert_eq!(
+            r.reasoning_effort, None,
+            "`/thinking auto` means no override even when a level is configured"
+        );
+    }
+
+    /// `off` reaches the request as an explicit disable — and only on a route
+    /// that declares a word for it.
+    #[test]
+    fn the_off_level_asks_the_route_to_disable_thinking() {
+        let mut p = profile();
+        p.capabilities.reasoning = true;
+        p.reasoning.style = ReasoningStyle::ThinkingFlag;
+        p.reasoning.default_effort = Some(ReasoningEffort::High);
+        p.reasoning.supported_efforts = vec![ReasoningEffort::Low, ReasoningEffort::High];
+        let off = ExecutionOverrides {
+            main_thinking: Some(ThinkingLevel::Off),
+            ..ExecutionOverrides::default()
+        };
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&off));
+        assert!(r.thinking_disabled);
+        assert_eq!(r.reasoning_effort, None, "a disabled knob has no strength");
+
+        // An effort-style route cannot say it: a session carrying `off` sends
+        // nothing rather than a parameter the provider would reject.
+        p.reasoning.style = ReasoningStyle::OpenAiEffort;
+        let r = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), Some(&off));
+        assert!(!r.thinking_disabled);
+        assert_eq!(r.reasoning_effort, None);
     }
 
     #[test]
@@ -870,9 +1055,8 @@ mod tests {
         ] {
             let child = resolve_execution_policy(&p, role, &goal_turn(), Some(&parent_only));
             assert_eq!(
-                child.reasoning_effort,
-                Some(ReasoningEffort::Max),
-                "{role:?} keeps the model default"
+                child.reasoning_effort, None,
+                "{role:?} keeps its own setting rather than the main seat's"
             );
         }
     }

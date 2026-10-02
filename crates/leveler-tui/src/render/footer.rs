@@ -277,7 +277,9 @@ struct ComposerVisRow {
     prompt: &'static str,
     /// Soft-wrapped slice of one logical line (display-width limited).
     text: String,
-    /// When set, the caret sits on this row at this display column within `text`.
+    /// When set, the caret sits on this row at this display column **within
+    /// the painted content area** — the wrapper's prompt indent is already
+    /// counted, so the caller must not add the prompt width again.
     caret_col: Option<usize>,
     /// Empty-buffer placeholder (visual only).
     placeholder: bool,
@@ -432,7 +434,6 @@ pub(crate) fn composer_box_lines(
 
         let room = content_w.saturating_sub(used);
         let piece = truncate_display(&row.text, room);
-        let text_start = used;
         used += UnicodeWidthStr::width(piece.as_str());
         spans.push(Span::styled(
             piece,
@@ -480,8 +481,12 @@ pub(crate) fn composer_box_lines(
         if vi == caret_row
             && let Some(cc) = row.caret_col
         {
-            // Left border + inner padding, then the prompt/text offset.
-            caret_col = (1 + pad + text_start + cc) as u16;
+            // Left border + inner padding + the caret's column inside the
+            // content area. `cc` already counts the `› ` prompt indent, which
+            // is why the prompt span's width is NOT added here: doing so put
+            // the cursor a prompt-width past the buffer (the `输|入消息` and
+            // trailing CJK gap both came from that one extra term).
+            caret_col = (1 + pad + cc) as u16;
         }
 
         // Frame: `│` + inner pad + content + fill + `│`

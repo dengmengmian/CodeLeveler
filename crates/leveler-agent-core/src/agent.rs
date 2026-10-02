@@ -26,6 +26,8 @@ pub struct Agent {
     model: ModelRef,
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
+    /// Ask the provider to turn reasoning off for this run (the user's `off`).
+    thinking_disabled: bool,
     pricing: Option<ModelPricing>,
     limits: ModelStepLimits,
     /// How much historical assistant reasoning this run re-sends to the
@@ -54,6 +56,7 @@ impl Agent {
             model,
             max_output_tokens: None,
             reasoning_effort: None,
+            thinking_disabled: false,
             pricing: None,
             limits: ModelStepLimits::default(),
             reasoning_retention: ReasoningRetention::All,
@@ -78,6 +81,12 @@ impl Agent {
 
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Ask the provider to turn reasoning off for this run.
+    pub fn with_thinking_disabled(mut self, thinking_disabled: bool) -> Self {
+        self.thinking_disabled = thinking_disabled;
         self
     }
 
@@ -275,6 +284,7 @@ impl Agent {
             request.tool_choice = ToolChoice::Auto;
             request.max_output_tokens = self.max_output_tokens;
             request.reasoning_effort = self.reasoning_effort;
+            request.thinking_disabled = self.thinking_disabled;
 
             // Publish the accounting of the EXACT request about to be sent —
             // its projection, not a second reading of the transcript. This is

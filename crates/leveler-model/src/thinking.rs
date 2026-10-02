@@ -29,9 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{
-    ReasoningConfig, ReasoningEffort, ReasoningStyle, normalize_reasoning_effort,
-};
+use crate::profile::{ReasoningConfig, ReasoningEffort, ReasoningStyle};
 
 /// How hard the user wants the model to think, in CodeLeveler's own words.
 ///
@@ -156,6 +154,11 @@ pub enum ThinkingProjection {
 /// two; a route that cannot be told to stop thinking does not offer `off`; and a
 /// route with nothing above `high` still offers `max`, because `max` means "the
 /// strongest this model has" rather than a level of its own.
+///
+/// Nothing here reads the profile's declared `default_effort`. That value is the
+/// harness's own choice for the calls it makes by itself, and a user's `auto`
+/// must never turn into it: `auto` means "do not override", and a named level
+/// means exactly that level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingCapabilities {
     access: ThinkingAccess,
@@ -165,8 +168,6 @@ pub struct ThinkingCapabilities {
     supports_disable: bool,
     /// The route's own levels, weakest first, deduplicated.
     supported: Vec<ReasoningEffort>,
-    /// CodeLeveler's declared default for this model, if any.
-    default: Option<ReasoningEffort>,
 }
 
 impl ThinkingCapabilities {
@@ -191,7 +192,6 @@ impl ThinkingCapabilities {
                 levels: Vec::new(),
                 supports_disable: false,
                 supported: Vec::new(),
-                default: None,
             };
         }
         // The style is the route's own declaration of how it spells a reasoning
@@ -225,7 +225,6 @@ impl ThinkingCapabilities {
             levels,
             supports_disable,
             supported,
-            default: config.default_effort,
         }
     }
 
@@ -250,16 +249,19 @@ impl ThinkingCapabilities {
     }
 
     /// What this level is on the wire, or `None` when this model cannot express
-    /// it. Strict on purpose; a caller that must not lose a request uses
-    /// [`ThinkingCapabilities::resolve`].
+    /// it **exactly**. No neighbouring level is substituted: `medium` on a model
+    /// declaring only `low` and `high` is not `high`, it is unavailable, and the
+    /// caller says so instead of quietly changing what the user asked for.
+    ///
+    /// `Auto` is always expressible, because it asks for nothing at all: the
+    /// request carries no reasoning override and the provider's own default
+    /// applies.
     pub fn project(&self, level: ThinkingLevel) -> Option<ThinkingProjection> {
         if !self.is_adjustable() {
             return None;
         }
         match level {
-            // "No preference": CodeLeveler's declared default, or nothing at
-            // all when the model declares none. Never an invented middle.
-            ThinkingLevel::Auto => Some(self.project_default()),
+            ThinkingLevel::Auto => Some(ThinkingProjection::Omit),
             ThinkingLevel::Off if self.supports_disable => Some(ThinkingProjection::Disabled),
             ThinkingLevel::Off => None,
             // The strongest this model declares.
@@ -268,47 +270,23 @@ impl ThinkingCapabilities {
                 .last()
                 .copied()
                 .map(ThinkingProjection::Effort),
-            other => other
-                .native()
-                .map(|effort| ThinkingProjection::Effort(self.nearest(effort))),
+            other => {
+                let effort = other.native()?;
+                self.supported
+                    .contains(&effort)
+                    .then_some(ThinkingProjection::Effort(effort))
+            }
         }
     }
 
-    /// Like [`ThinkingCapabilities::project`], but never drops a request: a
-    /// level this model cannot express becomes the nearest one it can. This is
-    /// what keeps a session setting working across a model switch — an
-    /// unavailable `off` becomes the model's lowest level instead of a
-    /// parameter the provider would reject.
-    pub fn resolve(&self, level: ThinkingLevel) -> Option<ThinkingProjection> {
-        self.project(level).or_else(|| {
-            if !self.is_adjustable() {
-                return None;
-            }
-            match level {
-                ThinkingLevel::Auto => None,
-                ThinkingLevel::Off => self
-                    .supported
-                    .first()
-                    .copied()
-                    .map(ThinkingProjection::Effort),
-                other => {
-                    let effort = other.native().or_else(|| self.supported.last().copied())?;
-                    Some(ThinkingProjection::Effort(self.nearest(effort)))
-                }
-            }
-        })
-    }
-
-    /// What a bare `auto` sends.
-    fn project_default(&self) -> ThinkingProjection {
-        match self.default {
-            Some(effort) => ThinkingProjection::Effort(effort),
-            None => ThinkingProjection::Omit,
-        }
-    }
-
-    fn nearest(&self, effort: ReasoningEffort) -> ReasoningEffort {
-        normalize_reasoning_effort(effort, &self.supported).unwrap_or(effort)
+    /// The request a level becomes here: exact, or no override at all — never a
+    /// different strength the user did not ask for.
+    ///
+    /// A session carrying `medium` onto a model that declares only `low` and
+    /// `high` runs that model at its provider default and is told so, rather
+    /// than being silently handed `high`.
+    pub fn request(&self, level: ThinkingLevel) -> ThinkingProjection {
+        self.project(level).unwrap_or(ThinkingProjection::Omit)
     }
 }
 
@@ -467,27 +445,31 @@ mod tests {
         );
         assert!(!caps.accepts(ThinkingLevel::Off));
         assert_eq!(caps.project(ThinkingLevel::Off), None);
-        // ...but a session that already says `off` must not send something the
-        // provider would reject: it resolves to the lowest level instead.
+        // ...and a request that must still be produced carries no override,
+        // rather than an `off` the provider would reject as an unknown value.
         assert_eq!(
-            effort(caps.resolve(ThinkingLevel::Off).unwrap()),
-            ReasoningEffort::Low
+            caps.request(ThinkingLevel::Off),
+            ThinkingProjection::Omit,
+            "no invented level, and no invalid parameter"
         );
     }
 
-    /// `auto` is not a level in disguise: it sends the model's declared default,
-    /// and omits the field entirely when the model declares none.
+    /// `auto` is not a level in disguise and never becomes the profile's
+    /// declared default: it asks for no override at all, so the provider's own
+    /// default applies. A declared default is the harness's business for the
+    /// calls it makes by itself; it is not what a user's `auto` means.
     #[test]
-    fn auto_sends_the_declared_default_or_nothing() {
+    fn auto_never_becomes_the_declared_default() {
         let caps = adjustable(
             ReasoningStyle::OpenAiEffort,
             &[ReasoningEffort::Low, ReasoningEffort::High],
         );
         assert_eq!(
-            effort(caps.project(ThinkingLevel::Auto).unwrap()),
-            ReasoningEffort::High,
-            "the declared default is the strongest supported here"
+            caps.project(ThinkingLevel::Auto),
+            Some(ThinkingProjection::Omit),
+            "the declared default must not answer for `auto`"
         );
+        // A model that declares no default at all answers identically.
         let no_default = ThinkingCapabilities::of(
             true,
             &ReasoningConfig {
@@ -502,21 +484,30 @@ mod tests {
         );
     }
 
-    /// A level the route does not declare lands on its nearest declared one
-    /// rather than being dropped.
+    /// A level the route does not declare is unavailable, not rounded. The
+    /// harness does not get to decide that `medium` "is closer to" `high` on a
+    /// model that offers only `low` and `high`.
     #[test]
-    fn an_undeclared_level_rounds_to_the_nearest_declared_one() {
+    fn an_undeclared_level_is_unavailable_rather_than_rounded() {
         let caps = adjustable(
             ReasoningStyle::OpenAiEffort,
             &[ReasoningEffort::Low, ReasoningEffort::High],
         );
+        assert_eq!(caps.project(ThinkingLevel::Medium), None);
+        assert_eq!(caps.project(ThinkingLevel::Minimal), None);
         assert_eq!(
-            effort(caps.resolve(ThinkingLevel::Medium).unwrap()),
-            ReasoningEffort::High
+            caps.request(ThinkingLevel::Medium),
+            ThinkingProjection::Omit,
+            "a request that must be produced carries no override at all"
+        );
+        // What the model does declare is exact.
+        assert_eq!(
+            caps.project(ThinkingLevel::Low),
+            Some(ThinkingProjection::Effort(ReasoningEffort::Low))
         );
         assert_eq!(
-            effort(caps.resolve(ThinkingLevel::Minimal).unwrap()),
-            ReasoningEffort::Low
+            caps.project(ThinkingLevel::High),
+            Some(ThinkingProjection::Effort(ReasoningEffort::High))
         );
     }
 
@@ -575,7 +566,7 @@ mod tests {
         assert!(!caps.is_adjustable());
         assert!(caps.levels().is_empty());
         assert_eq!(caps.project(ThinkingLevel::Max), None);
-        assert_eq!(caps.resolve(ThinkingLevel::Max), None);
+        assert_eq!(caps.request(ThinkingLevel::Max), ThinkingProjection::Omit);
     }
 
     /// The canonical layer serializes as the public words, so a session record

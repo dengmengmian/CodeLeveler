@@ -454,6 +454,16 @@ pub struct ModelProfile {
     /// measurement date. Consumers fall back to `limits.reliable_context`.
     #[serde(default)]
     pub context_quality: Option<ContextQuality>,
+    /// The user's configured Thinking Level for this model, if any.
+    ///
+    /// `None` means the user expressed no level — `auto` — so the provider's own
+    /// reasoning behaviour applies. This is deliberately NOT
+    /// `reasoning.default_effort`: that is the level CodeLeveler sends when it
+    /// makes a call by itself (compaction, memory extraction), and letting it
+    /// answer for `auto` would override the user's provider-default request with
+    /// CodeLeveler's tuning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<crate::ThinkingLevel>,
     #[serde(default)]
     pub reasoning: ReasoningConfig,
     #[serde(default)]
@@ -734,6 +744,7 @@ mod tests {
                 reasoning_content_key_required: true,
             },
             pricing: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&profile).unwrap();
         let back: ModelProfile = serde_json::from_str(&json).unwrap();

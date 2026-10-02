@@ -1366,6 +1366,8 @@ pub struct TurnPolicy {
     pub max_parallel_tools: usize,
     /// Per-request reasoning effort selected by the execution-policy resolver.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Ask the provider to turn reasoning off for this seat's requests.
+    pub thinking_disabled: bool,
     /// How the harness spends this model's declared capacity: window, quality
     /// boundary, completion reservation, headroom, fold threshold and the
     /// retention budget. Resolved by the execution-policy resolver; the loop
@@ -1414,6 +1416,7 @@ impl Default for TurnPolicy {
         Self {
             max_parallel_tools: 0,
             reasoning_effort: None,
+            thinking_disabled: false,
             context_policy: ResolvedContextPolicy::default(),
             reasoning_replay: leveler_model::ReasoningReplayContract::NONE,
             context_trace: false,
@@ -2081,6 +2084,9 @@ impl Executor {
                 // Loop shape comes from the role's resolved policy…
                 max_parallel_tools: child_policy.max_parallel_tools,
                 reasoning_effort: child_policy.reasoning_effort,
+                // A delegated seat keeps its own reasoning setting, exactly as
+                // it does for effort: the user's level is the main seat's.
+                thinking_disabled: false,
                 // …the rest is inherited or deliberately reset for a child.
                 context_policy: self.policy.context_policy,
                 reasoning_replay: self.policy.reasoning_replay,
@@ -2253,6 +2259,13 @@ impl Executor {
     /// recommendation (or provider default) stand.
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
         self.policy.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Ask the provider to turn reasoning off for this executor's requests (the
+    /// user's `off` level).
+    pub fn with_thinking_disabled(mut self, thinking_disabled: bool) -> Self {
+        self.policy.thinking_disabled = thinking_disabled;
         self
     }
 

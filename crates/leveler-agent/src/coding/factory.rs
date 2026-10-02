@@ -178,6 +178,7 @@ impl ExecutorFactory {
         .with_context_policy(resolved.context_policy)
         .with_reasoning_replay(resolved.reasoning_replay)
         .with_reasoning_effort(resolved.reasoning_effort)
+        .with_thinking_disabled(resolved.thinking_disabled)
         .with_context_trace(resolved.context_trace)
         .with_investigation_batching(resolved.investigation_batching)
         .with_post_edit_action_throughput(resolved.post_edit_action_throughput)

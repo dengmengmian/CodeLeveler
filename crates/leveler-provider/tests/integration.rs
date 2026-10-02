@@ -56,6 +56,7 @@ fn model_config() -> ModelConfigFile {
             reasoning: Default::default(),
             compatibility: Default::default(),
             pricing: None,
+            thinking: None,
         },
         policy: None,
     }
