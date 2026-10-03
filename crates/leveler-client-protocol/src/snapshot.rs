@@ -168,6 +168,33 @@ mod tests {
     }
 
     #[test]
+    fn the_thinking_state_is_canonical_and_carries_no_provider_parameter() {
+        let state = crate::UiThinkingState {
+            configured: leveler_model::ThinkingLevel::High,
+            session_override: Some(leveler_model::ThinkingLevel::Max),
+            current: leveler_model::ThinkingLevel::Max,
+            effective: leveler_model::ThinkingLevel::Max,
+            access: crate::UiThinkingAccess::Adjustable,
+            choices: vec![
+                leveler_model::ThinkingLevel::Auto,
+                leveler_model::ThinkingLevel::Low,
+                leveler_model::ThinkingLevel::High,
+                leveler_model::ThinkingLevel::Max,
+            ],
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        let text = json.to_string();
+        assert!(text.contains("\"max\""), "{text}");
+        // The provider's own vocabulary has no way in.
+        for native in ["xhigh", "reasoning_effort", "budget_tokens", "enabled"] {
+            assert!(!text.contains(native), "{native} in {text}");
+        }
+        // ...and it survives a round trip unchanged.
+        let back: crate::UiThinkingState = serde_json::from_value(json).unwrap();
+        assert_eq!(back, state);
+    }
+
+    #[test]
     fn snapshot_omits_thinking_when_unset() {
         let snap = UiSessionSnapshot {
             id: crate::SessionId::new("s1"),

@@ -796,6 +796,24 @@ mod tests {
     }
 
     #[test]
+    fn set_thinking_level_roundtrips_without_a_provider_parameter() {
+        for level in [
+            Some(leveler_model::ThinkingLevel::Auto),
+            Some(leveler_model::ThinkingLevel::Max),
+            // `None` is reset, and is a different payload from `auto`.
+            None,
+        ] {
+            roundtrip(
+                ClientCommand::SetThinkingLevel {
+                    session_id: SessionId::new("s1"),
+                    level,
+                },
+                "set_thinking_level",
+            );
+        }
+    }
+
+    #[test]
     fn set_permission_profile_roundtrips() {
         roundtrip(
             ClientCommand::SetPermissionProfile {
