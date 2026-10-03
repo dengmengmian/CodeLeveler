@@ -219,6 +219,31 @@ fn carried(request: &ModelRequest) -> Vec<String> {
         .collect()
 }
 
+#[tokio::test]
+async fn executor_thinking_off_reaches_each_main_request() {
+    let dir = workspace();
+    let script = Script::new(vec![thought_read(0, ""), answer("done")]);
+    executor(dir.path(), script.clone(), replaying_route(), false)
+        .with_thinking_disabled(true)
+        .run(
+            "read src/lib.rs",
+            &mut |_| {},
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn");
+    let requests = script.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(
+            request.thinking_disabled,
+            "off was lost before model dispatch"
+        );
+        assert_eq!(request.reasoning_effort, None);
+    }
+}
+
 /// R2 end to end: the reasoning of the tool exchange reaches the next request,
 /// through the projection the encoder reads.
 #[tokio::test]

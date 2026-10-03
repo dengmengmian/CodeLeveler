@@ -1375,6 +1375,14 @@ impl InProcessRuntimeClient {
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         let sessions = SessionRepository::new(&db);
+        if sessions
+            .get(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .is_none()
+        {
+            return Err(ClientError::SessionNotFound(session_id.clone()));
+        }
         sessions
             .update_model(session_id, &config.model.to_string(), leveler_core::now())
             .await
@@ -2802,6 +2810,10 @@ impl InProcessRuntimeClient {
                         .profile(&model)
                         .await
                         .map_err(|e| e.to_string())?;
+                    let overrides = app
+                        .execution_overrides_for_session(Some(session_id.as_str()))
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let policy = leveler_agent::coding::resolve_execution_policy(
                         &profile,
                         leveler_agent::coding::ExecutionRole::Main,
@@ -2809,7 +2821,7 @@ impl InProcessRuntimeClient {
                             continuation: leveler_agent::ContinuationPolicy::UntilTerminal,
                             limits: leveler_agent::StepLimits::default(),
                         },
-                        app.execution_overrides.as_ref(),
+                        overrides.as_ref(),
                     );
                     // The main task's runtime projection: the same facts the
                     // Background Tasks page renders, bound by id, copied out
@@ -2962,7 +2974,7 @@ impl InProcessRuntimeClient {
                         let summary_request = leveler_context::summary_request(
                             app.registry.as_ref(),
                             &model,
-                            policy.reasoning_effort,
+                            leveler_engine::ModelCallKind::Compaction.default_reasoning_effort(),
                             &messages,
                             retention.keep_recent_messages,
                             retention.keep_recent_tokens,
@@ -3039,6 +3051,7 @@ impl InProcessRuntimeClient {
                         };
                         request.max_output_tokens = Some(policy.max_output_tokens);
                         request.reasoning_effort = policy.reasoning_effort;
+                        request.thinking_disabled = policy.thinking_disabled;
                         request.projection = Some(projection);
                         let started = std::time::Instant::now();
                         let outcome = app.registry.generate(request, cancel.clone()).await;
@@ -4151,7 +4164,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // session keeps its transcript and checkpoints and stays in
                 // the session list, so `/clear` is a reversible move (reopen
                 // the old session) rather than an unrecoverable wipe.
-                let config = self.runtime_config(&requester_session_id).await?;
+                let mut config = self.runtime_config(&requester_session_id).await?;
+                // A new conversation inherits configured model defaults, not
+                // the previous conversation's explicit Thinking intent.
+                config.thinking = None;
                 match self
                     .app
                     .create_daemon_session(&config.model, PLACEHOLDER_GOAL)

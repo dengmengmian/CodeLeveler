@@ -159,7 +159,7 @@ fn thinking_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
     };
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
-        message: t.thinking_applied.replacen(
+        message: t.thinking_requested.replacen(
             "{}",
             &level.map_or("reset".to_string(), |l| l.to_string()),
             1,

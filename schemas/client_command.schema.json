@@ -1670,7 +1670,7 @@
       "type": "string"
     },
     "ThinkingLevel": {
-      "description": "How hard the user wants the model to think, in CodeLeveler's own words.\n\nThe order is the product contract: weakest → strongest, with `Auto` first because \"no preference\" is the default and the recommended answer.",
+      "description": "How hard the user wants the model to think, in CodeLeveler's own words.\n\nThe order is the product contract: weakest → strongest, with `Auto` first because \"no override\" precedes explicit intensity choices.",
       "oneOf": [
         {
           "type": "string",
@@ -1682,7 +1682,7 @@
           ]
         },
         {
-          "description": "No preference. CodeLeveler's default for the model applies; a model that declares none gets no reasoning field at all.",
+          "description": "No override. CodeLeveler does not specify reasoning intensity; the provider's own default applies.",
           "type": "string",
           "enum": [
             "auto"

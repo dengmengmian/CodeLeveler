@@ -256,11 +256,14 @@ fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
             // A model that does not reason cannot take a Thinking Level. The
             // global default reaches every model, so this is where a config that
             // asks for one here is reported instead of being silently dropped.
-            if let Some(level) = profile.thinking {
+            if let Some(level) = profile
+                .thinking
+                .filter(|level| *level != leveler_model::ThinkingLevel::Auto)
+            {
                 results.push(CheckResult::warn(
                     &format!("thinking: {}/{}", profile.provider, profile.id),
                     format!(
-                        "thinking = \"{level}\" has no effect: this model does not reason.                          Remove it, or set it on a model that does."
+                        "thinking = \"{level}\" has no effect: this model does not reason.                          Set this model's thinking to \"auto\" to use its native behavior."
                     ),
                 ));
             }
@@ -279,7 +282,7 @@ fn check_reasoning(config: &LoadedConfig) -> Vec<CheckResult> {
                 profile.capabilities.reasoning,
                 &profile.reasoning,
             );
-            if !caps.accepts(level) {
+            if level != leveler_model::ThinkingLevel::Auto && !caps.accepts(level) {
                 let available = if caps.levels().is_empty() {
                     "this model's thinking cannot be adjusted".to_string()
                 } else {
@@ -529,6 +532,62 @@ mod tests {
             api_key: Some("sk-test".into()),
             headers: Default::default(),
             timeouts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn default_high_is_diagnosed_for_unsupported_fixed_and_mismatched_models() {
+        let config: crate::global_config::GlobalConfig = toml::from_str(
+            r#"
+            [models.unsupported]
+            provider = "p"
+            [models.fixed]
+            provider = "p"
+            reasoning = true
+            [models.mismatch]
+            provider = "p"
+            reasoning = true
+            reasoning_style = "open_ai_effort"
+            supported_efforts = ["low", "medium"]
+            reasoning_effort = "low"
+            "#,
+        )
+        .unwrap();
+        let bundle = config.into_bundle();
+        let loaded = LoadedConfig {
+            models: bundle.models,
+            ..Default::default()
+        };
+        let results = check_reasoning(&loaded);
+        for id in ["unsupported", "fixed", "mismatch"] {
+            let warning = results
+                .iter()
+                .find(|result| result.name == format!("thinking: p/{id}"))
+                .unwrap_or_else(|| panic!("missing High diagnostic for {id}: {results:?}"));
+            assert_eq!(warning.status, CheckStatus::Warn);
+            assert!(
+                warning.detail.contains("thinking = \"high\""),
+                "{warning:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_auto_does_not_warn_on_unsupported_or_fixed_models() {
+        for reasoning in [false, true] {
+            let mut model = sample_model("p", "m");
+            model.profile.capabilities.reasoning = reasoning;
+            model.profile.thinking = Some(leveler_model::ThinkingLevel::Auto);
+            let config = LoadedConfig {
+                models: vec![model],
+                ..Default::default()
+            };
+            assert!(
+                !check_reasoning(&config)
+                    .iter()
+                    .any(|r| r.name.starts_with("thinking:")),
+                "Auto asks for no adjustment"
+            );
         }
     }
 

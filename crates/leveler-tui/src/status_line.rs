@@ -122,10 +122,10 @@ pub(crate) fn friendly_model_label(
     }
 }
 
-/// Input-border runtime summary: `{model} · think:{level} · perm · session`.
+/// Input-border runtime summary: `{model} ({level}) · perm · session`.
 ///
 /// The level is CodeLeveler's own word for the session's Thinking Level
-/// (`think:auto`, `think:max`). A provider's parameter never appears here: the
+/// (`auto`, `max`). A provider's parameter never appears here: the
 /// user reads the vocabulary they configured in, and a model whose thinking
 /// cannot be controlled shows no level at all rather than one that is not in
 /// use. When `max_width` is tight, drop from the right: session, then
@@ -134,7 +134,7 @@ pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String 
     let model = friendly_model_label(&state.model_label, &state.available_models);
     let effort = state.thinking.as_ref().and_then(|thinking| {
         (thinking.access == UiThinkingAccess::Adjustable)
-            .then(|| format!("think:{}", thinking.effective))
+            .then(|| format!("({})", thinking.effective))
     });
     let perm = permission_chip_label(state);
     let untrusted = (!state.untrusted_config.is_empty()).then_some(state.t().untrusted_config_chip);
@@ -157,7 +157,7 @@ pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String 
 
     let has_effort = effort.is_some();
     let head = match &effort {
-        Some(e) => format!("{model} · {e}"),
+        Some(e) => format!("{model} {e}"),
         None => model.clone(),
     };
     let mut shown = extras;
@@ -934,9 +934,31 @@ mod tests {
         state.collaboration = "chat".into();
         assert_eq!(
             runtime_status_chip(&state, 80),
-            "deepseek-v4-flash · think:max · ask · chat",
+            "deepseek-v4-flash (max) · ask · chat",
             "the level is CodeLeveler's word, and the provider's parameter never appears"
         );
+    }
+
+    #[test]
+    fn runtime_chip_uses_effective_canonical_level_and_hides_unadjustable_models() {
+        use leveler_client_protocol::UiThinkingAccess;
+        use leveler_model::ThinkingLevel;
+        let mut state = test_state();
+        state.model_label = "provider/model".into();
+        for level in [ThinkingLevel::High, ThinkingLevel::Max, ThinkingLevel::Auto] {
+            state.thinking = Some(thinking_state(level));
+            assert!(runtime_status_chip(&state, 80).starts_with(&format!("model ({level})")));
+        }
+        let thinking = state.thinking.as_mut().unwrap();
+        thinking.current = ThinkingLevel::Medium;
+        thinking.effective = ThinkingLevel::Auto;
+        assert!(runtime_status_chip(&state, 80).starts_with("model (auto)"));
+        for access in [UiThinkingAccess::Unsupported, UiThinkingAccess::Fixed] {
+            state.thinking.as_mut().unwrap().access = access;
+            let chip = runtime_status_chip(&state, 80);
+            assert!(chip.starts_with("model ·"), "{chip}");
+            assert!(!chip.contains('('), "{chip}");
+        }
     }
 
     #[test]
@@ -975,15 +997,15 @@ mod tests {
         state.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
-        let mid = runtime_status_chip(&state, 33);
+        let mid = runtime_status_chip(&state, 31);
         assert!(mid.contains("deepseek-v4-flash"), "{mid}");
-        assert!(mid.contains("think:max"), "{mid}");
+        assert!(mid.contains("(max)"), "{mid}");
         assert!(!mid.contains("chat"), "session is dropped first: {mid}");
-        let tight = runtime_status_chip(&state, 22);
+        let tight = runtime_status_chip(&state, 21);
         assert!(tight.contains("deepseek-v4-flash"), "{tight}");
         assert!(!tight.contains("ask"), "{tight}");
         assert!(
-            !tight.contains("think:"),
+            !tight.contains("(max)"),
             "the level is dropped with the rest: {tight}"
         );
     }

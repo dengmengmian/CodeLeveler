@@ -19,8 +19,7 @@
 //!
 //! What each level asks for:
 //!
-//! - `auto` — no preference: CodeLeveler's declared default for this model
-//!   stands, and a model that declares none gets no reasoning field at all, so
+//! - `auto` — no override: CodeLeveler does not specify reasoning intensity;
 //!   the provider's own default applies.
 //! - `off` — ask the route to turn thinking off, where the route can be asked.
 //! - `minimal` … `high` — the same-named native level, and only where the model
@@ -34,13 +33,13 @@ use crate::profile::{ReasoningConfig, ReasoningEffort, ReasoningStyle};
 /// How hard the user wants the model to think, in CodeLeveler's own words.
 ///
 /// The order is the product contract: weakest → strongest, with `Auto` first
-/// because "no preference" is the default and the recommended answer.
+/// because "no override" precedes explicit intensity choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
-    /// No preference. CodeLeveler's default for the model applies; a model that
-    /// declares none gets no reasoning field at all.
+    /// No override. CodeLeveler does not specify reasoning intensity; the
+    /// provider's own default applies.
     Auto,
     /// Ask the route to disable extra thinking, where it can be asked.
     Off,

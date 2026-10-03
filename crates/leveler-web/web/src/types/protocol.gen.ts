@@ -458,10 +458,10 @@ export type RuntimeEvent =
 /** Identifies a single agent session (one user goal end to end). */
 export type SessionId = string;
 
-/** How hard the user wants the model to think, in CodeLeveler's own words. The order is the product contract: weakest → strongest, with `Auto` first because "no preference" is the default and the recommended answer. */
+/** How hard the user wants the model to think, in CodeLeveler's own words. The order is the product contract: weakest → strongest, with `Auto` first because "no override" precedes explicit intensity choices. */
 export type ThinkingLevel =
   | 'minimal' | 'low' | 'medium' | 'high'
-  /** No preference. CodeLeveler's default for the model applies; a model that declares none gets no reasoning field at all. */
+  /** No override. CodeLeveler does not specify reasoning intensity; the provider's own default applies. */
   | 'auto'
   /** Ask the route to disable extra thinking, where it can be asked. */
   | 'off'

@@ -530,7 +530,7 @@ fn apply_thinking_choice(state: &mut AppState, key: &str) -> Vec<Effect> {
     let t = state.t();
     state.notification = Some(Notification {
         level: NotificationLevel::Info,
-        message: t.thinking_applied.replacen(
+        message: t.thinking_requested.replacen(
             "{}",
             &level.map_or("reset".to_string(), |l| l.to_string()),
             1,

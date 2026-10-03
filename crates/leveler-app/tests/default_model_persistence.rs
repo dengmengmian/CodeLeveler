@@ -87,6 +87,48 @@ fn write_global_default(text: &str) {
     std::fs::write(&path, text).unwrap();
 }
 
+#[tokio::test]
+async fn loaded_repo_models_resolve_thinking_configuration_precedence() {
+    use leveler_model::ThinkingLevel;
+    let _guard = config_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_repo_config(tmp.path());
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    for (config, expected) in [
+        ("", ThinkingLevel::High),
+        ("thinking = \"low\"", ThinkingLevel::Low),
+        ("thinking = \"auto\"", ThinkingLevel::Auto),
+        (
+            "thinking = \"low\"\n[models.m]\nprovider = \"mock\"\nreasoning = true\nreasoning_style = \"thinking_flag\"\nreasoning_effort = \"high\"\nthinking = \"max\"",
+            ThinkingLevel::Max,
+        ),
+    ] {
+        write_global_default(config);
+        let loaded = Application::load_config(&layout).unwrap();
+        assert_eq!(
+            loaded.models[0].profile.thinking,
+            Some(expected),
+            "repo model without its own preference must inherit resolved config"
+        );
+    }
+    let model_path = tmp.path().join("configs/models/m.yaml");
+    let mut model = std::fs::read_to_string(&model_path).unwrap();
+    model.push_str("\nthinking: auto\n");
+    std::fs::write(model_path, model).unwrap();
+    write_global_default("thinking = \"high\"");
+    assert_eq!(
+        Application::load_config(&layout).unwrap().models[0]
+            .profile
+            .thinking,
+        Some(ThinkingLevel::Auto),
+        "explicit repository preference wins over global"
+    );
+}
+
 async fn build(
     tmp: &tempfile::TempDir,
 ) -> (Arc<Application>, Arc<InProcessRuntimeClient>, SessionId) {

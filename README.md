@@ -151,16 +151,16 @@ For another OpenAI-compatible endpoint, run `leveler init` and edit `~/.leveler/
 How hard a model thinks is one vocabulary on every model:
 
 ```
-auto     no preference; the model's own default (recommended, and the default)
+auto     no override; the provider's own default
 off      turn extra reasoning off where the model can be asked
 minimal  the lowest usable amount
 low      light reasoning
 medium   balanced reasoning
-high     deep reasoning
+high     deep reasoning (the global default)
 max      the strongest level this model has
 ```
 
-The default is `auto`, so nothing needs configuring.
+The global default is `high`. Per-model settings take priority; `/thinking reset` clears only the session override and returns to that configured default. Explicit `auto` leaves the provider's reasoning intensity unchanged. Unsupported or fixed models do not apply an adjustable High setting.
 
 To change it for one session, from the TUI:
 
@@ -173,7 +173,7 @@ To change a default, write it in `~/.leveler/config.toml`:
 
 ```toml
 # every model
-thinking = "auto"
+thinking = "high"
 
 # one model, overriding the global value
 [models.deepseek-chat]
@@ -181,7 +181,7 @@ provider = "deepseek"
 thinking = "low"
 ```
 
-Four examples cover it: leave it at `auto`; `low` to spend less on thinking; `high` to have it think carefully; `max` to get the most the current model can do.
+Use the default `high` for deep reasoning, `auto` to leave intensity to the provider, `low` for lighter reasoning, or `max` for the most the current model can do.
 
 `high` and `max` are not the same: `max` means "the strongest this model has", so it tracks the model instead of pinning a provider's parameter, and a config file holds `max` rather than a string one provider happens to read. The provider's own values (an `xhigh`, a token budget) are a capability the model declares, not a setting a user writes. Which levels a model can distinguish is decided by what it declares; `leveler doctor` lists them per model.
 

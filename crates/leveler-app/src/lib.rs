@@ -512,9 +512,14 @@ impl Application {
         // Merge the global config (`~/.leveler/config.toml`) underneath the repo
         // bundle: the repo wins on any id collision, but global entries fill in
         // so `leveler` works without a per-repo `configs/` directory.
-        let global = global_config::GlobalConfig::load()
-            .map_err(|e| AppError::GlobalConfig(e.to_string()))?
-            .into_bundle();
+        let global_config = global_config::GlobalConfig::load()
+            .map_err(|e| AppError::GlobalConfig(e.to_string()))?;
+        for model in &mut models {
+            if model.profile.thinking.is_none() {
+                model.profile.thinking = Some(global_config.thinking_level_for(&model.profile.id));
+            }
+        }
+        let global = global_config.into_bundle();
         merge_providers(&mut providers, global.providers);
         for model in global.models {
             let exists = models.iter().any(|m| {
@@ -1105,6 +1110,30 @@ impl Application {
         }
     }
 
+    /// Compose a turn's overrides from the durable session intent. Clone the
+    /// application policy so one session cannot mutate another's main seat.
+    pub(crate) async fn execution_overrides_for_session(
+        &self,
+        session_scope: Option<&str>,
+    ) -> Result<Option<leveler_agent::coding::ExecutionOverrides>, AppError> {
+        let mut overrides = self.execution_overrides.clone();
+        if let Some(scope) = session_scope {
+            let db = self.open_database().await?;
+            let raw = SessionRepository::new(&db)
+                .thinking(&leveler_core::SessionId::new(scope))
+                .await?;
+            if let Some(raw) = raw {
+                let level = leveler_model::ThinkingLevel::parse(&raw).ok_or_else(|| {
+                    AppError::GlobalConfig(format!(
+                        "session {scope} stores invalid Thinking Level `{raw}`"
+                    ))
+                })?;
+                overrides.get_or_insert_with(Default::default).main_thinking = Some(level);
+            }
+        }
+        Ok(overrides)
+    }
+
     /// Build a session harness with its live permission cell and planning overlay.
     #[allow(clippy::too_many_arguments)]
     pub async fn engine_for_session(
@@ -1218,7 +1247,7 @@ impl Application {
                 tool_context,
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
-                overrides: self.execution_overrides.clone(),
+                overrides: self.execution_overrides_for_session(session_scope).await?,
                 capabilities: Some(capabilities),
                 memory_catalog,
                 memory_expose: available_packs.memory,

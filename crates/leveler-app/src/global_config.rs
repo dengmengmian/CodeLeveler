@@ -69,7 +69,7 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub default_model: Option<String>,
     /// Default Thinking Level for every model, in CodeLeveler's own words:
-    /// `auto` (the default), `off`, `minimal`, `low`, `medium`, `high`, `max`.
+    /// `auto`, `off`, `minimal`, `low`, `medium`, `high` (the default), `max`.
     ///
     /// This is the only reasoning setting a user writes. A model may override
     /// it in `[models.<id>]`, and `/thinking` overrides either for one session.
@@ -569,12 +569,11 @@ impl GlobalConfig {
             }
             // A per-model level is a statement about THAT model, so an
             // impossible one is an error rather than a silent rounding. The
-            // global default is a preference across models and is rounded per
-            // model instead — a default nobody can satisfy everywhere would be
-            // useless.
+            // global default is a preference across models; an unavailable
+            // level uses provider defaults with a diagnostic, never rounding.
             if let Some(level) = model.thinking {
                 let caps = leveler_model::ThinkingCapabilities::of(model.reasoning, &config);
-                if !caps.accepts(level) {
+                if level != ThinkingLevel::Auto && !caps.accepts(level) {
                     let available = match caps.access() {
                         leveler_model::ThinkingAccess::Unsupported => {
                             "this model does not reason".to_string()
@@ -602,7 +601,7 @@ impl GlobalConfig {
     }
 
     /// The configured Thinking Level for a model, before any session override:
-    /// the model's own setting, else the global default, else `auto`.
+    /// the model's own setting, else the global default, else `high`.
     ///
     /// `auto` is a real answer here — "no preference" — not a missing value.
     pub fn thinking_level_for(&self, model: &str) -> ThinkingLevel {
@@ -614,12 +613,12 @@ impl GlobalConfig {
             .get(id)
             .and_then(|m| m.thinking)
             .or(self.thinking)
-            .unwrap_or(ThinkingLevel::Auto)
+            .unwrap_or(ThinkingLevel::High)
     }
 
     /// The global Thinking Level default, before any model override.
     pub fn thinking_level(&self) -> ThinkingLevel {
-        self.thinking.unwrap_or(ThinkingLevel::Auto)
+        self.thinking.unwrap_or(ThinkingLevel::High)
     }
 
     /// Effective CodeLeveler default for `[models.<id>]` (`provider/model` or
@@ -1000,7 +999,7 @@ impl GlobalConfig {
 
     /// Expand into provider/model/policy configs with sensible defaults filled.
     pub fn into_bundle(self) -> GlobalBundle {
-        let global_thinking = self.thinking;
+        let global_thinking = Some(self.thinking_level());
         let retired = self.retired_model_instructions();
         if !retired.is_empty() {
             tracing::warn!(
@@ -1070,8 +1069,7 @@ impl GlobalConfig {
                         },
                         context_quality: None,
                         // The user's level for this model: its own, else the
-                        // global default. `None` here means `auto` — no level
-                        // at all — which is a real answer, not a missing value.
+                        // global default, including the built-in High default.
                         thinking: m.thinking.or(global_thinking),
                         reasoning,
                         compatibility: CompatibilityConfig {
@@ -1215,14 +1213,24 @@ mod tests {
 
     // ── Thinking Level: one vocabulary, three places it can be set ──────────
 
-    /// The global default is `auto` when nobody sets one, and `auto` is what a
-    /// model falls back to when it has no setting of its own.
+    /// Missing configuration uses High; explicit Auto still asks for no override.
     #[test]
-    fn the_thinking_default_is_auto() {
+    fn the_thinking_default_is_high() {
         let cfg: GlobalConfig = toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
-        assert_eq!(cfg.thinking_level(), ThinkingLevel::Auto);
-        assert_eq!(cfg.thinking_level_for("m"), ThinkingLevel::Auto);
-        assert_eq!(cfg.thinking_level_for("p/m"), ThinkingLevel::Auto);
+        assert_eq!(cfg.thinking_level(), ThinkingLevel::High);
+        assert_eq!(cfg.thinking_level_for("m"), ThinkingLevel::High);
+        assert_eq!(cfg.thinking_level_for("p/m"), ThinkingLevel::High);
+        assert_eq!(
+            cfg.into_bundle().models[0].profile.thinking,
+            Some(ThinkingLevel::High)
+        );
+        let explicit: GlobalConfig =
+            toml::from_str("thinking = \"auto\"\n[models.m]\nprovider = \"p\"\n").unwrap();
+        assert_eq!(explicit.thinking_level(), ThinkingLevel::Auto);
+        assert_eq!(
+            explicit.into_bundle().models[0].profile.thinking,
+            Some(ThinkingLevel::Auto)
+        );
     }
 
     /// The configured level reaches the model profile the harness resolves
@@ -1321,6 +1329,14 @@ mod tests {
         let toml = "[models.m]\nprovider = \"p\"\nthinking = \"max\"\n";
         let err = GlobalConfig::from_toml_str(toml).unwrap_err().to_string();
         assert!(err.contains("does not reason"), "{err}");
+    }
+
+    #[test]
+    fn explicit_auto_is_valid_for_unsupported_and_fixed_models() {
+        for capability in ["", "reasoning = true\n"] {
+            let config = format!("[models.m]\nprovider = \"p\"\n{capability}thinking = \"auto\"\n");
+            assert!(GlobalConfig::from_toml_str(&config).is_ok(), "{config}");
+        }
     }
 
     /// A level the model has to round is accepted for the *global* default: a

@@ -37,6 +37,59 @@ fn state() -> AppState {
     s
 }
 
+#[test]
+fn thinking_commands_do_not_claim_success_before_runtime_confirmation() {
+    use leveler_client_protocol::{UiThinkingAccess, UiThinkingState};
+    use leveler_model::ThinkingLevel;
+
+    for picker in [false, true] {
+        let mut s = state();
+        s.status = RuntimeStatus::Idle;
+        s.thinking = Some(UiThinkingState {
+            configured: ThinkingLevel::Auto,
+            session_override: None,
+            current: ThinkingLevel::Auto,
+            effective: ThinkingLevel::Auto,
+            access: UiThinkingAccess::Adjustable,
+            choices: vec![ThinkingLevel::Auto, ThinkingLevel::Max],
+        });
+        let input = if picker { "/thinking" } else { "/thinking max" };
+        for ch in input.chars() {
+            key(&mut s, KeyCode::Char(ch));
+        }
+        let mut effects = key(&mut s, KeyCode::Enter);
+        if picker {
+            key(&mut s, KeyCode::Down);
+            effects = key(&mut s, KeyCode::Enter);
+        }
+        let [Effect::Send(command @ ClientCommand::SetThinkingLevel { .. })] = effects.as_slice()
+        else {
+            panic!("{effects:?}");
+        };
+        assert!(
+            s.notification
+                .as_ref()
+                .is_none_or(|notice| !notice.message.contains("已设为")),
+            "unconfirmed Thinking command claimed success: {:?}",
+            s.notification
+        );
+        assert_eq!(s.thinking.as_ref().unwrap().current, ThinkingLevel::Auto);
+        reduce(
+            &mut s,
+            Action::EffectCompleted(EffectCompletion::CommandRejected {
+                command: command.clone(),
+                message: "runtime config persistence failed".into(),
+                snapshot: None,
+            }),
+        );
+        assert_eq!(s.thinking.as_ref().unwrap().current, ThinkingLevel::Auto);
+        assert_eq!(
+            s.notification.unwrap().message,
+            "runtime config persistence failed"
+        );
+    }
+}
+
 const CMD: &str = r#"{"cmd":"certbot renew --dry-run"}"#;
 
 fn start(s: &mut AppState, id: &str) {

@@ -617,6 +617,7 @@ impl Executor {
             .with_pricing(self.pricing)
             .with_max_output_tokens(Some(self.max_output_tokens))
             .with_reasoning_effort(self.policy.reasoning_effort)
+            .with_thinking_disabled(self.policy.thinking_disabled)
             .with_context_window(self.policy.context_policy.context_window)
             .with_reasoning_replay(self.policy.reasoning_replay)
             .with_compact_at(self.policy.context_policy.pressure_threshold)

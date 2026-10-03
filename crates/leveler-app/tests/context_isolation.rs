@@ -383,6 +383,514 @@ async fn query_context(
     }
 }
 
+/// Drive the public command through persistence and a real provider adapter.
+/// A green resolver unit test cannot prove the session choice reaches this wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thinking_session_override_reaches_wire_and_survives_reconnect_without_cross_session_leak()
+{
+    use leveler_model::ThinkingLevel;
+    use leveler_storage::SessionRepository;
+
+    let (_tmp, server, app, client, session_a) = harness_with_model(
+        (0..7).map(|_| text("answer")).collect(),
+        128_000,
+        100_000,
+        "capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, \
+         structured_output: true, reasoning: true, vision: false }\n\
+         reasoning: { style: open_ai_effort, supported_efforts: [low, medium, high, x_high], default_effort: medium }\n\
+         thinking: high",
+        "compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }",
+    ).await;
+    let model = ModelRef::new("mock", "m");
+    let session_b = app
+        .create_session(&model, "independent session")
+        .await
+        .unwrap();
+    let db = app.open_database().await.unwrap();
+
+    for (session, level, expected) in [
+        (&session_a, Some(ThinkingLevel::Max), Some("xhigh")),
+        (&session_b, Some(ThinkingLevel::Low), Some("low")),
+        (&session_a, Some(ThinkingLevel::Auto), None),
+        (&session_a, None, Some("high")),
+        (&session_b, Some(ThinkingLevel::Low), Some("low")),
+    ] {
+        client
+            .send(ClientCommand::SetThinkingLevel {
+                session_id: session.clone(),
+                level,
+            })
+            .await
+            .unwrap();
+        let snapshot = client.snapshot(session).await.unwrap();
+        assert_eq!(snapshot.thinking.as_ref().unwrap().session_override, level);
+        assert_eq!(
+            SessionRepository::new(&db)
+                .thinking(session)
+                .await
+                .unwrap()
+                .as_deref(),
+            level.map(|l| l.as_str())
+        );
+        // Restore Max, Auto and reset independently from storage before the
+        // next provider request, rather than trusting the writer's cache.
+        let restored = Arc::new(InProcessRuntimeClient::new(
+            app.clone(),
+            model.clone(),
+            PermissionProfile::Assisted,
+            false,
+        ));
+        assert_eq!(
+            restored
+                .snapshot(session)
+                .await
+                .unwrap()
+                .thinking
+                .unwrap()
+                .session_override,
+            level
+        );
+        let mut rx = restored.subscribe();
+        restored
+            .send(ClientCommand::SubmitMessage {
+                session_id: session.clone(),
+                content: "question".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        wait_for_turn_end(&mut rx).await;
+        let bodies = server.request_bodies().await;
+        let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            expected,
+            "session canonical intent must reach the real adapter: {body}"
+        );
+    }
+
+    // Reconnecting recreates the runtime cache from the durable session row.
+    let restored = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        model.clone(),
+        PermissionProfile::Assisted,
+        false,
+    ));
+    assert_eq!(
+        restored
+            .snapshot(&session_b)
+            .await
+            .unwrap()
+            .thinking
+            .unwrap()
+            .current,
+        ThinkingLevel::Low
+    );
+    let session_c = app.create_session(&model, "new session").await.unwrap();
+    for (session, expected) in [(&session_b, "low"), (&session_c, "high")] {
+        let mut rx = restored.subscribe();
+        restored
+            .send(ClientCommand::SubmitMessage {
+                session_id: session.clone(),
+                content: "question".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        wait_for_turn_end(&mut rx).await;
+        let bodies = server.request_bodies().await;
+        let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+        assert_eq!(
+            body["reasoning_effort"], expected,
+            "reconnect/new session must preserve its own canonical source"
+        );
+    }
+}
+
+#[tokio::test]
+async fn thinking_new_session_does_not_copy_the_requesting_sessions_override() {
+    use leveler_model::ThinkingLevel;
+    use leveler_storage::SessionRepository;
+    let (_tmp, _server, app, client, session) = harness_with_model(
+        vec![], 128_000, 100_000,
+        "capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: true, vision: false }\nreasoning: { style: open_ai_effort, supported_efforts: [low, medium, high, x_high], default_effort: medium }\nthinking: high",
+        "compatibility: { drop_unsupported_fields: true }",
+    ).await;
+    client
+        .send(ClientCommand::SetThinkingLevel {
+            session_id: session.clone(),
+            level: Some(ThinkingLevel::Max),
+        })
+        .await
+        .unwrap();
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    let opened = loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            RuntimeEvent::SessionOpened { session } => break session,
+            _ => continue,
+        }
+    };
+    let thinking = opened.thinking.unwrap();
+    assert_eq!(
+        thinking.session_override, None,
+        "a new conversation has no session choice yet"
+    );
+    assert_eq!(thinking.current, ThinkingLevel::High);
+    let db = app.open_database().await.unwrap();
+    assert_eq!(
+        SessionRepository::new(&db)
+            .thinking(&opened.id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        client
+            .snapshot(&session)
+            .await
+            .unwrap()
+            .thinking
+            .unwrap()
+            .current,
+        ThinkingLevel::Max
+    );
+}
+
+/// The configured level a session returns to is *this model's* level, not the
+/// global default. With the global default unset (so `high`) and this model
+/// configured `low`, `reset` must land on `low`; a hardcoded `reset = high`
+/// would reach the wire as `high` and fail here.
+///
+/// The same app also resolves a model that sets no level of its own to the
+/// global `high`, so the two precedence rules are asserted against one another
+/// rather than against an assumed default.
+#[tokio::test]
+async fn thinking_reset_returns_to_the_models_configured_level_not_the_global_default() {
+    use leveler_model::ThinkingLevel;
+    use leveler_storage::SessionRepository;
+
+    let (tmp, server, app, client, session) = harness_with_model(
+        (0..8).map(|_| text("answer")).collect(),
+        128_000,
+        100_000,
+        "capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, \
+         structured_output: true, reasoning: true, vision: false }\n\
+         reasoning: { style: open_ai_effort, supported_efforts: [low, medium, high, x_high], default_effort: medium }\n\
+         thinking: low",
+        "compatibility: { drop_unsupported_fields: true }",
+    )
+    .await;
+    let db = app.open_database().await.unwrap();
+
+    // (global = high, model = low, session = none) -> low, with no command at
+    // all: the configured level is what the request already carries.
+    let fresh = client.snapshot(&session).await.unwrap().thinking.unwrap();
+    assert_eq!(
+        fresh.configured,
+        ThinkingLevel::Low,
+        "the model's own configured level, not the global high"
+    );
+    assert_eq!(fresh.session_override, None);
+    assert_eq!(fresh.current, ThinkingLevel::Low);
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "question".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut rx).await;
+    let bodies = server.request_bodies().await;
+    let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+    assert_eq!(
+        body["reasoning_effort"], "low",
+        "a fresh session sends its configured level: {body}"
+    );
+
+    for (level, expected_wire, expected_current) in [
+        (Some(ThinkingLevel::Max), "xhigh", ThinkingLevel::Max),
+        // Reset -> the configured low, never the global high.
+        (None, "low", ThinkingLevel::Low),
+    ] {
+        client
+            .send(ClientCommand::SetThinkingLevel {
+                session_id: session.clone(),
+                level,
+            })
+            .await
+            .unwrap();
+        let state = client.snapshot(&session).await.unwrap().thinking.unwrap();
+        assert_eq!(state.current, expected_current);
+        assert_eq!(state.session_override, level);
+        assert_eq!(
+            SessionRepository::new(&db)
+                .thinking(&session)
+                .await
+                .unwrap()
+                .as_deref(),
+            level.map(|level| level.as_str())
+        );
+        let mut rx = client.subscribe();
+        client
+            .send(ClientCommand::SubmitMessage {
+                session_id: session.clone(),
+                content: "question".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        wait_for_turn_end(&mut rx).await;
+        let bodies = server.request_bodies().await;
+        let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+        assert_eq!(
+            body.get("reasoning_effort")
+                .and_then(|value| value.as_str()),
+            Some(expected_wire),
+            "canonical {expected_current} must reach the real adapter: {body}"
+        );
+    }
+
+    // The global default really is `high`: the same app resolves a model that
+    // sets no level of its own to High.
+    std::fs::write(
+        tmp.path().join("configs/models/plain.yaml"),
+        "id: plain\nprovider: mock\nmodel_id: plain\nprotocol: openai_chat\n\
+         capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: true, vision: false }\n\
+         reasoning: { style: open_ai_effort, supported_efforts: [low, medium, high, x_high], default_effort: medium }\n\
+         limits: { context_window: 128000, reliable_context: 100000, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }\n\
+         compatibility: { drop_unsupported_fields: true }\n",
+    )
+    .unwrap();
+    let app = Arc::new(
+        Application::assemble(Layout::from_parts(
+            tmp.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        ))
+        .unwrap(),
+    );
+    let plain = ModelRef::new("mock", "plain");
+    let plain_session = app.create_session(&plain, "global default").await.unwrap();
+    let client = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        plain,
+        PermissionProfile::Assisted,
+        false,
+    ));
+    let state = client
+        .snapshot(&plain_session)
+        .await
+        .unwrap()
+        .thinking
+        .unwrap();
+    assert_eq!(
+        state.configured,
+        ThinkingLevel::High,
+        "with no per-model level, the global default is high"
+    );
+    assert_eq!(state.session_override, None);
+    assert_eq!(state.current, ThinkingLevel::High);
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: plain_session.clone(),
+            content: "question".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut rx).await;
+    let bodies = server.request_bodies().await;
+    let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+    assert_eq!(
+        body["reasoning_effort"], "high",
+        "the global default reaches the wire for a model that sets none"
+    );
+}
+
+#[tokio::test]
+async fn thinking_btw_off_reaches_wire() {
+    use leveler_model::ThinkingLevel;
+    let response = MockResponse::SilentThenJson { silent_ms: 0, body: serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "side answer"}, "finish_reason": "stop"}]
+    }).to_string() };
+    let (_tmp, server, _app, client, session) = harness_with_model(
+        vec![response], 128_000, 100_000,
+        "capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: true, vision: false }\nreasoning: { style: thinking_flag, supported_efforts: [high], default_effort: high }",
+        "compatibility: { drop_unsupported_fields: true }",
+    ).await;
+    client
+        .send(ClientCommand::SetThinkingLevel {
+            session_id: session.clone(),
+            level: Some(ThinkingLevel::Off),
+        })
+        .await
+        .unwrap();
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::Btw {
+            session_id: session,
+            question: "side question".into(),
+        })
+        .await
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            RuntimeEvent::BtwCompleted => break,
+            RuntimeEvent::BtwFailed { error } => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let bodies = server.request_bodies().await;
+    let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(
+        body["thinking"]["type"], "disabled",
+        "user side questions honor the explicit session Off"
+    );
+}
+
+#[tokio::test]
+async fn thinking_model_switch_preserves_canonical_intent_and_reprojects_each_wire() {
+    use leveler_model::ThinkingLevel;
+    use leveler_storage::SessionRepository;
+    let (tmp, server, _app, _client, session) = harness_with_model(
+        (0..10).map(|_| text("answer")).collect(), 128_000, 100_000,
+        "capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: true, vision: false }\nreasoning: { style: open_ai_effort, supported_efforts: [low, medium, high, x_high], default_effort: medium }\nthinking: high",
+        "compatibility: { drop_unsupported_fields: true }",
+    ).await;
+    for (id, reasoning, supported) in [
+        (
+            "limited",
+            "reasoning: { style: open_ai_effort, supported_efforts: [low, medium, high], default_effort: medium }",
+            true,
+        ),
+        (
+            "boolean",
+            "reasoning: { style: thinking_flag, supported_efforts: [high], default_effort: high }",
+            true,
+        ),
+        ("unsupported", "", false),
+    ] {
+        std::fs::write(tmp.path().join(format!("configs/models/{id}.yaml")), format!(
+            "id: {id}\nprovider: mock\nmodel_id: {id}\nprotocol: openai_chat\ncapabilities: {{ streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: {supported}, vision: false }}\n{reasoning}\nlimits: {{ context_window: 128000, reliable_context: 100000, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }}\ncompatibility: {{ drop_unsupported_fields: true }}"
+        )).unwrap();
+    }
+    let app = Arc::new(
+        Application::assemble(Layout::from_parts(
+            tmp.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        ))
+        .unwrap(),
+    );
+    let client = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    ));
+    let db = app.open_database().await.unwrap();
+    for level in [ThinkingLevel::Max, ThinkingLevel::Auto] {
+        client
+            .send(ClientCommand::SetThinkingLevel {
+                session_id: session.clone(),
+                level: Some(level),
+            })
+            .await
+            .unwrap();
+        for (id, max_effort) in [
+            ("m", Some("xhigh")),
+            ("limited", Some("high")),
+            ("boolean", Some("high")),
+            ("unsupported", None),
+            ("m", Some("xhigh")),
+        ] {
+            client
+                .send(ClientCommand::SelectModel {
+                    session_id: session.clone(),
+                    model: ModelRef::new("mock", id),
+                })
+                .await
+                .unwrap();
+            let state = client.snapshot(&session).await.unwrap().thinking.unwrap();
+            assert_eq!(state.current, level);
+            assert_eq!(state.session_override, Some(level));
+            assert_eq!(
+                SessionRepository::new(&db)
+                    .thinking(&session)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(level.as_str())
+            );
+            let mut rx = client.subscribe();
+            client
+                .send(ClientCommand::SubmitMessage {
+                    session_id: session.clone(),
+                    content: "question".into(),
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+            wait_for_turn_end(&mut rx).await;
+            let bodies = server.request_bodies().await;
+            let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+            assert_eq!(
+                body.get("reasoning_effort").and_then(|v| v.as_str()),
+                if level == ThinkingLevel::Max {
+                    max_effort
+                } else {
+                    None
+                },
+                "model {id}, canonical {level}"
+            );
+            if id == "boolean" {
+                assert_eq!(body["thinking"]["type"], "enabled");
+            }
+            if id == "unsupported" {
+                assert!(body.get("thinking").is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn thinking_command_cannot_succeed_for_a_deleted_cached_session() {
+    let (_tmp, _server, app, client, session) = harness(vec![]).await;
+    client.snapshot(&session).await.unwrap(); // populate the runtime cache
+    let db = app.open_database().await.unwrap();
+    leveler_storage::SessionRepository::new(&db)
+        .delete(&session)
+        .await
+        .unwrap();
+    let result = client
+        .send(ClientCommand::SetThinkingLevel {
+            session_id: session.clone(),
+            level: Some(leveler_model::ThinkingLevel::Max),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(leveler_client_protocol::ClientError::SessionNotFound(id)) if id == session),
+        "an UPDATE of zero rows is not a persisted Thinking command"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_inspection_is_local_and_never_enters_the_conversation() {
     // A window large enough for the harness's fixed surface (tool schemas plus
@@ -664,8 +1172,18 @@ async fn btw_accounts_for_side_history_and_only_folds_with_an_accepted_summary()
         // fixed cost (the mode contract plus the read-only tool schemas) on top
         // of the retained tail; otherwise no fold could ever bring the request
         // under budget and the truth would be a refusal, not a briefing.
-        let (_tmp, server, app, client, session) =
-            harness_with_window(responses, 32_768, 8_192).await;
+        let (_tmp, server, app, client, session) = harness_with_model(
+            responses, 32_768, 8_192,
+            "capabilities: { streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: true, vision: false }\nreasoning: { style: open_ai_effort, supported_efforts: [low, medium, high, x_high], default_effort: high }\nthinking: high",
+            "compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }",
+        ).await;
+        client
+            .send(ClientCommand::SetThinkingLevel {
+                session_id: session.clone(),
+                level: Some(leveler_model::ThinkingLevel::Max),
+            })
+            .await
+            .unwrap();
         let db = app.open_database().await.unwrap();
         let repo = MessageRepository::new(&db);
         let history: Vec<String> = (0..10)
@@ -700,6 +1218,16 @@ async fn btw_accounts_for_side_history_and_only_folds_with_an_accepted_summary()
         assert_eq!(wait_btw(&mut rx).await, accepted);
         let bodies = server.request_bodies().await;
         assert_eq!(bodies.len(), if accepted { 3 } else { 2 });
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(
+            first["reasoning_effort"], "xhigh",
+            "a user side question inherits session intent"
+        );
+        assert_eq!(
+            summary["reasoning_effort"], "medium",
+            "side compaction uses its independent internal policy"
+        );
         // The side conversation is what pushed the second question over
         // budget: the first one fitted without a fold, so exactly one extra
         // request (the briefing) appears here. The newest messages are the
