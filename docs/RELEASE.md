@@ -6,6 +6,10 @@ This release rebuilds how a model request is assembled, folded, and paid for.
 The control context is now separate from the transcript, every delivered prompt
 segment has one source and one authority, and every model attempt is recorded in
 the request ledger.
+Reasoning also gets one user-facing vocabulary: a Thinking Level names the
+intent (`auto`, `off`, `minimal`, `low`, `medium`, `high`, `max`) rather than a
+provider's parameter, `/thinking` sets it for a session, the config file takes
+the same words globally or per model, and the default is `high`.
 Installed stable builds can update automatically, or use `leveler update`
 or `/update`.
 
@@ -28,6 +32,14 @@ or `/update`.
   1..=2048 pixel dimensions, a non-empty bounded query id, a bounded
   observability window, a validated agent name, and session-scoped model,
   permission, rename and archive commands. Anything else is refused.
+- **A Thinking Level every model shares.** `/thinking` and `/thinking <level>`
+  set `auto`, `off`, `minimal`, `low`, `medium`, `high` or `max` for the
+  session, and `~/.leveler/config.toml` takes the same words, globally or per
+  model. The default is `high`. `max` means "the strongest level this model
+  declares" rather than a fixed provider value, so the setting tracks a model
+  change instead of pinning a parameter one route happens to read. The picker
+  offers one entry per distinct effect, so `high` and `max` are never listed as
+  two names for one request, and the status line reads the canonical level.
 
 ## Changed
 
@@ -58,6 +70,18 @@ or `/update`.
   already runs; cross-owner control stays refused instead of being downgraded.
 - The repository's `./dev` development entry point is documented in the release
   archives, for local verification and release qualification.
+- `auto` means "no override" rather than CodeLeveler's own tuning: it no longer
+  becomes the model profile's declared default, which is reserved for the calls
+  the harness makes by itself (compaction, memory extraction) and for an
+  explicit native request from the eval seam or an agent manifest. A level a
+  model cannot express exactly is never rounded into a neighbouring one — it is
+  unavailable, the request carries no override, and `leveler doctor` names the
+  levels the model does have.
+- The session's Thinking Level reaches the main request, `/btw` side questions
+  inherit it, and internal compaction keeps its own policy. `off` becomes a
+  route-level disable instead of being lost between the executor policy and the
+  request, and a new session starts from the configured default rather than
+  inheriting the previous conversation's override.
 
 ## Fixed
 
@@ -84,6 +108,14 @@ or `/update`.
   growing without bound.
 - A memory listing reports the store failure that produced it, instead of
   presenting a failed read as an empty list.
+- The status line and the web client show the canonical level (`high`, `max`)
+  instead of a provider's parameter; `xhigh`, `reasoning_effort`,
+  `output_config` and `budget_tokens` no longer have a path to what a user reads.
+- `SetThinkingLevel` on a deleted session answers `SessionNotFound` instead of
+  updating zero rows and reporting success.
+- A repository model that declares no level resolves the global default, so the
+  built-in `high` reaches the YAML/model load path too, and explicit `auto`
+  never warns and never becomes `high`.
 
 ## Known limits
 

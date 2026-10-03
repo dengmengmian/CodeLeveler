@@ -15,6 +15,7 @@ one authority, and every model attempt is recorded in the request ledger.
 - A single request projection that wire encoding and context statistics both read, so the reported input size and the bytes sent cannot disagree
 - Per-attempt request accounting: failures, retries, compaction summaries, and child task calls all land in the request ledger and the resource budget
 - **CodeLeveler Desktop**, an Electron client in `apps/leveler-desktop/`. The renderer reaches the Electron main process only through a sandboxed preload with a fixed IPC surface, and the main process reaches the runtime only through the internal `leveler desktop-bridge` JSONL adapter, so runtime discovery, spawn, adopt, revive and handoff stay owned by the runtime host. It is built from the repository; the release archives still contain the `leveler` binary only
+- **One Thinking Level for every model.** `/thinking` and `/thinking <level>` set `auto`, `off`, `minimal`, `low`, `medium`, `high` or `max` for the session, and `~/.leveler/config.toml` takes the same words, globally or per model. The default is `high`. `max` means "the strongest level this model declares" rather than a fixed provider value, so the setting tracks a model change instead of pinning a parameter one route happens to read
 
 ### Changed
 
@@ -24,6 +25,8 @@ one authority, and every model attempt is recorded in the request ledger.
 - Rule delivery is budgeted against the request, so every rule stays authoritative even when only part of a rule file fits verbatim
 - An attachment import result carries the delivery identity of the command that produced it, so a client can match a stored upload, or its failure, to its own request instead of guessing by attachment name; the field is optional on the wire
 - A background task started with the `runtime` lifetime is owned by the Execution Host rather than by the runtime generation that launched it, so a dev server or watcher survives an update and the replacement generation re-attaches to it
+- `auto` means "no override" rather than CodeLeveler's own tuning: it no longer becomes the model profile's declared default, which is reserved for the calls the harness makes by itself. A level a model cannot express exactly is never rounded into a neighbouring one — it is unavailable, the request carries no override, and `leveler doctor` names the levels the model does have
+- The session's Thinking Level reaches the main request and `/btw` side questions inherit it, while internal compaction keeps its own policy. `off` becomes a route-level disable instead of being lost between the executor policy and the request
 
 ### Fixed
 
@@ -35,6 +38,9 @@ one authority, and every model attempt is recorded in the request ledger.
 - `/btw` read-only calls pass through the ToolHost admission pipeline
 - Background task writes are constrained to the OS execution boundary, task mutation settles only after the whole workload ends, and live stdout/stderr channels are capped with an explicit truncation marker
 - A memory listing reports the store failure that produced it instead of presenting a failed read as an empty list
+- The status line and the web client show the canonical level (`high`, `max`) instead of a provider's parameter; `xhigh`, `reasoning_effort`, `output_config` and `budget_tokens` no longer have a path to what a user reads
+- `SetThinkingLevel` on a deleted session answers `SessionNotFound` instead of updating zero rows and reporting success
+- A repository model that declares no level resolves the global default, so the built-in `high` reaches the YAML/model load path too
 
 ## [1.0.0] - 2026-09-18
 

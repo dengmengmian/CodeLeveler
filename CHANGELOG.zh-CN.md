@@ -14,6 +14,7 @@
 - 单一「已投影请求」：链路编码与上下文统计读取同一份结果，报告出的输入规模与实际发送的字节不会再互相矛盾
 - 逐次尝试的请求计量：失败、重试、压缩摘要和子任务调用都会记入请求账本和资源预算
 - **CodeLeveler Desktop**：`apps/leveler-desktop/` 下的 Electron 客户端。Renderer 只能通过 sandbox preload 的固定 IPC 面访问 Electron Main，Main 只能通过内部 `leveler desktop-bridge` JSONL 适配器访问 Runtime，因此 Runtime 的 discovery、spawn、adopt、revive 和 handoff 仍由 Runtime Host 拥有。它从仓库构建；发布包内仍只有 `leveler` 二进制
+- **所有模型共用一套 Thinking Level**：`/thinking` 与 `/thinking <level>` 可为当前会话设置 `auto`、`off`、`minimal`、`low`、`medium`、`high` 或 `max`，`~/.leveler/config.toml` 里写的是同一套词，可全局设置也可按模型设置。默认是 `high`。`max` 表示「该模型声明的最高档」，而不是某个固定的服务商取值，因此它会随模型变化重新解析，而不是钉死某个 route 恰好读取的参数
 
 ### 变更
 
@@ -23,6 +24,8 @@
 - 规则投递按请求额度分配：即使规则文件只有一部分能逐字放入，每条规则仍保持权威
 - 附件导入结果携带产生它的那条命令的身份，客户端因此可以把一次成功保存或一次失败对应回自己的请求，而不必按附件名猜测；该字段在链路上可选
 - 以 `runtime` lifetime 启动的后台任务由 Execution Host 拥有，而不是由启动它的那个 runtime generation 拥有：dev server 或 watcher 因此可以跨版本更新存活，替换上来的 generation 会重新接上它
+- `auto` 的含义是「不覆盖」，不再是 CodeLeveler 自己的调参：它不会再变成模型 profile 声明的 default，后者只留给 harness 自己发起的调用。模型无法精确表达的档位也不再被四舍五入到相邻档位——它不可用，请求不带覆盖，`leveler doctor` 会列出该模型真正支持的档位
+- 会话的 Thinking Level 会到达主请求，`/btw` 旁问继承它，内部压缩保留自己的策略。`off` 会变成 route 级别的关闭，而不是在 executor policy 与请求之间丢失
 
 ### 修复
 
@@ -34,6 +37,9 @@
 - `/btw` 的只读调用改为通过 ToolHost 准入管线
 - 后台任务写入被限制在 OS 执行边界内，任务变更在整个工作负载结束后才结算，运行中的 stdout、stderr 通道设有上限并在截断处给出明确标记
 - 记忆列表现在会报告导致它的 store 失败，而不会把一次失败的读取当作空列表
+- 状态栏与 Web 客户端显示的是统一词汇里的档位（`high`、`max`），而不是服务商的参数；`xhigh`、`reasoning_effort`、`output_config` 和 `budget_tokens` 不再有任何路径出现在用户看到的内容里
+- 对已删除的会话调用 `SetThinkingLevel` 会返回 `SessionNotFound`，而不是更新零行却报告成功
+- 仓库内置模型未声明档位时会解析到全局默认值，因此内置的 `high` 也能到达 YAML/model 加载路径
 
 ## [1.0.0] - 2026-09-18
 
