@@ -80,10 +80,27 @@ describe('product axes', () => {
     expect(state.current?.collaboration).toBe('plan');
   });
 
-  it('exposes the runtime-resolved reasoning effort, never inventing one', () => {
-    const state = stateWithSession({ reasoning: { effective: 'max' } });
+  it('exposes the runtime Thinking Level, never inventing one', () => {
+    const state = stateWithSession({
+      thinking: {
+        configured: 'auto',
+        session_override: 'max',
+        current: 'max',
+        effective: 'max',
+        access: 'adjustable',
+        choices: ['auto', 'max'],
+      },
+    });
     expect(state.current?.reasoningEffort).toBe('max');
-    const none = stateWithSession({ reasoning: { effective: null } });
+    const none = stateWithSession({
+      thinking: {
+        configured: 'auto',
+        current: 'auto',
+        effective: 'auto',
+        access: 'unsupported',
+        choices: [],
+      },
+    });
     expect(none.current?.reasoningEffort).toBeNull();
   });
 });

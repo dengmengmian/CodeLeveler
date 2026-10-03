@@ -1504,7 +1504,7 @@ fn replay_history(
             context_window: 0,
             locale: state.locale,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     );
     scratch.size = state.size;
@@ -1551,8 +1551,10 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     state.mode_label = mode_label(session.mode).to_string();
     state.available_models = session.available_models.clone();
     state.vision = session.vision;
-    if let Some(reasoning) = &session.reasoning {
-        state.reasoning_effort = reasoning.effective.clone();
+    // The runtime owns the level; adopt it so a reconnect cannot show a stale
+    // local guess. Absent on an old runtime means keep what we have.
+    if session.thinking.is_some() {
+        state.thinking = session.thinking.clone();
     }
     // Product axes: the session record is the source of truth; adopt when the
     // runtime sends them so a reconnect cannot show a stale local guess. Old

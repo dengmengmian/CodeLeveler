@@ -27,7 +27,7 @@ fn state() -> AppState {
             context_window: 0,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     )
 }
@@ -57,7 +57,7 @@ fn snapshot(goal: &str, status: &str) -> UiSessionSnapshot {
         recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
-        reasoning: None,
+        thinking: None,
         work_profile: None,
         collaboration: None,
         children: Vec::new(),

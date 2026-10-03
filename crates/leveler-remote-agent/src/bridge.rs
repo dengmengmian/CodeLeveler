@@ -619,6 +619,7 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::SetDefaultModel { .. } => "set_default_model",
         ClientCommand::SetPermissionProfile { .. } => "set_permission_profile",
         ClientCommand::SetProductAxes { .. } => "set_product_axes",
+        ClientCommand::SetThinkingLevel { .. } => "set_thinking_level",
         ClientCommand::ConfirmPlanToGoal { .. } => "confirm_plan_to_goal",
         ClientCommand::SteerCurrentTurn { .. } => "steer_current_turn",
         ClientCommand::ListMemory { .. } => "list_memory",

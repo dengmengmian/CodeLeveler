@@ -104,8 +104,8 @@ pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
     UiActiveBackgroundTask, UiActiveToolCall, UiBackgroundTaskBlocker, UiCheckpoint, UiMessage,
-    UiMessageKind, UiReasoningState, UiRole, UiSessionSnapshot, UiSessionSummary,
-    UiTaskDeclaration, UiTurnBlocker, UiUserShell,
+    UiMessageKind, UiRole, UiSessionSnapshot, UiSessionSummary, UiTaskDeclaration,
+    UiThinkingAccess, UiThinkingState, UiTurnBlocker, UiUserShell,
 };
 pub use version::{
     PROTOCOL_VERSION, ProtocolCapability, ProtocolEnvelope, ProtocolError, ProtocolVersion,
@@ -121,7 +121,7 @@ pub use leveler_core::{
     ApprovalId, BuildIdentity, CheckpointId, ClarificationId, CommandId, RuntimeId, SessionId,
     ToolCallId, UserShellId,
 };
-pub use leveler_model::ModelRef;
+pub use leveler_model::{ModelRef, ThinkingLevel};
 
 /// Prefix stamped on the message that replaces compacted history, so clients can
 /// render it as a distinct "history summary" block rather than a user message.

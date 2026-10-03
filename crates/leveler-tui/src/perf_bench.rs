@@ -48,7 +48,7 @@ fn opened() -> AppState {
             context_window: 200_000,
             locale: crate::i18n::Locale::Zh,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     );
     state.size = (WIDTH as u16, HEIGHT);
@@ -76,7 +76,7 @@ fn opened() -> AppState {
         recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
-        reasoning: None,
+        thinking: None,
         work_profile: None,
         collaboration: None,
         children: Vec::new(),

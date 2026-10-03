@@ -458,6 +458,16 @@ export type RuntimeEvent =
 /** Identifies a single agent session (one user goal end to end). */
 export type SessionId = string;
 
+/** How hard the user wants the model to think, in CodeLeveler's own words. The order is the product contract: weakest → strongest, with `Auto` first because "no preference" is the default and the recommended answer. */
+export type ThinkingLevel =
+  | 'minimal' | 'low' | 'medium' | 'high'
+  /** No preference. CodeLeveler's default for the model applies; a model that declares none gets no reasoning field at all. */
+  | 'auto'
+  /** Ask the route to disable extra thinking, where it can be asked. */
+  | 'off'
+  /** The strongest level this model declares — not a fixed setting. */
+  | 'max';
+
 /** How the token figures in a snapshot were produced. */
 export type TokenCountKind =
   /** Every figure came from a real tokenizer. */
@@ -956,12 +966,6 @@ export interface UiPlanStep {
   status: PlanStepStatus;
 }
 
-/** Additive reasoning projection. The client must display `effective` and must not infer an effort from the model name or provider. */
-export interface UiReasoningState {
-  /** Wire value the runtime will send (`max`, `high`, …). */
-  effective?: string | null;
-}
-
 /** Recovery facts that are already durable and safe to show. */
 export interface UiRecoveryObservation {
   interrupted_turns: number;
@@ -1061,8 +1065,6 @@ export interface UiSessionSnapshot {
   /** Live approval/clarification waiters for reconnect/resync. */
   pending_interactions?: UiPendingInteraction[];
   plan?: UiPlan | null;
-  /** Runtime-projected reasoning state. Absent on old runtimes so a new client keeps its boot-time value. Present with `effective: None` means the model has no controllable effort knob (do not invent one). */
-  reasoning?: UiReasoningState | null;
   /** Durable goal recaps for this session's goals (long-goal P3), oldest first. Each maps to one persisted GoalCheckpoint; a reopened client interleaves them into history by `transcript_ordinal`. Additive. */
   recaps?: UiGoalRecap[];
   repository?: string | null;
@@ -1070,6 +1072,8 @@ export interface UiSessionSnapshot {
   status: string;
   task_status?: UiTaskStatus | null;
   task_terminal?: UiTaskTerminal | null;
+  /** Runtime-projected Thinking Level state, in the user's own vocabulary. Absent on old runtimes so a new client keeps its boot-time value; a present value with `access: unsupported` means the model cannot be asked, which the client says rather than inventing a level. */
+  thinking?: UiThinkingState | null;
   /** User shell executions: the active one (if any) plus a bounded recent history, newest last. Additive/defaulted like the rest of this block. */
   user_shells?: UiUserShell[];
   /** Whether the current model accepts image input (spec §42). */
@@ -1111,6 +1115,31 @@ export interface UiTaskTerminal {
   sequence: number;
   stop?: string | null;
   warnings: string[];
+}
+
+/** How a model's thinking can be controlled. */
+export type UiThinkingAccess =
+  /** The model does not reason. */
+  | 'unsupported'
+  /** The model reasons, but nobody can ask for a different amount. */
+  | 'fixed'
+  /** The caller can choose a level. */
+  | 'adjustable';
+
+/** The session's Thinking Level, in CodeLeveler's own vocabulary. Every field is a canonical level (`auto`, `off`, `minimal`, `low`, `medium`, `high`, `max`). A client renders these and offers `choices`; it must not derive a level from a model name, from a provider's parameter, or from any other field on the wire — the runtime is the only place that knows what a level means for a model, and it answers here in the user's words. */
+export interface UiThinkingState {
+  /** Whether this model's thinking can be controlled at all. */
+  access: UiThinkingAccess;
+  /** The levels worth offering on this model: one entry per level that actually differs, `auto` first. Empty when `access` is not adjustable. */
+  choices?: ThinkingLevel[];
+  /** The configured level for this model: its own `[models.<id>] thinking`, else the global `thinking`. */
+  configured: ThinkingLevel;
+  /** What the user asked for: `session_override` when set, else `configured`. */
+  current: ThinkingLevel;
+  /** What is actually in effect for this model right now. Equal to `current` when this model can express it. Otherwise `auto`: the request carries no reasoning override at all, and the provider's own default applies. A client that showed `current` as if it were running would be reporting a setting that is not in use. */
+  effective: ThinkingLevel;
+  /** The session's explicit override. `None` means the session inherits `configured` — which is not the same as `Some(Auto)`. */
+  session_override?: ThinkingLevel | null;
 }
 
 /** Per-tool aggregate for the **whole session**, independent of the event window. Paired on `(call_id, agent_id)`; duration only from a matching start+finish. Unfinished starts are not success and do not invent duration. */
@@ -1211,6 +1240,8 @@ export type ClientCommand =
   | { type: 'set_default_model'; model: ModelRef; session_id: SessionId }
   /** Switch the execution mode used for subsequent turns . */
   | { type: 'set_permission_profile'; mode: PermissionProfile; session_id: SessionId }
+  /** Set or clear this session's Thinking Level. `Some(level)` sets an explicit level for this session — including `auto`, which is a choice ("do not override") and NOT the same as clearing one. `None` clears the override, so the session goes back to the level configured for the model or globally. The stored value is always CodeLeveler's canonical level. What that becomes on the wire is resolved per request from the model's declared capability, so switching models re-resolves instead of carrying one model's parameter to another. */
+  | { type: 'set_thinking_level'; level?: ThinkingLevel | null; session_id: SessionId }
   /** Set collaboration (`chat | plan | goal`). `work_profile` is a deprecated compatibility field accepted from old clients and ignored by the runtime. */
   | { type: 'set_product_axes'; collaboration: string; session_id: SessionId; work_profile: string }
   /** Confirm a collaboration-plan proposal and auto-enter goal mode (K24). */

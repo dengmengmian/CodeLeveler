@@ -126,6 +126,51 @@ pub(super) fn submit(state: &mut AppState) -> Vec<Effect> {
     send_message(state)
 }
 
+/// `/thinking [auto|off|minimal|low|medium|high|max|reset]`.
+///
+/// No argument opens the picker. A level applies to this session only; `reset`
+/// clears the override so the session goes back to the configured level, which
+/// is a different request from `auto` — a session that explicitly asked for no
+/// override at all.
+fn thinking_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
+    let arg = command.split_whitespace().nth(1).unwrap_or("").trim();
+    let t = state.t();
+    if arg.is_empty() {
+        crate::reducer::overlay_keys::open_thinking_picker(state);
+        return Vec::new();
+    }
+    let level = if arg.eq_ignore_ascii_case("reset") {
+        None
+    } else {
+        match leveler_model::ThinkingLevel::parse(arg) {
+            Some(level) => Some(level),
+            None => {
+                state.notification = Some(Notification {
+                    level: NotificationLevel::Warning,
+                    message: t.thinking_invalid.replacen("{}", arg, 1).replacen(
+                        "{}",
+                        &leveler_model::ThinkingLevel::values(),
+                        1,
+                    ),
+                });
+                return Vec::new();
+            }
+        }
+    };
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: t.thinking_applied.replacen(
+            "{}",
+            &level.map_or("reset".to_string(), |l| l.to_string()),
+            1,
+        ),
+    });
+    vec![Effect::Send(ClientCommand::SetThinkingLevel {
+        session_id: state.session_id.clone(),
+        level,
+    })]
+}
+
 fn looks_like_unknown_slash_command(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -504,6 +549,7 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
             open_mode_picker(state);
             Vec::new()
         }
+        "thinking" => thinking_slash(state, command),
         "goal" => run_goal(state, command),
         "develop" => run_develop(state, command),
         "btw" => run_btw(state, command),
@@ -1213,7 +1259,7 @@ mod export_tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         s.transcript.push_user("帮我加个导出功能".into());
@@ -1322,7 +1368,7 @@ mod export_tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         let effects = export_conversation(&mut s, "export");

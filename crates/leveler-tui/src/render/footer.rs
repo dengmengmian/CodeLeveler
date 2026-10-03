@@ -849,7 +849,7 @@ mod p1_tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         )
     }
@@ -1306,7 +1306,7 @@ mod slash_popup_layout_tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         )
     }
@@ -1394,7 +1394,7 @@ mod slash_popup_layout_tests {
         use crate::theme::Theme;
         let theme = Theme::dark();
         // Index of `/btw` in the quick list; `/develop` sits above it.
-        let (buf, _popup, content) = paint_slash_over_cjk(4);
+        let (buf, _popup, content) = paint_slash_over_cjk(5);
         let mut found = None;
         for y in content.y..content.y + content.height {
             let text = row_text(&buf, y, content.x, content.x + content.width);

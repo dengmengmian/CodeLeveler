@@ -48,6 +48,9 @@ pub enum Overlay {
     /// Confirm deleting a stored session. Deleting is irreversible, so it takes
     /// an explicit choice rather than firing on the first `d`.
     ConfirmSessionDelete(Box<SelectionModel>),
+    /// `/thinking` — the session's Thinking Level, listing only the levels this
+    /// model can actually distinguish.
+    ThinkingPicker(Box<SelectionModel>),
 }
 
 /// A short label for the status line while an overlay is open.
@@ -68,7 +71,8 @@ impl Overlay {
             | Overlay::ThemePicker(_)
             | Overlay::CollabPicker(_)
             | Overlay::CheckpointPicker(_)
-            | Overlay::ConfirmSessionDelete(_) => None,
+            | Overlay::ConfirmSessionDelete(_)
+            | Overlay::ThinkingPicker(_) => None,
         }
     }
 
@@ -99,7 +103,7 @@ impl Overlay {
                 m.insert_query_text(text);
                 true
             }
-            Overlay::Approval(_) => false,
+            Overlay::Approval(_) | Overlay::ThinkingPicker(_) => false,
         }
     }
 }
@@ -304,7 +308,8 @@ fn build_content(
         | Overlay::CollabPicker(model)
         | Overlay::UnsupportedMedia(model)
         | Overlay::CheckpointPicker(model)
-        | Overlay::ConfirmSessionDelete(model) => selection_content(model, theme, width, locale),
+        | Overlay::ConfirmSessionDelete(model)
+        | Overlay::ThinkingPicker(model) => selection_content(model, theme, width, locale),
         Overlay::Approval(ov) => approval_content(ov, theme, width, locale),
         Overlay::Clarification(ov) => clarification_content(ov, theme, width, locale),
     }

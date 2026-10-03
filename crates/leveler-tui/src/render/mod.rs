@@ -2038,7 +2038,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         )
     }
@@ -2619,7 +2619,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         state.active_screen = Screen::Help;

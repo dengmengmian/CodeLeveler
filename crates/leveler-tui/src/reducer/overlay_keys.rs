@@ -1,8 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use leveler_client_protocol::{
-    ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile,
+    ClientCommand, CommandId, ModelRef, NotificationLevel, PermissionProfile, UiThinkingAccess,
 };
+use leveler_model::ThinkingLevel;
 
 use crate::action::Effect;
 use crate::overlay::Overlay;
@@ -59,8 +60,9 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
             SelectionOutcome::Confirm(key) => match ModelRef::parse(&key) {
                 Some(model) => {
                     state.model_label = model.to_string();
-                    // Effort is model-specific; do not keep the previous model's value.
-                    state.reasoning_effort = None;
+                    // The level is model-specific; the runtime re-projects it for
+                    // the new model, so do not keep the previous model's value.
+                    state.thinking = None;
                     state.notification = Some(Notification {
                         level: NotificationLevel::Info,
                         message: format!("已切换模型并设为默认: {model}"),
@@ -98,6 +100,14 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                 apply_theme_id(state, &key);
                 Vec::new()
             }
+        },
+        Overlay::ThinkingPicker(mut sel) => match sel.on_key(effective) {
+            SelectionOutcome::None => {
+                state.overlay = Some(Overlay::ThinkingPicker(sel));
+                Vec::new()
+            }
+            SelectionOutcome::Cancel => Vec::new(),
+            SelectionOutcome::Confirm(key) => apply_thinking_choice(state, &key),
         },
         Overlay::CollabPicker(mut sel) => match sel.on_key(effective) {
             SelectionOutcome::None => {
@@ -402,6 +412,134 @@ pub(super) fn open_theme_picker(state: &mut AppState) {
     ];
     let model = SelectionModel::new(t.overlay_theme, options, false).focus_key(current);
     state.overlay = Some(Overlay::ThemePicker(Box::new(model)));
+}
+
+/// The choice that clears a session override, as opposed to choosing `auto`.
+///
+/// It is not a Thinking Level: it means "go back to the configured default",
+/// which is why the picker offers it separately and only when there is an
+/// override to clear.
+pub(super) const THINKING_RESET_KEY: &str = "__reset__";
+
+/// `/thinking` with no argument: pick a level for this session.
+///
+/// The list is the runtime's capability-driven set — the levels this model can
+/// actually distinguish — so a model with two levels offers three things and
+/// not seven, and a provider's own parameter never appears.
+pub(super) fn open_thinking_picker(state: &mut AppState) {
+    let t = state.t();
+    let Some(thinking) = state.thinking.clone() else {
+        state.notification = Some(Notification {
+            level: NotificationLevel::Warning,
+            message: t.thinking_unknown.to_string(),
+        });
+        return;
+    };
+    match thinking.access {
+        UiThinkingAccess::Unsupported => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: t.thinking_unsupported.to_string(),
+            });
+            return;
+        }
+        UiThinkingAccess::Fixed => {
+            state.notification = Some(Notification {
+                level: NotificationLevel::Info,
+                message: t.thinking_fixed.to_string(),
+            });
+            return;
+        }
+        UiThinkingAccess::Adjustable => {}
+    }
+    let describe = |level: ThinkingLevel| match level {
+        ThinkingLevel::Auto => t.thinking_lv_auto,
+        ThinkingLevel::Off => t.thinking_lv_off,
+        ThinkingLevel::Minimal => t.thinking_lv_minimal,
+        ThinkingLevel::Low => t.thinking_lv_low,
+        ThinkingLevel::Medium => t.thinking_lv_medium,
+        ThinkingLevel::High => t.thinking_lv_high,
+        ThinkingLevel::Max => t.thinking_lv_max,
+    };
+    let mut options: Vec<SelectionOption> = Vec::new();
+    // Only when there is something to clear: a user must not have to remember a
+    // command to get back to the configured level.
+    if thinking.session_override.is_some() {
+        options.push(
+            SelectionOption::new(
+                THINKING_RESET_KEY,
+                format!(
+                    "{} ({})",
+                    t.thinking_reset,
+                    t.thinking_default
+                        .replacen("{}", thinking.configured.as_str(), 1)
+                ),
+            )
+            .description(t.thinking_description),
+        );
+    }
+    for level in &thinking.choices {
+        // The word is what the user types and what the status line shows, so it
+        // is on the row; the sentence beside it says what the word means.
+        options.push(
+            SelectionOption::new(level.as_str(), format!("{level}  {}", describe(*level)))
+                .current(*level == thinking.current),
+        );
+    }
+    let title = format!(
+        "{}  {}  {}",
+        t.thinking_title,
+        t.thinking_current
+            .replacen("{}", thinking.current.as_str(), 1),
+        t.thinking_default
+            .replacen("{}", thinking.configured.as_str(), 1),
+    );
+    let description = if thinking.effective != thinking.current {
+        t.thinking_configured_unavailable
+            .replacen("{}", thinking.current.as_str(), 1)
+            .replacen(
+                "{}",
+                thinking
+                    .choices
+                    .iter()
+                    .map(|level| level.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                    .as_str(),
+                1,
+            )
+    } else {
+        t.thinking_description.to_string()
+    };
+    let model = SelectionModel::new(title, options, false)
+        .with_description(description)
+        .focus_key(thinking.current.as_str());
+    state.overlay = Some(Overlay::ThinkingPicker(Box::new(model)));
+}
+
+/// Apply one Thinking Level choice to this session.
+fn apply_thinking_choice(state: &mut AppState, key: &str) -> Vec<Effect> {
+    let level = if key == THINKING_RESET_KEY {
+        None
+    } else {
+        match ThinkingLevel::parse(key) {
+            Some(level) => Some(level),
+            None => return Vec::new(),
+        }
+    };
+    let t = state.t();
+    state.notification = Some(Notification {
+        level: NotificationLevel::Info,
+        message: t.thinking_applied.replacen(
+            "{}",
+            &level.map_or("reset".to_string(), |l| l.to_string()),
+            1,
+        ),
+    });
+    vec![Effect::Send(ClientCommand::SetThinkingLevel {
+        session_id: state.session_id.clone(),
+        level,
+    })]
 }
 
 /// Apply a named theme (picker confirm or `/theme <id>`). Invalid ids leave state unchanged

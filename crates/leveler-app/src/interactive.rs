@@ -33,15 +33,16 @@ use leveler_execution::{Approver, AutoApprove, PermissionProfile};
 use leveler_media::{MediaError, MediaStore};
 use leveler_model::{
     ContentPart, ImageSource, Message, ModelProfile, ModelRef, ModelRequest, ModelRuntime, Role,
-    ToolChoice, TranscriptOrigin, resolve_reasoning_effort,
+    ThinkingAccess, ThinkingCapabilities, ThinkingLevel, ToolChoice, TranscriptOrigin,
+    resolve_reasoning_effort,
 };
 use leveler_storage::{MessageRepository, SessionRepository};
 
 use leveler_client_protocol::{
     ApprovalDecision as UiApprovalDecision, ApprovalPolicy, AttachmentId, AttachmentKind,
     AttachmentRef, ClientCommand, ClientError, CommandEnvelope, InteractiveRuntimeClient,
-    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiReasoningState, UiRole,
-    UiSessionSnapshot, UiSessionSummary,
+    MessageId, NotificationLevel, RuntimeEvent, UiCheckpoint, UiMessage, UiRole, UiSessionSnapshot,
+    UiSessionSummary, UiThinkingAccess, UiThinkingState,
 };
 
 /// Whether a turn auto-approves risky actions. True when the session opted in
@@ -53,15 +54,43 @@ fn should_auto_approve(session_policy: Option<ApprovalPolicy>, global_auto_appro
     matches!(session_policy, Some(ApprovalPolicy::AutoApprove)) || global_auto_approve
 }
 
-/// New runtimes always project this block so the TUI can tell "no knob"
-/// (`effective: None`) from "old runtime, field absent".
-fn ui_reasoning_state(profile: Option<&ModelProfile>) -> Option<UiReasoningState> {
-    Some(UiReasoningState {
-        effective: profile.and_then(|p| {
-            resolve_reasoning_effort(None, &p.reasoning)
-                .effective
-                .map(|e| e.as_wire().to_string())
-        }),
+/// Project the session's Thinking Level for a client, in the user's own words.
+///
+/// Every field comes from a canonical source: the configured level the model
+/// profile carries (per-model override, else the global default), and the
+/// session's stored override. Nothing here is derived by reading back a
+/// provider's resolved parameter, which would lose the user's intent — the same
+/// `xhigh` can come from `max`, from an internal override, or from a harness
+/// call, and only the canonical side knows which.
+///
+/// `effective` is what is actually in use: equal to `current` when this model
+/// can express it, else `auto`, because a level the model cannot express is
+/// never rounded into a neighbouring one and the request then carries no
+/// reasoning override at all.
+pub fn ui_thinking_state(
+    profile: Option<&ModelProfile>,
+    session_override: Option<ThinkingLevel>,
+) -> Option<UiThinkingState> {
+    let profile = profile?;
+    let caps = ThinkingCapabilities::of(profile.capabilities.reasoning, &profile.reasoning);
+    let configured = profile.thinking.unwrap_or(ThinkingLevel::Auto);
+    let current = session_override.unwrap_or(configured);
+    let effective = if caps.project(current).is_some() {
+        current
+    } else {
+        ThinkingLevel::Auto
+    };
+    Some(UiThinkingState {
+        configured,
+        session_override,
+        current,
+        effective,
+        access: match caps.access() {
+            ThinkingAccess::Unsupported => UiThinkingAccess::Unsupported,
+            ThinkingAccess::Fixed => UiThinkingAccess::Fixed,
+            ThinkingAccess::Adjustable => UiThinkingAccess::Adjustable,
+        },
+        choices: caps.levels().to_vec(),
     })
 }
 
@@ -821,6 +850,10 @@ struct SessionRuntimeConfig {
     /// fallback (see `approver`). Not persisted: a restored session falls back to
     /// `Interactive` (daemon-crash continuation is out of scope for this gate).
     approval_policy: ApprovalPolicy,
+    /// This session's Thinking Level override, in CodeLeveler's own vocabulary.
+    /// `None` means the session inherits the configured level — which is not the
+    /// same as `Some(Auto)`, a session that explicitly asked for no override.
+    thinking: Option<ThinkingLevel>,
 }
 
 impl InProcessRuntimeClient {
@@ -977,6 +1010,7 @@ impl InProcessRuntimeClient {
                 // Per-session default; the daemon-wide `auto_approve` still
                 // applies as the fallback in `approver`.
                 approval_policy: ApprovalPolicy::Interactive,
+                thinking: None,
             },
             session_runtime: Mutex::new(HashMap::new()),
             auto_approve,
@@ -1294,6 +1328,14 @@ impl InProcessRuntimeClient {
                 )));
             }
         }
+        // A session that chose a level keeps it across a resume; the level is
+        // canonical, so a model switch or upgrade re-resolves it rather than
+        // replaying a provider's old parameter.
+        let thinking = SessionRepository::new(&db)
+            .thinking(session_id)
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+            .and_then(|raw| ThinkingLevel::parse(&raw));
         let config = SessionRuntimeConfig {
             model,
             mode,
@@ -1313,6 +1355,7 @@ impl InProcessRuntimeClient {
                 );
                 ApprovalPolicy::Interactive
             },
+            thinking,
         };
         self.session_runtime
             .lock()
@@ -1351,6 +1394,14 @@ impl InProcessRuntimeClient {
                 session_id,
                 &config.collaboration,
                 "single",
+                leveler_core::now(),
+            )
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        sessions
+            .set_thinking(
+                session_id,
+                config.thinking.map(|level| level.as_str()),
                 leveler_core::now(),
             )
             .await
@@ -3824,6 +3875,20 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 Ok(())
             }
 
+            ClientCommand::SetThinkingLevel { session_id, level } => {
+                // `/thinking <level>` sets this session's override; `/thinking
+                // reset` clears it, which is a different request from setting
+                // `auto` (`level` is `Some(Auto)` then, not `None`).
+                let mut config = self.runtime_config(&session_id).await?;
+                config.thinking = level;
+                self.persist_runtime_config(&session_id, config).await?;
+                if let Ok(session) = self.snapshot(&session_id).await {
+                    let _ = self
+                        .events_for(&session_id)
+                        .send(RuntimeEvent::SessionUpdated { session });
+                }
+                Ok(())
+            }
             ClientCommand::SetProductAxes {
                 session_id,
                 work_profile,
@@ -4931,7 +4996,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .as_ref()
             .map(|p| p.capabilities.vision)
             .unwrap_or(false);
-        let reasoning = ui_reasoning_state(profile.as_ref());
+        let thinking = ui_thinking_state(profile.as_ref(), config.thinking);
 
         let last_sequence = leveler_storage::EventRepository::new(&db)
             .latest_sequence(session_id)
@@ -5101,7 +5166,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             recaps,
             user_shells: self.user_shells.snapshot(session_id),
             completion_report: live.completion_report,
-            reasoning,
+            thinking,
             work_profile: Some("single".into()),
             collaboration: Some(config.collaboration.clone()),
             children,
@@ -5232,6 +5297,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 sandbox: self.default_runtime.sandbox,
                 collaboration: self.default_runtime.collaboration.clone(),
                 approval_policy: request.approval_policy,
+                thinking: None,
             },
         )
         .await?;
@@ -5615,7 +5681,15 @@ async fn compact_conversation(
             .as_ref()
             .map(|p| p.capabilities.vision)
             .unwrap_or(false);
-        let reasoning = ui_reasoning_state(profile.as_ref());
+        let thinking = ui_thinking_state(
+            profile.as_ref(),
+            SessionRepository::new(&db)
+                .thinking(session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|raw| ThinkingLevel::parse(&raw)),
+        );
         let last_sequence = leveler_storage::EventRepository::new(&db)
             .latest_sequence(session_id)
             .await
@@ -5679,7 +5753,7 @@ async fn compact_conversation(
                 recaps: Vec::new(),
                 user_shells: Vec::new(),
                 completion_report: live.completion_report,
-                reasoning,
+                thinking,
                 work_profile: Some(crate::canonical_work_profile(&record.work_profile)),
                 collaboration: Some(record.collaboration.clone()),
                 children: Vec::new(),

@@ -148,17 +148,6 @@
         }
       ]
     },
-    "reasoning": {
-      "description": "Runtime-projected reasoning state. Absent on old runtimes so a new client keeps its boot-time value. Present with `effective: None` means the model has no controllable effort knob (do not invent one).",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/UiReasoningState"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "recaps": {
       "description": "Durable goal recaps for this session's goals (long-goal P3), oldest first. Each maps to one persisted GoalCheckpoint; a reopened client interleaves them into history by `transcript_ordinal`. Additive.",
       "default": [],
@@ -191,6 +180,17 @@
       "anyOf": [
         {
           "$ref": "#/definitions/UiTaskTerminal"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "thinking": {
+      "description": "Runtime-projected Thinking Level state, in the user's own vocabulary. Absent on old runtimes so a new client keeps its boot-time value; a present value with `access: unsupported` means the model cannot be asked, which the client says rather than inventing a level.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UiThinkingState"
         },
         {
           "type": "null"
@@ -383,6 +383,41 @@
     "SessionId": {
       "description": "Identifies a single agent session (one user goal end to end).",
       "type": "string"
+    },
+    "ThinkingLevel": {
+      "description": "How hard the user wants the model to think, in CodeLeveler's own words.\n\nThe order is the product contract: weakest → strongest, with `Auto` first because \"no preference\" is the default and the recommended answer.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "description": "No preference. CodeLeveler's default for the model applies; a model that declares none gets no reasoning field at all.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Ask the route to disable extra thinking, where it can be asked.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        },
+        {
+          "description": "The strongest level this model declares — not a fixed setting.",
+          "type": "string",
+          "enum": [
+            "max"
+          ]
+        }
+      ]
     },
     "ToolCallId": {
       "description": "Identifies a tool call. Must be stable across streaming reassembly.",
@@ -1151,19 +1186,6 @@
         }
       }
     },
-    "UiReasoningState": {
-      "description": "Additive reasoning projection. The client must display `effective` and must not infer an effort from the model name or provider.",
-      "type": "object",
-      "properties": {
-        "effective": {
-          "description": "Wire value the runtime will send (`max`, `high`, …).",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
     "UiRole": {
       "description": "Who authored a message.",
       "type": "string",
@@ -1223,6 +1245,94 @@
           "items": {
             "type": "string"
           }
+        }
+      }
+    },
+    "UiThinkingAccess": {
+      "description": "How a model's thinking can be controlled.",
+      "oneOf": [
+        {
+          "description": "The model does not reason.",
+          "type": "string",
+          "enum": [
+            "unsupported"
+          ]
+        },
+        {
+          "description": "The model reasons, but nobody can ask for a different amount.",
+          "type": "string",
+          "enum": [
+            "fixed"
+          ]
+        },
+        {
+          "description": "The caller can choose a level.",
+          "type": "string",
+          "enum": [
+            "adjustable"
+          ]
+        }
+      ]
+    },
+    "UiThinkingState": {
+      "description": "The session's Thinking Level, in CodeLeveler's own vocabulary.\n\nEvery field is a canonical level (`auto`, `off`, `minimal`, `low`, `medium`, `high`, `max`). A client renders these and offers `choices`; it must not derive a level from a model name, from a provider's parameter, or from any other field on the wire — the runtime is the only place that knows what a level means for a model, and it answers here in the user's words.",
+      "type": "object",
+      "required": [
+        "access",
+        "configured",
+        "current",
+        "effective"
+      ],
+      "properties": {
+        "access": {
+          "description": "Whether this model's thinking can be controlled at all.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UiThinkingAccess"
+            }
+          ]
+        },
+        "choices": {
+          "description": "The levels worth offering on this model: one entry per level that actually differs, `auto` first. Empty when `access` is not adjustable.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ThinkingLevel"
+          }
+        },
+        "configured": {
+          "description": "The configured level for this model: its own `[models.<id>] thinking`, else the global `thinking`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ThinkingLevel"
+            }
+          ]
+        },
+        "current": {
+          "description": "What the user asked for: `session_override` when set, else `configured`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ThinkingLevel"
+            }
+          ]
+        },
+        "effective": {
+          "description": "What is actually in effect for this model right now.\n\nEqual to `current` when this model can express it. Otherwise `auto`: the request carries no reasoning override at all, and the provider's own default applies. A client that showed `current` as if it were running would be reporting a setting that is not in use.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ThinkingLevel"
+            }
+          ]
+        },
+        "session_override": {
+          "description": "The session's explicit override. `None` means the session inherits `configured` — which is not the same as `Some(Auto)`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThinkingLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

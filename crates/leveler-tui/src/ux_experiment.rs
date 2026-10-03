@@ -75,7 +75,7 @@ fn opened(goal: &str) -> AppState {
             context_window: 1_048_576,
             locale: crate::i18n::Locale::Zh,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     );
     let snap = UiSessionSnapshot {
@@ -102,7 +102,7 @@ fn opened(goal: &str) -> AppState {
         recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
-        reasoning: None,
+        thinking: None,
         work_profile: None,
         collaboration: None,
         children: Vec::new(),

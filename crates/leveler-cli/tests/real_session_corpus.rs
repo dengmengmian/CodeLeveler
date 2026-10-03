@@ -109,7 +109,7 @@ fn boot() -> Boot {
         context_window: 1_048_576,
         locale: leveler_tui::Locale::Zh,
         untrusted_config: Vec::new(),
-        reasoning_effort: None,
+        thinking: None,
     }
 }
 
@@ -138,7 +138,7 @@ fn snapshot(id: &str, goal: &str, repo: Option<&str>, model: &str) -> UiSessionS
         recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
-        reasoning: None,
+        thinking: None,
         work_profile: None,
         collaboration: None,
         children: Vec::new(),

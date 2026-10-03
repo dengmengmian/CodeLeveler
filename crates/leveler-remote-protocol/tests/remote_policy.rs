@@ -18,7 +18,7 @@
 
 use leveler_client_protocol::{
     ApprovalDecision, ApprovalId, CheckpointId, ClarificationId, ClientCommand, ModelRef,
-    PermissionProfile, SessionId,
+    PermissionProfile, SessionId, ThinkingLevel,
 };
 use leveler_remote_protocol::pairing::PairingScope;
 use leveler_remote_protocol::policy::RemotePolicy;
@@ -207,6 +207,14 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
                 session_id: session(),
                 work_profile: "w".to_string(),
                 collaboration: "c".to_string(),
+            },
+            true,
+        ),
+        (
+            "set_thinking_level",
+            ClientCommand::SetThinkingLevel {
+                session_id: session(),
+                level: Some(ThinkingLevel::Max),
             },
             true,
         ),

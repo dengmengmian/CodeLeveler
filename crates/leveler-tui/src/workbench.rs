@@ -952,7 +952,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         )
     }
@@ -973,7 +973,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1000,7 +1000,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::En,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         // An active team surface only shows during a busy turn — settled
@@ -1047,7 +1047,7 @@ mod tests {
                 context_window: 200_000,
                 locale,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
@@ -1154,7 +1154,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::En,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
@@ -1218,7 +1218,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::En,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
@@ -1834,7 +1834,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         state.clock_label = clock.into();
@@ -2809,7 +2809,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         // Busy goal with no plan must not reserve chrome for "等待计划".
@@ -3098,7 +3098,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::En,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
@@ -3344,7 +3344,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         state.elapsed_secs = 90;

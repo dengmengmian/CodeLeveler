@@ -41,6 +41,7 @@ mod workspace_view;
 
 pub use global_config::{GlobalConfig, GlobalConfigError};
 pub use interactive::InProcessRuntimeClient;
+pub use interactive::ui_thinking_state;
 pub use parallel::ParallelEditOutcome;
 pub use runtime_identity::{RuntimeIdentityError, load_or_create_runtime_id};
 pub use session::engine_event_to_agent;

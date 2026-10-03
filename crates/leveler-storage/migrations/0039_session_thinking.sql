@@ -1,0 +1,11 @@
+-- The session's Thinking Level override, in CodeLeveler's own vocabulary
+-- (`auto|off|minimal|low|medium|high|max`).
+--
+-- NULL means the session has no override and inherits the configured level.
+-- It deliberately does NOT mean `auto`: those are different states, and a
+-- session that explicitly chose `auto` must come back as `auto` after a resume.
+--
+-- Only the canonical level is stored. The provider's own parameter (an
+-- `xhigh`, a budget, a flag) is resolved from the model's capability on every
+-- request, so a model upgrade re-resolves instead of pinning an old setting.
+ALTER TABLE sessions ADD COLUMN thinking TEXT;

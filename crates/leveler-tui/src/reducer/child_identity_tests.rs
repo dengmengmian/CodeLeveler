@@ -20,7 +20,7 @@ fn state() -> AppState {
             context_window: 200_000,
             locale: crate::i18n::Locale::Zh,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     );
     s.size = (120, 40);

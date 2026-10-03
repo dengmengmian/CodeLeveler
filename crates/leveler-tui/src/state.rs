@@ -70,9 +70,11 @@ pub struct Boot {
     /// In-repo config files present but ignored for lack of trust, as display
     /// paths. Resolved by the composition root; see [`AppState::untrusted_config`].
     pub untrusted_config: Vec<String>,
-    /// Resolved `reasoning_effort` wire value (`max` / `high` / …). `None`
-    /// when the runtime has not supplied one — the chip must not invent it.
-    pub reasoning_effort: Option<String>,
+    /// The session's Thinking Level, in the user's own vocabulary, as the
+    /// runtime projected it. `None` when the runtime has not supplied one — the
+    /// chip must not invent a level, and must never render a provider's own
+    /// parameter instead.
+    pub thinking: Option<leveler_client_protocol::UiThinkingState>,
 }
 
 /// A transient status-line notification.
@@ -508,9 +510,9 @@ pub struct AppState {
     /// header shows and tracks active execution time across interruptions.
     pub active_goal: Option<crate::active_goal::ActiveGoal>,
     pub model_label: String,
-    /// Resolved reasoning effort for the active model (`max`, `high`, …).
-    /// `None` means the runtime did not report one.
-    pub reasoning_effort: Option<String>,
+    /// The session's Thinking Level for the active model, canonical and
+    /// user-facing. `None` means the runtime did not report one.
+    pub thinking: Option<leveler_client_protocol::UiThinkingState>,
     pub mode_label: String,
     /// Last permission profile we asked the runtime to adopt. Used only so
     /// rapid Shift+Tab can cycle while the displayed chip still waits for
@@ -671,7 +673,7 @@ impl AppState {
             staged_goal: None,
             active_goal: None,
             model_label: "—".to_string(),
-            reasoning_effort: boot.reasoning_effort.clone(),
+            thinking: boot.thinking.clone(),
             mode_label: "—".to_string(),
             pending_permission: None,
             clock_label: String::new(),

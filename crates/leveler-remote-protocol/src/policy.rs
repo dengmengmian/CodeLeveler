@@ -179,6 +179,9 @@ impl RemotePolicy {
             | ClientCommand::AnswerClarification { .. }
             | ClientCommand::SelectModel { .. }
             | ClientCommand::SetProductAxes { .. }
+            // A session preference like `SetProductAxes`: it changes how hard
+            // this session asks the model to think, and reaches nothing local.
+            | ClientCommand::SetThinkingLevel { .. }
             | ClientCommand::ConfirmPlanToGoal { .. }
             | ClientCommand::RequestDiff { .. }
             | ClientCommand::CompactContext { .. }

@@ -36,6 +36,7 @@ use crate::profile::{ReasoningConfig, ReasoningEffort, ReasoningStyle};
 /// The order is the product contract: weakest → strongest, with `Auto` first
 /// because "no preference" is the default and the recommended answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
     /// No preference. CodeLeveler's default for the model applies; a model that

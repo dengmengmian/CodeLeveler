@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use leveler_core::{ApprovalId, CheckpointId, ClarificationId, CommandId, SessionId, ToolCallId};
-use leveler_model::ModelRef;
+use leveler_model::{ModelRef, ThinkingLevel};
 
 use super::media::AttachmentRef;
 use super::{ApprovalDecision, PermissionProfile, UiMemoryKind};
@@ -199,6 +199,21 @@ pub enum ClientCommand {
     SetPermissionProfile {
         session_id: SessionId,
         mode: PermissionProfile,
+    },
+    /// Set or clear this session's Thinking Level.
+    ///
+    /// `Some(level)` sets an explicit level for this session — including
+    /// `auto`, which is a choice ("do not override") and NOT the same as
+    /// clearing one. `None` clears the override, so the session goes back to
+    /// the level configured for the model or globally.
+    ///
+    /// The stored value is always CodeLeveler's canonical level. What that
+    /// becomes on the wire is resolved per request from the model's declared
+    /// capability, so switching models re-resolves instead of carrying one
+    /// model's parameter to another.
+    SetThinkingLevel {
+        session_id: SessionId,
+        level: Option<ThinkingLevel>,
     },
     /// Set collaboration (`chat | plan | goal`). `work_profile` is a deprecated
     /// compatibility field accepted from old clients and ignored by the runtime.
@@ -479,6 +494,7 @@ impl ClientCommand {
             | ClientCommand::SelectModel { session_id, .. }
             | ClientCommand::SetDefaultModel { session_id, .. }
             | ClientCommand::SetPermissionProfile { session_id, .. }
+            | ClientCommand::SetThinkingLevel { session_id, .. }
             | ClientCommand::SetProductAxes { session_id, .. }
             | ClientCommand::ConfirmPlanToGoal { session_id, .. }
             | ClientCommand::ListMemory { session_id, .. }

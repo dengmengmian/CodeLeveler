@@ -26,7 +26,7 @@ fn state(locale: leveler_tui::Locale) -> AppState {
             context_window: 0,
             locale,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     )
 }

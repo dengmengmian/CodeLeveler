@@ -3,8 +3,8 @@ import { reasoningLabel } from './format';
 import { runConfigCompact, runConfigSummary } from './runConfig';
 
 describe('runConfigSummary', () => {
-  it('projects snapshot.reasoning.effective max as Max, never a client-invented value', () => {
-    expect(reasoningLabel('max')).toBe('Max');
+  it('shows the canonical level the runtime reported, never a client-invented one', () => {
+    expect(reasoningLabel('max')).toBe('think:max');
     expect(
       runConfigSummary({
         modelLabel: 'GLM-5.2',
@@ -12,7 +12,7 @@ describe('runConfigSummary', () => {
         collaboration: 'goal',
         permission: 'assisted',
       }),
-    ).toBe('GLM-5.2 · Max · Goal · 辅助模式');
+    ).toBe('GLM-5.2 · think:max · Goal · 辅助模式');
   });
 
   it('omits reasoning when the model has no effort', () => {

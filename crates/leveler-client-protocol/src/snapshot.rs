@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::PermissionProfile;
 use leveler_core::{SessionId, ToolCallId};
-use leveler_model::ModelRef;
+use leveler_model::{ModelRef, ThinkingLevel};
 
 use crate::{UiCompletionReport, UiDiff, UiPlan};
 
@@ -90,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn old_snapshot_json_without_reasoning_stays_compatible() {
+    fn old_snapshot_json_without_thinking_stays_compatible() {
         let json = serde_json::json!({
             "id": "s1",
             "repository": "/repo",
@@ -102,7 +102,7 @@ mod tests {
             "messages": []
         });
         let snap: UiSessionSnapshot = serde_json::from_value(json).unwrap();
-        assert_eq!(snap.reasoning, None);
+        assert_eq!(snap.thinking, None);
     }
 
     #[test]
@@ -148,7 +148,7 @@ mod tests {
             recaps: Vec::new(),
             user_shells: Vec::new(),
             completion_report: None,
-            reasoning: None,
+            thinking: None,
             work_profile: None,
             collaboration: None,
             children: Vec::new(),
@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_omits_reasoning_when_unset() {
+    fn snapshot_omits_thinking_when_unset() {
         let snap = UiSessionSnapshot {
             id: crate::SessionId::new("s1"),
             repository: Some("/repo".into()),
@@ -193,13 +193,13 @@ mod tests {
             recaps: Vec::new(),
             user_shells: Vec::new(),
             completion_report: None,
-            reasoning: None,
+            thinking: None,
             work_profile: None,
             collaboration: None,
             children: Vec::new(),
         };
         let value = serde_json::to_value(&snap).unwrap();
-        assert!(value.get("reasoning").is_none(), "{value}");
+        assert!(value.get("thinking").is_none(), "{value}");
     }
 }
 
@@ -596,11 +596,12 @@ pub struct UiSessionSnapshot {
     pub user_shells: Vec<UiUserShell>,
     #[serde(default)]
     pub completion_report: Option<UiCompletionReport>,
-    /// Runtime-projected reasoning state. Absent on old runtimes so a new
-    /// client keeps its boot-time value. Present with `effective: None` means
-    /// the model has no controllable effort knob (do not invent one).
+    /// Runtime-projected Thinking Level state, in the user's own vocabulary.
+    /// Absent on old runtimes so a new client keeps its boot-time value; a
+    /// present value with `access: unsupported` means the model cannot be
+    /// asked, which the client says rather than inventing a level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<UiReasoningState>,
+    pub thinking: Option<UiThinkingState>,
     /// Deprecated compatibility field. New runtimes emit `single`; historical
     /// values never control tool exposure. Clients must not display a selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -614,12 +615,50 @@ pub struct UiSessionSnapshot {
     pub children: Vec<crate::UiChildAgent>,
 }
 
-/// Additive reasoning projection. The client must display `effective` and
-/// must not infer an effort from the model name or provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// How a model's thinking can be controlled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UiReasoningState {
-    /// Wire value the runtime will send (`max`, `high`, …).
+#[serde(rename_all = "snake_case")]
+pub enum UiThinkingAccess {
+    /// The model does not reason.
+    Unsupported,
+    /// The model reasons, but nobody can ask for a different amount.
+    Fixed,
+    /// The caller can choose a level.
+    #[default]
+    Adjustable,
+}
+
+/// The session's Thinking Level, in CodeLeveler's own vocabulary.
+///
+/// Every field is a canonical level (`auto`, `off`, `minimal`, `low`, `medium`,
+/// `high`, `max`). A client renders these and offers `choices`; it must not
+/// derive a level from a model name, from a provider's parameter, or from any
+/// other field on the wire — the runtime is the only place that knows what a
+/// level means for a model, and it answers here in the user's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UiThinkingState {
+    /// The configured level for this model: its own `[models.<id>] thinking`,
+    /// else the global `thinking`.
+    pub configured: ThinkingLevel,
+    /// The session's explicit override. `None` means the session inherits
+    /// `configured` — which is not the same as `Some(Auto)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective: Option<String>,
+    pub session_override: Option<ThinkingLevel>,
+    /// What the user asked for: `session_override` when set, else `configured`.
+    pub current: ThinkingLevel,
+    /// What is actually in effect for this model right now.
+    ///
+    /// Equal to `current` when this model can express it. Otherwise `auto`: the
+    /// request carries no reasoning override at all, and the provider's own
+    /// default applies. A client that showed `current` as if it were running
+    /// would be reporting a setting that is not in use.
+    pub effective: ThinkingLevel,
+    /// Whether this model's thinking can be controlled at all.
+    pub access: UiThinkingAccess,
+    /// The levels worth offering on this model: one entry per level that
+    /// actually differs, `auto` first. Empty when `access` is not adjustable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<ThinkingLevel>,
 }

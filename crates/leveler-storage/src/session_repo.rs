@@ -279,6 +279,36 @@ impl<'a> SessionRepository<'a> {
         Ok(())
     }
 
+    /// Persist this session's Thinking Level override, or clear it.
+    ///
+    /// `None` clears it: the session inherits the configured level again. An
+    /// explicit `auto` is stored as the word `auto`, because a session that
+    /// asked for "no override" must not come back as one that never chose.
+    pub async fn set_thinking(
+        &self,
+        id: &SessionId,
+        thinking: Option<&str>,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        sqlx::query("UPDATE sessions SET thinking = ?2, updated_at = ?3 WHERE id = ?1")
+            .bind(id.as_str())
+            .bind(thinking)
+            .bind(now.to_rfc3339())
+            .execute(self.db.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Read back this session's Thinking Level override, as stored.
+    pub async fn thinking(&self, id: &SessionId) -> Result<Option<String>, StorageError> {
+        let row: Option<Option<String>> =
+            sqlx::query_scalar("SELECT thinking FROM sessions WHERE id = ?1")
+                .bind(id.as_str())
+                .fetch_optional(self.db.pool())
+                .await?;
+        Ok(row.flatten())
+    }
+
     /// Read back `(mode, sandbox, kind, outcome)`. `kind` stays a string
     /// (owned by the engine's `ExecutionKind`, parsed there); the terminal
     /// `outcome` is decoded to the typed lifecycle vocabulary.

@@ -124,6 +124,15 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
+    // The session's Thinking Level. `Always` because it changes the next
+    // request's reasoning, not the shape of the turn.
+    slash(
+        "/thinking",
+        &[],
+        SlashCategory::Agent,
+        SlashVisibility::Quick,
+        BusyPolicy::Always,
+    ),
     slash(
         "/goal",
         &[],
@@ -392,6 +401,7 @@ pub fn slash_popup_label(name: &str, t: &UiText) -> &'static str {
 fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
     match name {
         "/model" => s.model,
+        "/thinking" => s.thinking,
         "/permission" | "/mode" => s.permission,
         "/goal" => s.goal,
         "/develop" => s.develop,
@@ -677,6 +687,7 @@ mod surface_tests {
             [
                 "/model",
                 "/permission",
+                "/thinking",
                 "/goal",
                 "/develop",
                 "/btw",
@@ -874,6 +885,7 @@ mod ghost_tests {
             [
                 "/model",
                 "/permission",
+                "/thinking",
                 "/goal",
                 "/develop",
                 "/btw",
@@ -957,7 +969,7 @@ mod ghost_tests {
                 context_window: 0,
                 locale,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         );
         s.skill_catalog = skills

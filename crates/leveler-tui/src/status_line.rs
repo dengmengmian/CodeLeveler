@@ -22,6 +22,7 @@ use leveler_client_protocol::{FinalizationStage, RuntimeStatus};
 
 use crate::state::AppState;
 use crate::transcript::TranscriptItem;
+use leveler_client_protocol::UiThinkingAccess;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -121,18 +122,20 @@ pub(crate) fn friendly_model_label(
     }
 }
 
-/// Input-border runtime summary: `{model} [(effort)] · perm · session`.
+/// Input-border runtime summary: `{model} · think:{level} · perm · session`.
 ///
-/// Every field is a value already on [`AppState`]. Missing `reasoning_effort`
-/// omits the parentheses. When `max_width` is tight, drop from the right:
-/// session, then permission, then effort, then truncate model.
+/// The level is CodeLeveler's own word for the session's Thinking Level
+/// (`think:auto`, `think:max`). A provider's parameter never appears here: the
+/// user reads the vocabulary they configured in, and a model whose thinking
+/// cannot be controlled shows no level at all rather than one that is not in
+/// use. When `max_width` is tight, drop from the right: session, then
+/// permission, then effort, then truncate model.
 pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String {
     let model = friendly_model_label(&state.model_label, &state.available_models);
-    let effort = state
-        .reasoning_effort
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let effort = state.thinking.as_ref().and_then(|thinking| {
+        (thinking.access == UiThinkingAccess::Adjustable)
+            .then(|| format!("think:{}", thinking.effective))
+    });
     let perm = permission_chip_label(state);
     let untrusted = (!state.untrusted_config.is_empty()).then_some(state.t().untrusted_config_chip);
 
@@ -152,8 +155,9 @@ pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String 
         parts.join(" · ")
     };
 
-    let head = match effort {
-        Some(e) => format!("{model} ({e})"),
+    let has_effort = effort.is_some();
+    let head = match &effort {
+        Some(e) => format!("{model} · {e}"),
         None => model.clone(),
     };
     let mut shown = extras;
@@ -169,7 +173,7 @@ pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String 
     }
 
     // Drop effort next, then width-safe truncate the model name.
-    if effort.is_some() {
+    if has_effort {
         let chip = join(&model, &[]);
         if UnicodeWidthStr::width(chip.as_str()) <= max_width {
             return chip;
@@ -316,7 +320,8 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
             | crate::overlay::Overlay::CollabPicker(_)
             | crate::overlay::Overlay::UnsupportedMedia(_)
             | crate::overlay::Overlay::CheckpointPicker(_)
-            | crate::overlay::Overlay::ConfirmSessionDelete(_) => {
+            | crate::overlay::Overlay::ConfirmSessionDelete(_)
+            | crate::overlay::Overlay::ThinkingPicker(_) => {
                 return StatusPhase::AwaitingUser;
             }
         }
@@ -621,6 +626,20 @@ pub(crate) fn header_line(state: &AppState, width: usize) -> Line<'static> {
 mod tests {
     use super::*;
 
+    /// A runtime-projected Thinking Level, for the chip tests.
+    fn thinking_state(
+        level: leveler_model::ThinkingLevel,
+    ) -> leveler_client_protocol::UiThinkingState {
+        leveler_client_protocol::UiThinkingState {
+            configured: level,
+            session_override: None,
+            current: level,
+            effective: level,
+            access: leveler_client_protocol::UiThinkingAccess::Adjustable,
+            choices: vec![leveler_model::ThinkingLevel::Auto, level],
+        }
+    }
+
     fn test_state() -> AppState {
         AppState::new(
             crate::theme::Theme::no_color(),
@@ -634,7 +653,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
-                reasoning_effort: None,
+                thinking: None,
             },
         )
     }
@@ -910,12 +929,13 @@ mod tests {
     fn runtime_chip_strips_provider_and_shows_effort() {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
-        state.reasoning_effort = Some("max".into());
+        state.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
         assert_eq!(
             runtime_status_chip(&state, 80),
-            "deepseek-v4-flash (max) · ask · chat"
+            "deepseek-v4-flash · think:max · ask · chat",
+            "the level is CodeLeveler's word, and the provider's parameter never appears"
         );
     }
 
@@ -923,12 +943,12 @@ mod tests {
     fn runtime_chip_omits_effort_when_unset() {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
-        state.reasoning_effort = None;
+        state.thinking = None;
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
         let chip = runtime_status_chip(&state, 80);
         assert_eq!(chip, "deepseek-v4-flash · ask · chat");
-        assert!(!chip.contains('('), "{chip}");
+        assert!(!chip.contains("think:"), "{chip}");
     }
 
     #[test]
@@ -952,16 +972,20 @@ mod tests {
     fn runtime_chip_drops_low_priority_fields_when_narrow() {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
-        state.reasoning_effort = Some("max".into());
+        state.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
         let mid = runtime_status_chip(&state, 33);
         assert!(mid.contains("deepseek-v4-flash"), "{mid}");
-        assert!(mid.contains("ask"), "{mid}");
+        assert!(mid.contains("think:max"), "{mid}");
         assert!(!mid.contains("chat"), "session is dropped first: {mid}");
         let tight = runtime_status_chip(&state, 22);
         assert!(tight.contains("deepseek-v4-flash"), "{tight}");
         assert!(!tight.contains("ask"), "{tight}");
+        assert!(
+            !tight.contains("think:"),
+            "the level is dropped with the rest: {tight}"
+        );
     }
 
     #[test]

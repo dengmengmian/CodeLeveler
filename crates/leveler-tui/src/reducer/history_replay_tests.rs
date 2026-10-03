@@ -25,7 +25,7 @@ fn state() -> AppState {
             context_window: 200_000,
             locale: crate::i18n::Locale::Zh,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     );
     s.size = (120, 40);
@@ -69,7 +69,7 @@ fn snapshot(messages: Vec<UiMessage>) -> UiSessionSnapshot {
         recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
-        reasoning: None,
+        thinking: None,
         work_profile: None,
         collaboration: None,
         children: Vec::new(),

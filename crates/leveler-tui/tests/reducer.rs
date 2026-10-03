@@ -6,7 +6,8 @@ use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
     ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId, PermissionProfile,
     RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest, UiCheckpoint,
-    UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiReasoningState, UiRole, UiSessionSnapshot,
+    UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiRole, UiSessionSnapshot, UiThinkingAccess,
+    UiThinkingState,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::btw::{BtwTurnState, SurfaceFocus};
@@ -63,6 +64,18 @@ fn rendered(state: &mut AppState, w: u16, h: u16) -> String {
     out
 }
 
+/// A runtime-projected Thinking Level, as the protocol carries it.
+fn thinking_state(level: leveler_model::ThinkingLevel) -> UiThinkingState {
+    UiThinkingState {
+        configured: level,
+        session_override: None,
+        current: level,
+        effective: level,
+        access: UiThinkingAccess::Adjustable,
+        choices: vec![leveler_model::ThinkingLevel::Auto, level],
+    }
+}
+
 fn state() -> AppState {
     AppState::new(
         Theme::no_color(),
@@ -76,7 +89,7 @@ fn state() -> AppState {
             context_window: 0,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     )
 }
@@ -109,7 +122,7 @@ fn snapshot() -> UiSessionSnapshot {
         recaps: Vec::new(),
         user_shells: Vec::new(),
         completion_report: None,
-        reasoning: None,
+        thinking: None,
         work_profile: None,
         collaboration: None,
         children: Vec::new(),
@@ -219,44 +232,55 @@ fn session_updated_adopts_product_axes_from_snapshot() {
 }
 
 #[test]
-fn session_updated_copies_effective_reasoning_from_snapshot() {
+fn session_updated_adopts_the_runtimes_canonical_thinking_level() {
     let mut s = state();
-    s.reasoning_effort = Some("low".into());
     let mut snap = snapshot();
-    snap.reasoning = Some(UiReasoningState {
-        effective: Some("max".into()),
-    });
+    snap.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
     );
-    assert_eq!(s.reasoning_effort.as_deref(), Some("max"));
+    let thinking = s.thinking.expect("the level was adopted");
+    assert_eq!(thinking.effective, leveler_model::ThinkingLevel::Max);
+    assert_eq!(thinking.current, leveler_model::ThinkingLevel::Max);
 }
 
 #[test]
-fn session_updated_without_reasoning_keeps_boot_effort() {
+fn session_updated_without_thinking_keeps_what_the_client_has() {
     let mut s = state();
-    s.reasoning_effort = Some("max".into());
+    s.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::SessionUpdated {
             session: snapshot(),
         }),
     );
-    assert_eq!(s.reasoning_effort.as_deref(), Some("max"));
+    assert_eq!(
+        s.thinking.map(|t| t.effective),
+        Some(leveler_model::ThinkingLevel::Max)
+    );
 }
 
 #[test]
-fn session_updated_clears_effort_when_runtime_says_none() {
+fn session_updated_clears_the_level_when_the_runtime_reports_unsupported() {
     let mut s = state();
-    s.reasoning_effort = Some("max".into());
+    s.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
     let mut snap = snapshot();
-    snap.reasoning = Some(UiReasoningState { effective: None });
+    snap.thinking = Some(UiThinkingState {
+        configured: leveler_model::ThinkingLevel::Auto,
+        session_override: None,
+        current: leveler_model::ThinkingLevel::Auto,
+        effective: leveler_model::ThinkingLevel::Auto,
+        access: UiThinkingAccess::Unsupported,
+        choices: Vec::new(),
+    });
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::SessionUpdated { session: snap }),
     );
-    assert_eq!(s.reasoning_effort, None);
+    let thinking = s.thinking.expect("the runtime's answer is adopted");
+    assert_eq!(thinking.access, UiThinkingAccess::Unsupported);
+    assert_eq!(thinking.effective, leveler_model::ThinkingLevel::Auto);
 }
 
 #[test]
@@ -8642,7 +8666,7 @@ fn opened_in(locale: leveler_tui::Locale) -> AppState {
             context_window: 0,
             locale,
             untrusted_config: Vec::new(),
-            reasoning_effort: None,
+            thinking: None,
         },
     );
     reduce(

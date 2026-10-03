@@ -194,7 +194,10 @@ export interface SessionView {
   permission: PermissionProfile;
   /** 产品轴（chat|plan|goal）；goal 时 runtime 把普通提交路由成 goal turn */
   collaboration: string;
-  /** runtime 决议后的 reasoning effort（snapshot.reasoning.effective），只展示不发明 */
+  /**
+   * 当前会话的思考强度（snapshot.thinking.effective），CodeLeveler 自己的档位词。
+   * 只展示，不做任何映射：Provider 私有参数不出现在这里。
+   */
   reasoningEffort: string | null;
   tokens: { input: number; output: number };
   /** 上下文占用（token_usage 的 input+output；无真实读数时用估算占位） */
@@ -448,11 +451,13 @@ function viewFromSnapshot(
     permission: snap.mode,
     // 轴的 SoT 是 session record；老 runtime 不带字段时保留本地值 / 回退默认。
     collaboration: snap.collaboration ?? (sameSession ? prev.collaboration : 'chat'),
-    // reasoning.effective 缺席 = 老 runtime（保留旧值）；present but null =
-    // 模型没有可控档位（就是 null，不发明）。
+    // snapshot.thinking 缺席 = 老 runtime（保留旧值）；present 时按 access 决定是否
+    // 展示：模型不可调就什么都不显示，而不是显示一个并未生效的档位。
     reasoningEffort:
-      snap.reasoning !== undefined && snap.reasoning !== null
-        ? (snap.reasoning.effective ?? null)
+      snap.thinking !== undefined && snap.thinking !== null
+        ? snap.thinking.access === 'adjustable'
+          ? snap.thinking.effective
+          : null
         : sameSession
           ? prev.reasoningEffort
           : null,
@@ -536,8 +541,10 @@ function applySessionMeta(current: SessionView, snap: UiSessionSnapshot): void {
   if (snap.status) current.status = snap.status;
   if (snap.goal) current.title = snap.goal || current.title;
   if (snap.collaboration) current.collaboration = snap.collaboration;
-  if (snap.reasoning !== undefined && snap.reasoning !== null) {
-    current.reasoningEffort = snap.reasoning.effective ?? null;
+  if (snap.thinking !== undefined && snap.thinking !== null) {
+    // 用户词表里的档位；模型不可调时不显示任何档位。
+    current.reasoningEffort =
+      snap.thinking.access === 'adjustable' ? snap.thinking.effective : null;
   }
 }
 

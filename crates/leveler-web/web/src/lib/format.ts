@@ -129,8 +129,13 @@ export function collaborationLabel(collab: string): string {
   }
 }
 
-/** runtime 决议后的 reasoning effort 展示（`medium` → `Medium`）；null = 模型无档位。 */
-export function reasoningLabel(effort: string | null): string | null {
-  if (!effort) return null;
-  return effort.charAt(0).toUpperCase() + effort.slice(1);
+/**
+ * 会话思考强度的展示（`max` → `think:max`）；null = 当前模型不可调，不显示。
+ *
+ * 档位已经是 CodeLeveler 的词，所以这里不做任何大小写或同义映射：客户端一旦
+ * “翻译”Provider 参数，就等于自己发明了一个用户从未选择过的档位。
+ */
+export function reasoningLabel(level: string | null): string | null {
+  if (!level) return null;
+  return `think:${level}`;
 }
