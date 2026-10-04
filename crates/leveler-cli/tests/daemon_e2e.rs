@@ -1726,7 +1726,14 @@ async fn no_workspace_host_durably_admits_and_restores_after_process_restart_bod
                 Err(leveler_local_transport::TransportError::Io(error))
                     if matches!(
                         error.kind(),
-                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        // A SIGKILLed daemon's socket can surface as any of these
+                        // depending on how far the kernel had progressed; all of
+                        // them mean "it is not answering", which is what this
+                        // probe is waiting to observe.
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
                     ) =>
                 {
                     tokio::task::yield_now().await

@@ -386,7 +386,10 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         drop(listener);
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
+            // Generous: the refused connection is refused immediately, and a
+            // loaded CI runner must not turn that refusal into a connect
+            // timeout, which is a different structured kind.
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .expect("client");
         let err = client
@@ -400,7 +403,9 @@ mod tests {
         assert_eq!(
             mapped.transport_fault(),
             Some(leveler_model::TransportFault::ConnectionRefused),
-            "the fault must come from io::ErrorKind, not the message"
+            "the fault must come from io::ErrorKind, not the message \
+             (observed {:?}): {err}",
+            connect_io_kind(&err)
         );
     }
 
