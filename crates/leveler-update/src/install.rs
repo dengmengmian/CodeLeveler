@@ -164,12 +164,30 @@ pub fn validate_binary(path: &Path, expected: &Version) -> Result<(), UpdateErro
         std::fs::set_permissions(path, perms)?;
     }
 
-    let output = Command::new(path).arg("--version").output().map_err(|e| {
-        UpdateError::Validation(format!(
-            "could not run the downloaded binary ({}): {e}",
-            path.display()
-        ))
-    })?;
+    // ETXTBSY is the one transient exec failure: a file that was just written
+    // can still be reported as busy to a reader that opens it before the
+    // writer's copy-up settles (seen on overlay filesystems). Retry that one
+    // error briefly; every other failure is the honest answer and is reported
+    // as-is rather than retried.
+    let output = {
+        const ETXTBSY: i32 = 26;
+        let mut attempt = 0;
+        loop {
+            match Command::new(path).arg("--version").output() {
+                Ok(output) => break output,
+                Err(error) if error.raw_os_error() == Some(ETXTBSY) && attempt < 20 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(UpdateError::Validation(format!(
+                        "could not run the downloaded binary ({}): {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    };
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
