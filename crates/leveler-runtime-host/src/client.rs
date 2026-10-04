@@ -611,12 +611,24 @@ pub struct DaemonReviver {
     layout: Layout,
     launch: DetachedRuntimeLaunch,
     ui: Arc<dyn HandoffUi>,
+    /// One revival at a time. The request path and the event-stream reconnect
+    /// path revive the same runtime, and `ensure_default_runtime` only probes
+    /// the endpoint once at its start: two concurrent revivals each spawn a
+    /// daemon, and the loser exits while racing the winner's readiness — and
+    /// whatever bookkeeping its caller keeps about the process it launched.
+    /// Serialized, the second caller adopts the first one's daemon instead.
+    gate: tokio::sync::Mutex<()>,
 }
 
 #[cfg(any(unix, windows))]
 impl DaemonReviver {
     pub fn new(layout: Layout, launch: DetachedRuntimeLaunch, ui: Arc<dyn HandoffUi>) -> Self {
-        Self { layout, launch, ui }
+        Self {
+            layout,
+            launch,
+            ui,
+            gate: tokio::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -624,6 +636,7 @@ impl DaemonReviver {
 #[async_trait::async_trait]
 impl RuntimeReviver for DaemonReviver {
     async fn revive(&self) -> Result<(), String> {
+        let _gate = self.gate.lock().await;
         ensure_default_runtime(&self.layout, &self.launch, self.ui.clone())
             .await
             .map(|_probe_client| ())
