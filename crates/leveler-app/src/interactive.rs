@@ -1576,7 +1576,7 @@ impl InProcessRuntimeClient {
                 let db = match app.open_database().await {
                     Ok(db) => db,
                     Err(error) => {
-                        store.finish(&session_id, &id, None, "failed");
+                        store.finish(&session_id, &id, None, "failed", None);
                         active.finish(&admission);
                         let _ = events.send(RuntimeEvent::Notification {
                             level: NotificationLevel::Error,
@@ -1599,7 +1599,7 @@ impl InProcessRuntimeClient {
                 let token = match fenced {
                     Ok(token) => token,
                     Err(error) => {
-                        store.finish(&session_id, &id, None, "failed");
+                        store.finish(&session_id, &id, None, "failed", None);
                         active.finish(&admission);
                         let _ = events.send(RuntimeEvent::Notification {
                             level: NotificationLevel::Error,
@@ -1646,7 +1646,20 @@ impl InProcessRuntimeClient {
                     }),
                 };
                 let status = crate::user_shell::terminal_status(&result);
-                if let Ok(output) = &result
+                // The live channel is bounded and drops rather than block the
+                // child, so the tail this store streamed can be missing bytes
+                // — including the end of the output. When that happened, the
+                // runner's own capture is the real head+tail and the completed
+                // record uses it; its drop marker already reports retained
+                // truncation, so the separate note is not added on top.
+                let authoritative = match &result {
+                    Ok(output) if output.live_dropped_bytes > 0 => {
+                        Some(crate::user_shell::authoritative_tail(output))
+                    }
+                    _ => None,
+                };
+                if authoritative.is_none()
+                    && let Ok(output) = &result
                     && output.truncated
                 {
                     store.mark_output_truncated(&session_id, &id);
@@ -1683,7 +1696,13 @@ impl InProcessRuntimeClient {
                     store.append_output(&session_id, &id, &format!("{error}\n"));
                 }
                 let duration_ms = store
-                    .finish(&session_id, &id, exit_code, status)
+                    .finish(
+                        &session_id,
+                        &id,
+                        exit_code,
+                        status,
+                        authoritative.as_deref(),
+                    )
                     .unwrap_or(0);
                 // Release the session BEFORE the terminal event is published.
                 // A client enables its composer on `UserShellExited`, so the

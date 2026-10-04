@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_client_protocol::UiUserShell;
 use leveler_core::{SessionId, UserShellId};
 use leveler_engine::EngineEvent;
-use leveler_execution::{OutputStream, ProcessError};
+use leveler_execution::{OutputStream, ProcessError, ProcessOutput};
 
 /// Bounded live/completed output tail per execution. Big enough for a useful
 /// Details view, small enough to ride snapshots and stay in memory.
@@ -49,6 +49,16 @@ impl OutputTail {
     fn snapshot(&self) -> (String, bool) {
         let bytes: Vec<u8> = self.text.iter().copied().collect();
         (String::from_utf8_lossy(&bytes).into_owned(), self.truncated)
+    }
+
+    /// Replace the best-effort live bytes with the execution's authoritative
+    /// capture. The live channel is bounded and drops rather than block the
+    /// child, so the streamed tail can be missing its end; the runner's own
+    /// capture is the real head+tail.
+    fn adopt(&mut self, text: &str) {
+        self.text.clear();
+        self.truncated = false;
+        self.push(text);
     }
 }
 
@@ -124,12 +134,16 @@ impl UserShellStore {
 
     /// Move the active execution to history with its terminal facts. Returns
     /// the total runtime. A stale id (already finished) is a no-op `None`.
+    ///
+    /// `authoritative` replaces the streamed tail when the bounded live channel
+    /// dropped bytes; `None` keeps the interleaved live tail.
     pub fn finish(
         &self,
         session_id: &SessionId,
         id: &UserShellId,
         exit_code: Option<i32>,
         status: &str,
+        authoritative: Option<&str>,
     ) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap();
         let shells = inner.get_mut(session_id)?;
@@ -138,7 +152,11 @@ impl UserShellStore {
         }
         let active = shells.active.take().unwrap();
         let duration_ms = active.started.elapsed().as_millis() as u64;
-        let (output_tail, output_truncated) = active.tail.snapshot();
+        let mut tail = active.tail;
+        if let Some(text) = authoritative {
+            tail.adopt(text);
+        }
+        let (output_tail, output_truncated) = tail.snapshot();
         shells.history.push_back(UiUserShell {
             id: active.id,
             command: active.command,
@@ -218,6 +236,18 @@ pub(crate) fn stream_tag(stream: OutputStream) -> &'static str {
     }
 }
 
+/// The execution layer's own bounded capture, used for the completed record
+/// when the live channel dropped bytes. Stdout and stderr are concatenated
+/// because the interleaving between them is exactly what the dropped chunks
+/// carried; the capture's own `…[N bytes dropped]…` marker still reports any
+/// retained truncation.
+pub(crate) fn authoritative_tail(output: &ProcessOutput) -> String {
+    let mut text = String::with_capacity(output.stdout.len() + output.stderr.len());
+    text.push_str(&output.stdout);
+    text.push_str(&output.stderr);
+    text
+}
+
 /// Canonical started fact.
 pub(crate) fn started_event(id: &UserShellId, command: &str, cwd: &str) -> EngineEvent {
     EngineEvent::UserShellStarted {
@@ -249,6 +279,61 @@ mod tests {
         assert!(truncated);
     }
 
+    /// The bounded live channel drops rather than block the child, so the
+    /// streamed tail can be missing its end. When that happened, the completed
+    /// record must be the runner's own capture instead.
+    #[test]
+    fn a_dropped_live_channel_leaves_the_completed_tail_to_the_authoritative_capture() {
+        let store = UserShellStore::default();
+        let session = SessionId::new("s1");
+        let id = UserShellId::new("ush-dropped");
+        store.begin(
+            &session,
+            id.clone(),
+            "seq 1 2000".into(),
+            "/repo".into(),
+            CancellationToken::new(),
+        );
+        // Only the head of the stream made it through before chunks were lost.
+        store.append_output(&session, &id, "1\n2\n");
+        store.finish(
+            &session,
+            &id,
+            Some(0),
+            "success",
+            Some("1\n\n\u{2026}[15000 bytes dropped]\u{2026}\n1999\n2000\n"),
+        );
+        let shell = store.snapshot(&session);
+        assert_eq!(
+            shell[0].output_tail,
+            "1\n\n\u{2026}[15000 bytes dropped]\u{2026}\n1999\n2000\n"
+        );
+        assert!(
+            shell[0].output_tail.contains("2000"),
+            "the end survives: {}",
+            shell[0].output_tail
+        );
+    }
+
+    /// With nothing dropped, the interleaved live tail is what the record shows.
+    #[test]
+    fn an_intact_live_tail_is_kept_for_the_completed_record() {
+        let store = UserShellStore::default();
+        let session = SessionId::new("s1");
+        let id = UserShellId::new("ush-intact");
+        store.begin(
+            &session,
+            id.clone(),
+            "echo one".into(),
+            "/repo".into(),
+            CancellationToken::new(),
+        );
+        store.append_output(&session, &id, "out\nerr\n");
+        store.finish(&session, &id, Some(0), "success", None);
+        let shell = store.snapshot(&session);
+        assert_eq!(shell[0].output_tail, "out\nerr\n");
+    }
+
     #[test]
     fn stale_cancel_id_never_reaches_a_newer_execution() {
         let store = UserShellStore::default();
@@ -262,7 +347,7 @@ mod tests {
             "/repo".into(),
             CancellationToken::new(),
         );
-        store.finish(&session, &old, Some(0), "success");
+        store.finish(&session, &old, Some(0), "success", None);
         store.begin(
             &session,
             new.clone(),
@@ -287,7 +372,7 @@ mod tests {
             CancellationToken::new(),
         );
         store.append_output(&session, &a, "one\n");
-        store.finish(&session, &a, Some(0), "success");
+        store.finish(&session, &a, Some(0), "success", None);
         let b = UserShellId::new("b");
         store.begin(
             &session,

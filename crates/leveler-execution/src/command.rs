@@ -803,6 +803,14 @@ pub struct ProcessOutput {
     /// Lower bound on bytes omitted across retained output and live delivery.
     /// A byte lost in both is counted once; the channels may overlap.
     pub dropped_bytes: u64,
+    /// Bytes the bounded live channel could not deliver.
+    ///
+    /// The retained capture is unaffected, but a caller that builds its own
+    /// record from the live stream (the user shell keeps the interleaved tail
+    /// it streamed) must know when that record can be missing bytes — the
+    /// channel drops rather than block the child, so the dropped chunks can
+    /// include the end of the output.
+    pub live_dropped_bytes: u64,
 }
 
 impl ProcessOutput {
@@ -1616,9 +1624,10 @@ async fn drive_to_completion(
             drain.cancel();
         });
     }
-    let (stdout, stdout_dropped) = stdout_task.await.unwrap_or_default();
-    let (stderr, stderr_dropped) = stderr_task.await.unwrap_or_default();
+    let (stdout, stdout_dropped, stdout_live_dropped) = stdout_task.await.unwrap_or_default();
+    let (stderr, stderr_dropped, stderr_live_dropped) = stderr_task.await.unwrap_or_default();
     let dropped_bytes = stdout_dropped + stderr_dropped;
+    let live_dropped_bytes = stdout_live_dropped + stderr_live_dropped;
     process.reap_group();
     if !process.tree_gone().await {
         return Err(ProcessError::Io {
@@ -1634,6 +1643,7 @@ async fn drive_to_completion(
         timed_out,
         truncated: dropped_bytes > 0,
         dropped_bytes,
+        live_dropped_bytes,
     })
 }
 
@@ -1810,9 +1820,9 @@ async fn read_capped(
     cap: usize,
     drain: CancellationToken,
     chunks: Option<(OutputStream, tokio::sync::mpsc::Sender<OutputChunk>)>,
-) -> (String, u64) {
+) -> (String, u64, u64) {
     let Some(p) = pipe else {
-        return (String::new(), 0);
+        return (String::new(), 0, 0);
     };
     let head_cap = cap / 2;
     let tail_cap = cap - head_cap;
@@ -1867,7 +1877,7 @@ async fn read_capped(
         if live_dropped > 0 {
             text.push_str(&format!("\n[live output omitted: {live_dropped} bytes]\n"));
         }
-        return (text, live_dropped);
+        return (text, live_dropped, live_dropped);
     }
     let mut text = String::from_utf8_lossy(&head).into_owned();
     text.push_str(&format!("\n…[{dropped} bytes dropped]…\n"));
@@ -1877,7 +1887,7 @@ async fn read_capped(
     }
     // Both views can omit the same bytes; report a lower bound, never charge
     // the retained-buffer and live-channel losses twice.
-    (text, dropped.max(live_dropped))
+    (text, dropped.max(live_dropped), live_dropped)
 }
 
 #[cfg(test)]
@@ -2083,6 +2093,7 @@ mod tests {
             timed_out: false,
             truncated: false,
             dropped_bytes: 0,
+            live_dropped_bytes: 0,
         };
         assert!(!completed.success(), "the command reported failure");
         assert_eq!(completed.execution_status(), ToolExecutionStatus::Completed);
