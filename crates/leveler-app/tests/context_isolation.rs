@@ -1186,7 +1186,14 @@ async fn btw_accounts_for_side_history_and_only_folds_with_an_accepted_summary()
             .unwrap();
         let db = app.open_database().await.unwrap();
         let repo = MessageRepository::new(&db);
-        let history: Vec<String> = (0..10)
+        // Fourteen turns of ~350 projected tokens each put the two decisions
+        // well off the boundary instead of on it: the question that must fit
+        // lands ~1170 tokens below the pressure threshold and the one that
+        // must fold ~1470 above. A fixture any shorter leaves only tens of
+        // tokens of slack, and an incidental difference in the projected
+        // request (a path, a tool schema) then flips the fold and fails the
+        // test on a platform where nothing is actually wrong.
+        let history: Vec<String> = (0..14)
             .map(|i| {
                 serde_json::to_string(&Message::text(
                     Role::User,

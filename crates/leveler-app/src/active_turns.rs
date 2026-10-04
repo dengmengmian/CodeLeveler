@@ -362,19 +362,36 @@ mod tests {
     }
 
     /// The snapshot is the fact a handover shows: an age, and how long since
-    /// the turn last did anything observable. It starts at zero idle and
-    /// disappears with the turn.
+    /// the turn last did anything observable. The age is real elapsed time —
+    /// it grows with the wait — and both fields disappear with the turn.
     #[test]
     fn a_snapshot_reports_age_and_idle_and_lives_only_while_the_turn_does() {
         let turns = ActiveTurns::default();
         let session = SessionId::new("s1");
+        let began = Instant::now();
         let lease = turns.admit(&session).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
 
         let snapshot = turns.snapshots();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].session_id, session);
-        assert!(snapshot[0].elapsed_ms <= 50, "{:?}", snapshot[0]);
-        assert!(snapshot[0].idle_ms <= 50, "{:?}", snapshot[0]);
+        // Bounded by the wait this test itself measured rather than by a fixed
+        // millisecond budget: a busy runner can spend far longer than that
+        // between `admit` and the read, and an age that tracks real time is
+        // the property, not a small number.
+        assert!(snapshot[0].elapsed_ms >= 15, "{:?}", snapshot[0]);
+        assert!(
+            snapshot[0].elapsed_ms <= began.elapsed().as_millis() as u64,
+            "{:?}",
+            snapshot[0]
+        );
+        // Idle begins at the same instant as the age and never leads it.
+        assert!(snapshot[0].idle_ms >= 15, "{:?}", snapshot[0]);
+        assert!(
+            snapshot[0].idle_ms <= snapshot[0].elapsed_ms,
+            "{:?}",
+            snapshot[0]
+        );
 
         turns.finish(&lease);
         assert!(turns.snapshots().is_empty());

@@ -200,7 +200,14 @@ pub enum EnsureError {
     UnknownGeneration,
     #[error("runtime did not become ready within {seconds}s; log: {}", log_path.display())]
     ReadyTimeout { seconds: u64, log_path: PathBuf },
-    #[error("runtime exited during startup; log: {}", log_path.display())]
+    /// `tail` is the daemon's own last lines. The message carries it because a
+    /// caller that only sees this error has no other way to read why the
+    /// process it launched refused to start — collecting the reason and then
+    /// printing only the path was losing the only evidence there is.
+    #[error(
+        "runtime exited during startup; log: {}\n{tail}",
+        log_path.display()
+    )]
     StartupFailed { log_path: PathBuf, tail: String },
 }
 

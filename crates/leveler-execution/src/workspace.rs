@@ -683,7 +683,9 @@ mod tests {
             ws.resolve_for_write(".env", &WriteScope::Unrestricted)
                 .is_err()
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        // The open workspace root is what owns the directory on Windows, so a
+        // teardown there is best-effort for the same reason its siblings are.
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn ws_scope(ws: &Workspace) -> WriteScope {
@@ -1275,7 +1277,10 @@ mod scope_split_tests {
     }
 }
 
-#[cfg(test)]
+/// Filesystem object binding exists on unix only: the incarnation proof the
+/// grant is built on has no Windows implementation, so those grants are simply
+/// never offered there.
+#[cfg(all(test, unix))]
 mod resource_path_tests {
     use super::*;
     use leveler_core::{Capability, GrantBinding};

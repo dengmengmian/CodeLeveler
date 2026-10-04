@@ -202,9 +202,16 @@ fn parse_credential_protocol(output: &str) -> Option<CredentialMaterial> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::ffi::OsString;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
+    // The broker spawns the user's global Git credential helper. Windows
+    // real-host credential qualification is still open (see
+    // docs/ARCHITECTURE.md), so these assertions run where that boundary is
+    // proven; the broker itself still fails closed there.
+    #[cfg(unix)]
     fn snapshot(home: &std::path::Path) -> EnvSnapshot {
         EnvSnapshot::new(
             [
@@ -220,6 +227,7 @@ mod tests {
     }
 
     /// A global helper that answers with a fixed credential.
+    #[cfg(unix)]
     fn helper_home(password: &str) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -265,6 +273,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn broker_resolves_only_from_the_user_helper() {
         let home = helper_home("LEVELER_TEST_SECRET_xyz");
@@ -278,6 +287,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn broker_does_not_use_a_repository_local_helper() {
         // A helper configured only in the scratch repo must be invisible: the
@@ -290,6 +300,7 @@ mod tests {
         assert!(material.is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn broker_ignores_caller_environment_overrides() {
         let home = helper_home("LEVELER_TEST_SECRET_xyz");

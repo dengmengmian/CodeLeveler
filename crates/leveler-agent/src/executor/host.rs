@@ -2729,6 +2729,7 @@ mod authorize_tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn resource_store_restart_reuses_only_the_approved_git_target() {
         use leveler_storage::ResourceGrantStore;
@@ -2826,6 +2827,7 @@ mod authorize_tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn resource_shell_wrapped_git_keeps_exact_call_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -2893,6 +2895,9 @@ mod authorize_tests {
         }
     }
 
+    /// Unix only: a reusable Git grant needs the object-incarnation proof the
+    /// execution layer can only produce there; Windows keeps exact-call approval.
+    #[cfg(unix)]
     #[tokio::test]
     async fn resource_git_consumers_offer_only_the_approved_remote() {
         let dir = tempfile::tempdir().unwrap();
@@ -3454,6 +3459,9 @@ mod authorize_tests {
     /// Phase 4: a credential binding is reusable only because the frozen Git
     /// target re-verifies the credential incarnation at execution. On its own
     /// it authorizes nothing — a credential is never a remote-effect grant.
+    /// Unix only: `execution_bound_request` refuses a frozen Git target on a
+    /// platform without object-incarnation proof.
+    #[cfg(unix)]
     #[test]
     fn a_credential_binding_is_execution_bound_but_never_authorizes_alone() {
         use leveler_core::{Capability, GrantBinding, GrantRequest, ResourceIdentity};

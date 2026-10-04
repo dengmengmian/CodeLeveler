@@ -714,6 +714,7 @@ mod tests {
 
     /// PB_B_ORCH_1: a child with zero claimed paths reached apply_patch and
     /// created files. The tool itself must refuse, not only the drive loop.
+    #[cfg(unix)]
     #[tokio::test]
     async fn resource_patch_failure_restores_own_commit_but_preserves_third_party_replacement() {
         use leveler_core::{Capability, GrantBinding, GrantRequest, GrantScope};
@@ -854,6 +855,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn resource_patch_delete_does_not_reuse_write_only_consent() {
         use leveler_core::{Capability, GrantRequest, GrantScope};

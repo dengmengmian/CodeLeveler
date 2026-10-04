@@ -151,6 +151,7 @@ impl Tool for WriteFileTool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn resource_grant_writes_exact_external_file_without_global_authority() {
         use leveler_core::{Capability, GrantBinding, GrantRequest, GrantScope};
