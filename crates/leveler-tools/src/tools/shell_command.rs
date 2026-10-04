@@ -172,7 +172,9 @@ mod tests {
                 )
                 .is_some()
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        // Best-effort teardown: on Windows the still-open workspace root
+        // owns the directory, exactly as its siblings in this module do.
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -198,7 +200,9 @@ mod tests {
                 .unwrap()
                 .is_error
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        // Best-effort teardown: on Windows the still-open workspace root
+        // owns the directory, exactly as its siblings in this module do.
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(unix)]
@@ -248,7 +252,9 @@ mod tests {
                 argv.content
             );
         }
-        std::fs::remove_dir_all(dir).unwrap();
+        // Best-effort teardown: on Windows the still-open workspace root
+        // owns the directory, exactly as its siblings in this module do.
+        std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(auto_dir).unwrap();
     }
 

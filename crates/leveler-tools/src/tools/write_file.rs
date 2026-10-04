@@ -233,7 +233,9 @@ mod tests {
                 .approval_reason(&serde_json::json!({"path":path,"content":"next"}), &ctx)
                 .is_some()
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        // Best-effort teardown: on Windows the still-open workspace root
+        // owns the directory, exactly as its siblings in this module do.
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -282,7 +284,9 @@ mod tests {
             .unwrap();
         assert!(!patched.is_error, "{}", patched.content);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "patched\n");
-        std::fs::remove_dir_all(dir).unwrap();
+        // Best-effort teardown: on Windows the still-open workspace root
+        // owns the directory, exactly as its siblings in this module do.
+        std::fs::remove_dir_all(dir).ok();
     }
 
     async fn run(ctx: ToolContext, args: serde_json::Value) -> ToolOutput {

@@ -91,7 +91,16 @@ fn windows_real_host_lifecycle_and_ownership() {
 }
 
 async fn run(root: &Path) {
-    let layout = Layout::resolve(root.join("repo"), None);
+    // The same explicit paths the launcher passes to the daemon below, not
+    // `Layout::resolve`: this test binary never runs `main`, so the process
+    // environment was never installed as CodeLeveler's snapshot and the
+    // env-var lookup would silently fall back to `<repo>/configs` — where no
+    // mock model exists — and the daemon would exit with "no models configured".
+    let layout = Layout::ephemeral(
+        root.join("repo"),
+        Some(root.join("configs")),
+        &root.join("home"),
+    );
     let launch = DetachedRuntimeLaunch {
         executable: PathBuf::from(env!("CARGO_BIN_EXE_leveler")),
         ready_prefix: "windows-host-contract".into(),
