@@ -24,12 +24,18 @@ pub fn assistant_split(
 ) -> (Vec<Line<'static>>, usize) {
     let (lines, stable) = assistant_body(block, theme, wrap_width);
     // Bulleting maps lines 1:1, so the stable boundary is preserved.
-    let marker = if block.kind == AssistantKind::Final {
-        "◆"
-    } else {
-        "●"
+    // A final answer is the turn's one primary statement: the accent marker
+    // draws the eye to it. Interim narration is process prose and takes a
+    // quieter marker, so a long turn's running commentary never competes with
+    // the answer for attention. The distinction is structural — nothing here
+    // reads the message text.
+    let (marker, marker_style) = match block.kind {
+        AssistantKind::Final => ("◆", Style::default().fg(theme.accent.primary)),
+        AssistantKind::Progress | AssistantKind::Pending => {
+            ("●", Style::default().fg(theme.text.secondary))
+        }
     };
-    let bulleted = bulleted(lines, marker, Style::default().fg(theme.accent.primary));
+    let bulleted = bulleted(lines, marker, marker_style);
     (bulleted, stable)
 }
 
@@ -79,7 +85,9 @@ fn assistant_body(
 ///
 /// Assistant prose is communication, not evidence: interim narration and the
 /// final answer both render in full. Only tool output, diffs and other
-/// execution detail may sit behind a disclosure.
+/// execution detail may sit behind a disclosure. Kind selects the ink, never
+/// the amount of text: `Progress` is subordinate to `Final` in tone and marker,
+/// and neither is ever truncated.
 pub fn assistant_render(
     block: &AssistantBlock,
     theme: &Theme,
@@ -1225,18 +1233,54 @@ mod tests {
             .collect()
     }
 
+    /// The two kinds differ in marker GLYPH and in marker INK: a faint `●` for
+    /// process narration, the accent `◆` for the answer. A reader scanning a
+    /// long turn never has to compare glyph shapes to find the answer.
     #[test]
     fn progress_and_final_use_distinct_markers() {
-        let progress = assistant_render(
-            &block("working", AssistantKind::Progress),
-            &Theme::no_color(),
-            40,
-        );
-        let final_answer =
-            assistant_render(&block("done", AssistantKind::Final), &Theme::no_color(), 40);
+        let theme = Theme::dark();
+        let progress = assistant_render(&block("working", AssistantKind::Progress), &theme, 40);
+        let final_answer = assistant_render(&block("done", AssistantKind::Final), &theme, 40);
 
         assert!(line_text(&progress[0]).starts_with("● "));
         assert!(line_text(&final_answer[0]).starts_with("◆ "));
+        assert_eq!(progress[0].spans[0].style.fg, Some(theme.text.secondary));
+        assert_eq!(
+            final_answer[0].spans[0].style.fg,
+            Some(theme.accent.primary)
+        );
+        assert_ne!(
+            progress[0].spans[0].style.fg,
+            final_answer[0].spans[0].style.fg
+        );
+    }
+
+    /// The hierarchy invariant the presentation rests on: for the SAME prose,
+    /// every progress row renders in lighter ink than the final answer's body,
+    /// so a long turn's narration cannot outweigh the answer.
+    #[test]
+    fn progress_prose_is_subordinate_to_the_final_answer_body() {
+        let theme = Theme::dark();
+        // Two paragraphs: the final answer's first is its lead, its second is a
+        // body paragraph — both must stay heavier than progress prose.
+        let text = "第一段结论。\n\n第二段正文。";
+        let progress = assistant_render(&block(text, AssistantKind::Progress), &theme, 80);
+        let final_answer = assistant_render(&block(text, AssistantKind::Final), &theme, 80);
+        let ink = |lines: &[Line<'static>], needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.contains(needle))
+                .map(|span| span.style.fg)
+                .expect("span")
+        };
+
+        assert_eq!(ink(&progress, "第一段"), Some(theme.text.secondary));
+        assert_eq!(ink(&progress, "第二段"), Some(theme.text.secondary));
+        assert_eq!(ink(&final_answer, "第一段"), Some(theme.text.final_lead));
+        assert_eq!(ink(&final_answer, "第二段"), Some(theme.text.primary));
+        assert_ne!(ink(&progress, "第一段"), ink(&final_answer, "第一段"));
+        assert_ne!(ink(&progress, "第二段"), ink(&final_answer, "第二段"));
     }
 
     #[test]
@@ -1287,8 +1331,9 @@ mod tests {
             .and_then(|line| line.spans.iter().find(|span| span.content.as_ref() == "• "))
             .expect("list item marker span");
 
-        // Progress is unchanged: ordinary body ink.
-        assert_eq!(progress_body.style.fg, Some(theme.text.primary));
+        // Progress prose is process narration: subordinate ink, not the
+        // answer's body ink.
+        assert_eq!(progress_body.style.fg, Some(theme.text.secondary));
         // The opening paragraph is the lead; the list marker is the scan point;
         // the item text is body.
         assert_eq!(lead.style.fg, Some(theme.text.final_lead));
@@ -1431,10 +1476,10 @@ mod tests {
         assert_eq!(text.style.fg, Some(theme.text.secondary));
     }
 
-    /// Progress lists keep the marker they always had; only a final answer lifts
-    /// its markers.
+    /// Progress lists carry process ink, not the final answer's accent: the
+    /// subordination holds inside a block, not only at the block's marker.
     #[test]
-    fn progress_lists_keep_their_body_ink_marker() {
+    fn progress_lists_use_process_ink_not_the_final_accent() {
         let theme = Theme::dark();
         let lines = assistant_render(&block("- 过程项", AssistantKind::Progress), &theme, 80);
         let marker = lines
@@ -1442,7 +1487,14 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .find(|span| span.content.as_ref() == "• ")
             .expect("bullet");
-        assert_eq!(marker.style.fg, Some(theme.text.primary));
+        assert_eq!(marker.style.fg, Some(theme.text.secondary));
+        assert_ne!(marker.style.fg, Some(theme.accent.secondary));
+        let body = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("过程项"))
+            .expect("item body");
+        assert_eq!(body.style.fg, Some(theme.text.secondary));
     }
 
     #[test]

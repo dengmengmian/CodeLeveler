@@ -22,8 +22,8 @@ const HARNESS_REVIEWER_ROLE: &str = "reviewer";
 pub enum AssistantKind {
     /// Streaming, or complete but the turn has not yet shown which it is.
     Pending,
-    /// Interim narration: a tool call followed it. Rendered in full like any
-    /// other prose; the distinction only matters for answer bookkeeping.
+    /// Interim narration: a tool call followed it. Rendered in full, but one
+    /// step down the ink ladder from the answer.
     Progress,
     /// The turn's answer: the turn ended on it with no tool call after.
     Final,
@@ -1727,6 +1727,65 @@ mod tests {
         t.push_turn_end(TurnEndStatus::Completed, 2, 5, None, None);
         assert_eq!(
             kinds(&t),
+            vec![
+                AssistantKind::Progress,
+                AssistantKind::Progress,
+                AssistantKind::Final
+            ]
+        );
+    }
+
+    /// The lifecycle decides the kind in BOTH directions: wording never does.
+    /// A message that reads like an answer but a tool call followed is still
+    /// Progress, and one that reads like a promise the turn ended on is still
+    /// Final. This is what keeps the classification structural — no renderer
+    /// or bridge may ever parse the prose to re-derive it.
+    #[test]
+    fn wording_never_decides_the_kind() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "最终答案：两处都改好了。");
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        say(&mut t, "m2", "我会继续调查剩下的调用点。");
+        t.push_turn_end(TurnEndStatus::Completed, 2, 4, None, None);
+        assert_eq!(
+            kinds(&t),
+            vec![AssistantKind::Progress, AssistantKind::Final]
+        );
+    }
+
+    /// A resumed session carries no live event order: the same messages must be
+    /// classified from turn shape alone. Live and replay must agree, or a
+    /// restored turn would present a different hierarchy than the live one did.
+    #[test]
+    fn live_and_replayed_classification_agree() {
+        let mut live = TranscriptState::new();
+        live.push_user("第一个需求".into());
+        say(&mut live, "m1", "先看代码");
+        settled(&mut live, "r1", "read_file", r#"{"path":"a"}"#);
+        say(&mut live, "m2", "继续改");
+        settled(&mut live, "e1", "apply_patch", r#"{"patch":"p"}"#);
+        say(&mut live, "m3", "改好了。");
+        live.push_turn_end(TurnEndStatus::Completed, 2, 5, None, None);
+
+        let mut replayed = TranscriptState::new();
+        replayed.push_user("第一个需求".into());
+        say(&mut replayed, "m1", "先看代码");
+        say(&mut replayed, "m2", "继续改");
+        say(&mut replayed, "m3", "改好了。");
+        assert_eq!(
+            kinds(&replayed),
+            vec![
+                AssistantKind::Pending,
+                AssistantKind::Pending,
+                AssistantKind::Pending
+            ],
+            "restored messages arrive undecided"
+        );
+        replayed.classify_replayed_history();
+
+        assert_eq!(kinds(&live), kinds(&replayed));
+        assert_eq!(
+            kinds(&replayed),
             vec![
                 AssistantKind::Progress,
                 AssistantKind::Progress,

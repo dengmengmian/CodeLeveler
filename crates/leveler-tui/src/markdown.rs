@@ -25,9 +25,31 @@ use crate::theme::Theme;
 /// uses it to select the base prose color; its own semantic roles still win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AssistantTone {
-    #[default]
+    /// The model's interim narration: process prose, one step down the ink
+    /// ladder from the answer.
     Progress,
+    /// The turn's answer: plain reading prose plus the lead paragraph and the
+    /// accent markers that draw the eye to it.
     Final,
+    /// Assistant prose with NO turn role — a surface that renders Markdown
+    /// without a lifecycle classification (`/btw`'s answer). Exactly the
+    /// answer tone minus the lead emphasis.
+    #[default]
+    Plain,
+}
+
+impl AssistantTone {
+    /// The ink of ordinary body prose in this tone: an answer's body and
+    /// unclassified reading prose are reading ink, interim narration is one
+    /// step down. This is the ONE place the "progress is subordinate to the
+    /// answer" hierarchy comes from, so a block's weight cannot drift between
+    /// markdown elements.
+    fn body_ink(self, theme: &Theme) -> Color {
+        match self {
+            Self::Final | Self::Plain => theme.text.primary,
+            Self::Progress => theme.text.secondary,
+        }
+    }
 }
 
 /// A parsed markdown document, width-agnostic.
@@ -304,7 +326,13 @@ impl MdDoc {
         }
     }
 
-    /// Lay the document out to `width` columns with theme colors.
+    /// Lay the document out to `width` columns with theme colors as primary
+    /// reading prose.
+    ///
+    /// A surface that has a lifecycle classification (the transcript, from
+    /// event order) passes its tone through
+    /// [`Self::to_lines_split_with_tone`] instead; this entry point is for
+    /// assistant prose that IS the reading content by construction.
     pub fn to_lines(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         self.to_lines_split(width, theme).0
     }
@@ -364,7 +392,7 @@ impl MdDoc {
     /// tail (the last, possibly-still-growing block) should stay in the live
     /// region. For an empty doc the split index is 0.
     pub fn to_lines_split(&self, width: usize, theme: &Theme) -> (Vec<Line<'static>>, usize) {
-        self.to_lines_split_inner(width, theme, AssistantTone::Progress)
+        self.to_lines_split_inner(width, theme, AssistantTone::Plain)
     }
 
     fn to_lines_split_inner(
@@ -491,7 +519,7 @@ fn render_block(
                         .fg(theme.text.final_lead)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme.text.primary)
+                    Style::default().fg(tone.body_ink(theme))
                 };
                 out.extend(wrap_spans(
                     spans,
@@ -522,10 +550,10 @@ fn render_block(
                 // final answer lifts its markers — progress lists are unchanged.
                 let marker_color = match tone {
                     AssistantTone::Final => theme.accent.secondary,
-                    AssistantTone::Progress => theme.text.primary,
+                    AssistantTone::Progress | AssistantTone::Plain => tone.body_ink(theme),
                 };
                 let marker_style = Style::default().fg(marker_color);
-                let body_style = Style::default().fg(theme.text.primary);
+                let body_style = Style::default().fg(tone.body_ink(theme));
                 for (n, item) in items.iter().enumerate() {
                     let marker = if *ordered {
                         format!("{}. ", n + 1)
@@ -1447,6 +1475,27 @@ mod tests {
                 .any(|s| s.style.fg == Some(theme.text.primary)),
             "assistant prose must use the reading-text role, not a muted/dim fg"
         );
+    }
+
+    /// The tone is the ONLY source of the progress/answer hierarchy: interim
+    /// narration is one step down, an answer and unclassified reading prose
+    /// keep the reading ink. Markdown elements below the base all still win.
+    #[test]
+    fn tone_selects_the_base_prose_ink_in_one_place() {
+        let theme = Theme::dark();
+        let body = |tone: AssistantTone| {
+            MdDoc::parse("正文")
+                .to_lines_split_with_tone(40, &theme, tone)
+                .0[0]
+                .spans
+                .iter()
+                .find(|s| s.content.contains("正文"))
+                .and_then(|s| s.style.fg)
+        };
+        assert_eq!(body(AssistantTone::Progress), Some(theme.text.secondary));
+        assert_eq!(body(AssistantTone::Plain), Some(theme.text.primary));
+        // An answer's first paragraph is its lead, which is its own role.
+        assert_eq!(body(AssistantTone::Final), Some(theme.text.final_lead));
     }
 
     #[test]

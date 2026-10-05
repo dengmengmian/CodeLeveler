@@ -511,7 +511,13 @@ mod tests {
             .build();
 
         assert!(prompt.contains("- language: Chinese (中文)"));
-        assert!(prompt.contains("reasoning text streamed to the UI"));
+        assert!(prompt.contains("interim notes, status narration, and the final summary"));
+        // Raw reasoning is never a user-visible sentence: it only drives the
+        // status line's thinking indicator, so it must not be listed as one.
+        assert!(
+            !prompt.contains("reasoning text streamed to the UI"),
+            "the language contract covers visible assistant text only: {prompt}"
+        );
         assert!(
             !prompt.contains("Write EVERY user-visible sentence"),
             "the language behavior lives in the output contract, not as a second copy: {prompt}"
@@ -608,7 +614,7 @@ mod tests {
 
         assert!(prompt.contains("You are CodeLeveler"));
         assert!(prompt.contains("Turn context:"));
-        assert!(prompt.contains("reasoning text streamed to the UI"));
+        assert!(prompt.contains("interim notes, status narration, and the final summary"));
         assert!(prompt.contains("latest user message"));
         assert!(
             prompt.contains("An uncommitted working tree is a normal delivery state"),

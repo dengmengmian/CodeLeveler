@@ -329,6 +329,12 @@ pub struct EventBridge {
     /// fold (a nudged model repeating its "task complete" summary). Display
     /// layer only — the persisted transcript keeps every message.
     recent_assistant_texts: std::collections::VecDeque<String>,
+    /// True while the current model round was opened by a harness closeout
+    /// nudge. The fold below applies to THAT round only: the model is
+    /// re-answering the message the nudge answered, so a restatement carries
+    /// no new narration. In any other round the text is the model's own
+    /// commentary, however similar it reads to an earlier message.
+    round_after_closeout_nudge: bool,
     /// Role per in-flight child, so the terminal event can carry the role the
     /// spawn announced instead of an empty string.
     child_roles: HashMap<String, String>,
@@ -429,6 +435,16 @@ const FOLD_MIN_CHARS: usize = 24;
 /// below ≈0.7 — 0.85 separates the two with margin on the keep side.
 const FOLD_CONTAINMENT: f64 = 0.85;
 
+/// The harness key of a closeout continuation nudge, as spelled by
+/// `leveler_agent::RuntimeInjectionKind::as_key`'s `CloseoutNudge` arm
+/// (`closeout_goal_unresolved` / `closeout_empty_answer`). This is the owner's
+/// real scope: a round the harness opened by re-driving a quiet turn. It is a
+/// lifecycle key chosen by the harness, never anything read out of the model's
+/// prose.
+fn opens_from_closeout_nudge(kind: &str) -> bool {
+    kind.starts_with("closeout_")
+}
+
 /// True when `new` adds (nearly) nothing over `prev`: compare character
 /// trigrams of the normalized texts and require [`FOLD_CONTAINMENT`] of the
 /// new text's trigrams to be already present. Containment (not symmetric
@@ -457,6 +473,20 @@ fn is_near_duplicate(prev: &str, new: &str) -> bool {
     overlap as f64 / new_grams.len() as f64 >= FOLD_CONTAINMENT
 }
 
+/// The harness's closeout continuation, spelled exactly as
+/// `AgentEvent::runtime_injection` spells it (`RuntimeInjectionKind::as_key`).
+/// That injection is what opens the one round the near-duplicate fold is
+/// allowed to touch.
+#[cfg(test)]
+fn closeout_nudge() -> EngineEvent {
+    EngineEvent::RuntimeInjection {
+        kind: "closeout_goal_unresolved".into(),
+        role: "user".into(),
+        model_step: 2,
+        forces_continuation: true,
+    }
+}
+
 impl EventBridge {
     pub fn new(events: broadcast::Sender<RuntimeEvent>) -> Self {
         Self {
@@ -464,6 +494,7 @@ impl EventBridge {
             tool_starts: HashMap::new(),
             open_assistant: None,
             recent_assistant_texts: std::collections::VecDeque::new(),
+            round_after_closeout_nudge: false,
             child_roles: HashMap::new(),
             terminal_published: false,
             terminal_publisher: None,
@@ -543,14 +574,32 @@ impl EventBridge {
             EngineEvent::ReasoningDelta { text: delta } => {
                 let _ = self.events.send(RuntimeEvent::ReasoningDelta { delta });
             }
+            EngineEvent::RuntimeInjection { kind, .. } => {
+                // The ONE lifecycle opening that scopes the fold below: the
+                // harness re-drove a quiet round, so the next assistant text
+                // re-states what the nudge answered.
+                self.round_after_closeout_nudge = opens_from_closeout_nudge(&kind);
+            }
+            EngineEvent::TurnStarted { .. } => {
+                // A nudge whose round never produced a message must not follow
+                // the reader into the next turn.
+                self.round_after_closeout_nudge = false;
+            }
             EngineEvent::AssistantMessage { text } => {
-                // Near-duplicate fold: a nudged model that re-states an earlier
-                // summary is collapsed into one notice instead of rendering the
-                // repeat. Display only — the transcript sink keeps the message.
-                let duplicate = self
-                    .recent_assistant_texts
-                    .iter()
-                    .any(|prev| is_near_duplicate(prev, &text));
+                // Near-duplicate fold: a nudged model that re-states the
+                // summary the nudge answered is collapsed into one notice
+                // instead of rendering the repeat. Display only — the
+                // transcript sink keeps the message.
+                //
+                // Scoped to the nudge-opened round: eaten unconditionally, so
+                // it can cover exactly one message. Ordinary narration — the
+                // model's own progress text — is never folded for resembling
+                // an earlier message.
+                let duplicate = std::mem::take(&mut self.round_after_closeout_nudge)
+                    && self
+                        .recent_assistant_texts
+                        .iter()
+                        .any(|prev| is_near_duplicate(prev, &text));
                 if duplicate {
                     if let Some(id) = self.open_assistant.take() {
                         // Streamed path: the deltas are already on screen —
@@ -1069,9 +1118,7 @@ impl EventBridge {
                 }
             }
             EngineEvent::TaskStarted { .. }
-            | EngineEvent::TurnStarted { .. }
             | EngineEvent::TurnFinished { .. }
-            | EngineEvent::RuntimeInjection { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }
             | EngineEvent::ClarificationRequested { .. }
@@ -1701,6 +1748,8 @@ mod bridge_tests {
             &mut bridge,
             leveler_agent::AgentEvent::AssistantText(summary.into()),
         );
+        // The harness re-drives the quiet round; THAT is what opens the fold.
+        bridge.forward(closeout_nudge());
         // Nudged round two repeats the same summary with a trivial suffix.
         let repeat = format!("{summary}(以上为最终结论)");
         forward_agent(
@@ -1756,6 +1805,9 @@ mod bridge_tests {
                 "第一部分结论:closeout 决策点已统一,三个 nudge 机制合并为共享预算。".into(),
             ),
         );
+        // Even inside the nudge-opened round, a genuinely different answer is
+        // not a restatement and must render.
+        bridge.forward(closeout_nudge());
         forward_agent(&mut bridge, leveler_agent::AgentEvent::AssistantText(
             "补充遗漏的分支:event_bridge 的重复检测只作用于展示层,持久化与 resume 上下文都保持原样。"
                 .into(),
@@ -1787,6 +1839,8 @@ mod bridge_tests {
             &mut bridge,
             leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
         );
+        // Inside the nudge-opened round, so the length guard is what stops it.
+        bridge.forward(closeout_nudge());
         forward_agent(
             &mut bridge,
             leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
@@ -1797,6 +1851,88 @@ mod bridge_tests {
             .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
             .count();
         assert_eq!(completed, 2, "short repeats stay visible: {events:?}");
+    }
+
+    /// Regression: the fold is scoped to the round a closeout nudge opened.
+    /// Ordinary progress narration that happens to resemble an earlier
+    /// progress message is the model's own commentary and must survive — the
+    /// harness folds repeats by lifecycle, never by how the prose reads.
+    #[test]
+    fn progress_repeats_are_never_folded() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let summary = "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。";
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+                parallel: false,
+            },
+        );
+        // A tool call followed the first text: it was progress. The nudge flag
+        // was never set, so this second, near-identical text is kept.
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(
+                "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。(重复)"
+                    .into(),
+            ),
+        );
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(completed, 2, "both progress texts must render: {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::Notification { message, .. } if message.contains("折叠"))),
+            "progress repeats are never folded: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantAttemptReset {
+                    message_id: Some(_)
+                }
+            )),
+            "no progress block may be retracted: {events:?}"
+        );
+    }
+
+    /// A nudge flag must not leak into the next turn: a round the harness never
+    /// opened cannot fold anything.
+    #[test]
+    fn a_closeout_nudge_does_not_scope_the_next_turn() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let summary = "这一轮的总结足够长，足以触发近重复折叠的判定阈值。";
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
+        bridge.forward(closeout_nudge());
+        bridge.forward(EngineEvent::TurnStarted {
+            turn_id: leveler_core::TurnId::new("turn-2"),
+            kind: leveler_engine::TurnKind::User,
+        });
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(summary.into()),
+        );
+        let events = drain(&mut rx);
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(completed, 2, "the next turn's text renders: {events:?}");
     }
 
     /// The non-streamed fallback (no deltas) must fold BEFORE synthesizing the
@@ -1811,6 +1947,9 @@ mod bridge_tests {
             &mut bridge,
             leveler_agent::AgentEvent::AssistantText(summary.into()),
         );
+        // The fold needs the closeout nudge that re-drove the round; without it
+        // the second text is ordinary narration and stays.
+        bridge.forward(closeout_nudge());
         forward_agent(
             &mut bridge,
             leveler_agent::AgentEvent::AssistantText(summary.into()),
@@ -2248,6 +2387,7 @@ mod projection_equivalence {
         let text = "这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。".to_string();
         let shapes = project(vec![
             EngineEvent::AssistantMessage { text: text.clone() },
+            closeout_nudge(),
             EngineEvent::AssistantMessage { text },
         ]);
         assert_eq!(
