@@ -202,7 +202,7 @@ A clean Git worktree is recommended so changes remain easy to inspect or discard
 
 `/develop` runs Analyze → Coding → Verify → Review in one session. Without `[develop].model`, its reading stages use the session model. A configured model must be written as `provider/model`; an invalid value is an error, not a fallback.
 
-`--parallel` is a separate workflow, not runtime sub-agent delegation. It requires a clean, committed Git tree, creates isolated worktrees and branches, commits verified candidates, and integrates successful candidates into the current branch.
+`--parallel` is a separate workflow, not runtime sub-agent delegation. It requires `--collaboration goal`, a clean, committed Git tree; it creates isolated worktrees and branches, commits verified candidates, and integrates successful candidates into the current branch. `chat` and `plan` are refused, because neither is guaranteed to produce the committed candidate edit that integration merges.
 
 On macOS and Linux, `leveler serve` keeps the runtime alive behind a local Unix socket after a UI closes. Windows has no local Unix-socket daemon; persisted sessions and `resume` still work.
 

@@ -202,7 +202,7 @@ thinking = "low"
 
 `/develop` 在同一个会话中执行分析 → 编码 → 验证 → 评审。未配置 `[develop].model` 时，读取代码的阶段沿用当前会话模型。显式配置时必须写成 `provider/model`；无效值会报错，不会静默换成其他模型。
 
-`--parallel` 是独立的候选实现流程，不等同于运行时子 Agent 委派。它要求 Git 工作区干净且已有提交，会创建隔离 worktree 和分支，为通过验证的候选创建提交，并把成功候选集成回当前分支。
+`--parallel` 是独立的候选实现流程，不等同于运行时子 Agent 委派。它要求 `--collaboration goal`、Git 工作区干净且已有提交；会创建隔离 worktree 和分支，为通过验证的候选创建提交，并把成功候选集成回当前分支。`chat` 与 `plan` 会被拒绝：它们都不保证产生集成步骤可以合并的候选提交。
 
 macOS 和 Linux 可以运行 `leveler serve`，通过本机 Unix 套接字让运行时在界面关闭后继续工作。Windows 没有本机 Unix 套接字 daemon，但持久化会话和 `resume` 仍然可用。
 

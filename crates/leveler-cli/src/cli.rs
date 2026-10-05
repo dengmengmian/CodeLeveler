@@ -307,7 +307,9 @@ pub enum Command {
         #[arg(long, default_value = "goal")]
         collaboration: String,
         /// Run N agents concurrently in isolated worktrees and integrate the
-        /// results (>=2 enables parallel multi-agent editing).
+        /// results (>=2 enables parallel multi-agent editing). Requires
+        /// `--collaboration goal`: only a goal-typed candidate is driven to a
+        /// committed edit the integration step can merge.
         #[arg(long, default_value_t = 1)]
         parallel: usize,
     },

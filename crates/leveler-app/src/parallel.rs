@@ -42,6 +42,12 @@ fn honor_parent_cancellation(
 impl Application {
     /// Run `n` agents concurrently on `task` in isolated worktrees and integrate
     /// the results into the current branch. Requires a clean, committed repo.
+    ///
+    /// Only `goal` is accepted: the pipeline selects on committed candidate
+    /// edits and integrates them with `git merge`, while `chat` may end with a
+    /// textual answer and `plan` is a read-only overlay — neither is guaranteed
+    /// to produce the integrable change this path requires. The combination is
+    /// refused here, before a parent session, a worktree, or a provider request.
     pub async fn parallel_edit(
         &self,
         model: &ModelRef,
@@ -50,6 +56,12 @@ impl Application {
         n: usize,
         cancellation: CancellationToken,
     ) -> Result<ParallelEditOutcome, AppError> {
+        if self.collaboration() != leveler_lifecycle::CollaborationMode::Goal {
+            return Err(AppError::UnsupportedCombination(format!(
+                "--parallel currently requires collaboration=goal (got `{}`): `chat` may end with a textual answer and `plan` is read-only, so neither is guaranteed to produce the integrable changes parallel integration selects on. Use `--collaboration goal`, or drop `--parallel`.",
+                self.collaboration().as_str()
+            )));
+        }
         let n = n.max(2);
         let repo_root = self
             .layout
@@ -320,5 +332,43 @@ mod tests {
             result,
             Err(AppError::Agent(leveler_agent::AgentError::Cancelled))
         ));
+    }
+
+    /// `chat` and `plan` cannot guarantee a committed, integrable candidate
+    /// edit, so the refusal must land at the entry — before the layout is even
+    /// asked for a workspace, let alone a session or a provider request.
+    #[tokio::test]
+    async fn parallel_edit_refuses_axes_that_cannot_integrate() {
+        for axis in [
+            leveler_lifecycle::CollaborationMode::Chat,
+            leveler_lifecycle::CollaborationMode::Plan,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let layout = Layout::from_parts(
+                tmp.path().to_path_buf(),
+                tmp.path().join("configs"),
+                tmp.path().join("state"),
+            );
+            let app = Application::assemble(layout)
+                .unwrap()
+                .with_collaboration(axis);
+            // The layout has no workspace on purpose: reaching that check
+            // would mean the contract was validated after the fail-fast point.
+            let error = app
+                .parallel_edit(
+                    &ModelRef::new("mock", "m"),
+                    PermissionProfile::Assisted,
+                    "task",
+                    3,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("a non-goal axis must be refused at the entry");
+            assert!(matches!(&error, AppError::UnsupportedCombination(_)));
+            let message = error.to_string();
+            for needle in ["--parallel", "collaboration=goal", axis.as_str()] {
+                assert!(message.contains(needle), "{needle} missing: {message}");
+            }
+        }
     }
 }

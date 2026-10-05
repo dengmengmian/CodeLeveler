@@ -1,15 +1,18 @@
-//! Entry closure for the parallel run path.
+//! Entry contract for the parallel run path.
 //!
-//! `leveler run --parallel N --collaboration <axis>` must resolve the explicit
-//! axis the CLI parsed onto the parallel parent row, and every candidate child
-//! (a fresh `Application` per isolated worktree) must inherit that same axis.
-//! The leak this locks: dispatch dropped the parsed axis on the `--parallel`
-//! branch, so a parallel run silently reverted to the product default `goal`.
+//! The parallel pipeline exists to integrate candidate edits: it runs one
+//! agent per isolated worktree, commits whatever each candidate produced, and
+//! merges the verified branches into the current branch. `chat` may end with a
+//! textual answer and `plan` is a read-only overlay, so neither is guaranteed
+//! to produce the integrable change this path selects on. `--parallel` (more
+//! than one candidate) therefore requires `collaboration=goal`, and a
+//! non-goal axis is refused before a parent session, a worktree, or a provider
+//! request exists.
 //!
-//! Evidence is durable and mechanical: every session the run persisted (the
-//! parallel parent plus one per candidate child, each in its own worktree state
-//! namespace) carries the axis on its row, and each candidate actually ran a
-//! turn.
+//! The goal path still resolves the explicit CLI axis onto the parallel parent
+//! row, and every candidate child (a fresh `Application` per isolated
+//! worktree) inherits it. Evidence is durable and mechanical: every session the
+//! run persisted carries the axis on its row.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -105,7 +108,7 @@ fn spawn_run(env: &TestEnv, args: &[&str], log: &Path) -> Child {
         .stdout(std::fs::File::create(log.with_extension("out")).unwrap())
         .stderr(std::fs::File::create(log).unwrap())
         .spawn()
-        .expect("spawn leveler run --parallel")
+        .expect("spawn leveler run")
 }
 
 fn read_log(log: &Path) -> String {
@@ -138,15 +141,16 @@ async fn wait_for(mut child: Child, log: &Path, timeout: Duration) -> std::proce
     }
 }
 
-/// Every session this run persisted carries `goal == task`: the parallel parent
-/// (workspace = the repository) and each candidate child (workspace = its
-/// isolated worktree, a different state namespace). The axis contract is that
-/// all of them resolved to the same collaboration mode.
+/// Every session this run persisted carries the requested axis: the parallel
+/// parent (workspace = the repository) and each candidate child (workspace = its
+/// isolated worktree, a different state namespace). A refused run persists
+/// nothing, so a missing state directory is an empty answer, never a panic.
 async fn run_collaborations(env: &TestEnv, task: &str) -> Vec<String> {
     let projects = env.home.join("state/projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
-    let entries = std::fs::read_dir(&projects)
-        .unwrap_or_else(|e| panic!("no projects dir {}: {e}", projects.display()));
     for entry in entries.filter_map(Result::ok) {
         let db_path = entry.path().join("sessions.db");
         if !db_path.is_file() {
@@ -163,6 +167,21 @@ async fn run_collaborations(env: &TestEnv, task: &str) -> Vec<String> {
     found
 }
 
+/// How many git worktrees the repository has: the main checkout plus one per
+/// candidate. A refused run leaves exactly the main checkout.
+fn worktree_count(repo: &Path) -> usize {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .expect("git worktree list");
+    assert!(output.status.success(), "git worktree list failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count()
+}
+
 fn assert_candidate_count(bodies: &[String], log: &Path) {
     assert!(
         bodies.len() >= 2,
@@ -172,51 +191,67 @@ fn assert_candidate_count(bodies: &[String], log: &Path) {
     );
 }
 
-/// A + D + E — an explicit `chat` axis is not overridden by the Application
-/// default, and the candidate children inherit it.
+/// A + B + F + G — `--parallel` requires `collaboration=goal`. `chat` and
+/// `plan` are refused at the execution entry, before a parent session, a
+/// candidate child, a worktree, or a provider request exists. The refusal is
+/// mechanical, not a fallback to goal and not an integration-stage failure.
 #[tokio::test]
-async fn explicit_chat_parallel_axis_reaches_parent_and_children() {
-    let server = MockServer::start_one(text_response("done")).await;
-    let env = test_env(&server.base_url());
-    let log = env.tmp.path().join("run.log");
-    let child = spawn_run(
-        &env,
-        &[
-            "--parallel",
-            "2",
-            "--collaboration",
-            "chat",
-            "--auto-approve",
-            "parallel chat axis",
-        ],
-        &log,
-    );
-    let status = wait_for(child, &log, Duration::from_secs(120)).await;
-    // A chat candidate edits nothing, so the parallel run legitimately reports
-    // "no integrable changes" (exit 1). The axis contract is the point here:
-    // the run must reach the parallel result, not bail out early.
-    assert!(
-        status.code().is_some(),
-        "leveler run did not exit normally:\n{}",
-        read_log(&log)
-    );
-    assert!(
-        read_stdout(&log).contains("Parallel result"),
-        "the run never reached the parallel path:\n{}",
-        read_log(&log)
-    );
+async fn parallel_rejects_non_goal_collaboration_before_any_work() {
+    for axis in ["chat", "plan"] {
+        let server = MockServer::start_one(goal_complete_response()).await;
+        let env = test_env(&server.base_url());
+        let log = env.tmp.path().join("run.log");
+        let task = format!("parallel {axis} rejected");
+        let child = spawn_run(
+            &env,
+            &[
+                "--parallel",
+                "3",
+                "--collaboration",
+                axis,
+                "--auto-approve",
+                &task,
+            ],
+            &log,
+        );
+        let status = wait_for(child, &log, Duration::from_secs(120)).await;
+        let rendered = read_log(&log);
 
-    let task = "parallel chat axis";
-    assert_eq!(
-        run_collaborations(&env, task).await,
-        vec!["chat", "chat", "chat"],
-        "an explicit `--collaboration chat` must reach the parent and both candidates"
-    );
-    let bodies = server.request_bodies().await;
-    assert_candidate_count(&bodies, &log);
+        assert!(
+            !status.success(),
+            "--parallel {axis} must fail fast, not run the pipeline:\n{rendered}"
+        );
+        // Never entered the pipeline: no result banner, no candidate work.
+        assert!(
+            !read_stdout(&log).contains("Parallel result"),
+            "the parallel pipeline must not start:\n{rendered}"
+        );
+        // The error names the contract without binding the whole sentence.
+        for needle in ["parallel", "collaboration=goal", axis] {
+            assert!(
+                rendered.contains(needle),
+                "error must mention `{needle}`:\n{rendered}"
+            );
+        }
+        // Strong evidence: the refusal precedes every side effect.
+        assert!(
+            server.request_bodies().await.is_empty(),
+            "a refused combination must not call the provider:\n{rendered}"
+        );
+        assert!(
+            run_collaborations(&env, &task).await.is_empty(),
+            "a refused combination must persist no session:\n{rendered}"
+        );
+        assert_eq!(
+            worktree_count(&env.repo),
+            1,
+            "a refused combination must create no worktree:\n{rendered}"
+        );
+    }
 }
 
-/// B — an explicit `goal` axis lands on the parent and its children.
+/// C — an explicit `goal` axis still enters the parallel pipeline and lands on
+/// the parent and its children.
 #[tokio::test]
 async fn explicit_goal_parallel_axis_reaches_parent_and_children() {
     let server = MockServer::start_one(goal_complete_response()).await;
@@ -226,7 +261,7 @@ async fn explicit_goal_parallel_axis_reaches_parent_and_children() {
         &env,
         &[
             "--parallel",
-            "2",
+            "3",
             "--collaboration",
             "goal",
             "--auto-approve",
@@ -239,13 +274,14 @@ async fn explicit_goal_parallel_axis_reaches_parent_and_children() {
 
     assert_eq!(
         run_collaborations(&env, "parallel goal axis").await,
-        vec!["goal", "goal", "goal"]
+        vec!["goal", "goal", "goal", "goal"],
+        "the parent and all three candidates must run the goal axis"
     );
     let bodies = server.request_bodies().await;
     assert_candidate_count(&bodies, &log);
 }
 
-/// C — an omitted axis is the product default (goal) for the parallel path too.
+/// D — an omitted axis is the product default (goal) for the parallel path too.
 #[tokio::test]
 async fn omitted_parallel_axis_is_goal() {
     let server = MockServer::start_one(goal_complete_response()).await;
@@ -263,5 +299,44 @@ async fn omitted_parallel_axis_is_goal() {
         run_collaborations(&env, "parallel default axis").await,
         vec!["goal", "goal", "goal"],
         "an omitted axis must resolve to the product default"
+    );
+}
+
+/// E — `chat` without `--parallel` is not part of the parallel contract and
+/// stays legal: the new refusal must not capture the single-agent path.
+///
+/// Only the parallel entry is asserted here. The headless single-agent chat
+/// terminal is owned by the goal-lifecycle routing in `run_in_session` and is
+/// deliberately out of scope for this change.
+#[tokio::test]
+async fn chat_without_parallel_is_not_refused_by_the_parallel_contract() {
+    let server = MockServer::start_one(text_response("done")).await;
+    let env = test_env(&server.base_url());
+    let log = env.tmp.path().join("run.log");
+    let child = spawn_run(
+        &env,
+        &[
+            "--collaboration",
+            "chat",
+            "--auto-approve",
+            "chat without parallel",
+        ],
+        &log,
+    );
+    let _status = wait_for(child, &log, Duration::from_secs(120)).await;
+    let rendered = read_log(&log);
+
+    assert!(
+        !rendered.contains("collaboration=goal"),
+        "the parallel contract must not capture a single-agent run:\n{rendered}"
+    );
+    assert_eq!(
+        run_collaborations(&env, "chat without parallel").await,
+        vec!["chat"],
+        "an explicit chat axis must reach the single-agent session"
+    );
+    assert!(
+        !server.request_bodies().await.is_empty(),
+        "a legal single-agent chat run must reach the provider:\n{rendered}"
     );
 }

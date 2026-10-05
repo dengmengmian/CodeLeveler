@@ -121,6 +121,11 @@ pub enum AppError {
     ConfigFingerprint(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// A product-level axis combination the execution entry cannot honor.
+    /// Refused before any provider call, session row, or worktree exists, so
+    /// the caller gets the contract error instead of a half-started run.
+    #[error("{0}")]
+    UnsupportedCombination(String),
     #[error("io error creating {path}: {source}")]
     Io {
         path: String,
