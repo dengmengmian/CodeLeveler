@@ -334,6 +334,10 @@ pub struct EventBridge {
     /// re-answering the message the nudge answered, so a restatement carries
     /// no new narration. In any other round the text is the model's own
     /// commentary, however similar it reads to an earlier message.
+    ///
+    /// The scope ends at the first of: an assistant message (the round's
+    /// answer, consumed below), the round's own tool call (the round answered
+    /// with calls, so it has no message left to give), or the next turn.
     round_after_closeout_nudge: bool,
     /// Role per in-flight child, so the terminal event can carry the role the
     /// spawn announced instead of an empty string.
@@ -666,6 +670,11 @@ impl EventBridge {
                         .events
                         .send(RuntimeEvent::AssistantMessageCompleted { message_id: open });
                 }
+                // The nudge-opened round answered with calls, not text: any
+                // message the round had was emitted above, before its tools
+                // run. End the fold scope here so the NEXT round's progress is
+                // never mistaken for the nudge response.
+                self.round_after_closeout_nudge = false;
                 self.tool_starts.insert(id.clone(), Instant::now());
                 let _ = self.events.send(RuntimeEvent::ToolCallStarted {
                     id: ToolCallId::new(id),
@@ -687,6 +696,9 @@ impl EventBridge {
                 // Pair with the ToolCall by id, whatever order results arrive in.
                 // A denial/guard result has no prior ToolCall — synthesize a
                 // started block first so it still renders and isn't dropped.
+                // Such a result is still this round's own call, so it also ends
+                // the nudge fold scope (see the ToolCallStarted arm).
+                self.round_after_closeout_nudge = false;
                 let start = match self.tool_starts.remove(&id) {
                     Some(start) => start,
                     None => {
@@ -1933,6 +1945,126 @@ mod bridge_tests {
             .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
             .count();
         assert_eq!(completed, 2, "the next turn's text renders: {events:?}");
+    }
+
+    /// The summary and its restatement the two fold-scope tests below share.
+    /// They are the exact pair `near_duplicate_final_summary_is_folded` proves
+    /// foldable, so "it rendered" below cannot be an accident of the prose
+    /// scoring low.
+    const FOLD_SCOPE_SUMMARY: &str = "任务已完成:统一 closeout 决策点,合并三个 nudge 机制,四种催办原因都有 \
+                                       UI 事件与 transcript 持久化,工作区测试全部通过。";
+
+    fn fold_scope_restatement() -> String {
+        format!("{FOLD_SCOPE_SUMMARY}(以上为最终结论)")
+    }
+
+    /// Drive the lifecycle shape the pair differs by: a summary, the closeout
+    /// nudge that re-drives it, then optionally a TOOL-ONLY round (tool calls,
+    /// no assistant text). Returns the near-identical restatement that follows.
+    fn drive_closeout_fold_scope(bridge: &mut EventBridge, tool_only_round: bool) -> String {
+        forward_agent(
+            bridge,
+            leveler_agent::AgentEvent::AssistantText(FOLD_SCOPE_SUMMARY.into()),
+        );
+        bridge.forward(closeout_nudge());
+        if tool_only_round {
+            forward_agent(
+                bridge,
+                leveler_agent::AgentEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "grep".into(),
+                    arguments: "{}".into(),
+                    parallel: false,
+                },
+            );
+            forward_agent(
+                bridge,
+                leveler_agent::AgentEvent::ToolResult {
+                    exit_code: None,
+                    stop: None,
+                    execution_status: None,
+                    id: "t1".into(),
+                    name: "grep".into(),
+                    is_error: false,
+                    preview: "hit".into(),
+                    applied_diff: None,
+                },
+            );
+        }
+        fold_scope_restatement()
+    }
+
+    /// Regression: the fold scope is the model round the nudge opened, not "the
+    /// next assistant message after the nudge". When that round answers with
+    /// tool calls and no text, the scope is over — the following round's text is
+    /// the model's own progress, however closely it echoes the summary the
+    /// nudge answered.
+    #[test]
+    fn closeout_nudge_tool_only_round_does_not_scope_following_round() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let progress = drive_closeout_fold_scope(&mut bridge, /*tool_only_round*/ true);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(progress),
+        );
+        let events = drain(&mut rx);
+
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed, 2,
+            "the following round's progress must render: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Notification { message, .. } if message.contains("折叠")
+            )),
+            "nothing may be folded after the nudge-opened round ended: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::AssistantAttemptReset {
+                    message_id: Some(_)
+                }
+            )),
+            "no progress block may be retracted: {events:?}"
+        );
+    }
+
+    /// The positive side of the same pair: when the nudge-opened round answers
+    /// with the restatement itself, the fold still applies. Fixing the scope
+    /// above must not disable the fold.
+    #[test]
+    fn direct_closeout_nudge_response_can_still_fold() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        let repeat = drive_closeout_fold_scope(&mut bridge, /*tool_only_round*/ false);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::AssistantText(repeat),
+        );
+        let events = drain(&mut rx);
+
+        let completed = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::AssistantMessageCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed, 1,
+            "the nudge's own restatement still folds: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RuntimeEvent::Notification { message, .. } if message.contains("折叠")
+            )),
+            "the fold must leave its one visible notice: {events:?}"
+        );
     }
 
     /// The non-streamed fallback (no deltas) must fold BEFORE synthesizing the
