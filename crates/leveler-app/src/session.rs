@@ -11,14 +11,14 @@ use std::sync::atomic::AtomicBool;
 
 use tokio_util::sync::CancellationToken;
 
-use leveler_agent::coding::{TaskReport, TaskSpec};
+use leveler_agent::coding::{CodingRuntime, TaskReport, TaskSpec};
 use leveler_agent::{AdvisoryKind, AgentEvent, AgentOutcome, AutoClarify, Clarifier};
 use leveler_engine::{EngineError, EngineEvent, ExecutionKind, TaskOutcome};
 use leveler_execution::{Approver, PermissionProfile};
 use leveler_model::{ContentPart, ModelRef};
 use leveler_storage::SessionRepository;
 
-use crate::{AppError, Application};
+use crate::{AppError, Application, CollaborationExecution};
 
 fn goal_from_content(content: &[ContentPart]) -> String {
     content
@@ -356,6 +356,41 @@ pub(crate) async fn checkpoint_reaped_sessions(
         }
     }
     leveler_engine::release_reaped(engine, reaped_sessions).await;
+}
+
+/// Run one turn under a resolved collaboration execution.
+///
+/// The only place that turns an axis into an engine entry point, so the
+/// `run_in_session*` variants cannot disagree about chat/plan/goal. Content is
+/// always passed through: a Goal turn with attachments must keep them, and the
+/// headless goal path builds the same single text part `run` would.
+#[allow(clippy::too_many_arguments)]
+async fn run_collaboration_turn(
+    engine: &CodingRuntime,
+    execution: CollaborationExecution,
+    session_id: &leveler_core::SessionId,
+    spec: &TaskSpec,
+    content: Vec<ContentPart>,
+    // `/develop` is its own workflow command; it keeps its own harness and is
+    // not a collaboration axis.
+    develop: bool,
+    observer: &mut (dyn FnMut(EngineEvent) + Send),
+    cancellation: CancellationToken,
+) -> Result<TaskReport, EngineError> {
+    if develop {
+        return engine
+            .run_develop(session_id, spec, observer, cancellation)
+            .await;
+    }
+    if execution.runs_goal_lifecycle() {
+        engine
+            .run_with_content(session_id, spec, content, observer, cancellation)
+            .await
+    } else {
+        engine
+            .chat(session_id, spec, content, observer, cancellation)
+            .await
+    }
 }
 
 impl Application {
@@ -747,7 +782,10 @@ impl Application {
         let repo = SessionRepository::new(&db);
         // Product axes SoT is the session row (SetProductAxes / create defaults).
         let collaboration = self.turn_axes(&repo, session_id).await?;
-        let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
+        // The axis decides the profile and the capability surface through the
+        // one owner, not per entry point: headless `run` and the interactive
+        // turn read the same mapping.
+        let execution = CollaborationExecution::of(collaboration);
 
         let engine = self
             .engine_for_session(
@@ -756,7 +794,7 @@ impl Application {
                 sandbox,
                 approver,
                 clarifier,
-                read_only,
+                execution.read_only(),
                 Some(session_id.as_str()),
             )
             .await?
@@ -769,13 +807,19 @@ impl Application {
         let mut spec = self.direct_spec(goal.to_string(), mode, sandbox);
         spec.runtime.continuation = continuation;
         spec.runtime.limits = limits;
-        let result = if develop {
-            engine
-                .run_develop(session_id, &spec, observer, cancellation)
-                .await
-        } else {
-            engine.run(session_id, &spec, observer, cancellation).await
-        };
+        let result = run_collaboration_turn(
+            &engine,
+            execution,
+            session_id,
+            &spec,
+            vec![ContentPart::Text {
+                text: goal.to_string(),
+            }],
+            develop,
+            observer,
+            cancellation,
+        )
+        .await;
         self.notify_memory_consolidator();
         match result {
             Ok(report) => report_to_result(report),
@@ -808,7 +852,7 @@ impl Application {
         self.sync_session_memory_policy(&db, session_id).await;
         let repo = SessionRepository::new(&db);
         let collaboration = self.turn_axes(&repo, session_id).await?;
-        let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
+        let execution = CollaborationExecution::of(collaboration);
         let engine = self
             .engine_for_session(
                 model,
@@ -816,7 +860,7 @@ impl Application {
                 sandbox,
                 approver,
                 clarifier,
-                read_only,
+                execution.read_only(),
                 Some(session_id.as_str()),
             )
             .await?
@@ -827,15 +871,18 @@ impl Application {
         // the layer with a client to notify.
         let _ = ();
         let spec = self.direct_spec(goal, mode, sandbox);
-        let result = if collaboration == leveler_lifecycle::CollaborationMode::Goal {
-            engine
-                .run_with_content(session_id, &spec, content, observer, cancellation)
-                .await
-        } else {
-            engine
-                .chat(session_id, &spec, content, observer, cancellation)
-                .await
-        };
+        let result = run_collaboration_turn(
+            &engine,
+            execution,
+            session_id,
+            &spec,
+            content,
+            // `/develop` is its own workflow command, not a collaboration axis.
+            false,
+            observer,
+            cancellation,
+        )
+        .await;
         self.notify_memory_consolidator();
         match result {
             Ok(report) => report_to_result(report),
@@ -1029,8 +1076,7 @@ impl Application {
             .ok_or_else(|| AppError::Engine(format!("unknown persisted mode `{mode}`")))?;
         let kind = ExecutionKind::parse(&kind).map_err(app_error_from_engine)?;
         // Product axes: SoT is the session row, not Application defaults.
-        let collaboration = crate::axes_from_session_record(&record);
-        let read_only = collaboration == leveler_lifecycle::CollaborationMode::Plan;
+        let execution = CollaborationExecution::of(crate::axes_from_session_record(&record));
 
         let engine = self
             .engine_for_session(
@@ -1039,7 +1085,7 @@ impl Application {
                 sandbox,
                 approver,
                 clarifier,
-                read_only,
+                execution.read_only(),
                 Some(session_id.as_str()),
             )
             .await?

@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::StopReason;
-use leveler_app::{Application, InProcessRuntimeClient};
+use leveler_app::{Application, CollaborationExecution, InProcessRuntimeClient};
 use leveler_client_protocol::InteractiveRuntimeClient;
 use leveler_local_transport::{CreateSessionRequest, LocalSocketRuntimeClient};
 use leveler_project::Layout;
@@ -55,6 +55,7 @@ pub(crate) async fn cmd_run(
     let mut app = Application::assemble(layout)?
         .with_collaboration(collaboration)
         .with_model_step_ceiling(max_model_steps);
+    let execution = CollaborationExecution::of(collaboration);
     if let Some(overrides) = eval_env_overrides()? {
         app = app.with_execution_overrides(overrides);
     }
@@ -108,7 +109,7 @@ pub(crate) async fn cmd_run(
         ship_changes_and_print(&app, &model_ref, &task, &outcome.modified_files, &ship).await;
     }
 
-    finish(result, &session_id.to_string(), output)
+    finish(result, &session_id.to_string(), output, execution)
 }
 pub(crate) async fn cmd_run_parallel(
     layout: Layout,
@@ -1508,6 +1509,12 @@ pub(crate) async fn cmd_run_resume(
     let app = Application::assemble(layout)?;
     let session_id = leveler_core::SessionId::new(id.clone());
 
+    // The row is the axis SoT; an unreadable row falls back to the product
+    // default (Goal), never to a silent Chat. The same value drives the exit
+    // code, so an answer is a success exactly when the axis says so.
+    let collaboration = app.session_product_axes(&session_id).await.ok();
+    let execution = CollaborationExecution::of(collaboration.unwrap_or_default());
+
     // An explicit `--permission` overrides the persisted mode. This is the one
     // durable write the resume then reads back, so the resumed turn, the row
     // and any later snapshot all agree. Absence keeps the persisted mode.
@@ -1532,8 +1539,8 @@ pub(crate) async fn cmd_run_resume(
 
     if output == OutputFormat::Text {
         println!("{}", Line::heading(&format!("Resuming session {id}")));
-        if let Ok(collab) = app.session_product_axes(&session_id).await {
-            println!("  collab: {}", collab.as_str());
+        if let Some(collaboration) = collaboration {
+            println!("  collab: {}", collaboration.as_str());
         }
     }
 
@@ -1550,7 +1557,7 @@ pub(crate) async fn cmd_run_resume(
         )
         .await;
 
-    finish(result, &id, output)
+    finish(result, &id, output, execution)
 }
 
 /// Run the git/GitHub workflow for the produced changes and print the result.
@@ -1591,8 +1598,9 @@ async fn ship_changes_and_print(
 }
 
 /// Exit code for a run that ended honestly without an independently verified
-/// completion: `Blocked`, `Stalled`, `Incomplete`, `Answered`,
-/// `BudgetExhausted` or `TurnLimitReached`.
+/// completion: `Blocked`, `Stalled`, `Incomplete`, `BudgetExhausted` or
+/// `TurnLimitReached`. `Answered` joins them only for a Goal axis; for chat and
+/// plan the answer IS the terminal the axis exists to reach.
 ///
 /// It is deliberately distinct from [`std::process::ExitCode::FAILURE`] (1),
 /// which is reserved for an execution/runtime/provider error. An honest
@@ -1605,21 +1613,30 @@ pub(crate) const NOT_COMPLETED_EXIT_CODE: u8 = 3;
 ///
 /// `StopReason` is the runtime's authoritative outcome fact and is also
 /// emitted machine-readably. The process exit code is its coarse scriptable
-/// projection:
+/// projection, read through the collaboration dispatch so an axis's own
+/// terminal counts as success:
 ///
 /// ```text
-/// 0    completed     independently verified completion
-/// 1    failed        execution / runtime / provider error (crash, transport)
-/// 2    usage error   CLI argument error (clap)
-/// 3    not completed agent ended honestly without a verified completion
-/// 130  interrupted   cancelled; the session is resumable
+/// 0    completed / answered   goal completion, or the answer a chat/plan run exists for
+/// 1    failed                  execution / runtime / provider error (crash, transport)
+/// 2    usage error             CLI argument error (clap)
+/// 3    not completed           agent ended honestly without reaching the axis's terminal
+/// 130  interrupted             cancelled; the session is resumable
 /// ```
 ///
 /// A run can therefore never report an honest non-completion with the same
 /// code as a crash.
-fn outcome_exit_code(stop_reason: StopReason) -> std::process::ExitCode {
+fn outcome_exit_code(
+    stop_reason: StopReason,
+    execution: CollaborationExecution,
+) -> std::process::ExitCode {
     match stop_reason {
         StopReason::Completed => std::process::ExitCode::SUCCESS,
+        // `Answered` is the Goal axis's unresolved state; Chat and Plan end on
+        // it by design.
+        StopReason::Answered if execution.answer_is_the_terminal() => {
+            std::process::ExitCode::SUCCESS
+        }
         StopReason::Answered
         | StopReason::Incomplete
         | StopReason::BudgetExhausted
@@ -1635,6 +1652,7 @@ fn finish(
     result: Result<leveler_agent::AgentOutcome, leveler_app::AppError>,
     session_id: &str,
     output: OutputFormat,
+    execution: CollaborationExecution,
 ) -> anyhow::Result<std::process::ExitCode> {
     match result {
         Ok(outcome) => {
@@ -1655,13 +1673,25 @@ fn finish(
                             outcome.model_steps
                         ))
                     ),
-                    StopReason::Answered => println!(
-                        "{}",
-                        Line::warn(&format!(
-                            "Answer ended after {} model step(s); task completion was not independently verified.",
-                            outcome.model_steps
-                        ))
-                    ),
+                    StopReason::Answered => {
+                        if execution.answer_is_the_terminal() {
+                            println!(
+                                "{}",
+                                Line::ok(&format!(
+                                    "Answered in {} model step(s).",
+                                    outcome.model_steps
+                                ))
+                            )
+                        } else {
+                            println!(
+                                "{}",
+                                Line::warn(&format!(
+                                    "Answer ended after {} model step(s); task completion was not independently verified.",
+                                    outcome.model_steps
+                                ))
+                            )
+                        }
+                    }
                     StopReason::Incomplete => println!(
                         "{}",
                         Line::warn(&format!(
@@ -1713,7 +1743,7 @@ fn finish(
                     "modified_files": outcome.modified_files,
                 }));
             }
-            Ok(outcome_exit_code(outcome.stop_reason))
+            Ok(outcome_exit_code(outcome.stop_reason, execution))
         }
         Err(leveler_app::AppError::Agent(leveler_agent::AgentError::Cancelled)) => {
             if output == OutputFormat::Text {
@@ -3213,9 +3243,10 @@ mod handover_recovery_tests {
 mod outcome_exit_code_tests {
     use super::{NOT_COMPLETED_EXIT_CODE, outcome_exit_code};
     use leveler_agent::StopReason;
+    use leveler_app::CollaborationExecution;
 
-    fn code(reason: StopReason) -> std::process::ExitCode {
-        outcome_exit_code(reason)
+    fn code(reason: StopReason, execution: CollaborationExecution) -> std::process::ExitCode {
+        outcome_exit_code(reason, execution)
     }
 
     /// The one contract an external caller depends on: an honest refusal is
@@ -3227,25 +3258,57 @@ mod outcome_exit_code_tests {
             StopReason::Blocked,
             StopReason::Stalled,
             StopReason::Incomplete,
-            StopReason::Answered,
             StopReason::BudgetExhausted,
             StopReason::TurnLimitReached,
         ] {
-            assert_eq!(
-                code(reason),
-                std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
-                "{reason:?}"
-            );
-            assert_ne!(
-                code(reason),
-                std::process::ExitCode::FAILURE,
-                "{reason:?} must not look like a crash"
-            );
+            for execution in [
+                CollaborationExecution::Goal,
+                CollaborationExecution::Chat,
+                CollaborationExecution::Plan,
+            ] {
+                assert_eq!(
+                    code(reason, execution),
+                    std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
+                    "{reason:?} / {execution:?}"
+                );
+                assert_ne!(
+                    code(reason, execution),
+                    std::process::ExitCode::FAILURE,
+                    "{reason:?} / {execution:?} must not look like a crash"
+                );
+            }
         }
     }
 
+    /// Goal succeeds only on a declared completion; an answer is unresolved.
     #[test]
-    fn only_completed_is_success() {
-        assert_eq!(code(StopReason::Completed), std::process::ExitCode::SUCCESS);
+    fn only_completed_is_success_for_goal() {
+        assert_eq!(
+            code(StopReason::Completed, CollaborationExecution::Goal),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(
+            code(StopReason::Answered, CollaborationExecution::Goal),
+            std::process::ExitCode::from(NOT_COMPLETED_EXIT_CODE),
+            "a goal that only answered has not been resolved"
+        );
+    }
+
+    /// Chat and Plan exist to answer: `Answered` is their own terminal, and a
+    /// declared goal completion stays success as well.
+    #[test]
+    fn answer_is_success_for_chat_and_plan() {
+        for execution in [CollaborationExecution::Chat, CollaborationExecution::Plan] {
+            assert_eq!(
+                code(StopReason::Answered, execution),
+                std::process::ExitCode::SUCCESS,
+                "{execution:?}"
+            );
+            assert_eq!(
+                code(StopReason::Completed, execution),
+                std::process::ExitCode::SUCCESS,
+                "{execution:?}"
+            );
+        }
     }
 }

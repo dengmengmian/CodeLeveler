@@ -10,6 +10,7 @@ mod active_turns;
 pub mod agents;
 mod checkpoints;
 mod children;
+mod collaboration;
 pub mod contribution_query;
 pub mod doctor;
 /// Engine events -> client events. Public so a recorded session can be replayed
@@ -39,6 +40,7 @@ mod user_shell;
 mod vcs;
 mod workspace_view;
 
+pub use collaboration::CollaborationExecution;
 pub use global_config::{GlobalConfig, GlobalConfigError};
 pub use interactive::InProcessRuntimeClient;
 pub use interactive::ui_thinking_state;
@@ -1305,8 +1307,7 @@ impl Application {
 pub(crate) fn axes_from_session_record(
     record: &leveler_storage::SessionRecord,
 ) -> CollaborationMode {
-    use std::str::FromStr;
-    CollaborationMode::from_str(&record.collaboration).unwrap_or(CollaborationMode::Chat)
+    collaboration::collaboration_mode(&record.collaboration)
 }
 
 /// Compatibility marker for old wire clients. The retired database column

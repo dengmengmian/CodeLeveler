@@ -67,6 +67,24 @@ fn goal_complete_tool_call() -> MockResponse {
     ])
 }
 
+/// A model that tries to write a file, then reports its result: the shape a
+/// read-only overlay has to refuse.
+fn write_file_tool_call() -> MockResponse {
+    sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "c-write",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": serde_json::json!({"path": "plan-wrote.txt", "content": "x"}).to_string()
+            }
+        }]}}]})
+        .to_string(),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}).to_string(),
+    ])
+}
+
 async fn harness(
     responses: Vec<MockResponse>,
 ) -> (
@@ -329,5 +347,197 @@ async fn chat_session_ordinary_submit_excludes_the_goal_executor() {
         !bodies[0].contains("\"update_goal\""),
         "a Chat session must not carry the goal executor: {}",
         bodies[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Headless entry (`run_in_session`), the path a CLI `leveler run` takes. The
+// axis must EXECUTE here too, not just decorate the row: before this, the
+// headless path called the goal engine unconditionally, so a chat session was
+// persisted as `chat` and run as a Goal.
+// ---------------------------------------------------------------------------
+
+/// One Application over the harness's layout with the axis chosen explicitly,
+/// the way the CLI does: `assemble(..).with_collaboration(axis)` then a headless
+/// `run_in_session` — never the interactive client.
+fn headless_app(tmp: &tempfile::TempDir, axis: leveler_agent::CollaborationMode) -> Application {
+    Application::assemble(Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    ))
+    .unwrap()
+    .with_collaboration(axis)
+}
+
+async fn run_headless(
+    app: &Application,
+    axis: leveler_agent::CollaborationMode,
+    task: &str,
+) -> leveler_agent::AgentOutcome {
+    run_headless_with(app, axis, task, Arc::new(leveler_execution::AutoApprove)).await
+}
+
+/// A headless turn under an explicit approver: the read-only overlay turns a
+/// non-Safe action into an approval question, so which approver answers decides
+/// whether the write lands.
+async fn run_headless_with(
+    app: &Application,
+    axis: leveler_agent::CollaborationMode,
+    task: &str,
+    approver: Arc<dyn leveler_execution::Approver>,
+) -> leveler_agent::AgentOutcome {
+    let model = ModelRef::new("mock", "m");
+    let session = app.create_session(&model, task).await.unwrap();
+    assert_eq!(
+        collaboration_of(app, &session).await,
+        axis.as_str(),
+        "the run must persist the axis it was assembled with"
+    );
+    app.run_in_session(
+        &session,
+        &model,
+        leveler_execution::PermissionProfile::Assisted,
+        task,
+        approver,
+        false,
+        &mut |_| {},
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+}
+
+/// Denies every approval. Proves the read-only overlay asks for a non-Safe
+/// action rather than silently allowing it.
+struct DenyAll;
+
+#[async_trait::async_trait]
+impl leveler_execution::Approver for DenyAll {
+    async fn decide(
+        &self,
+        _request: &leveler_execution::ApprovalRequest,
+    ) -> leveler_execution::ApprovalDecision {
+        leveler_execution::ApprovalDecision::Deny
+    }
+}
+
+/// A — headless chat runs the Chat TurnProfile: a textual final ends the turn
+/// as `Answered`, the goal continuation never starts, and the request exposes
+/// no `update_goal`.
+#[tokio::test]
+async fn headless_chat_runs_the_chat_profile() {
+    let (tmp, server, _app, _client) = harness(vec![text("hi there")]).await;
+    let app = headless_app(&tmp, leveler_agent::CollaborationMode::Chat);
+    let outcome = run_headless(&app, leveler_agent::CollaborationMode::Chat, "just chat").await;
+
+    assert_eq!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::Answered,
+        "a chat answer is the terminal"
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "a chat turn is not continued by the goal lifecycle"
+    );
+    let bodies = server.request_bodies().await;
+    assert!(
+        !bodies[0].contains("\"update_goal\""),
+        "a chat request must not carry the goal executor: {}",
+        bodies[0]
+    );
+}
+
+/// B — headless goal keeps the Goal terminal contract: a quiet final is
+/// continued, never accepted as completion.
+#[tokio::test]
+async fn headless_goal_quiet_answer_is_continued_not_completed() {
+    let (tmp, server, _app, _client) = harness(vec![text("looks done to me")]).await;
+    let app = headless_app(&tmp, leveler_agent::CollaborationMode::Goal);
+    let outcome = run_headless(&app, leveler_agent::CollaborationMode::Goal, "drive it").await;
+
+    assert_ne!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "going quiet is not a Goal completion"
+    );
+    assert!(
+        server.request_count() > 1,
+        "a Goal that went quiet must be continued (got {} request(s))",
+        server.request_count()
+    );
+}
+
+/// B — an explicit `update_goal` is what completes a headless Goal.
+#[tokio::test]
+async fn headless_goal_declared_completion_is_completed() {
+    let (tmp, _server, _app, _client) = harness(vec![goal_complete_tool_call()]).await;
+    let app = headless_app(&tmp, leveler_agent::CollaborationMode::Goal);
+    let outcome = run_headless(&app, leveler_agent::CollaborationMode::Goal, "drive it").await;
+
+    assert_eq!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::Completed,
+        "update_goal(complete) is the Goal terminal"
+    );
+}
+
+/// C — headless plan keeps the read-only contract: the answer terminal, no
+/// `update_goal`, and a write the model attempts is refused. Under the daily
+/// Assisted profile the overlay turns a non-Safe action into an approval
+/// question, so the refusal is observed with a denying approver; the Chat
+/// control below shows the same approver does NOT block a normal write — the
+/// overlay is what refuses it.
+#[tokio::test]
+async fn headless_plan_stays_read_only_with_no_completion_authority() {
+    let (tmp, server, _app, _client) =
+        harness(vec![write_file_tool_call(), text("plan: do X")]).await;
+    let app = headless_app(&tmp, leveler_agent::CollaborationMode::Plan);
+    let outcome = run_headless_with(
+        &app,
+        leveler_agent::CollaborationMode::Plan,
+        "plan it",
+        Arc::new(DenyAll),
+    )
+    .await;
+
+    assert_eq!(
+        outcome.stop_reason,
+        leveler_agent::StopReason::Answered,
+        "plan ends on its answer and has no completion authority"
+    );
+    let bodies = server.request_bodies().await;
+    assert!(
+        !bodies[0].contains("\"update_goal\""),
+        "plan must not carry the goal executor: {}",
+        bodies[0]
+    );
+    assert!(
+        !tmp.path().join("plan-wrote.txt").exists(),
+        "a read-only plan turn must not write"
+    );
+}
+
+/// C control — without the read-only overlay the denying approver is never
+/// consulted for an ordinary workspace write, so the write lands. This pins
+/// that the plan refusal above comes from the overlay, not from the approver.
+#[tokio::test]
+async fn headless_chat_allows_the_workspace_write_plan_refuses() {
+    let (tmp, _server, _app, _client) =
+        harness(vec![write_file_tool_call(), text("wrote it")]).await;
+    let app = headless_app(&tmp, leveler_agent::CollaborationMode::Chat);
+    let outcome = run_headless_with(
+        &app,
+        leveler_agent::CollaborationMode::Chat,
+        "write it",
+        Arc::new(DenyAll),
+    )
+    .await;
+
+    assert_eq!(outcome.stop_reason, leveler_agent::StopReason::Answered);
+    assert!(
+        tmp.path().join("plan-wrote.txt").exists(),
+        "a chat turn has no read-only overlay: an ordinary workspace write is not held for approval"
     );
 }

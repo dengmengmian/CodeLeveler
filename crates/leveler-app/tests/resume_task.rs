@@ -96,7 +96,7 @@ struct Fixture {
     _server: MockServer,
 }
 
-async fn fixture(responses: Vec<MockResponse>) -> Fixture {
+async fn fixture(responses: Vec<MockResponse>, axis: leveler_agent::CollaborationMode) -> Fixture {
     isolate_global_config();
     let server = MockServer::start(responses).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -111,10 +111,10 @@ async fn fixture(responses: Vec<MockResponse>) -> Fixture {
     let app = Arc::new(
         Application::assemble(layout)
             .unwrap()
-            // The fixture distinguishes a resume from an ordinary fallback
-            // message by the turn it writes; a Chat session keeps that
-            // fallback an ordinary chat turn.
-            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+            // The axis is the fixture's: a Goal session runs the goal profile
+            // these tests are about, while a Chat session keeps a `继续` with
+            // nothing to resume an ordinary chat turn.
+            .with_collaboration(axis),
     );
     let session = app
         .create_session(&ModelRef::new("mock", "m"), "finish the inventory work")
@@ -201,7 +201,7 @@ async fn settled(app: &Application, session: &leveler_core::SessionId, min_turns
 /// task's goal, seeds its plan, and carries the amendment as an addition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn continuation_resumes_the_logical_task_and_seeds_its_plan() {
-    let f = fixture(interrupted_work()).await;
+    let f = fixture(interrupted_work(), leveler_agent::CollaborationMode::Goal).await;
     let model = ModelRef::new("mock", "m");
 
     // A window that ends early: two rounds, plan still open.
@@ -351,10 +351,13 @@ async fn continuation_resumes_the_logical_task_and_seeds_its_plan() {
 /// No resumable task: `继续` is an ordinary message, not a resume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn continuation_without_a_resumable_task_is_an_ordinary_message() {
-    let f = fixture(vec![sse(vec![
-        serde_json::json!({"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]})
-            .to_string(),
-    ])])
+    let f = fixture(
+        vec![sse(vec![
+            serde_json::json!({"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]})
+                .to_string(),
+        ])],
+        leveler_agent::CollaborationMode::Chat,
+    )
     .await;
     let client: Arc<dyn InteractiveRuntimeClient> = Arc::new(InProcessRuntimeClient::new(
         f.app.clone(),

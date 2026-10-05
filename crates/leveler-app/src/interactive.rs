@@ -440,9 +440,10 @@ fn emit_project_rules(events: &broadcast::Sender<RuntimeEvent>, repo: Option<&Pa
 /// Whether a plain Enter / SubmitMessage should use the Goal turn profile
 /// (`update_goal` / goal_mode) instead of Chat content turn.
 ///
-/// Pure policy: single mapping table for TUI, remote clients, and tests.
+/// Pure policy: the collaboration dispatch owns the answer, so TUI, remote
+/// clients, tests and the runtime cannot disagree about which axis is Goal.
 pub(crate) fn collaboration_routes_submit_to_goal(collaboration: &str) -> bool {
-    collaboration.eq_ignore_ascii_case("goal")
+    crate::CollaborationExecution::of_wire(collaboration).runs_goal_lifecycle()
 }
 
 /// Whether a persisted task terminal is one a `继续` may re-enter through the

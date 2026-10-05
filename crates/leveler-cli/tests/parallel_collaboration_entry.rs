@@ -305,9 +305,9 @@ async fn omitted_parallel_axis_is_goal() {
 /// E — `chat` without `--parallel` is not part of the parallel contract and
 /// stays legal: the new refusal must not capture the single-agent path.
 ///
-/// Only the parallel entry is asserted here. The headless single-agent chat
-/// terminal is owned by the goal-lifecycle routing in `run_in_session` and is
-/// deliberately out of scope for this change.
+/// The single-agent terminal itself is owned by the collaboration dispatch and
+/// covered end-to-end in `headless_collaboration_execution.rs`; here only the
+/// boundary is asserted.
 #[tokio::test]
 async fn chat_without_parallel_is_not_refused_by_the_parallel_contract() {
     let server = MockServer::start_one(text_response("done")).await;
@@ -323,9 +323,13 @@ async fn chat_without_parallel_is_not_refused_by_the_parallel_contract() {
         ],
         &log,
     );
-    let _status = wait_for(child, &log, Duration::from_secs(120)).await;
+    let status = wait_for(child, &log, Duration::from_secs(120)).await;
     let rendered = read_log(&log);
 
+    assert!(
+        status.success(),
+        "a single-agent chat run must succeed:\n{rendered}"
+    );
     assert!(
         !rendered.contains("collaboration=goal"),
         "the parallel contract must not capture a single-agent run:\n{rendered}"
