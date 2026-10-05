@@ -974,6 +974,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_chip_shows_the_collaboration_axis() {
+        let mut state = test_state();
+        state.model_label = "deepseek/deepseek-v4-flash".into();
+        state.thinking = None;
+        state.mode_label = "Assisted".into();
+        for axis in ["goal", "chat", "plan"] {
+            state.collaboration = axis.into();
+            let chip = runtime_status_chip(&state, 80);
+            assert!(
+                chip.contains(axis),
+                "the current session axis must be visible without knowing a slash command: {chip}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_chip_keeps_provider_when_model_names_collide() {
         let mut state = test_state();
         state.model_label = "openai/gpt-5".into();

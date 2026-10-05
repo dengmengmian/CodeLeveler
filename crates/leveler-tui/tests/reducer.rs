@@ -5047,6 +5047,10 @@ fn slash_goal_runs_explicit_goal_command() {
     );
     assert!(s.composer.is_empty());
     assert!(s.goal_mode_active);
+    assert_eq!(
+        s.collaboration, "goal",
+        "`/goal <task>` is a durable goal axis, mirrored locally for the status chip"
+    );
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     assert!(!s.goal_mode_active);
 }

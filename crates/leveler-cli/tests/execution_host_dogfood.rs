@@ -252,6 +252,7 @@ async fn start_service(
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::AutoApprove,
             goal: "Start this user-requested persistent Python development HTTP service".into(),

@@ -194,8 +194,8 @@ thinking = "low"
 | 打开终端界面 | `leveler` 或 `leveler tui` |
 | 运行完整开发工作流 | 在 TUI 中输入 `/develop <目标>` |
 | 打开浏览器界面 | `leveler web` |
-| 无界面运行一个任务 | `leveler run "…"` |
-| 一直运行到目标得到终态 | `leveler run "…" --collaboration goal` |
+| 无界面运行一个任务（默认一直运行到目标终态） | `leveler run "…"` |
+| 回答一条消息后结束 | `leveler run "…" --collaboration chat` |
 | 在隔离 worktree 中运行并行候选 | `leveler run "…" --parallel 3` |
 | 在 TUI 中继续会话 | `leveler resume [session-id]` |
 | 查看会话事件记录 | `leveler trace [session-id]` |

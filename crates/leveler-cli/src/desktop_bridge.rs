@@ -257,6 +257,13 @@ impl Bridge {
                     .as_ref()
                     .and_then(|layout| layout.primary_workspace());
                 let request = CreateSessionRequest {
+                    collaboration: match params.get("collaboration") {
+                        Some(value) if !value.is_null() => serde_json::from_value(value.clone())?,
+                        // Desktop has no axis selector yet: a new session gets
+                        // the product default, the same one the daemon
+                        // resolves for a request that omits the field.
+                        _ => leveler_local_transport::CollaborationMode::default(),
+                    },
                     workspace: workspace.map_or(CreateWorkspaceSelection::None, |root| {
                         CreateWorkspaceSelection::Workspace {
                             path: root.display().to_string(),

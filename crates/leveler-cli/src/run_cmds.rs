@@ -116,8 +116,12 @@ pub(crate) async fn cmd_run_parallel(
     model: Option<String>,
     mode: Option<RunMode>,
     parallel: usize,
+    collaboration: leveler_lifecycle::CollaborationMode,
 ) -> anyhow::Result<std::process::ExitCode> {
-    let app = Application::assemble(layout)?;
+    // The explicit CLI axis wins over the product default here exactly as it
+    // does on the single-agent path: `parallel_edit` reads this Application's
+    // resolved collaboration for both the parent session and every child.
+    let app = Application::assemble(layout)?.with_collaboration(collaboration);
     let model_ref = resolve_model(&app, model)?;
     let execution_mode = resolve_mode(mode, project_default_mode(&app.layout));
 
@@ -835,6 +839,10 @@ pub(crate) async fn cmd_tui(
             }
             let bootstrap = client
                 .create_session(CreateSessionRequest {
+                    // The product default for a new Coding Session. A user who
+                    // wants conversation switches with `/collab chat`; nothing
+                    // inspects the first prompt to decide this.
+                    collaboration: leveler_local_transport::CollaborationMode::default(),
                     workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
                     goal: "interactive session".to_string(),
                     model,

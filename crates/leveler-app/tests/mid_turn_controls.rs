@@ -122,7 +122,13 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
         tmp.path().join("configs"),
         tmp.path().join("state"),
     );
-    let app = Arc::new(Application::assemble(layout).unwrap());
+    let app = Arc::new(
+        Application::assemble(layout)
+            .unwrap()
+            // These tests control one running child/command; the surrounding
+            // turn is an ordinary chat exchange that ends on its answer.
+            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+    );
     let model = ModelRef::new("mock", "m");
     let session = app.create_session(&model, "goal").await.unwrap();
     let client = Arc::new(InProcessRuntimeClient::new(app, model, profile, false));

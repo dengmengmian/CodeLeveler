@@ -124,7 +124,14 @@ limits: {{ context_window: {window}, reliable_context: {reliable}, max_output_to
         tmp.path().join("configs"),
         tmp.path().join("state"),
     );
-    let app = Arc::new(Application::assemble(layout).unwrap());
+    let app = Arc::new(
+        Application::assemble(layout)
+            .unwrap()
+            // These tests exercise context, thinking and `/btw` — every main
+            // turn is an ordinary exchange that ends when the model answers,
+            // so the session is explicitly Chat rather than the goal default.
+            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+    );
     let model = ModelRef::new("mock", "m");
     let session = app.create_session(&model, "goal").await.unwrap();
     let client = Arc::new(InProcessRuntimeClient::new(

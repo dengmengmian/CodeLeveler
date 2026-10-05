@@ -636,6 +636,7 @@ async fn auto_approve_is_per_session_and_restore_is_fail_closed_body() {
     // A trusted-local create with AutoApprove is honored and stored per-session.
     let approving = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: ApprovalPolicy::AutoApprove,
             goal: "unattended".to_string(),
@@ -701,6 +702,7 @@ async fn transport_trust_controls_real_session_approval_policy_body() {
     .await
     .unwrap();
     let request = || CreateSessionRequest {
+        collaboration: leveler_local_transport::CollaborationMode::Chat,
         workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
         approval_policy: ApprovalPolicy::AutoApprove,
         goal: "transport approval contract".to_string(),
@@ -763,6 +765,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session_body() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
@@ -773,6 +776,7 @@ async fn daemon_session_runtime_options_are_isolated_per_session_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
@@ -831,6 +835,7 @@ async fn creating_a_daemon_session_does_not_reap_another_live_turn_body() {
 
     client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "another session".to_string(),
@@ -861,6 +866,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session_body() {
     let (_tmp, app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
@@ -871,6 +877,7 @@ async fn daemon_snapshots_keep_checkpoints_scoped_to_their_session_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
@@ -920,6 +927,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
     let (_tmp, _app, client, _existing_session) = build_client().await;
     let first = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first".to_string(),
@@ -930,6 +938,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second".to_string(),
@@ -980,6 +989,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
 
     let first = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "first over socket".to_string(),
@@ -990,6 +1000,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
         .unwrap();
     let second = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "second over socket".to_string(),
@@ -1152,6 +1163,7 @@ async fn first_message_retitles_a_placeholder_session_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let bootstrap = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "interactive session".to_string(),
@@ -1186,6 +1198,7 @@ async fn first_message_retitles_a_placeholder_session_body() {
 
     let named = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "已有正式目标".to_string(),
@@ -1308,6 +1321,78 @@ async fn session_menu_rename_archive_fork_roundtrip_body() {
     );
 }
 
+/// Fork and `/clear` are internal callers that copy a session's axis from the
+/// source row. With an explicit Chat source they must stay Chat: neither may
+/// fall back to `CollaborationMode::default()`, which is Goal.
+#[test]
+fn internal_session_copies_inherit_an_explicit_chat_axis() {
+    leveler_test_support::bounded_test(
+        "internal_session_copies_inherit_an_explicit_chat_axis",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        internal_session_copies_inherit_an_explicit_chat_axis_body,
+    );
+}
+
+async fn internal_session_copies_inherit_an_explicit_chat_axis_body() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let db = app.open_database().await.unwrap();
+    let sessions = leveler_storage::SessionRepository::new(&db);
+
+    // Make the axis an explicit chat choice, not the product default.
+    client
+        .send(ClientCommand::SetProductAxes {
+            session_id: session_id.clone(),
+            work_profile: "single".to_string(),
+            collaboration: "chat".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions
+            .get(&session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .collaboration,
+        "chat"
+    );
+
+    // Fork reads the source row.
+    client
+        .send(ClientCommand::ForkSession {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let all = sessions.list().await.unwrap();
+    let fork = all
+        .iter()
+        .find(|r| r.id != session_id.as_str())
+        .expect("forked session listed");
+    assert_eq!(
+        fork.collaboration, "chat",
+        "fork must inherit the source axis, not the CollaborationMode default"
+    );
+    let fork_id = fork.id.clone();
+
+    // `/clear` opens a sibling under the requester's axis.
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let all = sessions.list().await.unwrap();
+    let cleared = all
+        .iter()
+        .find(|r| r.id != session_id.as_str() && r.id != fork_id)
+        .expect("sibling session listed");
+    assert_eq!(
+        cleared.collaboration, "chat",
+        "`/clear` must inherit the requester's axis, not the enum default"
+    );
+}
+
 /// `/clear` must be a fresh start, not a wipe: the previous session keeps its
 /// transcript and stays listed, so the move is reversible by reopening it.
 #[test]
@@ -1404,6 +1489,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let onlooker = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "onlooker".to_string(),
@@ -1414,6 +1500,7 @@ async fn a_new_session_reaches_only_the_tab_that_asked_for_it_body() {
         .unwrap();
     let requester = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "requester".to_string(),
@@ -1489,6 +1576,7 @@ async fn resume_reasserts_the_sessions_auto_approve_policy_on_a_fresh_runtime_bo
     // A second, untouched session for the leak check.
     let other = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: ApprovalPolicy::Interactive,
             goal: "bystander".to_string(),
@@ -1547,6 +1635,7 @@ async fn a_restored_checkpoint_says_where_it_landed_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let opened = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "restore".to_string(),
@@ -1608,6 +1697,7 @@ async fn a_forked_session_tells_the_session_it_was_forked_from_body() {
     let (_tmp, app, client, _existing) = build_client().await;
     let opened = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "fork me".to_string(),
@@ -1651,6 +1741,7 @@ async fn no_workspace_session_persists_none_and_cannot_start_a_user_shell() {
         );
         let bootstrap = runtime
             .create_session(CreateSessionRequest {
+                collaboration: leveler_local_transport::CollaborationMode::Chat,
                 workspace: leveler_local_transport::CreateWorkspaceSelection::None,
                 goal: "polish this sentence".into(),
                 model: None,
@@ -1717,7 +1808,13 @@ async fn no_workspace_chat_uses_the_existing_runtime_and_restores_answer_and_ter
     let home = leveler_core::LevelerHome::from_root(tmp.path().join("home"));
     let make_layout = || Layout::no_workspace(home.clone(), Some(tmp.path().join("configs")));
     let id = {
-        let app = Arc::new(Application::assemble(make_layout()).unwrap());
+        let app = Arc::new(
+            Application::assemble(make_layout())
+                .unwrap()
+                // This test's contract is the chat terminal (`TurnAnswered`),
+                // so the session is explicitly a chat session.
+                .with_collaboration(leveler_agent::CollaborationMode::Chat),
+        );
         let runtime = InProcessRuntimeClient::new(
             app.clone(),
             ModelRef::new("mock", "m"),
@@ -1778,6 +1875,7 @@ async fn a_repository_source_refuses_explicit_no_workspace_creation() {
     let (_tmp, app, runtime, _) = build_client().await;
     let result = runtime
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::None,
             goal: "must not inherit repository".into(),
             model: None,
@@ -1790,6 +1888,7 @@ async fn a_repository_source_refuses_explicit_no_workspace_creation() {
     );
     let bootstrap = runtime
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             goal: "legacy repository task".into(),
             model: None,

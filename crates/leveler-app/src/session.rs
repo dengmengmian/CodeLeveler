@@ -388,7 +388,8 @@ impl Application {
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
         self.reap_zombie_turns(&db, None).await?;
-        self.insert_session(&db, model, goal, mode).await
+        self.insert_session(&db, model, goal, mode, self.collaboration())
+            .await
     }
 
     /// Clear the zombie `running` turns dead boots left behind, optionally
@@ -435,14 +436,20 @@ impl Application {
     /// Create a session inside a long-lived daemon. Startup performs the zombie
     /// reap once; doing it for every new session would interrupt unrelated live
     /// turns owned by the same daemon.
+    ///
+    /// `collaboration` is resolved by the caller (the transport request, or the
+    /// process default) so the durable row and the running config are written
+    /// from one decision.
     pub(crate) async fn create_daemon_session(
         &self,
         model: &ModelRef,
         goal: &str,
         mode: PermissionProfile,
+        collaboration: leveler_lifecycle::CollaborationMode,
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
-        self.insert_session(&db, model, goal, mode).await
+        self.insert_session(&db, model, goal, mode, collaboration)
+            .await
     }
 
     async fn insert_session(
@@ -451,6 +458,7 @@ impl Application {
         model: &ModelRef,
         goal: &str,
         mode: PermissionProfile,
+        collaboration: leveler_lifecycle::CollaborationMode,
     ) -> Result<leveler_core::SessionId, AppError> {
         self.task_engine(db)?
             .create_task(&leveler_engine::NewSession {
@@ -464,7 +472,7 @@ impl Application {
                 sandbox: false,
                 kind: ExecutionKind::Direct,
                 axes: Some(leveler_engine::NewSessionAxes {
-                    collaboration: self.collaboration().as_str().to_string(),
+                    collaboration: collaboration.as_str().to_string(),
                 }),
             })
             .await
@@ -1152,7 +1160,9 @@ mod turn_axes_tests {
     #[tokio::test]
     async fn a_missing_row_uses_collaboration_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let app = isolated_app(&tmp);
+        // A row-less turn reads the Application's configured default, not a
+        // hardcoded axis: an explicit Plan app yields Plan.
+        let app = isolated_app(&tmp).with_collaboration(CollaborationMode::Plan);
         let db = app.open_database().await.unwrap();
         assert_eq!(
             app.turn_axes(
@@ -1161,7 +1171,7 @@ mod turn_axes_tests {
             )
             .await
             .unwrap(),
-            CollaborationMode::Chat
+            CollaborationMode::Plan
         );
     }
 }

@@ -1014,8 +1014,12 @@ impl InProcessRuntimeClient {
                 model,
                 mode,
                 sandbox,
-                // Default: plain conversation (no update_goal gate).
-                collaboration: "chat".into(),
+                // A session the transport creates resolves its axis from the
+                // request; this is the fallback for a session attached without
+                // one. Same product default as a fresh Application.
+                collaboration: leveler_lifecycle::CollaborationMode::default()
+                    .as_str()
+                    .to_string(),
                 // Per-session default; the daemon-wide `auto_approve` still
                 // applies as the fallback in `approver`.
                 approval_policy: ApprovalPolicy::Interactive,
@@ -3765,7 +3769,26 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 content,
             } => {
-                let config = self.runtime_config(&session_id).await?;
+                let mut config = self.runtime_config(&session_id).await?;
+                // `/goal <task>` is a durable product-axis decision, not a
+                // one-turn override. Write the session row to `goal` before
+                // the turn starts so ordinary submissions after it — and after
+                // a resume — stay in the goal profile until an explicit
+                // `/goal clear` or `/collab chat` flips the axis back. This is
+                // the runtime's single mapping for every client; no client
+                // carries its own goal flag.
+                if config.collaboration != leveler_lifecycle::CollaborationMode::Goal.as_str() {
+                    config.collaboration = leveler_lifecycle::CollaborationMode::Goal
+                        .as_str()
+                        .to_string();
+                    self.persist_runtime_config(&session_id, config.clone())
+                        .await?;
+                    if let Ok(session) = self.snapshot(&session_id).await {
+                        let _ = self
+                            .events_for(&session_id)
+                            .send(RuntimeEvent::SessionUpdated { session });
+                    }
+                }
                 let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
                 let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
                 if self.durable_wire_ack {
@@ -4220,7 +4243,15 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 config.thinking = None;
                 match self
                     .app
-                    .create_daemon_session(&config.model, PLACEHOLDER_GOAL, config.mode)
+                    .create_daemon_session(
+                        &config.model,
+                        PLACEHOLDER_GOAL,
+                        config.mode,
+                        // `/clear` opens a sibling conversation under the
+                        // caller's own axis; an unreadable value falls back to
+                        // the product default rather than guessing chat.
+                        config.collaboration.parse().unwrap_or_default(),
+                    )
                     .await
                 {
                     Ok(session_id) => {
@@ -5352,7 +5383,12 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         }
         let session_id = self
             .app
-            .create_daemon_session(&model, &request.goal, execution_mode(request.mode))
+            .create_daemon_session(
+                &model,
+                &request.goal,
+                execution_mode(request.mode),
+                request.collaboration,
+            )
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         self.persist_runtime_config(
@@ -5361,7 +5397,10 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 model: model.clone(),
                 mode: execution_mode(request.mode),
                 sandbox: self.default_runtime.sandbox,
-                collaboration: self.default_runtime.collaboration.clone(),
+                // The axis the client asked for, written to the row above and
+                // mirrored here so the first turn runs under it without a
+                // re-read. One resolution, two views of the same fact.
+                collaboration: request.collaboration.as_str().to_string(),
                 approval_policy: request.approval_policy,
                 thinking: None,
             },

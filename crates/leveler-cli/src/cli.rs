@@ -302,9 +302,9 @@ pub enum Command {
         )]
         max_model_steps: Option<u32>,
         /// Collaboration axis: chat | plan | goal.
-        /// Default **chat** (ordinary turns). Use `goal` for
-        /// long runs that must call update_goal to finish.
-        #[arg(long, default_value = "chat")]
+        /// Default **goal** (a task is driven to completion). Use `chat` for
+        /// an ordinary conversation that ends when the model answers.
+        #[arg(long, default_value = "goal")]
         collaboration: String,
         /// Run N agents concurrently in isolated worktrees and integrate the
         /// results (>=2 enables parallel multi-agent editing).

@@ -846,6 +846,7 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication_body() {
     let client = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "crash me".to_string(),
@@ -988,6 +989,7 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped_b
         .unwrap();
     let daemon_session = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "daemon work".to_string(),
@@ -1126,6 +1128,7 @@ async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "shell work".to_string(),
@@ -1231,6 +1234,7 @@ async fn sigkill_after_durable_ack_before_transcript_append_recovers_once_body()
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "deterministic crash".to_string(),
@@ -1380,6 +1384,7 @@ async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart_body()
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "receipt crash".to_string(),
@@ -1525,6 +1530,7 @@ async fn connected_client_recovers_after_daemon_sigkill_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "survive the crash".to_string(),
@@ -1641,6 +1647,7 @@ async fn no_workspace_host_durably_admits_and_restores_after_process_restart_bod
     let first_info = LocalRuntimeService::runtime_info(&client).await.unwrap();
     let bootstrap = client
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::None,
             goal: "no workspace persisted task".into(),
             model: None,
@@ -1827,6 +1834,7 @@ async fn global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected_bod
         .unwrap();
     let boot_a = client_a
         .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "A history".into(),
             model: None,
@@ -1879,4 +1887,222 @@ async fn global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected_bod
             .unwrap()
             .runtime_id
     );
+}
+
+// ── Collaboration entry / persistence smoke ────────────────────────────────
+
+/// A fresh ordinary session through the *real* daemon: no `/goal`, no explicit
+/// axis. It must be Goal durably, its ordinary composer submit must enter the
+/// goal executor, an explicit Chat switch must make the next answer terminal,
+/// and switching back to Goal must survive a reconnect.
+#[test]
+fn collaboration_entry_smoke_is_goal_by_default_and_switchable() {
+    leveler_test_support::bounded_test(
+        "collaboration_entry_smoke_is_goal_by_default_and_switchable",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        collaboration_entry_smoke_body,
+    );
+}
+
+fn smoke_sse(frames: Vec<serde_json::Value>) -> leveler_test_support::MockResponse {
+    let mut body = String::new();
+    for frame in frames {
+        body.push_str("data: ");
+        body.push_str(&frame.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    leveler_test_support::MockResponse::Sse { body }
+}
+
+fn smoke_text(content: &str) -> leveler_test_support::MockResponse {
+    smoke_sse(vec![serde_json::json!({
+        "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
+    })])
+}
+
+fn smoke_goal_complete() -> leveler_test_support::MockResponse {
+    smoke_sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "c-goal",
+            "type": "function",
+            "function": {
+                "name": "update_goal",
+                "arguments": serde_json::json!({"status": "complete", "summary": "smoke done"})
+                    .to_string()
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// The terminal the runtime published for one turn.
+async fn smoke_wait_terminal(rx: &mut broadcast::Receiver<RuntimeEvent>) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(event)) => match event {
+                RuntimeEvent::TurnAnswered => return "answered".to_string(),
+                RuntimeEvent::TurnCompleted
+                | RuntimeEvent::TurnCompletedWithWarnings { .. }
+                | RuntimeEvent::TurnTruncated { .. }
+                | RuntimeEvent::TurnIncomplete { .. } => return "completed".to_string(),
+                RuntimeEvent::TurnFailed { error, .. } => return format!("failed: {error}"),
+                RuntimeEvent::TurnCancelled => return "cancelled".to_string(),
+                _ => continue,
+            },
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => panic!("the turn never settled"),
+        }
+    }
+}
+
+async fn collaboration_entry_smoke_body() {
+    use leveler_storage::{GoalStore, SessionRepository, TaskStore};
+
+    let server = leveler_test_support::MockServer::start(vec![
+        smoke_goal_complete(),
+        smoke_text("smoke answer"),
+    ])
+    .await;
+    let env = test_env(&server.base_url());
+    let ready = env.home.join("ready.json");
+    let mut daemon = spawn_serve(&env, &ready);
+    wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    let socket = find_socket(&env);
+    let client = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
+
+    // 1) A brand-new ordinary session, exactly like `leveler tui` creates one:
+    //    no `/goal` was typed, and the axis is the product default.
+    let session = client
+        .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::default(),
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "smoke: ordinary new session".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    let snapshot = client.snapshot(&session).await.unwrap();
+    assert_eq!(
+        snapshot.collaboration.as_deref(),
+        Some("goal"),
+        "a new Coding Session must report goal, not chat"
+    );
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let record = SessionRepository::new(&db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.collaboration, "goal", "sessions.collaboration");
+    eprintln!(
+        "[smoke] created {session}: sessions.collaboration={}",
+        record.collaboration
+    );
+
+    // 2) An ordinary composer submit enters the goal executor (update_goal is
+    //    only exposed when executor.goal_mode is on).
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "do the work".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(smoke_wait_terminal(&mut rx).await, "completed");
+    let goal_body = server.request_bodies().await.swap_remove(0);
+    assert!(
+        goal_body.contains("\"update_goal\""),
+        "executor.goal_mode must be on for a default session: {goal_body}"
+    );
+    eprintln!(
+        "[smoke] ordinary submit executor.goal_mode={}",
+        goal_body.contains("\"update_goal\"")
+    );
+    let task = TaskStore::task_for_session(&db, &session)
+        .await
+        .unwrap()
+        .expect("the goal turn opens a task");
+    let goals = GoalStore::for_task(&db, &task).await.unwrap();
+    assert_eq!(
+        goals.len(),
+        1,
+        "the goal turn opens exactly one goal record"
+    );
+    eprintln!("[smoke] goals record: {:?}", goals);
+
+    // 3) Explicit Chat: the next ordinary question ends on its answer.
+    client
+        .send(ClientCommand::SetProductAxes {
+            session_id: session.clone(),
+            work_profile: "single".to_string(),
+            collaboration: "chat".to_string(),
+        })
+        .await
+        .unwrap();
+    let snapshot = client.snapshot(&session).await.unwrap();
+    assert_eq!(snapshot.collaboration.as_deref(), Some("chat"));
+    let record = SessionRepository::new(&db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.collaboration, "chat");
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "just answer me".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        smoke_wait_terminal(&mut rx).await,
+        "answered",
+        "in Chat an assistant final IS the terminal (Answered)"
+    );
+    eprintln!(
+        "[smoke] chat collaboration={:?}, terminal=answered",
+        snapshot.collaboration
+    );
+
+    // 4) Back to Goal, durable across a reconnect.
+    client
+        .send(ClientCommand::SetProductAxes {
+            session_id: session.clone(),
+            work_profile: "single".to_string(),
+            collaboration: "goal".to_string(),
+        })
+        .await
+        .unwrap();
+    let record = SessionRepository::new(&db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.collaboration, "goal");
+    drop(db);
+    drop(client);
+
+    let resumed = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
+    let snapshot = resumed.snapshot(&session).await.unwrap();
+    assert_eq!(
+        snapshot.collaboration.as_deref(),
+        Some("goal"),
+        "the durable axis survives a reconnect"
+    );
+    drop(resumed);
+    stop_daemon(&mut daemon);
 }

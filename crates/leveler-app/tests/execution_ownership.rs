@@ -464,9 +464,20 @@ async fn windows_with(profile: PermissionProfile) -> Windows {
         .with_durable_wire_ack(),
         app,
     };
-    let a = window(Arc::new(Application::assemble(layout(tmp.path())).unwrap()));
+    let a = window(Arc::new(
+        Application::assemble(layout(tmp.path()))
+            .unwrap()
+            // Each of these tests drives one ordinary exchange and then reads
+            // ownership off the settled turn; Chat is the profile whose first
+            // answer ends the turn.
+            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+    ));
     let session = a.app.create_session(&model, "shared").await.unwrap();
-    let b = window(Arc::new(Application::assemble(layout(tmp.path())).unwrap()));
+    let b = window(Arc::new(
+        Application::assemble(layout(tmp.path()))
+            .unwrap()
+            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+    ));
     assert_eq!(a.app.runtime_id().unwrap(), b.app.runtime_id().unwrap());
     assert_ne!(a.boot(), b.boot());
     Windows {

@@ -1094,6 +1094,11 @@ fn run_goal(state: &mut AppState, command: &str) -> Vec<Effect> {
             });
             start_turn(state);
             state.goal_mode_active = true;
+            // Mirror the durable axis the runtime writes for `/goal <task>`:
+            // the session is now a goal session, not a one-turn override, so
+            // the status chip and `/goal clear` read the same value the row
+            // holds. The runtime is the authority; this is the client's view.
+            state.collaboration = "goal".into();
             let command = ClientCommand::RunGoal {
                 session_id: state.session_id.clone(),
                 content: rest,

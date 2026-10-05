@@ -732,6 +732,7 @@ mod tests {
             .add_daemon(PathBuf::from("/daemon"), daemon.clone())
             .await;
         let request = CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "g".to_string(),
@@ -756,6 +757,7 @@ mod tests {
         assert!(matches!(
             router
                 .create_session_for(Path::new("/missing"), CreateSessionRequest {
+                    collaboration: leveler_local_transport::CollaborationMode::Chat,
                     workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
                     approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                     goal: "g".to_string(),

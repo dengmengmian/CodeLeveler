@@ -16,6 +16,11 @@ use leveler_client_protocol::{CommandEnvelope, ProtocolEnvelope};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+/// Re-exported so every client that builds a
+/// [`CreateSessionRequest`] names the collaboration axis through one type
+/// instead of inventing its own string vocabulary.
+pub use leveler_lifecycle::CollaborationMode;
+
 /// What kind of client opened a subscription.
 ///
 /// The daemon serves every subscriber identically; this exists so the *count*
@@ -113,6 +118,16 @@ pub struct CreateSessionRequest {
     /// remote/web boundary force-resets it so a remote client cannot elevate.
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
+    /// The collaboration axis this session is created with.
+    ///
+    /// `default` keeps old clients decodable, but the value it fills in is the
+    /// product default for a new Coding Session ([`CollaborationMode::Goal`]),
+    /// not a silent downgrade to chat: an omitted field and an explicit
+    /// `"chat"` are different requests. Resolved once at the daemon boundary
+    /// and written to the session row, so TUI/Desktop/Web/CLI never each carry
+    /// their own mode logic.
+    #[serde(default)]
+    pub collaboration: CollaborationMode,
 }
 
 /// Initial client state returned atomically with session creation.
@@ -1986,6 +2001,40 @@ mod tests {
         assert_eq!(request.workspace, CreateWorkspaceSelection::None);
     }
 
+    /// The collaboration axis round-trips as a stable snake_case string. An
+    /// omitted field is the *product* default (`goal`), not a silent chat
+    /// downgrade; `chat` is only ever an explicit value. An unknown value is
+    /// refused instead of guessed.
+    #[test]
+    fn collaboration_wire_contract_defaults_to_goal_and_refuses_unknown() {
+        let base = serde_json::json!({"goal":"g", "model":null, "mode":"assisted"});
+        let omitted: CreateSessionRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.collaboration, CollaborationMode::Goal);
+
+        let chat: CreateSessionRequest =
+            serde_json::from_value(with_collaboration(base.clone(), "chat")).unwrap();
+        assert_eq!(chat.collaboration, CollaborationMode::Chat);
+        assert_eq!(
+            serde_json::to_value(&chat).unwrap()["collaboration"],
+            serde_json::json!("chat")
+        );
+
+        let goal: CreateSessionRequest =
+            serde_json::from_value(with_collaboration(base.clone(), "goal")).unwrap();
+        assert_eq!(goal.collaboration, CollaborationMode::Goal);
+
+        let unknown = with_collaboration(base, "pair");
+        assert!(
+            serde_json::from_value::<CreateSessionRequest>(unknown).is_err(),
+            "an unknown collaboration value is a hard error, never a guessed mode"
+        );
+    }
+
+    fn with_collaboration(mut value: serde_json::Value, collaboration: &str) -> serde_json::Value {
+        value["collaboration"] = serde_json::json!(collaboration);
+        value
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn explicit_none_cannot_be_silently_downgraded_by_legacy_daemon() {
@@ -2035,6 +2084,7 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let result = client
             .create_session(CreateSessionRequest {
+                collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::None,
                 goal: "without workspace".into(),
                 model: None,
@@ -2165,6 +2215,7 @@ mod tests {
             "s3cret-token",
             WireRequest::CreateSession {
                 request: CreateSessionRequest {
+                    collaboration: CollaborationMode::Chat,
                     workspace: CreateWorkspaceSelection::RuntimeDefault,
                     approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                     goal: "tcp session".to_string(),
@@ -2503,6 +2554,7 @@ mod tests {
 
         let error = client
             .create_session(CreateSessionRequest {
+                collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
@@ -2716,6 +2768,7 @@ mod tests {
         let received = deadend_server(&path);
         let error = client
             .create_session(CreateSessionRequest {
+                collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "must not duplicate".to_string(),
@@ -2849,6 +2902,7 @@ mod tests {
 
     fn create_req(policy: ApprovalPolicy) -> CreateSessionRequest {
         CreateSessionRequest {
+            collaboration: CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "s".to_string(),
             model: None,
@@ -3119,6 +3173,7 @@ mod tests {
             .unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "tcp e2e".to_string(),
@@ -3293,6 +3348,7 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
                 goal: "interactive session".to_string(),

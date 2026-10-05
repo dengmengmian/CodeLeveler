@@ -647,7 +647,10 @@ impl Application {
             memory_events,
             execution_overrides: None,
             memory,
-            collaboration: CollaborationMode::Chat,
+            // One product default for a new Coding Session: Goal. Callers
+            // that resolved an explicit axis (`--collaboration`, the transport
+            // request) override it via `with_collaboration` or the create path.
+            collaboration: CollaborationMode::default(),
             model_step_ceiling: None,
             environment,
             background_tasks,

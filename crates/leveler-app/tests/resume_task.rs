@@ -108,7 +108,14 @@ async fn fixture(responses: Vec<MockResponse>) -> Fixture {
         tmp.path().join("configs"),
         tmp.path().join("state"),
     );
-    let app = Arc::new(Application::assemble(layout).unwrap());
+    let app = Arc::new(
+        Application::assemble(layout)
+            .unwrap()
+            // The fixture distinguishes a resume from an ordinary fallback
+            // message by the turn it writes; a Chat session keeps that
+            // fallback an ordinary chat turn.
+            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+    );
     let session = app
         .create_session(&ModelRef::new("mock", "m"), "finish the inventory work")
         .await

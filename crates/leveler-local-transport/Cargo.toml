@@ -10,6 +10,7 @@ description = "Trusted local transport for CodeLeveler runtime clients."
 
 [dependencies]
 leveler-client-protocol = { workspace = true }
+leveler-lifecycle = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 fs2 = { workspace = true }

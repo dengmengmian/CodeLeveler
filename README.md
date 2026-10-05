@@ -194,8 +194,8 @@ A clean Git worktree is recommended so changes remain easy to inspect or discard
 | Open the terminal UI | `leveler` or `leveler tui` |
 | Run the full development workflow | In the TUI: `/develop <goal>` |
 | Open the browser UI | `leveler web` |
-| Run one headless task | `leveler run "…"` |
-| Continue until the goal reaches a terminal result | `leveler run "…" --collaboration goal` |
+| Run one headless task (driven to a goal by default) | `leveler run "…"` |
+| Answer one message and stop | `leveler run "…" --collaboration chat` |
 | Run parallel candidates in isolated worktrees | `leveler run "…" --parallel 3` |
 | Reopen a session in the TUI | `leveler resume [session-id]` |
 | Inspect a session's event log | `leveler trace [session-id]` |

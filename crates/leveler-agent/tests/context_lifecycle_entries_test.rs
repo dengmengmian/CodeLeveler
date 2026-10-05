@@ -553,3 +553,22 @@ fn soft_history() -> Vec<Message> {
     }
     messages
 }
+
+/// The Coding harness's session is a goal session by its own domain semantics:
+/// `CodingRuntime::create_task` spells `collaboration: "goal"` at the call site
+/// instead of leaning on `CollaborationMode::default()`. A future change to the
+/// enum default must not silently flip an internal caller.
+#[tokio::test]
+async fn the_coding_harness_always_creates_a_goal_session() {
+    let h = harness(Vec::new(), Summary::Produced).await;
+    let session = h.engine.create_task(&spec(&h, "anything")).await.unwrap();
+    let record = SessionRepository::new(&h.db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.collaboration, "goal",
+        "the Coding harness must not inherit the enum default"
+    );
+}

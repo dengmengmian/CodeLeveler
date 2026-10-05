@@ -139,6 +139,7 @@ impl Application {
             }
 
             // Run one agent per worktree, concurrently.
+            let collaboration = self.collaboration();
             let futures = worktrees.iter().map(|(path, branch)| {
                 let path = path.clone();
                 let branch = branch.clone();
@@ -148,7 +149,12 @@ impl Application {
                 let cancellation = cancellation.child_token();
                 async move {
                     let layout = Layout::resolve(path.clone(), Some(config_dir));
-                    let app = Application::assemble(layout).ok()?;
+                    // The candidate inherits the run's resolved axis; a fresh
+                    // Application would otherwise fall back to the product
+                    // default and silently re-open the axis the run closed.
+                    let app = Application::assemble(layout)
+                        .ok()?
+                        .with_collaboration(collaboration);
                     // Direct tool loop only — no orchestrate dual path.
                     let result = async {
                         let session_id = app

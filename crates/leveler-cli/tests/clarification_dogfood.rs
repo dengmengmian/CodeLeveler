@@ -220,7 +220,13 @@ compatibility:
         tmp.path().join("configs"),
         tmp.path().join("state"),
     );
-    let app = Arc::new(Application::assemble(layout).unwrap());
+    let app = Arc::new(
+        Application::assemble(layout)
+            .unwrap()
+            // The dogfood drives an ordinary question-answering turn whose
+            // terminal is the answer; it is explicitly Chat.
+            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+    );
     let model = ModelRef::new("mock", "m");
     let session = app.create_session(&model, "dogfood").await.unwrap();
     let client = Arc::new(InProcessRuntimeClient::new(
