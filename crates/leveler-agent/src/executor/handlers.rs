@@ -312,87 +312,113 @@ impl Executor {
                 for_turn: false,
             });
         }
-        let description = permission_request_description(action, reason, grants, scope);
-        // Risk: filesystem elevation is at least as sensitive as network.
-        let risk = if grants.repository_git || grants.unrestricted_fs {
-            RiskLevel::Privileged
-        } else {
-            RiskLevel::Network
-        };
-        let rule_paths: Vec<std::path::PathBuf> = Vec::new();
-        if grants.repository_git
-            && !grants.unrestricted_fs
-            && self
-                .permission_rules
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .evaluate(&call.name, Some(action), &rule_paths)
-                == leveler_execution::RuleDecision::Allow
-        {
-            return Ok(PermissionRequestOutcome::Granted {
-                message: permission_grant_message(true, grants),
-                grants,
-                for_turn: false,
-            });
-        }
-        // A permission request is a risky ACTION, not a question — it is exactly
-        // the yes/no an Approver exists to answer. Routing it to the Clarifier
-        // instead put it outside the approval policy, so `--auto-approve` (whose
-        // whole purpose is unattended driving) still stopped dead on a human.
-        let request = ApprovalRequest {
-            grant: None,
-            id: ApprovalId::generate(),
-            turn_id: None,
-            call_id: call.id.to_string(),
-            agent_id: self.agent_id.clone(),
-            action_fingerprint: action_fingerprint(call),
-            tool: call.name.clone(),
-            risk,
-            description,
-            command: Some(action.to_string()),
-            paths: Vec::new(),
-        };
-        // Through the host's one ask path (PR 5): the reviewer, the human, and
-        // the human-vs-headless distinction mean the same here as for a tool
-        // call. The grant's lifetime is still the caller's business.
-        let pending = leveler_execution::PendingApproval {
-            signature: action_fingerprint(call),
-            write: self.tool_context.write_scope(),
-            network_scope: self.tool_context.policy.network_scope(),
-            command_line: Some(action.to_string()),
-            scoped_paths: Vec::new(),
-            request,
-        };
-        match self.ask(&pending, None, None, cancellation).await {
-            super::host::AskOutcome::Allowed(evidence) => {
-                if grants.repository_git
-                    && !grants.unrestricted_fs
-                    && evidence == leveler_execution::AuthorizationEvidence::ApprovedAlways
-                {
-                    self.remember_always(&call.name, Some(action), &[]);
-                }
-                Ok(PermissionRequestOutcome::Granted {
+        for _ in 0..super::host::MAX_SUPERSEDE_RETRIES {
+            // The profile may change while a question waits. Re-check it here so
+            // a request superseded by a switch to Full is answered by Full's
+            // own policy instead of being re-asked under a profile that would.
+            if self.tool_context.policy.mode() == leveler_execution::PermissionProfile::FullAccess {
+                return Ok(PermissionRequestOutcome::Granted {
                     message: permission_grant_message(true, grants),
                     grants,
-                    for_turn: matches!(
-                        evidence,
-                        leveler_execution::AuthorizationEvidence::SessionGrant { .. }
-                            | leveler_execution::AuthorizationEvidence::ApprovedAlways
-                    ),
-                })
+                    for_turn: false,
+                });
             }
-            super::host::AskOutcome::DeniedByUser => Ok(PermissionRequestOutcome::DeniedByUser {
-                requested: grants,
-                message: permission_denied_by_user_message(),
-            }),
-            super::host::AskOutcome::DeniedUnattended(_) => {
-                Ok(PermissionRequestOutcome::DeniedUnattended {
-                    requested: grants,
-                    message: permission_denied_unattended_message(),
-                })
+            let description = permission_request_description(action, reason, grants, scope);
+            // Risk: filesystem elevation is at least as sensitive as network.
+            let risk = if grants.repository_git || grants.unrestricted_fs {
+                RiskLevel::Privileged
+            } else {
+                RiskLevel::Network
+            };
+            let rule_paths: Vec<std::path::PathBuf> = Vec::new();
+            if grants.repository_git
+                && !grants.unrestricted_fs
+                && self
+                    .permission_rules
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .evaluate(&call.name, Some(action), &rule_paths)
+                    == leveler_execution::RuleDecision::Allow
+            {
+                return Ok(PermissionRequestOutcome::Granted {
+                    message: permission_grant_message(true, grants),
+                    grants,
+                    for_turn: false,
+                });
             }
-            super::host::AskOutcome::Cancelled => Err(AgentError::Cancelled),
+            // A permission request is a risky ACTION, not a question — it is exactly
+            // the yes/no an Approver exists to answer. Routing it to the Clarifier
+            // instead put it outside the approval policy, so `--auto-approve` (whose
+            // whole purpose is unattended driving) still stopped dead on a human.
+            let request = ApprovalRequest {
+                grant: None,
+                id: ApprovalId::generate(),
+                turn_id: None,
+                call_id: call.id.to_string(),
+                agent_id: self.agent_id.clone(),
+                action_fingerprint: action_fingerprint(call),
+                tool: call.name.clone(),
+                risk,
+                description,
+                command: Some(action.to_string()),
+                paths: Vec::new(),
+            };
+            // Through the host's one ask path (PR 5): the reviewer, the human, and
+            // the human-vs-headless distinction mean the same here as for a tool
+            // call. The grant's lifetime is still the caller's business.
+            let pending = leveler_execution::PendingApproval {
+                signature: action_fingerprint(call),
+                write: self.tool_context.write_scope(),
+                network_scope: self.tool_context.policy.network_scope(),
+                command_line: Some(action.to_string()),
+                scoped_paths: Vec::new(),
+                request,
+            };
+            match self.ask(&pending, None, None, cancellation).await {
+                super::host::AskOutcome::Allowed(evidence) => {
+                    if grants.repository_git
+                        && !grants.unrestricted_fs
+                        && evidence == leveler_execution::AuthorizationEvidence::ApprovedAlways
+                    {
+                        self.remember_always(&call.name, Some(action), &[]);
+                    }
+                    return Ok(PermissionRequestOutcome::Granted {
+                        message: permission_grant_message(true, grants),
+                        grants,
+                        for_turn: matches!(
+                            evidence,
+                            leveler_execution::AuthorizationEvidence::SessionGrant { .. }
+                                | leveler_execution::AuthorizationEvidence::ApprovedAlways
+                        ),
+                    });
+                }
+                super::host::AskOutcome::DeniedByUser => {
+                    return Ok(PermissionRequestOutcome::DeniedByUser {
+                        requested: grants,
+                        message: permission_denied_by_user_message(),
+                    });
+                }
+                super::host::AskOutcome::DeniedUnattended(_) => {
+                    return Ok(PermissionRequestOutcome::DeniedUnattended {
+                        requested: grants,
+                        message: permission_denied_unattended_message(),
+                    });
+                }
+                super::host::AskOutcome::Cancelled => return Err(AgentError::Cancelled),
+                // The permission profile changed while this question waited;
+                // re-decide it under the profile now in force.
+                super::host::AskOutcome::Superseded => continue,
+            }
         }
+        Err(AgentError::Model(leveler_model::ModelError::new(
+            leveler_model::ModelErrorKind::InvalidRequest,
+            format!(
+                "permission profile changed {} times while `{}` waited for a decision; \
+                 request permissions again once the profile is settled",
+                super::host::MAX_SUPERSEDE_RETRIES,
+                call.name
+            ),
+        )))
     }
 
     /// Run one independent reviewer child.

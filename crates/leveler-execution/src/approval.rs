@@ -107,11 +107,38 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// What an approver answered.
+///
+/// [`Self::Superseded`] is deliberately NOT a variant of
+/// [`ApprovalDecision`]: nobody granted and nobody refused. The permission
+/// profile in force changed while the question waited, so the question's
+/// premise is gone and the caller must re-resolve the call under the new
+/// profile. It must never be reported as a user decision or persisted as a
+/// grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// A real decision, from a human or an automatic approver.
+    Decided(ApprovalDecision),
+    /// The permission profile changed while waiting; re-run policy resolution.
+    Superseded,
+}
+
 /// Something that can answer approval requests (interactive CLI, auto-approve,
 /// auto-deny, ...).
 #[async_trait]
 pub trait Approver: Send + Sync {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision;
+
+    /// [`Self::decide`], but able to report that the question was superseded by
+    /// a permission-profile change while it waited.
+    ///
+    /// Defaulted so an approver with no notion of supersession keeps its exact
+    /// behaviour. Only an approver that owns live waiters (the app's channel
+    /// approver) overrides it. The caller MUST re-resolve policy on
+    /// [`ApprovalOutcome::Superseded`], never treat it as a decision.
+    async fn decide_or_supersede(&self, request: &ApprovalRequest) -> ApprovalOutcome {
+        ApprovalOutcome::Decided(self.decide(request).await)
+    }
 
     /// Whether a person is actually reachable behind this approver.
     ///

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_agent::{ClarificationQuestionKind, ClarificationRequest, Clarifier, ClarifyOutcome};
 use leveler_core::{ApprovalId, ClarificationId, SessionId, TurnId};
 use leveler_core::{Capability, GrantBinding, ResourceIdentity};
-use leveler_execution::{ApprovalDecision, ApprovalRequest, Approver, RiskLevel};
+use leveler_execution::{ApprovalDecision, ApprovalOutcome, ApprovalRequest, Approver, RiskLevel};
 
 use leveler_client_protocol::{
     ClientError, RuntimeEvent, UiApprovalRequest, UiClarificationQuestion, UiClarificationRequest,
@@ -67,8 +67,20 @@ impl PendingBinding {
 pub(crate) struct PendingApproval {
     pub(crate) binding: PendingBinding,
     pub(crate) request: UiApprovalRequest,
-    pub(crate) reply: oneshot::Sender<ApprovalDecision>,
+    pub(crate) reply: oneshot::Sender<PendingReply>,
 }
+
+/// What a parked approval waiter is told.
+///
+/// `Superseded` is not a decision: the permission profile changed while the
+/// question was open, so the caller must re-resolve under the profile now in
+/// force instead of granting or refusing. It never persists a grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingReply {
+    Decided(ApprovalDecision),
+    Superseded,
+}
+
 pub(crate) type PendingApprovals = Arc<Mutex<HashMap<ApprovalId, PendingApproval>>>;
 
 /// Pending clarifications keyed by id (spec §35).
@@ -124,9 +136,51 @@ pub(crate) fn resolve_approval(
     let request = pending.lock().unwrap().remove(request_id).ok_or_else(|| {
         ClientError::Runtime("pending approval not found or already resolved".to_string())
     })?;
-    request.reply.send(decision).map_err(|_| {
-        ClientError::Runtime("pending approval is no longer waiting for a response".to_string())
-    })
+    request
+        .reply
+        .send(PendingReply::Decided(decision))
+        .map_err(|_| {
+            ClientError::Runtime("pending approval is no longer waiting for a response".to_string())
+        })
+}
+
+/// Void every parked permission approval belonging to `session_id`.
+///
+/// This is what a permission-profile change means for a question already
+/// waiting: the question's premise is gone. The waiter is woken with
+/// [`PendingReply::Superseded`] so the tool call is re-resolved under the new
+/// profile — on Full that is `Allow` — instead of being answered under a mode
+/// the user has left. Returns how many waiters were superseded.
+///
+/// Clarifications are deliberately untouched: `request_user_input` is not a
+/// permission approval, and Full does not take away the model's ability to ask
+/// the user a question.
+pub(crate) fn supersede_pending_approvals(
+    pending: &PendingApprovals,
+    session_id: &SessionId,
+) -> usize {
+    // Collect first, send after releasing the lock: `send` wakes the waiter,
+    // whose `PendingWaiterGuard::drop` takes the same lock.
+    let mut superseded = Vec::new();
+    {
+        let mut map = pending.lock().unwrap();
+        let ids: Vec<ApprovalId> = map
+            .iter()
+            .filter(|(_, entry)| entry.binding.session_id == *session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(entry) = map.remove(&id) {
+                superseded.push(entry);
+            }
+        }
+    }
+    let count = superseded.len();
+    for entry in superseded {
+        // A closed receiver means the waiter already ended; nothing to wake.
+        let _ = entry.reply.send(PendingReply::Superseded);
+    }
+    count
 }
 
 pub(crate) fn resolve_clarification(
@@ -263,6 +317,16 @@ pub(crate) struct ChannelApprover {
 #[async_trait]
 impl Approver for ChannelApprover {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        // A superseded question is not a decision. The only callers left on this
+        // plain entry point are ones without a re-resolution loop, so treat it
+        // as the safe refusal rather than inventing a grant.
+        match self.decide_or_supersede(request).await {
+            ApprovalOutcome::Decided(decision) => decision,
+            ApprovalOutcome::Superseded => ApprovalDecision::Deny,
+        }
+    }
+
+    async fn decide_or_supersede(&self, request: &ApprovalRequest) -> ApprovalOutcome {
         let ui = ui_approval_request(request);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
@@ -284,21 +348,25 @@ impl Approver for ChannelApprover {
             .is_err()
         {
             self.pending.lock().unwrap().remove(&request.id);
-            return ApprovalDecision::Deny;
+            return ApprovalOutcome::Decided(ApprovalDecision::Deny);
         }
         // If the turn is cancelled, or the UI that could answer is gone,
         // default to the safe (Deny) decision instead of waiting forever.
         let mut rx = rx;
-        loop {
+        let reply = loop {
             tokio::select! {
-                decision = &mut rx => break decision.unwrap_or(ApprovalDecision::Deny),
-                _ = self.cancel.cancelled() => break ApprovalDecision::Deny,
+                reply = &mut rx => break reply.unwrap_or(PendingReply::Decided(ApprovalDecision::Deny)),
+                _ = self.cancel.cancelled() => break PendingReply::Decided(ApprovalDecision::Deny),
                 _ = tokio::time::sleep(control_liveness_tick()) => {
                     if self.events.receiver_count() == 0 {
-                        break ApprovalDecision::Deny;
+                        break PendingReply::Decided(ApprovalDecision::Deny);
                     }
                 }
             }
+        };
+        match reply {
+            PendingReply::Decided(decision) => ApprovalOutcome::Decided(decision),
+            PendingReply::Superseded => ApprovalOutcome::Superseded,
         }
     }
 }
@@ -711,9 +779,70 @@ mod tests {
         );
 
         resolve_approval(&pending, &request.id, ApprovalDecision::ApproveOnce).unwrap();
-        assert_eq!(answer.await.unwrap(), ApprovalDecision::ApproveOnce);
+        assert_eq!(
+            answer.await.unwrap(),
+            PendingReply::Decided(ApprovalDecision::ApproveOnce)
+        );
         let second = resolve_approval(&pending, &request.id, ApprovalDecision::Deny).unwrap_err();
         assert!(second.to_string().contains("already resolved"));
+    }
+
+    #[tokio::test]
+    async fn supersede_wakes_only_the_target_session_and_removes_the_waiter() {
+        let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let target = SessionId::new("session-a");
+        let other = SessionId::new("session-b");
+        let request = approval_request();
+        let (reply, answer) = oneshot::channel();
+        pending.lock().unwrap().insert(
+            request.id.clone(),
+            PendingApproval {
+                binding: PendingBinding::for_approval(target.clone(), &request),
+                request: UiApprovalRequest {
+                    grant: None,
+                    requires_human_consent: false,
+                    id: request.id.clone(),
+                    tool: request.tool.clone(),
+                    summary: request.description.clone(),
+                    command: request.command.clone(),
+                    risks: vec![],
+                    call_id: Some(request.call_id.clone()),
+                    always_persists: true,
+                },
+                reply,
+            },
+        );
+        // A second waiter on another session must be untouched.
+        let mut second_request = approval_request();
+        second_request.id = ApprovalId::new("other-approval");
+        let (other_reply, _other_answer) = oneshot::channel();
+        pending.lock().unwrap().insert(
+            second_request.id.clone(),
+            PendingApproval {
+                binding: PendingBinding::for_approval(other.clone(), &second_request),
+                request: UiApprovalRequest {
+                    grant: None,
+                    requires_human_consent: false,
+                    id: second_request.id.clone(),
+                    tool: second_request.tool.clone(),
+                    summary: second_request.description.clone(),
+                    command: second_request.command.clone(),
+                    risks: vec![],
+                    call_id: Some(second_request.call_id.clone()),
+                    always_persists: true,
+                },
+                reply: other_reply,
+            },
+        );
+
+        assert_eq!(supersede_pending_approvals(&pending, &target), 1);
+        assert_eq!(answer.await.unwrap(), PendingReply::Superseded);
+        let remaining = pending.lock().unwrap();
+        assert!(
+            remaining.contains_key(&second_request.id),
+            "another session's question must survive"
+        );
+        assert!(!remaining.contains_key(&request.id));
     }
 
     #[test]

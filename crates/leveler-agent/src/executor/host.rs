@@ -18,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::ApprovalId;
 use leveler_execution::{
-    ApprovalDecision, ApprovalRequest, AuthorizationEvidence, CommandView, PendingApproval,
-    PolicyDenial, PolicyResolution, Requirement, ResolvedExecutionPolicy, ReviewVerdict, RiskLevel,
-    WriteScope, command_is_destructive,
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, AuthorizationEvidence, CommandView,
+    PendingApproval, PolicyDenial, PolicyResolution, Requirement, ResolvedExecutionPolicy,
+    ReviewVerdict, RiskLevel, WriteScope, command_is_destructive,
 };
 use leveler_lifecycle::PlanStep;
 use leveler_model::{ContentPart, ToolCall};
@@ -73,7 +73,17 @@ pub(crate) enum AskOutcome {
     /// Nobody was asked: a headless approver refused, or the reviewer did.
     DeniedUnattended(String),
     Cancelled,
+    /// The permission profile changed while the question waited, so the
+    /// question is void. Nobody granted or refused anything: the caller must
+    /// re-resolve the call under the profile now in force (Full => Allow).
+    Superseded,
 }
+
+/// How many times one call may be re-resolved because the permission profile
+/// changed while it was waiting for an answer. This is a mechanical guard
+/// against a flapping profile, not a policy: the profile owner drives every
+/// iteration, and reaching this bound is reported as a refusal, never spun on.
+pub(crate) const MAX_SUPERSEDE_RETRIES: usize = 8;
 
 /// A call whose admission ALREADY happened and is on the durable record — a
 /// `ToolCallStarted` the engine found dangling after a crash.
@@ -350,29 +360,45 @@ impl Executor {
         pending_always: &mut Option<PendingStandingGrant>,
         cancellation: &CancellationToken,
     ) -> Result<ResolvedExecutionPolicy, String> {
-        let pending = match self.resolve_policy(call, ctx, cancellation).await {
-            PolicyResolution::Allow(resolved) => return Ok(resolved),
-            PolicyResolution::Deny(PolicyDenial { reason }) => return Err(reason),
-            PolicyResolution::Ask(pending) => pending,
-        };
-        match self
-            .ask(
-                &pending,
-                Some(session_approved),
-                Some(pending_always),
-                cancellation,
-            )
-            .await
-        {
-            AskOutcome::Allowed(evidence) => Ok(pending.allowed(evidence)),
-            AskOutcome::DeniedByUser => Err("denied by user".to_string()),
-            AskOutcome::DeniedUnattended(reason) if call.name == "remember" => {
-                let _ = reason;
-                Err(self.park_unattended_denial(call))
+        // A permission-profile change supersedes a question that is already
+        // waiting; the answer is not "yes" or "no", it is "ask the policy
+        // again". Bounded so a pathological flapping profile cannot spin here:
+        // the profile owner drives each supersession, and a loop it can drive
+        // forever is a bug in the owner, not a question to answer.
+        for _ in 0..MAX_SUPERSEDE_RETRIES {
+            let pending = match self.resolve_policy(call, ctx, cancellation).await {
+                PolicyResolution::Allow(resolved) => return Ok(resolved),
+                PolicyResolution::Deny(PolicyDenial { reason }) => return Err(reason),
+                PolicyResolution::Ask(pending) => pending,
+            };
+            match self
+                .ask(
+                    &pending,
+                    Some(session_approved),
+                    Some(pending_always),
+                    cancellation,
+                )
+                .await
+            {
+                AskOutcome::Allowed(evidence) => return Ok(pending.allowed(evidence)),
+                AskOutcome::DeniedByUser => return Err("denied by user".to_string()),
+                AskOutcome::DeniedUnattended(reason) if call.name == "remember" => {
+                    let _ = reason;
+                    return Err(self.park_unattended_denial(call));
+                }
+                AskOutcome::DeniedUnattended(reason) => return Err(reason),
+                AskOutcome::Cancelled => return Err("cancelled".to_string()),
+                // The profile changed while the question waited. Loop and let
+                // `resolve_policy` answer under the profile now in force; a
+                // switch to Full resolves to Allow here.
+                AskOutcome::Superseded => continue,
             }
-            AskOutcome::DeniedUnattended(reason) => Err(reason),
-            AskOutcome::Cancelled => Err("cancelled".to_string()),
         }
+        Err(format!(
+            "permission profile changed {MAX_SUPERSEDE_RETRIES} times while `{}` waited for a \
+             decision; re-run the call once the profile is settled",
+            call.name
+        ))
     }
 
     /// Pure resolution (PR 5): pre hooks → permission rules → profile policy.
@@ -557,10 +583,11 @@ impl Executor {
         }
 
         // An agent or skill definition changes what future sessions run, so a
-        // human confirms each exact proposal in every profile, full access
-        // included, and no permission rule or earlier grant stands in for that.
-        // The proposal is validated first: a contradiction is refused to the
-        // model, never put to the user as a question.
+        // human confirms each exact proposal under Auto and Restricted. Full
+        // bypasses this consent gate with every other permission gate, at the
+        // top of this function — a definition write reaches here only under a
+        // profile that asks. The proposal is validated first: a contradiction
+        // is refused to the model, never put to the user as a question.
         let definition_write = if crate::agent_registry::is_agent_definition_write(&call.name) {
             Some(crate::agent_registry::authoring_preflight(
                 &call.name,
@@ -981,7 +1008,14 @@ impl Executor {
         let decision = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return AskOutcome::Cancelled,
-            decision = self.approver.decide(&pending.request) => decision,
+            decision = self.approver.decide_or_supersede(&pending.request) => decision,
+        };
+        let decision = match decision {
+            ApprovalOutcome::Decided(decision) => decision,
+            // The profile changed while this question waited. Do NOT record a
+            // grant, a session approval or a standing rule: re-resolution is
+            // the caller's job, and on Full it will resolve to Allow.
+            ApprovalOutcome::Superseded => return AskOutcome::Superseded,
         };
         if human_only {
             return match decision {
@@ -1735,6 +1769,130 @@ mod authorize_tests {
         .with_approver(approver)
     }
 
+    /// Same as [`executor_sharing`], with an approver that needs to report a
+    /// supersession (the plain entry point only carries decisions).
+    fn executor_sharing_any(
+        dir: &std::path::Path,
+        profile: &leveler_execution::SharedPermissionProfile,
+        approver: Arc<dyn Approver>,
+    ) -> Executor {
+        let workspace = Workspace::new(dir).unwrap();
+        let tool_context =
+            ToolContext::new(workspace, profile.get()).with_permission_profile(profile.clone());
+        Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        )
+        .with_approver(approver)
+    }
+
+    /// An approver that reports one supersession — after switching the session
+    /// to `switch_to` — and then answers normally. Models the lifecycle the app
+    /// channel approver reports when `SetPermissionProfile` voids a question.
+    struct SupersedeOnce {
+        session: leveler_execution::SharedPermissionProfile,
+        switch_to: PermissionProfile,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Approver for SupersedeOnce {
+        async fn decide(&self, _: &ApprovalRequest) -> ApprovalDecision {
+            unreachable!("the executor must call decide_or_supersede")
+        }
+
+        async fn decide_or_supersede(
+            &self,
+            _: &ApprovalRequest,
+        ) -> leveler_execution::ApprovalOutcome {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.session.set(self.switch_to);
+                leveler_execution::ApprovalOutcome::Superseded
+            } else {
+                leveler_execution::ApprovalOutcome::Decided(ApprovalDecision::ApproveOnce)
+            }
+        }
+    }
+
+    /// A supersession caused by switching to Full must re-resolve to Allow and
+    /// must NOT ask a second time: nobody decided, and Full needs no decision.
+    #[tokio::test]
+    async fn superseded_into_full_re_resolves_to_allow_without_a_second_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = leveler_execution::SharedPermissionProfile::new(PermissionProfile::Assisted);
+        let approver = Arc::new(SupersedeOnce {
+            session: session.clone(),
+            switch_to: PermissionProfile::FullAccess,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let exec = executor_sharing_any(dir.path(), &session, approver.clone());
+        let action = call(
+            "run_command",
+            serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+        );
+        let mut session_approved = HashSet::new();
+        let mut pending_always = None;
+        let resolved = exec
+            .authorize_with_cancellation(
+                &action,
+                &exec.tool_context.clone(),
+                &mut session_approved,
+                &mut pending_always,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("Full must allow the re-resolved call");
+        assert!(resolved.unrestricted_execution());
+        assert_eq!(
+            approver.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Full must resolve without asking again"
+        );
+        assert!(pending_always.is_none(), "a supersession persists no grant");
+        assert!(
+            session_approved.is_empty(),
+            "a supersession grants no session"
+        );
+    }
+
+    /// The security-relevant direction: a supersession caused by a STRICTER
+    /// profile must re-ask under that profile instead of riding the old answer.
+    #[tokio::test]
+    async fn superseded_into_a_stricter_profile_asks_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = leveler_execution::SharedPermissionProfile::new(PermissionProfile::Assisted);
+        let approver = Arc::new(SupersedeOnce {
+            session: session.clone(),
+            switch_to: PermissionProfile::RequestApproval,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let exec = executor_sharing_any(dir.path(), &session, approver.clone());
+        let action = call(
+            "run_command",
+            serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+        );
+        let mut session_approved = HashSet::new();
+        let mut pending_always = None;
+        exec.authorize_with_cancellation(
+            &action,
+            &exec.tool_context.clone(),
+            &mut session_approved,
+            &mut pending_always,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the second, real decision allows the call");
+        assert_eq!(
+            approver.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a stricter profile must re-ask, not reuse the superseded question"
+        );
+    }
+
     /// The defect this whole change exists for: the user switches to 完全访问
     /// while a turn is running, and that turn keeps prompting because it
     /// copied the profile at startup. The SAME executor — no restart — must
@@ -1994,7 +2152,8 @@ mod authorize_tests {
     }
 
     /// `rm -rf …` classifies dangerous (irreversible destruction), so Assisted
-    /// always asks for it. (`git push` no longer prompts: sandbox-first.)
+    /// always asks for it. (`git push`, `git reset --hard` and `git clean -fd`
+    /// ask too, through their own Git effects.)
     fn rm_rf_call() -> ToolCall {
         ToolCall {
             id: ToolCallId::new("c"),

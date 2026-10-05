@@ -345,7 +345,7 @@ use crate::event_bridge::{EventBridge, turn_runtime_event};
 use crate::prompt_assist::{self, AssistKind};
 use crate::prompt_bridge::{
     ChannelApprover, ChannelClarifier, PendingApprovals, PendingClarifications, resolve_approval,
-    resolve_clarification, validate_pending_session,
+    resolve_clarification, supersede_pending_approvals, validate_pending_session,
 };
 use crate::workspace_view::{compute_diff, detect_branch_label};
 
@@ -3897,8 +3897,27 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             }
             ClientCommand::SetPermissionProfile { session_id, mode } => {
                 let mut config = self.runtime_config(&session_id).await?;
-                config.mode = execution_mode(mode);
+                let next_mode = execution_mode(mode);
+                let changed = config.mode != next_mode;
+                config.mode = next_mode;
                 self.persist_runtime_config(&session_id, config).await?;
+                // A profile change voids every permission question already
+                // waiting for this session: its premise (the old profile) is
+                // gone. Superseding BEFORE the snapshot is what keeps the
+                // snapshot — and every client that renders it — free of a
+                // stale approval, and lets the blocked call re-resolve under
+                // the profile now in force (Full => Allow). Clarifications are
+                // untouched: they are not permission approvals.
+                if changed {
+                    let superseded = supersede_pending_approvals(&self.pending, &session_id);
+                    if superseded > 0 {
+                        tracing::info!(
+                            session = session_id.as_str(),
+                            superseded,
+                            "permission profile changed; superseded pending approvals"
+                        );
+                    }
+                }
                 if let Ok(session) = self.snapshot(&session_id).await {
                     let _ = self
                         .events_for(&session_id)

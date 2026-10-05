@@ -10,7 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_core::TurnId;
 use leveler_execution::{
-    ApprovalDecision, ApprovalRequest, Approver, ClarificationRequest, Clarifier, ClarifyOutcome,
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, Approver, ClarificationRequest, Clarifier,
+    ClarifyOutcome,
 };
 
 use crate::EngineEvent;
@@ -208,6 +209,16 @@ impl Approver for RecordingApprover {
     }
 
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        match self.decide_or_supersede(request).await {
+            ApprovalOutcome::Decided(decision) => decision,
+            // A superseded question is not a decision. Only callers without a
+            // re-resolution loop reach this plain entry point, so refuse
+            // rather than invent a grant.
+            ApprovalOutcome::Superseded => ApprovalDecision::Deny,
+        }
+    }
+
+    async fn decide_or_supersede(&self, request: &ApprovalRequest) -> ApprovalOutcome {
         let mut request = request.clone();
         request.turn_id = Some(self.turn_id.clone());
         self.events.emit(EngineEvent::ApprovalRequested {
@@ -220,20 +231,28 @@ impl Approver for RecordingApprover {
             command: request.command.clone(),
             risk: format!("{:?}", request.risk),
         });
-        let decision = self.inner.decide(&request).await;
-        self.events.emit(EngineEvent::ApprovalResolved {
-            id: request.id.clone(),
-            call_id: Some(request.call_id.clone()),
-            agent_id: request.agent_id.clone(),
-            decision: match decision {
+        let outcome = self.inner.decide_or_supersede(&request).await;
+        let decision = match &outcome {
+            ApprovalOutcome::Decided(decision) => match decision {
                 ApprovalDecision::ApproveOnce => "approve_once".to_string(),
                 ApprovalDecision::ApproveSession => "approve_session".to_string(),
                 ApprovalDecision::ApproveProject => "approve_project".to_string(),
                 ApprovalDecision::ApproveAlways => "approve_always".to_string(),
                 ApprovalDecision::Deny => "deny".to_string(),
             },
+            // Nobody decided: the permission profile changed while the
+            // question waited. Recording it as `superseded` keeps the log
+            // honest — the question closed without a grant, and it is not a
+            // user refusal.
+            ApprovalOutcome::Superseded => "superseded".to_string(),
+        };
+        self.events.emit(EngineEvent::ApprovalResolved {
+            id: request.id.clone(),
+            call_id: Some(request.call_id.clone()),
+            agent_id: request.agent_id.clone(),
+            decision,
         });
-        decision
+        outcome
     }
 }
 
