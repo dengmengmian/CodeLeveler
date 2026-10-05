@@ -805,6 +805,10 @@ pub struct UiText {
 
     // Turn end / completion report
     pub turn_end_completed: &'static str,
+    /// The turn ended because the model answered, not because a goal was
+    /// declared complete. Both are clean ends; only the second is a completion
+    /// claim, so the two never share wording.
+    pub turn_end_answered: &'static str,
     /// The loop ended cleanly with no answer committed (§12). Not a failure and
     /// not a completion — the marker says which half is missing.
     pub turn_no_final_answer: &'static str,
@@ -1698,6 +1702,7 @@ static ZH: UiText = UiText {
     failure_retried: "已重试 {n} 次",
     failure_retries_label: "重试",
     turn_end_completed: "任务已完成",
+    turn_end_answered: "回答结束",
     turn_no_final_answer: "执行已结束，但未提交最终回答",
     completion_files_changed: "修改 {} 个文件",
     completion_diff_hint: "/diff 查看改动",
@@ -2442,6 +2447,7 @@ static EN: UiText = UiText {
     failure_retried: "Retried {n} times",
     failure_retries_label: "Retries",
     turn_end_completed: "Task completed",
+    turn_end_answered: "Answer finished",
     turn_no_final_answer: "run ended without a final answer",
     completion_files_changed: "{} files changed",
     completion_diff_hint: "/diff to view changes",

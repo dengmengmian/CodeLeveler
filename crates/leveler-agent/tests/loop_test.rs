@@ -3089,14 +3089,17 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The model goes quiet every round and never calls update_goal: ONE
-    // protocol repair, then a second quiet round. That is a stall, not a
-    // completion — and the harness does not repeat itself.
+    // The model goes quiet every round and never calls update_goal. Each quiet
+    // round is a lifecycle continuation bounded by the no-progress guard
+    // (ProgressCaps::default().no_progress_rounds == 2), so the drive buys two
+    // more rounds and then stops. That is a stall, not a completion, and it is
+    // bounded — a model that only re-emits a premature summary cannot loop.
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_text("I think it's done."),
         assistant_text("Still done."),
         assistant_text("Done, really."),
         assistant_text("Done."),
+        assistant_text("Done forever."),
     ]));
 
     let executor = Executor::new(
@@ -3108,10 +3111,20 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
     )
     .with_goal_mode(true);
 
+    let mut advisories = 0u32;
     let outcome = executor
         .run(
             "do the task",
-            &mut |_| {},
+            &mut |event| {
+                if matches!(
+                    event,
+                    leveler_agent::AgentEvent::AdvisoryStarted {
+                        kind: leveler_agent::AdvisoryKind::CloseoutNudge(_),
+                    }
+                ) {
+                    advisories += 1;
+                }
+            },
             &mut NoopSink,
             CancellationToken::new(),
         )
@@ -3121,16 +3134,98 @@ async fn goal_mode_quiet_exhaustion_returns_stalled() {
     assert_eq!(
         outcome.stop_reason,
         StopReason::Stalled,
-        "quiet-nudge exhaustion must not be reported as a successful completion"
+        "quiet continuation exhaustion must not be reported as a successful completion"
     );
     assert_eq!(
-        outcome.model_steps, 2,
-        "one protocol repair, then the next quiet round stalls"
+        outcome.model_steps, 3,
+        "two bounded continuations, then the next quiet round stalls"
+    );
+    assert_eq!(
+        advisories, 2,
+        "each continuation is announced once so the extra round is explained"
     );
     assert_eq!(
         outcome.stop_detail.as_deref(),
         Some("closeout_reason=goal_unresolved; 目标模式结束但未调用 update_goal(complete/blocked)"),
         "the stall detail must carry the closeout reason for engine continuations"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The premature-final regression: a Goal round that ends with a summary and no
+/// tool call must NOT close the goal. The harness drives another round on the
+/// lifecycle fact alone, and the model's resumed real work resets the
+/// no-progress bound — so a model that was simply mid-task can keep going.
+#[tokio::test]
+async fn goal_mode_continuation_resumes_real_work_and_still_requires_a_terminal() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-goalcontinue-{}",
+        std::process::id() as u64 * 59 + 7
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), "partial work\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+    let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
+    let registry = Arc::new(default_registry());
+
+    // Round 1: a phase summary and no tool call — the bad-dogfood shape.
+    // Round 2: after the continuation it does real work again.
+    // Round 3: another premature summary.
+    // Round 4: now it declares the terminal.
+    let runtime = Arc::new(MockRuntime::new(vec![
+        assistant_text("Phase 1 done; much of the task remains."),
+        assistant_tool_call("c1", "read_file", serde_json::json!({"path": "note.txt"})),
+        assistant_text("Phase 2 notes; still finishing."),
+        assistant_tool_call(
+            "g1",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "Everything verified."}),
+        ),
+    ]));
+
+    let executor = Executor::new(
+        runtime.clone(),
+        registry,
+        tool_context,
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_goal_mode(true);
+
+    let mut tool_names: Vec<String> = Vec::new();
+    let outcome = executor
+        .run(
+            "do the whole task",
+            &mut |event| {
+                if let leveler_agent::AgentEvent::ToolCall { name, .. } = event {
+                    tool_names.push(name.clone());
+                }
+            },
+            &mut NoopSink,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.stop_reason, StopReason::Completed);
+    assert_eq!(
+        outcome.model_steps, 4,
+        "each premature summary bought one continuation; the tool round reset the bound"
+    );
+    assert!(
+        tool_names.contains(&"read_file".to_string()),
+        "the continuation drove real work, not another summary: {tool_names:?}"
+    );
+    assert_eq!(
+        runtime.recorded_requests().len(),
+        4,
+        "no hidden request follows the terminal"
+    );
+    assert_eq!(
+        outcome.progress.no_progress_streak, 0,
+        "the tool rounds reset the bound; the continuation never starved the goal: {:?}",
+        outcome.progress
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -5177,11 +5272,12 @@ async fn a_quiet_goal_gets_one_protocol_repair_and_no_coaching() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A model that will not resolve does not get coached repeatedly. One repair,
-/// then the run ends on an honest mechanical terminal — no hidden
-/// continuation, no second budget, no third re-prompt.
+/// A model that will not resolve still cannot loop: the Goal continuation is
+/// bounded by the consecutive no-progress guard, so after a fixed number of
+/// quiet rounds the run ends on an honest mechanical terminal — no hidden
+/// continuation, no second budget, no unbounded re-prompt.
 #[tokio::test]
-async fn a_goal_that_stays_unresolved_is_repaired_once_then_stops() {
+async fn a_goal_that_stays_unresolved_is_continued_then_stops_within_bound() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-quiet-stall-{}",
         std::process::id() as u64 * 31 + 25
@@ -5220,17 +5316,17 @@ async fn a_goal_that_stays_unresolved_is_repaired_once_then_stops() {
 
     assert_eq!(outcome.stop_reason, StopReason::Stalled);
     assert_eq!(
-        advisories, 1,
-        "exactly one protocol repair, then a mechanical stop"
+        advisories, 2,
+        "ProgressCaps::default() allows two continuations, then the bound stops the run"
     );
     assert_eq!(
         runtime.recorded_requests().len(),
-        2,
-        "the quiet round plus ONE repaired round — nothing buys a third"
+        3,
+        "two continued rounds plus the round that proves the bound is spent"
     );
     assert_eq!(
-        outcome.progress.no_progress_streak, 1,
-        "one stalled drive → one no-progress tick: {:?}",
+        outcome.progress.no_progress_streak, 3,
+        "two continuation ticks plus the stall tick: {:?}",
         outcome.progress
     );
     std::fs::remove_dir_all(&dir).ok();

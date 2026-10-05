@@ -40,12 +40,14 @@ async fn interrupt_turns_owned(
         // Fresh user/chat turns carry their initiating input in the same row
         // that made them `running`. If the process died before TurnSink
         // appended the transcript projection, rebuild it once by turn
-        // identity before recording the interruption. Legacy/resume turns
-        // have no such payload and retain their historical behavior.
+        // identity before recording the interruption. A continuation turn
+        // carries no new initiating message (a bare resume re-enters an
+        // existing lineage) — there is then nothing to rebuild, and that must
+        // not block the interruption. Legacy turns have no payload either.
         if matches!(turn.kind.as_str(), "user" | "chat")
             && let Some(payload) = turn.payload.as_deref()
+            && let Some(message) = crate::turn::decode_turn_initiating_message_opt(payload)?
         {
-            let message = crate::turn::TurnInitiationPayload::decode(payload)?;
             let message_payload = serde_json::to_string(&message)?;
             messages
                 .ensure_initiating_message_owned(

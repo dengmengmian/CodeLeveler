@@ -1816,6 +1816,37 @@ impl CodingRuntime {
             .await
     }
 
+    /// Whether the session's latest durable terminal is a declaration that the
+    /// goal is complete, rather than a turn that merely ended with an answer.
+    ///
+    /// The `sessions.outcome` column collapses both into `completed`, so it
+    /// cannot answer this on its own. `StopReason::Answered` is the model
+    /// stopping with text and no goal terminal — the shape a prematurely
+    /// closed long task lands in — and it must stay resumable. A declared
+    /// `completed` stop, or a legacy terminal with no stop at all, is a real
+    /// declaration and stays terminal.
+    async fn session_terminal_declares_completion(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, EngineError> {
+        let Some(row) = self
+            .engine
+            .stores
+            .events
+            .load_last_by_type(session_id, "task_finished", None)
+            .await?
+        else {
+            return Ok(true);
+        };
+        let Ok(event) = leveler_engine::EngineEvent::from_payload(&row.payload) else {
+            return Ok(true);
+        };
+        let leveler_engine::EngineEvent::TaskFinished { stop, .. } = event else {
+            return Ok(true);
+        };
+        Ok(stop != Some(crate::StopReason::Answered))
+    }
+
     async fn resume_inner(
         &self,
         session_id: &SessionId,
@@ -1845,7 +1876,11 @@ impl CodingRuntime {
                 spec.runtime.kind.as_str()
             )));
         }
-        if outcome == Some(TaskOutcome::Completed) {
+        if outcome == Some(TaskOutcome::Completed)
+            && self
+                .session_terminal_declares_completion(session_id)
+                .await?
+        {
             return Err(EngineError::Config(format!(
                 "session {session_id} already completed ({}); start a new task instead",
                 outcome.map(|o| o.as_str()).unwrap_or_default()

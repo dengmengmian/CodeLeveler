@@ -1749,6 +1749,66 @@ async fn resume_refuses_a_successfully_completed_session() {
     assert!(err.to_string().contains("already completed"), "{err}");
 }
 
+/// The bad-dogfood shape: `sessions.outcome` is `completed`, but the durable
+/// terminal stopped with `answered` — the model emitted a phase summary and
+/// never declared the goal complete. That is not a proven completion, so the
+/// remaining work must stay reachable through resume/reopen.
+///
+/// The counterpart above (`resume_refuses_a_successfully_completed_session`)
+/// protects the other half: a declared `update_goal(complete)` stop stays
+/// terminal.
+#[tokio::test]
+async fn resume_allows_a_session_that_only_answered() {
+    let h = harness(vec![
+        text("phase 1 done; A3/A4 and D/F still remain"),
+        text("continued; still working on the remainder"),
+    ])
+    .await;
+    let spec = spec(&h);
+    let session = h.engine.create_task(&spec).await.unwrap();
+    // A conversational turn: it goes quiet with text and no goal terminal.
+    h.engine
+        .chat(
+            &session,
+            &spec,
+            vec![ContentPart::Text {
+                text: "finish the whole task".to_string(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let row = EventRepository::new(&h.db)
+        .load_last_by_type(&session, "task_finished", None)
+        .await
+        .unwrap()
+        .expect("a terminal was committed");
+    let EngineEvent::TaskFinished { stop, .. } = EngineEvent::from_payload(&row.payload).unwrap()
+    else {
+        panic!("expected TaskFinished");
+    };
+    assert_eq!(stop, Some(StopReason::Answered));
+    let (_, _, _, outcome) = SessionRepository::new(&h.db)
+        .execution(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Some(TaskOutcome::Completed),
+        "the session column still reads completed — which is exactly why the stop decides"
+    );
+
+    let report = h
+        .engine
+        .resume(&session, &spec, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("an answered terminal is not a proven completion");
+    assert_eq!(report.stop_reason, StopReason::Answered);
+}
+
 /// A parallel multi-agent parent session is written by the launcher, not run by
 /// the engine. Resume must refuse it by its kind, not incidentally because its
 /// transcript is empty (§18.11).
@@ -1833,18 +1893,19 @@ async fn direct_spends_no_extra_model_call_on_acceptance() {
     assert_eq!(report.outcome, TaskOutcome::Completed);
 }
 
-/// A goal the model lets go quiet ends where the model stopped. The runtime
-/// records the stall; it does not open a second turn on the model's behalf —
-/// the queued completion is reached only after an explicit resume.
+/// A goal the model lets go quiet past the continuation bound ends where the
+/// model stopped. The runtime records the stall; it does not open a second
+/// turn on the model's behalf.
 #[tokio::test]
 async fn a_stalled_goal_ends_after_one_turn() {
     let h = harness(vec![
         text("still working 1"),
         text("still working 2"),
+        text("still working 3"),
         tool_call(
             "g1",
             "update_goal",
-            serde_json::json!({"status": "complete", "summary": "would finish after a continue"}),
+            serde_json::json!({"status": "complete", "summary": "reached after an explicit resume"}),
         ),
     ])
     .await;
@@ -1857,7 +1918,7 @@ async fn a_stalled_goal_ends_after_one_turn() {
         .await
         .unwrap();
 
-    // The goal was never resolved, and nothing re-drove it.
+    // The goal was never resolved, and nothing re-drove it into a second turn.
     assert_eq!(report.stop_reason, StopReason::Stalled);
     assert_eq!(report.outcome, TaskOutcome::Interrupted);
     assert_eq!(GoalStore::unfinished(&h.db).await.unwrap().len(), 1);
@@ -3412,21 +3473,36 @@ async fn a_multimodal_goal_requires_resolution_and_keeps_its_original_wal_conten
         .unwrap();
     assert_eq!(
         report.stop_reason,
-        StopReason::Stalled,
-        "an image cannot turn a Goal into an ordinary answered chat"
+        StopReason::Completed,
+        "an image cannot turn a Goal into an ordinary answered chat: the quiet rounds \
+         continue until the model actually resolves the goal"
     );
-    assert_eq!(report.outcome, TaskOutcome::Interrupted);
-    let goals = GoalStore::unfinished(&h.db).await.unwrap();
-    assert_eq!(goals.len(), 1);
+    assert_eq!(report.outcome, TaskOutcome::Completed);
+    assert!(
+        GoalStore::unfinished(&h.db).await.unwrap().is_empty(),
+        "the goal is settled by the model's own terminal, not by an answer"
+    );
     let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "still one turn: continuation buys rounds, not turns"
+    );
     assert_eq!(turns[0].kind, "user");
     let continuation =
         leveler_engine::decode_turn_continuation(turns[0].payload.as_deref().unwrap()).unwrap();
-    assert_eq!(continuation.goal_id.as_ref(), Some(&goals[0].id));
+    assert!(
+        continuation.goal_id.is_some(),
+        "the Goal identity is durable from the first turn"
+    );
     assert_eq!(continuation.initiating_message.unwrap().content, content);
     {
         let requests = h.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests.len(),
+            3,
+            "two continued quiet rounds, then the resolving call"
+        );
         assert!(
             requests[0]
                 .tools
@@ -3440,17 +3516,6 @@ async fn a_multimodal_goal_requires_resolution_and_keeps_its_original_wal_conten
                 .any(|message| message.role == Role::User && message.content == content)
         );
     }
-    let resumed = h
-        .engine
-        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(resumed.stop_reason, StopReason::Completed);
-    assert!(GoalStore::unfinished(&h.db).await.unwrap().is_empty());
-    let turns = TurnRepository::new(&h.db).list(&session).await.unwrap();
-    let continuation =
-        leveler_engine::decode_turn_continuation(turns[1].payload.as_deref().unwrap()).unwrap();
-    assert_eq!(continuation.goal_id.as_ref(), Some(&goals[0].id));
 }
 
 struct FailingCheckpointWrites {
@@ -3496,6 +3561,7 @@ async fn a_failed_continuation_checkpoint_preserves_owed_goal_and_live_services_
     let mut h = harness(vec![
         text("Still inspecting."),
         text("Work remains."),
+        text("More work remains."),
         tool_call(
             "finish",
             "update_goal",

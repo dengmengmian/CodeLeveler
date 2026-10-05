@@ -167,6 +167,47 @@ async fn a_dead_boots_turn_is_interrupted_and_its_task_taken_over() {
     assert_eq!(after.epoch, before.epoch.next().unwrap());
 }
 
+/// A continuation turn carries no new initiating user message: a bare resume
+/// re-enters an existing lineage with only an objective anchor. Recovery must
+/// interrupt it, not fail — an undecodable payload here used to abort the
+/// whole reap, which blocked every new session in the project until the
+/// process that killed the turn was restarted.
+#[tokio::test]
+async fn a_continuation_turn_without_a_new_message_is_reapable() {
+    let world = World::new().await;
+    let session = world.session().await;
+    let boot = world.boot("b1");
+    let token = boot.acquire_ownership(&session).await.unwrap();
+    let payload = serde_json::json!({
+        "version": 2,
+        "objective": {
+            "text": "finish the inventory work",
+            "version": 1,
+            "source": "session_goal"
+        },
+        "goal_id": null
+    })
+    .to_string();
+    boot.stores
+        .turns
+        .start_owned(
+            &token,
+            &session,
+            "chat",
+            Some(&payload),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    world.set("b1", BootLiveness::Dead);
+
+    let reap = reap_after_restart(&world.boot("b2"), None, ReapScope::EndedBoots)
+        .await
+        .expect("a continuation row must not abort recovery");
+    assert!(reap.conflicts.is_empty(), "{:?}", reap.conflicts);
+    assert_eq!(world.statuses(&session).await, ["interrupted"]);
+}
+
 /// T8: a turn left running before boots were recorded has no provable owner.
 #[tokio::test]
 async fn a_running_turn_without_a_boot_is_never_reaped_or_taken_over() {

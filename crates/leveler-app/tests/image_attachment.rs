@@ -180,6 +180,9 @@ async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
     let server = MockServer::start(vec![
         quiet(),
         quiet(),
+        // The Goal continuation bound (ProgressCaps::default) buys two rounds;
+        // a third quiet round is the stall the test then resumes from.
+        quiet(),
         MockResponse::Sse {
             body: format!("data: {completed}\n\ndata: [DONE]\n\n"),
         },
@@ -293,7 +296,11 @@ async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
         })
         .expect("WAL must contain original image bytes");
     let requests = server.request_bodies().await;
-    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests.len(),
+        3,
+        "two Goal continuations plus the round that proves the bound is spent"
+    );
     let first: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
     assert!(
         first["tools"]
@@ -339,7 +346,7 @@ async fn a_goal_image_keeps_its_goal_identity_through_submit_and_continue() {
     let resumed =
         leveler_engine::decode_turn_continuation(turns[1].payload.as_deref().unwrap()).unwrap();
     assert_eq!(resumed.goal_id.as_ref(), Some(&goals[0].id));
-    assert_eq!(server.request_count(), 3);
+    assert_eq!(server.request_count(), 4);
 }
 
 /// Upload acknowledgement is not the import result. Observe the authoritative

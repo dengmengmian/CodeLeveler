@@ -453,16 +453,23 @@ pub(crate) fn collaboration_routes_submit_to_goal(collaboration: &str) -> bool {
 /// A `failed` run is resumable only when the runtime typed the failure as a
 /// recoverable provider/network fault — a schema defect, a protocol violation
 /// or an internal invariant has no repaired path that another model round
-/// follows. `completed` and `blocked` are terminal statements the model made
-/// about the goal, not a window that ended early.
+/// follows. `blocked` is a terminal statement the model made about the goal.
+///
+/// `completed` is resumable **only** when the durable stop reason was
+/// [`leveler_lifecycle::StopReason::Answered`]: a turn that ended with an
+/// answer never declared the goal complete, and the model's own text may say
+/// the work is unfinished — the exact shape of a prematurely-closed long task.
+/// `StopReason::Completed` (or a legacy row with no stop at all) IS the
+/// declaration, and stays terminal.
 pub(crate) fn task_outcome_is_resumable(
     outcome: &leveler_lifecycle::TaskOutcome,
+    stop: Option<leveler_lifecycle::StopReason>,
     failure: Option<&leveler_model::ModelError>,
 ) -> bool {
+    use leveler_lifecycle::{StopReason, TaskOutcome};
     match outcome {
-        leveler_lifecycle::TaskOutcome::Interrupted
-        | leveler_lifecycle::TaskOutcome::BudgetLimited => true,
-        leveler_lifecycle::TaskOutcome::Failed => failure.is_some_and(|error| {
+        TaskOutcome::Interrupted | TaskOutcome::BudgetLimited => true,
+        TaskOutcome::Failed => failure.is_some_and(|error| {
             matches!(
                 error.kind,
                 leveler_model::ModelErrorKind::ProviderUnavailable
@@ -472,9 +479,11 @@ pub(crate) fn task_outcome_is_resumable(
                     | leveler_model::ModelErrorKind::RateLimit
             )
         }),
-        leveler_lifecycle::TaskOutcome::Completed
-        | leveler_lifecycle::TaskOutcome::Blocked
-        | leveler_lifecycle::TaskOutcome::Cancelled => false,
+        // An answer is not a completion declaration. Every other Completed
+        // terminal (a declared `completed` stop, or a legacy row with no stop)
+        // is one.
+        TaskOutcome::Completed => stop == Some(StopReason::Answered),
+        TaskOutcome::Blocked | TaskOutcome::Cancelled => false,
     }
 }
 
@@ -2402,7 +2411,10 @@ impl InProcessRuntimeClient {
         let event = leveler_engine::EngineEvent::from_payload(&row.payload)
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         let leveler_engine::EngineEvent::TaskFinished {
-            outcome, failure, ..
+            outcome,
+            failure,
+            stop,
+            ..
         } = event
         else {
             return Ok(ContinuationState::NotResumable);
@@ -2410,7 +2422,7 @@ impl InProcessRuntimeClient {
         if outcome == leveler_lifecycle::TaskOutcome::Cancelled {
             return Ok(ContinuationState::Cancelled);
         }
-        if !task_outcome_is_resumable(&outcome, failure.as_ref()) {
+        if !task_outcome_is_resumable(&outcome, stop, failure.as_ref()) {
             return Ok(ContinuationState::NotResumable);
         }
         // Resume rebuilds from the transcript; an empty one has nothing to
@@ -6212,17 +6224,29 @@ mod collab_route_tests {
 #[cfg(test)]
 mod resumable_task_tests {
     use super::task_outcome_is_resumable;
-    use leveler_lifecycle::TaskOutcome;
+    use leveler_lifecycle::{StopReason, TaskOutcome};
     use leveler_model::{ModelError, ModelErrorKind};
 
     fn failed(kind: ModelErrorKind) -> bool {
-        task_outcome_is_resumable(&TaskOutcome::Failed, Some(&ModelError::new(kind, "x")))
+        task_outcome_is_resumable(
+            &TaskOutcome::Failed,
+            None,
+            Some(&ModelError::new(kind, "x")),
+        )
     }
 
     #[test]
     fn interruption_and_budget_windows_are_resumable() {
-        assert!(task_outcome_is_resumable(&TaskOutcome::Interrupted, None));
-        assert!(task_outcome_is_resumable(&TaskOutcome::BudgetLimited, None));
+        assert!(task_outcome_is_resumable(
+            &TaskOutcome::Interrupted,
+            None,
+            None
+        ));
+        assert!(task_outcome_is_resumable(
+            &TaskOutcome::BudgetLimited,
+            None,
+            None
+        ));
     }
 
     #[test]
@@ -6250,21 +6274,45 @@ mod resumable_task_tests {
             assert!(!failed(kind), "{kind:?} must not be resumable");
         }
         assert!(
-            !task_outcome_is_resumable(&TaskOutcome::Failed, None),
+            !task_outcome_is_resumable(&TaskOutcome::Failed, None, None),
             "an untyped failure has no proven resume path"
         );
     }
 
     #[test]
-    fn completed_and_blocked_are_terminal() {
-        assert!(!task_outcome_is_resumable(&TaskOutcome::Completed, None));
-        assert!(!task_outcome_is_resumable(&TaskOutcome::Blocked, None));
+    fn a_declared_completion_is_terminal_but_an_answer_is_not() {
+        // `StopReason::Completed` is the model's own declaration.
+        assert!(!task_outcome_is_resumable(
+            &TaskOutcome::Completed,
+            Some(StopReason::Completed),
+            None
+        ));
+        // A legacy row with no stop carries no declaration either, so it is
+        // treated as the old meaning: terminal.
+        assert!(!task_outcome_is_resumable(
+            &TaskOutcome::Completed,
+            None,
+            None
+        ));
+        // The bad-dogfood shape: the session row says `completed`, but the
+        // durable stop is `answered` — the model answered a partial summary
+        // and the runtime never received a goal terminal. This must be
+        // resumable, or the remaining work is unreachable.
+        assert!(
+            task_outcome_is_resumable(&TaskOutcome::Completed, Some(StopReason::Answered), None),
+            "an answered terminal is not a proven completion"
+        );
+        assert!(!task_outcome_is_resumable(
+            &TaskOutcome::Blocked,
+            Some(StopReason::Blocked),
+            None
+        ));
     }
 
     #[test]
     fn an_explicitly_cancelled_task_is_not_resumable() {
         assert!(
-            !task_outcome_is_resumable(&TaskOutcome::Cancelled, None),
+            !task_outcome_is_resumable(&TaskOutcome::Cancelled, None, None),
             "an explicit task cancel must not be resumable"
         );
     }

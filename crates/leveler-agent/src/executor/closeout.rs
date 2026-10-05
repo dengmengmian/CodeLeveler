@@ -3,15 +3,22 @@
 //!
 //! Historically the quiet branch of `drive` chained four nudge mechanisms with
 //! their own counters (3 + 2 + 2 + 1), each able to re-invoke the model. This
-//! module is what is left: ONE decision, and ONE repair per turn.
+//! module is what is left: ONE decision per quiet round.
 //!
-//! The repair is a PROTOCOL repair. Two things can be established
-//! mechanically about a quiet round — a goal run did not call `update_goal`,
-//! and a round produced no text at all — and each buys exactly one more model
-//! round to fix the protocol. A model that still does not resolve after that
-//! is not coached again: the turn ends on an honest terminal. Nothing here
-//! reads the work for meaning, and nothing here decides the model deserves
-//! another turn.
+//! Two mechanically different things happen here, and conflating them was a bug:
+//!
+//! - **Turn finished with an answer.** The model produced final text in a
+//!   non-Goal turn. That is an answer, and the turn ends [`CloseoutAction::Finish`].
+//! - **Goal still active.** A Goal turn went quiet without calling
+//!   `update_goal`. Nothing about that establishes completion, so the harness
+//!   drives another round [`CloseoutAction::ContinueGoal`] with a lifecycle
+//!   fact only. Past the no-progress bound it ends [`CloseoutAction::Stall`] —
+//!   never as a success.
+//!
+//! A separate PROTOCOL repair covers an empty answer, and that one is budgeted:
+//! the model said nothing at all, so one re-prompt is warranted and a second
+//! would be coaching. Nothing here reads the work for meaning, and nothing here
+//! decides the model deserves another turn.
 
 /// Repairs one turn may inject. ONE: a second attempt at the same reminder is
 /// coaching, and the harness has nothing new to say.
@@ -24,16 +31,28 @@ pub enum CloseoutAction {
     Finish,
     /// Inject exactly one nudge for this reason, consuming shared budget.
     NudgeOnce(CloseoutReason),
-    /// A nudge is still warranted but the budget (or the round limit) is
-    /// spent. Goal mode terminates as `StopReason::Stalled` with this reason
-    /// recorded in the stop detail; non-goal turns treat this as `Finish`.
+    /// A Goal round went quiet without resolving the goal. The goal is still
+    /// active, so the harness drives one more model round with a lifecycle
+    /// fact ("goal remains active; keep working toward the original goal").
+    ///
+    /// This is NOT a protocol repair and does NOT spend the one-shot repair
+    /// budget: the no-progress guard is its bound. A model that resumes real
+    /// work resets that guard; a model that only re-emits a premature summary
+    /// exhausts it and terminates as [`CloseoutAction::Stall`].
+    ContinueGoal,
+    /// A resolution was warranted but no further round may be bought — the
+    /// goal is out of continuations (no-progress bound), the round limit is
+    /// spent, or the user denied a required permission. Goal mode terminates
+    /// as `StopReason::Stalled`/`Blocked` with this reason recorded in the
+    /// stop detail; non-goal turns treat this as `Finish`.
     Stall(CloseoutReason),
 }
 
 /// Why the harness wants to re-prompt the model once more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseoutReason {
-    /// Goal mode: the model went quiet without calling `update_goal`.
+    /// Goal mode: the model went quiet without calling `update_goal`. The goal
+    /// is mechanically unresolved; what the model said is not a terminal.
     GoalUnresolved,
     /// The model ended with an empty answer.
     EmptyAnswer,
@@ -118,12 +137,22 @@ pub struct CloseoutInput {
     /// The user explicitly denied a permission this task epoch.
     /// Harness must not buy extra model rounds to pressure past that boundary.
     pub human_boundary_seen: bool,
+    /// Goal mode: the consecutive no-progress bound is already reached, so no
+    /// further continuation may be bought. Mechanical and model-independent —
+    /// it counts consecutive quiet/refused rounds, not how the work looks.
+    pub goal_continuations_exhausted: bool,
 }
 
-/// Decide the fate of one quiet round. At most one nudge per round, chosen by
+/// Decide the fate of one quiet round. At most one action per round, chosen by
 /// priority: EmptyAnswer > GoalUnresolved
 /// (an empty answer means the model said nothing at all, so it outranks even
 /// the goal-mode prompt).
+///
+/// `has_final_text` alone never resolves a Goal — a Goal only ends through an
+/// explicit `update_goal` terminal or a mechanical bound. The three goal
+/// outcomes here are: drive another round ([`CloseoutAction::ContinueGoal`]),
+/// give up honestly ([`CloseoutAction::Stall`], which the drive reports as
+/// `StopReason::Stalled`), or yield to the user's denial.
 pub fn decide(input: &CloseoutInput) -> CloseoutAction {
     let candidate = if !input.has_final_text && !input.cancelled {
         Some(CloseoutReason::EmptyAnswer)
@@ -144,6 +173,17 @@ pub fn decide(input: &CloseoutInput) -> CloseoutAction {
             CloseoutAction::Stall(reason)
         } else {
             CloseoutAction::Finish
+        };
+    }
+    // A Goal quiet round is a lifecycle continuation, not a protocol repair:
+    // the goal is still active and the only fact the harness establishes is
+    // that the model stopped talking. It gets another round while the
+    // no-progress guard allows; past that it stalls (never a success).
+    if reason == CloseoutReason::GoalUnresolved {
+        return if input.can_continue && !input.goal_continuations_exhausted {
+            CloseoutAction::ContinueGoal
+        } else {
+            CloseoutAction::Stall(reason)
         };
     }
     if input.can_continue && input.budget_remaining > 0 {
@@ -167,6 +207,7 @@ mod tests {
             can_continue: true,
             budget_remaining: CLOSEOUT_NUDGE_BUDGET,
             human_boundary_seen: false,
+            goal_continuations_exhausted: false,
         }
     }
 
@@ -235,46 +276,43 @@ mod tests {
     }
 
     #[test]
-    fn goal_mode_quiet_is_goal_unresolved() {
+    fn goal_mode_quiet_continues_the_goal() {
         let mut i = input();
         i.goal_mode = true;
         assert_eq!(
             decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::GoalUnresolved)
+            CloseoutAction::ContinueGoal,
+            "a Goal that went quiet without resolving is still active"
         );
     }
 
-    /// The budget is ONE. A second quiet round after the repair does not get a
-    /// second reminder — it ends.
+    /// The continuation is bounded by the no-progress guard, not by the
+    /// one-shot protocol-repair budget: a model that resumes real work resets
+    /// the guard, while a model that only re-emits a premature summary does
+    /// not.
     #[test]
-    fn the_repair_is_offered_once_per_turn() {
+    fn the_repair_budget_does_not_gate_goal_continuation() {
         assert_eq!(CLOSEOUT_NUDGE_BUDGET, 1);
         let mut i = input();
         i.goal_mode = true;
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::NudgeOnce(CloseoutReason::GoalUnresolved)
-        );
         i.budget_remaining = 0;
-        assert_eq!(
-            decide(&i),
-            CloseoutAction::Stall(CloseoutReason::GoalUnresolved)
-        );
+        assert_eq!(decide(&i), CloseoutAction::ContinueGoal);
     }
 
     #[test]
-    fn exhausted_budget_stalls_goal_and_finishes_non_goal() {
+    fn exhausted_no_progress_stalls_goal_and_finishes_non_goal() {
         let mut i = input();
-        i.budget_remaining = 0;
+        i.goal_continuations_exhausted = true;
 
         i.goal_mode = true;
         assert_eq!(
             decide(&i),
-            CloseoutAction::Stall(CloseoutReason::GoalUnresolved)
+            CloseoutAction::Stall(CloseoutReason::GoalUnresolved),
+            "past the no-progress bound the goal must not buy another round"
         );
 
         let i = CloseoutInput {
-            budget_remaining: 0,
+            goal_continuations_exhausted: true,
             goal_mode: false,
             ..input()
         };

@@ -594,7 +594,14 @@ async fn an_empty_answer_repair_is_not_user_intent() {
 #[tokio::test]
 async fn a_goal_nudge_keeps_its_text_and_is_not_user_intent() {
     let dir = tempfile::tempdir().unwrap();
-    let script = Script::new(vec![answer("I looked."), answer("done")]);
+    // A goal run that never calls update_goal buys bounded continuations before
+    // it stalls, so the script must outlast the no-progress bound.
+    let script = Script::new(vec![
+        answer("I looked."),
+        answer("done"),
+        answer("done"),
+        answer("done"),
+    ]);
     let saved = Arc::new(Mutex::new(Vec::new()));
     executor(dir.path(), script)
         .with_goal_mode(true)

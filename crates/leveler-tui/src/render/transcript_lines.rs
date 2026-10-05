@@ -423,9 +423,12 @@ pub(crate) fn turn_end_marker(
     t: &crate::i18n::UiText,
 ) -> (String, ratatui::style::Color) {
     match block.status {
-        TurnEndStatus::Completed | TurnEndStatus::Answered => {
-            (format!("✓ {}", t.turn_end_completed), theme.status.success)
-        }
+        TurnEndStatus::Completed => (format!("✓ {}", t.turn_end_completed), theme.status.success),
+        // A clean turn that ended with an answer, not with a completion
+        // declaration. Saying "任务已完成" here would assert a goal terminal the
+        // runtime never received — the model's own text may still say the work
+        // is unfinished.
+        TurnEndStatus::Answered => (format!("✓ {}", t.turn_end_answered), theme.status.success),
         TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Truncated => (
             format!("⚠ {}", t.final_completed_warnings),
             theme.status.warning,
@@ -1636,7 +1639,11 @@ mod tests {
         let completed = turn_end_text(TurnEndStatus::Completed, None);
         assert!(completed.contains("✓ 任务已完成"), "{completed}");
         let answered = turn_end_text(TurnEndStatus::Answered, None);
-        assert!(answered.contains("✓ 任务已完成"), "{answered}");
+        assert!(
+            answered.contains("✓ 回答结束"),
+            "an answered turn is not a completion claim: {answered}"
+        );
+        assert!(!answered.contains("任务已完成"), "{answered}");
         let truncated = turn_end_text(TurnEndStatus::Truncated, Some("context limit"));
         assert!(truncated.contains("⚠ 已完成，但有警告"), "{truncated}");
         // Budget/loop/stall incompletes read as "未完成", not the old "被阻塞".

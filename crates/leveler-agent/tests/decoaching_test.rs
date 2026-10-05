@@ -190,7 +190,14 @@ async fn chat_control_has_no_goal_workflow() {
 #[tokio::test]
 async fn goal_mode_states_the_resolution_contract_only() {
     let dir = tempfile::tempdir().unwrap();
-    let script = Script::new(vec![answer("done"), answer("done")]);
+    // A goal run that never calls update_goal now buys bounded continuations
+    // before it stalls, so the script must outlast the no-progress bound.
+    let script = Script::new(vec![
+        answer("done"),
+        answer("done"),
+        answer("done"),
+        answer("done"),
+    ]);
     executor(dir.path(), script.clone())
         .with_goal_mode(true)
         .run(

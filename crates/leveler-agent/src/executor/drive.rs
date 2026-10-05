@@ -39,7 +39,7 @@ use crate::injected_tools::{
     request_permissions_tool_definition, request_user_input_tool_definition,
     spawn_agent_tool_definition, update_goal_tool_definition,
 };
-use crate::nudges::goal_resolve_nudge;
+use crate::nudges::goal_continuation_nudge;
 use crate::sub_agent::{
     AgentRole, ChildProfile, MAX_SUB_AGENT_DEPTH, agent_nickname, lost_children_note,
     multi_agent_steer_hint, new_delegated_agent_id, scopes_overlap, settlement_notice,
@@ -1803,17 +1803,16 @@ impl AgentHarness for Drive<'_> {
         }
 
         {
-            // Unified closeout (executor/closeout.rs): a quiet round buys at
-            // most ONE protocol repair — the goal run did not call
-            // update_goal, or the model produced no text at all. Past that a
-            // goal-mode quiet ends as `Stalled` — never as a success, so a
-            // model that never learns to call update_goal terminates without
-            // the harness declaring completion on its behalf; a non-goal turn
-            // ends `Answered`.
-            //
-            // No-progress is counted once when this drive ends as Stalled
-            // (below), not on the repair — so one drive can still use it,
-            // while Engine continue is capped across turns.
+            // Unified closeout (executor/closeout.rs): ONE decision per quiet
+            // round. A non-Goal turn ends `Answered` — the model answered, and
+            // that is the whole of the fact. A Goal turn that went quiet
+            // without calling `update_goal` is NOT resolved: the goal is still
+            // active, so the harness drives another round on that lifecycle
+            // fact alone. Continuation is bounded by the no-progress guard
+            // (consecutive quiet rounds), not by a per-turn reminder budget, so
+            // a model that resumes real work resets it while a model that only
+            // re-emits a premature summary exhausts it. Past the bound the goal
+            // ends `Stalled` — never as a success.
             let has_final_text = !self.last_text.trim().is_empty();
             let action = decide(&CloseoutInput {
                 goal_mode: self.executor.policy.goal_mode,
@@ -1822,6 +1821,9 @@ impl AgentHarness for Drive<'_> {
                 can_continue: has_next_model_step,
                 budget_remaining: self.closeout_budget.remaining(),
                 human_boundary_seen: self.progress.human_boundary_seen(),
+                goal_continuations_exhausted: self
+                    .progress
+                    .should_hard_stop_no_progress(self.progress_caps),
             });
             // Whether the harness accepted the quiet round or bought itself
             // another model call is the difference between "the model is
@@ -1832,8 +1834,41 @@ impl AgentHarness for Drive<'_> {
                 goal_mode = self.executor.policy.goal_mode,
                 has_final_text,
                 budget_remaining = self.closeout_budget.remaining(),
+                no_progress_streak = self.progress.no_progress_streak,
                 "closeout decided"
             );
+            // A Goal continuation is a lifecycle drive, not a protocol repair:
+            // it counts one no-progress tick (the mechanical bound) and does not
+            // spend the one-shot repair budget. The injected text states only
+            // that the goal is still active.
+            if let CloseoutAction::ContinueGoal = action {
+                self.progress.note_no_progress_round(model_steps);
+                (self.observer)(AgentEvent::ProgressUpdated {
+                    ledger: self.progress.clone(),
+                });
+                (self.observer)(AgentEvent::AdvisoryStarted {
+                    kind: AdvisoryKind::CloseoutNudge(CloseoutReason::GoalUnresolved),
+                });
+                let nudge = Message::user(
+                    goal_continuation_nudge(),
+                    TranscriptOrigin::ProtocolRepair {
+                        repair: ProtocolRepairKind::GoalUnresolved,
+                    },
+                );
+                // Persist BOTH the quiet-round assistant text and the nudge:
+                // a resume reloads the transcript from the sink, and any gap
+                // here makes the resumed model see a different conversation
+                // than the one it actually had.
+                self.sink.append(&[assistant, nudge.clone()]).await?;
+                messages.push(nudge);
+                (self.observer)(AgentEvent::runtime_injection(
+                    crate::executor::RuntimeInjectionKind::CloseoutNudge(
+                        CloseoutReason::GoalUnresolved,
+                    ),
+                    model_steps.saturating_add(1),
+                ));
+                return Ok(Flow::NextRound);
+            }
             if let CloseoutAction::NudgeOnce(reason) = action {
                 self.closeout_budget.consume();
                 // Surface the injection: without this the user sees a
@@ -1843,7 +1878,7 @@ impl AgentHarness for Drive<'_> {
                 });
                 let nudge = match reason {
                     CloseoutReason::GoalUnresolved => Message::user(
-                        goal_resolve_nudge(),
+                        goal_continuation_nudge(),
                         TranscriptOrigin::ProtocolRepair {
                             repair: ProtocolRepairKind::GoalUnresolved,
                         },

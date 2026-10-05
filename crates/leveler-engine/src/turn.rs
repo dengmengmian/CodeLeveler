@@ -217,6 +217,25 @@ pub fn decode_turn_initiating_message(payload: &str) -> Result<Message, EngineEr
     TurnInitiationPayload::decode(payload)
 }
 
+/// The initiating user message of a write-ahead payload, when the payload IS a
+/// fresh turn.
+///
+/// A v2 continuation turn legitimately carries **no** new initiating message —
+/// a bare resume re-enters an existing lineage with only an objective anchor —
+/// so recovery paths that merely want to repair a missing transcript
+/// projection must treat that as "nothing to rebuild", never as corruption.
+/// Only a fresh user/chat turn has a message to project.
+pub fn decode_turn_initiating_message_opt(payload: &str) -> Result<Option<Message>, EngineError> {
+    let version = serde_json::from_str::<serde_json::Value>(payload)?
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| EngineError::Corrupt("turn initiation payload has no version".into()))?;
+    if version == 2 {
+        return Ok(decode_turn_continuation(payload)?.initiating_message);
+    }
+    Ok(Some(TurnInitiationPayload::decode(payload)?))
+}
+
 /// Everything the engine offers the harness for one turn.
 ///
 /// This is the whole seam. The engine hands over durable ports and the state

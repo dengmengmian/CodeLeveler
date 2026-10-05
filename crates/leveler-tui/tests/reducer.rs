@@ -1886,6 +1886,47 @@ fn answer_end_is_distinct_from_verified_task_completion() {
     ));
 }
 
+/// The bad-dogfood regression at the client: a turn that ended with the model's
+/// own text — which itself said the work was unfinished and left the plan open —
+/// must not render the completion verdict "✓ 任务已完成". The answer marker
+/// reports what happened (the model answered), not a goal terminal the runtime
+/// never received.
+#[test]
+fn an_answered_turn_with_an_open_plan_does_not_claim_task_completion() {
+    let mut s = busy_state();
+    stale_open_plan(&mut s);
+    answer(
+        &mut s,
+        "m-final",
+        "A3/A4 未完成；D/F clean-room 未完成；H 仅部分完成。",
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
+
+    let screen = rendered(&mut s, 120, 40);
+    let zh = leveler_tui::Locale::Zh.text();
+    assert!(
+        screen.contains(zh.turn_end_answered),
+        "the marker must say the model answered: {screen}"
+    );
+    assert!(
+        !screen.contains(zh.turn_end_completed),
+        "an answered turn is not a completion claim: {screen}"
+    );
+    // The open plan is not erased: it is archived into history as the
+    // reconciliation signal the next turn (or the user) works from.
+    use leveler_client_protocol::PlanStepStatus as P;
+    let plan = historical_plans(&s)
+        .into_iter()
+        .next()
+        .expect("the open plan must stay visible in history");
+    assert_eq!(plan.steps.len(), 9);
+    assert_eq!(
+        plan.steps.iter().filter(|st| st.status == P::Done).count(),
+        5,
+        "no step is fabricated as done"
+    );
+}
+
 #[test]
 fn truncated_turn_is_visible_but_leaves_input_available() {
     let mut s = state();
