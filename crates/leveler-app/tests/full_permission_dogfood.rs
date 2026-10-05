@@ -775,6 +775,247 @@ fn sanitize(value: &str) -> String {
         .collect()
 }
 
+// ── INVARIANT B: permission-mode persistence ────────────────────────────────
+
+struct ModeCase<'a> {
+    cases: &'a mut Vec<Case>,
+    violations: &'a mut Vec<Violation>,
+}
+
+impl ModeCase<'_> {
+    /// Record one "mode must equal expected" assertion. A mismatch is
+    /// `FULL_PERMISSION_MODE_DRIFT`, a fatal dogfood violation.
+    fn check(
+        &mut self,
+        case: &str,
+        where_: &str,
+        expected: WirePermission,
+        actual: WirePermission,
+    ) {
+        if actual == expected {
+            self.cases.push(Case {
+                id: case.to_string(),
+                status: Status::Pass,
+                detail: format!("{where_}: {actual:?}"),
+            });
+            return;
+        }
+        let detail =
+            format!("FULL_PERMISSION_MODE_DRIFT: {where_}: expected {expected:?}, got {actual:?}");
+        self.cases.push(Case {
+            id: case.to_string(),
+            status: Status::Fail,
+            detail: detail.clone(),
+        });
+        self.violations.push(Violation {
+            case: case.to_string(),
+            detail,
+        });
+    }
+}
+
+async fn app_client(
+    app: Arc<Application>,
+    default_mode: PermissionProfile,
+) -> Arc<InProcessRuntimeClient> {
+    Arc::new(InProcessRuntimeClient::new(
+        app,
+        ModelRef::new("mock", "m"),
+        default_mode,
+        false,
+    ))
+}
+
+/// DOGFOOD paths A–F: the mode a user selected must survive create, persist,
+/// reconnect, restart and resume — in both the embedded and the daemon shape —
+/// and an explicit CLI override must move it in both directions.
+///
+/// A client is deliberately constructed with the WRONG default mode: the runtime
+/// must answer from the persisted row, not from a process default.
+async fn run_mode_persistence(workroot: &std::path::Path) -> (Vec<Case>, Vec<Violation>) {
+    let root = workroot.join("mode-persistence");
+    std::fs::create_dir_all(&root).unwrap();
+    write_config(&root, "http://127.0.0.1:1");
+    let model = ModelRef::new("mock", "m");
+    let mut cases = Vec::new();
+    let mut violations = Vec::new();
+
+    // A. embedded create in Full: the row is Full and the runtime reads it.
+    let app = Arc::new(Application::assemble(layout(&root)).unwrap());
+    let embedded_id = app
+        .create_session_with_mode(&model, "embedded full", PermissionProfile::FullAccess)
+        .await
+        .unwrap();
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        let persisted = app
+            .persisted_permission_profile(&embedded_id)
+            .await
+            .unwrap();
+        check.check(
+            "A_embedded_full_create/persisted",
+            "embedded create persisted mode",
+            WirePermission::FullAccess,
+            match persisted {
+                Some(PermissionProfile::FullAccess) => WirePermission::FullAccess,
+                _ => WirePermission::RequestApproval,
+            },
+        );
+        let runtime = app_client(app.clone(), PermissionProfile::Assisted).await;
+        let effective = runtime.snapshot(&embedded_id).await.unwrap().mode;
+        check.check(
+            "A_embedded_full_create/effective",
+            "embedded create effective mode",
+            WirePermission::FullAccess,
+            effective,
+        );
+    }
+    drop(app);
+
+    // B. embedded restart/resume keeps Full.
+    let restarted = Arc::new(Application::assemble(layout(&root)).unwrap());
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        let runtime = app_client(restarted.clone(), PermissionProfile::RequestApproval).await;
+        let effective = runtime.snapshot(&embedded_id).await.unwrap().mode;
+        check.check(
+            "B_embedded_restart_resume/effective",
+            "embedded restart effective mode",
+            WirePermission::FullAccess,
+            effective,
+        );
+    }
+    drop(restarted);
+
+    // C. daemon create in Full.
+    let app = Arc::new(Application::assemble(layout(&root)).unwrap());
+    let daemon = app_client(app.clone(), PermissionProfile::Assisted).await;
+    let daemon_id = daemon
+        .create_session(CreateSessionRequest {
+            workspace: CreateWorkspaceSelection::RuntimeDefault,
+            goal: "daemon full".to_string(),
+            model: Some(model.clone()),
+            mode: WirePermission::FullAccess,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        let effective = daemon.snapshot(&daemon_id).await.unwrap().mode;
+        check.check(
+            "C_daemon_full_create/effective",
+            "daemon create effective mode",
+            WirePermission::FullAccess,
+            effective,
+        );
+    }
+    drop(daemon);
+    drop(app);
+
+    // D. daemon restart/resume keeps Full.
+    let restarted = Arc::new(Application::assemble(layout(&root)).unwrap());
+    let daemon2 = app_client(restarted.clone(), PermissionProfile::Assisted).await;
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        let effective = daemon2.snapshot(&daemon_id).await.unwrap().mode;
+        check.check(
+            "D_daemon_restart_resume/effective",
+            "daemon restart effective mode",
+            WirePermission::FullAccess,
+            effective,
+        );
+    }
+
+    // E. persisted Auto + explicit Full override (the interactive equivalent of
+    //    `--permission full` on resume): effective and persisted both Full, and
+    //    no permission approval exists under Full.
+    let auto_id = restarted
+        .create_session_with_mode(&model, "persisted auto", PermissionProfile::Assisted)
+        .await
+        .unwrap();
+    daemon2
+        .send(ClientCommand::SetPermissionProfile {
+            session_id: auto_id.clone(),
+            mode: WirePermission::FullAccess,
+        })
+        .await
+        .unwrap();
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        let snapshot = daemon2.snapshot(&auto_id).await.unwrap();
+        check.check(
+            "E_explicit_full_override/effective",
+            "explicit override effective mode",
+            WirePermission::FullAccess,
+            snapshot.mode,
+        );
+        check.check(
+            "E_explicit_full_override/persisted",
+            "explicit override persisted mode",
+            WirePermission::FullAccess,
+            match restarted
+                .persisted_permission_profile(&auto_id)
+                .await
+                .unwrap()
+            {
+                Some(PermissionProfile::FullAccess) => WirePermission::FullAccess,
+                _ => WirePermission::RequestApproval,
+            },
+        );
+        if let Some(UiPendingInteraction::Approval(request)) = snapshot
+            .pending_interactions
+            .iter()
+            .find(|item| matches!(item, UiPendingInteraction::Approval(_)))
+        {
+            violations.push(Violation {
+                case: "E_explicit_full_override/pending".to_string(),
+                detail: format!(
+                    "FULL_PERMISSION_CONTRACT_VIOLATION: approval pending under Full: {request:?}"
+                ),
+            });
+        }
+    }
+
+    // F. persisted Full + resume with no explicit flag keeps Full.
+    drop(daemon2);
+    drop(restarted);
+    let resumed = Arc::new(Application::assemble(layout(&root)).unwrap());
+    let resumed_client = app_client(resumed.clone(), PermissionProfile::Assisted).await;
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        let effective = resumed_client.snapshot(&daemon_id).await.unwrap().mode;
+        check.check(
+            "F_resume_without_override/effective",
+            "resume without override effective mode",
+            WirePermission::FullAccess,
+            effective,
+        );
+    }
+
+    (cases, violations)
+}
+
 // ── the test entry points ────────────────────────────────────────────────────
 
 fn artifact_path() -> Option<std::path::PathBuf> {
@@ -863,6 +1104,13 @@ async fn full_permission_contract_dogfood() {
             violations.extend(v);
         }
     }
+
+    // INVARIANT B: the selected mode survives create/persist/restart/resume in
+    // both the embedded and the daemon shape, and an explicit override moves it
+    // in both directions. No model is needed: this is durable-state truth.
+    let (persistence_cases, persistence_violations) = run_mode_persistence(workroot.path()).await;
+    cases.extend(persistence_cases);
+    violations.extend(persistence_violations);
 
     write_report(&cases, &violations);
 

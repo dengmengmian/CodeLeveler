@@ -361,14 +361,34 @@ pub(crate) async fn checkpoint_reaped_sessions(
 impl Application {
     /// Create and persist a new session record, returning its id. The caller can
     /// then run it, and — crucially — knows the id even if the run is cancelled.
+    ///
+    /// This is the built-in default profile. Callers that resolved a profile
+    /// (CLI `--permission`, a project default) use
+    /// [`Self::create_session_with_mode`] so the row they persist is the same
+    /// mode they will run under.
     pub async fn create_session(
         &self,
         model: &ModelRef,
         goal: &str,
     ) -> Result<leveler_core::SessionId, AppError> {
+        self.create_session_with_mode(model, goal, PermissionProfile::Assisted)
+            .await
+    }
+
+    /// Create and persist a session whose durable `mode` IS `mode`.
+    ///
+    /// The permission profile has exactly one authoritative create-time write:
+    /// here. The running engine reads the same resolved value, so a created
+    /// session can never be `Full` in memory and `assisted` in the database.
+    pub async fn create_session_with_mode(
+        &self,
+        model: &ModelRef,
+        goal: &str,
+        mode: PermissionProfile,
+    ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
         self.reap_zombie_turns(&db, None).await?;
-        self.insert_session(&db, model, goal).await
+        self.insert_session(&db, model, goal, mode).await
     }
 
     /// Clear the zombie `running` turns dead boots left behind, optionally
@@ -419,9 +439,10 @@ impl Application {
         &self,
         model: &ModelRef,
         goal: &str,
+        mode: PermissionProfile,
     ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
-        self.insert_session(&db, model, goal).await
+        self.insert_session(&db, model, goal, mode).await
     }
 
     async fn insert_session(
@@ -429,6 +450,7 @@ impl Application {
         db: &leveler_storage::Database,
         model: &ModelRef,
         goal: &str,
+        mode: PermissionProfile,
     ) -> Result<leveler_core::SessionId, AppError> {
         self.task_engine(db)?
             .create_task(&leveler_engine::NewSession {
@@ -438,7 +460,7 @@ impl Application {
                     .map(|root| root.display().to_string()),
                 goal: goal.to_string(),
                 model: model.to_string(),
-                mode: PermissionProfile::Assisted.as_str().to_string(),
+                mode: mode.as_str().to_string(),
                 sandbox: false,
                 kind: ExecutionKind::Direct,
                 axes: Some(leveler_engine::NewSessionAxes {
@@ -447,6 +469,51 @@ impl Application {
             })
             .await
             .map_err(app_error_from_engine)
+    }
+
+    /// The durable permission mode of an existing session, if it has a row.
+    ///
+    /// The read half of the launch resolution: a resume turns the persisted
+    /// mode into the fallback an explicit CLI override may replace.
+    pub async fn persisted_permission_profile(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<Option<PermissionProfile>, AppError> {
+        let db = self.open_database().await?;
+        let Some((mode, _, _, _)) = SessionRepository::new(&db).execution(session_id).await? else {
+            return Ok(None);
+        };
+        Ok(mode_from_str(&mode))
+    }
+
+    /// Persist an explicit permission-mode choice for an existing session.
+    ///
+    /// Used by a headless resume (`leveler run --resume <id> --permission …`),
+    /// which has no live client to route the change through. Interactive
+    /// surfaces go through `SetPermissionProfile`, which persists the same
+    /// value and also updates any running execution; this is the same single
+    /// durable write for a session with nothing running yet.
+    pub async fn set_persisted_permission_profile(
+        &self,
+        session_id: &leveler_core::SessionId,
+        mode: PermissionProfile,
+    ) -> Result<(), AppError> {
+        let db = self.open_database().await?;
+        let sessions = SessionRepository::new(&db);
+        let (_, sandbox, kind, _) = sessions
+            .execution(session_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(session_id.to_string()))?;
+        sessions
+            .set_execution(
+                session_id,
+                mode.as_str(),
+                sandbox,
+                &kind,
+                leveler_core::now(),
+            )
+            .await?;
+        Ok(())
     }
 
     /// The direct-task spec for this repository.

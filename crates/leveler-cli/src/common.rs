@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use leveler_app::Application;
 use leveler_execution::{Approver, AutoApprove, PermissionProfile};
 use leveler_model::ModelRef;
+use leveler_project::Layout;
 
 use crate::approver;
 use crate::cli::RunMode;
@@ -75,6 +76,52 @@ pub(crate) fn map_mode(mode: RunMode) -> PermissionProfile {
         RunMode::Assisted => PermissionProfile::Assisted,
         RunMode::FullAccess => PermissionProfile::FullAccess,
     }
+}
+
+/// Resolve the permission mode a launch runs under.
+///
+/// Precedence, highest first:
+///
+/// 1. an explicit runtime `SetPermissionProfile` — already persisted, so it
+///    reaches this resolution as the persisted/fallback value;
+/// 2. an explicit CLI `--permission`;
+/// 3. the session's persisted mode (the `fallback`);
+/// 4. the project's configured default, resolved by the caller.
+///
+/// `None` means the flag was NOT supplied. It is never "the flag defaulted",
+/// which is what used to let a default silently overwrite a persisted mode.
+pub(crate) fn resolve_mode(
+    explicit: Option<RunMode>,
+    fallback: PermissionProfile,
+) -> PermissionProfile {
+    explicit.map(map_mode).unwrap_or(fallback)
+}
+
+/// The protocol mirror of [`PermissionProfile`]. One conversion, so a resolved
+/// mode cannot be spelled two ways on the wire.
+pub(crate) fn wire_mode(mode: PermissionProfile) -> leveler_client_protocol::PermissionProfile {
+    match mode {
+        PermissionProfile::RequestApproval => {
+            leveler_client_protocol::PermissionProfile::RequestApproval
+        }
+        PermissionProfile::Assisted => leveler_client_protocol::PermissionProfile::Assisted,
+        PermissionProfile::FullAccess => leveler_client_protocol::PermissionProfile::FullAccess,
+    }
+}
+
+/// The project's configured default permission mode (`.leveler/config.yaml`
+/// `mode:`), else the built-in `assisted`.
+///
+/// This is the fallback for a NEW session only. A resumed session uses its
+/// persisted mode as the fallback instead, so a project default can never
+/// overwrite a mode the user already chose for that session.
+pub(crate) fn project_default_mode(layout: &Layout) -> PermissionProfile {
+    layout
+        .primary_workspace()
+        .and_then(leveler_project::ProjectConfig::load)
+        .and_then(|config| config.mode)
+        .and_then(|raw| PermissionProfile::parse(&raw))
+        .unwrap_or(PermissionProfile::Assisted)
 }
 
 pub(crate) fn build_approver(auto_approve: bool) -> Arc<dyn Approver> {
@@ -200,5 +247,74 @@ mod key_preflight_tests {
     #[test]
     fn an_unconfigured_provider_is_left_to_its_own_error() {
         assert!(ensure_provider_key(&[], &ModelRef::new("nope", "m")).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod mode_resolution_tests {
+    use super::*;
+
+    /// Precedence 1/2/3 at the resolution layer: an explicit flag always wins;
+    /// absence keeps the fallback (a persisted mode on resume, a project
+    /// default on create).
+    #[test]
+    fn an_explicit_flag_wins_and_absence_keeps_the_fallback() {
+        assert_eq!(
+            resolve_mode(None, PermissionProfile::FullAccess),
+            PermissionProfile::FullAccess,
+            "absence must keep the persisted mode"
+        );
+        assert_eq!(
+            resolve_mode(Some(RunMode::Assisted), PermissionProfile::FullAccess),
+            PermissionProfile::Assisted,
+            "an explicit flag must override the persisted mode"
+        );
+        assert_eq!(
+            resolve_mode(Some(RunMode::FullAccess), PermissionProfile::Assisted),
+            PermissionProfile::FullAccess
+        );
+        assert_eq!(
+            resolve_mode(Some(RunMode::RequestApproval), PermissionProfile::Assisted),
+            PermissionProfile::RequestApproval
+        );
+    }
+
+    /// Precedence 4: the project config is only a fallback, and only for a new
+    /// session. A project default may not overwrite an explicit flag.
+    #[test]
+    fn the_project_default_is_only_a_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
+        std::fs::write(
+            tmp.path().join(".leveler/config.yaml"),
+            "mode: full_access\n",
+        )
+        .unwrap();
+        let layout = Layout::from_parts(
+            tmp.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        );
+        assert_eq!(project_default_mode(&layout), PermissionProfile::FullAccess);
+        assert_eq!(
+            resolve_mode(None, project_default_mode(&layout)),
+            PermissionProfile::FullAccess
+        );
+        assert_eq!(
+            resolve_mode(Some(RunMode::Assisted), project_default_mode(&layout)),
+            PermissionProfile::Assisted
+        );
+    }
+
+    /// No project config (or an unparseable mode) means the built-in default.
+    #[test]
+    fn an_absent_project_default_is_assisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::from_parts(
+            tmp.path().to_path_buf(),
+            tmp.path().join("configs"),
+            tmp.path().join("state"),
+        );
+        assert_eq!(project_default_mode(&layout), PermissionProfile::Assisted);
     }
 }

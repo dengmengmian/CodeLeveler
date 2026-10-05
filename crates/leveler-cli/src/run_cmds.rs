@@ -32,7 +32,10 @@ use leveler_runtime_host::{
 };
 
 use crate::cli::{OutputFormat, RunMode};
-use crate::common::{build_approver, map_mode, resolve_model, spawn_interrupt_handler};
+use crate::common::{
+    build_approver, map_mode, project_default_mode, resolve_mode, resolve_model,
+    spawn_interrupt_handler, wire_mode,
+};
 use crate::output::Line;
 use crate::render::{emit_jsonl, render_event};
 
@@ -41,7 +44,7 @@ pub(crate) async fn cmd_run(
     layout: Layout,
     task: String,
     model: Option<String>,
-    mode: RunMode,
+    mode: Option<RunMode>,
     auto_approve: bool,
     output: OutputFormat,
     ship: leveler_app::ShipOptions,
@@ -56,9 +59,11 @@ pub(crate) async fn cmd_run(
         app = app.with_execution_overrides(overrides);
     }
     let model_ref = resolve_model(&app, model)?;
-    let execution_mode = map_mode(mode);
+    let execution_mode = resolve_mode(mode, project_default_mode(&app.layout));
 
-    let session_id = app.create_session(&model_ref, &task).await?;
+    let session_id = app
+        .create_session_with_mode(&model_ref, &task, execution_mode)
+        .await?;
 
     if output == OutputFormat::Text {
         println!(
@@ -109,12 +114,12 @@ pub(crate) async fn cmd_run_parallel(
     layout: Layout,
     task: String,
     model: Option<String>,
-    mode: RunMode,
+    mode: Option<RunMode>,
     parallel: usize,
 ) -> anyhow::Result<std::process::ExitCode> {
     let app = Application::assemble(layout)?;
     let model_ref = resolve_model(&app, model)?;
-    let execution_mode = map_mode(mode);
+    let execution_mode = resolve_mode(mode, project_default_mode(&app.layout));
 
     println!(
         "{}",
@@ -686,7 +691,7 @@ fn make_url_opener() -> leveler_tui::UrlOpener {
 pub(crate) async fn cmd_tui(
     layout: Layout,
     model: Option<String>,
-    mode: RunMode,
+    mode: Option<RunMode>,
     auto_approve: bool,
     in_process: bool,
     socket: Option<PathBuf>,
@@ -762,7 +767,7 @@ pub(crate) async fn cmd_tui(
         let client = Arc::new(client);
         let (session_id, context_window) = if let Some(id) = session.as_deref() {
             let session_id = leveler_core::SessionId::new(id);
-            let _snap = client.snapshot(&session_id).await.map_err(|e| {
+            let snap = client.snapshot(&session_id).await.map_err(|e| {
                 anyhow::anyhow!(
                     "cannot open session {id}: {e}\n\
                      list sessions: leveler resume"
@@ -786,12 +791,31 @@ pub(crate) async fn cmd_tui(
                         anyhow::anyhow!("cannot re-assert auto-approve on session {id}: {e}")
                     })?;
             }
+            // An explicit `--permission` overrides the persisted mode; absence
+            // keeps it. The command persists AND moves the live cell, so the
+            // UI, the row and the running turn cannot disagree.
+            if let Some(explicit) = mode {
+                let requested = map_mode(explicit);
+                if requested.as_str() != snap.mode.as_str() {
+                    client
+                        .send(
+                            leveler_client_protocol::ClientCommand::SetPermissionProfile {
+                                session_id: session_id.clone(),
+                                mode: wire_mode(requested),
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("cannot apply --permission to session {id}: {e}")
+                        })?;
+                }
+            }
             // The daemon path has no model registry of its own and the
             // snapshot carries the model's name but not its limits, so the
             // context gauge had nothing to divide by — and, contrary to the
             // note that used to sit here, no later turn ever filled it in.
             // The window the user configured for that model is right here.
-            let window = _snap
+            let window = snap
                 .model
                 .as_ref()
                 .and_then(|m| {
@@ -814,17 +838,7 @@ pub(crate) async fn cmd_tui(
                     workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
                     goal: "interactive session".to_string(),
                     model,
-                    mode: match map_mode(mode) {
-                        leveler_execution::PermissionProfile::RequestApproval => {
-                            leveler_client_protocol::PermissionProfile::RequestApproval
-                        }
-                        leveler_execution::PermissionProfile::Assisted => {
-                            leveler_client_protocol::PermissionProfile::Assisted
-                        }
-                        leveler_execution::PermissionProfile::FullAccess => {
-                            leveler_client_protocol::PermissionProfile::FullAccess
-                        }
-                    },
+                    mode: wire_mode(resolve_mode(mode, project_default_mode(&layout))),
                     // `--auto-approve` becomes this session's policy; the daemon
                     // runs the turn and it survives this client disconnecting.
                     approval_policy: if auto_approve {
@@ -901,9 +915,11 @@ pub(crate) async fn cmd_tui(
     let app = Arc::new(Application::assemble(layout)?);
     app.reconcile_execution_services().await?;
     let model_ref = resolve_model(app.as_ref(), model)?;
-    let mode = map_mode(mode);
 
-    let session_id = if let Some(id) = session.as_deref() {
+    // One resolution per launch. A resume falls back to the PERSISTED mode
+    // (never a default), a new session falls back to the project default; an
+    // explicit `--permission` replaces either.
+    let (session_id, mode, persisted_mode) = if let Some(id) = session.as_deref() {
         let session_id = leveler_core::SessionId::new(id);
         // Fail early with a clear message if the id is unknown for this repo.
         let db = app.open_database().await?;
@@ -923,10 +939,18 @@ pub(crate) async fn cmd_tui(
         // "waiting for the model" clock over work that had been dead since the
         // kill. Scoped to this session: reopening one must not disturb another.
         app.reap_zombie_turns(&db, Some(&session_id)).await?;
-        session_id
-    } else {
-        app.create_session(&model_ref, "interactive session")
+        let persisted = app
+            .persisted_permission_profile(&session_id)
             .await?
+            .ok_or_else(|| anyhow::anyhow!("session `{id}` has no execution row"))?;
+        let mode = resolve_mode(mode, persisted);
+        (session_id, mode, Some(persisted))
+    } else {
+        let mode = resolve_mode(mode, project_default_mode(&app.layout));
+        let id = app
+            .create_session_with_mode(&model_ref, "interactive session", mode)
+            .await?;
+        (id, mode, None)
     };
 
     let in_process_client = Arc::new(InProcessRuntimeClient::new_with_options(
@@ -936,9 +960,19 @@ pub(crate) async fn cmd_tui(
         false,
         auto_approve,
     ));
-    // Do not overwrite persisted mode/model with process defaults when reopening.
-    if session.is_none() {
-        in_process_client.attach_session(session_id.clone());
+    // The created row already carries `mode`; on a resume an explicit flag has
+    // to move the persisted row + live cell like any other profile change.
+    if let Some(persisted) = persisted_mode
+        && persisted != mode
+    {
+        in_process_client
+            .send(
+                leveler_client_protocol::ClientCommand::SetPermissionProfile {
+                    session_id: session_id.clone(),
+                    mode: wire_mode(mode),
+                },
+            )
+            .await?;
     }
     // `/web` inside the TUI binds the browser Web UI over this same in-process
     // runtime. The service is the `InProcessRuntimeClient` itself (it implements
@@ -1042,7 +1076,7 @@ pub(crate) async fn cmd_tui(
 pub(crate) async fn cmd_serve(
     layout: Layout,
     model: Option<String>,
-    mode: RunMode,
+    mode: Option<RunMode>,
     auto_approve: bool,
     sandbox: bool,
     socket: Option<PathBuf>,
@@ -1052,6 +1086,7 @@ pub(crate) async fn cmd_serve(
     let socket_path = socket.unwrap_or_else(|| layout.socket_path());
     let app = Arc::new(Application::assemble(layout)?);
     let model_ref = resolve_model(app.as_ref(), model)?;
+    let default_mode = resolve_mode(mode, project_default_mode(&app.layout));
 
     // Minted here so the runtime can retire this process itself once work
     // drains (ShutdownWhenIdle); the signal handlers below cancel the same
@@ -1064,7 +1099,7 @@ pub(crate) async fn cmd_serve(
         InProcessRuntimeClient::new_with_options(
             app.clone(),
             model_ref.clone(),
-            map_mode(mode),
+            default_mode,
             sandbox,
             auto_approve,
         )
@@ -1157,7 +1192,7 @@ pub(crate) async fn cmd_web(
     connect: Option<SocketAddr>,
     token: Option<String>,
     model: Option<String>,
-    mode: RunMode,
+    mode: Option<RunMode>,
     auto_approve: bool,
     sandbox: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
@@ -1205,7 +1240,7 @@ pub(crate) async fn cmd_web(
             let runtime = Arc::new(InProcessRuntimeClient::new_with_options(
                 app.clone(),
                 model_ref,
-                map_mode(mode),
+                resolve_mode(mode, project_default_mode(&app.layout)),
                 sandbox,
                 auto_approve,
             ));
@@ -1370,10 +1405,11 @@ pub(crate) async fn cmd_resume(
         return list_sessions_for_resume(layout).await;
     };
     // Reopen reuses the TUI session path; persisted model/mode are restored.
+    // No explicit `--permission`: absence keeps the persisted mode.
     cmd_tui(
         layout,
         None,
-        RunMode::Assisted,
+        None,
         false,
         false,
         None,
@@ -1455,6 +1491,7 @@ fn format_resumable_hint(sessions: &[(String, String, String)]) -> Option<String
 pub(crate) async fn cmd_run_resume(
     layout: Layout,
     id: String,
+    mode: Option<RunMode>,
     auto_approve: bool,
     confirm_recovery: bool,
     output: OutputFormat,
@@ -1462,6 +1499,14 @@ pub(crate) async fn cmd_run_resume(
     // Resume reloads collaboration and active capabilities from durable state.
     let app = Application::assemble(layout)?;
     let session_id = leveler_core::SessionId::new(id.clone());
+
+    // An explicit `--permission` overrides the persisted mode. This is the one
+    // durable write the resume then reads back, so the resumed turn, the row
+    // and any later snapshot all agree. Absence keeps the persisted mode.
+    if let Some(explicit) = mode {
+        app.set_persisted_permission_profile(&session_id, map_mode(explicit))
+            .await?;
+    }
 
     // The explicit answer to a RecoveryConfirmationRequired stop: the user
     // inspected the workspace, so close the interrupted call(s) first.

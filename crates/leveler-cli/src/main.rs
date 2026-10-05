@@ -41,8 +41,8 @@ use clap::Parser;
 use leveler_project::Layout;
 
 use cli::{
-    AgentsCommand, Cli, Command, ConfigCommand, ModelSubcommand, ModelsCommand, RunMode,
-    SkillsCommand, ThemeCommand,
+    AgentsCommand, Cli, Command, ConfigCommand, ModelSubcommand, ModelsCommand, SkillsCommand,
+    ThemeCommand,
 };
 use eval_cmd::cmd_eval;
 use info_cmds::{
@@ -238,7 +238,7 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             return cmd_tui(
                 layout,
                 None,
-                RunMode::Assisted,
+                None,
                 false,
                 false,
                 None,
@@ -390,7 +390,8 @@ async fn run(args: Cli) -> anyhow::Result<std::process::ExitCode> {
             // `--resume <id>` continues an interrupted non-interactive run
             // (headless event stream); it does not take a fresh task.
             if let Some(id) = resume {
-                return cmd_run_resume(layout, id, auto_approve, confirm_recovery, output).await;
+                return cmd_run_resume(layout, id, mode, auto_approve, confirm_recovery, output)
+                    .await;
             }
             let task = task.ok_or_else(|| {
                 anyhow::anyhow!("a task is required (or pass --resume <id> to continue a run)")

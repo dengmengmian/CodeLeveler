@@ -4208,7 +4208,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 config.thinking = None;
                 match self
                     .app
-                    .create_daemon_session(&config.model, PLACEHOLDER_GOAL)
+                    .create_daemon_session(&config.model, PLACEHOLDER_GOAL, config.mode)
                     .await
                 {
                     Ok(session_id) => {
@@ -5340,7 +5340,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         }
         let session_id = self
             .app
-            .create_daemon_session(&model, &request.goal)
+            .create_daemon_session(&model, &request.goal, execution_mode(request.mode))
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         self.persist_runtime_config(

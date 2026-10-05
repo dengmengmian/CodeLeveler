@@ -151,7 +151,10 @@ impl Application {
                     let app = Application::assemble(layout).ok()?;
                     // Direct tool loop only — no orchestrate dual path.
                     let result = async {
-                        let session_id = app.create_session(&model, &task).await.ok()?;
+                        let session_id = app
+                            .create_session_with_mode(&model, &task, mode)
+                            .await
+                            .ok()?;
                         let outcome = app
                             .run_in_session(
                                 &session_id,

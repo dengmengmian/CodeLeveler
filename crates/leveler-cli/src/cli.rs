@@ -48,8 +48,12 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Permission profile: request-approval | assisted | full-access.
-        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
-        mode: RunMode,
+        ///
+        /// Omitted: a new session uses the project/default profile and a
+        /// resumed `--session` keeps its persisted profile. Supplied: it is an
+        /// explicit override of that persisted profile.
+        #[arg(long = "permission", value_enum)]
+        mode: Option<RunMode>,
         /// Approve risky actions automatically (no approval overlay). Required
         /// for unattended PTY/expect driving of the interactive UI.
         #[arg(long)]
@@ -76,8 +80,8 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Default permission profile: request-approval | assisted | full-access.
-        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
-        mode: RunMode,
+        #[arg(long = "permission", value_enum)]
+        mode: Option<RunMode>,
         /// Auto-approve risky actions for sessions owned by this daemon.
         #[arg(long)]
         auto_approve: bool,
@@ -120,8 +124,8 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Default permission profile: request-approval | assisted | full-access.
-        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
-        mode: RunMode,
+        #[arg(long = "permission", value_enum)]
+        mode: Option<RunMode>,
         /// Auto-approve risky actions for sessions owned by this runtime
         /// (in-process runtime only).
         #[arg(long)]
@@ -250,8 +254,12 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Permission profile: request-approval | assisted | full-access.
-        #[arg(long = "permission", value_enum, default_value_t = RunMode::Assisted)]
-        mode: RunMode,
+        ///
+        /// Omitted: a new task uses the project/default profile and
+        /// `--resume` keeps the session's persisted profile. Supplied: it is
+        /// an explicit override of that persisted profile.
+        #[arg(long = "permission", value_enum)]
+        mode: Option<RunMode>,
         /// Approve risky actions automatically (no prompts).
         #[arg(long)]
         auto_approve: bool,
@@ -1143,7 +1151,7 @@ mod tests {
                 session,
             }) => {
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
-                assert!(matches!(mode, RunMode::Assisted));
+                assert!(matches!(mode, Some(RunMode::Assisted)));
                 assert!(auto_approve);
                 assert!(in_process);
                 assert!(socket.is_none());
@@ -1179,7 +1187,7 @@ mod tests {
             }) => {
                 assert!(!no_workspace);
                 assert_eq!(model.as_deref(), Some("deepseek/v4"));
-                assert!(matches!(mode, RunMode::FullAccess));
+                assert!(matches!(mode, Some(RunMode::FullAccess)));
                 assert!(!auto_approve);
                 assert!(deny_network);
                 assert_eq!(socket, Some(PathBuf::from("/tmp/leveler.sock")));
@@ -1330,6 +1338,53 @@ mod tests {
                 );
             }
             other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    /// `--permission` absence and an explicit value must be distinguishable.
+    /// A defaulted flag was silently overwriting a resumed session's persisted
+    /// mode; `None` is "absent", `Some(..)` is an explicit override.
+    #[test]
+    fn permission_flag_absence_is_distinguishable_from_an_explicit_value() {
+        match parse(&["leveler", "tui", "--session", "s1"]).command {
+            Some(Command::Tui { mode, .. }) => {
+                assert!(mode.is_none(), "absence must be None, never a default")
+            }
+            other => panic!("expected Tui, got {other:?}"),
+        }
+        match parse(&[
+            "leveler",
+            "tui",
+            "--session",
+            "s1",
+            "--permission",
+            "full-access",
+        ])
+        .command
+        {
+            Some(Command::Tui { mode, .. }) => {
+                assert!(matches!(mode, Some(RunMode::FullAccess)))
+            }
+            other => panic!("expected Tui, got {other:?}"),
+        }
+        match parse(&["leveler", "run", "--resume", "s1"]).command {
+            Some(Command::Run { mode, .. }) => assert!(mode.is_none()),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        match parse(&[
+            "leveler",
+            "run",
+            "--resume",
+            "s1",
+            "--permission",
+            "assisted",
+        ])
+        .command
+        {
+            Some(Command::Run { mode, .. }) => {
+                assert!(matches!(mode, Some(RunMode::Assisted)))
+            }
+            other => panic!("expected Run, got {other:?}"),
         }
     }
 }
