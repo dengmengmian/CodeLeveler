@@ -1030,14 +1030,19 @@ impl Application {
         Ok((available_packs, tool_context, registry))
     }
 
-    /// The read-only tool surface a `/btw` side question may use.
+    /// The observe-only tool surface a `/btw` side question may use.
     ///
-    /// Same composition owner as a normal turn. Confined profiles narrow it
-    /// to observe-class tools: no mutating tool and no harness control
-    /// (`update_plan`, delegation, permissions) is present, so a side question
-    /// cannot change the workspace or steer the main task. The returned
-    /// [`ToolContext`] additionally carries the read-only overlay. FullAccess
-    /// retains actual available tools; side-question intent remains in its prompt.
+    /// Same composition owner as a normal turn, then narrowed to the side
+    /// question's own capability surface. The narrowing is decided by THIS
+    /// surface, never by the permission profile: a side question is an
+    /// observer of the main task, so it must not gain a lifecycle-bound tool
+    /// (`wait_task`, `run_command`, `kill_task`) or a mutating one merely
+    /// because the session runs with Full access. Full then governs how the
+    /// tools that DO belong to this surface are authorized — unrestricted, as
+    /// the permission contract requires — so nothing here is a DENY.
+    ///
+    /// Capability surface and permission policy stay separate owners:
+    /// [`PermissionProfile`] never adds a tool back to this list.
     pub async fn side_question_tools(
         &self,
         model: &ModelRef,
@@ -1048,11 +1053,14 @@ impl Application {
         let (_available, tool_context, registry) = self
             .compose_tool_surface(model, mode, sandbox, true, session_scope)
             .await?;
-        if tool_context.policy.unrestricted_execution() {
-            return Ok((registry, tool_context));
-        }
         // A bounded side question has no goal or capability loading protocol.
         // It may inspect base primitives without implicitly exposing packs.
+        //
+        // This runs for EVERY profile. `read_only_subset` keeps observe-class
+        // tools whose own risk is `Safe`, which is a mechanical property of
+        // the tool, not a permission decision: no `wait_task`, `run_command`,
+        // `kill_task`, `apply_patch`, `write_file` or `update_plan` can be in
+        // it, whatever `mode` says.
         let registry = registry.read_only_subset();
         let definitions = registry.definitions();
         let optional: Vec<&str> = definitions

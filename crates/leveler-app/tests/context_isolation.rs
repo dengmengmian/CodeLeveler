@@ -1300,68 +1300,89 @@ async fn btw_accounts_for_side_history_and_only_folds_with_an_accepted_summary()
 /// protocol, so optional packs (`find_references` and friends) stay
 /// undisclosed — see `session_axes_resume.rs`
 /// `a_side_question_has_only_base_observation_tools`.
+///
+/// The set is a property of the SIDE SURFACE, not of the permission profile:
+/// Full access must not add a mutating or lifecycle-bound tool back to it, so
+/// the whole matrix is checked and the sets must be identical. The permission
+/// contract is unaffected either way — this narrows what a side question may
+/// reach, never what the session is authorized to do.
 #[tokio::test]
 async fn btw_side_surface_is_read_only_and_excludes_harness_controls() {
     let (_tmp, _server, app, _client, session) = harness(vec![]).await;
-    let (registry, tool_context) = app
-        .side_question_tools(
-            &ModelRef::new("mock", "m"),
-            PermissionProfile::Assisted,
-            false,
-            Some(session.as_str()),
-        )
-        .await
-        .unwrap();
-    let names: Vec<String> = registry
-        .definitions()
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect();
-    for present in [
-        "read_file",
-        "grep",
-        "list_files",
-        "find_files",
-        "read_project_rules",
-        "get_task",
+    let mut baseline: Option<Vec<String>> = None;
+    for profile in [
+        PermissionProfile::RequestApproval,
+        PermissionProfile::Assisted,
+        PermissionProfile::FullAccess,
     ] {
-        assert!(
-            names.iter().any(|name| name == present),
-            "a side question must be able to investigate with {present}: {names:?}"
-        );
-    }
-    for forbidden in [
-        "apply_patch",
-        "write_file",
-        "run_command",
-        "shell_command",
-        "update_plan",
-        "update_goal",
-        "spawn_agent",
-        "request_permissions",
-        "remember",
-        "forget",
-        "kill_task",
-        "wait_task",
-    ] {
-        assert!(
-            !names.iter().any(|name| name == forbidden),
-            "a side question must not expose {forbidden}: {names:?}"
-        );
-    }
-    // A mutating call has no route on the side surface, so it cannot reach the
-    // workspace even if the model asks: the refusal is deterministic, not a
-    // prompt the model is trusted to obey.
-    let error = registry
-        .execute(
+        let (registry, tool_context) = app
+            .side_question_tools(
+                &ModelRef::new("mock", "m"),
+                profile,
+                false,
+                Some(session.as_str()),
+            )
+            .await
+            .unwrap();
+        let mut names: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        names.sort();
+        for present in [
+            "read_file",
+            "grep",
+            "list_files",
+            "find_files",
+            "read_project_rules",
+            "get_task",
+        ] {
+            assert!(
+                names.iter().any(|name| name == present),
+                "a side question must be able to investigate with {present} ({profile:?}): {names:?}"
+            );
+        }
+        for forbidden in [
+            "apply_patch",
             "write_file",
-            serde_json::json!({"path": "created-by-btw.txt", "content": "x"}),
-            tool_context,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .expect_err("a mutating tool is not on the side surface");
-    assert!(error.to_string().contains("unknown tool"), "{error}");
+            "run_command",
+            "shell_command",
+            "update_plan",
+            "update_goal",
+            "spawn_agent",
+            "request_permissions",
+            "remember",
+            "forget",
+            "kill_task",
+            "wait_task",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == forbidden),
+                "a side question must not expose {forbidden} ({profile:?}): {names:?}"
+            );
+        }
+        match &baseline {
+            None => baseline = Some(names),
+            Some(expected) => assert_eq!(
+                &names, expected,
+                "the side-question capability surface must not depend on the permission profile"
+            ),
+        }
+        // A mutating call has no route on the side surface, so it cannot reach
+        // the workspace even if the model asks: the refusal is deterministic,
+        // not a prompt the model is trusted to obey.
+        let error = registry
+            .execute(
+                "write_file",
+                serde_json::json!({"path": "created-by-btw.txt", "content": "x"}),
+                tool_context,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect_err("a mutating tool is not on the side surface");
+        assert!(error.to_string().contains("unknown tool"), "{error}");
+    }
 }
 
 /// A side question may read the workspace to answer, but it cannot write the

@@ -226,8 +226,11 @@ async fn a_side_question_has_only_base_observation_tools() {
     );
 }
 
+/// Full access governs how the tools ON the side surface are authorized — not
+/// which tools are on it. The surface stays the observe-only one, and Full is
+/// still unrestricted INSIDE it (nothing is denied, nothing asks).
 #[tokio::test]
-async fn full_side_question_retains_available_mutating_and_optional_tools() {
+async fn full_side_question_keeps_the_observe_only_surface_with_unrestricted_authority() {
     isolate_global_config();
     let tmp = tempfile::tempdir().unwrap();
     let app = Application::assemble(layout(&tmp)).unwrap();
@@ -240,15 +243,25 @@ async fn full_side_question_retains_available_mutating_and_optional_tools() {
         )
         .await
         .unwrap();
+    // Full is not downgraded to an approval flow: this is the permission
+    // contract, and narrowing the surface must not touch it.
     assert!(ctx.policy.unrestricted_execution());
-    for name in ["apply_patch", "run_command", "web_fetch"] {
+    assert!(registry.get("read_file").is_some());
+    assert!(registry.get("get_task").is_some());
+    // A lifecycle-bound or mutating tool is not part of the side surface, so
+    // Full access cannot add it back.
+    for name in [
+        "apply_patch",
+        "write_file",
+        "run_command",
+        "wait_task",
+        "kill_task",
+        "update_plan",
+        "spawn_agent",
+    ] {
         assert!(
-            registry.get(name).is_some(),
-            "Full side question omitted {name}"
+            registry.get(name).is_none(),
+            "the side surface must not expose {name}, whatever the permission profile"
         );
     }
-    assert!(
-        registry.get("spawn_agent").is_none(),
-        "composition must not invent harness handles"
-    );
 }
