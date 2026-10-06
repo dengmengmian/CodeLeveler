@@ -2158,19 +2158,45 @@ fn needs_network_permission(call: &ToolCallBlock) -> bool {
             .is_some_and(|p| p.trim_start().starts_with(NETWORK_PERMISSION_REQUIRED))
 }
 
+/// Both shapes the runtime writes for a timeout start with this.
+const TIMEOUT_TAG: &str = "[timed out after ";
+
+/// A row the runtime wrote about HOW a command ran — its exit status, its
+/// stream headers, a timeout, or one of the notes it addresses to the model —
+/// as opposed to anything the command itself printed.
+///
+/// These rows are the runtime's account of the EXECUTION, never evidence about
+/// the command's result: they are neither a failure reason nor output lines.
+/// Every prefix below is written by `leveler-tools` (the body assembled in
+/// `tools::command_execution`, plus `recoverable::sandbox_write_denied` and
+/// `recoverable::network_permission_required`); a command that prints one of
+/// them verbatim loses that line, which is the price of a text protocol the
+/// runtime already owns.
+///
+/// `[permission refused] …` is deliberately NOT here: that tag carries the
+/// tool's own structured refusal reason, so it IS the failure reason.
+fn is_runtime_note(line: &str) -> bool {
+    const TAGS: [&str; 3] = ["[execution policy] ", "[mutation rejected] ", "[note] "];
+    line.starts_with("exit: ")
+        || (line.starts_with("--- ") && line.ends_with(" ---"))
+        || is_timeout_note(line)
+        || TAGS.iter().any(|tag| line.starts_with(tag))
+}
+
+/// The runtime's timeout row: the limit that fired (`[timed out after 120s]`),
+/// or the bare `[timed out]` for a preview that carries no limit.
+fn is_timeout_note(line: &str) -> bool {
+    line == "[timed out]" || (line.starts_with(TIMEOUT_TAG) && line.ends_with(']'))
+}
+
 /// A finished command's output as its preview carries it, without the
-/// runtime's metadata rows (`exit: N`, stream headers) or its note to the model.
+/// runtime's notes about how it ran.
 fn preview_body_lines(call: &ToolCallBlock) -> Vec<&str> {
     call.preview
         .as_deref()
         .unwrap_or("")
         .lines()
-        .filter(|l| {
-            let metadata = l.starts_with("exit: ")
-                || (l.starts_with("--- ") && l.ends_with(" ---"))
-                || l.starts_with(NETWORK_PERMISSION_REQUIRED);
-            !l.trim().is_empty() && !metadata
-        })
+        .filter(|l| !l.trim().is_empty() && !is_runtime_note(l))
         .collect()
 }
 
@@ -2182,7 +2208,8 @@ fn preview_truncated(call: &ToolCallBlock) -> bool {
         .is_some_and(|p| p.trim_end().ends_with('\u{2026}'))
 }
 
-/// Output line count for an Ok result row, skipping shell metadata rows.
+/// Output line count for an Ok result row. A command's count is the lines it
+/// printed — the same lines [`preview_body_lines`] hands the expanded body.
 fn content_line_count(call: &ToolCallBlock) -> usize {
     let Some(preview) = call
         .preview
@@ -2193,14 +2220,7 @@ fn content_line_count(call: &ToolCallBlock) -> usize {
         return 0;
     };
     if is_shell_call(call) {
-        preview
-            .lines()
-            .filter(|l| {
-                !l.starts_with("exit: ")
-                    && *l != "[timed out]"
-                    && !(l.starts_with("--- ") && l.ends_with(" ---"))
-            })
-            .count()
+        preview_body_lines(call).len()
     } else {
         preview.lines().count()
     }
@@ -2220,7 +2240,7 @@ fn call_timed_out(call: &ToolCallBlock) -> bool {
         && call
             .preview
             .as_deref()
-            .is_some_and(|p| p.lines().any(|l| l == "[timed out]"))
+            .is_some_and(|p| p.lines().any(|l| is_timeout_note(l.trim())))
 }
 
 /// First non-empty preview line for a failed tool (honest one-line error).
@@ -2235,13 +2255,17 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
     if needs_network_permission(call) {
         return Some(t.command_needs_network_note.to_string());
     }
-    // Only where the head already states the exit code (`exit_code` arrived
-    // with protocol 1.10); an older row keeps its `exit: N` line.
-    if is_shell_call(call)
-        && call.exit_code.is_some()
-        && let Some(line) = call.preview.as_deref().and_then(shell_failure_line)
-    {
-        return Some(truncate_display(&line, 72));
+    // A command states its own reason, or it has none. `exit_code` arrived with
+    // protocol 1.10, so where the head already states the exit code, the result
+    // row must not fall back to a runtime row (`exit: N`, a stream header, a
+    // policy note) — those say how the command ran, never why it failed. A row
+    // from before 1.10 keeps its `exit: N` line here.
+    if is_shell_call(call) && call.exit_code.is_some() {
+        return call
+            .preview
+            .as_deref()
+            .and_then(shell_failure_line)
+            .map(|line| truncate_display(&line, 72));
     }
     let preview = call.preview.as_deref()?.trim();
     if preview.is_empty() {
@@ -2257,18 +2281,13 @@ fn failed_one_line_summary(call: &ToolCallBlock, t: &UiText) -> Option<String> {
 
 /// The line that says what went wrong in a failed command's preview: the
 /// first line that reports a failure (`error…`, `FAIL`, `✗`, `panic`), else the
-/// first thing it printed — never the runtime's own `exit: N` / stream-header
-/// rows, which the head already states. Color escapes are removed.
+/// first thing it printed — never a [`is_runtime_note`] row, which says how the
+/// command ran rather than why it failed. Color escapes are removed.
 fn shell_failure_line(preview: &str) -> Option<String> {
     let content: Vec<String> = preview
         .lines()
         .map(|l| strip_color(l).trim().to_string())
-        .filter(|l| {
-            let metadata = l.starts_with("exit: ")
-                || l == "[timed out]"
-                || (l.starts_with("--- ") && l.ends_with(" ---"));
-            !l.is_empty() && !metadata
-        })
+        .filter(|l| !l.is_empty() && !is_runtime_note(l))
         .collect();
     let reports_failure = |l: &str| {
         let lower = l.to_lowercase();
@@ -6112,6 +6131,156 @@ mod compact_command_tests {
             rows,
             vec!["\u{203a} \u{2713} $ rg TODO crates/ · 0.4s · 137 行"]
         );
+    }
+
+    // ── HOW a command ran is never WHY it failed ────────────────────────────
+
+    /// The runtime's own rows say how a command ran; the command's output says
+    /// what happened. A failure reason may only come from the second.
+    #[test]
+    fn runtime_rows_are_neither_output_nor_a_failure_reason() {
+        for row in [
+            "exit: 1",
+            "exit: signal",
+            "--- stdout ---",
+            "--- stderr ---",
+            "[timed out after 120s]",
+            "[timed out]",
+            "[execution policy] Filesystem writes were confined to the granted paths.",
+            "[execution policy] Network access was denied for this command.",
+            "[mutation rejected] command exceeded the remaining file budget (modified 3)",
+            "[note] a workspace mutation baseline was unavailable; file changes made by this \
+             command were not tracked and cannot be rolled back.",
+        ] {
+            assert!(is_runtime_note(row), "{row}");
+        }
+        // A refusal is the tool's own structured reason, so it IS one.
+        assert!(!is_runtime_note(
+            "[permission refused] refused a command argument pointing at a credential-bearing file"
+        ));
+        // A locator points at output; it is not a note about how the command
+        // ran, so it keeps its row in the expanded body.
+        assert!(!is_runtime_note("[stderr full output: /tmp/artifact-7]"));
+        assert!(!is_runtime_note("test case_1 ... ok"));
+        assert!(!is_runtime_note("--- not a stream header"));
+    }
+
+    /// The dogfooded case: `git grep` matched nothing, so it exited 1 with an
+    /// empty stderr while the preview carried the sandbox's write-confinement
+    /// note. That note says HOW the command ran; the row read it aloud as WHY
+    /// it failed.
+    #[test]
+    fn a_policy_note_is_not_shown_as_the_failure_reason() {
+        let mut c = cmd(
+            r#"{"program":"git","args":["grep","ZZZ_NOT_FOUND_ZZZ_9f3a"]}"#,
+            ToolStatus::Failed,
+        );
+        c.duration_ms = Some(200);
+        c.exit_code = Some(1);
+        c.preview = Some(
+            "exit: 1\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+                .to_string(),
+        );
+        let rows = rows(c);
+        assert_eq!(
+            rows,
+            vec!["\u{203a} \u{2717} $ git grep ZZZ_NOT_FOUND_ZZZ_9f3a · 0.2s · exit 1"],
+            "{rows:?}"
+        );
+    }
+
+    /// stderr is the reason. Dropping the runtime's notes must not drop it.
+    #[test]
+    fn a_real_stderr_line_still_wins_over_the_runtime_note() {
+        let mut c = cmd(
+            r#"{"program":"cargo-nextest","args":["--version"]}"#,
+            ToolStatus::Failed,
+        );
+        c.duration_ms = Some(100);
+        c.exit_code = Some(127);
+        c.preview = Some(
+            "exit: 127\n--- stderr ---\nsh: cargo-nextest: command not found\n\n\
+             [execution policy] Filesystem writes were confined to the granted paths.\n"
+                .to_string(),
+        );
+        let rows = rows(c);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            rows[1], "  \u{2514} sh: cargo-nextest: command not found",
+            "{rows:?}"
+        );
+    }
+
+    /// A rejected mutation is a note on the execution too, not the command's
+    /// own error.
+    #[test]
+    fn a_mutation_note_is_not_shown_as_the_failure_reason() {
+        let mut c = cmd(SED, ToolStatus::Failed);
+        c.duration_ms = Some(20);
+        c.exit_code = Some(0);
+        c.preview = Some(
+            "exit: 0\n--- stdout ---\nok\n\n[mutation rejected] command exceeded the remaining \
+             file budget (modified 3)\n"
+                .to_string(),
+        );
+        let rows = rows(c);
+        assert!(
+            !rows.iter().any(|r| r.contains("[mutation rejected]")),
+            "{rows:?}"
+        );
+    }
+
+    /// `false`: exit 1, nothing printed, nothing broken. There is no reason to
+    /// name, so the row names none instead of inventing one.
+    #[test]
+    fn a_failure_with_no_reported_reason_gets_no_reason_row() {
+        let mut c = cmd(r#"{"program":"false"}"#, ToolStatus::Failed);
+        c.exit_code = Some(1);
+        c.preview = Some(
+            "exit: 1\n\n[execution policy] Filesystem writes were confined to the granted paths.\n"
+                .to_string(),
+        );
+        let rows = rows(c);
+        assert_eq!(rows, vec!["\u{203a} \u{2717} $ false · exit 1"], "{rows:?}");
+    }
+
+    /// The runtime writes the limit that fired, and a timeout is stated as one
+    /// instead of its own note becoming the reason.
+    #[test]
+    fn a_real_timeout_note_states_the_timeout_instead_of_becoming_the_reason() {
+        let mut c = cmd(r#"{"program":"sleep","args":["300"]}"#, ToolStatus::Failed);
+        c.duration_ms = Some(120_000);
+        c.preview =
+            Some("[timed out after 120s]\nexit: signal\n--- stdout ---\nstarting\n".to_string());
+        let rows = rows(c);
+        assert_eq!(
+            rows,
+            vec!["\u{203a} \u{2717} $ sleep 300 · 2m 00s · timeout"],
+            "{rows:?}"
+        );
+    }
+
+    /// A successful command is untouched by the filtering, but the note is not
+    /// output: the row counts what the command printed.
+    #[test]
+    fn a_policy_note_does_not_count_as_output() {
+        let mut c = cmd(r#"{"program":"printf","args":["smoke-a"]}"#, ToolStatus::Ok);
+        c.duration_ms = Some(100);
+        c.exit_code = Some(0);
+        c.preview = Some(
+            "exit: 0\n--- stdout ---\nsmoke-a\n\n[execution policy] Filesystem writes were \
+             confined to the granted paths.\n"
+                .to_string(),
+        );
+        let rows = rows(c.clone());
+        assert_eq!(
+            rows,
+            vec!["\u{203a} \u{2713} $ printf smoke-a · 0.1s · 1 \u{884c}"],
+            "{rows:?}"
+        );
+        // A batch child renders through the unit path instead; its count comes
+        // from the same lines the expanded body shows.
+        assert_eq!(content_line_count(&c), 1);
     }
 
     #[test]

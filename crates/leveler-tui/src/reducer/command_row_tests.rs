@@ -545,6 +545,49 @@ fn the_network_permission_tag_is_the_one_the_runtime_writes() {
     );
 }
 
+/// The dogfooded shape, through the real path: a `git grep` that matched
+/// nothing exits 1 with an empty stderr, and the sandbox's write-confinement
+/// note rides along in the preview. The rendered conversation named that note
+/// as the reason the command failed.
+#[test]
+fn a_sandbox_policy_note_is_not_rendered_as_a_failure_reason() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("g1"),
+            name: "run_command".into(),
+            arguments: r#"{"program":"git","args":["grep","ZZZ_NOT_FOUND_ZZZ_9f3a"]}"#.into(),
+            parallel: false,
+            model_step: None,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("g1"),
+            ok: false,
+            preview: format!(
+                "exit: 1\n{}",
+                leveler_tools::recoverable::sandbox_write_denied()
+            ),
+            duration_ms: 200,
+            applied_diff: None,
+            exit_code: Some(1),
+            stop: None,
+        }),
+    );
+    let rendered = plain(&s).join("\n");
+    assert!(
+        rendered.contains("git grep ZZZ_NOT_FOUND_ZZZ_9f3a") && rendered.contains("exit 1"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("[execution policy]"),
+        "a note on HOW the command ran is not WHY it failed: {rendered}"
+    );
+}
+
 /// A stop the runtime could not confirm is not a stop, and not a failure.
 #[test]
 fn an_unconfirmed_stop_is_unknown_never_stopped_or_failed() {
