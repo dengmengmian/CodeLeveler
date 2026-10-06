@@ -229,20 +229,26 @@ void main() {
     expect(field.decoration?.hintText, '追加要求…');
   });
 
-  testWidgets('thinking stays collapsed until tapped', (tester) async {
-    final session = SessionState('s1')
-      ..applyEvent({'type': 'reasoning_delta', 'delta': '秘密推理过程'});
+  testWidgets('model reasoning never reaches the conversation (Contract v1 §I5)', (
+      tester,
+    ) async {
+      final session = SessionState('s1')
+        ..applyEvent({'type': 'reasoning_delta', 'delta': '秘密推理过程'});
+      session.applyEvent({'type': 'assistant_message_started', 'message_id': 'm1'});
+      session.applyEvent({
+        'type': 'assistant_text_delta',
+        'message_id': 'm1',
+        'delta': '公开回答',
+      });
 
-    await tester.pumpWidget(_app(_controllerWith(session)));
-    await tester.pumpAndSettle();
+      await tester.pumpWidget(_app(_controllerWith(session)));
+      await tester.pumpAndSettle();
 
-    expect(find.text('思考中'), findsOneWidget);
-    expect(find.text('秘密推理过程'), findsNothing);
-
-    await tester.tap(find.text('思考中'));
-    await tester.pumpAndSettle();
-    expect(find.text('秘密推理过程'), findsOneWidget);
-  });
+      expect(find.text('公开回答'), findsOneWidget);
+      // The body never reaches the screen. A live status may still say the
+      // model is thinking; that is chrome, not the reasoning text.
+      expect(find.text('秘密推理过程'), findsNothing);
+    });
 
   testWidgets(
       'the task header shows plan progress without inventing a percentage',

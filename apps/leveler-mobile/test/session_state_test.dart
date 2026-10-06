@@ -267,11 +267,12 @@ void main() {
         final type = event['type'] as String;
         expect(state.unknownEvents, isEmpty,
             reason: '$type counted as unknown');
-        expect(
-          state.timeline.isNotEmpty || state.approvals.isNotEmpty,
-          isTrue,
-          reason: '$type was dropped',
-        );
+        // Reasoning is deliberately NOT a row (Contract v1 §I5): it changes
+        // only the live status, so that is what must prove it was handled.
+        final shown = type == 'reasoning_delta'
+            ? state.activity != null
+            : state.timeline.isNotEmpty || state.approvals.isNotEmpty;
+        expect(shown, isTrue, reason: '$type was dropped');
       }
     });
 
@@ -320,15 +321,16 @@ void main() {
       expect(state.timeline.single.detail, contains('改完了'));
     });
 
-    test('reasoning_delta accumulates on one thinking row, not the transcript',
+    test('reasoning never becomes a transcript line or a row (Contract v1 §I5)',
         () {
       final state = SessionState('s1');
       state.applyEvent({'type': 'reasoning_delta', 'delta': '先'});
       state.applyEvent({'type': 'reasoning_delta', 'delta': '看测试'});
 
       expect(state.transcript, isEmpty);
-      expect(state.timeline.single.kind, TimelineKind.thinking);
-      expect(state.timeline.single.detail, '先看测试');
+      expect(state.timeline, isEmpty);
+      // Only the live status may say the model is thinking.
+      expect(state.activity, '思考中');
     });
 
     test(
@@ -353,7 +355,10 @@ void main() {
         'name': 'read_file',
         'arguments': '{"path":"lib/a.rs"}',
       });
-      expect(state.timeline.first.detail, 'lib/a.rs');
+      expect(
+        state.timeline.firstWhere((item) => item.kind == TimelineKind.tool).detail,
+        'lib/a.rs',
+      );
     });
 
     test('plan progress counts done steps', () {
@@ -389,11 +394,14 @@ void main() {
         'preview': 'fn a() {}',
       });
 
+      // One truthful ExecutionRound head, then the call and its result.
       expect(state.timeline.map((item) => item.kind), [
+        TimelineKind.executionRound,
         TimelineKind.tool,
         TimelineKind.toolResult,
       ]);
-      expect(state.timeline.first.title, '读取文件');
+      expect(state.timeline[1].title, '读取文件');
+      expect(state.timeline.first.title, '完成 1 项');
       expect(state.transcript, isEmpty);
     });
 
@@ -414,12 +422,34 @@ void main() {
       expect(state.sawPlan, isTrue);
     });
 
-    test('a finished turn inserts a status row', () {
+    test('a prose-free finished turn never claims completion (Contract v1 §I9)',
+        () {
       final state = SessionState('s1');
+      state.applyEvent({
+        'type': 'tool_call_started',
+        'id': 't1',
+        'name': 'read_file',
+        'arguments': '{}',
+      });
+      state.applyEvent({'type': 'tool_call_completed', 'id': 't1', 'ok': true});
       state.applyEvent({'type': 'turn_completed'});
-      expect(state.timeline.single.kind, TimelineKind.status);
-      expect(state.timeline.single.title, '回合完成');
+      final row = state.timeline.last;
+      expect(row.kind, TimelineKind.status);
+      expect(row.title, '执行已结束，但未提交最终回答');
       expect(state.status, 'idle');
+    });
+
+    test('a turn that committed an answer reads as completed', () {
+      final state = SessionState('s1');
+      state.applyEvent({'type': 'assistant_message_started', 'message_id': 'm1'});
+      state.applyEvent({
+        'type': 'assistant_text_delta',
+        'message_id': 'm1',
+        'delta': '改好了。',
+      });
+      state.applyEvent({'type': 'turn_completed'});
+      expect(state.timeline.last.kind, TimelineKind.status);
+      expect(state.timeline.last.title, '回合完成');
     });
 
     test('a delta for a message we never saw start is kept but marked suspect',

@@ -55,7 +55,7 @@ class TimelineRow extends StatelessWidget {
         ),
       TimelineKind.status => _StatusLine(text: item.title),
       TimelineKind.notice => _StatusLine(text: item.title),
-      TimelineKind.thinking => _ThinkingRow(text: item.detail),
+      TimelineKind.executionRound => _RoundRow(item: item),
       TimelineKind.subAgent => _RailRow(
           icon: Icons.hub_outlined,
           title: item.title,
@@ -190,54 +190,34 @@ class _RailRow extends StatelessWidget {
   }
 }
 
-class _ThinkingRow extends StatefulWidget {
-  const _ThinkingRow({required this.text});
-  final String text;
+/// OneExecutionRound head. The title carries the round's own truthful status
+/// (Contract v1 §I7); a round is never summarised from its members' wording.
+class _RoundRow extends StatelessWidget {
+  const _RoundRow({required this.item});
 
-  @override
-  State<_ThinkingRow> createState() => _ThinkingRowState();
-}
-
-class _ThinkingRowState extends State<_ThinkingRow> {
-  bool _open = false;
+  final TimelineItem item;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final failed = item.ok == false && item.title.contains('失败');
+    final color = failed ? theme.colorScheme.error : theme.colorScheme.outline;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: InkWell(
-        onTap: () => setState(() => _open = !_open),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(Icons.psychology_outlined, size: 16, color: theme.colorScheme.outline),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '思考中',
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      color: theme.colorScheme.outline,
-                    ),
-                  ),
-                  if (_open && widget.text.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 4),
-                      child: Text(
-                        widget.text,
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ),
-                ],
+      padding: const EdgeInsets.only(top: 10, bottom: 2),
+      child: Row(
+        children: [
+          Icon(Icons.account_tree_outlined, size: 15, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              item.title,
+              style: theme.textTheme.labelLarge?.copyWith(
+                fontFamily: 'monospace',
+                color: color,
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

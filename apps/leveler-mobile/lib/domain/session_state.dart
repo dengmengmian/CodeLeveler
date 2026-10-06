@@ -14,6 +14,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 
 import 'artifact.dart';
+import 'execution_presentation.dart';
 import 'task_status.dart';
 
 /// One line of the conversation (kept so snapshot goldens and Markdown
@@ -37,7 +38,8 @@ enum TimelineKind {
   approval,
   status,
   notice,
-  thinking,
+  /// A truthful ExecutionRound head (Contract v1); its tool rows follow it.
+  executionRound,
   subAgent,
   verification,
   diff,
@@ -49,14 +51,25 @@ class TimelineItem {
     required this.kind,
     this.title = '',
     this.detail = '',
-    this.ok,
-  });
+    bool? ok,
+    this.toolStatus,
+  }) : _ok = ok;
 
   final String id;
   final TimelineKind kind;
   String title;
   String detail;
-  bool? ok;
+
+  bool? _ok;
+
+  /// The five-way tool lifetime, for a tool row. Null on every other row.
+  ToolStatus? toolStatus;
+
+  /// Legacy boolean reading. On a tool row it is derived from [toolStatus], so
+  /// the two can never disagree; other rows keep their own value.
+  bool? get ok =>
+      toolStatus != null ? toolStatus == ToolStatus.ok : _ok;
+  set ok(bool? value) => _ok = value;
 }
 
 /// One delegated child, as the runtime recorded it.
@@ -265,6 +278,33 @@ class SessionState extends ChangeNotifier {
   /// Every child of this session, in the order the phone first learned of it.
   final Map<String, ChildAgent> children = {};
 
+  /// Tool calls of this session in arrival order. The Execution Presentation
+  /// Contract's rounds, statuses and committed answer are projected from THIS
+  /// list plus [timeline] — never derived again by a widget.
+  final List<ToolFact> _toolFacts = [];
+
+  /// Whether the current turn has reached a terminal. The FinalAnswer may only
+  /// be decided once it has (Contract v1 §I9).
+  bool _turnEnded = false;
+
+  /// The contract token of the last turn terminal (`completed`, `answered`,
+  /// `no_final_answer`, …), or null while a turn is live.
+  String? _lastTerminal;
+
+  /// Read-only view of this session's tool facts, for the contract projection.
+  List<ToolFact> get toolFacts => List.unmodifiable(_toolFacts);
+
+  /// The conversation as the contract's projection reads it.
+  List<ProjectedMessage> get projectedMessages => _projectedMessages();
+
+  /// The frozen contract token of the last terminal, when there is one.
+  String? get lastTerminal => _lastTerminal;
+
+  /// The conversation's execution items (`assistant_text | final_answer |
+  /// execution_round`). Widgets read THIS; they never re-derive rounds.
+  List<ProjectedItem> get executionItems =>
+      projectTurn(_projectedMessages(), _toolFacts, _turnEnded);
+
   List<ChildAgent> get openChildren =>
       children.values.where((child) => child.isOpen).toList(growable: false);
 
@@ -323,6 +363,33 @@ class SessionState extends ChangeNotifier {
     timeline
       ..clear()
       ..addAll(messages.map(_itemFromMessage));
+    // Running tools survive a reconnect: the snapshot states them, and it
+    // states the execution round each one belongs to (Contract v1 §I10).
+    _toolFacts.clear();
+    for (final raw in session['active_tools'] as List<dynamic>? ?? const []) {
+      final tool = raw as Map<String, dynamic>;
+      final id = '${tool['id'] ?? tool['call_id'] ?? ''}';
+      if (id.isEmpty) continue;
+      final name = tool['name'] as String? ?? 'tool';
+      _toolFacts.add(ToolFact(
+        id: id,
+        name: name,
+        status: ToolStatus.running,
+        seq: timeline.length,
+        modelStep: (tool['model_step'] as num?)?.toInt(),
+        preview: tool['output_tail'] as String? ?? '',
+      ));
+      timeline.add(TimelineItem(
+        id: 'tool-$id',
+        kind: TimelineKind.tool,
+        title: _toolTitle(name),
+        detail: _toolDetail(tool['arguments'] as String?),
+        toolStatus: ToolStatus.running,
+      ));
+    }
+    _syncRoundHeads();
+    _turnEnded = false;
+    _lastTerminal = null;
     _restoreChildren(session['children'] as List<dynamic>?);
     artifacts.clear();
     status = session['status'] as String? ?? status;
@@ -364,6 +431,8 @@ class SessionState extends ChangeNotifier {
   void applyEvent(Map<String, dynamic> event) {
     switch (event['type']) {
       case 'user_message_added':
+        _turnEnded = false;
+        _lastTerminal = null;
         final message = event['message'] as Map<String, dynamic>? ?? const {};
         final user = TranscriptEntry(
           id: message['id'] as String? ?? '',
@@ -381,6 +450,7 @@ class SessionState extends ChangeNotifier {
         // lands, and one of the `turn_*` kinds ends it.
         status = 'running';
       case 'assistant_message_started':
+        _turnEnded = false;
         final started = TranscriptEntry(
           id: event['message_id'] as String? ?? '',
           role: 'assistant',
@@ -408,35 +478,71 @@ class SessionState extends ChangeNotifier {
           _entry(id)?.text = '';
           _timelineById(id)?.detail = '';
         }
-        timeline.removeWhere((item) => item.id == 'thinking');
       case 'assistant_message_completed':
         activity = null;
       case 'agent_activity':
         activity = event['label'] as String?;
       case 'tool_call_started':
+        _turnEnded = false;
         sawTool = true;
         final name = event['name'] as String? ?? 'tool';
         activity = name;
+        final toolId = '${event['id']}';
         if (name == 'spawn_agent') {
-          _spawnCalls.add('${event['id']}');
+          _spawnCalls.add(toolId);
           break;
         }
+        if (_timelineById('tool-$toolId') != null) break;
+        final parallel = event['parallel'] as bool? ?? false;
+        final modelStep = (event['model_step'] as num?)?.toInt();
+        final batch = observedBatch(_toolFacts, parallel: parallel);
+        if (batch != null) {
+          for (final fact in _toolFacts) {
+            if (fact.status == ToolStatus.running && fact.parallel) fact.batch = batch;
+          }
+        }
+        final seq = timeline.length;
+        _toolFacts.add(ToolFact(
+          id: toolId,
+          name: name,
+          status: ToolStatus.running,
+          seq: seq,
+          modelStep: modelStep,
+          parallel: parallel,
+          batch: batch,
+        ));
         timeline.add(TimelineItem(
-          id: '${event['id'] ?? timeline.length}-start',
+          id: 'tool-$toolId',
           kind: TimelineKind.tool,
           title: _toolTitle(name),
           detail: _toolDetail(event['arguments'] as String?),
+          toolStatus: ToolStatus.running,
         ));
+        _syncRoundHeads();
       case 'tool_call_completed':
         activity = null;
         final ok = event['ok'] as bool? ?? true;
-        if (_spawnCalls.remove('${event['id']}') && ok) break;
+        final toolId = '${event['id']}';
+        final previewText = event['preview'] as String? ?? '';
+        final status = toolStatusFromOutcome(ok, event['stop'] as String?);
+        ToolFact? fact;
+        for (final candidate in _toolFacts) {
+          if (candidate.id == toolId) {
+            candidate.status = status;
+            candidate.preview = previewText;
+            fact = candidate;
+          }
+        }
+        final started = _timelineById('tool-$toolId');
+        started?.toolStatus = status;
+        _syncRoundHeads();
+        if (_spawnCalls.remove(toolId) && ok) break;
         timeline.add(TimelineItem(
-          id: '${event['id'] ?? timeline.length}-done',
+          id: '$toolId-done',
           kind: TimelineKind.toolResult,
-          title: ok ? '完成' : '失败',
-          detail: event['preview'] as String? ?? '',
-          ok: ok,
+          title: _toolStatusLabel(status),
+          detail: displayPreview(fact?.name ?? '', previewText) ?? previewText,
+          ok: status == ToolStatus.ok,
         ));
       case 'plan_updated':
         sawPlan = true;
@@ -459,19 +565,11 @@ class SessionState extends ChangeNotifier {
           detail: '${artifact.type.label} · ${artifact.sizeLabel}',
         ));
       case 'reasoning_delta':
+        // Raw reasoning never enters the transcript, and never becomes a row
+        // (Contract v1 §I5). It only keeps the live status honest.
+        activity = '思考中';
         final delta = event['delta'] as String? ?? '';
-        if (delta.isEmpty) break;
-        final thinking = _timelineById('thinking');
-        if (thinking == null) {
-          timeline.add(TimelineItem(
-            id: 'thinking',
-            kind: TimelineKind.thinking,
-            title: '思考中',
-            detail: delta,
-          ));
-        } else {
-          thinking.detail += delta;
-        }
+        if (delta.isNotEmpty) notifyListeners();
       case 'sub_agent_updated':
         _upsertSubAgent(event);
       case 'sub_agent_state_changed':
@@ -603,10 +701,18 @@ class SessionState extends ChangeNotifier {
         status = 'idle';
         activity = null;
         if (needsResync) _snapshotDue = true;
+        final type = event['type'] as String? ?? '';
+        final terminal = turnTerminalFromEvent(
+          type,
+          _projectedMessages(),
+          _toolFacts,
+        );
+        _lastTerminal = terminal;
+        _turnEnded = true;
         timeline.add(TimelineItem(
           id: 'turn-${timeline.length}',
           kind: TimelineKind.status,
-          title: _turnLabel(event['type'] as String? ?? ''),
+          title: _turnLabel(type, terminal: terminal),
         ));
       default:
         if (!_ignored.contains(event['type'])) {
@@ -651,6 +757,8 @@ class SessionState extends ChangeNotifier {
     'btw_started',
     'btw_text_delta',
     'btw_completed',
+    'btw_tool_started',
+    'btw_tool_finished',
   };
 
   /// Record a steer the user just sent. The host injects it into the next
@@ -706,6 +814,52 @@ class SessionState extends ChangeNotifier {
     }
     return null;
   }
+
+  /// The transcript as the contract's projection reads it: the timeline is the
+  /// interleaved arrival order, so its index is the sequence stamp.
+  List<ProjectedMessage> _projectedMessages() => [
+        for (var i = 0; i < timeline.length; i++)
+          if (timeline[i].kind == TimelineKind.user ||
+              timeline[i].kind == TimelineKind.assistant)
+            ProjectedMessage(
+              role: timeline[i].kind == TimelineKind.user ? 'user' : 'assistant',
+              text: timeline[i].detail,
+              seq: i,
+            ),
+      ];
+
+  /// Keep one truthful head per ExecutionRound, immediately before its first
+  /// tool row. Rounds only ever gain members, so the heads are updated in
+  /// place rather than rebuilt.
+  void _syncRoundHeads() {
+    final rounds = groupExecutionRounds(_toolFacts);
+    for (var i = 0; i < rounds.length; i++) {
+      final round = rounds[i];
+      final id = 'round-$i';
+      var head = _timelineById(id);
+      if (head == null) {
+        final firstTool = _timelineById('tool-${round.tools.first.id}');
+        if (firstTool == null) continue;
+        head = TimelineItem(
+          id: id,
+          kind: TimelineKind.executionRound,
+          title: roundHeadline(round),
+        );
+        timeline.insert(timeline.indexOf(firstTool), head);
+      }
+      head.title = roundHeadline(round);
+      head.ok = round.allOk;
+    }
+  }
+
+  /// A stopped call is not a failed one, and an unconfirmed stop is unknown.
+  static String _toolStatusLabel(ToolStatus status) => switch (status) {
+        ToolStatus.running => '运行中',
+        ToolStatus.ok => '完成',
+        ToolStatus.failed => '失败',
+        ToolStatus.cancelled => '已停止',
+        ToolStatus.unknown => '结果未知',
+      };
 
   static TimelineItem _itemFromMessage(TranscriptEntry entry) =>
       switch (entry.role) {
@@ -950,8 +1104,11 @@ class SessionState extends ChangeNotifier {
     return '$files 个文件  +$added −$removed · 验证 $passed / $total';
   }
 
-  static String _turnLabel(String type) => switch (type) {
-        'turn_completed' || 'turn_answered' => '回合完成',
+  static String _turnLabel(String type, {String? terminal}) => switch (type) {
+        // 工具跑完不等于任务做完（Contract v1 §I9）。
+        'turn_completed' || 'turn_answered' => terminal == 'no_final_answer'
+            ? '执行已结束，但未提交最终回答'
+            : '回合完成',
         'turn_completed_unverified' => '回合完成（未验证）',
         'turn_completed_checks_failed' => '回合完成（验证未通过）',
         'turn_incomplete' || 'turn_truncated' => '回合未完成',
