@@ -367,3 +367,46 @@ fn the_painted_screen_does_not_shift_when_the_group_closes() {
         screen_row(&f2, "› ✓ $ cargo check")
     );
 }
+
+/// The reported all-ok lie, driven through the REAL reducer: one command
+/// succeeds, the next is stopped, and the closed parent announced `全部成功`
+/// above its own `⊘ 已停止` row. Cancelled is not a failure, so counting
+/// failures let it through.
+#[test]
+fn a_stopped_command_never_lets_the_stage_claim_all_ok() {
+    let mut s = opened();
+    next_assistant(&mut s, "a1");
+
+    start(&mut s, "c1", r#"{"program":"cargo","args":["check"]}"#);
+    finish(&mut s, "c1", 200);
+
+    start(&mut s, "c2", r#"{"program":"sleep","args":["120"]}"#);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: Some(leveler_client_protocol::UiCommandStop::Confirmed),
+            id: ToolCallId::new("c2"),
+            ok: false,
+            preview: String::new(),
+            duration_ms: 700,
+            applied_diff: None,
+        }),
+    );
+    next_assistant(&mut s, "a2");
+
+    let t = lines(&s);
+    let p = parent_row(&t);
+    assert!(
+        !t[p].contains("全部成功") && !t[p].contains("all ok"),
+        "a stopped call is not a success: {t:?}"
+    );
+    // The stage and both its rows are still there — the fix withholds a claim,
+    // it does not hide the work.
+    assert!(t[p].contains("执行了 2 个命令"), "{t:?}");
+    assert_eq!(
+        t.iter().filter(|l| l.contains('\u{203a}')).count(),
+        2,
+        "both commands keep a row: {t:?}"
+    );
+}

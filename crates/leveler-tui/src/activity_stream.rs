@@ -513,7 +513,11 @@ fn disclosure_presentation(
         [only] => only.duration_ms,
         _ => group_duration_ms(visible),
     };
-    let clean = failed == 0 && needs_network == 0;
+    // "All ok" is a claim about EVERY visible call, so only calls that
+    // actually succeeded may earn it. Zero failures is not the same fact: a
+    // cancelled or unknown call fails at nothing, and a stage reading `全部成功`
+    // over `⊘ 已停止` contradicts itself in the same breath.
+    let all_ok = visible.iter().all(|c| c.status == ToolStatus::Ok);
     crate::presentation::disclosure::DisclosurePresentation {
         label: disclosure_label(visible, failed, t),
         failed,
@@ -523,7 +527,7 @@ fn disclosure_presentation(
             t.batch_needs_network
                 .replace("{}", &needs_network.to_string())
         }),
-        ok_suffix: (clean && visible.len() > 1).then(|| t.batch_all_ok.to_string()),
+        ok_suffix: (all_ok && visible.len() > 1).then(|| t.batch_all_ok.to_string()),
         expanded,
         running: false,
         drill_down: false,
@@ -3195,6 +3199,49 @@ mod tests {
             2,
             "and every failed row keeps its own mark: {lines:?}"
         );
+    }
+
+    /// D: "全部成功" is a claim about every row, so only rows that actually
+    /// SUCCEEDED may earn it. Counting failures is not enough — a cancelled or
+    /// unknown call fails at nothing, and the parent would then contradict the
+    /// `⊘ 已停止` row sitting right under it in the same group.
+    #[test]
+    fn a_stage_only_claims_all_ok_when_every_visible_call_succeeded() {
+        let read = || call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok);
+        let grep = |status| call("grep", r#"{"pattern":"x"}"#, status);
+
+        // A: the control — two successes do claim it.
+        let all_ok = render_group_text(&group(vec![read(), grep(ToolStatus::Ok)]), 100, Locale::Zh);
+        assert!(all_ok[0].contains("全部成功"), "{all_ok:?}");
+
+        // B/C: a settled call that did not succeed is not a success, and the
+        // parent must not announce an outcome it never observed.
+        for (label, status) in [
+            ("cancelled", ToolStatus::Cancelled),
+            ("unknown", ToolStatus::Unknown),
+        ] {
+            let lines = render_group_text(&group(vec![read(), grep(status)]), 100, Locale::Zh);
+            assert_eq!(
+                lines.iter().filter(|l| l.contains(TOOL_ANCHOR)).count(),
+                2,
+                "the parent keeps one row per call: {lines:?}"
+            );
+            assert!(
+                !lines[0].contains("全部成功"),
+                "{label} is not a success: {lines:?}"
+            );
+        }
+
+        // Two non-successes are no more a success than one.
+        let lines = render_group_text(
+            &group(vec![
+                shell(r#"{"program":"a"}"#, ToolStatus::Cancelled, 5),
+                shell(r#"{"program":"b"}"#, ToolStatus::Cancelled, 5),
+            ]),
+            100,
+            Locale::Zh,
+        );
+        assert!(!lines[0].contains("全部成功"), "{lines:?}");
     }
 
     /// The stage's duration is a fact no child row can state: serial calls add
