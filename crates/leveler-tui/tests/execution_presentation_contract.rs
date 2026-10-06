@@ -321,8 +321,8 @@ fn fixtures() -> Vec<(PathBuf, Fixture)> {
         .into_iter()
         .map(|path| {
             let raw = std::fs::read_to_string(&path).expect("fixture readable");
-            let fixture: Fixture = serde_json::from_str(&raw)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let fixture: Fixture =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             (path, fixture)
         })
         .collect()
@@ -364,8 +364,7 @@ fn execution_presentation_contract_v1() {
             let mut raw: Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             raw["expect"] = reference.clone();
-            let rendered =
-                serde_json::to_string_pretty(&raw).expect("serialize fixture") + "\n";
+            let rendered = serde_json::to_string_pretty(&raw).expect("serialize fixture") + "\n";
             std::fs::write(&path, rendered).unwrap();
             continue;
         }
@@ -408,7 +407,11 @@ fn the_fixture_corpus_covers_the_frozen_cases() {
         assert!(ids.contains(&id), "missing fixture {id}: have {ids:?}");
     }
     for (_, fixture) in fixtures() {
-        assert!(!fixture.title.trim().is_empty(), "{}: empty title", fixture.id);
+        assert!(
+            !fixture.title.trim().is_empty(),
+            "{}: empty title",
+            fixture.id
+        );
         assert!(
             !fixture.invariant.trim().is_empty(),
             "{}: empty invariant",
