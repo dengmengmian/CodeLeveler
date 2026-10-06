@@ -114,8 +114,9 @@ impl Tool for RunCommandTool {
          field; a shell command line is `shell_command`. Returns `exit: N`, \
          stdout, and stderr. `exit: 0` \
          means the program succeeded. A pipe is not available in this argv \
-         form. Temporary files written to the system `/tmp` are not writable \
-         in the sandbox; the workspace and `$TMPDIR` are. `background` true \
+         form. Temporary files are writable in the workspace, in `$TMPDIR`, \
+         and under the system `/tmp`; other host paths are not writable. \
+         `background` true \
          starts a long-running process and returns a task id for \
          `get_task`, `wait_task`, and `kill_task`. Background processes stop \
          when the goal finishes unless `background_lifetime` is `runtime`, \

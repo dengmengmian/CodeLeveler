@@ -187,3 +187,80 @@ fn transport_executable_overrides_do_not_inherit_remote_read_authority() {
         );
     }
 }
+
+/// Relocation moves the TARGET, not the EFFECT. `git -C <dir> status` is the
+/// same read pointed at another directory, and the profile permits reads
+/// anywhere — so it must not become a prompt. It is still tracked as
+/// relocated, which is what stops a relocated write from being bound to (and
+/// unsealing) a repository this host knows.
+#[test]
+fn relocation_keeps_reads_allowed_and_writes_unbound() {
+    // Reads: resolved, relocated, not gated, no metadata scope.
+    for words in [
+        vec!["git", "-C", ".", "status"],
+        vec!["git", "-C", "/tmp/elsewhere", "log", "--oneline", "-3"],
+        vec!["git", "-C.", "diff", "--stat"],
+        vec!["git", "--git-dir=/tmp/elsewhere", "rev-parse", "HEAD"],
+        vec!["git", "--work-tree", "/tmp/elsewhere", "status"],
+    ] {
+        let effects = git_effects(&words);
+        assert!(
+            effects.resolved,
+            "relocation keeps the effect readable: {words:?}"
+        );
+        assert!(effects.relocated, "relocation must be recorded: {words:?}");
+        assert!(effects.effects.metadata_read, "{words:?}");
+        assert_eq!(
+            classify("git", &words[1..]),
+            CommandClass::Safe,
+            "{words:?}"
+        );
+        let call = executed_commands(
+            "git",
+            &words[1..].iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        )
+        .git_effects();
+        assert!(call.relocated, "{words:?}");
+        assert!(!call.gated(), "a relocated read must not prompt: {words:?}");
+        assert!(
+            !call.needs_repository_write_scope(),
+            "a relocated read needs no metadata scope: {words:?}"
+        );
+    }
+
+    // Writes and remote transfers keep the gate: the target cannot be bound,
+    // so no capability is granted from the effects alone.
+    for words in [
+        vec!["git", "-C", "/tmp/elsewhere", "commit", "-m", "x"],
+        vec!["git", "--git-dir=/tmp/elsewhere", "fetch", "origin"],
+        vec!["git", "-C", "/tmp/elsewhere", "push", "origin", "main"],
+    ] {
+        let call = executed_commands(
+            "git",
+            &words[1..].iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        )
+        .git_effects();
+        assert!(call.relocated, "{words:?}");
+        assert!(call.gated(), "{words:?} must still ask");
+        assert!(
+            !call.grants_metadata_write_by_effect() && !call.needs_repository_write_scope(),
+            "a relocated write must not be bound to any repository: {words:?}"
+        );
+    }
+
+    // Config injection and an unknown global option stay UNREADABLE, not
+    // merely relocated: they can name a program Git executes.
+    for words in [
+        vec!["git", "-c", "core.fsmonitor=/tmp/evil", "status"],
+        vec!["git", "-ccore.fsmonitor=/tmp/evil", "status"],
+        vec!["git", "--exec-path=/tmp/evil", "status"],
+        vec!["git", "--unknown-option", "status"],
+    ] {
+        assert!(!git_effects(&words).resolved, "{words:?}");
+        assert_eq!(
+            classify("git", &words[1..]),
+            CommandClass::Dangerous,
+            "{words:?}"
+        );
+    }
+}

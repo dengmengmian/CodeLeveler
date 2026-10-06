@@ -727,7 +727,9 @@ provider 的响应外壳漏进会话记录。
 
 `FullAccess`（Full）由宿主在 admission 之前选择 unrestricted 执行路径，绕过 CodeLeveler 权限规则、审批、sandbox、资源范围、凭据过滤和任务所有权限制。Full 下的文件、HOME、凭据、任意 Git remote、loopback / LAN / Internet、进程控制及已实现的未来能力均不产生权限 ASK / DENY。实际能力缺失、无效工具参数、OS / 程序或外部服务失败仍是失败；进程取消、超时、日志持久化和资源回收仍是运行时职责。
 
-`Assisted`（Auto）默认允许普通读写、构建、测试、正常 commit / fetch、localhost 及 owned task 操作；危险删除、push、破坏性 Git、敏感凭据和控制其他任务在 admission 请求批准。Full 和明确批准动作的执行 authority 冻结在本次 `ResolvedExecutionPolicy`，`ProcessRequest`、文件工具、HTTP、MCP、任务控制统一消费；批准后的同一动作不再经第二套权限拒绝。单次批准不修改 session profile，也不扩大随后未批准的调用。
+`Assisted`（Auto）默认允许普通读写、构建、测试、正常 commit / fetch、localhost 及 owned task 操作；危险删除、push、破坏性 Git、敏感凭据和控制其他任务在 admission 请求批准。普通系统诊断（`ps`、`top`、`sysctl` 读取）、明确只读的 Git（`status` / `log` / `diff` / `rev-parse` / `show` / `branch --show-current`，包括 `git -C <dir> …` 这类只移动目标的写法）以及普通临时文件读写（工作区、`$TMPDIR`、系统 `/tmp`）都是普通开发动作，因而 Auto **ALLOW、不 ASK**。Full 和明确批准动作的执行 authority 冻结在本次 `ResolvedExecutionPolicy`，`ProcessRequest`、文件工具、HTTP、MCP、任务控制统一消费；批准后的同一动作不再经第二套权限拒绝。单次批准不修改 session profile，也不扩大随后未批准的调用。
+
+**Sandbox 不得比 permission policy 更严格。** 若 permission / risk 层判定 ALLOW，执行阶段的 OS sandbox 不得对同一 capability 静默返回 `EPERM`。因此 macOS seatbelt profile 必须显式携带 Auto 已允许的 capability：`sysctl` 名称到 OID 的翻译读取（`sysctlnametomib`，缺少它时连白名单中的 `kern.argmax` 都会被拒绝）、工作区之外的共享临时目录写入根、以及 `ps` / `top` 这两个 setuid 进程观察程序的 `process-exec (with no-sandbox)` 例外。最后一项是 OS 约束而非实现选择：内核禁止已沙箱化的进程 exec setuid/setgid 镜像，任何 SBPL 规则都无法放宽（`(allow default)` 同样失败），因此这两个只读观察者只能以沙箱外执行放行，且该放行按字面路径只对这两个镜像生效——`sudo`、`crontab`、`su`、`login`、`traceroute` 等其余 setuid 程序仍然 fail closed。若某 capability 确实无法安全进入 sandbox，必须在 permission 层 ASK 或给出明确结构化拒绝，而不是让上层看到裸的 `Operation not permitted`。
 
 `RequestApproval`（Restricted）使用受限资源契约。`NetworkScope` 和 `NetworkResource` 描述目的地与已解析地址；HTTP broker 禁用环境代理、pin 地址，并逐跳校验 redirect。Full / 明确批准调用直接走 unrestricted HTTP 路径。范围分类本身不构成执行证据。
 

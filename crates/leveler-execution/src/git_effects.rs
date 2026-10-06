@@ -19,9 +19,13 @@
 //! Fail-closed rules, because a permission verdict that guesses is worse than
 //! one that asks:
 //!
-//! - an unknown subcommand or a process-local configuration override (`-c`,
-//!   `--config-env`, a relocated `--git-dir`) marks the invocation unresolved,
-//!   so it is gated and never auto-widened;
+//! - an unknown subcommand, or a global option that injects configuration or
+//!   relocates the program Git executes (`-c`, `--config-env`, `--exec-path`),
+//!   marks the invocation unresolved, so it is gated and never auto-widened;
+//! - a global option that only moves the TARGET (`-C`, `--git-dir`,
+//!   `--work-tree`, `--namespace`) is tracked separately: the subcommand's
+//!   effects still hold, so a read stays allowed while a write can never be
+//!   bound to a repository this host knows;
 //! - a remote named by URL or path (`git fetch https://…`) is not the
 //!   repository's own configured remote, so a sync command cannot be turned
 //!   into an arbitrary fetch target on this path.
@@ -59,6 +63,7 @@ pub const CAP_REMOTE_WRITE: &str = "git_remote.write";
 pub const CAP_CONFIG_WRITE: &str = "git_config.write";
 pub const CAP_HISTORY_DESTROY: &str = "git_history.destroy";
 pub const CAP_ARGV_UNRESOLVED: &str = "git_argv.unresolved";
+pub const CAP_TARGET_RELOCATED: &str = "git_target.relocated";
 
 impl GitEffects {
     pub fn is_empty(self) -> bool {
@@ -116,6 +121,13 @@ pub struct GitCommandEffects {
     /// The subcommand is one this module knows AND its deciding arguments were
     /// readable. `false` means the verdict is a guess, so it must be asked.
     pub resolved: bool,
+    /// A global option moved the invocation's TARGET (the working directory,
+    /// the metadata directory, the ref namespace) somewhere this module cannot
+    /// bind to the repository it knows. The effects above are still exactly
+    /// what the subcommand produces — only the target is unbound — so an
+    /// effect-derived WRITE capability is never granted, while a read-only
+    /// subcommand is still a read and must not become a prompt.
+    pub relocated: bool,
     /// The invocation names a remote by URL or path rather than by the name of
     /// a remote the repository itself configures.
     pub explicit_remote: bool,
@@ -126,6 +138,7 @@ impl GitCommandEffects {
         Self {
             effects,
             resolved: true,
+            relocated: false,
             explicit_remote: false,
         }
     }
@@ -134,6 +147,7 @@ impl GitCommandEffects {
         Self {
             effects,
             resolved: false,
+            relocated: false,
             explicit_remote: false,
         }
     }
@@ -151,6 +165,8 @@ pub struct CallGitEffects {
     pub fully_git: bool,
     /// Some Git invocation in the call was not fully readable.
     pub unresolved: bool,
+    /// Some Git invocation relocated its target with a global option.
+    pub relocated: bool,
     /// A Git invocation named a remote by URL or path.
     pub explicit_remote: bool,
 }
@@ -163,6 +179,7 @@ impl CallGitEffects {
     pub fn grants_metadata_write_by_effect(&self) -> bool {
         self.fully_git
             && !self.unresolved
+            && !self.relocated
             && self.effects.needs_repository_write()
             && !self.effects.workspace_mutation
             && !self.effects.remote_write
@@ -180,6 +197,13 @@ impl CallGitEffects {
     /// `git add`, `git commit`) is deliberately NOT gated: it is the shape
     /// the profile already permits, and the metadata scope it runs with comes
     /// from [`Self::needs_repository_write_scope`].
+    ///
+    /// Relocation is not a reason to ask by itself. `git -C <dir> status` and
+    /// `git --git-dir=<dir> log` move the TARGET of a read that the profile
+    /// already permits anywhere; treating that as unreadable argv asked for
+    /// confirmation on the most ordinary read-only Git there is. It gates only
+    /// when the unbound target could receive a write or reach a remote — the
+    /// two things the effect-derived capability has to be bound for.
     pub fn gated(&self) -> bool {
         if !self.any_git {
             return false;
@@ -190,14 +214,21 @@ impl CallGitEffects {
             || self.effects.config_write
             || self.effects.irreversible
             || (self.explicit_remote && (self.effects.remote_read || self.effects.metadata_write))
+            || (self.relocated
+                && (self.effects.needs_repository_write() || self.effects.remote_read))
     }
 
     /// Whether the call must write repository metadata at all, once it is
     /// authorized. True for every resolved Git invocation that writes, so an
     /// APPROVED destructive or remote command can still write the refs it
-    /// needs — the capability follows the effect, not the decision.
+    /// needs — the capability follows the effect, not the decision. A relocated
+    /// invocation is excluded: the repository whose `.git` this scope would
+    /// unseal is not the one the command was pointed at.
     pub fn needs_repository_write_scope(&self) -> bool {
-        self.fully_git && !self.unresolved && self.effects.needs_repository_write()
+        self.fully_git
+            && !self.unresolved
+            && !self.relocated
+            && self.effects.needs_repository_write()
     }
 
     /// The capability ids a prompt or a log should name.
@@ -205,6 +236,9 @@ impl CallGitEffects {
         let mut ids = self.effects.capabilities();
         if self.unresolved {
             ids.push(CAP_ARGV_UNRESOLVED);
+        }
+        if self.relocated {
+            ids.push(CAP_TARGET_RELOCATED);
         }
         ids
     }
@@ -225,6 +259,7 @@ pub fn call_git_effects(commands: &[Vec<String>], complete: bool) -> CallGitEffe
                 out.any_git = true;
                 out.effects.merge(git.effects);
                 out.unresolved |= !git.resolved;
+                out.relocated |= git.relocated;
                 out.explicit_remote |= git.explicit_remote;
             }
             None => all_git = false,
@@ -264,10 +299,20 @@ pub fn git_command_effects(args: &[String]) -> Option<GitCommandEffects> {
         }));
     };
     let mut effects = classify_subcommand(&parsed.subcommand, &parsed.args);
-    if parsed.config_override {
-        // `git -c key=value …` / a relocated metadata directory changes the
-        // rules the invocation runs under; never auto-widen on that.
+    if parsed.rule_override {
+        // `git -c key=value …` / `--config-env` / `--exec-path` changes the
+        // rules the invocation runs under — configuration that can name a
+        // program Git will execute. The effect is no longer readable, so never
+        // auto-widen on it.
         effects.resolved = false;
+    }
+    if parsed.target_relocation {
+        // `git -C <dir> …` / `--git-dir` / `--work-tree` / `--namespace`
+        // changes only WHERE the invocation points. The subcommand still does
+        // exactly what the effects say, so a read stays a read; a write can no
+        // longer be bound to a repository this host knows, so it never earns
+        // the metadata scope and is gated by [`CallGitEffects::gated`].
+        effects.relocated = true;
     }
     if names_transport_exec_override(&parsed.args) {
         // `git fetch --upload-pack=<program> …` runs that program locally.
@@ -290,7 +335,7 @@ pub fn git_grant_selection(args: &[String]) -> Option<GitGrantSelection> {
         return None;
     }
     let effects = git_command_effects(args)?;
-    if !effects.resolved || effects.explicit_remote {
+    if !effects.resolved || effects.relocated || effects.explicit_remote {
         return None;
     }
     let parsed = split_subcommand(&args[1..])?;
@@ -325,13 +370,19 @@ pub fn git_grant_selection(args: &[String]) -> Option<GitGrantSelection> {
 struct ParsedInvocation {
     subcommand: String,
     args: Vec<String>,
-    config_override: bool,
+    /// A global option injects configuration or changes where Git looks for its
+    /// own subcommands: the invocation's EFFECTS are no longer readable.
+    rule_override: bool,
+    /// A global option moves the invocation's TARGET: the effects are still
+    /// readable, but they no longer belong to the repository this host knows.
+    target_relocation: bool,
 }
 
 /// Split global options from the subcommand. `None` when no subcommand follows.
 fn split_subcommand(args: &[String]) -> Option<ParsedInvocation> {
     let mut i = 0;
-    let mut config_override = false;
+    let mut rule_override = false;
+    let mut target_relocation = false;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--" {
@@ -341,38 +392,48 @@ fn split_subcommand(args: &[String]) -> Option<ParsedInvocation> {
         if !arg.starts_with('-') || arg == "-" {
             break;
         }
-        // Options that relocate metadata or inject configuration escape the
-        // boundary this module reasons about; they are reported as overrides
-        // and never auto-widened. Both spellings (`--git-dir X`, `--git-dir=X`)
+        // Options that move the invocation's target without changing what the
+        // subcommand does. Resolved as target relocation, not as unreadable
+        // argv: `git -C <dir> status` is the same read pointed somewhere else,
+        // and the profile permits reads anywhere. Both spellings
+        // (`--git-dir X`, `--git-dir=X`) count.
+        const RELOCATIONS: [&str; 4] = ["-C", "--git-dir", "--work-tree", "--namespace"];
+        if let Some(name) = RELOCATIONS.iter().find(|name| {
+            arg == *name || name.starts_with("--") && arg.starts_with(&format!("{name}="))
+        }) {
+            target_relocation = true;
+            // A long option in `=` form carries its value in the same word.
+            i += if *name == arg { 2 } else { 1 };
+            continue;
+        }
+        // Options that inject configuration or change where Git looks for its
+        // own subcommands. They can name a program Git executes, so the effect
+        // is no longer readable: reported as overrides and never
+        // auto-widened. Both spellings (`--config-env X`, `--config-env=X`)
         // count.
-        const OVERRIDES: [&str; 8] = [
-            "-C",
-            "-c",
-            "--config-env",
-            "--exec-path",
-            "--git-dir",
-            "--work-tree",
-            "--namespace",
-            "--super-prefix",
-        ];
+        const OVERRIDES: [&str; 4] = ["-c", "--config-env", "--exec-path", "--super-prefix"];
         if let Some(name) = OVERRIDES.iter().find(|name| {
             arg == *name || name.starts_with("--") && arg.starts_with(&format!("{name}="))
         }) {
-            config_override = true;
+            rule_override = true;
             // A long option in `=` form carries its value in the same word.
             i += if *name == arg { 2 } else { 1 };
             continue;
         }
         if arg == "--shallow-file" || arg.starts_with("--shallow-file=") {
-            config_override = true;
+            rule_override = true;
             i += if arg == "--shallow-file" { 2 } else { 1 };
             continue;
         }
-        if (arg.starts_with("-c") || arg.starts_with("-C"))
-            && !arg.starts_with("--")
-            && arg.len() > 2
-        {
-            config_override = true;
+        if arg.starts_with("-C") && !arg.starts_with("--") && arg.len() > 2 {
+            // `-C<dir>`: the short option with its value attached.
+            target_relocation = true;
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-c") && !arg.starts_with("--") && arg.len() > 2 {
+            // `-c<key>=<value>`: the short option with its value attached.
+            rule_override = true;
             i += 1;
             continue;
         }
@@ -390,14 +451,15 @@ fn split_subcommand(args: &[String]) -> Option<ParsedInvocation> {
                 | "--no-lazy-fetch"
                 | "--version"
         ) {
-            config_override = true;
+            rule_override = true;
         }
         i += 1;
     }
     args.get(i).map(|subcommand| ParsedInvocation {
         subcommand: subcommand.clone(),
         args: args[i + 1..].to_vec(),
-        config_override,
+        rule_override,
+        target_relocation,
     })
 }
 

@@ -6,7 +6,7 @@
 //! Unix process groups (`killpg`) and Windows Job Objects via `process-wrap`
 //! (WS1; no in-crate `unsafe`).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::WriteScope;
 use std::process::Stdio;
@@ -369,6 +369,10 @@ fn windows_sandbox_command(
 const SEATBELT_BASE: &str = include_str!("seatbelt_base.sbpl");
 #[cfg(target_os = "macos")]
 const SEATBELT_NETWORK: &str = include_str!("seatbelt_network.sbpl");
+/// Granted only when a write boundary is in force (see the file for why the
+/// setuid process inspectors cannot be sandboxed, and why only these two are).
+#[cfg(target_os = "macos")]
+const SEATBELT_PROCESS_INSPECTION: &str = include_str!("seatbelt_process_inspection.sbpl");
 
 /// Build the `sandbox-exec` argv on macOS (see [`sandbox_command`]).
 #[cfg(target_os = "macos")]
@@ -430,6 +434,7 @@ fn macos_sandbox_command(
         ),
     };
     let mut policy = String::from(SEATBELT_BASE);
+    policy.push_str(SEATBELT_PROCESS_INSPECTION);
     policy.push_str("\n; unrestricted file reads, writes limited to approved roots\n");
     policy.push_str("(allow file-read*)\n");
     // Ordered after the blanket allow on purpose: in SBPL the last matching
@@ -512,17 +517,61 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
     vec![path]
 }
 
-/// Directories a confined process may write to: its workspace and one private,
-/// host-created scratch directory plus a Leveler-owned, per-workspace tool
-/// cache. Environment redirection is applied by
+/// Directories a confined process may write to.
+///
+/// The set is: the workspace (when the scope has one), one private,
+/// host-created scratch directory, a Leveler-owned per-workspace tool cache,
+/// and the platform's shared temporary directory. Environment redirection for
+/// `$TMPDIR` and the toolchain caches is applied by
 /// [`apply_sandbox_environment`].
 ///
-/// In particular, never add a shared temp directory or a whole user directory
-/// here. Both allow a confined command to tamper with files consumed by other
-/// host processes and turn a cache compatibility allowance into persistence.
-/// Writable roots for a pre-claim (read-only-workspace) process: scratch and
-/// toolchain caches only — deliberately never the workspace itself.
-fn writable_roots_without_workspace(
+/// Never add a whole user directory or a host tool/config directory here: those
+/// hold authority another process owns, and a cache compatibility allowance
+/// must not turn into persistence over it. The shared temp directory is a
+/// different thing — the OS already lets any process write there, and ordinary
+/// temporary files are a normal development capability the Auto contract
+/// allows. Excluding it made the sandbox narrower than the policy that admitted
+/// the call: `WriteScope::Workspace` documents "this root plus the standard
+/// temp dirs", while a literal `/tmp` write died with EPERM.
+#[cfg(unix)]
+fn shared_temp_write_roots() -> Vec<PathBuf> {
+    // The one temp location POSIX guarantees. On macOS `/tmp` canonicalizes to
+    // `/private/tmp`, which is the vnode seatbelt matches.
+    vec![PathBuf::from("/tmp")]
+}
+
+#[cfg(not(unix))]
+fn shared_temp_write_roots() -> Vec<PathBuf> {
+    // Windows confines by ACL label, not by an argv profile, and its temp
+    // handling is not part of this contract.
+    Vec::new()
+}
+
+/// Whether `path` names a location under the shared temporary root the confined
+/// profile grants.
+///
+/// Both the lexical form a shell script writes (`/tmp/x`) and the resolved form
+/// the kernel matches (macOS: `/private/tmp/x`) count, because they are the same
+/// directory. This lives beside the profile's own root list on purpose: the
+/// classifier that decides whether to ASK and the sandbox that decides whether
+/// to allow must read the same fact, or Auto would ask for a write it then
+/// permits (or worse, allow one it then denies).
+///
+/// A `..` segment is never accepted here — `Path::starts_with` is lexical, and
+/// `/tmp/../etc/passwd` starts with `/tmp` while naming `/etc/passwd`.
+pub(crate) fn is_shared_temp_path(path: &str) -> bool {
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() || candidate.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    shared_temp_write_roots().iter().any(|root| {
+        let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
+        candidate.starts_with(root) || candidate.starts_with(&resolved)
+    })
+}
+
+fn confined_writable_roots(
+    workspace_root: Option<&Path>,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
@@ -536,13 +585,29 @@ fn writable_roots_without_workspace(
             roots.push(real);
         }
     };
+    if let Some(workspace_root) = workspace_root {
+        add(workspace_root.to_path_buf());
+    }
     if let Some(scratch_root) = scratch_root {
         add(scratch_root.to_path_buf());
     }
     for cache_root in cache_write_roots {
         add(cache_root.clone());
     }
+    for temp_root in shared_temp_write_roots() {
+        add(temp_root);
+    }
     roots
+}
+
+/// Writable roots for a pre-claim (read-only-workspace) process: scratch,
+/// toolchain caches, and the shared temp dir only — deliberately never the
+/// workspace itself.
+fn writable_roots_without_workspace(
+    scratch_root: Option<&Path>,
+    cache_write_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    confined_writable_roots(None, scratch_root, cache_write_roots)
 }
 
 fn writable_roots(
@@ -550,24 +615,7 @@ fn writable_roots(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let mut add = |p: PathBuf| {
-        if !p.is_dir() {
-            return;
-        }
-        let real = p.canonicalize().unwrap_or(p);
-        if !roots.contains(&real) {
-            roots.push(real);
-        }
-    };
-    add(root.to_path_buf());
-    if let Some(scratch_root) = scratch_root {
-        add(scratch_root.to_path_buf());
-    }
-    for cache_root in cache_write_roots {
-        add(cache_root.clone());
-    }
-    roots
+    confined_writable_roots(Some(root), scratch_root, cache_write_roots)
 }
 
 /// The write roots one [`WriteScope`] authorizes. `Unrestricted` authorizes
@@ -2540,6 +2588,82 @@ mod tests {
         }
     }
 
+    /// The Auto permission contract, expressed in the profile the sandbox
+    /// actually builds. Two capabilities are present in a confined profile and
+    /// absent from every other one:
+    ///
+    /// - the `sysctl.<name>` read that name→OID translation needs, without
+    ///   which even an explicitly listed `kern.argmax` dies with EPERM;
+    /// - a `no-sandbox` exec for the two setuid process inspectors, which the
+    ///   kernel refuses to execute inside any sandbox.
+    ///
+    /// The grant is scoped to `/bin/ps` and `/usr/bin/top` literally; it is
+    /// not a general escape and not a prefix match.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_confined_profile_carries_the_process_inspection_capability() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (program, args) = sandbox_command(
+            "ps",
+            &["ax".into()],
+            false,
+            &WriteScope::Workspace {
+                root: workspace.path().to_path_buf(),
+            },
+            Some(scratch.path()),
+            &[],
+        );
+        assert_eq!(program, "/usr/bin/sandbox-exec");
+        let policy = &args[1];
+        assert!(
+            policy.contains("(sysctl-name-prefix \"sysctl.\")"),
+            "the name→OID read every sysctl call performs must be allowed: {policy}"
+        );
+        for inspector in ["/bin/ps", "/usr/bin/top"] {
+            assert!(
+                policy.contains(&format!(
+                    "(allow process-exec (with no-sandbox) (literal \"{inspector}\"))"
+                )),
+                "{inspector} must be executable through the setuid grant: {policy}"
+            );
+        }
+        // Nothing else gets the escape, and not by name prefix either.
+        for forbidden in ["sudo", "crontab", "su", "login", "traceroute"] {
+            assert!(
+                !policy.contains(&format!("/usr/bin/{forbidden}\")"))
+                    && !policy.contains(&format!("/bin/{forbidden}\")")),
+                "{forbidden} must stay sandboxed: {policy}"
+            );
+        }
+        assert!(
+            !policy.contains("(with no-sandbox) (subpath"),
+            "the escape must be literal paths, never a subpath: {policy}"
+        );
+    }
+
+    /// The capability belongs to the confined profiles only. A network-denied
+    /// but otherwise open run (no write confinement) must not gain a setuid
+    /// escape, and neither must a bare `sandbox_command` call with no scope.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_process_inspection_capability_is_confined_only() {
+        let (program, args) = sandbox_command(
+            "curl",
+            &["x".into()],
+            true,
+            &WriteScope::Unrestricted,
+            None,
+            &[],
+        );
+        assert_eq!(program, "/usr/bin/sandbox-exec");
+        assert!(
+            !args[1].contains("no-sandbox"),
+            "the open, network-denied profile must not carry the setuid escape: {}",
+            args[1]
+        );
+    }
+
     /// The harness read seal (C2.3C-S) is macOS-only today. Pinned rather than
     /// left implicit: on Linux a sealed root with no write confinement runs the
     /// command bare, so an eval harness cannot put its answer key out of reach
@@ -2587,31 +2711,36 @@ mod tests {
         );
     }
 
+    /// The write roots are exactly the ones the contract grants, and nothing
+    /// wider. `/tmp` is included because ordinary temporary files are a normal
+    /// development operation: without it the sandbox was narrower than the
+    /// policy that admitted the call, and `echo hi > /tmp/x` died with EPERM
+    /// while the permission layer had already said ALLOW. A whole user
+    /// directory or a host tool/config directory stays out: those hold
+    /// authority another process owns.
     #[test]
-    fn writable_roots_exclude_shared_temp_and_host_tool_directories() {
+    fn writable_roots_are_workspace_scratch_caches_and_the_shared_temp_root() {
         let workspace = tempfile::tempdir().expect("workspace");
         let scratch = tempfile::tempdir().expect("scratch");
         let tool_cache = tempfile::tempdir().expect("tool cache");
         let cache_roots = vec![tool_cache.path().to_path_buf()];
         let roots = writable_roots(workspace.path(), Some(scratch.path()), &cache_roots);
 
-        assert_eq!(
-            roots.len(),
-            3,
-            "only workspace, private scratch, and Leveler tool cache: {roots:?}"
-        );
         assert!(roots.contains(&workspace.path().canonicalize().unwrap()));
         assert!(roots.contains(&scratch.path().canonicalize().unwrap()));
         assert!(roots.contains(&tool_cache.path().canonicalize().unwrap()));
-        for forbidden in [
-            std::env::temp_dir(),
-            PathBuf::from("/tmp"),
-            PathBuf::from("/var/tmp"),
-        ] {
-            let forbidden = forbidden.canonicalize().unwrap_or(forbidden);
+        #[cfg(unix)]
+        {
+            let shared = PathBuf::from("/tmp");
+            let shared = shared.canonicalize().unwrap_or(shared);
             assert!(
-                !roots.contains(&forbidden),
-                "shared temp root must remain read-only: {forbidden:?}"
+                roots.contains(&shared),
+                "the shared temp root must be writable: {roots:?}"
+            );
+            assert_eq!(
+                roots.len(),
+                4,
+                "workspace + private scratch + tool cache + /tmp only: {roots:?}"
             );
         }
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -2623,6 +2752,24 @@ mod tests {
                     "host tool/config directory must remain read-only: {path:?}"
                 );
             }
+        }
+        // The host's PRIVATE temp tree is not part of the grant: the child's
+        // `$TMPDIR` is redirected into the private scratch, so a host temp dir
+        // never needs to be a write root. `/var/tmp` is deliberately not in
+        // the contract either.
+        for forbidden in [std::env::temp_dir(), PathBuf::from("/var/tmp")] {
+            let forbidden = forbidden.canonicalize().unwrap_or(forbidden);
+            if forbidden
+                == PathBuf::from("/tmp")
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            {
+                continue;
+            }
+            assert!(
+                !roots.contains(&forbidden),
+                "only the shared temp root is granted, not {forbidden:?}"
+            );
         }
     }
 

@@ -19,7 +19,16 @@
     (vnode-type CHARACTER-DEVICE)))
 
 ; sysctls permitted (CPU/memory/kernel info that normal programs read).
+;
+; `sysctl.<name>` is not a diagnostic value: resolving ANY name to its numeric
+; OID (what `sysctlnametomib(3)` does, and what `/usr/sbin/sysctl` does before
+; every read) is itself a read of `sysctl.name2oid`. Without this prefix the
+; list below is unenforceable in the worst way: `sysctl -n kern.argmax` is
+; explicitly allowed and still dies with EPERM, because the translation step it
+; performs first was never granted. Verified on macOS 26: removing this line
+; denies every listed name; restoring it allows exactly the names below.
 (allow sysctl-read
+  (sysctl-name-prefix "sysctl.")
   (sysctl-name "hw.activecpu")
   (sysctl-name "hw.busfrequency_compat")
   (sysctl-name "hw.byteorder")

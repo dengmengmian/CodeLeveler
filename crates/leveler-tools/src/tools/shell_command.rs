@@ -55,8 +55,8 @@ impl Tool for ShellCommandTool {
          is the argv form and does not start a shell. The result starts with \
          `exit: N`; `exit: 0` means the command succeeded. A pipe such as \
          `grep` or `tail` replaces that exit code with the pipe's. Temporary \
-         files written to the system `/tmp` are not writable in the sandbox; \
-         the workspace and `$TMPDIR` are. Reads of system and toolchain paths \
+         files are writable in the workspace, in `$TMPDIR`, and under the \
+         system `/tmp`; other host paths are not writable. Reads of system and toolchain paths \
          are allowed. Writes outside the workspace, other user directories, \
          and readonly roots require approval outside full-access mode. \
          Default timeout 120s. `&` and nohup require approval outside full-access mode. A `#` comment does \

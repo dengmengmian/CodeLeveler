@@ -1,0 +1,30 @@
+; Appended after the base policy (workspace-write confinement only).
+;
+; Process-inspection binaries the kernel cannot execute inside a sandbox.
+;
+; `ps` and `top` are installed setuid-root on macOS (`-rwsr-xr-x`) because they
+; read the process table of every user. A sandboxed process may not transition
+; to a setuid image, and that refusal happens in the kernel before the profile
+; is consulted: a `(deny default)` profile AND a `(allow default)` profile both
+; fail `execve` with EPERM, and no SBPL predicate exists to grant it
+; (`process-exec`, `process-exec*` and `process-exec-interpreter` all fail;
+; `(with setugid)` is not a sandbox variable). An unprivileged setgid copy of a
+; plain binary reproduces it, so this is the setuid/setgid rule itself, not an
+; entitlement these two binaries carry.
+;
+; `(with no-sandbox)` is the only predicate that lifts the refusal, and it is
+; checked by the kernel for the exact image named, at exec time. It is granted
+; ONLY here, ONLY for the two fixed, root-installed, read-only process
+; observers: both exist to READ the process table and write nothing. Any other
+; setuid binary — `sudo`, `crontab`, `at`, `su`, `login`, `traceroute`,
+; `newgrp`, `quota` — keeps the sandbox and therefore keeps failing closed.
+;
+; The child is unconfined, so the write fence does not apply to it. That is an
+; accepted, narrowly-scoped cost of the OS constraint; CodeLeveler's Auto
+; contract states that ordinary system diagnosis is allowed, and the
+; alternative is a policy that says ALLOW while the sandbox answers EPERM.
+;
+; A caller cannot reach this by copying a binary: the match is a `literal`
+; path, and a copy is neither root-owned nor setuid, so it stays sandboxed.
+(allow process-exec (with no-sandbox) (literal "/bin/ps"))
+(allow process-exec (with no-sandbox) (literal "/usr/bin/top"))

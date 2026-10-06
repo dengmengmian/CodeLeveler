@@ -349,10 +349,18 @@ fn redirect_target_is_dangerous(redirect: &Node, src: &[u8]) -> bool {
     if matches!(target.as_str(), "/dev/null" | "/dev/stdout" | "/dev/stderr") {
         return false;
     }
-    if target.starts_with('/') {
+    // A `..` segment is dangerous wherever it appears, and it must be rejected
+    // BEFORE the temp-root exemption: `/tmp/../etc/passwd` is `/etc/passwd`.
+    if target.split('/').any(|segment| segment == "..") {
         return true;
     }
-    target.split('/').any(|segment| segment == "..")
+    // Ordinary temporary files are a normal development operation. Without this
+    // the classifier asked for `/tmp/x` while the sandbox would have allowed it
+    // — and the caller saw a prompt for the most ordinary write there is.
+    if crate::command::is_shared_temp_path(&target) {
+        return false;
+    }
+    target.starts_with('/')
 }
 
 /// A heredoc feeding a shell (`bash <<EOF … EOF`, possibly through a
