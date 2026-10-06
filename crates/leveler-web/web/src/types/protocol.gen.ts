@@ -347,7 +347,7 @@ export type RuntimeEvent =
   /** Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome. */
   | { type: 'project_rules_loaded'; sources: string[] }
   /** A tool call started . */
-  | { type: 'tool_call_started'; arguments: string; id: ToolCallId; name: string; parallel?: boolean }
+  | { type: 'tool_call_started'; arguments: string; id: ToolCallId; model_step?: number | null; name: string; parallel?: boolean }
   /** A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side. */
   | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; exit_code?: number | null; id: ToolCallId; ok: boolean; preview: string; stop?: UiCommandStop | null }
   /** Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record. */
@@ -501,6 +501,8 @@ export interface UiActiveToolCall {
   /** How long the call had been running when the snapshot was taken, by the runtime's clock, so a reconnecting client does not restart it at zero. */
   elapsed_ms?: number;
   id: ToolCallId;
+  /** The 1-based model step whose response requested this call — the same execution-round identity [`RuntimeEvent::ToolCallStarted`] carries. A reconnect must not re-guess the round from the tools' types or timing: the runtime already knows it, so the snapshot states it. Every call from one model response shares the value, so a reconnecting client rebuilds the same rounds it would have seen live. Legacy snapshots omit the field; a client then falls back to its old grouping rather than inventing a boundary. [`RuntimeEvent::ToolCallStarted`]: crate::RuntimeEvent::ToolCallStarted */
+  model_step?: number | null;
   name: string;
   /** The bounded end of the command's live output so far. */
   output_tail?: string;

@@ -2578,6 +2578,7 @@ fn reconnect_snapshot_restores_running_turn_render_state() {
         elapsed_ms: 0,
         output_tail: String::new(),
         output_truncated: false,
+        model_step: None,
         id: ToolCallId::new("tool-1"),
         name: "run_command".to_string(),
         arguments: r#"{"cmd":"cargo test"}"#.to_string(),

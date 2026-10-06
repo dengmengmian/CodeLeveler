@@ -228,6 +228,31 @@ mod tests {
         let value = serde_json::to_value(&snap).unwrap();
         assert!(value.get("thinking").is_none(), "{value}");
     }
+
+    /// The execution round is additive: a snapshot taken before the field
+    /// existed still decodes, and a new runtime never invents a round for a
+    /// peer that cannot read it.
+    #[test]
+    fn an_active_tools_round_is_additive_and_omitted_when_unknown() {
+        let legacy = serde_json::json!({
+            "id": "call-1",
+            "name": "run_command",
+            "arguments": "{}",
+        });
+        let tool: UiActiveToolCall = serde_json::from_value(legacy).expect("legacy decode");
+        assert_eq!(tool.model_step, None);
+        assert_eq!(tool.elapsed_ms, 0);
+        // An unset round stays off the wire, so an old peer sees no new field.
+        let wire = serde_json::to_value(&tool).unwrap();
+        assert!(wire.get("model_step").is_none(), "{wire}");
+
+        let mut tool = tool;
+        tool.model_step = Some(7);
+        let wire = serde_json::to_value(&tool).unwrap();
+        assert_eq!(wire["model_step"], 7);
+        let back: UiActiveToolCall = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, tool);
+    }
 }
 
 /// Who authored a message.
@@ -459,6 +484,19 @@ pub struct UiActiveToolCall {
     /// True when `output_tail` dropped earlier output.
     #[serde(default)]
     pub output_truncated: bool,
+    /// The 1-based model step whose response requested this call — the same
+    /// execution-round identity [`RuntimeEvent::ToolCallStarted`] carries.
+    ///
+    /// A reconnect must not re-guess the round from the tools' types or
+    /// timing: the runtime already knows it, so the snapshot states it. Every
+    /// call from one model response shares the value, so a reconnecting client
+    /// rebuilds the same rounds it would have seen live. Legacy snapshots omit
+    /// the field; a client then falls back to its old grouping rather than
+    /// inventing a boundary.
+    ///
+    /// [`RuntimeEvent::ToolCallStarted`]: crate::RuntimeEvent::ToolCallStarted
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_step: Option<u32>,
 }
 
 /// One user shell execution (`!command`) as the reconnect snapshot carries

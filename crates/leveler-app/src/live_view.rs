@@ -77,6 +77,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
             id,
             name,
             arguments,
+            model_step,
             ..
         } => {
             view.active_tools.retain(|tool| tool.id != *id);
@@ -89,6 +90,9 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
                 elapsed_ms: 0,
                 output_tail: String::new(),
                 output_truncated: false,
+                // The live view carries the round so a reconnect restores the
+                // SAME rounds, not a re-derived approximation.
+                model_step: *model_step,
             });
         }
         RuntimeEvent::ToolCallCompleted { id, .. } => {
@@ -182,6 +186,49 @@ mod tests {
             },
         );
         assert!(views.view(&session_id).active_tools.is_empty());
+    }
+
+    /// The snapshot states the execution round the runtime already knows, so a
+    /// reconnect does not have to re-derive one from the tools' kinds.
+    #[test]
+    fn a_running_calls_round_reaches_the_reconnect_snapshot() {
+        let session_id = SessionId::new("s1");
+        let views = LiveViews::default();
+        for (id, name) in [("a", "read_file"), ("b", "grep")] {
+            views.apply(
+                &session_id,
+                &RuntimeEvent::ToolCallStarted {
+                    id: ToolCallId::new(id),
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                    parallel: true,
+                    model_step: Some(4),
+                },
+            );
+        }
+        // A call from an older round is not retro-labelled by the newer one.
+        views.apply(
+            &session_id,
+            &RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new("c"),
+                name: "shell_command".to_string(),
+                arguments: "{}".to_string(),
+                parallel: false,
+                model_step: None,
+            },
+        );
+
+        let tools = views.view(&session_id).active_tools;
+        assert_eq!(
+            tools.iter().filter(|t| t.model_step == Some(4)).count(),
+            2,
+            "{tools:?}"
+        );
+        assert_eq!(
+            tools.iter().find(|t| t.id.as_str() == "c").unwrap().model_step,
+            None,
+            "an unknown round stays unknown: {tools:?}"
+        );
     }
 
     /// A reconnecting client must not restart a long command's clock at zero

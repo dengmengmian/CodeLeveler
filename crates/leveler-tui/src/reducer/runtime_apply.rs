@@ -1860,13 +1860,17 @@ fn apply_session_with(
         // restart a long command at zero.
         let started = state.elapsed_secs as i64 - (tool.elapsed_ms / 1000) as i64;
         let id = tool.id.clone();
+        // The snapshot states the round; restore it verbatim so the reconnected
+        // transcript groups the calls exactly as the live stream did. A legacy
+        // snapshot carries `None`, and the reducer keeps its old fallback.
+        let model_step = tool.model_step;
         state.transcript.push_tool_started(
             tool.id,
             tool.name,
             tool.arguments,
             false,
             started,
-            None,
+            model_step,
         );
         state.transcript.append_tool_output(&id, &tool.output_tail);
     }

@@ -5382,6 +5382,15 @@
         "id": {
           "$ref": "#/definitions/ToolCallId"
         },
+        "model_step": {
+          "description": "The 1-based model step whose response requested this call — the same execution-round identity [`RuntimeEvent::ToolCallStarted`] carries.\n\nA reconnect must not re-guess the round from the tools' types or timing: the runtime already knows it, so the snapshot states it. Every call from one model response shares the value, so a reconnecting client rebuilds the same rounds it would have seen live. Legacy snapshots omit the field; a client then falls back to its old grouping rather than inventing a boundary.\n\n[`RuntimeEvent::ToolCallStarted`]: crate::RuntimeEvent::ToolCallStarted",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "name": {
           "type": "string"
         },
