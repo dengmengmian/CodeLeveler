@@ -225,7 +225,11 @@ mod tests {
             "{tools:?}"
         );
         assert_eq!(
-            tools.iter().find(|t| t.id.as_str() == "c").unwrap().model_step,
+            tools
+                .iter()
+                .find(|t| t.id.as_str() == "c")
+                .unwrap()
+                .model_step,
             None,
             "an unknown round stays unknown: {tools:?}"
         );

@@ -88,7 +88,10 @@ fn reconnect(s: &mut AppState, tools: Vec<UiActiveToolCall>) {
     let mut snap = idle_snapshot();
     snap.status = "running".into();
     snap.active_tools = tools;
-    reduce(s, Action::Runtime(RuntimeEvent::SessionOpened { session: snap }));
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
 }
 
 fn active_tool(
@@ -204,7 +207,11 @@ fn c1_a_running_calls_round_survives_the_reconnect() {
     assert!(row(&lines(&seen), "sleep 60 · 2s").1.contains("2s"));
 
     complete(&mut seen, "c1");
-    assert_eq!(rounds(&seen), expected, "the settled round is the same round");
+    assert_eq!(
+        rounds(&seen),
+        expected,
+        "the settled round is the same round"
+    );
     assert!(
         lines(&seen).iter().any(|l| l.contains("完成 1 项")),
         "{:?}",
@@ -333,7 +340,8 @@ fn c5_reconnect_keeps_the_running_geometry_until_completion() {
     complete(&mut seen, "c1");
     let (done_head_at, done_head) = row(&lines(&seen), "完成 1 项");
     assert_eq!(
-        done_head_at, seen_head_at,
+        done_head_at,
+        seen_head_at,
         "closing must not insert a row above the head: {:?}",
         lines(&seen)
     );
@@ -343,8 +351,15 @@ fn c5_reconnect_keeps_the_running_geometry_until_completion() {
         indent(&row(&lines(&live), "sleep 60").1),
         "and the child column does not re-indent"
     );
-    assert_eq!(count_rows(&lines(&seen), "sleep 60"), 1, "still one ToolRow");
-    assert_eq!(rounds(&seen), vec![(Some(6), vec!["shell_command".to_string()])]);
+    assert_eq!(
+        count_rows(&lines(&seen), "sleep 60"),
+        1,
+        "still one ToolRow"
+    );
+    assert_eq!(
+        rounds(&seen),
+        vec![(Some(6), vec!["shell_command".to_string()])]
+    );
 }
 
 /// C6 — a snapshot from before the field existed still restores its calls and
@@ -365,7 +380,10 @@ fn c6_a_legacy_snapshot_without_a_round_falls_back_safely() {
     let mut snap = idle_snapshot();
     snap.status = "running".into();
     snap.active_tools = vec![tool];
-    reduce(&mut s, Action::Runtime(RuntimeEvent::SessionOpened { session: snap }));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
 
     assert_eq!(s.transcript.tool_calls().len(), 1, "the call is not lost");
     assert_eq!(
@@ -373,7 +391,11 @@ fn c6_a_legacy_snapshot_without_a_round_falls_back_safely() {
         vec![(None, vec!["shell_command".to_string()])],
         "an absent round stays absent instead of being invented"
     );
-    assert!(lines(&s).iter().any(|l| l.contains("sleep 60 · 3s")), "{:?}", lines(&s));
+    assert!(
+        lines(&s).iter().any(|l| l.contains("sleep 60 · 3s")),
+        "{:?}",
+        lines(&s)
+    );
 
     // A later, modern snapshot states its own rounds and carries no fallback over.
     reconnect(

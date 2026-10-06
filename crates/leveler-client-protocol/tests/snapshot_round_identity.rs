@@ -137,7 +137,9 @@ fn a_legacy_tool_call_started_event_decodes_with_an_unknown_round() {
     let event: RuntimeEvent = serde_json::from_value(legacy).unwrap();
     match event {
         RuntimeEvent::ToolCallStarted {
-            model_step, parallel, ..
+            model_step,
+            parallel,
+            ..
         } => {
             assert_eq!(model_step, None);
             assert!(!parallel);
