@@ -690,6 +690,35 @@ fn make_url_opener() -> leveler_tui::UrlOpener {
     })
 }
 
+/// The session-open request a bare `leveler` / `leveler tui` issues.
+///
+/// The axis is stated here and is `Chat`: an interactive terminal session is a
+/// conversation, and `/goal <task>` is the durable way to ask for the goal
+/// lifecycle. Reading `CollaborationMode::default()` here instead would make
+/// every new terminal session a Goal the moment the product default changes,
+/// which is the coupling this function exists to break. Resuming a session
+/// takes its persisted axis and never passes through here.
+fn interactive_session_request(
+    model: Option<leveler_client_protocol::ModelRef>,
+    mode: leveler_client_protocol::PermissionProfile,
+    auto_approve: bool,
+) -> CreateSessionRequest {
+    CreateSessionRequest {
+        collaboration: leveler_local_transport::CollaborationMode::Chat,
+        workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+        goal: "interactive session".to_string(),
+        model,
+        mode,
+        // `--auto-approve` becomes this session's policy; the daemon runs the
+        // turn and it survives this client disconnecting.
+        approval_policy: if auto_approve {
+            leveler_client_protocol::ApprovalPolicy::AutoApprove
+        } else {
+            leveler_client_protocol::ApprovalPolicy::Interactive
+        },
+    }
+}
+
 /// Open the interactive terminal UI. Reuses a healthy per-repository daemon
 /// when possible and otherwise starts the runtime inside the TUI process.
 #[allow(clippy::too_many_arguments)]
@@ -839,23 +868,11 @@ pub(crate) async fn cmd_tui(
                 eprintln!("{hint}");
             }
             let bootstrap = client
-                .create_session(CreateSessionRequest {
-                    // The product default for a new Coding Session. A user who
-                    // wants conversation switches with `/collab chat`; nothing
-                    // inspects the first prompt to decide this.
-                    collaboration: leveler_local_transport::CollaborationMode::default(),
-                    workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
-                    goal: "interactive session".to_string(),
+                .create_session(interactive_session_request(
                     model,
-                    mode: wire_mode(resolve_mode(mode, project_default_mode(&layout))),
-                    // `--auto-approve` becomes this session's policy; the daemon
-                    // runs the turn and it survives this client disconnecting.
-                    approval_policy: if auto_approve {
-                        leveler_client_protocol::ApprovalPolicy::AutoApprove
-                    } else {
-                        leveler_client_protocol::ApprovalPolicy::Interactive
-                    },
-                })
+                    wire_mode(resolve_mode(mode, project_default_mode(&layout))),
+                    auto_approve,
+                ))
                 .await?;
             (bootstrap.session.id, bootstrap.context_window)
         };
@@ -3310,5 +3327,80 @@ mod outcome_exit_code_tests {
                 "{execution:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod interactive_bootstrap_tests {
+    use super::*;
+
+    /// A bare `leveler` / `leveler tui` opens a conversation.
+    ///
+    /// The axis must not come from `CollaborationMode::default()`: that value
+    /// is the product's coding-session default and the wire's omitted-field
+    /// contract, and a terminal session may not silently inherit it every time
+    /// that default moves.
+    #[test]
+    fn a_new_interactive_session_is_chat() {
+        let request = interactive_session_request(
+            None,
+            leveler_client_protocol::PermissionProfile::Assisted,
+            false,
+        );
+        assert_eq!(
+            request.collaboration,
+            leveler_local_transport::CollaborationMode::Chat,
+            "a new terminal session is a conversation; `/goal <task>` is how a user asks for the goal lifecycle"
+        );
+        assert_eq!(request.goal, "interactive session");
+        assert_eq!(
+            request.workspace,
+            leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault
+        );
+        assert_eq!(
+            request.approval_policy,
+            leveler_client_protocol::ApprovalPolicy::Interactive
+        );
+        assert_eq!(
+            request.mode,
+            leveler_client_protocol::PermissionProfile::Assisted
+        );
+        assert!(request.model.is_none());
+    }
+
+    /// The create-time policy and permission overrides move the axis not at
+    /// all: they are orthogonal facts about the same session.
+    #[test]
+    fn terminal_overrides_do_not_change_the_axis() {
+        let request = interactive_session_request(
+            Some(leveler_client_protocol::ModelRef::parse("deepseek/v3").unwrap()),
+            leveler_client_protocol::PermissionProfile::FullAccess,
+            true,
+        );
+        assert_eq!(
+            request.collaboration,
+            leveler_local_transport::CollaborationMode::Chat
+        );
+        assert_eq!(
+            request.approval_policy,
+            leveler_client_protocol::ApprovalPolicy::AutoApprove
+        );
+        assert_eq!(
+            request.mode,
+            leveler_client_protocol::PermissionProfile::FullAccess
+        );
+        assert!(request.model.is_some());
+    }
+
+    /// The entry-level fix leaves the product default and the headless path
+    /// alone: `leveler run` (and a wire request that omits the field) still
+    /// resolve to Goal.
+    #[test]
+    fn the_product_default_stays_goal() {
+        assert_eq!(
+            leveler_local_transport::CollaborationMode::default(),
+            leveler_local_transport::CollaborationMode::Goal,
+            "only the terminal entry point moved, not the coding-session default"
+        );
     }
 }
