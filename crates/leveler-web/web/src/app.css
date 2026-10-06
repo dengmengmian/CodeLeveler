@@ -1827,6 +1827,22 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 .rs-recent { margin: 4px 0 0 16px; }
 .rs-tools { margin: 6px 0 2px 16px; }
+/* ExecutionRound 节点：head 陈述真实状态，rows 是它的成员（Contract v1）。 */
+.rs-round { margin: 6px 0 0 16px; }
+.rs-round-head {
+  display: flex; align-items: baseline; gap: 8px;
+  font-family: var(--mono); font-size: 12px; color: var(--text-secondary);
+}
+.rs-round-glyph { width: 14px; flex: none; text-align: center; color: var(--text-muted); }
+.rs-round.running .rs-round-glyph { color: var(--accent); }
+.rs-round.ok .rs-round-glyph { color: var(--text-muted); }
+.rs-round.failed .rs-round-glyph { color: var(--danger); }
+.rs-round.cancelled .rs-round-glyph, .rs-round.unknown .rs-round-glyph { color: var(--warning); }
+.rs-round-stat { font-size: 11px; color: var(--text-muted); }
+.tool-row .tool-reason {
+  font-size: 11.5px; color: var(--danger); flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-left: 8px; text-align: right;
+}
 .rs-toggle {
   font-family: var(--mono); font-size: 11.5px; color: var(--text-muted);
   background: none; border: none; cursor: pointer; padding: 2px 0; flex: none;

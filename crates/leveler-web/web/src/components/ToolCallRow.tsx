@@ -6,6 +6,7 @@
 import { useState } from 'react';
 import { useAppDispatch, type ToolCallView } from '../state/store';
 import { formatDuration, toolSummary } from '../lib/format';
+import { displayPreview, failureReason } from '../lib/executionRounds';
 import { tailLines } from '../lib/toolstats';
 import { DiffBlock, parseDiff, patchFromArguments } from './DiffBlock';
 
@@ -13,6 +14,8 @@ const GLYPH: Record<ToolCallView['status'], string> = {
   done: '✓',
   run: '◍',
   fail: '✗',
+  cancelled: '■',
+  unknown: '◇',
 };
 
 /** 失败命令默认展开输出末尾行数 */
@@ -32,7 +35,7 @@ export function ToolCallRow({ tool }: { tool: ToolCallView }) {
   const diffSource = editDiff ?? gitDiff;
   const diff = diffSource ? parseDiff(diffSource) : null;
 
-  const preview = tool.preview !== null && tool.preview !== '' ? tool.preview : null;
+  const preview = displayPreview(tool);
   const expandable = diffSource !== null || preview !== null;
 
   return (
@@ -63,6 +66,7 @@ export function ToolCallRow({ tool }: { tool: ToolCallView }) {
               : main}
           </span>
         </span>
+        {failed && !open && <span className="tool-reason">{failureReason(tool.preview ?? '')}</span>}
         {diff && (
           <span className="tool-stat">
             <span className="add">+{diff.additions}</span>{' '}

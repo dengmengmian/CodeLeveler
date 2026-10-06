@@ -95,7 +95,7 @@ export function deriveRunState(s: SessionView): RunView | null {
 
     // 计划步骤不在中间区域重复展示（右侧面板负责完整执行计划）。
 
-    // agent_activity 是阶段标题；完整推理走 ReasoningDisclosure，不塞进 detail。
+    // agent_activity 是阶段标题；raw reasoning 不进 transcript，也不进 detail（Contract v1 §I5）。
     if (s.activity) {
       return live('thinking', s.activity, null);
     }

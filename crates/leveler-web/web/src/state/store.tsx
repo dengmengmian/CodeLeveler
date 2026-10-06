@@ -44,6 +44,11 @@ import type {
 let seqCounter = 0;
 const nextSeq = (): number => (seqCounter += 1);
 
+/** Monotonic concurrent-burst id. Observed at `tool_started` time: two calls
+ *  share a batch only when one started while the other was still running. */
+let batchCounter = 0;
+const nextBatchId = (): number => (batchCounter += 1);
+
 export interface ChatMessage {
   id: string;
   role: UiRole;
@@ -65,10 +70,16 @@ export interface ToolCallView {
   id: ToolCallId;
   name: string;
   arguments: string;
-  status: 'run' | 'done' | 'fail';
+  /** Contract v1 lifecycle: `run` | `done` | `fail` | `cancelled` | `unknown`. */
+  status: 'run' | 'done' | 'fail' | 'cancelled' | 'unknown';
   preview: string | null;
   durationMs: number | null;
   parallel: boolean;
+  /** The real execution round (`RuntimeEvent::ToolCallStarted.model_step`);
+   *  null for a legacy transcript that never recorded it. */
+  modelStep: number | null;
+  /** Observed concurrent burst inside the round, or null when it ran alone. */
+  batch: number | null;
   /** 时间线排序戳（越小越早） */
   seq: number;
 }
@@ -314,8 +325,22 @@ export type Action =
   | { type: 'btw_started'; question: string; time: string }
   | { type: 'btw_delta'; delta: string }
   | { type: 'btw_done' }
-  | { type: 'tool_started'; id: ToolCallId; name: string; arguments: string; parallel: boolean }
-  | { type: 'tool_completed'; id: ToolCallId; ok: boolean; preview: string; durationMs: number }
+  | {
+      type: 'tool_started';
+      id: ToolCallId;
+      name: string;
+      arguments: string;
+      parallel: boolean;
+      modelStep: number | null;
+    }
+  | {
+      type: 'tool_completed';
+      id: ToolCallId;
+      ok: boolean;
+      preview: string;
+      durationMs: number;
+      stop: 'confirmed' | 'unconfirmed' | null;
+    }
   | {
       type: 'sub_agent_updated';
       id: string;
@@ -406,6 +431,8 @@ function viewFromSnapshot(
     preview: null,
     durationMs: null,
     parallel: false,
+    modelStep: t.model_step ?? null,
+    batch: null,
     seq: nextSeq(),
   }));
   const s = snap.status.toLowerCase();
@@ -783,6 +810,17 @@ export function reducer(state: AppState, action: Action): void {
       // 对思考采取行动 = 思考结束；下一条 reasoning delta 会替换它。
       state.current.reasoningSuperseded = true;
       if (state.current.tools.some((t) => t.id === action.id)) return;
+      // A batch is OBSERVED here, never inferred later: this call starts while
+      // those parallel calls are still running, so they were in flight
+      // together. Adjacency alone never groups (Contract v1 §I3).
+      let batch: number | null = null;
+      if (action.parallel) {
+        const inFlight = state.current.tools.filter((t) => t.status === 'run' && t.parallel);
+        if (inFlight.length > 0) {
+          batch = inFlight.find((t) => t.batch !== null)?.batch ?? nextBatchId();
+          for (const t of inFlight) t.batch = batch;
+        }
+      }
       state.current.tools.push({
         id: action.id,
         name: action.name,
@@ -791,6 +829,8 @@ export function reducer(state: AppState, action: Action): void {
         preview: null,
         durationMs: null,
         parallel: action.parallel,
+        modelStep: action.modelStep,
+        batch,
         seq: nextSeq(),
       });
       return;
@@ -798,7 +838,16 @@ export function reducer(state: AppState, action: Action): void {
     case 'tool_completed': {
       const tool = state.current?.tools.find((t) => t.id === action.id);
       if (tool) {
-        tool.status = action.ok ? 'done' : 'fail';
+        // A stop decides the outcome on its own: confirmed is cancelled,
+        // unconfirmed is unknown — neither is ever read as a failure.
+        tool.status =
+          action.stop === 'confirmed'
+            ? 'cancelled'
+            : action.stop === 'unconfirmed'
+              ? 'unknown'
+              : action.ok
+                ? 'done'
+                : 'fail';
         tool.preview = action.preview || null;
         tool.durationMs = action.durationMs;
       }

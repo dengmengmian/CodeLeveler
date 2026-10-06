@@ -8,6 +8,7 @@ import { formatClock, modelRefString } from './format';
 import { loadLastSession, saveLastSession } from './lastSession';
 import { getToken } from './token';
 import { shouldRefreshObservability } from './observabilityView';
+import { committedFinalAnswer } from './executionRounds';
 import {
   commandProgressLabel,
   finalizationStageLabel,
@@ -199,6 +200,7 @@ export class RuntimeBridge {
           name: ev.name,
           arguments: ev.arguments,
           parallel: ev.parallel ?? false,
+          modelStep: ev.model_step ?? null,
         });
         break;
       case 'tool_call_completed':
@@ -208,6 +210,7 @@ export class RuntimeBridge {
           ok: ev.ok,
           preview: ev.preview,
           durationMs: ev.duration_ms,
+          stop: ev.stop ?? null,
         });
         break;
       case 'approval_requested':
@@ -412,8 +415,16 @@ export class RuntimeBridge {
 
     const end = turnEndFromEvent(ev);
     if (end) {
-      // 7 个终态逐一保真（Turn Truth）：incomplete/unverified 绝不折叠成 completed。
-      this.dispatch({ type: 'turn_terminal', outcome: end.outcome, detail: end.detail });
+      // Turn Truth：7 个 runtime 终态逐一保真（incomplete/unverified 绝不折叠成
+      // completed）。Completed/Answered 但本回合没有 commit 的 FinalAnswer 时，
+      // 终态只能是 no_final_answer —— 工具跑完不等于任务做完（Contract v1 §I9）。
+      const outcome =
+        (end.outcome === 'completed' || end.outcome === 'answered') &&
+        current &&
+        committedFinalAnswer(current.messages, current.tools) === null
+          ? 'no_final_answer'
+          : end.outcome;
+      this.dispatch({ type: 'turn_terminal', outcome, detail: end.detail });
       // dispatch 是异步的，getState() 还没落地，强制跳过 turnActive 检查
       this.flushQueue(true);
     }

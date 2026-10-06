@@ -84,19 +84,10 @@ export interface ConversationTurn {
   items: TimelineSlot[];
 }
 
-/** Last non-btw assistant result in a turn. Streaming / empty → no copy. */
-export function assistantResultText(items: readonly TimelineSlot[]): string | null {
-  let text: string | null = null;
-  for (const slot of items) {
-    if (slot.kind !== 'message') continue;
-    const m = slot.message;
-    if (m.role !== 'assistant' || m.btw !== undefined) continue;
-    if (m.streaming || !m.text.trim()) continue;
-    text = m.text;
-  }
-  return text;
-}
-
+/**
+ * Copy text moved to `lib/executionRounds.ts::committedFinalAnswer`: it needs the
+ * turn's tool calls to tell an answer from interim narration (Contract v1 §I9).
+ */
 export function groupConversationTurns(slots: readonly TimelineSlot[]): ConversationTurn[] {
   const turns: ConversationTurn[] = [];
   for (const slot of slots) {

@@ -9,6 +9,7 @@ export type TurnOutcome =
   | 'completed'
   | 'completed_with_warnings'
   | 'answered'
+  | 'no_final_answer'
   | 'incomplete'
   | 'truncated'
   | 'failed'
@@ -74,6 +75,10 @@ export function presentTurnEnd(end: TurnEnd): TurnEndPresentation {
   switch (end.outcome) {
     case 'completed':
       return { glyph: '✓', label: '任务已完成', tone: 'success', detail: null };
+    case 'no_final_answer':
+      // 工具跑完不等于任务做完（Contract v1 §I9）：回合在没有 commit 的
+      // FinalAnswer 上终态，不得显示绿色完成。文案对齐 TUI turn_no_final_answer。
+      return { glyph: '⚠', label: '执行已结束，但未提交最终回答', tone: 'warn', detail: null };
     case 'completed_with_warnings':
       return {
         glyph: '⚠',

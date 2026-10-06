@@ -14,11 +14,11 @@ import {
 } from '../state/store';
 import { useBridge } from '../state/bridge';
 import { completionTruth } from '../lib/completionTruth';
+import { groupExecutionRounds, roundGlyph, roundHeadline, type ExecutionRoundView } from '../lib/executionRounds';
 import { deriveRunState, type AgentRunState } from '../lib/runstate';
 import { formatSeconds, statsLine, summarizeTools } from '../lib/toolstats';
 import { presentTurnEnd, turnFooterPrimary } from '../lib/turn';
 import { CopyButton } from './CopyButton';
-import { ReasoningDisclosure } from './ReasoningDisclosure';
 import { ToolCallRow } from './ToolCallRow';
 
 /** 每秒重渲染以刷新耗时；active=false 时停走。 */
@@ -43,8 +43,41 @@ const SPINNING: ReadonlySet<AgentRunState> = new Set([
   'generating',
 ]);
 
-/** 最近完成的工具（最多 3 条），折叠态下的次级信息。 */
-const RECENT_DONE = 3;
+/**
+ * One ExecutionRound: a truthful head plus its tool rows.
+ *
+ * The head states the round's own status and never claims all-success over a
+ * call that did not succeed (Contract v1 §I7). Rows are gated by the block's
+ * expand affordance — collapsing is a visual behavior and does not change the
+ * round's membership or status.
+ */
+function ExecutionRoundBlock({
+  round,
+  showRows,
+}: {
+  round: ExecutionRoundView;
+  showRows: boolean;
+}) {
+  const stats = summarizeTools(round.tools);
+  return (
+    <div className={`rs-round ${round.status}`}>
+      <div className="rs-round-head">
+        <span className="rs-round-glyph" aria-hidden="true">
+          {roundGlyph(round)}
+        </span>
+        <span className="rs-round-label">{roundHeadline(round)}</span>
+        <span className="rs-round-stat">{statsLine(stats)}</span>
+      </div>
+      {showRows && (
+        <div className="rs-tools">
+          {round.tools.map((t) => (
+            <ToolCallRow key={t.id} tool={t} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function BackgroundTaskRow({ task }: { task: BackgroundTaskView }) {
   const running = task.status === 'run';
@@ -96,6 +129,7 @@ export function AgentRunBlock({
     const backgroundTasks = bgProp ?? current?.backgroundTasks ?? [];
     if (tools.length === 0 && backgroundTasks.length === 0) return null;
     const stats = summarizeTools(tools);
+    const rounds = groupExecutionRounds(tools);
     return (
       <div className="run-summary r-process tone-muted">
         {tools.length > 0 && <div className="rs-sub">{statsLine(stats)}</div>}
@@ -107,13 +141,9 @@ export function AgentRunBlock({
             {expanded ? '收起执行过程' : `查看执行过程 · ${tools.length}`}
           </button>
         )}
-        {expanded && (
-          <div className="rs-tools">
-            {tools.map((t) => (
-              <ToolCallRow key={t.id} tool={t} />
-            ))}
-          </div>
-        )}
+        {rounds.map((round, i) => (
+          <ExecutionRoundBlock key={`${round.modelStep ?? 'legacy'}-${i}`} round={round} showRows={expanded} />
+        ))}
       </div>
     );
   }
@@ -161,8 +191,7 @@ export function AgentRunBlock({
   const tools = current.tools;
   const spinning = SPINNING.has(run.state);
   const backgroundTasks = current.backgroundTasks;
-
-  const recentDone = tools.filter((t) => t.status !== 'run').slice(-RECENT_DONE);
+  const rounds = groupExecutionRounds(tools);
 
   return (
     <div className={`run-summary r-live r-${run.state}`}>
@@ -179,27 +208,13 @@ export function AgentRunBlock({
 
       {run.detail && <div className="rs-detail">{run.detail}</div>}
 
-      <ReasoningDisclosure text={current.reasoning} />
-
       {backgroundTasks.map((t) => (
         <BackgroundTaskRow key={t.id} task={t} />
       ))}
 
-      {!expanded && recentDone.length > 0 && (
-        <div className="rs-recent">
-          {recentDone.map((t) => (
-            <ToolCallRow key={t.id} tool={t} />
-          ))}
-        </div>
-      )}
-
-      {expanded && (
-        <div className="rs-tools">
-          {tools.map((t) => (
-            <ToolCallRow key={t.id} tool={t} />
-          ))}
-        </div>
-      )}
+      {rounds.map((round, i) => (
+        <ExecutionRoundBlock key={`${round.modelStep ?? 'legacy'}-${i}`} round={round} showRows={expanded} />
+      ))}
     </div>
   );
 }

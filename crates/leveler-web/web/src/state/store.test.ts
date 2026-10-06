@@ -484,8 +484,9 @@ describe('turn terminal truth', () => {
       name: 'read_file',
       arguments: '{"path":"README.md"}',
       parallel: false,
+      modelStep: null,
     });
-    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 12 });
+    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 12, stop: null });
     reducer(state, { type: 'sub_agent_updated', id: 'ag1', nickname: 'W', role: 'worker', done: true, ok: true, detail: 'x' });
     reducer(state, { type: 'turn_terminal', outcome: 'answered', detail: null });
     const toolsBefore = state.current?.tools.length;
@@ -518,6 +519,7 @@ describe('turn terminal truth', () => {
       name: 'read_file',
       arguments: '{}',
       parallel: false,
+      modelStep: null,
     });
     reducer(state, { type: 'snapshot', session: snapshot({ status: 'idle', active_tools: [] }) });
     expect(state.current?.tools).toHaveLength(0);
@@ -533,8 +535,9 @@ describe('turn terminal truth', () => {
       name: 'read_file',
       arguments: '{"path":"README.md"}',
       parallel: false,
+      modelStep: null,
     });
-    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 12 });
+    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 12, stop: null });
     reducer(state, { type: 'turn_terminal', outcome: 'answered', detail: null });
     expect(state.current?.traces).toHaveLength(1);
     expect(state.current?.traces[0]?.userSeq).toBe(userSeq);
@@ -771,7 +774,7 @@ describe('reasoning stream', () => {
     reducer(state, { type: 'reasoning_delta', delta: '先看 auth' });
     reducer(state, { type: 'reasoning_delta', delta: ' 模块' });
     expect(state.current?.reasoning).toBe('先看 auth 模块');
-    reducer(state, { type: 'tool_started', id: 't1', name: 'read_file', arguments: '{}', parallel: false });
+    reducer(state, { type: 'tool_started', id: 't1', name: 'read_file', arguments: '{}', parallel: false, modelStep: null });
     reducer(state, { type: 'reasoning_delta', delta: '新想法' });
     expect(state.current?.reasoning).toBe('新想法');
   });

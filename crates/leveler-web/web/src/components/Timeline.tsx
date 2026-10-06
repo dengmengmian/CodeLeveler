@@ -6,11 +6,12 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
-  assistantResultText,
   groupConversationTurns,
   layoutTimeline,
   type TimelineSlot,
 } from '../lib/timelineLayout';
+import { committedFinalAnswer } from '../lib/executionRounds';
+import { isTurnUser } from '../lib/presentationKind';
 import { useAppState, type ChatMessage, type LastTurn, type TurnTrace } from '../state/store';
 import { AgentRunBlock } from './AgentRunBlock';
 import { CompactionSummary } from './CompactionSummary';
@@ -183,6 +184,7 @@ export function Timeline() {
       : '↓ 回到底部';
 
   const traces = current.traces ?? [];
+  const lastUserSeq = [...current.messages].reverse().find((m) => isTurnUser(m))?.seq ?? -1;
   const slots = layoutTimeline(current.messages, {
     turnActive: current.turnActive,
     hasLastTurn: Boolean(current.lastTurn) && current.pendingApprovals.length === 0 && current.pendingClarifications.length === 0,
@@ -195,7 +197,15 @@ export function Timeline() {
     <div className="timeline" ref={scrollRef} onScroll={onScroll}>
       <div className="tl-inner">
         {groupConversationTurns(slots).map((turn) => {
-          const copyText = assistantResultText(turn.items);
+          // Copy text is the turn's committed answer: interim narration a tool
+          // call acted on is not the answer (Contract v1 §I9).
+          const turnMessages = turn.items
+            .filter((slot): slot is Extract<TimelineSlot, { kind: 'message' }> => slot.kind === 'message')
+            .map((slot) => slot.message);
+          const turnTools =
+            traceBySeq.get(turn.userSeq)?.tools ??
+            (turn.userSeq === lastUserSeq ? current.tools : []);
+          const copyText = committedFinalAnswer(turnMessages, turnTools);
           return (
           <div className="conv-turn" key={`turn-${turn.userSeq}`} data-turn={turn.userSeq}>
             {turn.items.map((slot, i) =>

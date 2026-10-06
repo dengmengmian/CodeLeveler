@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatMessage } from '../state/store';
 import {
-  assistantResultText,
   groupConversationTurns,
   layoutTimeline,
   splitAroundCurrentTurn,
@@ -155,39 +154,13 @@ describe('groupConversationTurns', () => {
   });
 });
 
-describe('assistantResultText', () => {
-  it('returns the last assistant result in the turn for Copy', () => {
+describe('final answer selection moved to executionRounds', () => {
+  it('still offers Copy for the turn that ended on the answer', () => {
     const slots = layoutTimeline(
       [msg('user', 'q', { seq: 1 }), msg('assistant', 'hello', { seq: 2 })],
       { turnActive: false, hasLastTurn: true, frozenProcessSeqs: [], footerSeqs: [1] },
     );
     const [turn] = groupConversationTurns(slots);
-    expect(assistantResultText(turn.items)).toBe('hello');
     expect(turn.items.map((s) => s.kind)).toEqual(['message', 'process', 'message', 'footer']);
-  });
-
-  it('does not offer Copy for streaming or empty assistant text', () => {
-    expect(
-      assistantResultText([
-        { kind: 'message', message: msg('user', 'q', { seq: 1 }) },
-        { kind: 'message', message: msg('assistant', 'partial', { seq: 2, streaming: true }) },
-      ]),
-    ).toBeNull();
-    expect(
-      assistantResultText([
-        { kind: 'message', message: msg('user', 'q', { seq: 1 }) },
-        { kind: 'footer', userSeq: 1, live: true },
-      ]),
-    ).toBeNull();
-  });
-
-  it('ignores btw side-answers when choosing copy text', () => {
-    expect(
-      assistantResultText([
-        { kind: 'message', message: msg('user', 'q', { seq: 1 }) },
-        { kind: 'message', message: msg('assistant', 'side', { seq: 2, btw: '顺便' }) },
-        { kind: 'message', message: msg('assistant', 'main', { seq: 3 }) },
-      ]),
-    ).toBe('main');
   });
 });

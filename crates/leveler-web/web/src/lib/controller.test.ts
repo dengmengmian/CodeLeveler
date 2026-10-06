@@ -480,8 +480,9 @@ describe('session_updated vs session_opened', () => {
       name: 'read_file',
       arguments: '{"path":"README.md"}',
       parallel: false,
+      modelStep: null,
     });
-    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 8 });
+    reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 8, stop: null });
     apply({
       type: 'session_updated',
       session: {
@@ -512,6 +513,7 @@ describe('session_updated vs session_opened', () => {
       name: 'read_file',
       arguments: '{}',
       parallel: false,
+      modelStep: null,
     });
     apply({
       type: 'session_opened',
