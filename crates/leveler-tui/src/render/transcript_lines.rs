@@ -1048,8 +1048,12 @@ fn push_prefixed(
     style: Style,
     width: usize,
 ) {
-    let indent = " ".repeat(prefix.chars().count());
-    let inner = width.saturating_sub(prefix.chars().count()).max(1);
+    // Prefixes such as `※ 回顾: ` are wider than their char count. The wrap
+    // budget and the continuation indent both have to use that display width,
+    // or the first painted row overruns and the terminal clips a wide glyph.
+    let prefix_cols = UnicodeWidthStr::width(prefix);
+    let indent = " ".repeat(prefix_cols);
+    let inner = width.saturating_sub(prefix_cols).max(1);
     let wrapped = wrap(text, inner);
     for (i, line) in wrapped.into_iter().enumerate() {
         let lead = if i == 0 {
@@ -2093,5 +2097,117 @@ mod tests {
         assert!(en.contains("✓ Task completed"), "{en}");
         assert!(en.contains("3 files changed"), "{en}");
         assert!(en.contains("/diff to view changes"), "{en}");
+    }
+
+    fn recap_lines(body: &str, width: usize) -> Vec<String> {
+        let item = TranscriptItem::Recap(crate::transcript::RecapBlock {
+            summary: Some(body.to_string()),
+            next_step: None,
+        });
+        item_render(&item, &Theme::default(), width, false, Locale::Zh.text())
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    /// Continuation rows are indented with spaces. The wrapped piece itself
+    /// does not start with a space, so stripping the indent recovers the text.
+    fn recover_prefixed(lines: &[String], prefix: &str) -> String {
+        let mut body = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            if index == 0 {
+                assert!(line.starts_with(prefix), "{line}");
+                body.push_str(&line[prefix.len()..]);
+            } else {
+                body.push_str(line.trim_start_matches(' '));
+            }
+        }
+        body
+    }
+
+    /// The dogfood recap lost 两 at 40 columns because the prefix was measured
+    /// in characters while the row was painted in display columns.
+    #[test]
+    fn a_cjk_recap_keeps_every_wide_glyph() {
+        let body = "三句话说明 yq 仓库用途，仅读两个文件，未改文件";
+        let prefix = format!("※ {}: ", Locale::Zh.text().recap_label);
+        for width in [80usize, 48, 40, 32] {
+            let lines = recap_lines(body, width);
+            assert_eq!(recover_prefixed(&lines, &prefix), body, "width {width}");
+            for line in &lines {
+                let painted = UnicodeWidthStr::width(line.as_str());
+                assert!(
+                    painted <= width,
+                    "width {width} painted {painted}: {line:?}"
+                );
+            }
+            assert!(
+                lines.iter().any(|line| line.contains('两')),
+                "width {width} dropped 两: {lines:?}"
+            );
+        }
+    }
+
+    /// The first visual row ends on a width-2 glyph that still fits. A short
+    /// prefix budget pushes that glyph past the terminal edge and the cell clips it.
+    #[test]
+    fn a_prefixed_row_ends_on_a_wide_glyph_without_overflow() {
+        let prefix = format!("※ {}: ", Locale::Zh.text().recap_label);
+        let prefix_cols = UnicodeWidthStr::width(prefix.as_str());
+        let width = 40usize;
+        let glyphs = width.saturating_sub(prefix_cols) / 2;
+        let mut body = "仅".repeat(glyphs);
+        body.push('两');
+        let lines = recap_lines(&body, width);
+        assert_eq!(recover_prefixed(&lines, &prefix), body, "{lines:?}");
+        let first = UnicodeWidthStr::width(lines[0].as_str());
+        assert!(
+            first <= width,
+            "first row overflowed: {first} > {width}: {lines:?}"
+        );
+        let last = lines[0].chars().last().unwrap();
+        assert_eq!(
+            unicode_width::UnicodeWidthChar::width(last),
+            Some(2),
+            "the row must end on a whole wide glyph: {lines:?}"
+        );
+        assert!(
+            lines.get(1).is_some_and(|line| line.contains('两')),
+            "两 must wrap onto a following row instead of being clipped: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_ascii_error_prefix_still_wraps_inside_the_width() {
+        // No spaces: a word-break would drop the break space, which is wrap's
+        // existing behavior and not a lost glyph.
+        let body = "x".repeat(70);
+        let width = 40usize;
+        let item = TranscriptItem::Error(body);
+        let lines: Vec<String> =
+            item_render(&item, &Theme::default(), width, false, Locale::En.text())
+                .iter()
+                .map(line_text)
+                .collect();
+        assert_eq!(recover_prefixed(&lines, "✗ "), "x".repeat(70));
+        for line in &lines {
+            assert!(UnicodeWidthStr::width(line.as_str()) <= width, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_recap_with_an_emoji_keeps_the_wide_glyph() {
+        // Sixteen width-2 hanzi fill the correct 40-column body. The emoji is
+        // the next glyph, so a character-counted prefix pushes it past the edge.
+        let mut body = "仅".repeat(16);
+        body.push('😀');
+        body.push_str("未改");
+        let prefix = format!("※ {}: ", Locale::Zh.text().recap_label);
+        let lines = recap_lines(&body, 40);
+        assert_eq!(recover_prefixed(&lines, &prefix), body);
+        assert!(lines.iter().any(|line| line.contains('😀')), "{lines:?}");
+        for line in &lines {
+            assert!(UnicodeWidthStr::width(line.as_str()) <= 40, "{line:?}");
+        }
     }
 }
