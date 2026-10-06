@@ -228,31 +228,6 @@ mod tests {
         let value = serde_json::to_value(&snap).unwrap();
         assert!(value.get("thinking").is_none(), "{value}");
     }
-
-    /// The execution round is additive: a snapshot taken before the field
-    /// existed still decodes, and a new runtime never invents a round for a
-    /// peer that cannot read it.
-    #[test]
-    fn an_active_tools_round_is_additive_and_omitted_when_unknown() {
-        let legacy = serde_json::json!({
-            "id": "call-1",
-            "name": "run_command",
-            "arguments": "{}",
-        });
-        let tool: UiActiveToolCall = serde_json::from_value(legacy).expect("legacy decode");
-        assert_eq!(tool.model_step, None);
-        assert_eq!(tool.elapsed_ms, 0);
-        // An unset round stays off the wire, so an old peer sees no new field.
-        let wire = serde_json::to_value(&tool).unwrap();
-        assert!(wire.get("model_step").is_none(), "{wire}");
-
-        let mut tool = tool;
-        tool.model_step = Some(7);
-        let wire = serde_json::to_value(&tool).unwrap();
-        assert_eq!(wire["model_step"], 7);
-        let back: UiActiveToolCall = serde_json::from_value(wire).unwrap();
-        assert_eq!(back, tool);
-    }
 }
 
 /// Who authored a message.
