@@ -122,64 +122,95 @@ pub(crate) fn friendly_model_label(
     }
 }
 
-/// Input-border runtime summary: `{model} ({level}) · perm · session`.
+/// Input-border runtime summary: `{model} ({level}) · perm · collaboration`.
 ///
 /// The level is CodeLeveler's own word for the session's Thinking Level
 /// (`auto`, `max`). A provider's parameter never appears here: the
 /// user reads the vocabulary they configured in, and a model whose thinking
 /// cannot be controlled shows no level at all rather than one that is not in
-/// use. When `max_width` is tight, drop from the right: session, then
-/// permission, then effort, then truncate model.
+/// use. Visual order stays model, effort, permission, collaboration. When
+/// `max_width` is tight the drop order is the reverse of importance: the
+/// untrusted marker, then effort, then the model (shortened, then omitted),
+/// and only then collaboration, then permission. Context and key hints live
+/// on the footer and must not outlast these two controls.
 pub(crate) fn runtime_status_chip(state: &AppState, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
     let model = friendly_model_label(&state.model_label, &state.available_models);
     let effort = state.thinking.as_ref().and_then(|thinking| {
         (thinking.access == UiThinkingAccess::Adjustable)
             .then(|| format!("({})", thinking.effective))
     });
     let perm = permission_chip_label(state);
+    let axis = state.collaboration.as_str();
     let untrusted = (!state.untrusted_config.is_empty()).then_some(state.t().untrusted_config_chip);
 
-    let mut extras: Vec<String> = Vec::new();
-    extras.push(perm.to_string());
-    extras.push(state.collaboration.clone());
-    if let Some(u) = untrusted {
-        extras.push(u.to_string());
+    let mut controls: Vec<&str> = Vec::new();
+    if !perm.is_empty() {
+        controls.push(perm);
+    }
+    if !axis.is_empty() {
+        controls.push(axis);
+    }
+    while !controls.is_empty() && UnicodeWidthStr::width(controls.join(" · ").as_str()) > max_width
+    {
+        controls.pop();
     }
 
-    let join = |head: &str, extra: &[String]| -> String {
-        let mut parts = Vec::with_capacity(1 + extra.len());
-        if !head.is_empty() {
-            parts.push(head.to_string());
-        }
-        parts.extend(extra.iter().cloned());
-        parts.join(" · ")
-    };
+    let control_text = controls.join(" · ");
+    let control_w = UnicodeWidthStr::width(control_text.as_str());
+    let sep = if control_w > 0 { 3 } else { 0 };
+    let leftover = max_width.saturating_sub(control_w).saturating_sub(sep);
+    let identity = chip_identity(&model, effort.as_deref(), leftover);
 
-    let has_effort = effort.is_some();
-    let head = match &effort {
-        Some(e) => format!("{model} {e}"),
-        None => model.clone(),
-    };
-    let mut shown = extras;
-    loop {
-        let chip = join(&head, &shown);
-        if UnicodeWidthStr::width(chip.as_str()) <= max_width || shown.is_empty() {
-            if UnicodeWidthStr::width(chip.as_str()) <= max_width {
-                return chip;
-            }
-            break;
-        }
-        shown.pop();
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(identity) = identity {
+        parts.push(identity);
     }
-
-    // Drop effort next, then width-safe truncate the model name.
-    if has_effort {
-        let chip = join(&model, &[]);
+    parts.extend(controls.into_iter().map(str::to_string));
+    if let Some(untrusted) = untrusted {
+        let mut with_untrusted = parts.clone();
+        with_untrusted.push(untrusted.to_string());
+        let chip = with_untrusted.join(" · ");
         if UnicodeWidthStr::width(chip.as_str()) <= max_width {
             return chip;
         }
     }
-    crate::render::truncate_display(&model, max_width.max(1))
+    parts.join(" · ")
+}
+
+/// Model and thinking level use only the columns the controls did not reserve.
+/// A budget under two columns is empty rather than a lone ellipsis.
+fn chip_identity(model: &str, effort: Option<&str>, budget: usize) -> Option<String> {
+    if budget < 2 || model.is_empty() {
+        return None;
+    }
+    if let Some(effort) = effort {
+        let with_effort = format!("{model} {effort}");
+        if UnicodeWidthStr::width(with_effort.as_str()) <= budget {
+            return Some(with_effort);
+        }
+    }
+    if UnicodeWidthStr::width(model) <= budget {
+        return Some(model.to_string());
+    }
+    Some(crate::render::truncate_display(model, budget))
+}
+
+/// Both collaboration and permission still fit in a chip of `max_width`.
+///
+/// The footer uses the composer's trust budget. Context, cache and key hints
+/// are secondary and stay hidden once either control has been dropped.
+pub(crate) fn status_control_fields_fit(state: &AppState, max_width: usize) -> bool {
+    let perm = permission_chip_label(state);
+    let axis = state.collaboration.as_str();
+    if perm.is_empty() || axis.is_empty() {
+        return false;
+    }
+    let chip = runtime_status_chip(state, max_width);
+    let parts: Vec<&str> = chip.split(" · ").collect();
+    parts.contains(&perm) && parts.contains(&axis)
 }
 
 /// Compact magnitude for footer context: `41181 → 41k`, `1048576 → 1M`.
@@ -1017,23 +1048,45 @@ mod tests {
         );
     }
 
+    fn chip_parts(chip: &str) -> Vec<&str> {
+        chip.split(" · ").collect()
+    }
+
+    /// Collaboration and permission outrank the model decoration. Effort is
+    /// dropped, and the model is shortened, before either control disappears.
     #[test]
-    fn runtime_chip_drops_low_priority_fields_when_narrow() {
+    fn runtime_chip_keeps_controls_ahead_of_model_decoration() {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
         state.thinking = Some(thinking_state(leveler_model::ThinkingLevel::Max));
         state.mode_label = "RequestApproval".into();
         state.collaboration = "chat".into();
+
         let mid = runtime_status_chip(&state, 31);
-        assert!(mid.contains("deepseek-v4-flash"), "{mid}");
-        assert!(mid.contains("(max)"), "{mid}");
-        assert!(!mid.contains("chat"), "session is dropped first: {mid}");
-        let tight = runtime_status_chip(&state, 21);
-        assert!(tight.contains("deepseek-v4-flash"), "{tight}");
-        assert!(!tight.contains("ask"), "{tight}");
+        assert!(UnicodeWidthStr::width(mid.as_str()) <= 31, "{mid}");
+        assert!(chip_parts(&mid).contains(&"ask"), "{mid}");
+        assert!(chip_parts(&mid).contains(&"chat"), "{mid}");
         assert!(
-            !tight.contains("(max)"),
-            "the level is dropped with the rest: {tight}"
+            !mid.contains("(max)"),
+            "effort yields before the axis: {mid}"
+        );
+
+        let tight = runtime_status_chip(&state, 21);
+        assert!(UnicodeWidthStr::width(tight.as_str()) <= 21, "{tight}");
+        assert!(chip_parts(&tight).contains(&"ask"), "{tight}");
+        assert!(chip_parts(&tight).contains(&"chat"), "{tight}");
+        assert!(!tight.contains("(max)"), "{tight}");
+
+        // `auto · goal` is 11 columns. Below that, the axis goes before
+        // permission, and the model only keeps what the controls leave.
+        state.mode_label = "Assisted".into();
+        state.collaboration = "goal".into();
+        let cramped = runtime_status_chip(&state, 10);
+        assert!(UnicodeWidthStr::width(cramped.as_str()) <= 10, "{cramped}");
+        assert!(chip_parts(&cramped).contains(&"auto"), "{cramped}");
+        assert!(
+            !chip_parts(&cramped).contains(&"goal"),
+            "the axis yields only once the row cannot hold both controls: {cramped}"
         );
     }
 

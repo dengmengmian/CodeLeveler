@@ -805,7 +805,16 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     let clock = state.clock_label.clone();
     let clock_w = UnicodeWidthStr::width(clock.as_str());
-    let usage = crate::status_line::footer_usage_line(state);
+    // The composer chip is `width - 6` on this same chrome slot. Once that
+    // budget cannot keep both permission and the collaboration axis, context
+    // and key hints would outrank them, so they leave together.
+    let show_secondary = crate::status_line::status_control_fields_fit(
+        state,
+        (area.width as usize).saturating_sub(6),
+    );
+    let usage = show_secondary
+        .then(|| crate::status_line::footer_usage_line(state))
+        .flatten();
     let usage_w = usage.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
 
     // The background summary is placed before the usage/clock chips. It is the
@@ -874,7 +883,8 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
     state.background_footer_hit =
         bg_start.map(|start| (area.y, start as u16, (start + bg_w) as u16));
 
-    if left_limit > 0
+    if show_secondary
+        && left_limit > 0
         && let Some(line) = crate::render::key_hint_line(state, left_limit)
             .into_iter()
             .next()
@@ -1659,6 +1669,112 @@ mod tests {
             prompt_x,
             Some(ix + 1 + crate::layout::INPUT_INTERNAL_PADDING_X),
             "prompt sits one inner pad after the border"
+        );
+    }
+
+    fn screen_rows(state: &mut AppState, width: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render(frame, state))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|cell| cell.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn status_fixture(collaboration: &str, busy: bool) -> AppState {
+        let mut state = test_state();
+        state.model_label = "deepseek/deepseek-v4-flash".into();
+        state.thinking = Some(leveler_client_protocol::UiThinkingState {
+            configured: leveler_model::ThinkingLevel::Max,
+            session_override: None,
+            current: leveler_model::ThinkingLevel::Max,
+            effective: leveler_model::ThinkingLevel::Max,
+            access: leveler_client_protocol::UiThinkingAccess::Adjustable,
+            choices: vec![leveler_model::ThinkingLevel::Max],
+        });
+        state.mode_label = "Assisted".into();
+        state.collaboration = collaboration.into();
+        state.goal_mode_active = collaboration == "goal";
+        state.context_window_tokens = 1_000_000;
+        state.context_tokens = 11_000;
+        state.token_input = 11_000;
+        state.token_cached = 9_570;
+        state.clock_label = "09:30".into();
+        if busy {
+            state.status = leveler_client_protocol::RuntimeStatus::Busy;
+            state.activity = Some("思考".into());
+            state.tick = 0;
+        }
+        state
+    }
+
+    /// Narrow terminals drop context, cache and key hints before collaboration
+    /// or permission. A busy row keeps a real activity word at every width.
+    #[test]
+    fn narrow_status_keeps_axis_and_permission_ahead_of_context() {
+        for width in [120u16, 80, 60, 48, 40, 32, 28, 24, 20] {
+            for busy in [false, true] {
+                let mut state = status_fixture("goal", busy);
+                let rows = screen_rows(&mut state, width);
+                let screen = rows.join("\n");
+                let axis = screen.contains("goal");
+                let permission = screen.contains("auto");
+                // Wide glyphs occupy two cells, so the joined row reads
+                // `上 下 文`. The ASCII usage figures stay contiguous.
+                let context = screen.contains("11k/1M") || screen.contains("87%");
+                let hint = screen.contains("Shift+Tab") || screen.contains("Ctrl+C");
+                if context || hint {
+                    assert!(
+                        axis && permission,
+                        "width {width} busy {busy} dropped a control while keeping secondary chrome:\n{screen}"
+                    );
+                }
+                if busy {
+                    assert!(
+                        screen.contains('思') || screen.contains('考'),
+                        "width {width} busy row has no activity label:\n{screen}"
+                    );
+                }
+                if width >= 48 && busy {
+                    assert!(
+                        axis && permission,
+                        "width {width} must keep activity, axis and permission:\n{screen}"
+                    );
+                }
+                if width == 40 {
+                    assert!(
+                        axis && permission,
+                        "width 40 must keep the axis and permission ahead of context:\n{screen}"
+                    );
+                }
+                if width == 20 && busy {
+                    assert!(
+                        !context && !hint,
+                        "width 20 must drop context and hints before the axis:\n{screen}"
+                    );
+                }
+            }
+        }
+
+        let mut chat = status_fixture("chat", false);
+        let screen = screen_rows(&mut chat, 80).join("\n");
+        assert!(screen.contains("chat"), "{screen}");
+        assert!(
+            !screen.contains("goal"),
+            "chat must not paint the goal axis:\n{screen}"
         );
     }
 
