@@ -668,6 +668,24 @@ pub enum RuntimeEvent {
     BtwCancelled,
     /// Side-question failed.
     BtwFailed { error: String },
+    /// A `/btw` side question started a read-only tool call.
+    ///
+    /// The side surface has its own activity: the main turn's
+    /// [`Self::ToolCallStarted`] / [`Self::ToolCallCompleted`] stay the main
+    /// transcript's, and a side question never appears there. Transient and
+    /// never persisted, like every other `Btw*` event.
+    BtwToolStarted { call_id: ToolCallId, tool: String },
+    /// A `/btw` side-question tool call finished.
+    ///
+    /// Carries the outcome and the measured duration only — no arguments, no
+    /// tool output, no error payload — because the side surface is an
+    /// observer and its activity is chrome, not a record.
+    BtwToolFinished {
+        call_id: ToolCallId,
+        tool: String,
+        is_error: bool,
+        elapsed_ms: u64,
+    },
     /// Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2).
     ///
     /// No free-form paths or tool output — safe to surface in TUI chrome and

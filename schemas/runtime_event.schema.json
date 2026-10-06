@@ -1941,6 +1941,62 @@
       }
     },
     {
+      "description": "A `/btw` side question started a read-only tool call.\n\nThe side surface has its own activity: the main turn's [`Self::ToolCallStarted`] / [`Self::ToolCallCompleted`] stay the main transcript's, and a side question never appears there. Transient and never persisted, like every other `Btw*` event.",
+      "type": "object",
+      "required": [
+        "call_id",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "call_id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw_tool_started"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A `/btw` side-question tool call finished.\n\nCarries the outcome and the measured duration only — no arguments, no tool output, no error payload — because the side surface is an observer and its activity is chrome, not a record.",
+      "type": "object",
+      "required": [
+        "call_id",
+        "elapsed_ms",
+        "is_error",
+        "tool",
+        "type"
+      ],
+      "properties": {
+        "call_id": {
+          "$ref": "#/definitions/ToolCallId"
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "is_error": {
+          "type": "boolean"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "btw_tool_finished"
+          ]
+        }
+      }
+    },
+    {
       "description": "Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2).\n\nNo free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`].",
       "type": "object",
       "required": [
@@ -4980,6 +5036,62 @@
               "type": "string",
               "enum": [
                 "btw_failed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A `/btw` side question started a read-only tool call.\n\nThe side surface has its own activity: the main turn's [`Self::ToolCallStarted`] / [`Self::ToolCallCompleted`] stay the main transcript's, and a side question never appears there. Transient and never persisted, like every other `Btw*` event.",
+          "type": "object",
+          "required": [
+            "call_id",
+            "tool",
+            "type"
+          ],
+          "properties": {
+            "call_id": {
+              "$ref": "#/definitions/ToolCallId"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "btw_tool_started"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A `/btw` side-question tool call finished.\n\nCarries the outcome and the measured duration only — no arguments, no tool output, no error payload — because the side surface is an observer and its activity is chrome, not a record.",
+          "type": "object",
+          "required": [
+            "call_id",
+            "elapsed_ms",
+            "is_error",
+            "tool",
+            "type"
+          ],
+          "properties": {
+            "call_id": {
+              "$ref": "#/definitions/ToolCallId"
+            },
+            "elapsed_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "is_error": {
+              "type": "boolean"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "btw_tool_finished"
               ]
             }
           }

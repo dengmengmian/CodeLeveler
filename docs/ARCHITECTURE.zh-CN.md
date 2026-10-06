@@ -355,7 +355,7 @@ Provider 只能改变表示，不能改变决定。OpenAI Chat 把稳定的控�
 
 旧 session 的 `Role::System` 行本身不是来源。已知的子目录规则标记只是路径，当前文件会重新读取并标成 `ProjectInstruction`。其余历史 System 文本保持未分类，不会升成 `CoreContract` 或 `ProjectInstruction`，存储的原始记录也不改写。
 
-`Role::User` 同样不是来源。只有 payload 记录为用户输入的转录行才是 `UserIntent`。协议修补（非法 JSON、空回答、截断的工具调用、输出续写、Goal 尚未 resolution）是 `CoreContract`，来源是 `ProtocolRepair`。子 Agent 结算和重启重投是 `AdvisoryContext`，因为正文主要是另一个 Agent 的结果。丢失、恢复、目标重钉和 Goal checkpoint 是 `RuntimeFact`。`/btw` 旁问包装是 `CoreContract`：它是该交互模式的产品契约（不调用工具、不修改文件、不继续主任务）。用户的问题被引用在同一行里，所以这一行不是 `UserIntent`，也不是 `RuntimeFact`。工具取回的图片改用用户传输角色时仍是 `ExternalData`。压缩摘要仍是 `AdvisoryContext`：新行记录 `CompactionSummary`，旧行靠既有 breadcrumb 标记识别。没有 `origin` 的历史 User 行是 `LegacyUser` / `Unclassified`，不会因为角色名叫 User 而升成 `UserIntent`。权威元数据不写进发给模型的提示词，Provider 编码也不改变上述权威。
+`Role::User` 同样不是来源。只有 payload 记录为用户输入的转录行才是 `UserIntent`。协议修补（非法 JSON、空回答、截断的工具调用、输出续写、Goal 尚未 resolution）是 `CoreContract`，来源是 `ProtocolRepair`。子 Agent 结算和重启重投是 `AdvisoryContext`，因为正文主要是另一个 Agent 的结果。丢失、恢复、目标重钉和 Goal checkpoint 是 `RuntimeFact`。`/btw` 旁问包装是 `CoreContract`：它是该交互模式的产品契约（只调用 observe 类只读工具、不修改文件、不继续主任务）。用户的问题被引用在同一行里，所以这一行不是 `UserIntent`，也不是 `RuntimeFact`。工具取回的图片改用用户传输角色时仍是 `ExternalData`。压缩摘要仍是 `AdvisoryContext`：新行记录 `CompactionSummary`，旧行靠既有 breadcrumb 标记识别。没有 `origin` 的历史 User 行是 `LegacyUser` / `Unclassified`，不会因为角色名叫 User 而升成 `UserIntent`。权威元数据不写进发给模型的提示词，Provider 编码也不改变上述权威。
 
 ### 5.7 Context Lifecycle
 

@@ -446,6 +446,10 @@ export type RuntimeEvent =
   | { type: 'btw_cancelled' }
   /** Side-question failed. */
   | { type: 'btw_failed'; error: string }
+  /** A `/btw` side question started a read-only tool call. The side surface has its own activity: the main turn's [`Self::ToolCallStarted`] / [`Self::ToolCallCompleted`] stay the main transcript's, and a side question never appears there. Transient and never persisted, like every other `Btw*` event. */
+  | { type: 'btw_tool_started'; call_id: ToolCallId; tool: string }
+  /** A `/btw` side-question tool call finished. Carries the outcome and the measured duration only — no arguments, no tool output, no error payload — because the side surface is an observer and its activity is chrome, not a record. */
+  | { type: 'btw_tool_finished'; call_id: ToolCallId; elapsed_ms: number; is_error: boolean; tool: string }
   /** Coarse turn-progress / closeout signal (additive; protocol minor ≥ 1.2). No free-form paths or tool output — safe to surface in TUI chrome and optional remote summaries. Unknown older clients that reject new variants should skip events via [`crate::event::parse_runtime_event`]. */
   | { type: 'turn_progress'; closing: boolean; no_progress_streak: number; phase: string }
   /** Result of [`crate::ClientCommand::QueryContext`]. `accounting` is `None` when no model request has been assembled yet for the session (a fresh session before its first turn). */

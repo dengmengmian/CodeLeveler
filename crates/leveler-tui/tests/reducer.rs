@@ -10,7 +10,7 @@ use leveler_client_protocol::{
     UiThinkingState,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
-use leveler_tui::btw::{BtwTurnState, SurfaceFocus};
+use leveler_tui::btw::{BtwToolState, BtwTurnState, SurfaceFocus};
 use leveler_tui::overlay::Overlay;
 use leveler_tui::reducer::reduce;
 use leveler_tui::screen::Screen;
@@ -662,6 +662,153 @@ fn a_restored_verification_is_not_the_next_turns_verification() {
 fn ask_btw(s: &mut AppState, q: &str) -> Vec<Effect> {
     s.composer.replace(format!("/btw {q}"));
     reduce(s, key(KeyCode::Enter))
+}
+
+/// A `/btw` answer's read-only tool calls are visible while they run and
+/// settle in place, instead of the whole tool phase reading as "Answering…".
+#[test]
+fn btw_tool_activity_renders_running_then_finished() {
+    let mut s = opened();
+    ask_btw(&mut s, "后台任务还在跑吗？");
+    side_answer_started(&mut s, "后台任务还在跑吗？");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BtwToolStarted {
+            call_id: ToolCallId::new("tc1"),
+            tool: "get_task".into(),
+        }),
+    );
+    let running = rendered(&mut s, 100, 40);
+    assert!(running.contains("get_task"), "{running}");
+    assert!(running.contains("运行中"), "{running}");
+    assert!(
+        !running.contains("回答中"),
+        "a running tool IS the progress; the bare note must not hide it: {running}"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BtwToolFinished {
+            call_id: ToolCallId::new("tc1"),
+            tool: "get_task".into(),
+            is_error: false,
+            elapsed_ms: 12,
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BtwTextDelta {
+            delta: "还在跑。".into(),
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
+
+    let done = rendered(&mut s, 100, 40);
+    assert!(done.contains("get_task · 12ms"), "{done}");
+    assert!(done.contains("还在跑。"), "{done}");
+    assert_eq!(s.btw.turns[0].tools.len(), 1);
+    assert_eq!(s.btw.turns[0].tools[0].state, BtwToolState::Finished);
+    assert_eq!(s.btw.turns[0].tools[0].elapsed_ms, 12);
+}
+
+/// A tool that fails is shown as failed, and the side turn still finishes.
+#[test]
+fn btw_tool_error_is_visible_and_the_turn_still_finishes() {
+    let mut s = opened();
+    ask_btw(&mut s, "读一下 README");
+    side_answer_started(&mut s, "读一下 README");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BtwToolStarted {
+            call_id: ToolCallId::new("tce"),
+            tool: "read_file".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BtwToolFinished {
+            call_id: ToolCallId::new("tce"),
+            tool: "read_file".into(),
+            is_error: true,
+            elapsed_ms: 3,
+        }),
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
+
+    let text = rendered(&mut s, 100, 40);
+    assert!(text.contains("read_file · 3ms"), "{text}");
+    assert_eq!(s.btw.turns[0].tools[0].state, BtwToolState::Error);
+    assert_eq!(s.btw.turns[0].state, BtwTurnState::Done);
+}
+
+/// A terminal side state closes every call still in flight: a cancelled side
+/// answer must never leave a tool rendered as running forever.
+#[test]
+fn a_terminal_btw_state_closes_a_running_tool_call() {
+    for terminal in [
+        RuntimeEvent::BtwCancelled,
+        RuntimeEvent::BtwFailed {
+            error: "boom".into(),
+        },
+    ] {
+        let mut s = opened();
+        ask_btw(&mut s, "等等");
+        side_answer_started(&mut s, "等等");
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BtwToolStarted {
+                call_id: ToolCallId::new("tcr"),
+                tool: "grep".into(),
+            }),
+        );
+        reduce(&mut s, Action::Runtime(terminal));
+
+        assert_eq!(
+            s.btw.turns[0].tools[0].state,
+            BtwToolState::Interrupted,
+            "a terminal side state must close a running tool call"
+        );
+        let text = rendered(&mut s, 100, 40);
+        assert!(text.contains("已中断"), "{text}");
+        assert!(!text.contains("运行中"), "{text}");
+    }
+}
+
+/// Activity is supporting chrome: past five calls collapse into one count so
+/// the newest calls and the answer stay visible.
+#[test]
+fn btw_tool_activity_collapses_over_five_calls() {
+    let mut s = opened();
+    ask_btw(&mut s, "全都查一遍");
+    side_answer_started(&mut s, "全都查一遍");
+    for i in 0..7 {
+        let call_id = ToolCallId::new(format!("tc{i}"));
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BtwToolStarted {
+                call_id: call_id.clone(),
+                tool: format!("tool_{i}"),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BtwToolFinished {
+                call_id,
+                tool: format!("tool_{i}"),
+                is_error: false,
+                elapsed_ms: 1,
+            }),
+        );
+    }
+    reduce(&mut s, Action::Runtime(RuntimeEvent::BtwCompleted));
+
+    let text = rendered(&mut s, 120, 40);
+    assert!(text.contains("还有 2 次工具调用"), "{text}");
+    assert!(text.contains("tool_6"), "the newest calls stay: {text}");
+    assert!(
+        !text.contains("tool_1"),
+        "the oldest calls collapse: {text}"
+    );
 }
 
 /// The runtime announced the side answer started.

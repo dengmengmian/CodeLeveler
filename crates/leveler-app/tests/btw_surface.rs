@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{
-    ClientCommand, InteractiveRuntimeClient, PermissionProfile as WirePermissionProfile, RuntimeEvent,
+    ClientCommand, InteractiveRuntimeClient, PermissionProfile as WirePermissionProfile,
+    RuntimeEvent,
 };
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
@@ -153,7 +154,12 @@ async fn side_surface_names(
     session: &leveler_core::SessionId,
 ) -> Vec<String> {
     let (registry, _context) = app
-        .side_question_tools(&ModelRef::new("mock", "m"), profile, false, Some(session.as_str()))
+        .side_question_tools(
+            &ModelRef::new("mock", "m"),
+            profile,
+            false,
+            Some(session.as_str()),
+        )
         .await
         .unwrap();
     let mut names: Vec<String> = registry
@@ -377,7 +383,9 @@ async fn two_consecutive_side_questions_while_a_main_turn_waits_on_a_background_
     for body in &bodies[1..] {
         let names = advertised_tool_names(body);
         assert!(
-            !names.iter().any(|name| name == "wait_task" || name == "run_command"),
+            !names
+                .iter()
+                .any(|name| name == "wait_task" || name == "run_command"),
             "a side question must never be able to wait on the main task: {names:?}"
         );
     }
@@ -393,10 +401,87 @@ async fn two_consecutive_side_questions_while_a_main_turn_waits_on_a_background_
 /// by a snapshot: everything reachable from `/btw` must be `Safe` risk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_side_surface_is_observe_class_by_construction() {
-    let (_tmp, _server, app, _client, session) = harness(vec![], PermissionProfile::FullAccess).await;
+    let (_tmp, _server, app, _client, session) =
+        harness(vec![], PermissionProfile::FullAccess).await;
     let names = side_surface_names(&app, PermissionProfile::FullAccess, &session).await;
     assert!(
         names.len() < FORBIDDEN_ON_SIDE_SURFACE.len() + 20,
         "the side surface stays a narrow observer set: {names:?}"
+    );
+}
+
+/// The side thread's tool activity travels on its OWN events.
+///
+/// `/btw` may use read-only tools, and that activity belongs to the side
+/// surface: a client must see it without borrowing the main turn's
+/// `ToolCallStarted` / `ToolCallCompleted`, which stay the main transcript's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn side_tool_activity_uses_only_btw_events() {
+    let tool_call = MockResponse::SilentThenJson {
+        silent_ms: 0,
+        body: serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_probe",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": serde_json::json!({"path": "probe.txt"}).to_string()
+                    }
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string(),
+    };
+    let (tmp, _server, _app, client, session) = harness(
+        vec![tool_call, json_response("probe.txt says hello")],
+        PermissionProfile::FullAccess,
+    )
+    .await;
+    std::fs::write(tmp.path().join("probe.txt"), "hello-from-probe\n").unwrap();
+
+    let mut rx = client.subscribe();
+    client
+        .send(ClientCommand::Btw {
+            session_id: session.clone(),
+            question: "read probe.txt and tell me what it says".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut started: Vec<String> = Vec::new();
+    let mut finished: Vec<(String, bool, u64)> = Vec::new();
+    let mut main_tool_events = 0usize;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("the side question must finish")
+            .unwrap()
+        {
+            RuntimeEvent::BtwToolStarted { tool, .. } => started.push(tool),
+            RuntimeEvent::BtwToolFinished {
+                tool,
+                is_error,
+                elapsed_ms,
+                ..
+            } => finished.push((tool, is_error, elapsed_ms)),
+            RuntimeEvent::ToolCallStarted { .. } | RuntimeEvent::ToolCallCompleted { .. } => {
+                main_tool_events += 1;
+            }
+            RuntimeEvent::BtwCompleted => break,
+            RuntimeEvent::BtwFailed { error } => panic!("side question failed: {error}"),
+            RuntimeEvent::BtwCancelled => panic!("side question was cancelled"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(started, vec!["read_file"], "the side call announces itself");
+    assert_eq!(finished.len(), 1, "and reports its own outcome");
+    assert_eq!(finished[0].0, "read_file");
+    assert!(!finished[0].1, "a successful read is not an error");
+    assert_eq!(
+        main_tool_events, 0,
+        "a side tool call must not borrow the main turn's tool events"
     );
 }

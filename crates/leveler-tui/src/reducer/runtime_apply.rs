@@ -871,6 +871,19 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         RuntimeEvent::BtwTextDelta { delta } => {
             state.btw.append(&delta);
         }
+        RuntimeEvent::BtwToolStarted { call_id, tool } => {
+            state.btw.tool_started(call_id.to_string(), tool);
+        }
+        RuntimeEvent::BtwToolFinished {
+            call_id,
+            is_error,
+            elapsed_ms,
+            ..
+        } => {
+            state
+                .btw
+                .tool_finished(call_id.as_str(), is_error, elapsed_ms);
+        }
         RuntimeEvent::BtwCompleted => {
             state.btw.finish(crate::btw::BtwTurnState::Done, None);
         }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// `major` for a breaking wire change.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 1,
-    minor: 13,
+    minor: 14,
 };
 
 /// Features explicitly supported by the peer. Absence means a legacy peer.
@@ -128,7 +128,7 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert_eq!(
             json,
-            r#"{"protocol":{"major":1,"minor":13},"body":{"type":"quit"},"capabilities":["optional_workspace"]}"#
+            r#"{"protocol":{"major":1,"minor":14},"body":{"type":"quit"},"capabilities":["optional_workspace"]}"#
         );
         // And it round-trips.
         let back: ProtocolEnvelope<ClientCommand> = serde_json::from_str(&json).unwrap();

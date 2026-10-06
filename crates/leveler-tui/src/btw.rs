@@ -53,6 +53,8 @@ pub struct BtwTurn {
     pub question: String,
     pub answer: String,
     pub state: BtwTurnState,
+    /// Read-only tool calls made while answering, in call order.
+    pub tools: Vec<BtwToolActivity>,
 }
 
 impl BtwTurn {
@@ -61,8 +63,33 @@ impl BtwTurn {
             question,
             answer: String::new(),
             state: BtwTurnState::Streaming,
+            tools: Vec::new(),
         }
     }
+}
+
+/// Where one side-question tool call stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BtwToolState {
+    Running,
+    Finished,
+    Error,
+    /// The side turn reached a terminal state before this call reported its
+    /// own outcome (stop, failure, or a lost event). Never shown as running.
+    Interrupted,
+}
+
+/// One read-only tool call made while answering a side question.
+///
+/// Activity, not a record: this says what the observer reached for and how
+/// long it took. It never leaves the side surface and is never persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtwToolActivity {
+    pub call_id: String,
+    pub tool: String,
+    pub state: BtwToolState,
+    /// Measured duration. Meaningful only once the call reported its outcome.
+    pub elapsed_ms: u64,
 }
 
 /// The side thread's presentation state: its turns, its own composer draft,
@@ -107,12 +134,57 @@ impl BtwThread {
         }
     }
 
+    /// The side question started a read-only tool call. Recorded on the
+    /// streaming turn only; a call that arrives with no streaming turn has no
+    /// answer to belong to and is dropped rather than attached to an old one.
+    pub fn tool_started(&mut self, call_id: String, tool: String) {
+        if let Some(turn) = self.streaming_turn() {
+            turn.tools.push(BtwToolActivity {
+                call_id,
+                tool,
+                state: BtwToolState::Running,
+                elapsed_ms: 0,
+            });
+        }
+    }
+
+    /// That call's outcome. Matched by `call_id` against a call this view saw
+    /// start; an unmatched finish is ignored instead of inventing activity.
+    pub fn tool_finished(&mut self, call_id: &str, is_error: bool, elapsed_ms: u64) {
+        if let Some(turn) = self.streaming_turn()
+            && let Some(activity) = turn.tools.iter_mut().find(|activity| {
+                activity.call_id == call_id && activity.state == BtwToolState::Running
+            })
+        {
+            activity.state = if is_error {
+                BtwToolState::Error
+            } else {
+                BtwToolState::Finished
+            };
+            activity.elapsed_ms = elapsed_ms;
+        }
+    }
+
+    fn streaming_turn(&mut self) -> Option<&mut BtwTurn> {
+        self.turns
+            .last_mut()
+            .filter(|turn| turn.state == BtwTurnState::Streaming)
+    }
+
     /// Close the newest streaming turn. `detail` is appended for a failure so
     /// the reason stays on the turn instead of only flashing as a toast.
+    ///
+    /// Any tool call still running at this point is closed too: a terminal
+    /// side state must never leave a call rendered as in flight.
     pub fn finish(&mut self, state: BtwTurnState, detail: Option<&str>) {
         if let Some(turn) = self.turns.last_mut()
             && turn.state == BtwTurnState::Streaming
         {
+            for activity in &mut turn.tools {
+                if activity.state == BtwToolState::Running {
+                    activity.state = BtwToolState::Interrupted;
+                }
+            }
             if let Some(detail) = detail {
                 if !turn.answer.is_empty() {
                     turn.answer.push('\n');
@@ -217,15 +289,20 @@ fn body_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
             body,
         ));
         out.push(Line::from(""));
+        out.extend(tool_lines(turn, theme, t, width));
         match turn.state {
             BtwTurnState::Streaming if turn.answer.is_empty() => {
-                out.extend(marked_wrapped(
-                    ASSISTANT_MARKER,
-                    theme.accent.secondary,
-                    t.btw_answering,
-                    width,
-                    Style::default().fg(theme.text.secondary),
-                ));
+                // While a tool call is the only thing happening, the activity
+                // IS the progress; the bare "answering" note would hide it.
+                if turn.tools.is_empty() {
+                    out.extend(marked_wrapped(
+                        ASSISTANT_MARKER,
+                        theme.accent.secondary,
+                        t.btw_answering,
+                        width,
+                        Style::default().fg(theme.text.secondary),
+                    ));
+                }
             }
             BtwTurnState::Streaming | BtwTurnState::Done => {
                 out.extend(marked_markdown(
@@ -272,6 +349,60 @@ fn body_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
                 ));
             }
         }
+    }
+    out
+}
+
+/// At most this many tool activity lines per side answer. The answer is the
+/// point; activity is supporting chrome.
+const MAX_TOOL_LINES: usize = 5;
+
+/// The read-only activity behind one side answer, oldest hidden first.
+///
+/// Only the newest [`MAX_TOOL_LINES`] calls are shown; the rest collapse into
+/// one count line above them, so live activity stays visible instead of an
+/// ever-growing list pushing the answer down.
+fn tool_lines(
+    turn: &BtwTurn,
+    theme: &crate::theme::Theme,
+    t: &crate::i18n::UiText,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if turn.tools.is_empty() {
+        return Vec::new();
+    }
+    let hidden = turn.tools.len().saturating_sub(MAX_TOOL_LINES);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if hidden > 0 {
+        out.push(Line::from(vec![
+            Span::raw(" ".repeat(MARKER_PREFIX)),
+            Span::styled(
+                t.btw_tool_hidden.replace("{n}", &hidden.to_string()),
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    for activity in turn.tools.iter().skip(hidden) {
+        let (glyph, color) = match activity.state {
+            BtwToolState::Running => ('◌', theme.accent.primary),
+            BtwToolState::Finished => ('✓', theme.status.success),
+            BtwToolState::Error => ('✗', theme.status.error),
+            BtwToolState::Interrupted => ('?', theme.status.warning),
+        };
+        let detail = match activity.state {
+            BtwToolState::Running => t.tool_status_running.to_string(),
+            BtwToolState::Interrupted => t.btw_tool_interrupted.to_string(),
+            BtwToolState::Finished | BtwToolState::Error => {
+                format!("{}ms", activity.elapsed_ms)
+            }
+        };
+        out.extend(marked_wrapped(
+            glyph,
+            color,
+            &format!("{} · {detail}", activity.tool),
+            width,
+            Style::default().fg(theme.text.muted),
+        ));
     }
     out
 }

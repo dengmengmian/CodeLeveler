@@ -517,6 +517,10 @@ struct BtwSession {
     /// Cancel handle of the answer being generated right now, if any. `None`
     /// when the side thread is idle.
     cancel: Option<CancellationToken>,
+    /// Monotonic per-session side-question ordinal, used ONLY to correlate
+    /// diagnostic traces of one question end to end. Never a state machine:
+    /// nothing reads it to decide behavior.
+    seq: u64,
 }
 
 /// Per-session side threads, keyed by session. Wrapped in `Arc<Mutex<..>>`
@@ -2796,7 +2800,7 @@ impl InProcessRuntimeClient {
         // One answer at a time per side thread: a second question while one is
         // streaming would race the history append and the single "generating"
         // state. Refuse it visibly instead of interleaving two answers.
-        let (cancel, history) = {
+        let (cancel, history, btw_seq) = {
             let mut threads = btw
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2812,9 +2816,23 @@ impl InProcessRuntimeClient {
                 return;
             }
             let thread = threads.entry(session_id.clone()).or_default();
+            thread.seq += 1;
+            let btw_seq = thread.seq;
             let token = CancellationToken::new();
             thread.cancel = Some(token.clone());
-            (token, thread.history.clone())
+            // `active_background_tasks` used to be logged here from
+            // `try_active_ids_for_scope(..).unwrap_or(0)`: an unavailable lock
+            // became "0 tasks", which reads as a fact but is not one. Unknown
+            // is not zero, so the field is gone rather than made "more
+            // accurate" with an extra await on the side-question path.
+            tracing::info!(
+                session = %session_id,
+                btw_seq,
+                history_messages = thread.history.len(),
+                model = %model,
+                "BTW_START"
+            );
+            (token, thread.history.clone(), btw_seq)
         };
 
         let handle = tokio::runtime::Handle::current();
@@ -3089,10 +3107,33 @@ impl InProcessRuntimeClient {
                         request.reasoning_effort = policy.reasoning_effort;
                         request.thinking_disabled = policy.thinking_disabled;
                         request.projection = Some(projection);
+                        let request_id = request.request_id.to_string();
+                        tracing::info!(
+                            session = %session_id,
+                            btw_seq,
+                            step,
+                            request_id = %request_id,
+                            message_count = messages.len(),
+                            estimated_input_tokens = estimated_input,
+                            provider = %model.provider,
+                            model = %model.model,
+                            "BTW_MODEL_DISPATCH"
+                        );
                         let started = std::time::Instant::now();
                         let outcome = app.registry.generate(request, cancel.clone()).await;
                         let latency_ms =
                             started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                        tracing::info!(
+                            session = %session_id,
+                            btw_seq,
+                            step,
+                            request_id = %request_id,
+                            elapsed_ms = latency_ms,
+                            outcome = if outcome.is_ok() { "ok" } else { "error" },
+                            delivery_state = ?outcome.as_ref().err().map(|e| e.delivery_state),
+                            error_kind = ?outcome.as_ref().err().map(|e| e.kind),
+                            "BTW_MODEL_RETURN"
+                        );
                         crate::observability::record_auxiliary_call(
                             &app,
                             &db,
@@ -3135,6 +3176,23 @@ impl InProcessRuntimeClient {
                             .expect("a tool call implies the side surface exists");
                         let mut parts = Vec::with_capacity(calls.len());
                         for call in calls {
+                            tracing::info!(
+                                session = %session_id,
+                                btw_seq,
+                                step,
+                                tool = %call.name,
+                                call_id = %call.id,
+                                "BTW_TOOL_START"
+                            );
+                            let tool_started = std::time::Instant::now();
+                            // The side thread's own activity, carried on the
+                            // side thread's own events. The main turn's
+                            // `ToolCall*` events stay the main transcript's;
+                            // a side question never reaches it.
+                            let _ = events.send(RuntimeEvent::BtwToolStarted {
+                                call_id: call.id.clone(),
+                                tool: call.name.clone(),
+                            });
                             let (content, is_error) = match executor
                                 .run_read_only_call(call.clone(), tool_context.clone(), &cancel)
                                 .await
@@ -3151,6 +3209,25 @@ impl InProcessRuntimeClient {
                                     is_error,
                                 },
                             });
+                            let elapsed_ms = tool_started.elapsed().as_millis() as u64;
+                            tracing::info!(
+                                session = %session_id,
+                                btw_seq,
+                                step,
+                                call_id = %call.id,
+                                elapsed_ms,
+                                is_error,
+                                "BTW_TOOL_END"
+                            );
+                            // Sent on BOTH outcomes, including an admit or
+                            // execution error: a terminal side state must not
+                            // leave the tool rendered as still running.
+                            let _ = events.send(RuntimeEvent::BtwToolFinished {
+                                call_id: call.id.clone(),
+                                tool: call.name.clone(),
+                                is_error,
+                                elapsed_ms,
+                            });
                         }
                         messages.push(Message::from_parts(Role::Tool, parts, None));
                     }
@@ -3161,9 +3238,19 @@ impl InProcessRuntimeClient {
                 let (event, record) = match result {
                     Ok(text) => {
                         if !text.is_empty() {
-                            let _ = events.send(RuntimeEvent::BtwTextDelta {
-                                delta: text.clone(),
-                            });
+                            let receivers = events
+                                .send(RuntimeEvent::BtwTextDelta {
+                                    delta: text.clone(),
+                                })
+                                .unwrap_or(0);
+                            tracing::info!(
+                                session = %session_id,
+                                btw_seq,
+                                event = "BtwTextDelta",
+                                bytes = text.len(),
+                                receivers,
+                                "BTW_EVENT_SEND"
+                            );
                         }
                         // A fulfilled answer joins the side thread's own history
                         // so the next question can reference it.
@@ -3188,7 +3275,20 @@ impl InProcessRuntimeClient {
                         }
                     }
                 }
-                let _ = events.send(event);
+                let event_name = match &event {
+                    RuntimeEvent::BtwCompleted => "BtwCompleted",
+                    RuntimeEvent::BtwCancelled => "BtwCancelled",
+                    RuntimeEvent::BtwFailed { .. } => "BtwFailed",
+                    _ => "other",
+                };
+                let delivered = events.send(event).unwrap_or(0);
+                tracing::info!(
+                    session = %session_id,
+                    btw_seq,
+                    event = event_name,
+                    receivers = delivered,
+                    "BTW_EVENT_SEND"
+                );
             });
         });
     }

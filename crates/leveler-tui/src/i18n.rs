@@ -758,6 +758,10 @@ pub struct UiText {
     pub btw_footer_hint_stop: &'static str,
     /// Refusal when a second side question arrives before the first finished.
     pub btw_busy: &'static str,
+    /// Collapsed overflow of side-question tool activity. `{n}` is a count.
+    pub btw_tool_hidden: &'static str,
+    /// A side-question tool call that never reported its own outcome.
+    pub btw_tool_interrupted: &'static str,
 
     // `/update` panel
     pub update_panel_title: &'static str,
@@ -1672,6 +1676,8 @@ static ZH: UiText = UiText {
     btw_footer_hint: "Esc 返回主线程 · Enter 发送 · ↑↓ 滚动",
     btw_footer_hint_stop: "Esc 返回主线程 · Ctrl+C 停止回答 · ↑↓ 滚动",
     btw_busy: "上一条旁问还在回答，先等它结束或按 Ctrl+C 停止",
+    btw_tool_hidden: "还有 {n} 次工具调用",
+    btw_tool_interrupted: "已中断",
     update_panel_title: "CodeLeveler 更新",
     update_current: "当前",
     update_latest: "最新",
@@ -2417,6 +2423,8 @@ static EN: UiText = UiText {
     btw_footer_hint: "Esc Main · Enter send · ↑↓ scroll",
     btw_footer_hint_stop: "Esc Main · Ctrl+C stop reply · ↑↓ scroll",
     btw_busy: "the previous side answer is still streaming — wait or press Ctrl+C",
+    btw_tool_hidden: "{n} more tool calls",
+    btw_tool_interrupted: "interrupted",
     update_panel_title: "CodeLeveler update",
     update_current: "current",
     update_latest: "latest",
