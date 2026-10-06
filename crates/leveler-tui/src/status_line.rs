@@ -275,20 +275,31 @@ fn truncate_to_width(s: &str, width: usize) -> String {
     acc
 }
 
+/// Fit a busy row into `width`, in priority order.
+///
+/// `parts[0]` is the live state — the reason the row exists at all. It is
+/// truncated when the row is too narrow to hold it, never dropped: a spinner
+/// alone says that something is happening but not WHAT, which is the only
+/// thing the strip is for. Dropping it also silently discarded the elapsed /
+/// tool / token parts behind it, because the caller splits the fitted text
+/// back apart. Later parts are evidence/metadata and only fill what the live
+/// state leaves, so the row degrades from the right.
 fn fit_status(parts: &[String], width: usize) -> String {
-    let mut out = String::new();
-    for (i, p) in parts.iter().enumerate() {
-        let candidate = if i == 0 {
-            p.clone()
-        } else {
-            format!("{out} · {p}")
-        };
+    let Some(live) = parts.first() else {
+        return String::new();
+    };
+    if UnicodeWidthStr::width(live.as_str()) > width {
+        return truncate_to_width(live, width);
+    }
+    let mut out = live.clone();
+    for part in &parts[1..] {
+        let candidate = format!("{out} · {part}");
         if UnicodeWidthStr::width(candidate.as_str()) > width {
             break;
         }
         out = candidate;
     }
-    truncate_to_width(&out, width)
+    out
 }
 
 /// Coarse status-strip phase for honesty checks (tests + render).
@@ -1049,6 +1060,37 @@ mod tests {
             text.contains(SPINNER[0]) && text.contains("running tools"),
             "busy status: {text}"
         );
+    }
+
+    /// The row says WHAT is happening; the spinner only says THAT something
+    /// is. A live part too wide for the row (a long running command, a narrow
+    /// split-pane header) used to be dropped whole, leaving a bare spinner —
+    /// and taking the elapsed / tool / token parts with it, because the caller
+    /// splits the fitted text back apart. The row must always keep its label.
+    #[test]
+    fn a_busy_row_keeps_its_label_instead_of_a_bare_spinner() {
+        let mut state = test_state();
+        state.status = RuntimeStatus::Busy;
+        state.goal_mode_active = true;
+        state.activity = Some("运行 cargo test --workspace --all-targets".into());
+        state.elapsed_secs = 12;
+        state.turn_tool_calls = 3;
+        state.token_input = 12_000;
+        state.token_output = 800;
+        state.tick = 0;
+        // Widths from a cramped pane up to a full terminal: the live part
+        // never fits one of them, and the metadata never fits all of them.
+        for width in [5usize, 8, 16, 24, 40, 80, 120] {
+            let text = status_line_content(&state, width).to_string();
+            assert!(
+                text.contains(SPINNER[0]),
+                "the busy row must still exist at width {width}: {text:?}"
+            );
+            assert!(
+                text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "a busy row may not be a bare spinner at width {width}: {text:?}"
+            );
+        }
     }
 
     #[test]
