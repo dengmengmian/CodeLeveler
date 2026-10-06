@@ -275,6 +275,17 @@ fixture 目录：`testdata/execution_presentation/v1/`。
 cargo test -p leveler-tui --test execution_presentation_contract
 ```
 
+各 surface 各自的 conformance（读取同一份 corpus）：
+
+```sh
+# Web
+cd crates/leveler-web/web && npx vitest run src/lib/executionPresentation.test.ts
+# Desktop
+cd apps/leveler-desktop && node --test test/executionPresentation.test.mjs
+# App
+cd apps/leveler-mobile && flutter test test/execution_presentation_test.dart
+```
+
 其中 `UPDATE_EXECUTION_PRESENTATION_FIXTURES=1` 可以从参考实现重新生成 `expect`。
 生成器记录产品当前行为，不决定产品应当如何行为；每次重生成都必须人工 review。
 
@@ -314,22 +325,33 @@ CI / Gate 每次必须给出如下矩阵；每格只能是 `PASS` / `DEFERRED` /
 
 | # | invariant | TUI | Web | Desktop | App |
 | --- | --- | --- | --- | --- | --- |
-| C1 | multi-round | PASS | PASS | DEFERRED | DEFERRED |
-| C2 | parallel batch | PASS | PASS | DEFERRED | DEFERRED |
-| C3 | run/batch | PASS | PASS | DEFERRED | DEFERRED |
+| C1 | multi-round | PASS | PASS | PASS | PASS |
+| C2 | parallel batch | PASS | PASS | PASS | PASS |
+| C3 | run/batch | PASS | PASS | PASS | PASS |
 | C4 | public text | PASS | PASS | PASS | PASS |
 | C5 | tool-only | PASS | PASS | PASS | PASS |
-| C6 | mixed kinds | PASS | PASS | DEFERRED | DEFERRED |
+| C6 | mixed kinds | PASS | PASS | PASS | PASS |
 | C7 | status truth | PASS | PASS | PASS | PASS |
-| C8 | failure truth | PASS | PASS | PARTIAL | DEFERRED |
+| C8 | failure truth | PASS | PASS | PASS | PASS |
 | C9 | final bookkeeping | PASS | PASS | PASS | PASS |
-| C10 | reconnect/replay | PASS | PASS | PASS | DEFERRED |
+| C10 | reconnect/replay | PASS | PARTIAL | PARTIAL | DEFERRED |
 | C11 | legacy | PASS | PASS | PASS | PASS |
 | C12 | BTW | PASS | PASS | PASS | PASS |
 | C13 | runtime injection | PASS | PASS | PASS | PASS |
 
 `PARTIAL` 是显式允许的中间态，只用于「语义已正确但覆盖不完整」；不得用来描述
 「看起来没问题」。
+
+C10 的三种口径：
+
+- TUI：live / reconnect snapshot / durable replay 全部验证（`replay_history`
+  走真实 reducer）。
+- Web：live 与 reconnect snapshot 通过；durable replay DEFERRED —— Web 目前没有
+  `query_session_history` 消费者，因此从 snapshot 打开的历史会话只恢复文本，不恢复
+  已经结束的 Round。Conformance 测试里显式断言了这个缺口。
+- Desktop：live 与「snapshot + history」通过；仅用 durable history（没有 snapshot）
+  重建 turn 的路径 DEFERRED，缺口同样被显式断言。
+- App：DEFERRED —— App 只消费 live 事件流与 snapshot，没有 history 消费者。
 
 ---
 

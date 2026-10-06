@@ -294,6 +294,17 @@ Reference-implementation (TUI) conformance:
 cargo test -p leveler-tui --test execution_presentation_contract
 ```
 
+Each surface's own conformance (same corpus):
+
+```sh
+# Web
+cd crates/leveler-web/web && npx vitest run src/lib/executionPresentation.test.ts
+# Desktop
+cd apps/leveler-desktop && node --test test/executionPresentation.test.mjs
+# App
+cd apps/leveler-mobile && flutter test test/execution_presentation_test.dart
+```
+
 `UPDATE_EXECUTION_PRESENTATION_FIXTURES=1` regenerates `expect` from the reference
 implementation. The generator records what the product does; it does not decide what the
 product should do. Every regeneration must be reviewed by hand.
@@ -336,22 +347,35 @@ CI / Gate must print this matrix; each cell is only `PASS` / `DEFERRED` / `N/A` 
 
 | # | invariant | TUI | Web | Desktop | App |
 | --- | --- | --- | --- | --- | --- |
-| C1 | multi-round | PASS | PASS | DEFERRED | DEFERRED |
-| C2 | parallel batch | PASS | PASS | DEFERRED | DEFERRED |
-| C3 | run/batch | PASS | PASS | DEFERRED | DEFERRED |
+| C1 | multi-round | PASS | PASS | PASS | PASS |
+| C2 | parallel batch | PASS | PASS | PASS | PASS |
+| C3 | run/batch | PASS | PASS | PASS | PASS |
 | C4 | public text | PASS | PASS | PASS | PASS |
 | C5 | tool-only | PASS | PASS | PASS | PASS |
-| C6 | mixed kinds | PASS | PASS | DEFERRED | DEFERRED |
+| C6 | mixed kinds | PASS | PASS | PASS | PASS |
 | C7 | status truth | PASS | PASS | PASS | PASS |
-| C8 | failure truth | PASS | PASS | PARTIAL | DEFERRED |
+| C8 | failure truth | PASS | PASS | PASS | PASS |
 | C9 | final bookkeeping | PASS | PASS | PASS | PASS |
-| C10 | reconnect/replay | PASS | PASS | PASS | DEFERRED |
+| C10 | reconnect/replay | PASS | PARTIAL | PARTIAL | DEFERRED |
 | C11 | legacy | PASS | PASS | PASS | PASS |
 | C12 | BTW | PASS | PASS | PASS | PASS |
 | C13 | runtime injection | PASS | PASS | PASS | PASS |
 
 `PARTIAL` is an explicitly allowed intermediate state, used only for "the semantics are
 correct but the coverage is incomplete". It is never used for "looks fine".
+
+The three readings of C10:
+
+- TUI: live, reconnect snapshot and durable replay are all verified (its
+  `replay_history` runs the real reducer).
+- Web: live and the reconnect snapshot pass; durable replay is DEFERRED — the Web
+  client has no `query_session_history` consumer yet, so a session opened from a
+  snapshot restores its text but not its finished rounds. The conformance test asserts
+  that gap explicitly.
+- Desktop: live and "snapshot + history" pass; the path that rebuilds a turn from
+  durable history ALONE (no snapshot) is DEFERRED, and the gap is asserted too.
+- App: DEFERRED — the app consumes the live event stream and snapshots only, with no
+  history consumer.
 
 ---
 
