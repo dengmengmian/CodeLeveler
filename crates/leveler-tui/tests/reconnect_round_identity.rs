@@ -409,3 +409,53 @@ fn c6_a_legacy_snapshot_without_a_round_falls_back_safely() {
         rounds(&s)
     );
 }
+
+/// R6 — a completed round is not re-minted by a resume, and the durable record
+/// shows the answer exactly once.
+///
+/// Tool rows are transient by design: the durable record of a finished turn is
+/// its transcript messages. What a resume must never do is invent a round out
+/// of an empty active list, or duplicate the answer the live client already has.
+#[test]
+fn r6_resume_after_completion_mints_no_orphan_round() {
+    let mut live = state();
+    live.transcript.push_user("验证续期".into());
+    start(&mut live, "c1", "shell_command", CMD, Some(5));
+    complete(&mut live, "c1");
+    reduce(&mut live, Action::Runtime(RuntimeEvent::TurnAnswered));
+
+    assert_eq!(
+        rounds(&live),
+        vec![(Some(5), vec!["shell_command".to_string()])],
+        "the live round settles in place: {:?}",
+        rounds(&live)
+    );
+    assert_eq!(
+        count_rows(&lines(&live), "sleep 60"),
+        1,
+        "one ToolRow, not two: {:?}",
+        lines(&live)
+    );
+
+    // Resume: a snapshot of the finished session. Active tools are empty, so no
+    // round may be invented — and applying the same snapshot twice is
+    // idempotent, never a second set of rows.
+    let mut snap = idle_snapshot();
+    snap.status = "idle".into();
+    let mut resumed = state();
+    for _ in 0..2 {
+        reduce(
+            &mut resumed,
+            Action::Runtime(RuntimeEvent::SessionOpened {
+                session: snap.clone(),
+            }),
+        );
+    }
+    assert!(
+        rounds(&resumed).is_empty(),
+        "no orphan round: {:?}",
+        rounds(&resumed)
+    );
+    assert_eq!(resumed.transcript.tool_calls().len(), 0);
+    assert_eq!(count_rows(&lines(&resumed), "sleep 60"), 0);
+}
