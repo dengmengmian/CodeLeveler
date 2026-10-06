@@ -172,9 +172,9 @@ pub(crate) fn render_group_rows(
     // in flight, and a settled-but-open one is still being written to.
     let live = group.open || !group_is_finished(group);
     // A round whose calls are NOT all one tool does not fit the single-run
-    // form, but it is still one execution node: it names itself (`多个工具`)
-    // and counts what finished, instead of a stage sentence. Edit rounds are
-    // excluded — a diff is the result and keeps its own shape.
+    // form, but it is still one execution node: it drops the tool name and
+    // counts the operations it ran, instead of a stage sentence. Edit rounds
+    // are excluded — a diff is the result and keeps its own shape.
     let mixed_round = group.round.is_some()
         && !visible.is_empty()
         && !group_has_edits(group)
@@ -185,7 +185,7 @@ pub(crate) fn render_group_rows(
         && (visible.len() > 1 || visible.first().is_some_and(|c| is_shell_call(c)));
     let header = if mixed_round {
         let mut p = disclosure_presentation(&visible, group.expanded, live, t);
-        p.label = round_mixed_head(&visible, t);
+        p.label = round_mixed_head(&visible, live, t);
         p.ok_suffix = None;
         Some(p)
     } else {
@@ -591,27 +591,17 @@ fn disclosure_presentation(
 /// the present tense, carrying only the count observed so far. It mirrors the
 /// finished label's shape so closing a group rewrites the row in place instead
 /// of replacing it with a differently shaped one.
-/// A mixed execution round's head: its name ("多个工具" / "Multiple Tools")
-/// plus what completed or, while live, what is still running. The count of
-/// SUCCESSES is stated, so a round that ran a failure never reads as if
-/// everything finished.
-fn round_mixed_head(visible: &[&ToolCallBlock], t: &UiText) -> String {
-    if visible.iter().any(|c| c.status == ToolStatus::Running) {
-        format!(
-            "{} \u{b7} {}",
-            t.round_mixed,
-            t.round_running.replace("{}", &visible.len().to_string())
-        )
+/// A mixed execution round's head. The round ran several tools, so there is
+/// no single tool name to show; it states how many operations it ran instead.
+/// `running` is the group's own truth, not the members' momentary statuses —
+/// the same flag that decides the row's glyph — so a live head says what is
+/// running and a settled one states the count, never both at once.
+fn round_mixed_head(visible: &[&ToolCallBlock], running: bool, t: &UiText) -> String {
+    let count = visible.len().to_string();
+    if running {
+        t.round_mixed_running.replace("{}", &count)
     } else {
-        let ok = visible
-            .iter()
-            .filter(|c| c.status == ToolStatus::Ok)
-            .count();
-        format!(
-            "{} \u{b7} {}",
-            t.round_mixed,
-            t.round_done.replace("{}", &ok.to_string())
-        )
+        t.round_mixed_done.replace("{}", &count)
     }
 }
 

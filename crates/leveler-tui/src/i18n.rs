@@ -937,15 +937,22 @@ pub struct UiText {
     /// "全部成功". The counterpart of `batch_failed`, so the parent row states
     /// an outcome instead of leaving success to be inferred from the children.
     pub batch_all_ok: &'static str,
-    /// A finished execution round's head: how many of its calls completed,
-    /// e.g. "完成 3 项" / "3 done". `{}` is the count. The round's head names
-    /// the tool (or the mixed set) and counts what finished there, so the
-    /// round reads as one lightweight node instead of a stage sentence.
+    /// A finished SAME-TOOL round's head: how many of its calls completed,
+    /// e.g. "完成 3 项" / "3 done". `{}` is the count. The head names the tool
+    /// and counts what finished there, so the round reads as one lightweight
+    /// node instead of a stage sentence. A mixed round uses
+    /// [`Self::round_mixed_done`] instead.
     pub round_done: &'static str,
     /// A round head while it is still in flight: "正在执行 3 项" / "3 running".
     pub round_running: &'static str,
-    /// The name a round head wears when its calls are not all one tool.
-    pub round_mixed: &'static str,
+    /// A MIXED round's head once it settles: how many operations it ran, with
+    /// no tool name — the round ran several. e.g. "完成 3 项操作" /
+    /// "3 operations completed". `{}` is the count. The failure/permission
+    /// suffixes carry whichever of them did not succeed.
+    pub round_mixed_done: &'static str,
+    /// A mixed round's head while it is still in flight: "正在执行 3 项操作" /
+    /// "3 operations running". States no outcome.
+    pub round_mixed_running: &'static str,
 
     // Tool disclosure semantic labels (C5-TUI): the one-line summary a
     // finished group leaves behind. `{}` is the count where present.
@@ -1857,7 +1864,8 @@ static ZH: UiText = UiText {
     batch_all_ok: "全部成功",
     round_done: "完成 {} 项",
     round_running: "正在执行 {} 项",
-    round_mixed: "多个工具",
+    round_mixed_done: "完成 {} 项操作",
+    round_mixed_running: "正在执行 {} 项操作",
     agents_running_header: "{} 个 agents 正在运行",
     agents_done_header: "{} 个 agents 完成",
     agents_ended_header: "{} 个 agents 结束",
@@ -2616,7 +2624,8 @@ static EN: UiText = UiText {
     batch_all_ok: "all ok",
     round_done: "{} done",
     round_running: "{} running",
-    round_mixed: "Multiple Tools",
+    round_mixed_done: "{} operations completed",
+    round_mixed_running: "{} operations running",
     agents_running_header: "{} agents running",
     agents_done_header: "{} agents completed",
     agents_ended_header: "{} agents finished",

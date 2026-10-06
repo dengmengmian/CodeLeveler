@@ -92,8 +92,9 @@ fn start(s: &mut AppState, id: &str, program: &str, args: &str, model_step: u32)
     );
 }
 
-/// A read call in `model_step`, so a mixed round is exercised.
-fn read_in_round(s: &mut AppState, id: &str, path: &str, model_step: u32) {
+/// A read call in `model_step`. Stops short of completion so a caller can
+/// drive several calls into one open (running) round.
+fn start_read(s: &mut AppState, id: &str, path: &str, model_step: u32) {
     reduce(
         s,
         Action::Runtime(RuntimeEvent::ToolCallStarted {
@@ -104,6 +105,32 @@ fn read_in_round(s: &mut AppState, id: &str, path: &str, model_step: u32) {
             model_step: Some(model_step),
         }),
     );
+}
+
+/// A completed read call in `model_step`, so a mixed round is exercised.
+fn read_in_round(s: &mut AppState, id: &str, path: &str, model_step: u32) {
+    start_read(s, id, path, model_step);
+    finish(s, id, true);
+}
+
+/// A search call in `model_step`. Stops short of completion so a caller can
+/// drive several calls into one open (running) round.
+fn start_search(s: &mut AppState, id: &str, pattern: &str, model_step: u32) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new(id),
+            name: "grep".into(),
+            arguments: format!(r#"{{"pattern":"{pattern}"}}"#),
+            parallel: false,
+            model_step: Some(model_step),
+        }),
+    );
+}
+
+/// A completed search call in `model_step`.
+fn search_in_round(s: &mut AppState, id: &str, pattern: &str, model_step: u32) {
+    start_search(s, id, pattern, model_step);
     finish(s, id, true);
 }
 
@@ -173,11 +200,76 @@ fn round_head_rows(lines: &[String]) -> Vec<usize> {
         .collect()
 }
 
-/// A mixed round (a command and a read) still reads as one lightweight node:
-/// it names itself and counts what finished, and never claims all-ok over a
-/// call that did not succeed.
+/// A — a homogeneous shell round keeps the tool's own name (`执行命令`), and
+/// never falls back to an abstract count. The same rule covers every
+/// same-tool round: reads name reads, searches name searches.
 #[test]
-fn a_mixed_round_is_still_one_named_node() {
+fn a_homogeneous_shell_round_names_the_tool() {
+    let mut s = opened();
+    next_assistant(&mut s, "a1");
+    start(&mut s, "c1", "cargo", r#""check""#, 1);
+    finish(&mut s, "c1", true);
+    start(&mut s, "c2", "cargo", r#""test""#, 1);
+    finish(&mut s, "c2", true);
+
+    let t = lines(&s);
+    let head = t
+        .iter()
+        .find(|l| l.contains("执行命令"))
+        .unwrap_or_else(|| panic!("the shell round names the tool: {t:?}"));
+    assert!(head.contains("完成 2 项"), "it counts both calls: {head:?}");
+    assert!(
+        !head.contains("多个工具") && !head.contains("项操作"),
+        "a same-tool round is not the mixed fallback: {head:?}"
+    );
+}
+
+/// B — three reads in one round read as `读取文件 · 完成 3 项`.
+#[test]
+fn a_homogeneous_read_round_names_the_tool() {
+    let mut s = opened();
+    next_assistant(&mut s, "a1");
+    read_in_round(&mut s, "r1", "src/a.rs", 1);
+    read_in_round(&mut s, "r2", "src/b.rs", 1);
+    read_in_round(&mut s, "r3", "src/c.rs", 1);
+
+    let t = lines(&s);
+    let head = t
+        .iter()
+        .find(|l| l.contains("读取文件"))
+        .unwrap_or_else(|| panic!("the read round names the tool: {t:?}"));
+    assert!(head.contains("完成 3 项"), "it counts all three: {head:?}");
+    assert!(
+        !head.contains("项操作"),
+        "it is not the mixed fallback: {head:?}"
+    );
+}
+
+/// C — two searches in one round read as `搜索代码 · 完成 2 项`.
+#[test]
+fn a_homogeneous_search_round_names_the_tool() {
+    let mut s = opened();
+    next_assistant(&mut s, "a1");
+    search_in_round(&mut s, "g1", "fn main", 1);
+    search_in_round(&mut s, "g2", "fn run", 1);
+
+    let t = lines(&s);
+    let head = t
+        .iter()
+        .find(|l| l.contains("搜索代码"))
+        .unwrap_or_else(|| panic!("the search round names the tool: {t:?}"));
+    assert!(head.contains("完成 2 项"), "it counts both: {head:?}");
+    assert!(
+        !head.contains("项操作"),
+        "it is not the mixed fallback: {head:?}"
+    );
+}
+
+/// A mixed round (a command and a read) still reads as one lightweight node:
+/// it counts its operations instead of naming an abstract "multiple tools",
+/// and never claims all-ok over a call that did not succeed.
+#[test]
+fn a_mixed_round_still_reads_as_one_node() {
     let mut s = opened();
     next_assistant(&mut s, "a1");
     start(&mut s, "c1", "cargo", r#""check""#, 5);
@@ -188,15 +280,71 @@ fn a_mixed_round_is_still_one_named_node() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("多个工具"))
-        .unwrap_or_else(|| panic!("the mixed round names itself: {t:?}"));
+        .find(|l| l.contains("完成 2 项操作"))
+        .unwrap_or_else(|| panic!("the mixed round counts its operations: {t:?}"));
     assert!(
-        head.contains("完成 2 项"),
-        "the head counts what finished: {head:?}"
+        !head.contains("多个工具"),
+        "the abstract 'multiple tools' label is gone: {head:?}"
     );
     assert!(
         !head.contains("执行了"),
         "the mixed round is not a stage sentence: {head:?}"
+    );
+}
+
+/// E — a mixed round with a failure counts every operation and still states
+/// the failure; nothing is hidden because one of them failed.
+#[test]
+fn a_mixed_round_with_a_failure_counts_every_operation() {
+    let mut s = opened();
+    next_assistant(&mut s, "a1");
+    start(&mut s, "c1", "cargo", r#""check""#, 1);
+    finish(&mut s, "c1", true);
+    start_read(&mut s, "r1", "src/lib.rs", 1);
+    finish(&mut s, "r1", false);
+    search_in_round(&mut s, "g1", "fn main", 1);
+    next_assistant(&mut s, "a2");
+
+    let t = lines(&s);
+    let head = t
+        .iter()
+        .find(|l| l.contains("完成 3 项操作"))
+        .unwrap_or_else(|| panic!("the mixed round counts every operation: {t:?}"));
+    assert!(
+        head.contains("1 个失败"),
+        "the failure still rides the head: {head:?}"
+    );
+    assert!(
+        !head.contains("多个工具"),
+        "the abstract label is gone: {head:?}"
+    );
+    assert!(
+        t.iter().any(|l| l.contains("src/lib.rs")),
+        "the failed call keeps its own row: {t:?}"
+    );
+}
+
+/// F — while a mixed round is in flight its head says what is running and
+/// counts the operations, and states no outcome at all.
+#[test]
+fn a_running_mixed_round_counts_operations_without_an_outcome() {
+    let mut s = opened();
+    next_assistant(&mut s, "a1");
+    start(&mut s, "c1", "cargo", r#""check""#, 1);
+    start_read(&mut s, "r1", "src/lib.rs", 1);
+
+    let t = lines(&s);
+    let head = t
+        .iter()
+        .find(|l| l.contains("正在执行 2 项操作"))
+        .unwrap_or_else(|| panic!("the live mixed round counts operations: {t:?}"));
+    assert!(
+        head.contains('\u{22ee}'),
+        "a live row wears the running mark: {head:?}"
+    );
+    assert!(
+        !head.contains("完成") && !head.contains("全部成功") && !head.contains("个失败"),
+        "a live round states no outcome yet: {head:?}"
     );
 }
 
