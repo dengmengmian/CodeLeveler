@@ -1782,6 +1782,22 @@ mod bridge_tests {
         )));
     }
 
+    /// Live clients never see the closeout injection as a user message. The
+    /// harness still emits it; the bridge only remembers it for the fold.
+    #[test]
+    fn a_closeout_injection_is_not_a_live_user_message() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        bridge.forward(closeout_nudge());
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, RuntimeEvent::UserMessageAdded { .. })),
+            "live closeout must not paint a user row: {events:?}"
+        );
+    }
+
     /// Display-layer fold: a later assistant message that near-duplicates an
     /// earlier one this turn (the repeated "task complete" summary after a
     /// closeout nudge) is retracted and replaced by ONE folded notice. The

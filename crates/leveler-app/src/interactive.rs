@@ -6095,6 +6095,11 @@ fn image_count(attachments: &[AttachmentRef]) -> usize {
 
 fn ui_message_at(payload: &str, ordinal: Option<u64>) -> Option<UiMessage> {
     let message: leveler_model::Message = serde_json::from_str(payload).ok()?;
+    // Same rule as history replay: a protocol repair is model context, not a
+    // snapshot row. Filtering the sentence would also hide user-authored English.
+    if message.is_protocol_repair() {
+        return None;
+    }
     let role = match message.role {
         Role::User => UiRole::User,
         Role::Assistant => UiRole::Assistant,
@@ -6214,6 +6219,50 @@ mod runtime_notice_tests {
         assert_eq!(
             typed.kind, None,
             "a notice header is a whole first line, not a prefix a user can type into"
+        );
+    }
+
+    /// The goal closeout row uses the user transport role so the model sees it.
+    /// The snapshot is what a person sees, so that row is absent. English the
+    /// person actually wrote stays a user message, origin or not.
+    #[test]
+    fn a_protocol_repair_is_absent_from_the_snapshot() {
+        let nudge = serde_json::to_string(&leveler_model::Message::user(
+            "Goal remains active. Continue working toward the original goal, and resolve it \
+             with update_goal(complete|blocked) when the work is finished or cannot proceed.",
+            TranscriptOrigin::ProtocolRepair {
+                repair: leveler_model::ProtocolRepairKind::GoalUnresolved,
+            },
+        ))
+        .unwrap();
+        assert!(
+            ui_message(&nudge).is_none(),
+            "a protocol repair must not become a snapshot user row"
+        );
+
+        let authored = serde_json::to_string(&leveler_model::Message::user_input(
+            "Goal remains active. I wrote this myself.",
+        ))
+        .unwrap();
+        let shown = ui_message(&authored).unwrap();
+        assert_eq!(shown.role, UiRole::User);
+        assert_eq!(shown.kind, None);
+        assert!(shown.text.contains("I wrote this myself."));
+
+        let historical = ui_message(&persisted(Role::User, "please continue")).unwrap();
+        assert_eq!(historical.role, UiRole::User);
+        assert_eq!(historical.text, "please continue");
+
+        let other_repair = serde_json::to_string(&leveler_model::Message::user(
+            "Continue from where the answer was cut off.",
+            TranscriptOrigin::ProtocolRepair {
+                repair: leveler_model::ProtocolRepairKind::LengthContinuation,
+            },
+        ))
+        .unwrap();
+        assert!(
+            ui_message(&other_repair).is_none(),
+            "every protocol repair is harness control, not a user turn"
         );
     }
 }

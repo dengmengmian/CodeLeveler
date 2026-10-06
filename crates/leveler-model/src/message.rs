@@ -83,6 +83,13 @@ impl Message {
         )
     }
 
+    /// A harness protocol repair stored on the user transport role.
+    ///
+    /// The row stays in the model transcript. It is not something a person wrote.
+    pub fn is_protocol_repair(&self) -> bool {
+        matches!(self.origin, Some(TranscriptOrigin::ProtocolRepair { .. }))
+    }
+
     /// Concatenate all `Text` parts (ignoring reasoning/tool parts).
     pub fn text_content(&self) -> String {
         self.content

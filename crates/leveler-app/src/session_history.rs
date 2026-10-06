@@ -238,6 +238,11 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
     if message.role != leveler_model::Role::User {
         return None;
     }
+    // The user transport role is how the model receives a protocol repair.
+    // Origin, not the role and not the sentence, says the person did not write it.
+    if message.is_protocol_repair() {
+        return None;
+    }
     let text = message.text_content();
     let images = message
         .content
@@ -268,7 +273,7 @@ mod tests {
     use leveler_core::{Timestamp, TurnId, now};
     use leveler_engine::{EngineEvent, TurnKind};
     use leveler_lifecycle::{StopReason, TaskOutcome};
-    use leveler_model::{Message, Role};
+    use leveler_model::{Message, ProtocolRepairKind, Role, TranscriptOrigin};
     use leveler_storage::{EventStore, MessageRepository, SessionRecord, SessionRepository};
 
     async fn session() -> (Database, SessionId) {
@@ -595,5 +600,131 @@ mod tests {
         let (entries, omitted) = load_session_history(&db, &sid).await.unwrap();
         assert!(entries.is_empty());
         assert_eq!(omitted, 0);
+    }
+
+    /// The sentence the harness persists for a quiet goal. Kept here so the
+    /// history test does not depend on the private nudge constructor.
+    const GOAL_CLOSEOUT: &str = "Goal remains active. Continue working toward the original goal, \
+         and resolve it with update_goal(complete|blocked) when the work is finished or cannot proceed.";
+
+    fn user_texts(entries: &[UiHistoryEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                RuntimeEvent::UserMessageAdded { message } => Some(message.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn message_row(db: &Database, sid: &SessionId, at: Timestamp, message: &Message) {
+        let payload = serde_json::to_string(message).unwrap();
+        MessageRepository::new(db)
+            .append(sid, &[payload], at)
+            .await
+            .unwrap();
+    }
+
+    /// A goal closeout row stays in the model transcript. Replay must not
+    /// present it as something the user wrote. Real user English, including
+    /// text that happens to mention the same words, still replays.
+    #[tokio::test]
+    async fn a_goal_closeout_injection_is_model_context_not_user_history() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::User,
+            },
+        )
+        .await;
+        user(&db, &sid, t0 + ms(10), "修一下解析器").await;
+        message_row(
+            &db,
+            &sid,
+            t0 + ms(20),
+            &Message::user_input("Goal remains active. I wrote this myself."),
+        )
+        .await;
+        user(&db, &sid, t0 + ms(30), "please continue").await;
+        message_row(
+            &db,
+            &sid,
+            t0 + ms(40),
+            &Message::user(
+                GOAL_CLOSEOUT,
+                TranscriptOrigin::ProtocolRepair {
+                    repair: ProtocolRepairKind::GoalUnresolved,
+                },
+            ),
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::AssistantMessage {
+                text: "解析器已修好。".into(),
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1500),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: Vec::new(),
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(
+            user_texts(&entries),
+            vec![
+                "修一下解析器".to_string(),
+                "Goal remains active. I wrote this myself.".to_string(),
+                "please continue".to_string(),
+            ],
+            "protocol repair must not join the user-visible history: {entries:#?}"
+        );
+
+        let rows = MessageRepository::new(&db).load(&sid).await.unwrap();
+        assert_eq!(rows.len(), 4, "the model still needs the persisted nudge");
+        let nudge: Message = serde_json::from_str(
+            rows.iter()
+                .find(|payload| payload.contains("update_goal(complete|blocked)"))
+                .expect("closeout row"),
+        )
+        .unwrap();
+        assert!(matches!(
+            nudge.origin,
+            Some(TranscriptOrigin::ProtocolRepair {
+                repair: ProtocolRepairKind::GoalUnresolved
+            })
+        ));
+        assert_eq!(nudge.role, Role::User);
+    }
+
+    /// A chat turn is not a goal closeout. User text replays even when it
+    /// contains the words the harness also uses.
+    #[tokio::test]
+    async fn a_chat_turn_replays_user_text_that_mentions_an_active_goal() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        turn(&db, &sid, t0, "Goal remains active in my notes", "好的").await;
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(
+            user_texts(&entries),
+            vec!["Goal remains active in my notes".to_string()]
+        );
     }
 }
