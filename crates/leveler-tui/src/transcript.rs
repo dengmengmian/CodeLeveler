@@ -1594,6 +1594,44 @@ mod tests {
         assert_eq!(shapes[3].len(), 3);
     }
 
+    /// The stage boundary the reader sees: assistant progress text between two
+    /// tool calls closes the running group, so the next call belongs to the new
+    /// stage. Two consecutive shell calls with NO prose between them stay one
+    /// group — the prose is the boundary, not the tool name.
+    #[test]
+    fn assistant_progress_text_starts_a_new_tool_group() {
+        let mut t = TranscriptState::new();
+        settled(
+            &mut t,
+            "s1",
+            "run_command",
+            r#"{"program":"make","args":["a"]}"#,
+        );
+        settled(
+            &mut t,
+            "s2",
+            "run_command",
+            r#"{"program":"make","args":["b"]}"#,
+        );
+        assert_eq!(
+            group_shapes(&t).len(),
+            1,
+            "no prose: one stage, two commands: {:?}",
+            group_shapes(&t)
+        );
+        say(&mut t, "m1", "第一批看完了。");
+        settled(
+            &mut t,
+            "s3",
+            "run_command",
+            r#"{"program":"make","args":["c"]}"#,
+        );
+        let shapes = group_shapes(&t);
+        assert_eq!(shapes.len(), 2, "the prose closed the stage: {shapes:?}");
+        assert_eq!(shapes[0].len(), 2, "the first stage kept both calls");
+        assert_eq!(shapes[1], vec!["run_command".to_string()]);
+    }
+
     /// Reads and searches are one activity ("exploring"), not two.
     #[test]
     fn reads_and_searches_stay_in_one_exploration_group() {

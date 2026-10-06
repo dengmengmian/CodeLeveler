@@ -853,13 +853,15 @@ fn a_mixed_group_reads_the_same_live_and_replayed() {
     };
     let live_lines = shape(&live);
     assert!(
+        live_lines
+            .iter()
+            .any(|l| l.contains("检查代码库") && l.contains("全部成功")),
+        "the stage states its own outcome: {live_lines:#?}"
+    );
+    assert!(
         live_lines.iter().any(|l| l.contains("› 搜索代码"))
             && live_lines.iter().any(|l| l.contains("› 读取文件")),
         "each tool speaks for itself: {live_lines:#?}"
-    );
-    assert!(
-        !live_lines.iter().any(|l| l.contains("检查代码库")),
-        "and nothing summarizes them again: {live_lines:#?}"
     );
     assert_eq!(
         shape(&replayed),

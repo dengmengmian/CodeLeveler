@@ -936,11 +936,11 @@ fn a_reconnect_restores_the_running_clock_and_output() {
     ));
 }
 
-/// A clean mixed stretch no longer wears a summary header, so its FIRST tool
-/// row is what a click lands on. The group still opens — hiding a redundant
-/// row must not cost the only mouse route to a call's output.
+/// A clean mixed stretch wears its stage header, and that parent row is the
+/// click target. The group still opens — the hierarchy must not cost the only
+/// mouse route to a call's output.
 #[test]
-fn clicking_a_headerless_mixed_group_still_opens_it() {
+fn clicking_a_mixed_group_header_opens_every_call_in_it() {
     let mut s = state();
     s.transcript.push_user("看看状态".into());
     for (id, name, args) in [
@@ -971,20 +971,20 @@ fn clicking_a_headerless_mixed_group_still_opens_it() {
     }
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
 
-    // No summary row: the first row of the group is the read itself.
+    // The stage header is the parent row, and it is the click target.
     assert!(
-        !plain(&s).iter().any(|l| l.contains("检查代码库")),
+        plain(&s).iter().any(|l| l.contains("检查代码库")),
         "{:?}",
         plain(&s)
     );
     let (line, _) = row_with(&s, "README.md").expect("the read row");
     assert!(
-        !plain(&s)[..line].iter().any(|l| l.contains('\u{25b8}')),
-        "nothing folded sits above it: {:?}",
+        plain(&s)[..line].iter().any(|l| l.contains('\u{25b8}')),
+        "the parent folds above it: {:?}",
         plain(&s)
     );
 
-    let (col, row) = cell_of(&s, "README.md");
+    let (col, row) = cell_of(&s, "检查代码库");
     click(&mut s, col, row);
     assert!(
         plain(&s).iter().any(|l| l.contains("t1 output line"))
@@ -993,7 +993,7 @@ fn clicking_a_headerless_mixed_group_still_opens_it() {
         plain(&s)
     );
     // The open group is taller, so the row moved: ask again where it is.
-    let (col, row) = cell_of(&s, "README.md");
+    let (col, row) = cell_of(&s, "检查代码库");
     click(&mut s, col, row);
     assert!(
         !plain(&s).iter().any(|l| l.contains("t1 output line")),

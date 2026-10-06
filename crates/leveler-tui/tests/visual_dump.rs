@@ -517,3 +517,107 @@ fn visual_background_timeline() {
         "the terminal task detail is retained for reopening"
     );
 }
+
+/// Hierarchical execution timeline: an assistant stage, the commands it ran,
+/// then the next stage. Eyeball harness like the others:
+///   cargo test -p leveler-tui --test visual_dump -- --ignored --nocapture
+#[test]
+#[ignore = "manual visual harness; run with --ignored --nocapture"]
+fn visual_stage_timeline() {
+    fn stage(s: &mut AppState, id: &str, text: &str) {
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+                message_id: MessageId::new(id.to_string()),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantTextDelta {
+                message_id: MessageId::new(id.to_string()),
+                delta: text.into(),
+            }),
+        );
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::AssistantMessageCompleted {
+                message_id: MessageId::new(id.to_string()),
+            }),
+        );
+    }
+    fn cmd(s: &mut AppState, id: &str, args: &str, ok: bool, lines: usize, ms: u64) {
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: "run_command".into(),
+                arguments: args.into(),
+                parallel: false,
+            }),
+        );
+        let preview = (0..lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                id: ToolCallId::new(id),
+                ok,
+                preview,
+                duration_ms: ms,
+                applied_diff: None,
+                exit_code: if ok { Some(0) } else { Some(1) },
+                stop: None,
+            }),
+        );
+    }
+
+    let mut s = opened();
+    s.transcript.push_user("检查一下服务状态".into());
+    stage(
+        &mut s,
+        "p1",
+        "HEAD 又动了，当前运行中的 api 可能还是旧进程。",
+    );
+    cmd(
+        &mut s,
+        "c1",
+        r#"{"program":"make","args":["status"]}"#,
+        true,
+        9,
+        200,
+    );
+    cmd(
+        &mut s,
+        "c2",
+        r#"{"program":"make","args":["bogus"]}"#,
+        false,
+        3,
+        2_700,
+    );
+    stage(&mut s, "p2", "提交历史已经回答了这个问题。");
+    cmd(
+        &mut s,
+        "c3",
+        r#"{"program":"make","args":["ps"]}"#,
+        true,
+        22,
+        200,
+    );
+    cmd(
+        &mut s,
+        "c4",
+        r#"{"program":"make","args":["logs","api"]}"#,
+        true,
+        8,
+        200,
+    );
+    // The stage only becomes CLOSED history when the run moves on. A settled
+    // but still-open group is not history, and must not claim a completed
+    // summary while the model may issue another call.
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
+
+    println!("\n╔══════ stage timeline 88x30 ══════╗");
+    print!("{}", screen_dump(&mut s, 88, 30));
+}

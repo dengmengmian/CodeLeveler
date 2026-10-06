@@ -933,6 +933,10 @@ pub struct UiText {
     pub batch_failed: &'static str,
     /// Appended when some of them ran without the network they needed.
     pub batch_needs_network: &'static str,
+    /// Appended to a finished batch's label when EVERY call in it succeeded:
+    /// "全部成功". The counterpart of `batch_failed`, so the parent row states
+    /// an outcome instead of leaving success to be inferred from the children.
+    pub batch_all_ok: &'static str,
 
     // Tool disclosure semantic labels (C5-TUI): the one-line summary a
     // finished group leaves behind. `{}` is the count where present.
@@ -1821,6 +1825,7 @@ static ZH: UiText = UiText {
     batch_done: "{} 个工具",
     batch_failed: "{} 个失败",
     batch_needs_network: "{} 个需要网络权限",
+    batch_all_ok: "全部成功",
     agents_running_header: "{} 个 agents 正在运行",
     agents_done_header: "{} 个 agents 完成",
     agents_ended_header: "{} 个 agents 结束",
@@ -2568,6 +2573,7 @@ static EN: UiText = UiText {
     batch_done: "{} tools",
     batch_failed: "{} failed",
     batch_needs_network: "{} need network permission",
+    batch_all_ok: "all ok",
     agents_running_header: "{} agents running",
     agents_done_header: "{} agents completed",
     agents_ended_header: "{} agents finished",

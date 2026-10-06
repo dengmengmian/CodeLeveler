@@ -117,28 +117,33 @@ pub(crate) fn render_group_rows(
         .filter(|c| is_conversation_visible(c))
         .collect();
     let units = plan_units(&group.calls);
-    // A group header earns its row only by ADDING something. Over a lone call
-    // "读取 1 个文件" is the row beneath it said twice; over a run, each run
-    // already names its tool and counts its own failures; over a mixed
-    // stretch, "检查代码库" is what the rows below say, in their own words,
-    // with their own targets. What no single row can say — how many of them
-    // failed, how many lack a permission — keeps the header alive.
+    // A group header earns its row by ADDING what no child can. A lone call
+    // never gets one. A `Run`/`Batch` unit paints its own head, so a second
+    // disclosure above it would be two parents for one stretch. Every other
+    // finished multi-call group is a STAGE, and its parent row states the
+    // aggregate — how many, whether any failed, and the whole stretch's
+    // duration — including when everything succeeded: the rows below are then
+    // children of a stated outcome instead of orphans.
     //
-    // The group's FIRST row is the click target either way (see
-    // `conversation::build`), so dropping the header costs no interaction.
-    let runs = units.iter().any(|u| match u {
-        StreamUnit::Run(_) => true,
-        StreamUnit::Batch(calls) => is_uniform(calls),
-        _ => false,
-    });
-    if group_has_disclosure(group) && visible.len() > 1 && !runs {
-        let header = disclosure_presentation(&visible, group.expanded, t);
-        if header_adds_information(&header) {
-            out.push(crate::presentation::disclosure::header_line(
-                &header, theme, width,
-            ));
-        }
+    // A group's FIRST row is the click target either way (see
+    // `conversation::build`), so this adds a parent without moving the target.
+    let unit_owns_head = units
+        .iter()
+        .any(|u| matches!(u, StreamUnit::Run(_) | StreamUnit::Batch(_)));
+    let header = (group_has_disclosure(group) && visible.len() > 1 && !unit_owns_head)
+        .then(|| disclosure_presentation(&visible, group.expanded, t));
+    if let Some(header) = &header {
+        out.push(crate::presentation::disclosure::header_line(
+            header, theme, width,
+        ));
     }
+    // The children are clipped to the room they will occupy BEFORE the indent
+    // is added below, so nesting can never push a row past the right gutter.
+    let width = if header.is_some() {
+        width.saturating_sub(GROUP_BODY_INDENT.len())
+    } else {
+        width
+    };
     for unit in units {
         match unit {
             StreamUnit::Single(call) if is_shell_call(call) => {
@@ -295,6 +300,20 @@ pub(crate) fn render_group_rows(
             }
         }
     }
+    // Ownership is stated by position: when the stage row exists, every row
+    // under it steps in one level. Width was already reserved above, so this
+    // only paints.
+    if header.is_some() {
+        for line in out.iter_mut().skip(1) {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    GROUP_BODY_INDENT.to_string(),
+                    Style::default().fg(theme.ink(Ink::Subtle)),
+                ),
+            );
+        }
+    }
     out
 }
 
@@ -442,12 +461,12 @@ fn disclosure_presentation(
         .count()
         - needs_network;
     // Only a single call has an authoritative duration (the runtime supplied
-    // it). Summing children fakes wall time for parallel batches — four 5s
-    // reads did not take 20s — so a multi-tool disclosure shows none.
+    // it). A multi-call stretch derives one — see `group_duration_ms`.
     let duration_ms = match visible {
         [only] => only.duration_ms,
-        _ => None,
+        _ => group_duration_ms(visible),
     };
+    let clean = failed == 0 && needs_network == 0;
     crate::presentation::disclosure::DisclosurePresentation {
         label: disclosure_label(visible, failed, t),
         failed,
@@ -457,24 +476,12 @@ fn disclosure_presentation(
             t.batch_needs_network
                 .replace("{}", &needs_network.to_string())
         }),
+        ok_suffix: (clean && visible.len() > 1).then(|| t.batch_all_ok.to_string()),
         expanded,
         drill_down: false,
         duration_ms,
         first_error: (!expanded).then(|| first_error_line(visible)).flatten(),
     }
-}
-
-/// Whether a group header says anything its own rows cannot.
-///
-/// The label never does: every row names its tool, its target and its result
-/// in the same user language the label is written in. An aggregate does —
-/// "2 failed" over eight rows is a fact about the stretch, not about any row
-/// in it, and the same goes for calls that lack a permission rather than
-/// having failed on their own. (`duration_ms` is authoritative only for a lone
-/// call, which never reaches this header, and `first_error` belongs to the
-/// collapsed form this surface does not render.)
-fn header_adds_information(p: &crate::presentation::disclosure::DisclosurePresentation) -> bool {
-    p.failed > 0 || p.needs_permission_suffix.is_some()
 }
 
 /// The semantic summary for a finished group: what KIND of work it was, in
@@ -512,6 +519,41 @@ fn disclosure_label(visible: &[&ToolCallBlock], failed: usize, t: &UiText) -> St
         (true, Work, 1) => t.disclosure_tools_one.to_string(),
         _ => t.disclosure_tools_many.replace("{}", &n.to_string()),
     }
+}
+
+/// The wall-clock duration of a finished multi-call group, DERIVED from the
+/// runtime's per-call durations instead of summed blind.
+///
+/// A call the reducer OBSERVED overlapping another (a shared `batch`) ran
+/// concurrently, so its burst costs its LONGEST member, not the sum: four 5s
+/// reads did not take 20s. Calls with no batch demonstrably ran one after the
+/// other, so they add up. `None` unless every visible call reported a
+/// duration — a partial sum would read as a complete one.
+fn group_duration_ms(visible: &[&ToolCallBlock]) -> Option<u64> {
+    if visible.is_empty() || visible.iter().any(|c| c.duration_ms.is_none()) {
+        return None;
+    }
+    let mut total = 0u64;
+    // First-seen burst order, each folded to its longest member.
+    let mut bursts: Vec<u32> = Vec::new();
+    let mut burst_max: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for call in visible {
+        let ms = call.duration_ms.unwrap_or(0);
+        match call.batch {
+            Some(id) => {
+                if !bursts.contains(&id) {
+                    bursts.push(id);
+                }
+                let slot = burst_max.entry(id).or_insert(0);
+                *slot = (*slot).max(ms);
+            }
+            None => total = total.saturating_add(ms),
+        }
+    }
+    for id in bursts {
+        total = total.saturating_add(burst_max.get(&id).copied().unwrap_or(0));
+    }
+    Some(total)
 }
 
 /// The first meaningful error line of a failed call, for the collapsed row.
@@ -2157,6 +2199,13 @@ fn append_call_detail(
 /// never push a row past the right gutter.
 pub(crate) const ACTIVITY_INDENT: &str = "  ";
 
+/// The THIRD level: a finished group's rows sit one step in from the group's
+/// own disclosure row, so a stage reads as `assistant text → group summary →
+/// the calls it made`. It is applied only when that disclosure row exists, so
+/// a lone tool call keeps its current position. Two columns, matching
+/// [`ACTIVITY_INDENT`]: the hierarchy is stated by position, never by a box.
+const GROUP_BODY_INDENT: &str = "  ";
+
 /// A tool group placed at the conversation's activity level.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_activity(
@@ -2983,35 +3032,36 @@ mod tests {
         assert!(lines[2].contains("\u{2514}\u{2500} "), "{lines:?}");
     }
 
-    // ── A group header earns its row only by ADDING something ──────────────
+    // ── A group header is the STAGE's parent row ─────────────────────────
     //
-    // Over a mixed stretch the header used to say "检查代码库" above rows that
-    // already read "读取文件 README.md" and "搜索代码 TaskStatus". That is the
-    // rows summarized, not information. What it can still say — how many of
-    // them failed, how many lack a permission — no single row can.
+    // A finished multi-call group reads as `assistant text → group summary →
+    // the calls it made`. The parent states the aggregate a child cannot: how
+    // many ran, whether any failed, and the whole stretch's duration. The
+    // children step in one level so the ownership is visible, not only
+    // structural. A `Run`/`Batch` child paints its own head and is left alone.
 
-    /// A: an ordinary mixed group is its rows, in order, and nothing else.
+    /// A: an ordinary mixed group keeps its parent, its outcome and its rows.
     #[test]
-    fn a_clean_mixed_group_drops_its_summary_header() {
+    fn a_clean_mixed_group_keeps_a_parent_header_above_its_rows() {
         let g = group(vec![
             call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok),
             call("grep", r#"{"pattern":"TaskStatus"}"#, ToolStatus::Ok),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 2, "one row per call, no header: {lines:?}");
+        assert_eq!(lines.len(), 3, "one parent, one row per call: {lines:?}");
         assert!(
-            lines[0].starts_with("\u{203a} 读取文件") && lines[0].contains("README.md"),
-            "{lines:?}"
+            lines[0].starts_with('\u{25b8}')
+                && lines[0].contains("检查代码库")
+                && lines[0].contains("全部成功"),
+            "the parent states the outcome: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("\u{203a} 搜索代码") && lines[1].contains("TaskStatus"),
-            "{lines:?}"
+            lines[1].starts_with("  \u{203a} 读取文件") && lines[1].contains("README.md"),
+            "the read is a nested child: {lines:?}"
         );
         assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains("检查代码库") || l.contains('\u{25b8}')),
-            "the summary said what the rows say: {lines:?}"
+            lines[2].starts_with("  \u{203a} 搜索代码") && lines[2].contains("TaskStatus"),
+            "the search is a nested child: {lines:?}"
         );
     }
 
@@ -3025,10 +3075,10 @@ mod tests {
             call("diagnostics", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "parent plus three rows: {lines:?}");
         assert!(
-            lines.iter().all(|l| l.starts_with(TOOL_ANCHOR)),
-            "{lines:?}"
+            lines[1..].iter().all(|l| l.starts_with("  \u{203a} ")),
+            "every child is nested, one row each: {lines:?}"
         );
         assert!(
             !lines
@@ -3065,11 +3115,107 @@ mod tests {
         assert_eq!(
             lines
                 .iter()
-                .filter(|l| l.starts_with("\u{203a} \u{2717}"))
+                .filter(|l| l.trim_start().starts_with("\u{203a} \u{2717}"))
                 .count(),
             2,
             "and every failed row keeps its own mark: {lines:?}"
         );
+    }
+
+    /// The stage's duration is a fact no child row can state: serial calls add
+    /// up, so `0.2s + 2.7s` is the `2.9s` the parent shows.
+    #[test]
+    fn a_group_header_sums_the_wall_clock_of_serial_calls() {
+        let mut first = call(
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Ok,
+        );
+        first.duration_ms = Some(200);
+        let mut second = call(
+            "run_command",
+            r#"{"program":"cargo","args":["build"]}"#,
+            ToolStatus::Ok,
+        );
+        second.duration_ms = Some(2_700);
+        let lines = render_group_text(&group(vec![first, second]), 120, Locale::Zh);
+        assert!(lines[0].starts_with('\u{25b8}'), "{lines:?}");
+        assert!(lines[0].contains("执行了 2 个命令"), "{lines:?}");
+        assert!(lines[0].contains("全部成功"), "{lines:?}");
+        assert!(
+            lines[0].contains("2.9s"),
+            "the stage's whole wall clock: {lines:?}"
+        );
+    }
+
+    /// A failure keeps its count on the parent and its reason under its own
+    /// nested row — the fold never hides why the stage failed.
+    #[test]
+    fn a_failed_stage_nests_its_error_under_the_failed_row() {
+        let mut bad = call(
+            "run_command",
+            r#"{"program":"cargo","args":["bogus"]}"#,
+            ToolStatus::Failed,
+        );
+        bad.preview = Some("error: no such command: `bogus`\nhelp dump".into());
+        let good = call(
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Ok,
+        );
+        let lines = render_group_text(&group(vec![good, bad]), 120, Locale::Zh);
+        assert!(
+            lines[0].contains('\u{2717}') && lines[0].contains("1 个失败"),
+            "the parent counts the failure: {lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("  \u{203a} \u{2713} $ cargo test"),
+            "the success is a nested child: {lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("  \u{203a} \u{2717} $ cargo bogus"),
+            "the failure is a nested child: {lines:?}"
+        );
+        assert!(
+            lines[3].starts_with("    \u{2514} ") && lines[3].contains("no such command"),
+            "the reason hangs one level under the failed row: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("help dump")),
+            "OUTPUT stays folded; only the reason shows by default: {lines:?}"
+        );
+    }
+
+    /// A burst the reducer observed overlapping costs its LONGEST member, not
+    /// the sum: four 5s reads did not take 20s.
+    #[test]
+    fn group_duration_folds_a_parallel_burst_to_its_longest_member() {
+        let mut a = batched("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(7));
+        a.duration_ms = Some(5_000);
+        let mut b = batched("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Ok, Some(7));
+        b.duration_ms = Some(5_000);
+        let mut c = call(
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Ok,
+        );
+        c.duration_ms = Some(1_500);
+        let refs: Vec<&ToolCallBlock> = vec![&a, &b, &c];
+        assert_eq!(
+            group_duration_ms(&refs),
+            Some(6_500),
+            "one 5s burst (not 10s) plus the 1.5s serial call"
+        );
+    }
+
+    /// A partial total is not a total: one unreported call makes the stage's
+    /// duration unknown rather than understated.
+    #[test]
+    fn group_duration_is_unknown_until_every_call_reports_one() {
+        let a = call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok);
+        let mut b = call("grep", r#"{"pattern":"x"}"#, ToolStatus::Running);
+        b.duration_ms = None;
+        assert_eq!(group_duration_ms(&[&a, &b]), None);
     }
 
     /// The boundary this round draws: a group that already renders a RUN says
@@ -4653,8 +4799,8 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert!(
-            !lines.iter().any(|l| l.contains("检查代码库")),
-            "four rows already say what the summary would: {lines:?}"
+            lines[0].contains("检查代码库") && lines[0].contains("全部成功"),
+            "reads and searches together are one stage: {lines:?}"
         );
         // …and when one of them fails, the stretch is named and counted.
         let mut with_failure = g.clone();

@@ -27,6 +27,11 @@ pub struct DisclosurePresentation {
     /// Executions that did not fail on their own but lack a permission
     /// ("2 need network permission"), already localized. Marked ⚠, not ✗.
     pub needs_permission_suffix: Option<String>,
+    /// Extra suffix a FINISHED batch wears when every execution in it
+    /// succeeded ("全部成功"), already localized. Muted, unlike the
+    /// warning-coloured failure/permission suffixes: it confirms, it does not
+    /// warn. `None` over a lone execution, where a success is the row itself.
+    pub ok_suffix: Option<String>,
     /// Open (`▾`) or folded (`▸`).
     pub expanded: bool,
     /// This row opens an independent detail surface instead of expanding
@@ -99,15 +104,35 @@ pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> L
             Style::default().fg(theme.status.warning),
         ));
     }
+    if let Some(suffix) = &p.ok_suffix {
+        spans.push(Span::styled(
+            format!(" · {suffix}"),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    // Any MEASURED duration is worth stating: the aggregate is a fact about
+    // the whole stage. Sub-100ms is not measured, only clocked — it would
+    // print `0.0s` — so it stays off. A single call never reaches this
+    // header, so this cannot add clock noise to one row.
     if let Some(ms) = p.duration_ms
-        && ms >= 1000
+        && ms >= 100
     {
         spans.push(Span::styled(
-            format!(" · {:.1}s", ms as f64 / 1000.0),
+            format!(" · {}", format_duration(ms)),
             Style::default().fg(theme.text.muted),
         ));
     }
     Line::from(spans)
+}
+
+/// A duration as the rest of the activity stream writes it: `1.2s` under a
+/// minute, `2m03s` past it. Seconds only — the row never claims milliseconds.
+fn format_duration(ms: u64) -> String {
+    if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
 }
 
 /// The folded form: the header row plus, for failures, the first meaningful

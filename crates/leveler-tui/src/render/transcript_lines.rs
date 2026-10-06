@@ -1108,6 +1108,8 @@ pub(crate) fn user_shell_lines(
             .filter(|code| failed && *code != 0)
             .map(|code| format!("exit {code}")),
         needs_permission_suffix: None,
+        // A user shell is never a batch: it has no siblings to summarize.
+        ok_suffix: None,
         expanded: shell.expanded,
         // A user shell row opens Shell Details (its own screen) rather than
         // expanding inline, so it carries the drill-down marker, not the
