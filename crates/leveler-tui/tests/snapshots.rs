@@ -16,23 +16,8 @@ use leveler_tui::render::render;
 use leveler_tui::state::{AppState, Boot};
 use leveler_tui::theme::Theme;
 
-fn opened_state() -> AppState {
-    let mut s = AppState::new(
-        Theme::no_color(),
-        Boot {
-            session_id: SessionId::new("s1"),
-            user: "麻凡".to_string(),
-            version: "0.1.0".to_string(),
-            show_welcome: false,
-            draft_path: None,
-            history_path: None,
-            context_window: 200_000,
-            locale: leveler_tui::Locale::Zh,
-            untrusted_config: Vec::new(),
-            thinking: None,
-        },
-    );
-    let snap = UiSessionSnapshot {
+fn session_snapshot(collaboration: Option<String>) -> UiSessionSnapshot {
+    UiSessionSnapshot {
         id: SessionId::new("s1"),
         repository: Some("~/Develop/codeleveler".to_string()),
         task_status: None,
@@ -58,12 +43,32 @@ fn opened_state() -> AppState {
         completion_report: None,
         thinking: None,
         work_profile: None,
-        collaboration: None,
+        collaboration,
         children: Vec::new(),
-    };
+    }
+}
+
+fn opened_state() -> AppState {
+    let mut s = AppState::new(
+        Theme::no_color(),
+        Boot {
+            session_id: SessionId::new("s1"),
+            user: "麻凡".to_string(),
+            version: "0.1.0".to_string(),
+            show_welcome: false,
+            draft_path: None,
+            history_path: None,
+            context_window: 200_000,
+            locale: leveler_tui::Locale::Zh,
+            untrusted_config: Vec::new(),
+            thinking: None,
+        },
+    );
     reduce(
         &mut s,
-        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: session_snapshot(None),
+        }),
     );
     s
 }
@@ -109,6 +114,36 @@ fn sticky_chrome(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+/// The trust chip on the composer border names the session's collaboration
+/// axis as the runtime recorded it. The chip is a view of
+/// `sessions.collaboration`: a session the runtime says is chat renders as
+/// chat, and one it says is goal renders as goal.
+#[test]
+fn footer_chip_names_the_axis_the_runtime_recorded() {
+    for axis in ["chat", "goal"] {
+        let mut state = opened_state();
+        reduce(
+            &mut state,
+            Action::Runtime(RuntimeEvent::SessionUpdated {
+                session: session_snapshot(Some(axis.to_string())),
+            }),
+        );
+        assert_eq!(state.collaboration, axis);
+        let text = render_at(80, 24, &mut state);
+        // The trust chip is the row that carries both the permission and the
+        // axis (`{model} · {perm} · {axis}`); locating it by its own separator
+        // keeps the assertion independent of the footer's row count.
+        let chip = text
+            .lines()
+            .find(|line| line.contains(" · auto · "))
+            .unwrap_or_else(|| panic!("the trust chip must be on screen: {text:?}"));
+        assert!(
+            chip.contains(axis),
+            "the composer trust chip must name {axis:?}: {chip:?}"
+        );
+    }
 }
 
 #[test]

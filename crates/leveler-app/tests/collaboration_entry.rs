@@ -214,6 +214,38 @@ async fn create_session_goal_and_chat_reach_the_row() {
     );
 }
 
+/// The interactive bootstrap's own request — the values `leveler` / `leveler
+/// tui` send for a new session — lands on the row AND in the snapshot as Chat.
+/// The row is the source of truth; the snapshot is what the client renders.
+#[tokio::test]
+async fn interactive_bootstrap_axis_reaches_row_and_snapshot_as_chat() {
+    use leveler_local_transport::{CollaborationMode, LocalRuntimeService};
+
+    let (_tmp, _server, app, client) = harness(vec![]).await;
+    let bootstrap = client
+        .create_session(leveler_local_transport::CreateSessionRequest {
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            goal: "interactive session".to_string(),
+            model: None,
+            mode: WirePermission::Assisted,
+            approval_policy: ApprovalPolicy::Interactive,
+            collaboration: CollaborationMode::Chat,
+        })
+        .await
+        .unwrap();
+    let session = bootstrap.session.id.clone();
+    assert_eq!(collaboration_of(&app, &session).await, "chat");
+    assert_eq!(
+        bootstrap.session.collaboration.as_deref(),
+        Some("chat"),
+        "the client renders the axis the runtime just wrote"
+    );
+    assert_eq!(
+        app.session_product_axes(&session).await.unwrap(),
+        leveler_agent::CollaborationMode::Chat
+    );
+}
+
 /// A + D — an omitted wire field is the product default (goal) and survives a
 /// reopen: the row, not a process default, is the source of truth.
 #[tokio::test]

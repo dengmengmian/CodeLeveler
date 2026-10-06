@@ -5194,6 +5194,46 @@ fn plain_message_with_default_chat_collab_stays_chat() {
     );
 }
 
+/// The axis the runtime records decides the chrome even when the client did
+/// not open the session. A chat axis adopted from a snapshot keeps a plain
+/// Enter out of the goal chrome, exactly as the local default does — so the
+/// runtime, not a client-side initial value, is what the user sees.
+#[test]
+fn a_chat_axis_adopted_from_the_runtime_keeps_submits_out_of_goal_chrome() {
+    let mut s = state();
+    let mut goal = snapshot();
+    goal.collaboration = Some("goal".into());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: goal }),
+    );
+    assert_eq!(s.collaboration, "goal");
+
+    let mut chat = snapshot();
+    chat.collaboration = Some("chat".into());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session: chat }),
+    );
+    assert_eq!(s.collaboration, "chat");
+    typed(&mut s, "你好");
+    let effects = reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit {
+                command: ClientCommand::SubmitMessage { .. },
+                ..
+            }]
+        ),
+        "{effects:?}"
+    );
+    assert!(
+        !s.goal_mode_active,
+        "an adopted chat axis must not mirror a goal turn"
+    );
+}
+
 #[test]
 fn plain_message_with_goal_collab_marks_goal_mode() {
     let mut s = opened();
