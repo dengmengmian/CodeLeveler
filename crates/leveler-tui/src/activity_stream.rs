@@ -16,10 +16,13 @@
 //!   once, and each call becomes a `├─`/`└─` child carrying only what differs.
 //!   A count of children would be the children said twice; a count of
 //!   FAILURES rides on the head, because nothing else shows it at a glance.
-//! - A finished group that is not a run keeps a clickable `▸/▾` summary as a
-//!   HEADER over its rows. That fold governs each call's OUTPUT — the one
-//!   thing it may hide. A lone call gets no header: its own row already says
-//!   everything. Either way the group's FIRST row is the click target.
+//! - A group that is not a run keeps a clickable `▸/▾` summary as a HEADER
+//!   over its rows. That fold governs each call's OUTPUT — the one thing it
+//!   may hide. The header exists from the group's FIRST second (`⋮ 正在执行 ·
+//!   N 个命令`) and closing only rewrites it (`▸ … · 全部成功`), so a close
+//!   never inserts a row or shifts the children under it. A lone non-shell
+//!   call gets no header: it may still become a run, whose own head then owns
+//!   the stretch. Either way the group's FIRST row is the click target.
 //! - Calls the reducer OBSERVED in flight together ([`ToolCallBlock::batch`])
 //!   keep their own header, which is the ONLY row that claims concurrency:
 //!   a run's tree says "same tool, one after another", never "at once".
@@ -117,21 +120,34 @@ pub(crate) fn render_group_rows(
         .filter(|c| is_conversation_visible(c))
         .collect();
     let units = plan_units(&group.calls);
-    // A group header earns its row by ADDING what no child can. A lone call
-    // never gets one. A `Run`/`Batch` unit paints its own head, so a second
-    // disclosure above it would be two parents for one stretch. Every other
-    // finished multi-call group is a STAGE, and its parent row states the
-    // aggregate — how many, whether any failed, and the whole stretch's
-    // duration — including when everything succeeded: the rows below are then
-    // children of a stated outcome instead of orphans.
+    // A group header earns its row by ADDING what no child can. A `Run`/`Batch`
+    // unit paints its own head, so a second disclosure above it would be two
+    // parents for one stretch. Every other group is a STAGE, and its parent row
+    // states the aggregate — how many, whether any failed, and the whole
+    // stretch's duration — including when everything succeeded: the rows below
+    // are then children of a stated outcome instead of orphans.
+    //
+    // Ownership is STRUCTURAL, not historical: the parent row exists from the
+    // moment the stage does, and `open` only decides its CONTENT (running verb
+    // vs outcome). Gating the row itself on `open` — or on the call count —
+    // made closing the group insert a row and shift every child, the layout
+    // jump this rule exists to remove. A lone non-shell call is still eligible
+    // to become a `Run`, whose head would then own the stretch, so the stage row
+    // waits for it; a lone shell command never merges into a run.
     //
     // A group's FIRST row is the click target either way (see
     // `conversation::build`), so this adds a parent without moving the target.
     let unit_owns_head = units
         .iter()
         .any(|u| matches!(u, StreamUnit::Run(_) | StreamUnit::Batch(_)));
-    let header = (group_has_disclosure(group) && visible.len() > 1 && !unit_owns_head)
-        .then(|| disclosure_presentation(&visible, group.expanded, t));
+    let stage_worthy = group_is_disclosable(group)
+        && !unit_owns_head
+        && (visible.len() > 1 || visible.first().is_some_and(|c| is_shell_call(c)));
+    // Live unless the group is CLOSED and every call has settled. The group's
+    // own `open` flag alone is not enough: a closed group can still hold a call
+    // in flight, and a settled-but-open one is still being written to.
+    let live = group.open || !group_is_finished(group);
+    let header = stage_worthy.then(|| disclosure_presentation(&visible, group.expanded, live, t));
     if let Some(header) = &header {
         out.push(crate::presentation::disclosure::header_line(
             header, theme, width,
@@ -404,7 +420,16 @@ pub(crate) fn group_has_disclosure(group: &ToolGroupBlock) -> bool {
     // as completed history paints active work as done (the real
     // `▸ 并行执行了 7 个工具`-while-running regression). History begins when
     // the group closes, not when its current members happen to be settled.
-    if group.open || !group_is_finished(group) || group_has_edits(group) {
+    !group.open && group_is_finished(group) && group_is_disclosable(group)
+}
+
+/// Whether a disclosure may speak for this group's calls at all: not an edit
+/// stretch (a diff IS the result), and every visible call is ordinary work
+/// rather than bookkeeping/interaction that keeps its own shape. Says nothing
+/// about `open`, the call count or the outcome — those change while a group
+/// runs, and the parent row's EXISTENCE must not depend on them.
+fn group_is_disclosable(group: &ToolGroupBlock) -> bool {
+    if group_has_edits(group) {
         return false;
     }
     let visible: Vec<&ToolCallBlock> = group
@@ -444,11 +469,33 @@ fn is_edit_call(c: &ToolCallBlock) -> bool {
 /// presentation. All tool-specific judgement happens here (semantic label,
 /// which failure names itself, when a duration is authoritative); the
 /// renderer in `presentation::disclosure` sees only the finished model.
+///
+/// `running` is the group's own truth, not the members' momentary statuses: a
+/// stage whose calls have all settled while the model streams the next one is
+/// still running, and must not wear an outcome it has not reached.
 fn disclosure_presentation(
     visible: &[&ToolCallBlock],
     expanded: bool,
+    running: bool,
     t: &UiText,
 ) -> crate::presentation::disclosure::DisclosurePresentation {
+    if running {
+        // Live: what the stage is doing and how much of it exists so far.
+        // No failure count, no success claim, no final duration — each would
+        // be a verdict the burst has not earned yet.
+        return crate::presentation::disclosure::DisclosurePresentation {
+            label: disclosure_running_label(visible, t),
+            failed: 0,
+            failed_suffix: None,
+            needs_permission_suffix: None,
+            ok_suffix: None,
+            expanded,
+            running: true,
+            drill_down: false,
+            duration_ms: None,
+            first_error: None,
+        };
+    }
     // A command that ran without the network it needed lacks a permission;
     // it is counted apart from the failures.
     let needs_network = visible
@@ -478,9 +525,35 @@ fn disclosure_presentation(
         }),
         ok_suffix: (clean && visible.len() > 1).then(|| t.batch_all_ok.to_string()),
         expanded,
+        running: false,
         drill_down: false,
         duration_ms,
         first_error: (!expanded).then(|| first_error_line(visible)).flatten(),
+    }
+}
+
+/// The live form of [`disclosure_label`]: the same KIND-of-work judgement, in
+/// the present tense, carrying only the count observed so far. It mirrors the
+/// finished label's shape so closing a group rewrites the row in place instead
+/// of replacing it with a differently shaped one.
+fn disclosure_running_label(visible: &[&ToolCallBlock], t: &UiText) -> String {
+    use DisclosureClass::*;
+    let n = visible.len();
+    let class = disclosure_class(&visible[0].name);
+    let uniform = visible.iter().all(|c| disclosure_class(&c.name) == class);
+    if !uniform && visible.iter().all(|c| is_exploratory(c)) {
+        return t.disclosure_running_explore.to_string();
+    }
+    match (uniform, class, n) {
+        (true, Shell, 1) => t.disclosure_running_shell_one.to_string(),
+        (true, Shell, _) => t
+            .disclosure_running_shell_many
+            .replace("{}", &n.to_string()),
+        (true, Read, 1) => t.disclosure_running_read_one.to_string(),
+        (true, Read, _) => t.disclosure_running_read_many.replace("{}", &n.to_string()),
+        (true, Search, _) => t.disclosure_running_search.to_string(),
+        (true, Work, 1) => t.disclosure_running_work_one.to_string(),
+        _ => t.disclosure_running_work_many.replace("{}", &n.to_string()),
     }
 }
 
@@ -2199,11 +2272,13 @@ fn append_call_detail(
 /// never push a row past the right gutter.
 pub(crate) const ACTIVITY_INDENT: &str = "  ";
 
-/// The THIRD level: a finished group's rows sit one step in from the group's
-/// own disclosure row, so a stage reads as `assistant text → group summary →
-/// the calls it made`. It is applied only when that disclosure row exists, so
-/// a lone tool call keeps its current position. Two columns, matching
-/// [`ACTIVITY_INDENT`]: the hierarchy is stated by position, never by a box.
+/// The THIRD level: a group's rows sit one step in from the group's own parent
+/// row, so a stage reads as `assistant text → group summary → the calls it
+/// made`. Applied whenever that parent row is drawn — running (`⋮ 正在执行`)
+/// or closed (`▸ …`) — so the children are in the same column for the group's
+/// whole life; only a lone non-shell call, which owns no parent row, keeps its
+/// current position. Two columns, matching [`ACTIVITY_INDENT`]: the hierarchy
+/// is stated by position, never by a box.
 const GROUP_BODY_INDENT: &str = "  ";
 
 /// A tool group placed at the conversation's activity level.
@@ -3186,6 +3261,292 @@ mod tests {
         );
     }
 
+    // ── Layout stability across a group's life ──────────────────────────────
+    //
+    // A group's parent row is STRUCTURAL: it exists from the first visible call
+    // and closing the group only REWRITES its text. These tests compare the
+    // snapshots of one group at each life stage by GEOMETRY — parent index,
+    // child column, row count — so a close that inserts a row or re-indents a
+    // child fails here even when the strings look reasonable.
+
+    /// The 0-based index of the group's first child row.
+    fn first_child_row(lines: &[String]) -> usize {
+        lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(TOOL_ANCHOR))
+            .expect("group has a child row")
+    }
+
+    /// The starting COLUMN of the group's first child row — the group-body
+    /// indent made concrete.
+    fn first_child_column(lines: &[String]) -> usize {
+        lines[first_child_row(lines)]
+            .chars()
+            .take_while(|c| *c == ' ')
+            .count()
+    }
+
+    fn shell(args: &str, status: ToolStatus, ms: u64) -> ToolCallBlock {
+        let mut c = call("run_command", args, status);
+        c.duration_ms = Some(ms);
+        c
+    }
+
+    /// Section 13: the SAME group at t0 (one call), t1 (two calls) and t2
+    /// (closed). The parent is row 0 and the first child sits at the same
+    /// column in all three; growth only appends, close only rewrites.
+    #[test]
+    fn a_tool_group_lifecycle_never_moves_its_first_child() {
+        let check = || {
+            shell(
+                r#"{"program":"cargo","args":["check"]}"#,
+                ToolStatus::Running,
+                200,
+            )
+        };
+        let test = || {
+            shell(
+                r#"{"program":"cargo","args":["test"]}"#,
+                ToolStatus::Running,
+                200,
+            )
+        };
+        let settled = |c: ToolCallBlock| {
+            let mut c = c;
+            c.status = ToolStatus::Ok;
+            c
+        };
+
+        let t0 = render_group_text(&open_group(vec![check()]), 100, Locale::Zh);
+        let t1 = render_group_text(&open_group(vec![check(), test()]), 100, Locale::Zh);
+        let t2 = render_group_text(
+            &group(vec![settled(check()), settled(test())]),
+            100,
+            Locale::Zh,
+        );
+
+        for (name, lines) in [("t0", &t0), ("t1", &t1), ("t2", &t2)] {
+            assert_eq!(first_child_row(lines), 1, "{name}: parent leads: {lines:?}");
+            assert_eq!(
+                first_child_column(lines),
+                GROUP_BODY_INDENT.len(),
+                "{name}: child indent never changes: {lines:?}"
+            );
+        }
+        assert_eq!(t2.len(), t1.len(), "close adds no row: {t1:?} vs {t2:?}");
+        assert_eq!(t1.len(), t0.len() + 1, "growth only appends: {t0:?}");
+    }
+
+    /// Section 12A/D: an open multi-call group HAS a parent row, and that row
+    /// speaks in the running tense — no outcome it has not reached.
+    #[test]
+    fn an_open_group_parent_states_running_never_an_outcome() {
+        let g = open_group(vec![
+            shell(
+                r#"{"program":"cargo","args":["check"]}"#,
+                ToolStatus::Running,
+                100,
+            ),
+            shell(
+                r#"{"program":"cargo","args":["test"]}"#,
+                ToolStatus::Running,
+                100,
+            ),
+        ]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert!(lines[0].starts_with('\u{22ee}'), "running glyph: {lines:?}");
+        assert!(lines[0].contains("正在执行"), "{lines:?}");
+        assert!(lines[0].contains("2 个命令"), "{lines:?}");
+        assert!(!lines[0].contains("全部成功"), "no success yet: {lines:?}");
+        assert!(!lines[0].contains("失败"), "no verdict yet: {lines:?}");
+        assert!(
+            !lines[0].contains("执行了"),
+            "not the past tense: {lines:?}"
+        );
+        assert!(!lines[0].contains("s"), "no final duration: {lines:?}");
+    }
+
+    /// Section 12E: 1 → 2 → 3 calls. The parent's count follows the burst and
+    /// the hierarchy never changes.
+    #[test]
+    fn a_growing_stage_updates_its_count_without_touching_the_hierarchy() {
+        let shell_at = |n: usize| {
+            let mut c = call(
+                "run_command",
+                &format!(r#"{{"program":"cargo","args":["run{n}"]}}"#),
+                ToolStatus::Running,
+            );
+            c.duration_ms = Some(100);
+            c
+        };
+        let s1 = render_group_text(&open_group(vec![shell_at(1)]), 100, Locale::Zh);
+        let s2 = render_group_text(&open_group(vec![shell_at(1), shell_at(2)]), 100, Locale::Zh);
+        let s3 = render_group_text(
+            &open_group(vec![shell_at(1), shell_at(2), shell_at(3)]),
+            100,
+            Locale::Zh,
+        );
+        assert!(
+            s1[0].contains("1 个命令") && s2[0].contains("2 个命令") && s3[0].contains("3 个命令"),
+            "{s1:?} {s2:?} {s3:?}"
+        );
+        for lines in [&s1, &s2, &s3] {
+            assert_eq!(first_child_row(lines), 1, "{lines:?}");
+            assert_eq!(
+                first_child_column(lines),
+                GROUP_BODY_INDENT.len(),
+                "{lines:?}"
+            );
+        }
+        assert_eq!(s1.len() + 1, s2.len());
+        assert_eq!(s2.len() + 1, s3.len());
+    }
+
+    /// Section 12C/F: closing a clean stage rewrites the parent in place — same
+    /// rows, same child column — and the run's FIRST second already had it.
+    #[test]
+    fn closing_a_clean_stage_rewrites_its_parent_in_place() {
+        let check = shell(
+            r#"{"program":"cargo","args":["check"]}"#,
+            ToolStatus::Ok,
+            200,
+        );
+        let test = shell(
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Ok,
+            200,
+        );
+        let open = render_group_text(
+            &open_group(vec![check.clone(), test.clone()]),
+            100,
+            Locale::Zh,
+        );
+        let closed = render_group_text(&group(vec![check, test]), 100, Locale::Zh);
+
+        assert_eq!(
+            open.len(),
+            closed.len(),
+            "no row is inserted: {open:?} vs {closed:?}"
+        );
+        assert_eq!(
+            first_child_column(&open),
+            first_child_column(&closed),
+            "the child never moves: {open:?} vs {closed:?}"
+        );
+        assert!(
+            open[0].starts_with('\u{22ee}') && open[0].contains("正在执行"),
+            "{open:?}"
+        );
+        assert!(
+            closed[0].starts_with('\u{25b8}')
+                && closed[0].contains("执行了 2 个命令")
+                && closed[0].contains("全部成功")
+                && closed[0].contains("0.4s"),
+            "the same row now states the outcome: {closed:?}"
+        );
+    }
+
+    /// Section 12G: a failure changes only the parent's verdict; the rows and
+    /// the reason stay exactly where they were.
+    #[test]
+    fn a_failing_stage_keeps_its_layout_and_gains_only_the_verdict() {
+        let mut bad = shell(
+            r#"{"program":"cargo","args":["bogus"]}"#,
+            ToolStatus::Failed,
+            200,
+        );
+        bad.preview = Some("error: no such command: `bogus`\nhelp dump".into());
+        let good = shell(
+            r#"{"program":"cargo","args":["test"]}"#,
+            ToolStatus::Ok,
+            200,
+        );
+        // The same two calls, one group still open (the failing call's verdict
+        // is already known, the other is still running) and one closed.
+        let mut running = good.clone();
+        running.status = ToolStatus::Running;
+        let open = render_group_text(&open_group(vec![running, bad.clone()]), 120, Locale::Zh);
+        let closed = render_group_text(&group(vec![good, bad]), 120, Locale::Zh);
+
+        assert_eq!(open.len(), closed.len(), "{open:?} vs {closed:?}");
+        assert_eq!(
+            first_child_column(&open),
+            first_child_column(&closed),
+            "{open:?} vs {closed:?}"
+        );
+        assert!(
+            open[0].contains("正在执行") && !open[0].contains("失败"),
+            "{open:?}"
+        );
+        assert!(
+            closed[0].contains('\u{2717}')
+                && closed[0].contains("1 个失败")
+                && closed[0].contains("0.4s"),
+            "{closed:?}"
+        );
+        assert!(
+            closed.iter().any(|l| l.contains("no such command")),
+            "the reason survives the close: {closed:?}"
+        );
+    }
+
+    /// Section 12H: sub-100ms calls — the case the flicker was worst in — still
+    /// produce exactly one parent and one row per call.
+    #[test]
+    fn a_fast_stage_stays_one_parent_over_its_rows() {
+        let fast = |n: usize, ms: u64| {
+            let mut c = call(
+                "run_command",
+                &format!(r#"{{"program":"echo","args":["c{n}"]}}"#),
+                ToolStatus::Ok,
+            );
+            c.duration_ms = Some(ms);
+            c
+        };
+        let g = group(vec![fast(1, 0), fast(2, 100), fast(3, 200)]);
+        let lines = render_group_text(&g, 100, Locale::Zh);
+        assert_eq!(lines.len(), 4, "one parent plus three rows: {lines:?}");
+        assert_eq!(first_child_row(&lines), 1, "{lines:?}");
+        assert!(lines[0].contains("执行了 3 个命令"), "{lines:?}");
+    }
+
+    /// Section 12I: the fixed child indent must not push a row past the gutter.
+    #[test]
+    fn a_stage_fits_its_narrow_terminal() {
+        let check = shell(
+            r#"{"program":"cargo","args":["check"]}"#,
+            ToolStatus::Ok,
+            400,
+        );
+        let test = shell(
+            r#"{"program":"cargo","args":["test","-p","leveler-tui"]}"#,
+            ToolStatus::Ok,
+            400,
+        );
+        for width in [50usize, 60] {
+            let open = render_group_text(
+                &open_group(vec![check.clone(), test.clone()]),
+                width,
+                Locale::Zh,
+            );
+            let closed =
+                render_group_text(&group(vec![check.clone(), test.clone()]), width, Locale::Zh);
+            for lines in [&open, &closed] {
+                for l in lines {
+                    assert!(
+                        UnicodeWidthStr::width(l.as_str()) <= width,
+                        "{width}: {l:?}"
+                    );
+                }
+                assert_eq!(
+                    first_child_column(lines),
+                    GROUP_BODY_INDENT.len(),
+                    "{width}: {lines:?}"
+                );
+            }
+        }
+    }
+
     /// A burst the reducer observed overlapping costs its LONGEST member, not
     /// the sum: four 5s reads did not take 20s.
     #[test]
@@ -3267,8 +3628,8 @@ mod tests {
         );
     }
 
-    /// E: a mixed group in flight never had a header (history begins when the
-    /// burst closes), so hiding the clean one cannot cost it running truth.
+    /// E: a mixed group in flight wears its LIVE header (`⋮`, never `▸`), so
+    /// the parent row exists while the rows beneath it are already settling.
     #[test]
     fn a_running_mixed_group_keeps_its_live_rows() {
         let g = open_group(vec![
@@ -3276,9 +3637,13 @@ mod tests {
             call("grep", r#"{"pattern":"x"}"#, ToolStatus::Running),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 3, "a live parent plus two rows: {lines:?}");
         assert!(
-            lines[1].contains('\u{25cc}'),
+            lines[0].starts_with('\u{22ee}'),
+            "in flight is not history: {lines:?}"
+        );
+        assert!(
+            lines[2].contains('\u{25cc}'),
             "the live call is live: {lines:?}"
         );
         assert!(!lines.iter().any(|l| l.contains('\u{25b8}')), "{lines:?}");
@@ -4355,8 +4720,13 @@ mod tests {
         let args = serde_json::json!({ "cmd": script }).to_string();
         let g = group(vec![call("shell_command", &args, ToolStatus::Running)]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert_eq!(lines.len(), 1, "one row: {lines:?}");
-        assert!(lines[0].contains("◌ $ echo start"), "{lines:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "a live stage row plus one command row: {lines:?}"
+        );
+        assert!(lines[0].starts_with('\u{22ee}'), "{lines:?}");
+        assert!(lines[1].contains("◌ $ echo start"), "{lines:?}");
     }
 
     #[test]
@@ -4384,8 +4754,8 @@ mod tests {
     }
 
     /// The summary label classifies work outside shell/read/search too. Tested
-    /// with two calls because a lone call needs no summary — its own row says
-    /// everything the summary would.
+    /// with two calls because a lone non-shell call owns no summary row — the
+    /// run or its own row says everything the summary would.
     #[test]
     fn known_work_tools_outside_shell_read_search_get_a_summary_too() {
         // WebSearch kind → generic work. Two DIFFERENT tools, so the group
@@ -4985,13 +5355,17 @@ mod tests {
         c.preview = Some("warning: unused import\nexit: 0".into());
         let g = group(vec![c]);
         let lines = render_group_text(&g, 100, Locale::Zh);
-        assert_eq!(lines.len(), 1, "one row: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "a stage row plus the one command row: {lines:?}"
+        );
         assert!(
-            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✓ $ cargo test")),
+            lines[1].starts_with(&format!("  {TOOL_ANCHOR} ✓ $ cargo test")),
             "the row names the command it ran: {lines:?}"
         );
         assert!(
-            lines[0].ends_with("1 行"),
+            lines[1].ends_with("1 行"),
             "how much it printed is counted on the row: {lines:?}"
         );
         assert!(
@@ -5047,13 +5421,17 @@ mod tests {
         let g = group(vec![c]);
         assert!(!g.expanded);
         let lines = render_group_text(&g, 120, Locale::Zh);
-        assert_eq!(lines.len(), 2, "one call: its row and its error: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            3,
+            "a stage row, the call's row and its error: {lines:?}"
+        );
         assert!(
-            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✗ $ cargo test")),
+            lines[1].starts_with(&format!("  {TOOL_ANCHOR} ✗ $ cargo test")),
             "the row names the failure and the command: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("  └ ") && lines[1].contains("error: no such command"),
+            lines[2].starts_with("    └ ") && lines[2].contains("error: no such command"),
             "result row carries the first error line: {lines:?}"
         );
         assert!(
@@ -5201,9 +5579,10 @@ mod tests {
         )]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines[0].starts_with(&format!("{TOOL_ANCHOR} ◌ $ cargo build")),
+            lines[1].starts_with(&format!("  {TOOL_ANCHOR} ◌ $ cargo build")),
             "{lines:?}"
         );
+        assert!(lines[0].starts_with('\u{22ee}'), "{lines:?}");
     }
 
     #[test]
@@ -5234,9 +5613,10 @@ mod tests {
         })
         .collect();
         assert!(
-            lines[0].contains("45s"),
+            lines[1].contains("45s"),
             "running command must show live elapsed: {lines:?}"
         );
+        assert!(lines[0].starts_with('\u{22ee}'), "{lines:?}");
     }
 
     #[test]
@@ -5455,8 +5835,39 @@ mod compact_command_tests {
             .collect()
     }
 
+    /// Whether this row is a group's stage parent (`⋮` running / `▸` closed)
+    /// rather than a command's own row.
+    fn is_stage_parent(line: &str) -> bool {
+        line.starts_with('\u{22ee}') || line.starts_with('\u{25b8}')
+    }
+
+    /// The command's own rows as its unit renderer produced them: the stage
+    /// parent row a lone-command group now leads with, and the group-body
+    /// indent the parent applies to its children, are stripped here. These
+    /// tests pin the COMMAND row's shape; the parent row and the child indent
+    /// have their own lifecycle test.
+    fn body(lines: Vec<String>) -> Vec<String> {
+        let lines = if lines.first().is_some_and(|l| is_stage_parent(l)) {
+            lines.into_iter().skip(1).collect::<Vec<_>>()
+        } else {
+            lines
+        };
+        lines
+            .into_iter()
+            .map(|l| l.strip_prefix(GROUP_BODY_INDENT).unwrap_or(&l).to_string())
+            .collect()
+    }
+
+    fn body_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+        if text(&lines).first().is_some_and(|l| is_stage_parent(l)) {
+            lines.into_iter().skip(1).collect()
+        } else {
+            lines
+        }
+    }
+
     fn rows(call: ToolCallBlock) -> Vec<String> {
-        text(&lines_at(call, &Theme::no_color(), 100, 0))
+        body(text(&lines_at(call, &Theme::no_color(), 100, 0)))
     }
 
     fn fg_of(lines: &[Line<'static>], needle: &str) -> Option<ratatui::style::Color> {
@@ -5501,7 +5912,7 @@ mod compact_command_tests {
             ToolStatus::Running,
         );
         c.started_elapsed_secs = 10;
-        let rows = text(&lines_at(c, &Theme::no_color(), 100, 16));
+        let rows = body(text(&lines_at(c, &Theme::no_color(), 100, 16)));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(
             rows[0].starts_with("\u{203a} \u{25cc} $ go build ./cmd/..."),
@@ -5597,7 +6008,7 @@ mod compact_command_tests {
             ToolStatus::Running,
         );
         let id = c.id.clone();
-        let rows: Vec<String> = text(&render_group(
+        let rows: Vec<String> = body(text(&render_group(
             &ToolGroupBlock {
                 calls: vec![c],
                 open: true,
@@ -5609,7 +6020,7 @@ mod compact_command_tests {
             Locale::Zh.text(),
             5,
             Some(&id),
-        ));
+        )));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(
             rows[0].contains("\u{26a0} $ curl https://example.com"),
@@ -5630,7 +6041,7 @@ mod compact_command_tests {
         c.duration_ms = Some(8_200);
         c.exit_code = Some(101);
         for width in [40usize, 60, 80] {
-            let rows = text(&lines_at(c.clone(), &Theme::no_color(), width, 0));
+            let rows = body(text(&lines_at(c.clone(), &Theme::no_color(), width, 0)));
             let head = &rows[0];
             assert!(head.ends_with(" · 8.2s · exit 101"), "{width}: {head:?}");
             assert!(head.contains('\u{2026}'), "{width}: {head:?}");
@@ -5649,7 +6060,7 @@ mod compact_command_tests {
         );
         c.duration_ms = Some(1_000);
         for width in [20usize, 30, 44] {
-            let rows = text(&lines_at(c.clone(), &Theme::no_color(), width, 0));
+            let rows = body(text(&lines_at(c.clone(), &Theme::no_color(), width, 0)));
             assert!(
                 UnicodeWidthStr::width(rows[0].as_str()) <= width,
                 "{width}: {rows:?}"
@@ -5681,7 +6092,7 @@ mod compact_command_tests {
     #[test]
     fn a_new_running_command_keeps_one_stable_row() {
         let c = with_output(cmd(SED, ToolStatus::Running), 2);
-        let rows = text(&lines_at(c, &Theme::no_color(), 100, 0));
+        let rows = body(text(&lines_at(c, &Theme::no_color(), 100, 0)));
         assert_eq!(rows.len(), 1, "{rows:?}");
     }
 
@@ -5690,7 +6101,7 @@ mod compact_command_tests {
     #[test]
     fn a_running_command_shows_a_bounded_tail_of_its_live_output() {
         let c = with_output(cmd(SED, ToolStatus::Running), 30);
-        let rows = text(&lines_at(c, &Theme::no_color(), 100, 4));
+        let rows = body(text(&lines_at(c, &Theme::no_color(), 100, 4)));
         assert!(
             rows[0].starts_with("\u{203a} \u{25cc} $ sed -n"),
             "{rows:?}"
@@ -5710,7 +6121,7 @@ mod compact_command_tests {
     #[test]
     fn a_short_live_output_is_shown_whole() {
         let c = with_output(cmd(SED, ToolStatus::Running), 2);
-        let rows = text(&lines_at(c, &Theme::no_color(), 100, 4));
+        let rows = body(text(&lines_at(c, &Theme::no_color(), 100, 4)));
         assert_eq!(rows.len(), 3, "{rows:?}");
         assert!(rows[1].ends_with("test case_1 ... ok"), "{rows:?}");
     }
@@ -5721,14 +6132,14 @@ mod compact_command_tests {
     fn settling_collapses_the_tail_and_the_ink_together() {
         let theme = Theme::dark();
         let running = with_output(cmd(SED, ToolStatus::Running), 12);
-        let live = lines_at(running.clone(), &theme, 100, 4);
+        let live = body_lines(lines_at(running.clone(), &theme, 100, 4));
         assert!(live.len() > 1);
         assert_eq!(fg_of(&live, "sed -n"), Some(theme.ink(Ink::Active)));
 
         let mut done = running;
         done.status = ToolStatus::Ok;
         done.duration_ms = Some(4_100);
-        let settled = lines_at(done, &theme, 100, 4);
+        let settled = body_lines(lines_at(done, &theme, 100, 4));
         assert_eq!(settled.len(), 1, "{:?}", text(&settled));
         assert_eq!(fg_of(&settled, "sed -n"), Some(theme.ink(Ink::Settled)));
         assert!(text(&settled)[0].contains("12 行"), "{:?}", text(&settled));
@@ -5772,7 +6183,7 @@ mod compact_command_tests {
         let mut c = cmd(SED, ToolStatus::Running);
         c.output = "编译产物已经上传到对象存储并完成校验\n".repeat(9);
         for width in [0usize, 6, 18, 30] {
-            for row in text(&lines_at(c.clone(), &Theme::no_color(), width, 4)) {
+            for row in body(text(&lines_at(c.clone(), &Theme::no_color(), width, 4))) {
                 assert!(
                     UnicodeWidthStr::width(row.as_str()) <= width,
                     "{width}: {row:?}"
@@ -5839,7 +6250,7 @@ mod compact_command_tests {
         let theme = Theme::dark();
         let mut c = cmd(SED, ToolStatus::Ok);
         c.duration_ms = Some(200);
-        let lines = lines_at(c, &theme, 100, 0);
+        let lines = body_lines(lines_at(c, &theme, 100, 0));
         assert_eq!(fg_of(&lines, "sed -n"), Some(theme.ink(Ink::Settled)));
         assert_eq!(fg_of(&lines, "0.2s"), Some(theme.ink(Ink::Meta)));
         assert_eq!(fg_of(&lines, "\u{203a}"), Some(theme.ink(Ink::Subtle)));

@@ -1111,6 +1111,8 @@ pub(crate) fn user_shell_lines(
         // A user shell is never a batch: it has no siblings to summarize.
         ok_suffix: None,
         expanded: shell.expanded,
+        // A user shell is a direct invocation, never a running stage header.
+        running: false,
         // A user shell row opens Shell Details (its own screen) rather than
         // expanding inline, so it carries the drill-down marker, not the
         // inline `▸/▾`.

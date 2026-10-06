@@ -11,7 +11,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::render::truncate_display;
-use crate::theme::Theme;
+use crate::theme::{Ink, Theme};
 
 /// Everything a disclosure header row shows. Text is already localized by the
 /// adapter; this model carries no domain types and no tool names.
@@ -34,6 +34,12 @@ pub struct DisclosurePresentation {
     pub ok_suffix: Option<String>,
     /// Open (`▾`) or folded (`▸`).
     pub expanded: bool,
+    /// The execution this row heads is still in flight. A running row is not a
+    /// summary: it wears `⋮`, says what is happening now, and carries no
+    /// outcome — no failure count, no success claim, no final duration. It
+    /// exists so the group's first row is structurally the same open and
+    /// closed, so closing a group updates text instead of inserting a row.
+    pub running: bool,
     /// This row opens an independent detail surface instead of expanding
     /// inline. A drill-down renders `↗` (the shared drill-down marker) and
     /// ignores `expanded`, because there is no inline form to fold. A tool
@@ -53,20 +59,25 @@ pub struct DisclosurePresentation {
 pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> Line<'static> {
     // `↗` is the one marker that means "this opens its own detail surface".
     // An inline disclosure keeps `▸/▾`, so the two affordances never wear the
-    // same glyph.
-    let glyph = if p.drill_down {
-        "↗"
+    // same glyph. `⋮` is the live form of the same row: the stage is running,
+    // not folded.
+    let glyph = if p.running {
+        "\u{22ee}"
+    } else if p.drill_down {
+        "\u{2197}"
     } else if p.expanded {
-        "▾"
+        "\u{25be}"
     } else {
-        "▸"
+        "\u{25b8}"
     };
     let failed = p.failed > 0;
     let attention = failed || p.needs_permission_suffix.is_some();
     let mut spans = vec![
         Span::styled(
             format!("{glyph} "),
-            Style::default().fg(if attention {
+            Style::default().fg(if p.running {
+                theme.accent.primary
+            } else if attention {
                 theme.status.warning
             } else {
                 theme.text.muted
@@ -74,7 +85,9 @@ pub fn header_line(p: &DisclosurePresentation, theme: &Theme, width: usize) -> L
         ),
         Span::styled(
             truncate_display(&p.label, width.saturating_sub(16)),
-            Style::default().fg(if attention {
+            Style::default().fg(if p.running {
+                theme.ink(Ink::Active)
+            } else if attention {
                 theme.text.primary
             } else {
                 theme.text.muted
