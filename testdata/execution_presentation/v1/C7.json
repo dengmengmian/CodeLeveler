@@ -1,0 +1,255 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "a1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "a2",
+            "name": "read_file",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "all_ok": false,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 2,
+        "status": "failed",
+        "tools": [
+          {
+            "id": "b1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "b2",
+            "name": "run_command",
+            "status": "failed"
+          }
+        ]
+      },
+      {
+        "all_ok": false,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 3,
+        "status": "cancelled",
+        "tools": [
+          {
+            "id": "c1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "c2",
+            "name": "run_command",
+            "status": "cancelled"
+          }
+        ]
+      },
+      {
+        "all_ok": false,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 4,
+        "status": "unknown",
+        "tools": [
+          {
+            "id": "d1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "d2",
+            "name": "run_command",
+            "status": "unknown"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "no_final_answer"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C7",
+  "invariant": "all-success holds only when EVERY visible tool call is Ok; a cancelled or unknown call is never success",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "arguments": "{\"path\":\"a\"}",
+          "id": "a1",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "id": "a1",
+          "ok": true,
+          "preview": "a",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"b\"}",
+          "id": "a2",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "id": "a2",
+          "ok": true,
+          "preview": "b",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"c\"}",
+          "id": "b1",
+          "model_step": 2,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "id": "b1",
+          "ok": true,
+          "preview": "c",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"program\":\"false\"}",
+          "id": "b2",
+          "model_step": 2,
+          "name": "run_command",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "exit_code": 1,
+          "id": "b2",
+          "ok": false,
+          "preview": "exit: 1",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"d\"}",
+          "id": "c1",
+          "model_step": 3,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "id": "c1",
+          "ok": true,
+          "preview": "d",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"program\":\"sleep\",\"args\":[\"60\"]}",
+          "id": "c2",
+          "model_step": 3,
+          "name": "run_command",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 500,
+          "id": "c2",
+          "ok": false,
+          "preview": "stopped",
+          "stop": "confirmed",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"e\"}",
+          "id": "d1",
+          "model_step": 4,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "id": "d1",
+          "ok": true,
+          "preview": "e",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"program\":\"sleep\",\"args\":[\"60\"]}",
+          "id": "d2",
+          "model_step": 4,
+          "name": "run_command",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 500,
+          "id": "d2",
+          "ok": false,
+          "preview": "signalled",
+          "stop": "unconfirmed",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ]
+  },
+  "title": "status truth"
+}

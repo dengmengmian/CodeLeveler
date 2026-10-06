@@ -1,0 +1,114 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "t2",
+            "name": "grep",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 2,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t3",
+            "name": "read_file",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "no_final_answer"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C1",
+  "invariant": "different model_step => different ExecutionRound; the presenter never synthesizes narration",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/a.rs\"}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 12,
+          "id": "t1",
+          "ok": true,
+          "preview": "fn a() {}",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"pattern\":\"fn main\"}",
+          "id": "t2",
+          "model_step": 1,
+          "name": "grep",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 9,
+          "id": "t2",
+          "ok": true,
+          "preview": "src/main.rs:1",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/b.rs\"}",
+          "id": "t3",
+          "model_step": 2,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 7,
+          "id": "t3",
+          "ok": true,
+          "preview": "fn b() {}",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ]
+  },
+  "title": "prose-free multi-round"
+}

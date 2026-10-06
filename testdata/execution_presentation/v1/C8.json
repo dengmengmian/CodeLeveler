@@ -1,0 +1,69 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": false,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "failed",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "run_command",
+            "status": "failed"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "incomplete"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C8",
+  "invariant": "a runtime note about HOW a command ran ([execution policy], [mutation rejected], stream headers, exit row, timeout) is never presented as WHY it failed",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "arguments": "{\"program\":\"cargo\",\"args\":[\"test\"]}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "run_command",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 800,
+          "exit_code": 101,
+          "id": "t1",
+          "ok": false,
+          "preview": "exit: 101\n--- stderr ---\n[execution policy] write denied: /tmp/lock\n[mutation rejected] apply_patch outside the workspace\nerror: 2 tests failed\n",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "reason": "cargo test failed",
+          "type": "turn_incomplete"
+        }
+      }
+    ]
+  },
+  "title": "failure attribution",
+  "rendered": {
+    "contains": [
+      "2 tests failed"
+    ],
+    "excludes": [
+      "[execution policy]",
+      "[mutation rejected]",
+      "write denied"
+    ]
+  }
+}

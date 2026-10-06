@@ -1,0 +1,115 @@
+{
+  "expect": {
+    "items": [
+      {
+        "kind": "assistant_text",
+        "text": "我先看一下解析器。"
+      },
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "read_file",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "final_answer",
+        "text": "解析器已修好。"
+      },
+      {
+        "kind": "turn_end",
+        "status": "answered"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": [
+      "检查解析器"
+    ]
+  },
+  "id": "C4",
+  "invariant": "public assistant content is preserved verbatim; work after it makes it interim narration, and the message the turn ends on is the FinalAnswer",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "message": {
+            "id": "u1",
+            "role": "user",
+            "text": "检查解析器"
+          },
+          "type": "user_message_added"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m1",
+          "type": "assistant_message_started"
+        }
+      },
+      {
+        "event": {
+          "delta": "我先看一下解析器。",
+          "message_id": "m1",
+          "type": "assistant_text_delta"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m1",
+          "type": "assistant_message_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/parser.rs\"}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 20,
+          "id": "t1",
+          "ok": true,
+          "preview": "fn parse() {}",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m2",
+          "type": "assistant_message_started"
+        }
+      },
+      {
+        "event": {
+          "delta": "解析器已修好。",
+          "message_id": "m2",
+          "type": "assistant_text_delta"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m2",
+          "type": "assistant_message_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_answered"
+        }
+      }
+    ]
+  },
+  "title": "assistant text plus tools"
+}

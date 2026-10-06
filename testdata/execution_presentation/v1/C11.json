@@ -1,0 +1,112 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": null,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "t2",
+            "name": "read_file",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": null,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t3",
+            "name": "run_command",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "no_final_answer"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C11",
+  "invariant": "a transcript from before model_step groups by the pre-round heuristic and never crashes; the round identity stays unknown rather than invented",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/a.rs\"}",
+          "id": "t1",
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 4,
+          "id": "t1",
+          "ok": true,
+          "preview": "a",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/b.rs\"}",
+          "id": "t2",
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 4,
+          "id": "t2",
+          "ok": true,
+          "preview": "b",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"program\":\"cargo\",\"args\":[\"test\"]}",
+          "id": "t3",
+          "name": "run_command",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 500,
+          "exit_code": 0,
+          "id": "t3",
+          "ok": true,
+          "preview": "ok",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ]
+  },
+  "title": "legacy round identity"
+}

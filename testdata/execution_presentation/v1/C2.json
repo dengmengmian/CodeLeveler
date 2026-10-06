@@ -1,0 +1,111 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": true,
+        "batches": [
+          [
+            "t1",
+            "t2",
+            "t3"
+          ]
+        ],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "t2",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "t3",
+            "name": "read_file",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "no_final_answer"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C2",
+  "invariant": "every call from one model_step belongs to one ExecutionRound, however it was dispatched",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/a.rs\"}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": true,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/b.rs\"}",
+          "id": "t2",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": true,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/c.rs\"}",
+          "id": "t3",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": true,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 10,
+          "id": "t1",
+          "ok": true,
+          "preview": "a",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 11,
+          "id": "t2",
+          "ok": true,
+          "preview": "b",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 12,
+          "id": "t3",
+          "ok": true,
+          "preview": "c",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ]
+  },
+  "title": "same-step parallel batch"
+}

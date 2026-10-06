@@ -1,0 +1,104 @@
+{
+  "expect": {
+    "items": [
+      {
+        "kind": "final_answer",
+        "text": "解析器已修好，测试通过。"
+      },
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "update_plan",
+            "status": "ok"
+          },
+          {
+            "id": "t2",
+            "name": "update_goal",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "answered"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C9",
+  "invariant": "update_plan / update_goal bookkeeping after a committed answer neither demotes the FinalAnswer nor becomes one",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "message_id": "m1",
+          "type": "assistant_message_started"
+        }
+      },
+      {
+        "event": {
+          "delta": "解析器已修好，测试通过。",
+          "message_id": "m1",
+          "type": "assistant_text_delta"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m1",
+          "type": "assistant_message_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"steps\":[]}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "update_plan",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 2,
+          "id": "t1",
+          "ok": true,
+          "preview": "plan updated",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"status\":\"complete\"}",
+          "id": "t2",
+          "model_step": 1,
+          "name": "update_goal",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 2,
+          "id": "t2",
+          "ok": true,
+          "preview": "goal complete",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_answered"
+        }
+      }
+    ]
+  },
+  "title": "final answer survives bookkeeping"
+}

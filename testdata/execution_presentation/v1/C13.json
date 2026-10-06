@@ -1,0 +1,49 @@
+{
+  "expect": {
+    "items": [
+      {
+        "kind": "note",
+        "text": "## Background sub-agent settled"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": [
+      "我自己写的 English"
+    ]
+  },
+  "id": "C13",
+  "invariant": "a runtime-authored message (kind=runtime_notice) is never a user transcript line; a protocol repair (goal closeout / length continuation) is absent from snapshot and replay entirely and stays only in the model transcript",
+  "notes": "The protocol-repair half is owned by the runtime's own tests (leveler-app: session_history + interactive snapshot projection); a client cannot assert it because the repair never reaches the wire. This fixture pins the client-side rule for the messages that DO reach it.",
+  "paths": {
+    "snapshot": [
+      {
+        "snapshot": {
+          "session": {
+            "branch": null,
+            "goal": "fixture",
+            "id": "s1",
+            "messages": [
+              {
+                "id": "u1",
+                "role": "user",
+                "text": "我自己写的 English"
+              },
+              {
+                "id": "n1",
+                "kind": "runtime_notice",
+                "role": "user",
+                "text": "## Background sub-agent settled"
+              }
+            ],
+            "mode": "assisted",
+            "model": null,
+            "repository": "/repo",
+            "status": "idle"
+          },
+          "type": "session_opened"
+        }
+      }
+    ]
+  },
+  "title": "runtime injection is not a user message"
+}

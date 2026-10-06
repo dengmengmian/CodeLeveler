@@ -1,0 +1,143 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "t2",
+            "name": "read_file",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "all_ok": true,
+        "batches": [
+          [
+            "t3",
+            "t4"
+          ]
+        ],
+        "kind": "execution_round",
+        "model_step": 2,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t3",
+            "name": "read_file",
+            "status": "ok"
+          },
+          {
+            "id": "t4",
+            "name": "grep",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "no_final_answer"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C3",
+  "invariant": "a concurrent burst is an observed batch inside its ExecutionRound, never a separate round and never inferred from timing",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/a.rs\"}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 8,
+          "id": "t1",
+          "ok": true,
+          "preview": "a",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/b.rs\"}",
+          "id": "t2",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 8,
+          "id": "t2",
+          "ok": true,
+          "preview": "b",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/c.rs\"}",
+          "id": "t3",
+          "model_step": 2,
+          "name": "read_file",
+          "parallel": true,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"pattern\":\"x\"}",
+          "id": "t4",
+          "model_step": 2,
+          "name": "grep",
+          "parallel": true,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 9,
+          "id": "t3",
+          "ok": true,
+          "preview": "c",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 9,
+          "id": "t4",
+          "ok": true,
+          "preview": "d",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ]
+  },
+  "title": "run and batch inside one round"
+}

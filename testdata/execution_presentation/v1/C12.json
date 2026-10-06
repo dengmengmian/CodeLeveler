@@ -1,0 +1,140 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "run_command",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "no_final_answer"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": [
+      "跑测试"
+    ]
+  },
+  "id": "C12",
+  "invariant": "a /btw side question never enters the main ExecutionRound, the main transcript, or the FinalAnswer",
+  "paths": {
+    "main": [
+      {
+        "event": {
+          "message": {
+            "id": "u1",
+            "role": "user",
+            "text": "跑测试"
+          },
+          "type": "user_message_added"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"program\":\"cargo\",\"args\":[\"test\"]}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "run_command",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 400,
+          "exit_code": 0,
+          "id": "t1",
+          "ok": true,
+          "preview": "ok",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ],
+    "with_btw": [
+      {
+        "event": {
+          "message": {
+            "id": "u1",
+            "role": "user",
+            "text": "跑测试"
+          },
+          "type": "user_message_added"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"program\":\"cargo\",\"args\":[\"test\"]}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "run_command",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 400,
+          "exit_code": 0,
+          "id": "t1",
+          "ok": true,
+          "preview": "ok",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "question": "这个仓库用什么测试框架？",
+          "type": "btw_started"
+        }
+      },
+      {
+        "event": {
+          "delta": "用的是 cargo test。",
+          "type": "btw_text_delta"
+        }
+      },
+      {
+        "event": {
+          "call_id": "b1",
+          "tool": "grep",
+          "type": "btw_tool_started"
+        }
+      },
+      {
+        "event": {
+          "call_id": "b1",
+          "elapsed_ms": 3,
+          "is_error": false,
+          "tool": "grep",
+          "type": "btw_tool_finished"
+        }
+      },
+      {
+        "event": {
+          "type": "btw_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ]
+  },
+  "title": "side question isolation"
+}

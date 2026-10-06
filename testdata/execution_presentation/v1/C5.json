@@ -1,0 +1,63 @@
+{
+  "expect": {
+    "items": [
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "read_file",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "no_final_answer"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": []
+  },
+  "id": "C5",
+  "invariant": "reasoning never enters the transcript; a response with no public text yields an ExecutionRound and no AssistantText",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "delta": "我应该先读一下入口文件。",
+          "type": "reasoning_delta"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"path\":\"src/main.rs\"}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "read_file",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 6,
+          "id": "t1",
+          "ok": true,
+          "preview": "fn main() {}",
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_completed"
+        }
+      }
+    ]
+  },
+  "title": "tool-only response"
+}
