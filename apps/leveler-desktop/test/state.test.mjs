@@ -57,13 +57,15 @@ test('metadata-only session update preserves runtime live transcript and tool ev
  assert.equal(next.session.goal,'retitled');
  assert.equal(next.status,'running');
 });
-test('reasoning stays separate and retry discards the failed attempt',()=>{
- let state=projectSnapshot(snapshot);
+test('reasoning never becomes transcript or exposed state (Contract v1 §I5)',()=>{
+ let state=projectSnapshot({id:'s1',messages:[],status:'running'});
  state=applyEvent(state,{type:'reasoning_delta',delta:'Provider reasoning'});
- assert.equal(state.reasoningText,'Provider reasoning');
- assert.equal(state.messages.length,1);
+ // Raw reasoning is not carried at all: it is neither a message nor view state
+ // the renderer could paint.
+ assert.equal(state.messages.length,0);
+ assert.equal('reasoningText' in state,false);
  state=applyEvent(state,{type:'assistant_attempt_reset',message_id:null});
- assert.equal(state.reasoningText,'');
+ assert.equal(state.messages.length,0);
 });
 test('plan updates and metadata come only from runtime projections',()=>{
  let state=projectSnapshot({...snapshot,plan:{steps:[{index:0,description:'Read',status:'pending'}]}});

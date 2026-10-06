@@ -95,3 +95,185 @@ export function commandCandidates(text,commands){const match=/^\/([a-z-]*)$/.exe
 
 /** @param {{composing:boolean,modalOpen:boolean,settingsOpen:boolean}} state @param {()=>void} open */
 export function activateSettingsShortcut(state,open){if(state.composing||state.modalOpen||state.settingsOpen)return false;open();return true;}
+
+// ── Execution Presentation Contract v1 ────────────────────────────────
+// The Desktop projection of docs/EXECUTION_PRESENTATION_CONTRACT.md. Pure
+// functions only: the renderer paints what they return, and the conformance
+// test reads the same ones (test/executionPresentation.test.mjs). Nothing here
+// guesses a boundary — the round is the runtime's `model_step`, the batch is an
+// observed overlap, and Final vs Progress is decided by event order.
+
+/** Tool lifecycle -> the contract's frozen vocabulary. @param {string} status */
+export function contractToolStatus(status){
+ switch(status){case 'running':case 'run':return 'running';case 'success':case 'done':return 'ok';case 'failed':case 'fail':return 'failed';case 'cancelled':return 'cancelled';default:return 'unknown';}
+}
+/** @param {boolean} ok @param {string|null|undefined} stop */
+export function toolStatusFromOutcome(ok,stop){if(stop==='confirmed')return 'cancelled';if(stop==='unconfirmed')return 'unknown';return ok?'success':'failed';}
+
+/** Tools whose presence never demotes a committed answer and never becomes one. */
+const BOOKKEEPING_TOOLS=new Set(['update_plan','update_goal','list_files','get_task','wait_task','git_status','create_checkpoint','expand_tools','memory','consolidate_memory','spawn_agent']);
+/** @param {string} name */
+export function actsOnAnswer(name){return !BOOKKEEPING_TOOLS.has(name);}
+
+const RUNTIME_NOTE_TAGS=['[execution policy] ','[mutation rejected] ','[note] '];
+/** A runtime row about HOW a command ran, never why it failed. @param {string} line */
+export function isRuntimeNote(line){
+ const trimmed=line.replace(/\s+$/,'');
+ if(trimmed.startsWith('exit: '))return true;
+ if(trimmed.startsWith('--- ')&&trimmed.endsWith(' ---'))return true;
+ if(trimmed==='[timed out]')return true;
+ if(trimmed.startsWith('[timed out after ')&&trimmed.endsWith(']'))return true;
+ return RUNTIME_NOTE_TAGS.some(tag=>trimmed.startsWith(tag));
+}
+/** The command's own output, without the runtime's execution rows. @param {string} preview */
+export function commandOutputBody(preview){return preview.split('\n').map(line=>line.replace(/\s+$/,'')).filter(line=>line.trim()!==''&&!isRuntimeNote(line));}
+/** The reason a failed command states, never a runtime note. @param {string} preview */
+export function failureReason(preview){const lines=commandOutputBody(preview);return lines.find(line=>/^(error|fail|✗|panic)/i.test(line.trim()))??lines[0]??null;}
+/** The preview a row renders. @param {{name:string,preview?:string|null}} tool */
+export function displayPreview(tool){if(!tool.preview)return null;if(!['run_command','shell_command'].includes(tool.name))return tool.preview;const body=commandOutputBody(tool.preview).join('\n');return body===''?null:body;}
+
+/** Activity class for the legacy fallback only. @param {string} name */
+function activityClass(name){const n=name.toLowerCase();if(/apply_patch|edit|write|patch/.test(n))return 'edit';if(/read|cat|open|view/.test(n))return 'read';if(/search|grep|find|glob|list/.test(n))return 'search';if(/bash|shell|exec|command|run|terminal|cargo|npm|git_(?!diff)/.test(n))return 'command';return 'other';}
+
+/** @typedef {{id:string,name:string,status:string,parallel?:boolean,modelStep?:number|null,batch?:number|null}} ExecutionToolRow */
+/** @typedef {{modelStep:number|null,tools:ExecutionToolRow[],status:string,allOk:boolean,batches:string[][]}} ExecutionRoundView */
+
+/** @param {ExecutionRoundView} round @param {ExecutionToolRow} tool */
+function startsNewRound(round,tool){
+ if(round.modelStep!==null&&tool.modelStep!=null)return round.modelStep!==tool.modelStep;
+ if(round.tools.some(item=>item.status==='running'))return false;
+ const previous=round.tools[round.tools.length-1];
+ if(!previous)return false;
+ return activityClass(previous.name)!==activityClass(tool.name);
+}
+/** @param {ExecutionToolRow[]} tools @returns {ExecutionRoundView[]} */
+export function groupExecutionRounds(tools){
+ /** @type {ExecutionRoundView[]} */ const rounds=[];
+ for(const tool of tools){
+  const last=rounds[rounds.length-1];
+  if(last&&!startsNewRound(last,tool)){last.tools.push(tool);continue;}
+  rounds.push({modelStep:tool.modelStep??null,tools:[tool],status:'running',allOk:false,batches:[]});
+ }
+ for(const round of rounds){
+  round.status=roundStatus(round.tools);
+  round.allOk=round.tools.length>0&&round.tools.every(tool=>contractToolStatus(tool.status)==='ok');
+  round.batches=roundBatches(round.tools);
+ }
+ return rounds;
+}
+/** @param {ExecutionToolRow[]} tools */
+function roundStatus(tools){
+ if(tools.some(tool=>contractToolStatus(tool.status)==='running'))return 'running';
+ if(tools.length>0&&tools.every(tool=>contractToolStatus(tool.status)==='ok'))return 'ok';
+ if(tools.some(tool=>contractToolStatus(tool.status)==='failed'))return 'failed';
+ if(tools.some(tool=>contractToolStatus(tool.status)==='cancelled'))return 'cancelled';
+ return 'unknown';
+}
+/** @param {ExecutionToolRow[]} tools */
+function roundBatches(tools){
+ /** @type {number[]} */ const order=[];
+ /** @type {string[][]} */ const batches=[];
+ for(const tool of tools){
+  if(tool.batch==null)continue;
+  const index=order.indexOf(tool.batch);
+  if(index>=0){batches[index].push(tool.id);continue;}
+  order.push(tool.batch);batches.push([tool.id]);
+ }
+ return batches;
+}
+/** Truthful one-line head; claims all-success only when every call succeeded. @param {ExecutionRoundView} round */
+export function roundHeadline(round){
+ const total=round.tools.length;
+ switch(round.status){
+  case 'running':return `执行中 · ${total} 项`;
+  case 'ok':return round.allOk?`完成 ${total} 项`:`${total} 项已结束`;
+  case 'failed':return `完成 ${total} 项 · ${round.tools.filter(tool=>contractToolStatus(tool.status)==='failed').length} 项失败`;
+  case 'cancelled':return `已停止 · ${total} 项`;
+  default:return `结果未知 · ${total} 项`;
+ }
+}
+/** @param {ExecutionRoundView} round */
+export function roundGlyph(round){switch(round.status){case 'running':return '●';case 'ok':return '✓';case 'failed':return '✗';case 'cancelled':return '■';default:return '◇';}}
+
+/** @typedef {{id?:string,role:string,text:string,kind?:string,btw?:string,seq?:number,anchor?:string}} ProjectionMessage */
+
+/**
+ * Arrival order for one tool row. A live call carries the runtime stream's own
+ * stamp; a replayed one does not, so it takes its position from the message it
+ * was anchored to — the same anchor the renderer inserts the row after.
+ * @param {any} tool @param {ProjectionMessage[]} messages @param {number} index
+ */
+function toolOrder(tool,messages,index){
+ if(typeof tool.seq==='number')return tool.seq;
+ const anchorIndex=messages.findIndex(message=>message.id===tool.anchor);
+ const base=anchorIndex>=0?(messages[anchorIndex].seq??anchorIndex):(messages.length?messages.length-1:-1);
+ return base+0.5+index*0.001;
+}
+
+/**
+ * Project one turn's messages and tool rows onto the contract's items.
+ * @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools @param {boolean} turnEnded
+ */
+export function projectTurn(messages,tools,turnEnded){
+ /** @type {Array<{seq:number,message?:ProjectionMessage,tool?:ExecutionToolRow}>} */ const entries=[];
+ let start=0;
+ for(let i=messages.length-1;i>=0;i-=1){if(messageKind(messages[i])==='user'){start=i;break;}}
+ messages.slice(start).forEach((message,index)=>entries.push({seq:message.seq??index,message}));
+ tools.forEach((tool,index)=>entries.push({seq:toolOrder(tool,messages,index),tool}));
+ entries.sort((a,b)=>a.seq-b.seq);
+ /** @type {any[]} */ const nodes=[];
+ for(const entry of entries){
+  if(entry.message){
+   const message=entry.message;
+   if(message.btw!==undefined)continue;
+   // Only the model's public assistant content is AssistantText. A user line,
+   // a runtime notice and a compaction summary (stored on the user role) are
+   // not assistant prose.
+   const kind=message.kind==='compaction_summary'?'assistant':messageKind(message);
+   if(kind!=='assistant')continue;
+   if(!message.text.trim())continue;
+   nodes.push({kind:'assistant',text:message.text,demoted:false,seq:entry.seq});
+   continue;
+  }
+  const tool=entry.tool;
+  if(!tool)continue;
+  if(actsOnAnswer(tool.name)){for(const node of nodes){if(node.kind==='assistant')node.demoted=true;}}
+  const last=nodes[nodes.length-1];
+  if(last&&last.kind==='round'&&!startsNewRound(last.round,tool)){last.round.tools.push(tool);}
+  else nodes.push({kind:'round',seq:entry.seq,round:{modelStep:tool.modelStep??null,tools:[tool],status:'running',allOk:false,batches:[]}});
+ }
+ /** @type {any[]} */ const items=[];
+ for(const node of nodes){
+  if(node.kind==='assistant'){items.push({seq:node.seq,kind:turnEnded&&!node.demoted?'final_answer':'assistant_text',text:node.text});continue;}
+  node.round.status=roundStatus(node.round.tools);
+  node.round.allOk=node.round.tools.length>0&&node.round.tools.every(/** @param {ExecutionToolRow} row */ row=>contractToolStatus(row.status)==='ok');
+  node.round.batches=roundBatches(node.round.tools);
+  items.push({seq:node.seq,kind:'execution_round',round:node.round});
+ }
+ return items;
+}
+/**
+ * The turn's committed answer, or null when it ended without one.
+ * @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools
+ */
+export function committedFinalAnswer(messages,tools){
+ let answer=null;
+ for(const item of projectTurn(messages,tools,true))if(item.kind==='final_answer')answer=item.text;
+ return answer;
+}
+/**
+ * The turn terminal, keeping Contract §I9: a Completed/Answered turn with no
+ * committed answer reads no_final_answer instead of a green completion.
+ * @param {string} type @param {ProjectionMessage[]} messages @param {ExecutionToolRow[]} tools
+ */
+export function turnTerminalFromEvent(type,messages,tools){
+ if(type==='turn_completed'||type==='turn_answered'){
+  return committedFinalAnswer(messages,tools)===null?'no_final_answer':(type==='turn_answered'?'answered':'completed');
+ }
+ if(type==='turn_completed_with_warnings')return 'completed_with_warnings';
+ if(type==='turn_truncated')return 'truncated';
+ if(type==='turn_incomplete')return 'incomplete';
+ if(type==='turn_failed')return 'failed';
+ if(type==='turn_cancelled')return 'cancelled';
+ return null;
+}

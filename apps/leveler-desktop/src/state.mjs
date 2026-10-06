@@ -1,6 +1,12 @@
 // Presentation only: snapshots and events come from the Rust client protocol.
+//
+// Execution semantics live in `presentation.mjs` (Contract v1); this module
+// only carries the runtime facts the renderer and the conformance test project.
+import { toolStatusFromOutcome, turnTerminalFromEvent } from './presentation.mjs';
+
 export function projectSnapshot(snapshot, history = []) {
-  let state = {session:snapshot, messages:structuredClone(snapshot.messages ?? []), status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,reasoningText:'',streamingMessageId:null};
+  const messages = structuredClone(snapshot.messages ?? []).map((message,index)=>({...message,seq:index}));
+  let state = {session:snapshot, messages, nextSeq:messages.length, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null};
   let anchor=null;
   for (const entry of history) {
     if(entry.event.type==='user_message_added')anchor=entry.event.message.id;
@@ -8,47 +14,66 @@ export function projectSnapshot(snapshot, history = []) {
     state=applyToolEvent(state,{...entry.event,anchor});
   }
   for (const tool of snapshot.active_tools ?? []) state = applyToolEvent(state,{type:'tool_call_started',...tool,id:tool.id ?? tool.call_id,name:tool.name,arguments:tool.arguments});
+  // The durable history's turn terminal is the runtime's own fact: without it a
+  // reopened turn could not tell an answer from interim narration (Contract §I9).
+  const terminal = [...history].reverse().find(entry=>terminalEvents.has(entry.event.type))?.event.type;
+  if (terminal) state = {...state, lastTerminal: turnTerminalFromEvent(terminal, state.messages, state.tools)};
   state.approvals = (snapshot.pending_interactions ?? []).filter(i=>i.type==='approval').map(i=>i.request);
   state.clarifications = (snapshot.pending_interactions ?? []).filter(i=>i.type==='clarification').map(i=>i.request);
   return state;
 }
 function applyToolEvent(state, event) {
   const tools = state.tools.map(t=>({...t}));
+  let nextSeq = state.nextSeq ?? 0;
   let tool = tools.find(t=>t.id===event.id);
   if (event.type === 'tool_call_started') {
-    if (!tool) tools.push({id:event.id,name:event.name,arguments:event.arguments,status:'running',preview:event.output_tail??'',anchor:'anchor' in event?event.anchor:state.messages?.at(-1)?.id});
+    if (!tool) {
+      // A batch is OBSERVED here, never inferred later: this call starts while
+      // those parallel calls are still running, so they were in flight
+      // together (Contract v1 §I3).
+      let batch = null;
+      if (event.parallel) {
+        const inFlight = tools.filter(t=>t.status==='running'&&t.parallel);
+        if (inFlight.length > 0) {
+          batch = inFlight.find(t=>t.batch!=null)?.batch ?? Math.max(-1,...tools.map(t=>t.batch??-1)) + 1;
+          for (const t of inFlight) t.batch = batch;
+        }
+      }
+      tools.push({id:event.id,name:event.name,arguments:event.arguments,status:'running',preview:event.output_tail??'',anchor:'anchor' in event?event.anchor:state.messages?.at(-1)?.id,parallel:!!event.parallel,modelStep:event.model_step??null,batch,seq:'anchor' in event?undefined:nextSeq++});
+    }
   } else if (event.type === 'tool_call_completed' || event.type === 'tool_call_output') {
-    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:''}; tools.push(tool);}
-    if (event.type === 'tool_call_completed') Object.assign(tool,{status:event.ok?'success':'failed',preview:event.preview,exit_code:event.exit_code});
+    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',parallel:false,modelStep:null,batch:null}; tools.push(tool);}
+    if (event.type === 'tool_call_completed') Object.assign(tool,{status:toolStatusFromOutcome(event.ok,event.stop),preview:event.preview,exit_code:event.exit_code});
     else tool.preview = (tool.preview + event.chunk).slice(-16000);
   }
-  return {...state,tools};
+  return {...state,tools,nextSeq};
 }
 export function applyEvent(state,event) {
   if(['diff_updated','diff_failed'].includes(event.type)&&event.query_id&&(state.diffQuery?.id!==event.query_id||!['pending','unknown'].includes(state.diffQuery.status)))return state;
   let next=applyToolEvent(state,event);
   next.messages=state.messages.map(m=>({...m}));
-  if (event.type==='user_message_added' && !next.messages.some(m=>m.id===event.message.id)) next.messages.push(event.message);
-  if (event.type==='assistant_message_started' && !next.messages.some(m=>m.id===event.message_id)) next.messages.push({id:event.message_id,role:'assistant',text:''});
+  // Arrival order is the fact the Execution Presentation Contract groups by, so
+  // every message and tool carries the same monotonic stamp.
+  if (event.type==='user_message_added' && !next.messages.some(m=>m.id===event.message.id)) next.messages.push({...event.message,seq:next.nextSeq++});
+  if (event.type==='assistant_message_started' && !next.messages.some(m=>m.id===event.message_id)) next.messages.push({id:event.message_id,role:'assistant',text:'',seq:next.nextSeq++});
   if (event.type==='assistant_text_delta') {
     let message=next.messages.find(m=>m.id===event.message_id);
-    if (!message) {message={id:event.message_id,role:'assistant',text:''};next.messages.push(message);}
+    if (!message) {message={id:event.message_id,role:'assistant',text:'',seq:next.nextSeq++};next.messages.push(message);}
     message.text+=event.delta;
   }
   if(event.type==='assistant_message_started'||event.type==='assistant_text_delta')next.streamingMessageId=event.message_id;
   if(event.type==='assistant_message_completed'&&state.streamingMessageId===event.message_id)next.streamingMessageId=null;
   if(terminalEvents.has(event.type)||event.type==='assistant_attempt_reset')next.streamingMessageId=null;
-  if(event.type==='reasoning_delta') next.reasoningText=(state.reasoningText??'')+event.delta;
   if(event.type==='plan_updated') next.plan=event.plan;
   if(event.type==='diff_updated'){next.diff=event.diff;next.diffError=null;if(event.query_id)next.diffQuery={id:event.query_id,status:'confirmed',error:null};}
   if(event.type==='diff_failed'){next.diff=null;next.diffError=event.message;if(event.query_id)next.diffQuery={id:event.query_id,status:'failed',error:event.message};}
-  if(event.type==='assistant_attempt_reset') next.reasoningText='';
-  if (event.type==='assistant_attempt_reset') next.messages=next.messages.filter(m=>m.id!==event.message_id);
+  if(event.type==='assistant_attempt_reset') next.messages=next.messages.filter(m=>m.id!==event.message_id);
   if (event.type==='approval_requested') next.approvals=[...state.approvals.filter(a=>a.id!==event.request.id),event.request];
   if (event.type==='approval_resolved') next.approvals=state.approvals.filter(a=>a.id!==event.id);
   if (event.type==='clarification_requested') next.clarifications=[...state.clarifications.filter(a=>a.id!==event.request.id),event.request];
   if (event.type==='clarification_resolved') next.clarifications=state.clarifications.filter(a=>a.id!==event.id);
   if (event.type==='agent_activity' || event.type==='command_progress') next.activity=event.label;
+  if (terminalEvents.has(event.type)) next.lastTerminal=turnTerminalFromEvent(event.type,next.messages,next.tools);
   return next;
 }
 export function commandEnvelope(sessionId,command) {
