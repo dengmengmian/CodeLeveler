@@ -690,21 +690,32 @@ fn make_url_opener() -> leveler_tui::UrlOpener {
     })
 }
 
+/// The collaboration axis every NEW interactive TUI session opens on.
+///
+/// An interactive terminal session is a conversation, and `/goal <task>` is the
+/// durable way to ask for the goal lifecycle. This is the ONE statement of that
+/// product intent: the daemon request and the in-process create both consume it,
+/// so the transport can never change the axis. Reading
+/// `CollaborationMode::default()` instead would hand the axis to the product's
+/// coding-session default, and the two transports would silently disagree the
+/// moment that default moved. Resuming a session takes its persisted axis and
+/// never passes through here.
+fn interactive_session_collaboration() -> leveler_local_transport::CollaborationMode {
+    leveler_local_transport::CollaborationMode::Chat
+}
+
 /// The session-open request a bare `leveler` / `leveler tui` issues.
 ///
-/// The axis is stated here and is `Chat`: an interactive terminal session is a
-/// conversation, and `/goal <task>` is the durable way to ask for the goal
-/// lifecycle. Reading `CollaborationMode::default()` here instead would make
-/// every new terminal session a Goal the moment the product default changes,
-/// which is the coupling this function exists to break. Resuming a session
-/// takes its persisted axis and never passes through here.
+/// The axis is stated by [`interactive_session_collaboration`] and is `Chat`.
+/// `leveler run` and a wire request that omits the field keep resolving to the
+/// product default (Goal), and resume takes the session's persisted axis.
 fn interactive_session_request(
     model: Option<leveler_client_protocol::ModelRef>,
     mode: leveler_client_protocol::PermissionProfile,
     auto_approve: bool,
 ) -> CreateSessionRequest {
     CreateSessionRequest {
-        collaboration: leveler_local_transport::CollaborationMode::Chat,
+        collaboration: interactive_session_collaboration(),
         workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
         goal: "interactive session".to_string(),
         model,
@@ -974,7 +985,12 @@ pub(crate) async fn cmd_tui(
     } else {
         let mode = resolve_mode(mode, project_default_mode(&app.layout));
         let id = app
-            .create_session_with_mode(&model_ref, "interactive session", mode)
+            .create_session_with_collaboration(
+                &model_ref,
+                "interactive session",
+                mode,
+                interactive_session_collaboration(),
+            )
             .await?;
         (id, mode, None)
     };
@@ -3366,6 +3382,30 @@ mod interactive_bootstrap_tests {
             leveler_client_protocol::PermissionProfile::Assisted
         );
         assert!(request.model.is_none());
+    }
+
+    /// The single statement of the interactive axis. Both transports consume
+    /// it: the daemon writes it into the wire request, and the embedded runtime
+    /// passes it to the create. This test is what keeps a second, hand-written
+    /// axis from reappearing on one of the two paths.
+    #[test]
+    fn both_transports_consume_the_one_interactive_axis() {
+        let from_the_daemon_request = interactive_session_request(
+            None,
+            leveler_client_protocol::PermissionProfile::Assisted,
+            false,
+        )
+        .collaboration;
+        assert_eq!(
+            from_the_daemon_request,
+            interactive_session_collaboration(),
+            "the daemon request must state the shared interactive axis, not its own copy"
+        );
+        assert_eq!(
+            interactive_session_collaboration(),
+            leveler_local_transport::CollaborationMode::Chat,
+            "a new terminal session is a conversation; `/goal <task>` is how a user asks for the goal lifecycle"
+        );
     }
 
     /// The create-time policy and permission overrides move the axis not at

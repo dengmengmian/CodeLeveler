@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::CollaborationMode;
 use leveler_agent::coding::{CodingRuntime, TaskReport, TaskSpec};
 use leveler_agent::{AdvisoryKind, AgentEvent, AgentOutcome, AutoClarify, Clarifier};
 use leveler_engine::{EngineError, EngineEvent, ExecutionKind, TaskOutcome};
@@ -417,15 +418,41 @@ impl Application {
     /// The permission profile has exactly one authoritative create-time write:
     /// here. The running engine reads the same resolved value, so a created
     /// session can never be `Full` in memory and `assisted` in the database.
+    ///
+    /// The collaboration axis comes from [`Self::collaboration`], which is the
+    /// headless entry's contract (`leveler run`): the axis this Application was
+    /// assembled with. An entry whose axis is fixed by the product — the
+    /// interactive terminal session — states it through
+    /// [`Self::create_session_with_collaboration`] instead, so its row never
+    /// depends on what the process default happens to be.
     pub async fn create_session_with_mode(
         &self,
         model: &ModelRef,
         goal: &str,
         mode: PermissionProfile,
     ) -> Result<leveler_core::SessionId, AppError> {
+        self.create_session_with_collaboration(model, goal, mode, self.collaboration())
+            .await
+    }
+
+    /// Create and persist a session whose durable collaboration axis IS
+    /// `collaboration`, independent of this Application's own default.
+    ///
+    /// The axis has exactly one authoritative create-time write: here, through
+    /// the same [`Self::insert_session`] every other create path uses. A caller
+    /// that owns a fixed product axis writes that value; it must not read the
+    /// process default, or the entry point silently changes meaning whenever
+    /// the default moves.
+    pub async fn create_session_with_collaboration(
+        &self,
+        model: &ModelRef,
+        goal: &str,
+        mode: PermissionProfile,
+        collaboration: CollaborationMode,
+    ) -> Result<leveler_core::SessionId, AppError> {
         let db = self.open_database().await?;
         self.reap_zombie_turns(&db, None).await?;
-        self.insert_session(&db, model, goal, mode, self.collaboration())
+        self.insert_session(&db, model, goal, mode, collaboration)
             .await
     }
 
