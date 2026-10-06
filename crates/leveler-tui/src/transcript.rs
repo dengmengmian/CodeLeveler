@@ -836,12 +836,14 @@ impl TranscriptState {
             self.close_tool_group();
         }
         self.assign_batch(&mut call);
-        // Visible work acting on the prose is the proof that the prose was not
-        // the answer. Silent bookkeeping is NOT that proof: a real run ends
-        // `answer → update_goal(complete) → turn end`, and counting that as a
-        // boundary folded the answer away. Same rule the activity stream uses
-        // to decide what is work at all.
-        if is_grouping_visible(&call) {
+        // Work acting on the prose is the proof that the prose was not the
+        // answer. Silent calls never are — and neither is bookkeeping that only
+        // records state, even when it is Important: a real run ends
+        // `answer → update_plan → update_goal(complete) → turn end`, and
+        // counting the plan row as a boundary folded the answer away. This is
+        // the answer lifecycle's own predicate, deliberately separate from
+        // `is_grouping_visible`'s presentation question.
+        if crate::tool_taxonomy::acts_on_answer(&call.name, &call.arguments) {
             self.decide_pending_assistants(AssistantKind::Progress);
         }
         match self.items.last_mut() {
@@ -2047,7 +2049,6 @@ mod tests {
     /// Goal bookkeeping is not acting on the prose. The real dogfood run
     /// ended `answer → update_goal(complete) → turn_finished`, and treating
     /// that silent call as a tool boundary folded the actual answer away.
-    /// Only conversation-visible work decides that prose was interim.
     #[test]
     fn silent_bookkeeping_after_the_answer_does_not_demote_it() {
         let mut t = TranscriptState::new();
@@ -2060,6 +2061,62 @@ mod tests {
         );
         t.push_turn_end(TurnEndStatus::Completed, 1, 9, None, None);
         assert_eq!(kinds(&t), vec![AssistantKind::Final]);
+    }
+
+    /// Plan bookkeeping is not acting on the prose either — even though it is
+    /// an Important (visible) row. The real dogfood run ended
+    /// `answer → update_plan → update_goal(complete) → turn end`; letting the
+    /// plan row act as a work boundary folded the committed answer away and
+    /// made a completed turn render "未提交最终回答".
+    #[test]
+    fn plan_bookkeeping_after_the_answer_does_not_demote_it() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "调查完成，结论如下：两处都改好了。");
+        settled(&mut t, "p1", "update_plan", r#"{"plan":"done"}"#);
+        assert!(t.settle_final_answer());
+        t.push_turn_end(TurnEndStatus::Completed, 1, 9, None, None);
+        assert_eq!(kinds(&t), vec![AssistantKind::Final]);
+    }
+
+    /// The exact dogfood sequence: an answer, a plan update, then the goal
+    /// closeout. Every later call is bookkeeping, so the answer stands.
+    #[test]
+    fn plan_then_goal_closeout_after_the_answer_does_not_demote_it() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "调查完成，结论如下。");
+        settled(&mut t, "p1", "update_plan", r#"{"plan":"done"}"#);
+        settled(
+            &mut t,
+            "g1",
+            "update_goal",
+            r#"{"status":"complete","summary":"done"}"#,
+        );
+        assert!(t.settle_final_answer());
+        t.push_turn_end(TurnEndStatus::Completed, 2, 9, None, None);
+        assert_eq!(kinds(&t), vec![AssistantKind::Final]);
+    }
+
+    /// The fix must not turn every plan update into an answer. Narration in
+    /// front of a plan update is still narration when real work follows it,
+    /// and a turn that never wrote an answer still has none.
+    #[test]
+    fn plan_bookkeeping_does_not_rescue_narration_before_real_work() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m1", "我先做个计划，再开始改。");
+        settled(&mut t, "p1", "update_plan", r#"{"plan":"start"}"#);
+        settled(&mut t, "r1", "read_file", r#"{"path":"a"}"#);
+        assert!(!t.settle_final_answer());
+        t.push_turn_end(TurnEndStatus::Completed, 2, 9, None, None);
+        assert_eq!(kinds(&t), vec![AssistantKind::Progress]);
+    }
+
+    /// A plan update on its own does not answer anything: with no prose at all
+    /// the turn still has no committed answer.
+    #[test]
+    fn plan_bookkeeping_without_prose_commits_no_answer() {
+        let mut t = TranscriptState::new();
+        settled(&mut t, "p1", "update_plan", r#"{"plan":"start"}"#);
+        assert!(!t.settle_final_answer());
     }
 
     /// A silent exploration probe is not a boundary either — the prose stays

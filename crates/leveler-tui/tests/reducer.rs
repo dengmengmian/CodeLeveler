@@ -1979,6 +1979,94 @@ fn a_model_spawned_child_still_demotes_the_prose_before_it() {
     );
 }
 
+/// Reduce one settled tool call, the way a real turn records it.
+fn tool_call(s: &mut AppState, id: &str, name: &str, arguments: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new(id),
+            name: name.into(),
+            arguments: arguments.into(),
+            parallel: false,
+            model_step: Some(1),
+        }),
+    );
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new(id),
+            ok: true,
+            preview: "ok".into(),
+            duration_ms: 5,
+            applied_diff: None,
+        }),
+    );
+}
+
+/// The real dogfood regression, as the exact event order the run produced:
+/// `assistant_message(final) → update_plan → update_goal(complete) → turn end`.
+/// The durable session said completed and the report was in the transcript, yet
+/// the plan row (an Important *bookkeeping* call) folded the answer away and the
+/// footer read "未提交最终回答". Bookkeeping must not erase a committed answer.
+#[test]
+fn bookkeeping_tools_after_the_answer_do_not_erase_the_completion_footer() {
+    for end in [RuntimeEvent::TurnCompleted, RuntimeEvent::TurnAnswered] {
+        let mut s = opened();
+        answer(&mut s, "m-report", "调查完成，结论如下：两处都改好了。");
+        tool_call(&mut s, "p1", "update_plan", r#"{"plan":"done"}"#);
+        tool_call(
+            &mut s,
+            "g1",
+            "update_goal",
+            r#"{"status":"complete","summary":"done"}"#,
+        );
+        reduce(&mut s, Action::Runtime(end));
+        assert_ne!(
+            last_turn_end(&s).status,
+            TurnEndStatus::NoFinalAnswer,
+            "a committed answer must stand behind bookkeeping tools"
+        );
+        let screen = rendered(&mut s, 100, 30);
+        assert!(
+            !screen.contains(leveler_tui::Locale::Zh.text().turn_no_final_answer),
+            "the missing-answer banner is false here: {screen}"
+        );
+    }
+}
+
+/// A plan update on its own is not an answer. Narration followed by a plan
+/// update and then a real tool is still narration, so the turn still reports
+/// the missing answer — the fix must not turn every plan row into an answer.
+#[test]
+fn plan_bookkeeping_does_not_rescue_narration_before_real_work() {
+    let mut s = opened();
+    answer(&mut s, "m-progress", "我先看看 worker.go。");
+    tool_call(&mut s, "p1", "update_plan", r#"{"plan":"start"}"#);
+    tool_call(&mut s, "r1", "read_file", r#"{"path":"worker.go"}"#);
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert_eq!(
+        last_turn_end(&s).status,
+        TurnEndStatus::NoFinalAnswer,
+        "real work after the prose proves it was narration"
+    );
+}
+
+/// `progress → tool → answer → update_plan → end`: the answer that comes after
+/// real work is still the answer, and plan bookkeeping after it does not fold
+/// it away.
+#[test]
+fn plan_bookkeeping_after_a_late_answer_keeps_it() {
+    let mut s = opened();
+    answer(&mut s, "m-progress", "先看代码。");
+    tool_call(&mut s, "r1", "read_file", r#"{"path":"a"}"#);
+    answer(&mut s, "m-final", "改好了，两处都通过验证。");
+    tool_call(&mut s, "p1", "update_plan", r#"{"plan":"done"}"#);
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+    assert_eq!(last_turn_end(&s).status, TurnEndStatus::Completed);
+}
+
 fn sub_agent_running(id: &str, role: &str) -> RuntimeEvent {
     RuntimeEvent::SubAgentUpdated {
         id: id.into(),

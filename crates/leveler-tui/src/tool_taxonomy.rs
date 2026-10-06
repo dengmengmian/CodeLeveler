@@ -497,6 +497,27 @@ pub fn activity_visibility(name: &str, arguments: &str) -> ActivityVisibility {
         .unwrap_or(ActivityVisibility::Normal)
 }
 
+/// Whether a started call acts on the answer: its presence proves the prose
+/// before it was interim narration, not the turn's answer.
+///
+/// Deliberately a different question from [`activity_visibility`], which only
+/// decides whether the call becomes a Conversation row. `update_plan` is an
+/// Important row — the reader should see the plan change — yet it is pure
+/// bookkeeping: it records what the turn intends and does no work, so an answer
+/// written in front of it is still the answer. Folding presentation into the
+/// answer lifecycle is what made the real dogfood run
+/// `answer → update_plan → update_goal(complete) → turn end` render
+/// "未提交最终回答" over an answer that was already in the transcript.
+///
+/// Silent calls never act on the answer — that already covers
+/// `update_goal(complete)` and the read-only probes. `update_goal(blocked)`
+/// stays a boundary: it is why the run stopped, and that reason is not the
+/// turn's answer.
+pub fn acts_on_answer(name: &str, arguments: &str) -> bool {
+    activity_visibility(name, arguments) != ActivityVisibility::Silent
+        && !matches!(lookup(name).map(|e| e.kind), Some(ToolKind::Plan))
+}
+
 pub(crate) fn update_goal_is_blocked(arguments: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
@@ -841,5 +862,29 @@ mod tests {
             activity_visibility("update_goal", r#"{"status":"blocked","summary":"缺密钥"}"#),
             ActivityVisibility::Important
         );
+    }
+
+    /// The answer lifecycle is not the presentation question: `update_plan` is
+    /// an Important row yet never acts on the answer, while the read-only
+    /// probes and `update_goal(complete)` are Silent for both questions.
+    #[test]
+    fn answer_lifecycle_separates_bookkeeping_from_work() {
+        // Work: prose in front of it was narration.
+        assert!(acts_on_answer("read_file", r#"{"path":"a"}"#));
+        assert!(acts_on_answer("apply_patch", r#"{"patch":"p"}"#));
+        assert!(acts_on_answer("run_command", r#"{"program":"cargo"}"#));
+        // Bookkeeping: the answer before it survives.
+        assert!(!acts_on_answer("update_plan", r#"{"plan":"done"}"#));
+        assert!(!acts_on_answer(
+            "update_goal",
+            r#"{"status":"complete","summary":"done"}"#
+        ));
+        // Silent probes are never a boundary either.
+        assert!(!acts_on_answer("list_files", r#"{"path":"."}"#));
+        // A blocked goal stops the run; that reason is not the answer.
+        assert!(acts_on_answer(
+            "update_goal",
+            r#"{"status":"blocked","summary":"缺密钥"}"#
+        ));
     }
 }

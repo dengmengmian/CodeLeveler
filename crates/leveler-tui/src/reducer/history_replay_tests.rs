@@ -658,6 +658,113 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
     }
 }
 
+/// The dogfood terminal sequence must read the same after a reopen:
+/// `answer → update_plan → update_goal(complete) → turn end` has a committed
+/// answer behind it, live and replayed. If the paths disagreed, resuming a
+/// completed session would flip it back to "未提交最终回答".
+#[test]
+fn bookkeeping_after_the_answer_reads_the_same_live_and_replayed() {
+    let bookkeeping = |id: &str, name: &str, arguments: &str| -> [RuntimeEvent; 2] {
+        [
+            RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: name.into(),
+                arguments: arguments.into(),
+                parallel: false,
+                model_step: Some(2),
+            },
+            RuntimeEvent::ToolCallCompleted {
+                id: ToolCallId::new(id),
+                ok: true,
+                preview: "ok".into(),
+                duration_ms: 4,
+                applied_diff: None,
+                exit_code: None,
+                stop: None,
+            },
+        ]
+    };
+    let report = "调查完成，结论如下：两处都改好了。";
+    let answer = MessageId::new("a1");
+    let mut events = vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "修一下终态"),
+        },
+        RuntimeEvent::AssistantMessageStarted {
+            message_id: answer.clone(),
+        },
+        RuntimeEvent::AssistantTextDelta {
+            message_id: answer.clone(),
+            delta: report.into(),
+        },
+        RuntimeEvent::AssistantMessageCompleted {
+            message_id: answer.clone(),
+        },
+    ];
+    events.extend(bookkeeping("p1", "update_plan", r#"{"plan":"done"}"#));
+    events.extend(bookkeeping(
+        "g1",
+        "update_goal",
+        r#"{"status":"complete","summary":"done"}"#,
+    ));
+    events.push(RuntimeEvent::TurnCompleted);
+
+    let mut live = state();
+    open(&mut live, Vec::new());
+    for event in events.clone() {
+        reduce(&mut live, Action::Runtime(event));
+    }
+
+    let mut replayed = state();
+    let effects = open(
+        &mut replayed,
+        vec![
+            message(UiRole::User, "修一下终态"),
+            message(UiRole::Assistant, report),
+        ],
+    );
+    let entries: Vec<UiHistoryEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+
+    for (label, s) in [("live", &live), ("replayed", &replayed)] {
+        let end = s
+            .transcript
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                TranscriptItem::TurnEnd(end) => Some(end.status),
+                _ => None,
+            });
+        assert_eq!(end, Some(TurnEndStatus::Completed), "{label}");
+        assert_eq!(
+            s.transcript
+                .items()
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    TranscriptItem::Assistant(b)
+                        if b.kind == crate::transcript::AssistantKind::Final
+                ))
+                .count(),
+            1,
+            "{label}: the report is the committed answer"
+        );
+    }
+}
+
 /// Browser parity: the per-call action label (`打开页面`, `读取页面`) is
 /// presentation derived from the call's own arguments, so history must rebuild
 /// it exactly as the live turn showed it. A real dogfood caught the live run
