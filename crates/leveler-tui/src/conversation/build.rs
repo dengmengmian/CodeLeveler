@@ -554,6 +554,7 @@ mod tests {
             .to_string(),
             false,
             0,
+            None,
         );
         s.transcript
             .complete_tool(&id, true, "patched".into(), 5, Some(diff));

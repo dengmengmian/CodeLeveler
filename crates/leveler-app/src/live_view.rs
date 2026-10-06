@@ -164,6 +164,7 @@ mod tests {
                 name: "run_command".to_string(),
                 arguments: r#"{"cmd":"cargo test"}"#.to_string(),
                 parallel: false,
+                model_step: None,
             },
         );
         assert_eq!(views.view(&session_id).active_tools.len(), 1);
@@ -197,6 +198,7 @@ mod tests {
                 name: "shell_command".to_string(),
                 arguments: r#"{"cmd":"cargo test"}"#.to_string(),
                 parallel: false,
+                model_step: None,
             },
         );
         views.apply(
@@ -298,6 +300,7 @@ mod task_cancel_cleanup_tests {
                 name: "run_command".into(),
                 arguments: "{}".into(),
                 parallel: false,
+                model_step: None,
             },
         );
         views.apply(

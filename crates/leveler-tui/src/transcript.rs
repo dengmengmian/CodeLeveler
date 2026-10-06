@@ -124,18 +124,29 @@ pub struct ToolCallBlock {
     pub applied_diff: Option<String>,
 }
 
-/// A consecutive burst of tool calls between two assistant messages.
+/// A burst of tool calls belonging to one execution round.
+///
+/// The boundary is the REAL one: every call the model requested in a single
+/// response shares this group, and the next response's calls open a new one —
+/// even when neither response produced visible assistant prose. `round` is the
+/// runtime's model-step identity (the same value the durable
+/// `TurnFinished.model_steps` / `RuntimeInjection.model_step` use). `None` is a
+/// legacy transcript that never recorded it; grouping then falls back to the
+/// pre-round heuristic so old sessions read exactly as before.
 ///
 /// The group stays open after an individual call finishes because the model may
-/// immediately issue another call. Keeping the whole burst live prevents an
-/// early call from being committed to terminal scrollback before the UI knows
-/// the group is complete and can collapse it to one summary line.
+/// immediately issue another call in the SAME round. Keeping the whole burst
+/// live prevents an early call from being committed to terminal scrollback
+/// before the UI knows the group is complete and can collapse it to one summary
+/// line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolGroupBlock {
     pub calls: Vec<ToolCallBlock>,
     pub open: bool,
     /// Per-group disclosure. Ctrl+O toggles only the current (latest) group.
     pub expanded: bool,
+    /// The execution round (model step) whose response made these calls.
+    pub round: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -786,6 +797,11 @@ impl TranscriptState {
     }
 
     /// Record a started tool call as a running block.
+    ///
+    /// `model_step` is the runtime's execution-round identity: every call from
+    /// one model response carries the same value. `None` only for a transcript
+    /// that never recorded it (legacy history), where grouping falls back to
+    /// the pre-round activity-class heuristic.
     pub fn push_tool_started(
         &mut self,
         id: ToolCallId,
@@ -793,6 +809,7 @@ impl TranscriptState {
         arguments: String,
         parallel: bool,
         started_elapsed_secs: i64,
+        model_step: Option<u32>,
     ) {
         self.bump();
         let mut call = ToolCallBlock {
@@ -814,7 +831,7 @@ impl TranscriptState {
         };
         if let Some(TranscriptItem::ToolGroup(group)) = self.items.last()
             && group.open
-            && starts_new_activity(group, &call)
+            && starts_new_group(group, &call, model_step)
         {
             self.close_tool_group();
         }
@@ -833,6 +850,7 @@ impl TranscriptState {
                 calls: vec![call],
                 open: true,
                 expanded: false,
+                round: model_step,
             })),
         }
     }
@@ -1358,13 +1376,31 @@ fn compact_summary(text: String, max_chars: usize) -> Option<String> {
     Some(summary)
 }
 
+/// Whether `call` opens a new execution ROUND instead of continuing `group`.
+///
+/// The round boundary is the real one the runtime observed: a different model
+/// step made this call, so the previous group belongs to an earlier response.
+/// This is the primary boundary and it does NOT consult tool kind, timing or
+/// assistant prose — two prose-free rounds of the same tool still split.
+///
+/// When either side lacks the identity (a legacy persisted transcript, or a
+/// synthesized start whose result arrived without one) the pre-round heuristic
+/// decides, so old sessions read exactly as they did before.
+fn starts_new_group(group: &ToolGroupBlock, call: &ToolCallBlock, model_step: Option<u32>) -> bool {
+    match (group.round, model_step) {
+        (Some(existing), Some(incoming)) => existing != incoming,
+        _ => starts_new_activity(group, call),
+    }
+}
+
 /// Whether `call` begins a new semantic activity instead of continuing `group`.
 ///
 /// A transcript burst ("everything between two assistant messages") is a
 /// runtime fact; an activity is what the reader sees. Welding reads, an edit
 /// and a shell run into one block let the edit hold the whole burst open and
 /// left the conversation with no narrative shape — so a fully settled group
-/// yields to the next KIND of work.
+/// yields to the next KIND of work. Superseded by [`starts_new_group`] wherever
+/// the real execution-round identity exists.
 fn starts_new_activity(group: &ToolGroupBlock, call: &ToolCallBlock) -> bool {
     // Still in flight: this is a real concurrent batch, never split it.
     if group.calls.iter().any(|c| c.status == ToolStatus::Running) {
@@ -1416,6 +1452,7 @@ mod tests {
             "{}".into(),
             false,
             0,
+            None,
         );
         let v2 = t.version();
         assert!(v2 > v1, "push_tool_started must bump");
@@ -1434,7 +1471,14 @@ mod tests {
     /// Push one call and settle it, so the next push sees a fully settled
     /// (but still open) group — the shape a sequential model turn produces.
     fn settled(t: &mut TranscriptState, id: &str, name: &str, args: &str) {
-        t.push_tool_started(ToolCallId::new(id), name.into(), args.into(), false, 0);
+        t.push_tool_started(
+            ToolCallId::new(id),
+            name.into(),
+            args.into(),
+            false,
+            0,
+            None,
+        );
         t.complete_tool(&ToolCallId::new(id), true, "ok".into(), 1, None);
     }
 
@@ -1444,7 +1488,14 @@ mod tests {
     /// when it dispatches a concurrent read-only batch (every member is
     /// announced, then they all run).
     fn announce(t: &mut TranscriptState, id: &str, name: &str, args: &str, parallel: bool) {
-        t.push_tool_started(ToolCallId::new(id), name.into(), args.into(), parallel, 0);
+        t.push_tool_started(
+            ToolCallId::new(id),
+            name.into(),
+            args.into(),
+            parallel,
+            0,
+            None,
+        );
     }
 
     fn finish(t: &mut TranscriptState, id: &str) {
@@ -1460,6 +1511,165 @@ mod tests {
             })
             .flatten()
             .collect()
+    }
+
+    // ── Execution Round: the real model-step boundary ───────────────────────
+
+    /// Calls per tool group, in transcript order.
+    fn groups_len(t: &TranscriptState) -> Vec<usize> {
+        t.items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::ToolGroup(g) if !g.calls.is_empty() => Some(g.calls.len()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The round identity carried by each tool group, in transcript order.
+    fn rounds(t: &TranscriptState) -> Vec<Option<u32>> {
+        t.items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::ToolGroup(g) => Some(g.round),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One settled call the model requested in `round` (a model-step identity).
+    fn call_in_round(t: &mut TranscriptState, id: &str, name: &str, args: &str, round: u32) {
+        t.push_tool_started(
+            ToolCallId::new(id),
+            name.into(),
+            args.into(),
+            false,
+            0,
+            Some(round),
+        );
+        t.complete_tool(&ToolCallId::new(id), true, "ok".into(), 1, None);
+    }
+
+    fn announce_in_round(
+        t: &mut TranscriptState,
+        id: &str,
+        name: &str,
+        args: &str,
+        parallel: bool,
+        round: u32,
+    ) {
+        t.push_tool_started(
+            ToolCallId::new(id),
+            name.into(),
+            args.into(),
+            parallel,
+            0,
+            Some(round),
+        );
+    }
+
+    /// A — two model responses, no visible assistant prose between them. The
+    /// calls still split: the boundary is the response, not the prose.
+    #[test]
+    fn two_prose_free_responses_are_two_tool_groups() {
+        let mut t = TranscriptState::new();
+        call_in_round(&mut t, "a1", "run_command", r#"{"program":"ls"}"#, 1);
+        call_in_round(&mut t, "a2", "run_command", r#"{"program":"pwd"}"#, 1);
+        call_in_round(&mut t, "b1", "run_command", r#"{"program":"stat"}"#, 2);
+        call_in_round(&mut t, "b2", "run_command", r#"{"program":"git"}"#, 2);
+
+        assert_eq!(groups_len(&t), vec![2, 2], "one group per model response");
+        assert_eq!(rounds(&t), vec![Some(1), Some(2)]);
+    }
+
+    /// B — one response, three calls: one group, three rows.
+    #[test]
+    fn one_response_with_three_calls_is_one_tool_group() {
+        let mut t = TranscriptState::new();
+        for (id, program) in [("c1", "ls"), ("c2", "pwd"), ("c3", "git")] {
+            let args = format!(r#"{{"program":"{program}"}}"#);
+            call_in_round(&mut t, id, "run_command", &args, 7);
+        }
+        assert_eq!(groups_len(&t), vec![3]);
+        assert_eq!(rounds(&t), vec![Some(7)]);
+    }
+
+    /// C — a parallel batch is still ONE round: the observed batch is a
+    /// presentation unit inside the round, never a boundary.
+    #[test]
+    fn a_parallel_batch_stays_one_round() {
+        let mut t = TranscriptState::new();
+        for (id, path) in [("r1", "a"), ("r2", "b"), ("r3", "c")] {
+            let args = format!(r#"{{"path":"{path}"}}"#);
+            announce_in_round(&mut t, id, "read_file", &args, true, 3);
+        }
+        assert_eq!(rounds(&t), vec![Some(3)]);
+        assert_eq!(groups_len(&t), vec![3]);
+        assert!(
+            batches(&t).iter().all(|b| b.is_some()),
+            "the observed batch identity survives the round boundary: {:?}",
+            batches(&t)
+        );
+    }
+
+    /// D — visible prose between two rounds neither merges them nor loses
+    /// either: the second round is a fresh group.
+    #[test]
+    fn assistant_prose_between_rounds_keeps_both_groups() {
+        let mut t = TranscriptState::new();
+        call_in_round(&mut t, "a1", "run_command", r#"{"program":"ls"}"#, 1);
+        t.begin_assistant(leveler_client_protocol::MessageId::new("m1"));
+        t.finish_assistant(&leveler_client_protocol::MessageId::new("m1"));
+        call_in_round(&mut t, "b1", "read_file", r#"{"path":"x"}"#, 2);
+        assert_eq!(groups_len(&t), vec![1, 1]);
+        assert_eq!(rounds(&t), vec![Some(1), Some(2)]);
+    }
+
+    /// E — the real Dogfood shape: ten prose-free rounds of 2–3 calls are ten
+    /// groups, not one ~25-call group.
+    #[test]
+    fn many_prose_free_rounds_are_many_tool_groups() {
+        let mut t = TranscriptState::new();
+        let mut total = 0usize;
+        for round in 1..=10u32 {
+            let n = if round % 2 == 0 { 2 } else { 3 };
+            for i in 0..n {
+                call_in_round(
+                    &mut t,
+                    &format!("c{round}-{i}"),
+                    "run_command",
+                    r#"{"program":"ls"}"#,
+                    round,
+                );
+                total += 1;
+            }
+        }
+        assert_eq!(total, 25);
+        assert_eq!(groups_len(&t), vec![3, 2, 3, 2, 3, 2, 3, 2, 3, 2]);
+        assert_eq!(rounds(&t).first(), Some(&Some(1)));
+        assert_eq!(rounds(&t).last(), Some(&Some(10)));
+    }
+
+    /// Without the runtime identity (a legacy persisted transcript) the old
+    /// activity-class rule still applies — old sessions must not regress into
+    /// one giant group or into a different shape.
+    #[test]
+    fn legacy_calls_without_a_round_keep_the_activity_class_boundary() {
+        let mut t = TranscriptState::new();
+        settled(&mut t, "a1", "read_file", r#"{"path":"a"}"#);
+        settled(&mut t, "a2", "read_file", r#"{"path":"b"}"#);
+        settled(
+            &mut t,
+            "a3",
+            "run_command",
+            r#"{"program":"cargo","args":["test"]}"#,
+        );
+        assert_eq!(
+            groups_len(&t),
+            vec![2, 1],
+            "a settled read group yields to a command"
+        );
+        assert_eq!(rounds(&t), vec![None, None]);
     }
 
     /// B1: three reads announced before any finishes were in flight together,
@@ -1654,6 +1864,7 @@ mod tests {
             r#"{"path":"a"}"#.into(),
             true,
             0,
+            None,
         );
         t.push_tool_started(
             ToolCallId::new("e1"),
@@ -1661,6 +1872,7 @@ mod tests {
             r#"{"patch":"x"}"#.into(),
             true,
             0,
+            None,
         );
         assert_eq!(group_shapes(&t).len(), 1, "{:?}", group_shapes(&t));
     }
@@ -1941,6 +2153,7 @@ mod tests {
             }],
             open: false,
             expanded,
+            round: None,
         }
     }
 

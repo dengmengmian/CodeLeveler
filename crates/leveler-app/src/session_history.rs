@@ -466,6 +466,7 @@ mod tests {
                 parallel: false,
                 risk: None,
                 agent_id: None,
+                model_step: None,
             },
         )
         .await;

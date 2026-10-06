@@ -441,6 +441,7 @@ fn renders_failed_tool_inline_and_tools_screen() {
             name: "run_command".into(),
             arguments: "cargo test".into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -515,6 +516,7 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["test"]}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -602,6 +604,7 @@ fn command_result_renders_as_important_activity_not_file_list() {
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["test","-p","leveler-tui"]}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -663,6 +666,7 @@ fn running_command_renders_as_progress_activity() {
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["check"]}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
 
@@ -692,6 +696,7 @@ fn list_files_scan_stays_out_of_conversation() {
                 name: "list_files".into(),
                 arguments: format!(r#"{{"path":"{path}"}}"#),
                 parallel: false,
+                model_step: None,
             }),
         );
         reduce(
@@ -715,6 +720,7 @@ fn list_files_scan_stays_out_of_conversation() {
             name: "apply_patch".into(),
             arguments: r#"{"patch":"*** Begin Patch\n*** Update File: internal/admin/web/web.go\n*** End Patch"}"#.into(),
             parallel: false,
+        model_step: None,
         }),
     );
     reduce(
@@ -1012,6 +1018,7 @@ fn recap_does_not_render_raw_markdown_markers() {
             })
             .to_string(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -1199,6 +1206,7 @@ fn a_silent_tool_group_leaves_no_hole() {
             name: "run_command".into(),
             arguments: r#"{"program":"ls","args":["-la"]}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(

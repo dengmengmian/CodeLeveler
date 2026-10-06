@@ -142,6 +142,7 @@ fn tool(s: &mut AppState, id: &str, name: &str, args: &str, ok: bool, preview: &
             name: name.into(),
             arguments: args.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -175,6 +176,7 @@ fn edit(s: &mut AppState, id: &str, path: &str, applied: &str) {
             name: "apply_patch".into(),
             arguments: serde_json::json!({ "patch": patch }).to_string(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -417,6 +419,7 @@ fn s11_command_focus_and_stop() {
             })
             .to_string(),
             parallel: false,
+            model_step: None,
         }),
     );
     s.elapsed_secs = 34;
@@ -637,6 +640,7 @@ fn s03_long_task() {
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["test","--workspace"]}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -833,6 +837,7 @@ fn d02_applied_diff_line_count() {
             "patch": "*** Begin Patch\n*** Update File: src/other.rs\n@@\n-let a = 1;\n+let a = 2;\n*** End Patch"
         }).to_string(),
         parallel: false,
+    model_step: None,
     }));
     reduce(
         &mut s,

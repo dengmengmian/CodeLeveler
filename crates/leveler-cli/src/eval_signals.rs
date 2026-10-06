@@ -223,6 +223,7 @@ impl SignalCollector {
                 name,
                 arguments,
                 parallel,
+                ..
             } => {
                 self.signals.tool_calls += 1;
                 // Observation density: the read-only class is the runtime's
@@ -562,6 +563,7 @@ mod tests {
             name: name.into(),
             arguments: args.to_string(),
             parallel: false,
+            model_step: None,
         }
     }
 
@@ -573,6 +575,7 @@ mod tests {
             name: name.into(),
             arguments: args.to_string(),
             parallel: true,
+            model_step: None,
         }
     }
 

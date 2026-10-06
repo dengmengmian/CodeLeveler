@@ -224,6 +224,14 @@ pub enum EngineEvent {
         /// top-level one. Legacy events omit it (parent call).
         #[serde(default)]
         agent_id: Option<String>,
+        /// The 1-based model step whose response requested this call — the
+        /// real execution-round boundary, so a client can group one response's
+        /// calls together even when the round produced no assistant prose.
+        /// Legacy events omit it; a reader must then fall back to its old
+        /// grouping rather than invent a boundary. Same identity as
+        /// [`Self::RuntimeInjection::model_step`] and `TurnFinished.model_steps`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_step: Option<u32>,
     },
     ToolCallFinished {
         call_id: String,
@@ -1298,6 +1306,7 @@ mod contract_tests {
                 parallel: false,
                 risk: None,
                 agent_id: None,
+                model_step: None,
             },
             EngineEvent::ContextSnapshot {
                 messages: vec![],
@@ -1393,6 +1402,39 @@ mod contract_tests {
         assert!(matches!(
             EngineEvent::from_payload(payload).unwrap(),
             EngineEvent::ToolCallStarted { risk: None, .. }
+        ));
+    }
+
+    /// The round identity is durable: a tool call written with its model step
+    /// reads back with it, and a pre-round row reads back as `None` (unknown),
+    /// never as step 0 — which would fuse every legacy round into one.
+    #[test]
+    fn tool_started_keeps_its_model_step_and_a_legacy_row_stays_unknown() {
+        let event = EngineEvent::ToolCallStarted {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+            parallel: false,
+            risk: None,
+            agent_id: None,
+            model_step: Some(3),
+        };
+        let payload = serde_json::to_string(&event).unwrap();
+        assert!(matches!(
+            EngineEvent::from_payload(&payload).unwrap(),
+            EngineEvent::ToolCallStarted {
+                model_step: Some(3),
+                ..
+            }
+        ));
+
+        let legacy = r#"{"type":"tool_call_started","payload":{"call_id":"c1","name":"read_file","arguments":"{}"}}"#;
+        assert!(matches!(
+            EngineEvent::from_payload(legacy).unwrap(),
+            EngineEvent::ToolCallStarted {
+                model_step: None,
+                ..
+            }
         ));
     }
 }

@@ -384,6 +384,7 @@ mod tests {
             serde_json::json!({ "task_id": task_id }).to_string(),
             false,
             started as i64,
+            None,
         );
         state.activity = Some("等待任务".into());
     }
@@ -454,6 +455,7 @@ mod tests {
             serde_json::json!({ "profile": "worker", "task": "run cargo check" }).to_string(),
             false,
             0,
+            None,
         );
         state
             .team
@@ -548,6 +550,7 @@ mod tests {
             serde_json::json!({ "path": "README.md" }).to_string(),
             false,
             0,
+            None,
         );
         assert!(
             project(&state).is_none(),
@@ -639,6 +642,7 @@ mod tests {
                 serde_json::json!({ "task_id": id }).to_string(),
                 true,
                 0,
+                None,
             );
         }
         let view = project(&state).unwrap();

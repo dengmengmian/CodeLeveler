@@ -119,6 +119,7 @@ fn start(s: &mut AppState, id: &str, args: &str) {
             name: "run_command".into(),
             arguments: args.into(),
             parallel: false,
+            model_step: None,
         }),
     );
 }

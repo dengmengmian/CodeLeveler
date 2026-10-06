@@ -381,6 +381,9 @@ impl<'a> EventLog<'a> {
                     parallel: _,
                     risk,
                     agent_id,
+                    // Crash recovery pairs calls by id; the round a call
+                    // belonged to is not part of a dangling-call record.
+                    model_step: _,
                 } => open.push(DanglingCall {
                     turn_id: row.turn_id.clone(),
                     call_id,
@@ -731,6 +734,7 @@ mod tests {
                     parallel: false,
                     risk: None,
                     agent_id: None,
+                    model_step: None,
                 },
                 &mut sink,
             )
@@ -821,6 +825,7 @@ mod tests {
                     parallel: false,
                     risk: Some(leveler_execution::RiskLevel::Safe),
                     agent_id: None,
+                    model_step: None,
                 },
                 &mut |_| {},
             )
@@ -882,6 +887,7 @@ mod tests {
                     parallel: false,
                     risk: Some(leveler_execution::RiskLevel::Destructive),
                     agent_id: Some(agent.to_string()),
+                    model_step: None,
                 },
                 &mut |_| {},
             )
@@ -948,6 +954,7 @@ mod tests {
                 parallel: false,
                 risk: Some(leveler_execution::RiskLevel::Destructive),
                 agent_id: None,
+                model_step: None,
             },
             &mut |_| {},
         )
@@ -1186,6 +1193,7 @@ mod tests {
                 parallel: false,
                 risk: None,
                 agent_id: None,
+                model_step: None,
             },
             EngineEvent::AssistantDelta {
                 text: "thinking".into(),

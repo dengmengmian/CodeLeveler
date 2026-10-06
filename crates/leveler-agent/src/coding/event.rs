@@ -24,6 +24,7 @@ impl From<AgentEvent> for EngineEvent {
                 name,
                 arguments,
                 parallel,
+                model_step,
             } => EngineEvent::ToolCallStarted {
                 call_id: id,
                 name,
@@ -35,6 +36,7 @@ impl From<AgentEvent> for EngineEvent {
                 // The top-level loop's own call; a delegated one arrives as a
                 // ChildToolEvent and carries its agent id.
                 agent_id: None,
+                model_step,
             },
             A::ToolResult {
                 id,

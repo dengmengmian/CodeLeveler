@@ -287,6 +287,14 @@ pub enum RuntimeEvent {
         /// group such calls as one parallel burst.
         #[serde(default)]
         parallel: bool,
+        /// The 1-based model step whose response requested this call — the real
+        /// execution-round boundary. Every call from one model response carries
+        /// the same value, so a UI groups one response's calls together even
+        /// when the round produced no visible assistant prose. Legacy events
+        /// omit it; a client must then fall back to its old grouping rather
+        /// than invent a boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_step: Option<u32>,
     },
     /// A tool call finished. `preview` is the runtime's truncated output;
     /// `duration_ms` is measured client-side.
@@ -1138,9 +1146,28 @@ mod tests {
                 name: "read".to_string(),
                 arguments: "{}".to_string(),
                 parallel: false,
+                model_step: Some(2),
             },
             "tool_call_started",
         );
+    }
+
+    /// A recorded pre-round event has no `model_step`; a reader must decode it
+    /// as `None` so it can fall back to its old grouping, not as step 0 (which
+    /// would fuse every legacy call into one round).
+    #[test]
+    fn a_legacy_tool_call_started_decodes_without_a_round_identity() {
+        let json = serde_json::json!({
+            "type": "tool_call_started",
+            "id": "tc1",
+            "name": "read",
+            "arguments": "{}",
+            "parallel": false,
+        });
+        match serde_json::from_value::<RuntimeEvent>(json).unwrap() {
+            RuntimeEvent::ToolCallStarted { model_step, .. } => assert_eq!(model_step, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

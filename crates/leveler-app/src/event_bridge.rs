@@ -661,6 +661,7 @@ impl EventBridge {
                 parallel,
                 risk: _,
                 agent_id: None,
+                model_step,
             } => {
                 // A tool call ends the current assistant thought. Close any open
                 // streamed message so the next round's text opens a fresh block
@@ -681,6 +682,7 @@ impl EventBridge {
                     name,
                     arguments,
                     parallel,
+                    model_step,
                 });
             }
             EngineEvent::ToolCallFinished {
@@ -707,6 +709,10 @@ impl EventBridge {
                             name,
                             arguments: String::new(),
                             parallel: false,
+                            // No round identity survived with this result:
+                            // a client keeps its old grouping rather than
+                            // invent a boundary (see the arm above).
+                            model_step: None,
                         });
                         Instant::now()
                     }
@@ -1561,6 +1567,39 @@ mod bridge_tests {
             .unwrap_or_default()
     }
 
+    /// The kernel's model-step identity rides the tool call all the way to the
+    /// client. This is the fact a UI groups one model response's calls by; it
+    /// is not re-derived from prose, timing or tool kind anywhere downstream.
+    #[test]
+    fn the_model_step_round_identity_reaches_clients() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut bridge = EventBridge::new(tx);
+        forward_agent(
+            &mut bridge,
+            leveler_agent::AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                parallel: false,
+                model_step: Some(3),
+            },
+        );
+        let events = drain(&mut rx);
+        match events
+            .iter()
+            .find_map(|e| match e {
+                RuntimeEvent::ToolCallStarted { id, model_step, .. } if id.as_str() == "c1" => {
+                    Some(*model_step)
+                }
+                _ => None,
+            })
+            .expect("the call reached the client")
+        {
+            Some(3) => {}
+            other => panic!("the round identity was dropped: {other:?}"),
+        }
+    }
+
     /// A command's live output and how it ended both reach clients: output
     /// as `ToolCallOutput` for that call, exit code and stop outcome on its
     /// completion.
@@ -1575,6 +1614,7 @@ mod bridge_tests {
                 name: "shell_command".into(),
                 arguments: r#"{"cmd":"cargo test"}"#.into(),
                 parallel: false,
+                model_step: None,
             },
         );
         forward_agent(
@@ -1635,6 +1675,7 @@ mod bridge_tests {
                 name: "grep".into(),
                 arguments: String::new(),
                 parallel: false,
+                model_step: None,
             },
         );
         forward_agent(
@@ -1644,6 +1685,7 @@ mod bridge_tests {
                 name: "apply_patch".into(),
                 arguments: String::new(),
                 parallel: false,
+                model_step: None,
             },
         );
         forward_agent(
@@ -1885,6 +1927,7 @@ mod bridge_tests {
                 name: "grep".into(),
                 arguments: "{}".into(),
                 parallel: false,
+                model_step: None,
             },
         );
         // A tool call followed the first text: it was progress. The nudge flag
@@ -1975,6 +2018,7 @@ mod bridge_tests {
                     name: "grep".into(),
                     arguments: "{}".into(),
                     parallel: false,
+                    model_step: None,
                 },
             );
             forward_agent(
@@ -2123,6 +2167,7 @@ mod bridge_tests {
                 name: "read_file".into(),
                 arguments: String::new(),
                 parallel: false,
+                model_step: None,
             },
         );
         forward_agent(
@@ -2415,6 +2460,7 @@ mod projection_equivalence {
             parallel: false,
             risk: None,
             agent_id: agent.map(str::to_string),
+            model_step: None,
         }
     }
 

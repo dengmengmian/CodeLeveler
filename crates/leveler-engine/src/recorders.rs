@@ -159,6 +159,9 @@ impl EventBarrier for PumpBarrier {
                 parallel: false,
                 risk,
                 agent_id: Some(agent_id),
+                // A child's model step is the child's own; the durable
+                // execution-round identity here belongs to the parent loop.
+                model_step: None,
             },
             ChildToolEvent::Finished {
                 agent_id,
@@ -420,6 +423,7 @@ mod tests {
                 parallel: true,
                 risk: None,
                 agent_id: agent_id.clone(),
+                model_step: None,
             });
             emitter.emit(EngineEvent::ToolCallFinished {
                 exit_code: None,

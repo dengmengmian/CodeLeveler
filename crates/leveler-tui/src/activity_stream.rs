@@ -120,6 +120,33 @@ pub(crate) fn render_group_rows(
         .filter(|c| is_conversation_visible(c))
         .collect();
     let units = plan_units(&group.calls);
+    // An execution round whose calls are all one tool IS a run: it reads as a
+    // tool-named head (`› 执行命令 · 完成 3 项`) with the calls as its tree,
+    // instead of a stage sentence above flat rows. The round identity makes
+    // the group exactly one model response, so this is its natural form.
+    if group.round.is_some()
+        && group_is_disclosable(group)
+        && !visible.is_empty()
+        && visible.iter().all(|c| c.name == visible[0].name)
+    {
+        push_run(
+            &visible,
+            None,
+            group,
+            theme,
+            width,
+            locale,
+            t,
+            now_elapsed_secs,
+            awaiting_approval,
+            true,
+            rows,
+            &index_of,
+            focused_command,
+            &mut out,
+        );
+        return out;
+    }
     // A group header earns its row by ADDING what no child can. A `Run`/`Batch`
     // unit paints its own head, so a second disclosure above it would be two
     // parents for one stretch. Every other group is a STAGE, and its parent row
@@ -140,14 +167,30 @@ pub(crate) fn render_group_rows(
     let unit_owns_head = units
         .iter()
         .any(|u| matches!(u, StreamUnit::Run(_) | StreamUnit::Batch(_)));
-    let stage_worthy = group_is_disclosable(group)
-        && !unit_owns_head
-        && (visible.len() > 1 || visible.first().is_some_and(|c| is_shell_call(c)));
     // Live unless the group is CLOSED and every call has settled. The group's
     // own `open` flag alone is not enough: a closed group can still hold a call
     // in flight, and a settled-but-open one is still being written to.
     let live = group.open || !group_is_finished(group);
-    let header = stage_worthy.then(|| disclosure_presentation(&visible, group.expanded, live, t));
+    // A round whose calls are NOT all one tool does not fit the single-run
+    // form, but it is still one execution node: it names itself (`多个工具`)
+    // and counts what finished, instead of a stage sentence. Edit rounds are
+    // excluded — a diff is the result and keeps its own shape.
+    let mixed_round = group.round.is_some()
+        && !visible.is_empty()
+        && !group_has_edits(group)
+        && group_is_disclosable(group);
+    let stage_worthy = !mixed_round
+        && group_is_disclosable(group)
+        && !unit_owns_head
+        && (visible.len() > 1 || visible.first().is_some_and(|c| is_shell_call(c)));
+    let header = if mixed_round {
+        let mut p = disclosure_presentation(&visible, group.expanded, live, t);
+        p.label = round_mixed_head(&visible, t);
+        p.ok_suffix = None;
+        Some(p)
+    } else {
+        stage_worthy.then(|| disclosure_presentation(&visible, group.expanded, live, t))
+    };
     if let Some(header) = &header {
         out.push(crate::presentation::disclosure::header_line(
             header, theme, width,
@@ -207,6 +250,10 @@ pub(crate) fn render_group_rows(
                     t,
                     now_elapsed_secs,
                     awaiting_approval,
+                    false,
+                    rows,
+                    &index_of,
+                    focused_command,
                     &mut out,
                 );
             }
@@ -225,6 +272,10 @@ pub(crate) fn render_group_rows(
                     t,
                     now_elapsed_secs,
                     awaiting_approval,
+                    false,
+                    rows,
+                    &index_of,
+                    focused_command,
                     &mut out,
                 );
             }
@@ -540,6 +591,30 @@ fn disclosure_presentation(
 /// the present tense, carrying only the count observed so far. It mirrors the
 /// finished label's shape so closing a group rewrites the row in place instead
 /// of replacing it with a differently shaped one.
+/// A mixed execution round's head: its name ("多个工具" / "Multiple Tools")
+/// plus what completed or, while live, what is still running. The count of
+/// SUCCESSES is stated, so a round that ran a failure never reads as if
+/// everything finished.
+fn round_mixed_head(visible: &[&ToolCallBlock], t: &UiText) -> String {
+    if visible.iter().any(|c| c.status == ToolStatus::Running) {
+        format!(
+            "{} \u{b7} {}",
+            t.round_mixed,
+            t.round_running.replace("{}", &visible.len().to_string())
+        )
+    } else {
+        let ok = visible
+            .iter()
+            .filter(|c| c.status == ToolStatus::Ok)
+            .count();
+        format!(
+            "{} \u{b7} {}",
+            t.round_mixed,
+            t.round_done.replace("{}", &ok.to_string())
+        )
+    }
+}
+
 fn disclosure_running_label(visible: &[&ToolCallBlock], t: &UiText) -> String {
     use DisclosureClass::*;
     let n = visible.len();
@@ -1055,6 +1130,7 @@ fn is_uniform(calls: &[&ToolCallBlock]) -> bool {
 /// stretch — it ran in parallel, some of it failed) and a `├─`/`└─` child per
 /// call carrying only what differs.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn push_run(
     calls: &[&ToolCallBlock],
     // A fact about the stretch itself, already localized ("6 tasks in
@@ -1067,6 +1143,13 @@ fn push_run(
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    // True when this run IS an execution round's head: it then states how many
+    // of its calls completed, so the round reads as one lightweight node
+    // instead of a stage sentence.
+    round: bool,
+    rows: &mut Vec<CommandRow>,
+    index_of: &dyn Fn(&ToolCallBlock) -> usize,
+    focused_command: Option<&leveler_client_protocol::ToolCallId>,
     out: &mut Vec<Line<'static>>,
 ) {
     // A run is active while any of its calls is; once all are settled the head
@@ -1092,6 +1175,19 @@ fn push_run(
             Style::default().fg(theme.ink(Ink::Meta)),
         ));
     }
+    if round {
+        let running = calls.iter().any(|c| c.status == ToolStatus::Running);
+        let count = if running {
+            t.round_running.replace("{}", &calls.len().to_string())
+        } else {
+            let ok = calls.iter().filter(|c| c.status == ToolStatus::Ok).count();
+            t.round_done.replace("{}", &ok.to_string())
+        };
+        head.push(Span::styled(
+            format!(" \u{b7} {count}"),
+            Style::default().fg(theme.ink(Ink::Meta)),
+        ));
+    }
     // A count of children is what the children already show; a count of
     // FAILURES is not. It rides on the head so a run that went wrong says so
     // on the row that names it.
@@ -1104,6 +1200,27 @@ fn push_run(
         } else {
             "  \u{251c}\u{2500} "
         };
+        // A round run covers shell calls too, so a shell child is rendered by the
+        // shell renderer that owns its stop action, expansion and output rows
+        // instead of the generic child row (which would drop all three).
+        if is_shell_call(call) {
+            let at = out.len();
+            let (lines, stoppable) = command_unit_lines(
+                call,
+                theme,
+                width,
+                locale,
+                t,
+                group.expanded,
+                now_elapsed_secs,
+                Some(branch),
+                awaits(call, awaiting_approval),
+                focused_command,
+            );
+            push_command_rows(rows, at, index_of(call), stoppable, lines.len());
+            out.extend(lines);
+            continue;
+        }
         out.extend(run_child_lines(
             call,
             theme,
@@ -2597,6 +2714,7 @@ mod tests {
             calls,
             open: false,
             expanded: false,
+            round: None,
         }
     }
 
@@ -2605,6 +2723,7 @@ mod tests {
             calls,
             open: true,
             expanded: false,
+            round: None,
         }
     }
 
@@ -5865,6 +5984,7 @@ mod compact_command_tests {
                 calls: vec![call],
                 open: false,
                 expanded: false,
+                round: None,
             },
             theme,
             width,
@@ -6060,6 +6180,7 @@ mod compact_command_tests {
                 calls: vec![c],
                 open: true,
                 expanded: false,
+                round: None,
             },
             &Theme::no_color(),
             100,
@@ -6275,6 +6396,7 @@ mod compact_command_tests {
                 calls: vec![edit(200)],
                 open: false,
                 expanded: true,
+                round: None,
             },
             &Theme::no_color(),
             100,

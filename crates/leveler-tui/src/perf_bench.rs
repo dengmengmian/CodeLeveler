@@ -212,6 +212,7 @@ fn push_history(state: &mut AppState, turns: usize, bytes_per_message: usize) {
                 name: "read_file".into(),
                 arguments: format!("{{\"path\":\"src/file_{i}.rs\"}}"),
                 parallel: false,
+                model_step: None,
             },
         );
         runtime(
@@ -460,6 +461,7 @@ fn perf_tool_stream_curve() {
                     name: "read_file".into(),
                     arguments: format!("{{\"path\":\"src/module_{i}.rs\"}}"),
                     parallel: false,
+                    model_step: None,
                 },
             );
             runtime(
@@ -873,6 +875,7 @@ fn synth_mixed() -> Vec<crate::record::RecordedEvent> {
                     name: "bash".into(),
                     arguments: "{\"command\":\"cargo check\"}".into(),
                     parallel: false,
+                    model_step: None,
                 },
             ));
             seq += 1;

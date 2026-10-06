@@ -342,6 +342,7 @@ fn goal_turn_with_args(s: &mut AppState, args: serde_json::Value, ok: bool) {
             name: "update_goal".into(),
             arguments: args.to_string(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -745,6 +746,7 @@ fn a5_cancelled_and_failed_turns_offer_nothing() {
             })
             .to_string(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(

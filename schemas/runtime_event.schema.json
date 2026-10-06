@@ -476,6 +476,15 @@
         "id": {
           "$ref": "#/definitions/ToolCallId"
         },
+        "model_step": {
+          "description": "The 1-based model step whose response requested this call — the real execution-round boundary. Every call from one model response carries the same value, so a UI groups one response's calls together even when the round produced no visible assistant prose. Legacy events omit it; a client must then fall back to its old grouping rather than invent a boundary.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "name": {
           "type": "string"
         },
@@ -3575,6 +3584,15 @@
             },
             "id": {
               "$ref": "#/definitions/ToolCallId"
+            },
+            "model_step": {
+              "description": "The 1-based model step whose response requested this call — the real execution-round boundary. Every call from one model response carries the same value, so a UI groups one response's calls together even when the round produced no visible assistant prose. Legacy events omit it; a client must then fall back to its old grouping rather than invent a boundary.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
             },
             "name": {
               "type": "string"

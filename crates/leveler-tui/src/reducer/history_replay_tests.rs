@@ -111,6 +111,7 @@ fn stopped_turn() -> Vec<UiHistoryEntry> {
                 name: "run_command".into(),
                 arguments: r#"{"program":"./scripts/soak.sh"}"#.into(),
                 parallel: false,
+                model_step: None,
             },
         ),
         entry(
@@ -297,6 +298,7 @@ fn a_replayed_session_hides_background_wait_polls() {
             name: "run_command".into(),
             arguments: r#"{"program":"make","args":["up"],"background":true}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("bg"),
@@ -312,6 +314,7 @@ fn a_replayed_session_hides_background_wait_polls() {
             name: "wait_task".into(),
             arguments: r#"{"task_id":"t-1","timeout_seconds":120}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("w1"),
@@ -327,6 +330,7 @@ fn a_replayed_session_hides_background_wait_polls() {
             name: "get_task".into(),
             arguments: r#"{"task_id":"t-1"}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("w2"),
@@ -458,6 +462,7 @@ fn a_delivery_snapshot_keeps_the_tool_rows_already_on_screen() {
             name: "run_command".into(),
             arguments: r#"{"program":"./scripts/soak.sh"}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("c1"),
@@ -668,6 +673,7 @@ fn a_browser_run_reads_the_same_live_and_replayed() {
             name: "browser_tab".into(),
             arguments: r#"{"action":"navigate","url":"http://localhost:3000"}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("b1"),
@@ -683,6 +689,7 @@ fn a_browser_run_reads_the_same_live_and_replayed() {
             name: "browser_tab".into(),
             arguments: r#"{"action":"snapshot"}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("b2"),
@@ -759,6 +766,7 @@ fn read_started(id: &str, path: &str) -> RuntimeEvent {
         name: "read_file".into(),
         arguments: serde_json::json!({ "path": path }).to_string(),
         parallel: false,
+        model_step: None,
     }
 }
 
@@ -789,6 +797,7 @@ fn a_mixed_group_reads_the_same_live_and_replayed() {
             name: "grep".into(),
             arguments: r#"{"pattern":"TaskStatus"}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("c1"),
@@ -887,6 +896,7 @@ fn a_settled_command_reads_as_one_row_live_and_replayed() {
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["test","-p","leveler-update"]}"#.into(),
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallOutput {
             id: ToolCallId::new("t1"),

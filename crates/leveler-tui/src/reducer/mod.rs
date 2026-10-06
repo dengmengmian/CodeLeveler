@@ -1908,8 +1908,14 @@ mod disclosure_tests {
     }
 
     fn finished_tool(s: &mut AppState, id: &str, name: &str, args: &str) {
-        s.transcript
-            .push_tool_started(ToolCallId::new(id), name.into(), args.into(), false, 0);
+        s.transcript.push_tool_started(
+            ToolCallId::new(id),
+            name.into(),
+            args.into(),
+            false,
+            0,
+            None,
+        );
         s.transcript
             .complete_tool(&ToolCallId::new(id), true, "done".into(), 1200, None);
     }
@@ -2009,6 +2015,7 @@ mod disclosure_tests {
                 name: "read_file".into(),
                 arguments: r#"{"path":"a.rs"}"#.into(),
                 parallel: false,
+                model_step: None,
             }),
         );
         assert!(
@@ -2183,6 +2190,7 @@ mod disclosure_tests {
             r#"{"program":"ls"}"#.into(),
             false,
             0,
+            None,
         );
         s.transcript
             .complete_tool(&ToolCallId::new("s1"), true, "".into(), 3, None);
@@ -2386,6 +2394,7 @@ mod disclosure_tests {
             r#"{"program":"cargo"}"#.into(),
             false,
             0,
+            None,
         );
         let running_idx = s.transcript.items().len() - 1;
         let hits = s.conversation_lines_and_hits(80).1;

@@ -764,6 +764,7 @@ async fn crashed_turn(app: &Application, session: &SessionId, dangling: bool) ->
                 parallel: false,
                 risk: None,
                 agent_id: None,
+                model_step: None,
             },
             &mut |_| {},
         )

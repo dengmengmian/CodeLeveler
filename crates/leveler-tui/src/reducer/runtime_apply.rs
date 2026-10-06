@@ -214,6 +214,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             name,
             arguments,
             parallel,
+            model_step,
         } => {
             mark_turn_busy(state);
             state.turn_tool_calls = state.turn_tool_calls.saturating_add(1);
@@ -239,9 +240,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 format!("{verb} {target}")
             });
             let started = state.elapsed_secs;
-            state
-                .transcript
-                .push_tool_started(id, name, arguments, parallel, started as i64);
+            state.transcript.push_tool_started(
+                id,
+                name,
+                arguments,
+                parallel,
+                started as i64,
+                model_step,
+            );
         }
         RuntimeEvent::ToolCallCompleted {
             id,
@@ -1854,9 +1860,14 @@ fn apply_session_with(
         // restart a long command at zero.
         let started = state.elapsed_secs as i64 - (tool.elapsed_ms / 1000) as i64;
         let id = tool.id.clone();
-        state
-            .transcript
-            .push_tool_started(tool.id, tool.name, tool.arguments, false, started);
+        state.transcript.push_tool_started(
+            tool.id,
+            tool.name,
+            tool.arguments,
+            false,
+            started,
+            None,
+        );
         state.transcript.append_tool_output(&id, &tool.output_tail);
     }
 

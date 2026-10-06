@@ -124,6 +124,7 @@ mod tests {
             name: name.into(),
             arguments: "{}".into(),
             parallel: false,
+            model_step: None,
         }
     }
 

@@ -2917,6 +2917,7 @@ mod tests {
             r#"{"path":"README.md"}"#.into(),
             false,
             0,
+            None,
         );
         s.transcript
             .complete_tool(&call, true, "ok".into(), 1, None);

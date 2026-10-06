@@ -1082,6 +1082,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             name: "read_file".into(),
             arguments: r#"{"path":"old.rs"}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -1122,6 +1123,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             name: "run_command".into(),
             arguments: r#"{"program":"ls"}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -1184,6 +1186,7 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
             name: "read_file".into(),
             arguments: r#"{"path":"a.rs"}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -1716,6 +1719,7 @@ fn an_approval_request_stops_its_call_reading_as_running() {
             name: "run_command".into(),
             arguments: r#"{"program":"rm","args":["-rf","stale"]}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     let running = rendered(&mut s, 120, 40);
@@ -1876,6 +1880,7 @@ fn interim_narration_does_not_satisfy_the_completion_footer() {
             name: "read_file".into(),
             arguments: r#"{"path":"worker.go"}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -3021,6 +3026,7 @@ fn tool_started(s: &mut AppState, id: &str, name: &str, args: &str) {
             name: name.into(),
             arguments: args.into(),
             parallel: false,
+            model_step: None,
         }),
     );
 }
@@ -4993,6 +4999,7 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
             })
             .to_string(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -5034,6 +5041,7 @@ fn goal_completion_without_structured_next_step_has_no_suggestion() {
             })
             .to_string(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -5398,6 +5406,7 @@ fn activity_clears_when_the_tool_completes() {
             name: "read_file".into(),
             arguments: r#"{"path":"src/lib.rs"}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     assert!(s.activity.is_some());
@@ -6003,6 +6012,7 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
             name: "read_file".into(),
             arguments: "{}".into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -9001,6 +9011,7 @@ fn tool(s: &mut AppState, id: &str) {
             name: "read_file".into(),
             arguments: r#"{"path":"a.rs"}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(

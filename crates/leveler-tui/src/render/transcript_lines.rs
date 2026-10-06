@@ -1626,6 +1626,7 @@ mod tests {
             }],
             open: false,
             expanded: false,
+            round: None,
         });
         let lines = item_render(&item, &theme, 120, false, t);
         let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");

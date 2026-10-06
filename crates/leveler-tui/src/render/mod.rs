@@ -2802,6 +2802,7 @@ mod tests {
                 arguments: serde_json::json!({"task": "SPAWNED survey", "role": "explorer"})
                     .to_string(),
                 parallel: false,
+                model_step: None,
             }),
         );
         if ok {
@@ -3111,6 +3112,7 @@ mod tests {
             }],
             open: false,
             expanded: false,
+            round: None,
         });
         let task = item_render(
             &task,
@@ -3311,6 +3313,7 @@ mod tests {
                         name: "read_file".into(),
                         arguments: serde_json::json!({ "path": path }).to_string(),
                         parallel: false,
+                        model_step: None,
                     },
                 ),
             );
@@ -3528,6 +3531,7 @@ mod tests {
             r#"{"path":"README.md"}"#.into(),
             false,
             0,
+            None,
         );
         s.transcript.complete_tool(
             &first,
@@ -3543,6 +3547,7 @@ mod tests {
             r#"{"pattern":"TODO","path":"crates"}"#.into(),
             false,
             0,
+            None,
         );
         s.transcript
             .complete_tool(&second, false, "grep failed loudly".into(), 20, None);
@@ -3952,7 +3957,14 @@ mod tests {
         let mut transcript = crate::transcript::TranscriptState::new();
         for id in ["t1", "t2"] {
             let id = ToolCallId::new(id);
-            transcript.push_tool_started(id.clone(), "read_file".into(), "{}".into(), false, 0);
+            transcript.push_tool_started(
+                id.clone(),
+                "read_file".into(),
+                "{}".into(),
+                false,
+                0,
+                None,
+            );
             transcript.complete_tool(&id, true, "ok".into(), 1, None);
         }
         assert_eq!(transcript.items().len(), 1);

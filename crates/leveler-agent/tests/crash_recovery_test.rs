@@ -246,6 +246,7 @@ async fn seed_dangling_call(
             parallel: false,
             risk: engine.factory.registry.get(name).map(|tool| tool.risk()),
             agent_id: None,
+            model_step: None,
         },
         &mut |_| {},
     )
@@ -275,6 +276,7 @@ async fn seed_pending_approval_call(
             parallel: false,
             risk: engine.factory.registry.get(name).map(|tool| tool.risk()),
             agent_id: None,
+            model_step: None,
         },
         &mut |_| {},
     )
@@ -608,6 +610,7 @@ async fn legacy_call_without_persisted_risk_blocks_conservatively() {
                 parallel: false,
                 risk: None,
                 agent_id: None,
+                model_step: None,
             },
             &mut |_| {},
         )
@@ -918,6 +921,7 @@ async fn two_agents_sharing_a_call_id_do_not_close_each_others_records() {
                 parallel: false,
                 risk: Some(leveler_execution::RiskLevel::WorkspaceWrite),
                 agent_id: Some(agent.to_string()),
+                model_step: None,
             },
             &mut |_| {},
         )

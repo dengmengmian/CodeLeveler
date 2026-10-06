@@ -1040,6 +1040,7 @@ mod tests {
                 parallel: false,
                 risk: None,
                 agent_id: None,
+                model_step: None,
             },
         )
         .await;
@@ -1180,6 +1181,7 @@ mod tests {
             parallel: false,
             risk: None,
             agent_id: None,
+            model_step: None,
         }
     }
 
@@ -1622,6 +1624,7 @@ mod tests {
             parallel: false,
             risk: None,
             agent_id: Some(agent.into()),
+            model_step: None,
         }
     }
 

@@ -282,6 +282,15 @@ pub enum AgentEvent {
         /// True when this call was dispatched into the concurrent read-only
         /// batch (a UI can render such calls as one parallel group).
         parallel: bool,
+        /// The 1-based model step whose response requested this call, when the
+        /// kernel knows it. Every call from one model response carries the same
+        /// value, and the next response's calls carry a different one — the
+        /// real execution-round boundary, available even when the round
+        /// produced no visible assistant prose. Already the round identity the
+        /// durable `RuntimeInjection.model_step` and `TurnFinished.model_steps`
+        /// use. `None` only on a legacy reverse projection that never recorded
+        /// it; a consumer must then fall back to its old grouping.
+        model_step: Option<u32>,
     },
     /// A tool finished. `id` matches its [`AgentEvent::ToolCall`]; denial/guard
     /// results carry an id with no prior `ToolCall`.

@@ -427,6 +427,7 @@ fn a_replayed_clarification_shows_the_answers_with_no_active_focus() {
             name: "request_user_input".into(),
             arguments,
             parallel: false,
+            model_step: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("t1"),

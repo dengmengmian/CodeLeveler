@@ -143,6 +143,7 @@ fn visual_inspect() {
             name: "grep".into(),
             arguments: "{\"pattern\":\"resolveUsage\"}".into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -245,6 +246,7 @@ fn visual_disclosure_matrix() {
                 name: name.into(),
                 arguments: args.into(),
                 parallel: false,
+                model_step: None,
             }),
         );
         reduce(
@@ -387,6 +389,7 @@ fn visual_disclosure_matrix() {
             name: "run_command".into(),
             arguments: r#"{"program":"cargo","args":["build"]}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     live.status = leveler_client_protocol::RuntimeStatus::Busy;
@@ -414,6 +417,7 @@ fn visual_background_timeline() {
             name: "run_command".into(),
             arguments: r#"{"program":"make","args":["up"],"background":true}"#.into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -461,6 +465,7 @@ fn visual_background_timeline() {
                 name: (*name).into(),
                 arguments: r#"{"task_id":"bg-1","timeout_seconds":120}"#.into(),
                 parallel: false,
+                model_step: None,
             }),
         );
         reduce(
@@ -553,6 +558,7 @@ fn visual_stage_timeline() {
                 name: "run_command".into(),
                 arguments: args.into(),
                 parallel: false,
+                model_step: None,
             }),
         );
         let preview = (0..lines)

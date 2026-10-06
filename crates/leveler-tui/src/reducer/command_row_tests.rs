@@ -101,6 +101,7 @@ fn start(s: &mut AppState, id: &str) {
             name: "shell_command".into(),
             arguments: CMD.into(),
             parallel: false,
+            model_step: None,
         }),
     );
 }
@@ -358,6 +359,7 @@ fn a_backgrounded_command_says_it_started_not_that_it_finished() {
             arguments: r#"{"program":"node","args":["bench/run.js","40000"],"background":true}"#
                 .into(),
             parallel: false,
+            model_step: None,
         }),
     );
     reduce(
@@ -857,6 +859,7 @@ fn parallel_commands_keep_independent_identity() {
                 name: "run_command".into(),
                 arguments: format!(r#"{{"program":"echo","args":["{id}"]}}"#),
                 parallel: true,
+                model_step: None,
             }),
         );
     }
@@ -954,6 +957,7 @@ fn clicking_a_mixed_group_header_opens_every_call_in_it() {
                 name: name.into(),
                 arguments: args.into(),
                 parallel: false,
+                model_step: None,
             }),
         );
         reduce(

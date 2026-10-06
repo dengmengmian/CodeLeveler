@@ -937,6 +937,15 @@ pub struct UiText {
     /// "全部成功". The counterpart of `batch_failed`, so the parent row states
     /// an outcome instead of leaving success to be inferred from the children.
     pub batch_all_ok: &'static str,
+    /// A finished execution round's head: how many of its calls completed,
+    /// e.g. "完成 3 项" / "3 done". `{}` is the count. The round's head names
+    /// the tool (or the mixed set) and counts what finished there, so the
+    /// round reads as one lightweight node instead of a stage sentence.
+    pub round_done: &'static str,
+    /// A round head while it is still in flight: "正在执行 3 项" / "3 running".
+    pub round_running: &'static str,
+    /// The name a round head wears when its calls are not all one tool.
+    pub round_mixed: &'static str,
 
     // Tool disclosure semantic labels (C5-TUI): the one-line summary a
     // finished group leaves behind. `{}` is the count where present.
@@ -1846,6 +1855,9 @@ static ZH: UiText = UiText {
     batch_failed: "{} 个失败",
     batch_needs_network: "{} 个需要网络权限",
     batch_all_ok: "全部成功",
+    round_done: "完成 {} 项",
+    round_running: "正在执行 {} 项",
+    round_mixed: "多个工具",
     agents_running_header: "{} 个 agents 正在运行",
     agents_done_header: "{} 个 agents 完成",
     agents_ended_header: "{} 个 agents 结束",
@@ -2602,6 +2614,9 @@ static EN: UiText = UiText {
     batch_failed: "{} failed",
     batch_needs_network: "{} need network permission",
     batch_all_ok: "all ok",
+    round_done: "{} done",
+    round_running: "{} running",
+    round_mixed: "Multiple Tools",
     agents_running_header: "{} agents running",
     agents_done_header: "{} agents completed",
     agents_ended_header: "{} agents finished",

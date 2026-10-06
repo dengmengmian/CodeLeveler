@@ -62,12 +62,14 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
             arguments,
             parallel,
             agent_id: None,
+            model_step,
             ..
         } => AgentEvent::ToolCall {
             id: call_id,
             name,
             arguments,
             parallel,
+            model_step,
         },
         EngineEvent::ToolCallFinished {
             call_id,

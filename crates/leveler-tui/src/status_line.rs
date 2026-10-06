@@ -1170,6 +1170,7 @@ mod tests {
                     name: "run_command".into(),
                     arguments: r#"{"program":"node","args":["--version"]}"#.into(),
                     parallel: false,
+                    model_step: None,
                 },
             ),
         );
@@ -1196,6 +1197,7 @@ mod tests {
                     name: "read_file".into(),
                     arguments: r#"{"path":"a.rs"}"#.into(),
                     parallel: false,
+                    model_step: None,
                 },
             ),
         );
@@ -1268,6 +1270,7 @@ mod tests {
             serde_json::json!({ "task_id": "bg-2" }).to_string(),
             false,
             12,
+            None,
         );
         state.activity = Some("等待任务".into());
         let text = status_text(&state);

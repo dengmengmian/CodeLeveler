@@ -372,12 +372,14 @@ pub(crate) fn deny_call(
     observer: &mut (dyn FnMut(AgentEvent) + Send),
     call: ToolCall,
     message: String,
+    model_step: u32,
 ) -> ContentPart {
     observer(AgentEvent::ToolCall {
         id: call.id.as_str().to_string(),
         name: call.name.clone(),
         arguments: compact_json(&call.arguments),
         parallel: false,
+        model_step: Some(model_step),
     });
     observer(AgentEvent::ToolResult {
         exit_code: None,

@@ -2036,6 +2036,7 @@ impl AgentHarness for Drive<'_> {
                     name: call.name.clone(),
                     arguments: compact_json(&call.arguments),
                     parallel: false,
+                    model_step: Some(model_steps),
                 });
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
@@ -2063,6 +2064,7 @@ impl AgentHarness for Drive<'_> {
                     name: call.name.clone(),
                     arguments: compact_json(&call.arguments),
                     parallel: false,
+                    model_step: Some(model_steps),
                 });
                 if let Some(barrier) = &self.executor.event_barrier {
                     barrier.flush().await?;
@@ -2072,6 +2074,7 @@ impl AgentHarness for Drive<'_> {
                         &mut *self.observer,
                         call,
                         "cancelled before capability loading".into(),
+                        model_steps,
                     ));
                     cancelled_mid_batch = true;
                     break;
@@ -2167,6 +2170,7 @@ impl AgentHarness for Drive<'_> {
                     name: REPORT_FINDING_TOOL.to_string(),
                     arguments: compact_json(&call.arguments),
                     parallel: false,
+                    model_step: Some(model_steps),
                 });
                 let kind = call
                     .arguments
@@ -2241,6 +2245,7 @@ impl AgentHarness for Drive<'_> {
                     name: UPDATE_GOAL_TOOL.to_string(),
                     arguments: compact_json(&call.arguments),
                     parallel: false,
+                    model_step: Some(model_steps),
                 });
                 // A resolution without an explicit status is not accepted as
                 // completion — feed the error back so the model resolves
@@ -2394,6 +2399,7 @@ impl AgentHarness for Drive<'_> {
                     name: call.name.clone(),
                     arguments: compact_json(&call.arguments),
                     parallel: false,
+                    model_step: Some(model_steps),
                 });
                 let answer = self.executor.handle_ask_user(&call, &cancellation).await?;
                 (self.observer)(AgentEvent::ToolResult {
@@ -2505,6 +2511,7 @@ impl AgentHarness for Drive<'_> {
                     name: call.name.clone(),
                     arguments: compact_json(&call.arguments),
                     parallel: false,
+                    model_step: Some(model_steps),
                 });
                 (self.observer)(AgentEvent::ToolResult {
                     exit_code: None,
@@ -2556,6 +2563,7 @@ impl AgentHarness for Drive<'_> {
                     name: CLAIM_WRITE_SCOPE_TOOL.to_string(),
                     arguments: compact_json(&call.arguments),
                     parallel: false,
+                    model_step: Some(model_steps),
                 });
                 let paths: Vec<String> = call
                     .arguments
@@ -2806,7 +2814,7 @@ impl AgentHarness for Drive<'_> {
                              the next model step; review them, then retry the edit."
                     );
                     denied_calls_this_round += 1;
-                    results[index] = Some(deny_call(&mut *self.observer, call, msg));
+                    results[index] = Some(deny_call(&mut *self.observer, call, msg, model_steps));
                     continue;
                 }
             }
@@ -2861,7 +2869,7 @@ impl AgentHarness for Drive<'_> {
                 let msg = format!("Refused: {which}. The run stops here.");
                 self.budget_exceeded = Some((format!("Stopped: {which}."), exhaustion));
                 denied_calls_this_round += 1;
-                results[index] = Some(deny_call(&mut *self.observer, call, msg));
+                results[index] = Some(deny_call(&mut *self.observer, call, msg, model_steps));
                 continue;
             }
             // Keep the claim/mutation race synchronized when no foreign claim
@@ -2894,6 +2902,7 @@ impl AgentHarness for Drive<'_> {
                 name: call.name.clone(),
                 arguments: compact_json(&call.arguments),
                 parallel,
+                model_step: Some(model_steps),
             });
             collect_scoped_paths_from_call(&call, &mut self.scoped_paths);
 
@@ -3891,6 +3900,7 @@ impl AgentHarness for Drive<'_> {
                         &mut *self.observer,
                         call_snapshot[index].clone(),
                         "cancelled by the user before this call ran".to_string(),
+                        model_steps,
                     ));
                 }
             }
