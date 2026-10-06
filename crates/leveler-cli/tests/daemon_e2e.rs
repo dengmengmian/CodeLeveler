@@ -1974,8 +1974,9 @@ async fn collaboration_entry_smoke_body() {
     let socket = find_socket(&env);
     let client = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
 
-    // 1) A brand-new ordinary session, exactly like `leveler tui` creates one:
-    //    no `/goal` was typed, and the axis is the product default.
+    // 1) An ordinary wire client that omits the axis gets the product default
+    //    (Goal), and it survives the row. `leveler tui` does NOT take this
+    //    path: its own request states the interactive axis (chat) explicitly.
     let session = client
         .create_session(CreateSessionRequest {
             collaboration: leveler_local_transport::CollaborationMode::default(),

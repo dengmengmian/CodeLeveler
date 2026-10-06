@@ -2036,6 +2036,52 @@ fn bookkeeping_tools_after_the_answer_do_not_erase_the_completion_footer() {
     }
 }
 
+/// The same real shape on the INTERACTIVE Chat axis: the axis the terminal
+/// session opens on. A chat session must keep its committed final answer across
+/// `update_plan` / `update_goal` bookkeeping exactly as any other axis does,
+/// and the bookkeeping must not put the turn into the goal chrome. This is the
+/// lifecycle regression the axis fix must not reintroduce.
+#[test]
+fn the_interactive_chat_axis_keeps_the_final_answer_across_bookkeeping() {
+    let mut s = opened();
+    let mut session = snapshot();
+    session.collaboration = Some("chat".into());
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionUpdated { session }),
+    );
+    assert_eq!(s.collaboration, "chat");
+
+    answer(&mut s, "m-report", "调查完成，结论如下：两处都改好了。");
+    tool_call(&mut s, "p1", "update_plan", r#"{"plan":"done"}"#);
+    tool_call(
+        &mut s,
+        "g1",
+        "update_goal",
+        r#"{"status":"complete","summary":"done"}"#,
+    );
+    reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+
+    assert_ne!(
+        last_turn_end(&s).status,
+        TurnEndStatus::NoFinalAnswer,
+        "the interactive chat axis must keep its committed answer"
+    );
+    assert!(
+        !s.goal_mode_active,
+        "a chat axis must not acquire the goal chrome through bookkeeping"
+    );
+    let screen = rendered(&mut s, 100, 30);
+    assert!(
+        !screen.contains(leveler_tui::Locale::Zh.text().turn_no_final_answer),
+        "the missing-answer banner is false here: {screen}"
+    );
+    assert!(
+        screen.contains("两处都改好了"),
+        "the committed final answer must stay on screen: {screen}"
+    );
+}
+
 /// A plan update on its own is not an answer. Narration followed by a plan
 /// update and then a real tool is still narration, so the turn still reports
 /// the missing answer — the fix must not turn every plan row into an answer.

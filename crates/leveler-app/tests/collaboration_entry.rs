@@ -246,6 +246,31 @@ async fn interactive_bootstrap_axis_reaches_row_and_snapshot_as_chat() {
     );
 }
 
+/// The axis the interactive entry writes is the axis the runtime adopts. The
+/// embedded TUI creates through the wrapped `Application` and then reads the
+/// same row, so this is the exact chain the footer renders:
+/// create-with-collaboration → row → snapshot.collaboration.
+#[tokio::test]
+async fn the_interactive_create_axis_is_what_the_runtime_adopts() {
+    let (_tmp, _server, app, client) = harness(vec![]).await;
+    let session = app
+        .create_session_with_collaboration(
+            &ModelRef::new("mock", "m"),
+            "interactive session",
+            leveler_execution::PermissionProfile::Assisted,
+            leveler_agent::CollaborationMode::Chat,
+        )
+        .await
+        .unwrap();
+    assert_eq!(collaboration_of(&app, &session).await, "chat");
+    let snapshot = client.snapshot(&session).await.unwrap();
+    assert_eq!(
+        snapshot.collaboration.as_deref(),
+        Some("chat"),
+        "the runtime must adopt the axis the embedded create wrote"
+    );
+}
+
 /// A + D — an omitted wire field is the product default (goal) and survives a
 /// reopen: the row, not a process default, is the source of truth.
 #[tokio::test]

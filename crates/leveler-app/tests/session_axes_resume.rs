@@ -265,3 +265,50 @@ async fn full_side_question_keeps_the_observe_only_surface_with_unrestricted_aut
         );
     }
 }
+
+/// The interactive entry states its axis at the create, so a Chat terminal
+/// session is not a side effect of the Application's own default. The headless
+/// default (Goal) stays exactly as it was for every other caller.
+#[tokio::test]
+async fn an_explicit_create_axis_overrides_the_application_default() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+    // The product default is Goal: the coding-session axis `leveler run` uses.
+    let app = Application::assemble(layout(&tmp)).unwrap();
+    assert_eq!(app.collaboration(), CollaborationMode::Goal);
+
+    let interactive = app
+        .create_session_with_collaboration(
+            &ModelRef::new("mock", "m"),
+            "interactive session",
+            leveler_execution::PermissionProfile::Assisted,
+            CollaborationMode::Chat,
+        )
+        .await
+        .unwrap();
+    let db = app.open_database().await.unwrap();
+    let record = SessionRepository::new(&db)
+        .get(&interactive)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.collaboration, "chat",
+        "an entry that owns a fixed axis must not inherit the process default"
+    );
+
+    let headless = app
+        .create_session_with_mode(
+            &ModelRef::new("mock", "m"),
+            "fix the login bug",
+            leveler_execution::PermissionProfile::Assisted,
+        )
+        .await
+        .unwrap();
+    let record = SessionRepository::new(&db)
+        .get(&headless)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.collaboration, "goal");
+}
