@@ -242,3 +242,164 @@ async fn full_access_has_no_codeleveler_sandbox() {
         detail(&out)
     );
 }
+
+// ── The network half of the same contract ───────────────────────────────────
+//
+// The permission layer decides ALLOW for Auto's ordinary network use and the
+// seatbelt profile must carry the capability that decision implies. The failure
+// this covers is a double truth source: the policy grants the network and the
+// sandbox answers a silent DNS/connect failure, so the user sees
+// `Could not resolve host` and blames the network.
+//
+// The evidence is the same shape as above — the real `CommandRunner` through a
+// real `sandbox-exec` against a real loopback server — plus a NEGATIVE control:
+// when the permission layer denies the network, the same call must fail. A test
+// that only proved the allow half would also pass with the sandbox switched
+// off.
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+/// A one-shot loopback HTTP server. Returns the bound port; it serves every
+/// request with `200` and the body `ok` until the listener is dropped.
+fn loopback_http_server() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = stream.flush();
+        }
+    });
+    (port, handle)
+}
+
+/// One request through the real runner. `deny` is the permission layer's
+/// verdict; the sandbox must agree with it.
+async fn network_probe(
+    fixture: &Fixture,
+    url: &str,
+    deny: bool,
+    unrestricted: bool,
+) -> ProcessOutput {
+    let mut request = ProcessRequest::new(
+        "curl",
+        [
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "10",
+            "--noproxy",
+            "*",
+            url,
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect(),
+        fixture.workspace.clone(),
+    );
+    request.timeout = Duration::from_secs(30);
+    request.write_scope = if unrestricted {
+        WriteScope::Unrestricted
+    } else {
+        WriteScope::Workspace {
+            root: fixture.workspace.clone(),
+        }
+    };
+    request.unrestricted_execution = unrestricted;
+    request.network_scope = if deny {
+        leveler_execution::NetworkScope::None
+    } else {
+        leveler_execution::NetworkScope::Internet
+    };
+    request.deny_network = deny;
+    fixture
+        .runner
+        .run(request, CancellationToken::new())
+        .await
+        .unwrap_or_else(|error| panic!("curl failed to run: {error:?}"))
+}
+
+/// P2/P3. Auto's ALLOW reaches a real TCP destination through the sandbox, by
+/// literal address and by name — and the same call is genuinely denied when the
+/// permission layer denies it, so neither half is a no-op.
+#[tokio::test]
+async fn auto_network_allow_and_deny_agree_with_the_sandbox() {
+    let fixture = Fixture::new();
+    let (port, _server) = loopback_http_server();
+
+    for url in [
+        format!("http://127.0.0.1:{port}/"),
+        format!("http://localhost:{port}/"),
+    ] {
+        // ALLOW: the sandbox must let the connection through.
+        let allowed = network_probe(&fixture, &url, false, false).await;
+        assert!(
+            allowed.success() && allowed.stdout.trim() == "200",
+            "ALLOW must reach the granted destination {url}: {}",
+            detail(&allowed)
+        );
+
+        // DENY: the same request must fail in the sandbox, not "succeed".
+        let denied = network_probe(&fixture, &url, true, false).await;
+        assert!(
+            !denied.success(),
+            "a permission DENY must not be silently allowed by the sandbox {url}: {}",
+            detail(&denied)
+        );
+        assert!(
+            !denied.stdout.contains("200"),
+            "a denied request must not report a status code {url}: {}",
+            detail(&denied)
+        );
+
+        // Full parity: no CodeLeveler sandbox is involved.
+        let full = network_probe(&fixture, &url, false, true).await;
+        assert!(
+            full.success() && full.stdout.trim() == "200",
+            "Full must reach {url} with no sandbox in the way: {}",
+            detail(&full)
+        );
+    }
+}
+
+/// The external hop, when the machine has one. It is opt-in because a build
+/// farm has no egress; when the host cannot reach the destination, the run
+/// reports why instead of pretending a sandbox PASS.
+///
+/// Enable with `LEVELER_TEST_EXTERNAL_NETWORK=1`. This is the real DNS + TLS
+/// path (no HTTP proxy), which the loopback case above cannot cover.
+#[tokio::test]
+async fn auto_external_https_when_the_host_has_egress() {
+    if std::env::var("LEVELER_TEST_EXTERNAL_NETWORK").as_deref() != Ok("1") {
+        eprintln!("skipping: set LEVELER_TEST_EXTERNAL_NETWORK=1 to probe real egress");
+        return;
+    }
+    let fixture = Fixture::new();
+    let url = "https://example.com/";
+
+    // Host control: if the bare host cannot resolve/connect, the sandbox is not
+    // the variable under test and the result would be UNPROVEN, not a pass.
+    let bare = network_probe(&fixture, url, false, true).await;
+    if !bare.success() || bare.stdout.trim() != "200" {
+        eprintln!(
+            "skipping: this host has no direct egress to {url}: {}",
+            detail(&bare)
+        );
+        return;
+    }
+
+    let auto = network_probe(&fixture, url, false, false).await;
+    assert!(
+        auto.success() && auto.stdout.trim() == "200",
+        "Auto ALLOW must perform real DNS + TLS, not degrade to a sandbox DNS failure: {}",
+        detail(&auto)
+    );
+}
