@@ -31,32 +31,6 @@ use crate::state::{AppState, Boot};
 use crate::theme::Theme;
 
 // ───────────────────────────────────────────────────────────────────────────
-// Presentation policy (the A/B switch)
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Presentation-policy override used by the retained UX harness. The diff-cap
-/// knob is the one the implemented I-03 change needs to be compared against
-/// fixed budgets; the rejected folding policies left no seam behind.
-pub(crate) mod policy {
-    use std::cell::Cell;
-
-    thread_local! {
-        static DIFF_CAP: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    pub(crate) fn set_diff_preview_cap(cap: Option<usize>) {
-        DIFF_CAP.with(|c| c.set(cap));
-    }
-
-    /// The preview row budget the diff renderer should use. `default_cap` is
-    /// the production value derived from the viewport; the experiment overrides
-    /// it to compare fixed caps against the responsive one.
-    pub(crate) fn diff_preview_cap(default_cap: usize) -> usize {
-        DIFF_CAP.with(|c| c.get()).unwrap_or(default_cap)
-    }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
 // Deterministic transcripts
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -260,6 +234,35 @@ fn run_test(s: &mut AppState, id: &str, ok: bool, preview: &str) {
         ok,
         preview,
         1438,
+    );
+}
+
+/// A failed run the way protocol 1.10 reports it: the exit code is a struct
+/// field, so the collapsed row can skip runtime notes and name the real
+/// failing target.
+fn run_failed(s: &mut AppState, id: &str, preview: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new(id),
+            name: "run_command".into(),
+            arguments: r#"{"program":"cargo","args":["test","--quiet"]}"#.into(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: Some(1),
+            stop: None,
+            id: ToolCallId::new(id),
+            ok: false,
+            preview: preview.into(),
+            duration_ms: 1438,
+            applied_diff: None,
+        }),
     );
 }
 
@@ -636,6 +639,42 @@ fn is_edit_head(text: &str) -> bool {
     text.contains("编辑文件") || text.contains("写入文件") || text.contains("Edit file")
 }
 
+/// How many change rows the LAST confirmed edit's canonical patch contains.
+/// The Full Diff contract says the conversation paints exactly these — no
+/// preview budget may remove one.
+fn expected_change_rows(state: &AppState, width: usize) -> usize {
+    use crate::transcript::TranscriptItem;
+    let items = state.transcript.items();
+    let Some(i) = items.iter().rposition(|it| match it {
+        TranscriptItem::ToolGroup(g) => g.calls.iter().any(|c| {
+            c.applied_diff
+                .as_deref()
+                .is_some_and(|d| !d.trim().is_empty())
+        }),
+        _ => false,
+    }) else {
+        return 0;
+    };
+    let TranscriptItem::ToolGroup(g) = &items[i] else {
+        return 0;
+    };
+    let calls: Vec<&crate::transcript::ToolCallBlock> = g
+        .calls
+        .iter()
+        .filter(|c| {
+            c.applied_diff
+                .as_deref()
+                .is_some_and(|d| !d.trim().is_empty())
+        })
+        .collect();
+    let mut out = Vec::new();
+    crate::tool_cell::merged_diff_rows(&calls, &state.theme, width, &mut out);
+    out.iter()
+        .map(line_plain)
+        .filter(|t| is_diff_change_row(t))
+        .count()
+}
+
 /// Whether a plain conversation line is a diff change row (`│ +` / `│ -`).
 fn is_diff_change_row(text: &str) -> bool {
     let Some((_, after)) = text.rsplit_once('\u{2502}') else {
@@ -687,10 +726,6 @@ mod tests {
         )
     }
 
-    fn reset_policies() {
-        policy::set_diff_preview_cap(None);
-    }
-
     /// I-02: tool-history density, measured on the CURRENT design. The A/B
     /// comparison (fold settled runs) was run during the phase and rejected;
     /// this test keeps the fixture that made the case and records the real
@@ -699,7 +734,6 @@ mod tests {
     #[ignore = "ux experiment harness"]
     fn i02_tool_history_density() {
         let mut out = report("i02");
-        reset_policies();
         for (label, build) in [("T1", build_t1 as fn() -> AppState), ("T2", build_t2)] {
             header(&mut out, &format!("I-02 {label} / 80x24"));
             let mut a = build();
@@ -716,104 +750,238 @@ mod tests {
                 "the shipped UI never folds a run's target list"
             );
         }
-        reset_policies();
     }
 
-    /// I-03: diff preview density. T2.
+    /// I-03: the confirmed edit diff is complete. This test used to sweep
+    /// preview-row budgets; the Full Diff contract removed the budget, so it
+    /// now pins the invariant that replaced it — every change row of the last
+    /// confirmed edit is painted into the conversation, at any viewport, and no
+    /// `… +N lines` marker stands in for a hunk.
     #[test]
     #[ignore = "ux experiment harness"]
-    fn i03_diff_preview() {
+    fn i03_full_diff_is_always_painted() {
         let mut out = report("i03");
-        reset_policies();
         for (w, h) in [(80u16, 24u16), (100, 30), (120, 40)] {
-            header(
-                &mut out,
-                &format!("I-03 T2 / {w}x{h} (measured at the edit live edge)"),
-            );
-            // Variant A — the pre-experiment fixed 24-row cap, forced.
-            policy::set_diff_preview_cap(Some(24));
+            header(&mut out, &format!("I-03 T2 live / {w}x{h}"));
             let mut a = build_t2_live();
-            let ma = measure(&mut a, w, h);
-            write_dump(
-                &format!("i03-live-A-{w}x{h}"),
-                &visible_window(&mut a, w, h),
-            );
-            let _ = writeln!(out, "A 24:   {ma:?}");
+            let m = measure(&mut a, w, h);
+            write_dump(&format!("i03-full-{w}x{h}"), &full_text(&mut a, w, h));
 
-            policy::set_diff_preview_cap(Some(12));
-            let mut b = build_t2_live();
-            let mb = measure(&mut b, w, h);
-            write_dump(
-                &format!("i03-live-B-{w}x{h}"),
-                &visible_window(&mut b, w, h),
+            let width = crate::conversation::geometry::content_width(&a);
+            let lines = a.conversation_lines(width);
+            let painted: Vec<String> = lines.iter().map(line_plain).collect();
+            let change_rows = painted.iter().filter(|t| is_diff_change_row(t)).count();
+            let expected = expected_change_rows(&a, width);
+            assert!(expected > 0, "the T2 transcript contains a confirmed edit");
+            assert_eq!(
+                change_rows, expected,
+                "width {w}: the conversation paints every confirmed change row"
             );
-            let _ = writeln!(out, "B 12:   {mb:?}");
-
-            policy::set_diff_preview_cap(Some(6));
-            let mut c = build_t2_live();
-            let mc = measure(&mut c, w, h);
-            write_dump(
-                &format!("i03-live-C-{w}x{h}"),
-                &visible_window(&mut c, w, h),
-            );
-            let _ = writeln!(out, "C 6:    {mc:?}");
-
-            // Variant D — responsive: a fraction of the effective viewport.
-            policy::set_diff_preview_cap(None);
-            let mut probe = build_t2_live();
-            let viewport = measure(&mut probe, w, h).viewport;
-            for (tag, formula) in [
-                ("D1 viewport/2", (viewport / 2).clamp(6, 24)),
-                ("D2 viewport-4", viewport.saturating_sub(4).clamp(6, 24)),
-                ("D3 viewport-3", viewport.saturating_sub(3).clamp(6, 24)),
-            ] {
-                policy::set_diff_preview_cap(Some(formula));
-                let mut d = build_t2_live();
-                let md = measure(&mut d, w, h);
-                write_dump(
-                    &format!("i03-live-{tag}-{w}x{h}"),
-                    &visible_window(&mut d, w, h),
-                );
-                let _ = writeln!(
-                    out,
-                    "{tag} = {formula}: head_visible={} change_rows_visible={} total={}",
-                    md.edit_head_visible, md.diff_content_visible, md.total
-                );
-            }
-            // PRODUCTION candidate: quantized viewport budget (cap = None uses
-            // the value build_conversation derives from the viewport).
-            policy::set_diff_preview_cap(None);
-            let mut prod = build_t2_live();
-            let mprod = measure(&mut prod, w, h);
-            write_dump(
-                &format!("i03-live-PROD-{w}x{h}"),
-                &visible_window(&mut prod, w, h),
+            assert!(
+                !painted.iter().any(|t| t.contains("还有")),
+                "width {w}: a `… +N lines` marker replaced a hunk"
             );
             let _ = writeln!(
                 out,
-                "PROD quantized: viewport={} head_visible={} change_rows_visible={} total={} {mprod:?}",
-                mprod.viewport, mprod.edit_head_visible, mprod.diff_content_visible, mprod.total
-            );
-            reset_policies();
-
-            // Full-turn density (Final included): how much does the preview
-            // budget leave in history once the turn is done?
-            policy::set_diff_preview_cap(Some(24));
-            let mut fa = build_t2();
-            let mfa = measure(&mut fa, w, h);
-            policy::set_diff_preview_cap(None);
-            let mut fb = build_t2();
-            let mfb = measure(&mut fb, w, h);
-            reset_policies();
-            let _ = writeln!(
-                out,
-                "  full-turn total lines: A24={} PROD={} (saved {})",
-                mfa.total,
-                mfb.total,
-                mfa.total.saturating_sub(mfb.total)
+                "total={} change_rows={change_rows} head_visible={}",
+                m.total, m.edit_head_visible
             );
         }
-        reset_policies();
+    }
+
+    fn reasoning(s: &mut AppState, text: &str, done_ms: Option<u64>) {
+        reduce(s, Action::Runtime(RuntimeEvent::ReasoningStarted));
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::ReasoningDelta { delta: text.into() }),
+        );
+        if let Some(ms) = done_ms {
+            reduce(
+                s,
+                Action::Runtime(RuntimeEvent::ReasoningCompleted { elapsed_ms: ms }),
+            );
+        }
+    }
+
+    fn run_started(s: &mut AppState, id: &str) {
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: "run_command".into(),
+                arguments: r#"{"program":"cargo","args":["test"]}"#.into(),
+                parallel: false,
+                model_step: None,
+                answer_effect: None,
+            }),
+        );
+    }
+
+    fn first_group(s: &AppState) -> usize {
+        s.transcript
+            .items()
+            .iter()
+            .position(|it| matches!(it, crate::transcript::TranscriptItem::ToolGroup(_)))
+            .expect("a tool group")
+    }
+
+    /// A–M: the Conversation IA frames, rendered through the REAL paint path
+    /// (the same `frame_text` the workbench uses) on fixture events. These are
+    /// deterministic frames, not a real-model session.
+    #[test]
+    #[ignore = "ux experiment harness"]
+    fn ia_frames() {
+        let mut out = report("ia");
+        let print = |out: &mut dyn std::io::Write, tag: &str, mut s: AppState| {
+            let frame = visible_window(&mut s, 80, 24);
+            write_dump(&format!("ia-{tag}"), &frame);
+            let _ = writeln!(out, "\n===== {tag} =====\n{frame}");
+        };
+
+        // A — running Thinking shows its body.
+        let mut a = opened("检查 catalog fallback");
+        say(&mut a, "p", "先看一下 pricing 的 fallback。");
+        reasoning(
+            &mut a,
+            "正在检查 pricing.rs……\n当前怀疑 catalog fallback 还引用旧模型。",
+            None,
+        );
+        print(&mut out, "A-running-thinking", a);
+
+        // B — completed Thought is a bare header.
+        let mut b = opened("检查 catalog fallback");
+        say(&mut b, "p", "先看一下 pricing 的 fallback。");
+        reasoning(&mut b, "查过了，fallback 指的是旧模型。", Some(4100));
+        turn_end(&mut b);
+        print(&mut out, "B-completed-thought", b);
+
+        // C — Read / Search collapsed by default.
+        let mut c = opened("找出 bug");
+        say(&mut c, "p", "先读两个文件再搜一下。");
+        read(&mut c, "r1", "src/pricing.rs", 40);
+        read(&mut c, "r2", "src/catalog.rs", 30);
+        search(&mut c, "s1", "missing model");
+        turn_end(&mut c);
+        print(&mut out, "C-exploration-collapsed", c);
+
+        // D — interleaved Thoughts + exploration groups fold into one receipt.
+        let mut d = opened("找出 bug");
+        say(&mut d, "p", "读文件并搜索。");
+        reasoning(&mut d, "先读 pricing。", Some(800));
+        read(&mut d, "r1", "src/pricing.rs", 40);
+        reasoning(&mut d, "再读 catalog。", Some(500));
+        read(&mut d, "r2", "src/catalog.rs", 30);
+        search(&mut d, "s1", "missing model");
+        reasoning(&mut d, "快结束了。", Some(400));
+        turn_end(&mut d);
+        print(&mut out, "D-run-collapsed", d);
+        let mut d2 = opened("找出 bug");
+        say(&mut d2, "p", "读文件并搜索。");
+        reasoning(&mut d2, "先读 pricing。", Some(800));
+        read(&mut d2, "r1", "src/pricing.rs", 40);
+        reasoning(&mut d2, "再读 catalog。", Some(500));
+        read(&mut d2, "r2", "src/catalog.rs", 30);
+        search(&mut d2, "s1", "missing model");
+        reasoning(&mut d2, "快结束了。", Some(400));
+        turn_end(&mut d2);
+        let anchor = first_group(&d2);
+        crate::conversation::interaction::toggle_fold(&mut d2, anchor);
+        print(&mut out, "E-run-expanded", d2);
+
+        // F — Run running.
+        let mut f = opened("跑测试");
+        say(&mut f, "p", "跑一下测试。");
+        run_started(&mut f, "t1");
+        print(&mut out, "F-run-running", f);
+
+        // G — Run completed collapsed.
+        let mut g = opened("跑测试");
+        say(&mut g, "p", "跑一下测试。");
+        run_test(
+            &mut g,
+            "t1",
+            true,
+            (0..117)
+                .map(|i| format!("ok line {i}\n"))
+                .collect::<String>()
+                .as_str(),
+        );
+        turn_end(&mut g);
+        print(&mut out, "G-run-collapsed", g);
+
+        // H — Run expanded.
+        let mut h = opened("跑测试");
+        say(&mut h, "p", "跑一下测试。");
+        run_test(
+            &mut h,
+            "t1",
+            true,
+            (0..117)
+                .map(|i| format!("ok line {i}\n"))
+                .collect::<String>()
+                .as_str(),
+        );
+        turn_end(&mut h);
+        let anchor = first_group(&h);
+        h.transcript
+            .set_item_display(anchor, crate::fold::DisplayMode::Expanded);
+        print(&mut out, "H-run-expanded", h);
+
+        // I — Run failure collapsed.
+        let mut i = opened("跑测试");
+        say(&mut i, "p", "跑一下测试。");
+        run_failed(
+            &mut i,
+            "t1",
+            "exit: 1\nportal-layout-contract.test.ts · 1 failed\n",
+        );
+        turn_end(&mut i);
+        print(&mut out, "I-run-failure-collapsed", i);
+
+        // J — Run failure expanded.
+        let mut j = opened("跑测试");
+        say(&mut j, "p", "跑一下测试。");
+        run_failed(
+            &mut j,
+            "t1",
+            "exit: 1\nportal-layout-contract.test.ts · 1 failed\n",
+        );
+        turn_end(&mut j);
+        let anchor = first_group(&j);
+        j.transcript
+            .set_item_display(anchor, crate::fold::DisplayMode::Expanded);
+        print(&mut out, "J-run-failure-expanded", j);
+
+        // K — small full diff.
+        let mut k = opened("改 pricing");
+        say(&mut k, "p", "把调用点改掉。");
+        edit(&mut k, "e1", "src/pricing.rs", 1);
+        turn_end(&mut k);
+        print(&mut out, "K-edit-small-diff", k);
+
+        // L — long full diff.
+        let mut l = opened("改 pricing");
+        say(&mut l, "p", "把调用点都改掉。");
+        edit(&mut l, "e1", "src/pricing.rs", 14);
+        turn_end(&mut l);
+        print(&mut out, "L-edit-long-diff", l);
+
+        // M — final transcript.
+        let mut m = opened("修复 bug");
+        say(&mut m, "p", "修一下并验证。");
+        reasoning(&mut m, "先看当前分支与状态。", Some(4100));
+        read(&mut m, "r1", "src/pricing.rs", 40);
+        search(&mut m, "s1", "missing model");
+        run_test(&mut m, "t1", true, "ok\n");
+        edit(&mut m, "e1", "src/pricing.rs", 2);
+        say(
+            &mut m,
+            "f1",
+            "已经确认：把 catalog fallback 指向了新的模型常量，本地构建与测试均通过。",
+        );
+        turn_end(&mut m);
+        print(&mut out, "M-final-transcript", m);
+        let _ = out.flush();
     }
 
     /// I-04: Final navigation. T3 (40-line Final) + T4 (110-line Final).
@@ -821,7 +989,6 @@ mod tests {
     #[ignore = "ux experiment harness"]
     fn i04_final_navigation() {
         let mut out = report("i04");
-        reset_policies();
         for (label, build) in [("T3", build_t3 as fn() -> AppState), ("T4", build_t4)] {
             let mut s = build();
             let m = measure(&mut s, 80, 24);
@@ -867,7 +1034,6 @@ mod tests {
             // The other Variant A inputs, for the record: page-up count.
             let _ = writeln!(out, "A PageUp: {pageups} actions");
         }
-        reset_policies();
     }
 
     /// EXP-04: historical Progress. T5.
@@ -875,7 +1041,6 @@ mod tests {
     #[ignore = "ux experiment harness"]
     fn exp04_historical_progress() {
         let mut out = report("exp04");
-        reset_policies();
         header(&mut out, "EXP-04 T5 / 80x24");
         let mut a = build_t5();
         let ma = measure(&mut a, 80, 24);
@@ -889,7 +1054,6 @@ mod tests {
             "  historical Progress lines={} (kept in full: it carries the 'why')",
             ma.progress_lines
         );
-        reset_policies();
     }
 
     /// T6: a failure's evidence must stay on the surface. The shipped UI has no
@@ -899,7 +1063,6 @@ mod tests {
     #[ignore = "ux experiment harness"]
     fn t6_failure_evidence_is_visible() {
         let mut out = report("t6");
-        reset_policies();
         header(&mut out, "T6 failure / 80x24");
         let mut a = build_t6();
         let ma = measure(&mut a, 80, 24);

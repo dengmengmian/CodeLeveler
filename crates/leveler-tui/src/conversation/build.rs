@@ -87,9 +87,6 @@ impl AppState {
                 std::rc::Rc::new(starts),
             );
         }
-        let diff_preview_rows = crate::activity_stream::diff_preview_rows_for_viewport(
-            super::geometry::viewport_height(self),
-        );
         let key = ConvKey {
             version: self.transcript.version(),
             width,
@@ -99,7 +96,7 @@ impl AppState {
             tools_expanded: self.tools_expanded,
             awaiting_approval: self.approval_gated_call().cloned(),
             elapsed_secs: self.elapsed_secs,
-            diff_preview_rows,
+            fold_version: self.conv.fold_version,
             focused_command: self.focused_command().cloned(),
         };
         if let Some((k, lines, hits, commands, anchor, starts)) = self.conv.cache.borrow().as_ref()
@@ -198,9 +195,6 @@ fn build_conversation(
     // fold preserves the toggled entry's position on screen by shifting the
     // viewport by the same amount the entry moved.
     let mut item_spans: Vec<(usize, usize)> = vec![(0, 0); state.transcript.items().len()];
-    let diff_preview_rows = crate::activity_stream::diff_preview_rows_for_viewport(
-        super::geometry::viewport_height(state),
-    );
 
     // Empty session: brand splash (logo + tagline) instead of a blank void.
     if crate::splash::conversation_is_empty(state) {
@@ -233,9 +227,56 @@ fn build_conversation(
     let mut new_units: Vec<super::view::CachedUnit> = Vec::new();
 
     let items = state.transcript.items();
+    let folds = plan_exploration_folds(items);
     let mut idx = 0;
     while idx < items.len() {
         let item = &items[idx];
+        // A view-time exploration run paints as ONE unit: the aggregate
+        // receipt, plus whatever its current fold state reveals. Nothing is
+        // merged — the run's items stay in the transcript and opening the fold
+        // restores them in their real order.
+        if let Some(run) = folds.owner[idx] {
+            let fold = &folds.runs[run];
+            debug_assert_eq!(fold.start, idx, "a run is entered at its start");
+            if idx > 0 && items_need_gap(&items[idx - 1], item) {
+                out.push(Line::from(""));
+            }
+            let before_item = out.len();
+            render_exploration_fold(
+                state,
+                fold,
+                &mut out,
+                &mut hits,
+                &mut commands,
+                width,
+                theme,
+                t,
+            );
+            // The memo is positional over cacheable items: consume one stale
+            // unit per cacheable item the fold covers and push a
+            // never-matching placeholder, so items AFTER the fold keep their
+            // cache slot instead of re-wrapping on every frame.
+            for covered in &items[fold.start..fold.end] {
+                if !matches!(
+                    covered,
+                    TranscriptItem::ToolGroup(_)
+                        | TranscriptItem::SubAgent(_)
+                        | TranscriptItem::UserShell(_)
+                ) {
+                    let _ = prev_units.next();
+                    new_units.push(super::view::CachedUnit {
+                        items: Vec::new(),
+                        env,
+                        lines: std::rc::Rc::new(Vec::new()),
+                        hits: Vec::new(),
+                        commands: Vec::new(),
+                    });
+                }
+            }
+            item_spans[fold.start..fold.end].fill((before_item, out.len()));
+            idx = fold.end;
+            continue;
+        }
         // Remember where this item starts: a group whose tools are all Silent
         // (ls / probe runs) renders nothing, and a separator emitted before it
         // would leave a blank gap with no content — the reader sees a hole
@@ -324,7 +365,6 @@ fn build_conversation(
                         state.elapsed_secs,
                         state.approval_gated_call(),
                         state.focused_command(),
-                        diff_preview_rows,
                         &mut rows,
                     ));
                     commands.extend(rows.into_iter().map(|row| super::view::CommandHit {
@@ -382,6 +422,310 @@ fn build_conversation(
 
     *state.conv.item_cache.borrow_mut() = super::view::ItemLineCache { units: new_units };
     (out, hits, commands, final_anchor, item_spans)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// View-time exploration folds
+// ───────────────────────────────────────────────────────────────────────────
+//
+// A provider that reasons between tool calls makes the transcript alternate
+// `Thought / ToolGroup / Thought / ToolGroup`, which paints a wall of `◆`
+// headers over one-row reads. The fix is PRESENTATION ONLY: a chronological run
+// of finished collapsed Thoughts and settled non-destructive exploration groups
+// is painted as ONE aggregate receipt until the reader opens it. Nothing is
+// merged or reordered — the same semantic items stay in the transcript, and
+// opening the fold restores them in their real order.
+
+/// One item inside a view-time exploration run.
+#[derive(Debug)]
+struct FoldSlot {
+    item: usize,
+    /// Hidden while the fold is collapsed. A participant is a finished
+    /// collapsed Thought or a settled exploration group; a transparent slot is
+    /// one the reader already opened and must keep seeing.
+    participant: bool,
+}
+
+/// One derived exploration run. `end` is exclusive.
+#[derive(Debug)]
+struct ExplorationFold {
+    /// The run's first exploration group — the toggle target and the run's
+    /// stable identity. Its first call's id keys the view-time fold set.
+    anchor: usize,
+    start: usize,
+    end: usize,
+    slots: Vec<FoldSlot>,
+    /// Every exploration call the receipt counts, as (item index, call index).
+    members: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Default)]
+struct ExplorationFolds {
+    /// For each transcript item, the run index it belongs to.
+    owner: Vec<Option<usize>>,
+    runs: Vec<ExplorationFold>,
+}
+
+/// How one transcript item behaves inside an exploration run.
+enum FoldClass {
+    /// A settled exploration group that the folded receipt speaks for.
+    ParticipantGroup,
+    /// A finished, default-collapsed Thought the receipt folds over.
+    ParticipantThought,
+    /// A member the reader already opened: kept visible, never hidden.
+    Transparent,
+    /// Anything else ends the run.
+    Break,
+}
+
+fn classify_fold_item(item: &TranscriptItem) -> FoldClass {
+    match item {
+        TranscriptItem::Thought(block) if block.done => {
+            if block.display.is_collapsed() {
+                FoldClass::ParticipantThought
+            } else {
+                // A Thought the reader opened keeps its body visible. It does
+                // not split the run: the fold still speaks for its groups.
+                FoldClass::Transparent
+            }
+        }
+        // A live Thought is the tail itself; a run never folds around it.
+        TranscriptItem::Thought(_) => FoldClass::Break,
+        TranscriptItem::ToolGroup(group)
+            if crate::activity_stream::group_is_exploration_fold_member(group) =>
+        {
+            // The run's fold state is the fold SET, not the group's own
+            // drawer: a member that was opened before the fold formed is still
+            // claimed by the receipt, and its drawer is restored when the
+            // receipt is opened.
+            FoldClass::ParticipantGroup
+        }
+        _ => FoldClass::Break,
+    }
+}
+
+/// Derive every view-time exploration run in one pass.
+///
+/// A run folds only when it holds at least one exploration group and counts at
+/// least two exploration calls: a lone read keeps its own target row, and a
+/// run of only Thoughts has an empty label and nothing to compact. When a
+/// candidate run does not fold, the whole candidate is skipped — no sub-run of
+/// it can have more members, so none can fold either.
+fn plan_exploration_folds(items: &[TranscriptItem]) -> ExplorationFolds {
+    let mut plan = ExplorationFolds {
+        owner: vec![None; items.len()],
+        runs: Vec::new(),
+    };
+    let mut i = 0;
+    while i < items.len() {
+        let mut slots: Vec<FoldSlot> = Vec::new();
+        let mut members: Vec<(usize, usize)> = Vec::new();
+        let mut anchor: Option<usize> = None;
+        let mut j = i;
+        while j < items.len() {
+            match classify_fold_item(&items[j]) {
+                FoldClass::ParticipantGroup => {
+                    if let Some(TranscriptItem::ToolGroup(group)) = items.get(j) {
+                        for (ci, call) in group.calls.iter().enumerate() {
+                            if crate::activity_stream::is_exploration_fold_call(call) {
+                                members.push((j, ci));
+                            }
+                        }
+                    }
+                    anchor.get_or_insert(j);
+                    slots.push(FoldSlot {
+                        item: j,
+                        participant: true,
+                    });
+                }
+                FoldClass::ParticipantThought => slots.push(FoldSlot {
+                    item: j,
+                    participant: true,
+                }),
+                FoldClass::Transparent => slots.push(FoldSlot {
+                    item: j,
+                    participant: false,
+                }),
+                FoldClass::Break => break,
+            }
+            j += 1;
+        }
+        match anchor {
+            Some(anchor) if members.len() >= 2 && j > i => {
+                let run = plan.runs.len();
+                for k in i..j {
+                    plan.owner[k] = Some(run);
+                }
+                plan.runs.push(ExplorationFold {
+                    anchor,
+                    start: i,
+                    end: j,
+                    slots,
+                    members,
+                });
+                i = j;
+            }
+            _ => i = if j > i { j } else { i + 1 },
+        }
+    }
+    plan
+}
+
+/// The stable identity of a run: its anchor group's first exploration call.
+fn fold_anchor_key(
+    items: &[TranscriptItem],
+    fold: &ExplorationFold,
+) -> Option<leveler_client_protocol::ToolCallId> {
+    let TranscriptItem::ToolGroup(group) = items.get(fold.anchor)? else {
+        return None;
+    };
+    crate::activity_stream::group_exploration_fold_calls(group)
+        .first()
+        .map(|call| call.id.clone())
+}
+
+/// Whether a view-time exploration fold is open. Presentation-only state kept
+/// on the conversation view, keyed by the run's anchor call id.
+impl crate::conversation::ConversationView {
+    pub(crate) fn exploration_fold_expanded(
+        &self,
+        key: &leveler_client_protocol::ToolCallId,
+    ) -> bool {
+        self.exploration_folds.borrow().contains(key)
+    }
+}
+
+/// Toggle the view-time exploration fold whose receipt is `item`, if any.
+/// Returns the new expanded state, or `None` when the item is not a run's
+/// anchor.
+///
+/// Only the run's ANCHOR (its first exploration group) opens or closes the
+/// fold. A Thought or member row inside an open fold keeps its own fold: a
+/// click there must reveal reasoning, never collapse the run around it.
+///
+/// Kept beside the planner so the run the reader clicked is resolved by the
+/// same derivation that painted it — the hit can never describe another run.
+pub(crate) fn toggle_exploration_fold(state: &mut AppState, item: usize) -> Option<bool> {
+    let items = state.transcript.items();
+    let plan = plan_exploration_folds(items);
+    let run = plan.owner.get(item).copied().flatten()?;
+    let fold = plan.runs.get(run)?;
+    if fold.anchor != item {
+        return None;
+    }
+    let key = fold_anchor_key(items, fold)?;
+    let expanded = {
+        let mut folds = state.conv.exploration_folds.borrow_mut();
+        if folds.remove(&key) {
+            false
+        } else {
+            folds.insert(key);
+            true
+        }
+    };
+    state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
+    // The plain-text projection backs selection and URL hit-testing; the fold
+    // changed the lines under it, so it must be rebuilt on next use.
+    state.conv.plain.clear();
+    state.conv.plain_width = 0;
+    Some(expanded)
+}
+
+/// Paint one view-time exploration run as a unit: the aggregate receipt, then
+/// the members the current fold state reveals.
+#[allow(clippy::too_many_arguments)]
+fn render_exploration_fold(
+    state: &AppState,
+    fold: &ExplorationFold,
+    out: &mut Vec<Line<'static>>,
+    hits: &mut Vec<(usize, usize)>,
+    commands: &mut Vec<super::view::CommandHit>,
+    width: usize,
+    theme: &crate::theme::Theme,
+    t: &crate::i18n::UiText,
+) {
+    let items = state.transcript.items();
+    let expanded =
+        fold_anchor_key(items, fold).is_some_and(|key| state.conv.exploration_fold_expanded(&key));
+    let members: Vec<&crate::transcript::ToolCallBlock> = fold
+        .members
+        .iter()
+        .filter_map(|(i, c)| match items.get(*i) {
+            Some(TranscriptItem::ToolGroup(group)) => group.calls.get(*c),
+            _ => None,
+        })
+        .collect();
+    // The receipt IS the fold's disclosure row: its click toggles the run.
+    hits.push((out.len(), fold.anchor));
+    out.push(crate::activity_stream::exploration_fold_receipt_line(
+        &members, theme, width, t, expanded,
+    ));
+    let body_start = out.len();
+    let child_width = width
+        .saturating_sub(crate::activity_stream::GROUP_BODY_INDENT.len())
+        .max(1);
+    for slot in &fold.slots {
+        // A collapsed fold shows nothing of its participants: the receipt
+        // already speaks for them. Transparent slots stay visible either way.
+        if !expanded && slot.participant {
+            continue;
+        }
+        match items.get(slot.item) {
+            Some(TranscriptItem::Thought(block)) => {
+                hits.push((out.len(), slot.item));
+                out.extend(crate::render::thought_lines(block, theme, child_width, t));
+            }
+            Some(TranscriptItem::ToolGroup(group)) if slot.participant => {
+                let calls = crate::activity_stream::group_exploration_fold_calls(group);
+                out.extend(crate::activity_stream::exploration_fold_member_lines(
+                    &calls,
+                    theme,
+                    child_width,
+                    state.locale,
+                    t,
+                    state.elapsed_secs,
+                    state.approval_gated_call(),
+                ));
+            }
+            Some(TranscriptItem::ToolGroup(group)) => {
+                // A member the reader already opened keeps its own drawer.
+                if crate::activity_stream::group_has_disclosure(group) {
+                    hits.push((out.len(), slot.item));
+                }
+                let base = out.len();
+                let mut rows = Vec::new();
+                out.extend(crate::activity_stream::render_activity(
+                    group,
+                    theme,
+                    child_width,
+                    state.locale,
+                    t,
+                    state.elapsed_secs,
+                    state.approval_gated_call(),
+                    state.focused_command(),
+                    &mut rows,
+                ));
+                commands.extend(rows.into_iter().map(|row| super::view::CommandHit {
+                    line: base + row.line,
+                    item: slot.item,
+                    call: row.call,
+                    stoppable: row.stoppable,
+                }));
+            }
+            _ => {}
+        }
+    }
+    // Children step in one level under the receipt, exactly like every other
+    // fold's body. Width was reserved above, so this only paints.
+    for line in out.iter_mut().skip(body_start) {
+        line.spans.insert(
+            0,
+            Span::styled(
+                crate::activity_stream::GROUP_BODY_INDENT.to_string(),
+                Style::default().fg(theme.ink(crate::theme::Ink::Subtle)),
+            ),
+        );
+    }
 }
 
 /// Render one memoized transcript item to lines, plus its disclosure hit rows
@@ -574,11 +918,12 @@ mod tests {
         );
     }
 
-    /// A height-only resize (same width) must re-project the diff preview: the
-    /// budget is derived from the viewport, so the cache key has to notice a
-    /// changed height or it keeps painting the previous budget's truncation.
+    /// A height-only resize can no longer truncate a confirmed diff. The Full
+    /// Diff contract paints every change row at any viewport, so the same
+    /// width projects the same number of lines whether the viewport is short
+    /// or tall — and the last change row is always present.
     #[test]
-    fn a_height_only_resize_reprojects_the_diff_preview() {
+    fn a_confirmed_diff_is_complete_at_any_viewport_height() {
         let mut s = test_state();
         s.transcript.push_user("edit a file".into());
         let diff = (0..40)
@@ -609,16 +954,439 @@ mod tests {
         // Seal the group so the edit renders as settled history.
         s.transcript.push_note("tail".into());
 
-        // Small viewport: the preview budget is small.
+        // Small viewport and tall viewport, same width.
         s.conv.rect = Some((0, 2, 80, 12));
-        let short = s.conversation_lines(80).len();
-        // Same width, tall viewport: the budget grows and the fold marker goes.
+        let short_lines = s.conversation_lines(80);
+        let short = short_lines.len();
         s.conv.rect = Some((0, 2, 80, 80));
-        let tall = s.conversation_lines(80).len();
+        let tall_lines = s.conversation_lines(80);
+        let tall = tall_lines.len();
 
-        assert!(
-            tall > short,
-            "a height-only resize must re-project the diff preview: {short} -> {tall}"
+        assert_eq!(
+            tall, short,
+            "a confirmed diff is never viewport-truncated: {short} -> {tall}"
         );
+        let plain: Vec<String> = tall_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            plain.iter().any(|r| r.contains("+ new call 39")),
+            "the last change row is painted: {plain:?}"
+        );
+        assert!(
+            !plain.iter().any(|r| r.contains("还有")),
+            "no preview marker replaced a hunk"
+        );
+    }
+}
+
+/// View-time exploration folds: the presentation contracts the Conversation
+/// IA now guarantees. These tests drive the SAME build path the UI paints.
+#[cfg(test)]
+mod exploration_fold_tests {
+    use super::*;
+    use leveler_client_protocol::{MessageId, SessionId, ToolCallId};
+
+    fn boot() -> AppState {
+        let mut s = AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: SessionId::new("fold"),
+                user: "u".into(),
+                version: "0.1.0".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                thinking: None,
+            },
+        );
+        s.size = (80, 40);
+        s.conv.rect = Some((0, 2, 80, 30));
+        s.transcript.push_user("find the bug".into());
+        s
+    }
+
+    fn tool(s: &mut AppState, id: &str, name: &str, args: serde_json::Value, step: u32, ok: bool) {
+        s.transcript.push_tool_started(
+            ToolCallId::new(id),
+            name.into(),
+            args.to_string(),
+            false,
+            0,
+            Some(step),
+            None,
+        );
+        let preview = "alpha\nbeta\n";
+        let diff =
+            (name == "apply_patch").then(|| "@@ -1,1 +1,2 @@\n context\n+added\n".to_string());
+        s.transcript
+            .complete_tool(&ToolCallId::new(id), ok, preview.into(), 10, diff);
+    }
+
+    fn read(s: &mut AppState, id: &str, path: &str, step: u32) {
+        tool(
+            s,
+            id,
+            "read_file",
+            serde_json::json!({ "path": path }),
+            step,
+            true,
+        );
+    }
+
+    fn search(s: &mut AppState, id: &str, pattern: &str, step: u32) {
+        tool(
+            s,
+            id,
+            "grep",
+            serde_json::json!({ "pattern": pattern }),
+            step,
+            true,
+        );
+    }
+
+    fn thought(s: &mut AppState, text: &str) {
+        s.transcript.begin_thought();
+        s.transcript.append_thought(text);
+        s.transcript.finish_thought(Some(800));
+    }
+
+    fn narration(s: &mut AppState, text: &str) {
+        let id = MessageId::new("n");
+        s.transcript.begin_assistant(id.clone());
+        s.transcript.append_assistant(&id, text);
+        s.transcript.finish_assistant(&id);
+    }
+
+    /// Close the trailing group. A group the model may still extend is not
+    /// history yet, so a fixture that wants settled runs must close it.
+    fn seal(s: &mut AppState) {
+        s.transcript.push_note("sealed".into());
+    }
+
+    fn render(s: &AppState) -> Vec<String> {
+        s.conversation_lines(80)
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn receipts(lines: &[String]) -> Vec<&String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with('\u{25b8}') || l.starts_with('\u{25be}'))
+            .collect()
+    }
+
+    /// The index of the run's anchor: its first exploration group.
+    fn first_group_index(s: &AppState) -> usize {
+        s.transcript
+            .items()
+            .iter()
+            .position(|it| matches!(it, TranscriptItem::ToolGroup(_)))
+            .expect("a tool group")
+    }
+
+    /// THOUGHT-IA-4/8: a click on a Thought row inside an OPEN fold opens its
+    /// reasoning body; it never collapses the run around it.
+    #[test]
+    fn clicking_a_thought_inside_an_open_fold_opens_its_body() {
+        let mut s = boot();
+        thought(&mut s, "first");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "open this body");
+        read(&mut s, "r2", "b.rs", 1);
+        seal(&mut s);
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        assert!(render(&s).iter().any(|l| l.starts_with('\u{25be}')));
+
+        // The second Thought is item 3 (user=0, t=1, group=2, t=3).
+        crate::conversation::interaction::toggle_fold(&mut s, 3);
+        let after = render(&s);
+        assert!(
+            after.iter().any(|l| l.starts_with('\u{25be}')),
+            "the fold stays open: {after:#?}"
+        );
+        assert!(
+            after.iter().any(|l| l.contains("open this body")),
+            "the reasoning body opened: {after:#?}"
+        );
+    }
+
+    fn position(lines: &[String], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not found in {lines:#?}"))
+    }
+
+    /// THOUGHT-IA-2/3/5/6 and TOOL-IA-4: alternating Thoughts and exploration
+    /// groups paint ONE aggregate receipt, the Thoughts stay out of the label,
+    /// and neither a Thought header nor a member target is on screen.
+    #[test]
+    fn a_collapsed_run_is_one_receipt_and_hides_its_thoughts() {
+        let mut s = boot();
+        thought(&mut s, "checking pricing");
+        read(&mut s, "r1", "README.md", 0);
+        thought(&mut s, "now config");
+        read(&mut s, "r2", "config.rs", 1);
+        search(&mut s, "g1", "missing model", 2);
+        thought(&mut s, "almost done");
+
+        let lines = render(&s);
+        let found = receipts(&lines);
+        assert_eq!(found.len(), 1, "one aggregate receipt: {lines:#?}");
+        assert_eq!(
+            found[0].trim_end(),
+            "\u{25b8} 读取 2 个文件 \u{b7} 搜索 1 次"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("已思考")),
+            "no Thought header while folded: {lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("README.md") || l.contains("config.rs")),
+            "member targets are hidden while folded: {lines:#?}"
+        );
+    }
+
+    /// THOUGHT-IA-7 / SEMANTIC-IA-3 / TOOL-IA-5: opening the receipt restores
+    /// the REAL chronology — each Thought and each member row in its original
+    /// order. Nothing was merged away.
+    #[test]
+    fn expanding_a_run_restores_the_real_chronology() {
+        let mut s = boot();
+        thought(&mut s, "first thought");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "second thought");
+        read(&mut s, "r2", "b.rs", 1);
+        search(&mut s, "g1", "missing model", 2);
+        seal(&mut s);
+
+        let collapsed = render(&s);
+        assert!(collapsed.iter().any(|l| l.contains("读取 2 个文件")));
+
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let open = render(&s);
+        assert!(open.len() > collapsed.len(), "the fold added rows");
+        assert_eq!(
+            open.iter().filter(|l| l.starts_with('\u{25be}')).count(),
+            1,
+            "the receipt stays and opens: {open:#?}"
+        );
+        let receipt = position(&open, "\u{25be}");
+        let thoughts: Vec<usize> = open
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("已思考"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(thoughts.len(), 2, "both Thoughts are restored: {open:#?}");
+        let (t1, t2) = (thoughts[0], thoughts[1]);
+        let a = position(&open, "a.rs");
+        let b = position(&open, "b.rs");
+        let g = position(&open, "missing model");
+        assert!(
+            receipt < t1 && t1 < a && a < t2 && t2 < b && b < g,
+            "chronology restored: {open:#?}"
+        );
+    }
+
+    /// THOUGHT-IA-8: a Thought the reader opened keeps its body and is never
+    /// absorbed back into the fold.
+    #[test]
+    fn an_opened_thought_stays_visible_inside_the_fold() {
+        let mut s = boot();
+        thought(&mut s, "first");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "keep me visible");
+        read(&mut s, "r2", "b.rs", 1);
+        seal(&mut s);
+        // User opens the second Thought (item 3: user, t, read, t).
+        s.transcript
+            .set_item_display(3, crate::fold::DisplayMode::Expanded);
+
+        let lines = render(&s);
+        assert!(
+            lines.iter().any(|l| l.contains("keep me visible")),
+            "the opened reasoning body stays on screen: {lines:#?}"
+        );
+        assert_eq!(receipts(&lines).len(), 1, "the fold still forms");
+    }
+
+    /// TOOL-IA-6: a Run is its own block and breaks the exploration fold.
+    #[test]
+    fn a_command_breaks_the_run() {
+        let mut s = boot();
+        thought(&mut s, "t1");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "t2");
+        read(&mut s, "r2", "b.rs", 1);
+        tool(
+            &mut s,
+            "c1",
+            "run_command",
+            serde_json::json!({ "program": "cargo", "args": ["test"] }),
+            2,
+            true,
+        );
+        read(&mut s, "r3", "c.rs", 3);
+        search(&mut s, "g1", "x", 4);
+        seal(&mut s);
+
+        let lines = render(&s);
+        assert_eq!(
+            receipts(&lines).len(),
+            2,
+            "the Run split the run: {lines:#?}"
+        );
+        let run = position(&lines, "cargo test");
+        let first = position(&lines, "\u{25b8}");
+        let second = lines
+            .iter()
+            .rposition(|l| l.starts_with('\u{25b8}'))
+            .expect("second receipt");
+        assert!(
+            first < run && run < second,
+            "the Run sits between: {lines:#?}"
+        );
+    }
+
+    /// TOOL-IA-7: a confirmed Edit breaks the fold — a diff is a result, not
+    /// exploration.
+    #[test]
+    fn an_edit_breaks_the_run() {
+        let mut s = boot();
+        thought(&mut s, "t1");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "t2");
+        read(&mut s, "r2", "b.rs", 1);
+        tool(
+            &mut s,
+            "e1",
+            "apply_patch",
+            serde_json::json!({ "path": "a.rs" }),
+            2,
+            true,
+        );
+        read(&mut s, "r3", "c.rs", 3);
+        search(&mut s, "g1", "x", 4);
+        seal(&mut s);
+
+        let lines = render(&s);
+        assert_eq!(
+            receipts(&lines).len(),
+            2,
+            "the Edit split the run: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("+ added")),
+            "the diff stays: {lines:#?}"
+        );
+    }
+
+    /// TOOL-IA-8: narration (assistant prose) breaks the fold and stays whole.
+    #[test]
+    fn narration_breaks_the_run_and_stays_visible() {
+        let mut s = boot();
+        thought(&mut s, "t1");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "t2");
+        read(&mut s, "r2", "b.rs", 1);
+        narration(&mut s, "the workspace is clean");
+        read(&mut s, "r3", "c.rs", 2);
+        search(&mut s, "g1", "x", 3);
+        seal(&mut s);
+
+        let lines = render(&s);
+        assert_eq!(
+            receipts(&lines).len(),
+            2,
+            "narration split the run: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("the workspace is clean")),
+            "narration is never folded: {lines:#?}"
+        );
+    }
+
+    /// TOOL-IA-9: a failed exploration call is a breaker, so its target can
+    /// never be hidden inside an aggregate receipt.
+    #[test]
+    fn a_failed_exploration_target_is_never_folded_away() {
+        let mut s = boot();
+        thought(&mut s, "t1");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "t2");
+        read(&mut s, "r2", "b.rs", 1);
+        tool(
+            &mut s,
+            "f1",
+            "read_file",
+            serde_json::json!({ "path": "missing.rs" }),
+            2,
+            false,
+        );
+
+        let lines = render(&s);
+        assert!(
+            lines.iter().any(|l| l.contains("missing.rs")),
+            "the failing target is visible: {lines:#?}"
+        );
+        // The group holding the failure is not an exploration participant.
+        assert!(
+            lines.iter().any(|l| l.contains("\u{2717}")),
+            "the failure glyph is present: {lines:#?}"
+        );
+    }
+
+    /// TOOL-IA-3-like: a lone exploration call keeps its own target row instead
+    /// of a one-item receipt.
+    #[test]
+    fn a_lone_exploration_call_keeps_its_own_target() {
+        let mut s = boot();
+        read(&mut s, "r1", "only.rs", 0);
+        let lines = render(&s);
+        assert!(
+            receipts(&lines).is_empty(),
+            "no receipt for one call: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("only.rs")),
+            "the lone target is visible: {lines:#?}"
+        );
+    }
+
+    /// SEMANTIC-IA-2 / toggling: opening and closing the fold is reversible and
+    /// never reorders or loses a semantic item.
+    #[test]
+    fn toggling_the_receipt_is_reversible() {
+        let mut s = boot();
+        thought(&mut s, "t1");
+        read(&mut s, "r1", "a.rs", 0);
+        thought(&mut s, "t2");
+        read(&mut s, "r2", "b.rs", 1);
+        seal(&mut s);
+        let before = render(&s);
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let open = render(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let after = render(&s);
+        assert_eq!(before, after, "closing restores the collapsed frame");
+        assert!(open.len() > before.len(), "opening revealed detail");
     }
 }

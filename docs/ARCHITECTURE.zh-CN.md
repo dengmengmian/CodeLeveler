@@ -1222,8 +1222,10 @@ dogfood 验证，不要在后续改动中回退：
 - **错误来源与投递事实结构化**：`LocalConfiguration`、`Auth`（结构化
   `error.code`）、`ConnectionRefused`（结构化 `io::ErrorKind`）都从事实判定；
   禁止 `message.contains(...)` 字符串特判。
-- **响应式 diff 预览**：Conversation 的 edit preview 预算由会话视口高度推导
-  （量化以避免 notice 行引起的抖动）；全屏 Diff 页仍显示完整 patch。
+- **Confirmed Edit Diff 始终完整可见**：已确认的 edit 结果不是“输出”，而是
+  用户正在被展示的修改；其 canonical diff 必须整段绘制，不受视口高度或折叠态
+  影响，不存在 preview 预算、`… +N lines` 替代或 diffstat-only 形态。全屏 Diff
+  页与 Conversation 一致。
 - **Ctrl+G 跳到最终回答**：锚点复用同一份 memoized 投影；无 Final 时只提示，
   不移动视口。
 - **Transcript entry 的折叠是纯 presentation 状态**：`Collapsed` / `Truncated`
@@ -1233,9 +1235,14 @@ dogfood 验证，不要在后续改动中回退：
 - **Thought 是 transcript 的一级条目**：其 rail 只覆盖自身正文，Tool 与它是
   sibling（同一个首列锚点），不能表现成 Thought 的子节点。新的 reasoning 段
   永远是 tail 上的那个可变条目。
-- **探索回执是 view-time fold，不是聚合覆盖**：连续 Read / Search / List 只改变
-  折叠态的呈现，原始 Tool entry 始终保留；展开必须恢复每个真实成员。Run / Edit
-  是 breaker，不和探索工具同组。
+- **探索回执是 view-time fold，不是聚合覆盖**：连续 Read / Search / List，以及
+  它们之间已完成的默认折叠 Thought，只改变折叠态的呈现；原始 Thought / Tool
+  entry 始终保留，展开必须按真实 chronology 恢复每个 Thought 与成员。Run / Edit
+  / MCP / 权限 / 失败 / Narration / Final 是 breaker。折叠标签只统计工具，不发明
+  执行阶段名（如“后端验证”），Thought 不计入标签；失败的探索目标永远直接可见。
+- **工具详细内容默认折叠**：Read / Search / List / Run 默认只画 header 与结果；
+  失败摘要与 running 的极短 live tail 是唯一未经请求就显示的 body。running
+  Thinking、Narration、Final 与已确认 Edit diff 是永远显示正文的例外。
 - **折叠不得移动阅读位置**：折叠以上/以内的条目时，视口顶边锚定的那一行必须保持
   不变；follow-tail 时不需要锚定。
 - **性能基线**：`leveler-tui` 的 `perf_bench` 是 deterministic 性能回归基线，

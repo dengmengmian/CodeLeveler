@@ -61,7 +61,7 @@ use crate::tool_taxonomy::{ActivityVisibility, activity_visibility};
 use crate::transcript::{StopRequest, ToolCallBlock, ToolGroupBlock, ToolStatus};
 
 /// Render a tool group for the Conversation activity stream (test-only
-/// convenience wrapper over [`render_group_rows`] with a default diff budget).
+/// convenience wrapper over [`render_group_rows`]).
 ///
 /// Every user-visible call in the group owns a row, whatever the group's
 /// state. The row says which tool ran, on what, what came back, and what state
@@ -88,7 +88,6 @@ pub(crate) fn render_group(
         now_elapsed_secs,
         awaiting_approval,
         None,
-        DIFF_PREVIEW_ROWS,
         &mut rows,
     )
 }
@@ -116,8 +115,6 @@ pub(crate) fn render_group_rows(
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
-    // Responsive diff preview budget, computed from the conversation viewport.
-    diff_preview_rows: usize,
     rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
@@ -410,15 +407,11 @@ pub(crate) fn render_group_rows(
                 }
             }
             StreamUnit::EditMerge(calls) => {
-                out.extend(edit_unit_lines(
-                    &calls,
-                    theme,
-                    width,
-                    locale,
-                    t,
-                    group.expanded(),
-                    diff_preview_rows,
-                ));
+                // A confirmed edit's diff IS the result: every hunk and every
+                // changed line is painted, whatever the group's fold. Folding
+                // may hide a tool's OUTPUT; it may never hide the change the
+                // user was shown.
+                out.extend(edit_unit_lines(&calls, theme, width, locale, t));
             }
             StreamUnit::FailMerge(calls) => {
                 let total_ms: u64 = calls.iter().filter_map(|c| c.duration_ms).sum();
@@ -643,6 +636,82 @@ fn exploration_members(group: &ToolGroupBlock) -> Vec<&ToolCallBlock> {
         .iter()
         .filter(|c| is_conversation_visible(c) && is_exploration_call(c))
         .collect()
+}
+
+/// Whether one call is eligible to be counted by a view-time exploration fold:
+/// visible, non-destructive, and exploration. The fold planner uses this to
+/// collect the members a receipt speaks for without knowing any tool name.
+pub(crate) fn is_exploration_fold_call(call: &ToolCallBlock) -> bool {
+    is_conversation_visible(call) && is_exploration_call(call)
+}
+
+/// Whether this group is a settled, non-destructive EXPLORATION participant in
+/// a view-time fold.
+///
+/// Stricter than [`group_is_compact_exploration`]: a single call still
+/// participates (a finished Thought beside it already gives the fold a reason
+/// to exist), but the group must be closed and every visible call must have
+/// SUCCEEDED. A failure, an edit, a command or an unknown tool is a breaker,
+/// so a fold can never hide a target the reader needs.
+pub(crate) fn group_is_exploration_fold_member(group: &ToolGroupBlock) -> bool {
+    if group.open || !group_is_finished(group) {
+        return false;
+    }
+    let visible: Vec<&ToolCallBlock> = group
+        .calls
+        .iter()
+        .filter(|c| is_conversation_visible(c))
+        .collect();
+    !visible.is_empty()
+        && visible
+            .iter()
+            .all(|c| is_exploration_call(c) && c.status == ToolStatus::Ok)
+}
+
+/// The exploration calls one fold participant contributes, in order.
+pub(crate) fn group_exploration_fold_calls(group: &ToolGroupBlock) -> Vec<&ToolCallBlock> {
+    group
+        .calls
+        .iter()
+        .filter(|c| is_exploration_fold_call(c))
+        .collect()
+}
+
+/// The aggregate receipt row of a view-time exploration fold that spans
+/// several groups (and the finished Thoughts between them). `members` are the
+/// real exploration calls the fold speaks for, in chronology; Thoughts never
+/// count toward the label.
+pub(crate) fn exploration_fold_receipt_line(
+    members: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+    expanded: bool,
+) -> Line<'static> {
+    exploration_receipt_line(members, theme, width, t, false, expanded)
+}
+
+/// One group's member rows inside an OPEN fold, indented one level under the
+/// aggregate receipt. No receipt of its own: the fold already stated it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exploration_fold_member_lines(
+    calls: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    now_elapsed_secs: u64,
+    awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+) -> Vec<Line<'static>> {
+    expanded_exploration_body(
+        calls,
+        theme,
+        width,
+        locale,
+        t,
+        now_elapsed_secs,
+        awaiting_approval,
+    )
 }
 
 /// Whether this call is a directory listing (counted separately in the
@@ -1659,28 +1728,6 @@ pub(crate) const LIVE_TAIL_ROWS: usize = 6;
 /// enough for its live tail to be useful instead of a one-frame layout jump.
 const LIVE_TAIL_DELAY_SECS: u64 = 1;
 
-/// Diff rows a settled edit keeps on screen before the rest is counted.
-pub(crate) const DIFF_PREVIEW_ROWS: usize = 24;
-
-/// Floor for the responsive preview budget: enough to show the node's head,
-/// stats, a hunk header and at least one change pair.
-pub(crate) const DIFF_PREVIEW_MIN_ROWS: usize = 6;
-
-/// The preview budget for a settled edit, derived from the conversation
-/// viewport it is judged in. An edit node is `head + stats + preview + fold`
-/// rows; keeping the budget three rows under the viewport keeps the node's own
-/// head — which names the file — on screen beside its diff.
-///
-/// Quantized to 4 rows on purpose: a transient chrome change (a notice row
-/// appearing) moves the viewport by a row or two, and a continuous formula
-/// would shift the whole projection with it — and with it every anchor a
-/// navigation action computed a moment earlier. Four-row steps absorb that
-/// jitter while still tracking a real resize.
-pub(crate) fn diff_preview_rows_for_viewport(viewport_height: usize) -> usize {
-    let quantized = viewport_height.saturating_sub(3) / 4 * 4;
-    quantized.clamp(DIFF_PREVIEW_MIN_ROWS, DIFF_PREVIEW_ROWS)
-}
-
 /// Rows a resolved clarification's answer may take in the transcript before
 /// the rest is folded. A multi-question answer is one row per question, and
 /// the whole set is the record of what the user decided.
@@ -2313,20 +2360,19 @@ fn strip_line_gutter(line: &str) -> &str {
 
 /// Merged same-file edit node: one head (glyph + action + inline files), one
 /// hunk-stats line, then the combined diff rows — always complete (§6).
+/// A confirmed edit node: head, stats, and the COMPLETE canonical diff.
+///
+/// Unlike every other tool, an edit's diff is not output to be folded away —
+/// it is the change the user is being shown, and it is painted in full. There
+/// is no preview budget, no `… +N lines` substitution, and no diffstat-only
+/// form: a fold may hide a run's stdout, never a line of the patch.
 fn edit_unit_lines(
     calls: &[&ToolCallBlock],
     theme: &Theme,
     width: usize,
     locale: Locale,
     t: &UiText,
-    // The group was opened: show the whole diff instead of its preview.
-    expanded: bool,
-    preview_rows: usize,
 ) -> Vec<Line<'static>> {
-    // Experimental UX seam (test-only): the harness sweeps preview budgets
-    // without touching production call sites. Production uses `preview_rows`.
-    #[cfg(test)]
-    let preview_rows = crate::ux_experiment::policy::diff_preview_cap(preview_rows);
     let Some(first) = calls.first() else {
         return Vec::new();
     };
@@ -2400,25 +2446,10 @@ fn edit_unit_lines(
         ),
     ]));
 
-    // An edit is a durable result: its diff stays after the call settles.
-    // A large one is a PREVIEW — the first rows and a count of the rest — not
-    // a fold; opening the group shows every row.
-    let start = out.len();
+    // An edit is a durable result: its diff stays after the call settles, and
+    // it is never abbreviated. Every hunk, every changed line and every
+    // canonical context line is painted here.
     crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out);
-    let hidden = (out.len() - start).saturating_sub(preview_rows);
-    if !expanded && hidden > 0 {
-        out.truncate(start + preview_rows);
-        out.push(clip_line(
-            vec![
-                Span::styled("    ", Style::default().fg(theme.ink(Ink::Subtle))),
-                Span::styled(
-                    t.fold_more_lines.replace("{}", &hidden.to_string()),
-                    Style::default().fg(theme.ink(Ink::Meta)),
-                ),
-            ],
-            width,
-        ));
-    }
     out
 }
 
@@ -2710,7 +2741,7 @@ pub(crate) const ACTIVITY_INDENT: &str = "  ";
 /// whole life; only a lone non-shell call, which owns no parent row, keeps its
 /// current position. Two columns, matching [`ACTIVITY_INDENT`]: the hierarchy
 /// is stated by position, never by a box.
-const GROUP_BODY_INDENT: &str = "  ";
+pub(crate) const GROUP_BODY_INDENT: &str = "  ";
 
 /// A tool group placed at the conversation's activity level.
 #[allow(clippy::too_many_arguments)]
@@ -2723,8 +2754,6 @@ pub(crate) fn render_activity(
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
-    // Responsive diff preview budget, computed from the conversation viewport.
-    diff_preview_rows: usize,
     rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
     let mut group_rows = Vec::new();
@@ -2737,7 +2766,6 @@ pub(crate) fn render_activity(
         now_elapsed_secs,
         awaiting_approval,
         focused_command,
-        diff_preview_rows,
         &mut group_rows,
     );
     rows.extend(group_rows);
@@ -4844,7 +4872,6 @@ mod tests {
             0,
             None,
             None,
-            DIFF_PREVIEW_ROWS,
             &mut Vec::new(),
         );
         let text: Vec<String> = lines
@@ -6408,6 +6435,60 @@ mod compact_command_tests {
         );
     }
 
+    /// RUN-IA-3/5: opening a command reveals the COMPLETE captured output, not
+    /// a bounded tail. Collapsed is the default; expanded is the reader's ask.
+    #[test]
+    fn opening_a_command_reveals_its_full_output() {
+        let mut c = cmd(r#"{"program":"cargo","args":["test"]}"#, ToolStatus::Ok);
+        c.duration_ms = Some(8200);
+        let full: String = (0..85).map(|i| format!("line {i}\n")).collect();
+        c.preview = Some(full.clone());
+        c.output = full;
+        c.expanded = true;
+        let lines = lines_at(c, &Theme::no_color(), 100, 0);
+        let text = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("$ cargo test"), "{text}");
+        assert!(
+            text.contains("line 84"),
+            "the whole output is present: {text}"
+        );
+        assert!(
+            !text.contains("\u{8fd8}\u{6709}"),
+            "an opened command is never tail-truncated: {text}"
+        );
+    }
+
+    /// RUN-IA-4: a failed command names its failure while collapsed. The
+    /// reader never has to open the node to notice the red.
+    #[test]
+    fn a_collapsed_failed_command_names_the_failure() {
+        let mut c = cmd(
+            r#"{"program":"npm","args":["-s","run","test"]}"#,
+            ToolStatus::Failed,
+        );
+        c.duration_ms = Some(6200);
+        c.exit_code = Some(1);
+        c.preview = Some("exit: 1\nportal-layout-contract.test.ts \u{b7} 1 failed\n".into());
+        let rows = rows(c);
+        assert!(
+            rows.iter().any(|r| r.contains("failed")),
+            "the failure is visible without expanding: {rows:?}"
+        );
+        assert!(
+            rows[0].contains("\u{2717}"),
+            "the row carries the failure glyph: {rows:?}"
+        );
+    }
+
     // ── HOW a command ran is never WHY it failed ────────────────────────────
 
     /// The runtime's own rows say how a command ran; the command's output says
@@ -6815,16 +6896,21 @@ mod compact_command_tests {
         assert!(rows.iter().any(|r| r.contains("+ line 2")), "{rows:?}");
     }
 
-    /// A large diff is a preview, not a fold: its first rows stay, the rest is
-    /// counted, and opening the group shows all of it.
+    /// The Full Diff contract: a confirmed edit's diff is NEVER abbreviated.
+    /// Every change row is painted, whatever the group's fold, and no
+    /// `… +N lines` marker ever replaces a hunk.
     #[test]
-    fn a_large_diff_is_truncated_not_collapsed() {
+    fn a_large_diff_is_painted_in_full() {
         let rows = rows(edit(200));
         assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
-        assert!(!rows.iter().any(|r| r.contains("+ line 199")), "{rows:?}");
-        assert!(rows.len() <= 2 + DIFF_PREVIEW_ROWS + 1, "{}", rows.len());
-        assert!(rows.last().unwrap().contains("还有"), "{:?}", rows.last());
+        assert!(rows.iter().any(|r| r.contains("+ line 199")), "{rows:?}");
+        assert!(
+            !rows.last().unwrap().contains("还有"),
+            "no preview marker: {:?}",
+            rows.last()
+        );
 
+        // The same complete diff, whatever the group's own fold.
         let opened = text(&render_group(
             &ToolGroupBlock {
                 calls: vec![edit(200)],
@@ -6887,54 +6973,45 @@ mod compact_command_tests {
         assert_eq!(fg_of(&lines, "0.2s"), Some(theme.ink(Ink::Meta)));
         assert_eq!(fg_of(&lines, "\u{203a}"), Some(theme.ink(Ink::Subtle)));
     }
-}
 
-#[cfg(test)]
-mod diff_preview_tests {
-    use super::*;
+    // ── Full Diff contract ───────────────────────────────────────────────
 
-    /// The budget must leave room for an edit node's own head (1), stats (1)
-    /// and fold marker (1) inside the viewport it is judged in — otherwise a
-    /// long diff scrolls the file name off the screen above its changes.
+    /// DIFF-3 / DIFF-4: every changed line of a confirmed edit is painted at
+    /// every width. There is no preview row cap and no hunk is dropped.
     #[test]
-    fn the_budget_keeps_an_edit_nodes_head_inside_its_viewport() {
-        for viewport in [9usize, 10, 11, 12, 13, 17, 27, 40] {
-            let cap = diff_preview_rows_for_viewport(viewport);
-            assert!(
-                (DIFF_PREVIEW_MIN_ROWS..=DIFF_PREVIEW_ROWS).contains(&cap),
-                "viewport {viewport}: budget {cap} out of range"
-            );
-            assert!(
-                cap + 3 <= viewport.max(9),
-                "viewport {viewport}: node of {} rows exceeds it",
-                cap + 3
-            );
+    fn every_changed_line_is_painted_at_any_width() {
+        for width in [24usize, 40, 80, 200] {
+            let rows = body(text(&lines_at(edit(40), &Theme::no_color(), width, 0)));
+            for i in 0..40 {
+                assert!(
+                    rows.iter().any(|r| r.contains(&format!("+ line {i}"))),
+                    "width {width} dropped change line {i}"
+                );
+            }
         }
     }
 
-    /// Quantization is the point: a transient chrome row (a notice) moves the
-    /// viewport by one or two rows, and a continuous formula would shift every
-    /// diff line — and every navigation anchor computed a moment earlier.
+    /// DIFF-6: no diffstat-only substitution. The collapsed edit node paints
+    /// the complete patch, not a count of the lines it hid.
     #[test]
-    fn a_two_row_chrome_change_does_not_move_the_budget() {
-        assert_eq!(
-            diff_preview_rows_for_viewport(11),
-            diff_preview_rows_for_viewport(12)
-        );
-        assert_eq!(
-            diff_preview_rows_for_viewport(12),
-            diff_preview_rows_for_viewport(13)
-        );
-        assert_eq!(
-            diff_preview_rows_for_viewport(16),
-            diff_preview_rows_for_viewport(17)
+    fn a_collapsed_edit_never_replaces_the_diff_with_a_count() {
+        let rows = body(text(&lines_at(edit(120), &Theme::no_color(), 100, 0)));
+        assert!(rows.iter().any(|r| r.contains("+ line 119")), "{rows:?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("还有") || r.contains("more lines")),
+            "a preview marker replaced diff content: {rows:?}"
         );
     }
 
-    /// A real resize still changes it.
+    /// DIFF-7: an edit is never an exploration participant, so an eager
+    /// exploration fold can never swallow its diff.
     #[test]
-    fn a_real_resize_moves_the_budget() {
-        assert!(diff_preview_rows_for_viewport(13) < diff_preview_rows_for_viewport(40));
-        assert_eq!(diff_preview_rows_for_viewport(40), DIFF_PREVIEW_ROWS);
+    fn an_edit_never_joins_an_exploration_fold() {
+        let edit = edit(3);
+        assert!(is_edit_call(&edit));
+        assert!(!is_exploration_call(&edit));
+        assert!(!folds_into_exploration(&edit));
     }
 }

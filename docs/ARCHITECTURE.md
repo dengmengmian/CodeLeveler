@@ -1281,9 +1281,11 @@ verified by deterministic tests and real dogfood — do not regress them:
   `Auth` (structured `error.code`) and `ConnectionRefused` (structured
   `io::ErrorKind`) are decided from facts; `message.contains(...)` string
   matching is forbidden.
-- **Responsive diff preview**: the Conversation edit-preview budget is derived
-  from the conversation viewport height (quantized so a notice row cannot shift
-  it); the full-screen Diff page still shows the whole patch.
+- **A confirmed Edit Diff is always fully visible**: a confirmed edit's result is
+  not "output" but the change the user is being shown; its canonical diff is
+  painted whole, whatever the viewport height or fold state. There is no preview
+  budget, no `… +N lines` substitution and no diffstat-only form. The
+  full-screen Diff page and the Conversation agree.
 - **A transcript entry's fold is presentation state only**: `Collapsed` /
   `Truncated` / `Expanded` belongs to the TUI and never enters the Runtime,
   the event log or persistence. Thoughts and tool groups share ONE fold
@@ -1294,9 +1296,18 @@ verified by deterministic tests and real dogfood — do not regress them:
   first column — never a child of the Thought. A new reasoning segment is always
   the one mutable entry at the tail.
 - **An exploration receipt is a view-time fold, not an aggregate overlay**:
-  consecutive Read / Search / List calls only change how the collapsed group is
-  painted; every original tool entry is kept, and expanding MUST restore each
-  real member. A run or an edit is a breaker, never a member of the same fold.
+  consecutive Read / Search / List calls, plus the finished default-collapsed
+  Thoughts between them, only change how the collapsed run is painted; every
+  original Thought / tool entry is kept, and expanding MUST restore each Thought
+  and member in real chronology. A run, an edit, an MCP dispatch, a permission
+  hold, a failure, narration and the Final are breakers. The label counts tools
+  only and never invents an execution-stage name; Thoughts never count, and a
+  failed exploration target is always directly visible.
+- **Tool detail is collapsed by default**: Read / Search / List / Run paint only a
+  header and outcome unless asked; a failure summary and a running command's
+  short live tail are the only bodies shown unasked. Running Thinking,
+  narration, the Final and a confirmed Edit diff are the exceptions that always
+  show their body.
 - **Folding must not move the reading position**: the line anchored at the
   viewport's top edge keeps its place when an entry above or inside the viewport
   is folded; while following the live tail there is no position to anchor.

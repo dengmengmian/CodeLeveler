@@ -236,7 +236,6 @@ pub fn item_render(
                 0,
                 None,
                 None,
-                crate::activity_stream::DIFF_PREVIEW_ROWS,
                 &mut Vec::new(),
             ));
         }
@@ -1423,6 +1422,58 @@ mod tests {
         );
         assert!(lines[0].contains("思考中"), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains('▌')), "{lines:?}");
+    }
+
+    /// THOUGHT-IA-1: while the model reasons, its body is on screen. The
+    /// running Thought is the ONE reasoning entry that defaults to showing text.
+    #[test]
+    fn a_running_thought_paints_its_body() {
+        let mut block = thought("正在检查 pricing.rs", false, None, false);
+        block.display = crate::fold::DisplayMode::Truncated;
+        block.display_pinned = false;
+        let lines = thought_rows(&block, 60);
+        assert!(lines[0].contains("思考中"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("检查 pricing.rs")),
+            "the live body is visible: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains('\u{2502}')),
+            "the body rides its own rail: {lines:?}"
+        );
+    }
+
+    /// THOUGHT-IA-2/3: a completed Thought defaults to its header alone; the
+    /// reasoning body is not painted until the reader opens it.
+    #[test]
+    fn a_finished_thought_defaults_to_a_bare_header() {
+        let mut block = thought("body that must not show", true, Some(4100), false);
+        block.display = crate::fold::collapse_target(false);
+        block.display_pinned = false;
+        let lines = thought_rows(&block, 60);
+        assert_eq!(lines.len(), 1, "header only: {lines:?}");
+        assert!(lines[0].contains("已思考 4.1s"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("body that must not show")),
+            "the body is collapsed: {lines:?}"
+        );
+    }
+
+    /// THOUGHT-IA-4: opening the Thought paints the whole reasoning body.
+    #[test]
+    fn an_opened_thought_paints_the_whole_body() {
+        let mut block = thought(
+            "first line\nsecond line\nthird line",
+            true,
+            Some(2000),
+            false,
+        );
+        block.display = crate::fold::DisplayMode::Expanded;
+        block.display_pinned = true;
+        let lines = thought_rows(&block, 60);
+        for want in ["first line", "second line", "third line"] {
+            assert!(lines.iter().any(|l| l.contains(want)), "{want}: {lines:?}");
+        }
     }
 
     /// The two kinds differ in marker GLYPH and in marker INK: a faint `●` for

@@ -151,7 +151,13 @@ pub fn toggle_fold(state: &mut AppState, item: usize) -> Option<bool> {
         top_of_viewport(state, width)
     };
 
-    let mode = state.transcript.toggle_item_display(item)?;
+    // A view-time exploration run is folded by its own presentation state; a
+    // single entry folds through its block. Both resolve the SAME item index,
+    // so a click on a receipt can never describe a different entry.
+    let expanded = match super::build::toggle_exploration_fold(state, item) {
+        Some(expanded) => expanded,
+        None => state.transcript.toggle_item_display(item)?.is_expanded(),
+    };
 
     if !followed
         && let Some((anchor_item, offset)) = anchor
@@ -166,9 +172,8 @@ pub fn toggle_fold(state: &mut AppState, item: usize) -> Option<bool> {
     // changed the lines under it, so it must be rebuilt on next use.
     state.conv.plain.clear();
     state.conv.plain_width = 0;
-    Some(mode.is_expanded())
+    Some(expanded)
 }
-
 /// The transcript item and intra-item offset painted at the viewport's top
 /// edge, as the reader is currently looking at it.
 fn top_of_viewport(state: &AppState, width: usize) -> Option<(usize, usize)> {

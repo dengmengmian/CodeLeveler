@@ -28,10 +28,10 @@ pub struct ConvKey {
     /// run time) are painted from it, so a new second is a new frame even when
     /// no transcript event arrived. Constant while idle.
     pub(crate) elapsed_secs: u64,
-    /// The diff preview budget derived from the conversation viewport height.
-    /// Part of the key because a height-only resize (same width) changes it and
-    /// would otherwise keep painting the previous budget's truncation.
-    pub(crate) diff_preview_rows: usize,
+    /// Bumped whenever a view-time exploration fold is opened or closed. The
+    /// fold set itself lives on the view; the cache key reads this counter so
+    /// a toggle repaints without the transcript changing.
+    pub(crate) fold_version: u64,
     /// The command row holding the keyboard focus, when the Command workbench
     /// focus is active. Part of the key because focus paints the row's opener
     /// (§11), and a cache that did not notice would keep two rows marked.
@@ -119,6 +119,10 @@ pub struct ConversationView {
     pub unread: usize,
     /// Last seen conversation line count (to detect growth while scrolled up).
     pub last_len: usize,
+    /// Bumped whenever a view-time exploration fold opens or closes. The fold
+    /// set is presentation state, and the conversation cache key reads this
+    /// counter so a toggle repaints without a transcript change.
+    pub fold_version: u64,
     /// Last painted Conversation rect (x, y, w, h) — the authoritative
     /// viewport for every geometry computation.
     pub rect: Option<(u16, u16, u16, u16)>,
@@ -144,6 +148,14 @@ pub struct ConversationView {
     /// a long finalized history from being re-wrapped on every streaming frame:
     /// only the item whose content changed is recomputed.
     pub item_cache: std::cell::RefCell<ItemLineCache>,
+    /// View-time exploration folds the reader opened, keyed by the run's
+    /// anchor call id (the first exploration call of the run's first group).
+    ///
+    /// PRESENTATION ONLY. It never enters the transcript, the event log or
+    /// resume: a fold is re-derived from the same semantic items every build,
+    /// and an unopened run is simply collapsed.
+    pub(crate) exploration_folds:
+        std::cell::RefCell<std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
 }
 
 impl Default for ConversationView {
@@ -153,6 +165,7 @@ impl Default for ConversationView {
             auto_scroll: true,
             unread: 0,
             last_len: 0,
+            fold_version: 0,
             rect: None,
             scroll_bottom_rect: None,
             selection: crate::selection::TextSelection::default(),
@@ -163,6 +176,7 @@ impl Default for ConversationView {
             plain_width: 0,
             cache: std::cell::RefCell::new(None),
             item_cache: std::cell::RefCell::new(ItemLineCache::default()),
+            exploration_folds: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
     }
 }

@@ -1124,7 +1124,9 @@ pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
     sub_agent_tree_lines,
 };
-pub(crate) use transcript_lines::{sub_agent_detail, turn_end_marker, user_shell_lines};
+pub(crate) use transcript_lines::{
+    sub_agent_detail, thought_lines, turn_end_marker, user_shell_lines,
+};
 
 pub(crate) use panes::pad_line_to_width;
 pub(crate) use panes::{render_list_focused, render_scrolled};
