@@ -12,7 +12,16 @@
 use ratatui::text::Line;
 
 /// How much of a foldable transcript entry is painted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+///
+/// Deliberately has no `Default`. There used to be one (`Expanded`), and every
+/// kind defaults differently: a live entry opens as `Truncated`, a finished
+/// Thought and a settled tool group fold to `Collapsed`, and only the reader's
+/// own toggle lands on `Expanded`. A `Default` that agreed with none of them
+/// was a trap — the next construction site that omitted the field would have
+/// painted a completed Thought wide open. Choosing a mode is part of stating
+/// what an entry is, so every construction names it, and the compiler keeps it
+/// that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DisplayMode {
     /// Header (and outcome) only. The default for a finished entry: a settled
     /// body is evidence, not something the reader has to wade through.
@@ -22,7 +31,6 @@ pub enum DisplayMode {
     /// nothing at the end to justify the space, so it never defaults here.
     Truncated,
     /// Header plus the whole body. The explicit user choice.
-    #[default]
     Expanded,
 }
 
