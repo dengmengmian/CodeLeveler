@@ -1,4 +1,4 @@
-# CodeLeveler 1.0.11
+# CodeLeveler 1.0.12
 
 英文版：[`RELEASE.md`](RELEASE.md)
 
