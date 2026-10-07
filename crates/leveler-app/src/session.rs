@@ -585,6 +585,10 @@ impl Application {
                 leveler_core::now(),
             )
             .await?;
+        // One durable write, both projections: the row above is the record and
+        // this is the same value as RUNNING state. A session whose row was
+        // rewritten this way must not keep authorizing under the old mode.
+        self.set_live_permission_profile(session_id.as_str(), mode);
         Ok(())
     }
 

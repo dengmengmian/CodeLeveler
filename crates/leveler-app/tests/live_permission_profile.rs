@@ -304,3 +304,118 @@ async fn delivered_permission_selection_persists_only_the_target_session_and_lea
     }
     assert_eq!(client.snapshot(&session_id).await.unwrap().mode, initial);
 }
+
+/// A turn whose config snapshot predates a profile switch must NOT write its
+/// stale snapshot back into the session's live cell. The bug this pins:
+/// `handle_submit_message` reads the config, then a `SetPermissionProfile`
+/// lands while the turn is being staged; the turn's engine build re-applied
+/// the pre-switch `mode`, so the UI (acked by `SessionUpdated`) showed `full`
+/// while the running turn kept authorizing under `auto` and asked for approval
+/// on `rm -rf`.
+#[tokio::test]
+async fn a_stale_turn_snapshot_cannot_downgrade_the_live_profile() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+    let app = app(&tmp);
+    let model = leveler_model::ModelRef::new("mock", "m");
+    let session_id = app.create_session(&model, "goal").await.unwrap();
+    let scope = session_id.as_str().to_string();
+    let build = |mode| {
+        let app = &app;
+        let model = model.clone();
+        let scope = scope.clone();
+        async move {
+            app.engine_for_session(
+                &model,
+                mode,
+                false,
+                std::sync::Arc::new(leveler_execution::AutoApprove),
+                std::sync::Arc::new(leveler_agent::AutoClarify),
+                false,
+                Some(scope.as_str()),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Turn 1 starts under Auto and creates the session's live cell.
+    let first = build(PermissionProfile::Assisted).await;
+    assert_eq!(
+        first.factory.tool_context.policy.mode(),
+        PermissionProfile::Assisted
+    );
+
+    // The user switches to Full while the next turn is being staged.
+    app.set_live_permission_profile(&scope, PermissionProfile::FullAccess);
+
+    // The staged turn still carries the pre-switch snapshot. Building its
+    // engine must NOT overwrite the newer live authority.
+    let stale = build(PermissionProfile::Assisted).await;
+    assert_eq!(
+        stale.factory.tool_context.policy.mode(),
+        PermissionProfile::FullAccess,
+        "a stale turn snapshot must not downgrade the session's live profile"
+    );
+    assert_eq!(
+        first.factory.tool_context.policy.mode(),
+        PermissionProfile::FullAccess,
+        "the already-running turn must still see Full"
+    );
+    assert_eq!(
+        app.live_permission_profile(&scope),
+        Some(PermissionProfile::FullAccess)
+    );
+}
+
+/// `/clear` opens a sibling conversation under the requester's axes, including
+/// its permission mode. `NewSessionFor` persists the new row through the same
+/// single owner as any other session, so the new session's runtime state, its
+/// durable row and the snapshot a client renders are one value.
+#[tokio::test]
+async fn a_new_session_inherits_the_requesters_full_mode() {
+    isolate_global_config();
+    let tmp = tempfile::tempdir().unwrap();
+    let app = std::sync::Arc::new(app(&tmp));
+    let model = leveler_model::ModelRef::new("mock", "m");
+    let session_id = app
+        .create_session_with_mode(&model, "goal", PermissionProfile::FullAccess)
+        .await
+        .unwrap();
+    let client = InProcessRuntimeClient::new(
+        app.clone(),
+        model.clone(),
+        // Deliberately the WRONG launch default: the requester's session row
+        // decides, not the client's fallback.
+        PermissionProfile::Assisted,
+        false,
+    );
+    let mut events = client.subscribe_session(&session_id);
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(RuntimeEvent::SessionOpened { session }) = events.recv().await
+                && session.id != session_id
+            {
+                return session;
+            }
+        }
+    })
+    .await
+    .expect("the runtime announces the sibling session");
+    assert_eq!(
+        opened.mode,
+        WirePermissionProfile::FullAccess,
+        "the sibling session must inherit Full, not the client's launch default"
+    );
+    assert_eq!(
+        app.persisted_permission_profile(&opened.id).await.unwrap(),
+        Some(PermissionProfile::FullAccess),
+        "the durable row must agree with the snapshot the client rendered"
+    );
+}

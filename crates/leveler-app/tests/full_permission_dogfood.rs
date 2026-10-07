@@ -6,6 +6,13 @@
 //! runs it explicitly with `--ignored`. The `full_permission_lifecycle.rs`
 //! regression tests are the always-on version of the same invariant.
 //!
+//! The six-case acceptance matrix (`Full` × rm -rf / git reset --hard / kill /
+//! network, and `Auto` × dangerous / benign) is the Release Gate half here and
+//! the fast always-on half in `full_permission_acceptance.rs`.
+//! `rm_out_of_workspace`, `git_reset_hard`, `process_signal` and
+//! `network_public` are the Full cases; an `auto_asks` operation on the
+//! Auto→Full path is the Auto-positive case.
+//!
 //! WHAT IT PROVES (the long-term product invariant):
 //!
 //! ```text
@@ -32,6 +39,13 @@
 //!   * DOGFOOD 4 — reconnect/snapshot never restores the superseded question.
 //!   * DOGFOOD 5 — a Full session resumes Full and still asks nothing.
 //!   * DOGFOOD 6 — operation × entry-path matrix under the global checker.
+//!   * INVARIANT B — the selected mode survives create/persist/restart/resume.
+//!   * INVARIANT C — one live authority per session: a stale turn snapshot (a
+//!     turn staged before a `SetPermissionProfile`) must not write the older
+//!     mode back over the switch; `/clear` and a restart keep the row, the
+//!     snapshot and the live cell on one value.
+//!   * AUTO MATRIX — Auto asks for a dangerous command and does not ask for an
+//!     ordinary one, both on real sessions.
 //!
 //! MCP is reported UNMEASURED here: no MCP fixture server is wired into this
 //! harness. It is covered at the policy layer by
@@ -1018,6 +1032,369 @@ async fn run_mode_persistence(workroot: &std::path::Path) -> (Vec<Case>, Vec<Vio
     (cases, violations)
 }
 
+// ── INVARIANT C: one live permission authority per session ──────────────────
+
+/// Build a session-scoped engine with the production sharing semantics.
+async fn engine_for_scope(
+    app: &Application,
+    model: &ModelRef,
+    mode: PermissionProfile,
+    scope: &str,
+) -> leveler_agent::coding::CodingRuntime {
+    app.engine_for_session(
+        model,
+        mode,
+        false,
+        Arc::new(leveler_execution::AutoApprove),
+        Arc::new(leveler_agent::AutoClarify),
+        false,
+        Some(scope),
+    )
+    .await
+    .unwrap()
+}
+
+fn live_mode(engine: &leveler_agent::coding::CodingRuntime) -> PermissionProfile {
+    engine.factory.tool_context.policy.mode()
+}
+
+/// The stale-turn-snapshot regression, plus the `/clear` and restart forms of
+/// the same one-authority rule:
+///
+/// * a turn whose config snapshot predates a `SetPermissionProfile` must NOT
+///   write the older mode back into the session's live cell (this is the exact
+///   defect: the UI chip said `full` while the running turn kept authorizing
+///   under `auto` and asked for approval on `rm -rf`);
+/// * `/clear` opens a sibling under the requester's mode, with the durable row,
+///   the runtime snapshot and the live cell on one value;
+/// * a restart reads that value back from the row.
+async fn run_live_profile_authority(workroot: &std::path::Path) -> (Vec<Case>, Vec<Violation>) {
+    let root = workroot.join("live-profile-authority");
+    std::fs::create_dir_all(&root).unwrap();
+    write_config(&root, "http://127.0.0.1:1");
+    let model = ModelRef::new("mock", "m");
+    let mut cases = Vec::new();
+    let mut violations = Vec::new();
+
+    let app = Arc::new(Application::assemble(layout(&root)).unwrap());
+    let session_id = app
+        .create_session_with_mode(&model, "live authority", PermissionProfile::Assisted)
+        .await
+        .unwrap();
+    // The client's default is deliberately wrong: the session row decides.
+    let client = app_client(app.clone(), PermissionProfile::Assisted).await;
+
+    // C1. A stale Assisted turn snapshot cannot downgrade the live Full.
+    let first = engine_for_scope(
+        &app,
+        &model,
+        PermissionProfile::Assisted,
+        session_id.as_str(),
+    )
+    .await;
+    // The product switch: one write moves the durable row and the live cell.
+    client
+        .send(ClientCommand::SetPermissionProfile {
+            session_id: session_id.clone(),
+            mode: WirePermission::FullAccess,
+        })
+        .await
+        .unwrap();
+    let stale = engine_for_scope(
+        &app,
+        &model,
+        PermissionProfile::Assisted,
+        session_id.as_str(),
+    )
+    .await;
+    let (stale_mode, first_mode) = (live_mode(&stale), live_mode(&first));
+    if stale_mode == PermissionProfile::FullAccess && first_mode == PermissionProfile::FullAccess {
+        cases.push(Case {
+            id: "C1_stale_snapshot_keeps_live_full".to_string(),
+            status: Status::Pass,
+            detail: "a stale Assisted turn snapshot did not downgrade the live Full profile"
+                .to_string(),
+        });
+    } else {
+        let detail = format!(
+            "FULL_PERMISSION_LIVE_AUTHORITY_VIOLATION: a stale turn snapshot moved the live \
+             profile to {stale_mode:?} (already-running turn: {first_mode:?}) while the user \
+             selected Full"
+        );
+        cases.push(Case {
+            id: "C1_stale_snapshot_keeps_live_full".to_string(),
+            status: Status::Fail,
+            detail: detail.clone(),
+        });
+        violations.push(Violation {
+            case: "C1_stale_snapshot_keeps_live_full".to_string(),
+            detail,
+        });
+    }
+
+    // C2. `/clear` opens a sibling under the requester's Full, and the row, the
+    //     client snapshot and the live cell agree.
+    let mut events = client.subscribe_session(&session_id);
+    client
+        .send(ClientCommand::NewSessionFor {
+            requester_session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let sibling = tokio::time::timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            if let Ok(RuntimeEvent::SessionOpened { session }) = events.recv().await
+                && session.id != session_id
+            {
+                return session;
+            }
+        }
+    })
+    .await;
+    let sibling = match sibling {
+        Ok(session) => session,
+        Err(_) => {
+            let detail = "FULL_PERMISSION_LIVE_AUTHORITY_VIOLATION: `/clear` never announced a \
+                          sibling session"
+                .to_string();
+            cases.push(Case {
+                id: "C2_clear_sibling_effective".to_string(),
+                status: Status::Fail,
+                detail: detail.clone(),
+            });
+            violations.push(Violation {
+                case: "C2_clear_sibling_effective".to_string(),
+                detail,
+            });
+            return (cases, violations);
+        }
+    };
+    let persisted = app.persisted_permission_profile(&sibling.id).await.unwrap();
+    let sibling_engine = engine_for_scope(
+        &app,
+        &model,
+        PermissionProfile::FullAccess,
+        sibling.id.as_str(),
+    )
+    .await;
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        check.check(
+            "C2_clear_sibling/effective",
+            "`/clear` sibling snapshot mode",
+            WirePermission::FullAccess,
+            sibling.mode,
+        );
+        check.check(
+            "C2_clear_sibling/persisted",
+            "`/clear` sibling persisted mode",
+            WirePermission::FullAccess,
+            match persisted {
+                Some(PermissionProfile::FullAccess) => WirePermission::FullAccess,
+                _ => WirePermission::RequestApproval,
+            },
+        );
+        check.check(
+            "C2_clear_sibling/live",
+            "`/clear` sibling live cell",
+            WirePermission::FullAccess,
+            match live_mode(&sibling_engine) {
+                PermissionProfile::FullAccess => WirePermission::FullAccess,
+                _ => WirePermission::RequestApproval,
+            },
+        );
+        if let Some(UiPendingInteraction::Approval(request)) = sibling
+            .pending_interactions
+            .iter()
+            .find(|item| matches!(item, UiPendingInteraction::Approval(_)))
+        {
+            violations.push(Violation {
+                case: "C2_clear_sibling/pending".to_string(),
+                detail: format!(
+                    "FULL_PERMISSION_CONTRACT_VIOLATION: approval pending under Full: {request:?}"
+                ),
+            });
+        }
+    }
+
+    // C3. A restart reads Full back from the durable row.
+    let sibling_id = sibling.id.clone();
+    drop(sibling_engine);
+    drop(client);
+    let restarted = Arc::new(Application::assemble(layout(&root)).unwrap());
+    let restarted_client = app_client(restarted.clone(), PermissionProfile::Assisted).await;
+    {
+        let mut check = ModeCase {
+            cases: &mut cases,
+            violations: &mut violations,
+        };
+        check.check(
+            "C3_clear_sibling_restart/effective",
+            "`/clear` sibling mode after restart",
+            WirePermission::FullAccess,
+            restarted_client.snapshot(&sibling_id).await.unwrap().mode,
+        );
+    }
+
+    (cases, violations)
+}
+
+// ── Auto's own half of the permission contract ───────────────────────────────
+
+struct AutoObserved {
+    approval: Option<UiApprovalRequest>,
+    terminal: bool,
+}
+
+/// Run one operation on a real Auto session and observe whether it asked. A
+/// question is answered `Deny` so the turn settles; the observation is the
+/// question itself, not the decision.
+async fn run_auto_operation(
+    root: &std::path::Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> AutoObserved {
+    let server =
+        MockServer::start(vec![tool_call(tool, arguments), text("dogfood complete")]).await;
+    std::fs::create_dir_all(root).unwrap();
+    write_config(root, &server.base_url());
+    init_git(root);
+    let app = Arc::new(Application::assemble(layout(root)).unwrap());
+    let model = ModelRef::new("mock", "m");
+    let client = app_client(app.clone(), PermissionProfile::Assisted).await;
+    let session_id = client
+        .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: CreateWorkspaceSelection::RuntimeDefault,
+            goal: "auto matrix".to_string(),
+            model: Some(model.clone()),
+            mode: WirePermission::Assisted,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    let mut events = client.subscribe_session(&session_id);
+    let mut watcher = ContractWatcher::new("auto_matrix", WirePermission::Assisted);
+    let mut signals = Signals::default();
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session_id.clone(),
+            content: "auto matrix".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    // Wait for the question (if any) or the terminal.
+    pump_until(
+        &mut events,
+        &mut watcher,
+        &mut signals,
+        |s| s.approval.is_some() || s.terminal,
+        DEFAULT_TIMEOUT,
+    )
+    .await;
+    if let Some(approval) = signals.approval.clone() {
+        let _ = client
+            .send(ClientCommand::ApprovalDecision {
+                request_id: approval.id,
+                decision: ApprovalDecision::Deny,
+            })
+            .await;
+        pump_until(
+            &mut events,
+            &mut watcher,
+            &mut signals,
+            |s| s.terminal,
+            DEFAULT_TIMEOUT,
+        )
+        .await;
+    }
+    AutoObserved {
+        approval: signals.approval,
+        terminal: signals.terminal,
+    }
+}
+
+/// The Auto acceptance matrix: a dangerous command must ASK, an ordinary
+/// development command must RUN without asking. Both are real runtime sessions.
+async fn run_auto_matrix(workroot: &std::path::Path) -> (Vec<Case>, Vec<Violation>) {
+    let mut cases = Vec::new();
+    let mut violations = Vec::new();
+
+    let dangerous_root = workroot.join("auto-dangerous");
+    std::fs::create_dir_all(&dangerous_root).unwrap();
+    let victim = dangerous_root.join("victim.txt");
+    std::fs::write(&victim, "x").unwrap();
+    let dangerous = run_auto_operation(
+        &dangerous_root,
+        "run_command",
+        serde_json::json!({"program": "rm", "args": ["-rf", victim.display().to_string()]}),
+    )
+    .await;
+    if dangerous.approval.is_some() {
+        cases.push(Case {
+            id: "A1_auto_dangerous_asks".to_string(),
+            status: Status::Pass,
+            detail: "Auto asked before the dangerous command ran".to_string(),
+        });
+    } else {
+        let detail = "Auto ran a dangerous command without asking".to_string();
+        cases.push(Case {
+            id: "A1_auto_dangerous_asks".to_string(),
+            status: Status::Fail,
+            detail: detail.clone(),
+        });
+        violations.push(Violation {
+            case: "A1_auto_dangerous_asks".to_string(),
+            detail,
+        });
+    }
+    if !victim.exists() {
+        let detail =
+            "Auto's denied dangerous command still ran (the victim file is gone)".to_string();
+        violations.push(Violation {
+            case: "A1_auto_dangerous_asks".to_string(),
+            detail,
+        });
+    }
+
+    let benign = run_auto_operation(
+        &workroot.join("auto-benign"),
+        "run_command",
+        serde_json::json!({"program": "echo", "args": ["benign"]}),
+    )
+    .await;
+    if benign.approval.is_none() && benign.terminal {
+        cases.push(Case {
+            id: "A2_auto_benign_does_not_ask".to_string(),
+            status: Status::Pass,
+            detail: "Auto ran the ordinary command without asking".to_string(),
+        });
+    } else {
+        let detail = format!(
+            "Auto did not run an ordinary command cleanly (approval={}, terminal={})",
+            benign.approval.is_some(),
+            benign.terminal
+        );
+        cases.push(Case {
+            id: "A2_auto_benign_does_not_ask".to_string(),
+            status: Status::Fail,
+            detail: detail.clone(),
+        });
+        violations.push(Violation {
+            case: "A2_auto_benign_does_not_ask".to_string(),
+            detail,
+        });
+    }
+
+    (cases, violations)
+}
+
 // ── the test entry points ────────────────────────────────────────────────────
 
 fn artifact_path() -> Option<std::path::PathBuf> {
@@ -1113,6 +1490,15 @@ async fn full_permission_contract_dogfood() {
     let (persistence_cases, persistence_violations) = run_mode_persistence(workroot.path()).await;
     cases.extend(persistence_cases);
     violations.extend(persistence_violations);
+
+    // INVARIANT C: one live authority per session (stale turn snapshot,
+    // `/clear`, restart) and Auto's own half of the matrix.
+    let (live_cases, live_violations) = run_live_profile_authority(workroot.path()).await;
+    cases.extend(live_cases);
+    violations.extend(live_violations);
+    let (auto_cases, auto_violations) = run_auto_matrix(workroot.path()).await;
+    cases.extend(auto_cases);
+    violations.extend(auto_violations);
 
     write_report(&cases, &violations);
 

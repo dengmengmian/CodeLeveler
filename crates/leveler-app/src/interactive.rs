@@ -1271,11 +1271,18 @@ impl InProcessRuntimeClient {
     /// Associate an externally created session with this client's defaults.
     /// Legacy in-process entry points create the session through `Application`
     /// before constructing the runtime client.
+    ///
+    /// It only SEEDS a session this client has no live config for. A session
+    /// whose config was already written by `persist_runtime_config` (create,
+    /// `/clear`, `SetPermissionProfile`) keeps that value: re-inserting the
+    /// client's launch defaults would overwrite the durable mode with a stale
+    /// one — a second truth source for the same session.
     pub fn attach_session(&self, session_id: SessionId) {
         self.session_runtime
             .lock()
             .unwrap()
-            .insert(session_id, self.default_runtime.clone());
+            .entry(session_id)
+            .or_insert_with(|| self.default_runtime.clone());
     }
 
     /// The effective approval policy the daemon would use for `session_id` —
@@ -4381,7 +4388,10 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                                 return Ok(());
                             }
                         };
-                        self.attach_session(session_id.clone());
+                        // `persist_runtime_config` above already registered
+                        // this session's runtime config (mode included), so the
+                        // new conversation inherits the caller's axes and no
+                        // second write can disagree with the durable row.
                         let _ = self
                             .events_for(&requester_session_id)
                             .send(RuntimeEvent::SessionOpened { session });

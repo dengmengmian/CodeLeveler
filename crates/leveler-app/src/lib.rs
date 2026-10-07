@@ -440,9 +440,17 @@ impl Drop for Application {
 }
 
 impl Application {
-    /// The live permission profile for a session, created on first use from
-    /// `mode` (the caller's authority — the session row or its cached runtime
-    /// config) and reused by every later turn of that session.
+    /// The live permission profile for a session, SEEDED once from `mode` (the
+    /// caller's authority — the session row or its cached runtime config) and
+    /// reused by every later turn of that session.
+    ///
+    /// Seeding is not reconciliation: once a session has a live cell, that cell
+    /// is the one authority for its running execution. A caller's `mode` is a
+    /// snapshot taken when a turn was staged, so writing it back would let a
+    /// turn whose snapshot predates a `SetPermissionProfile` silently restore
+    /// the older profile — the UI chip says `full` while the turn keeps
+    /// authorizing under `auto` and asks for approval. Live changes go through
+    /// [`Self::set_live_permission_profile`] only.
     fn permission_profile_for(
         &self,
         scope: Option<&str>,
@@ -457,14 +465,9 @@ impl Application {
             .permission_profiles
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let profile = map
-            .entry(scope.to_string())
+        map.entry(scope.to_string())
             .or_insert_with(|| leveler_execution::SharedPermissionProfile::new(mode))
-            .clone();
-        // A turn starts from the current authority, so the cell and the
-        // session row cannot drift apart across turns.
-        profile.set(mode);
-        profile
+            .clone()
     }
 
     /// Apply a permission change to a session's RUNNING execution.
