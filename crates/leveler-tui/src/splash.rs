@@ -47,6 +47,9 @@ pub(crate) fn conversation_is_empty(state: &AppState) -> bool {
                 | TranscriptItem::UserShell(_)
                 | TranscriptItem::Recap(_)
                 | TranscriptItem::GoalRecap(_)
+                // A Thought is conversation content: a replay that carried
+                // reasoning is not an empty session.
+                | TranscriptItem::Thought(_)
         )
     })
 }

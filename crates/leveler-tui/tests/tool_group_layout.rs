@@ -170,10 +170,14 @@ fn child_column(lines: &[String], from: usize) -> usize {
 }
 
 /// The number of rows the group occupies, parent included.
+///
+/// A group's own summary row sits at the transcript baseline (`›`/`⋮`/`▸`),
+/// exactly like `▌` for the user and `●` for the agent; only its children step
+/// in one level, so `GROUP_BODY_INDENT` (2 columns) is the tell.
 fn group_rows(lines: &[String], from: usize) -> usize {
     1 + lines[from + 1..]
         .iter()
-        .take_while(|l| l.starts_with("    ") || l.trim_start().starts_with('\u{2514}'))
+        .take_while(|l| l.starts_with("  ") || l.trim_start().starts_with('\u{2514}'))
         .count()
 }
 

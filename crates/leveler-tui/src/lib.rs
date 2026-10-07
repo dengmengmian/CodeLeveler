@@ -28,6 +28,7 @@ pub mod context_grid;
 pub mod conversation;
 mod diff_view;
 pub mod external_editor;
+pub mod fold;
 pub mod i18n;
 mod layout;
 pub mod markdown;

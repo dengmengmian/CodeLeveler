@@ -3112,7 +3112,7 @@ mod tests {
                 applied_diff: None,
             }],
             open: false,
-            expanded: false,
+            display: crate::fold::DisplayMode::Collapsed,
             round: None,
         });
         let task = item_render(
@@ -3446,7 +3446,10 @@ mod tests {
             "the raw detail must not leak into the default view:\n{joined}"
         );
         // Disclosure reveals the raw technical detail.
-        let _ = s.transcript.toggle_last_collapsible();
+        let _ = s
+            .transcript
+            .last_foldable_index()
+            .map(|i| s.transcript.toggle_item_display(i));
         let expanded: String = crate::conversation::build::build_conversation_lines(&s, 120)
             .iter()
             .map(line_str)
@@ -3502,7 +3505,10 @@ mod tests {
             "the reason stays behind the disclosure:\n{default}"
         );
 
-        let _ = s.transcript.toggle_last_collapsible();
+        let _ = s
+            .transcript
+            .last_foldable_index()
+            .map(|i| s.transcript.toggle_item_display(i));
         let expanded: String = crate::conversation::build::build_conversation_lines(&s, 120)
             .iter()
             .map(line_str)
@@ -3571,7 +3577,7 @@ mod tests {
             "a batch that broke must say so: {auto}"
         );
         if let Some(TranscriptItem::ToolGroup(group)) = s.transcript.items().last() {
-            assert!(!group.expanded, "failed groups must not auto-expand");
+            assert!(!group.expanded(), "failed groups must not auto-expand");
         }
         assert!(
             !auto.contains("rest of the readme body"),
@@ -3582,7 +3588,7 @@ mod tests {
         // closed the group sits after it, so find the group by type.)
         for item in s.transcript.items_mut() {
             if let TranscriptItem::ToolGroup(group) = item {
-                group.expanded = true;
+                group.display = crate::fold::DisplayMode::Expanded;
             }
         }
         let open: String = crate::conversation::build::build_conversation_lines(&s, 100)
@@ -3598,7 +3604,7 @@ mod tests {
         // Expand the (only) group via its own flag — not a global blast.
         for item in s.transcript.items_mut() {
             if let TranscriptItem::ToolGroup(group) = item {
-                group.expanded = true;
+                group.display = crate::fold::DisplayMode::Expanded;
             }
         }
         let expanded: String = crate::conversation::build::build_conversation_lines(&s, 100)

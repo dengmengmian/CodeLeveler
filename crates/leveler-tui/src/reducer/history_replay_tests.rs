@@ -637,7 +637,7 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
     let live_lines = shape(&live);
     let replayed_lines = shape(&replayed);
     assert!(
-        live_lines.iter().any(|l| l.contains("› 读取 2 个文件")),
+        live_lines.iter().any(|l| l.contains("▸ 读取 2 个文件")),
         "the two consecutive reads are one compact receipt: {live_lines:#?}"
     );
     assert!(
@@ -985,7 +985,7 @@ fn a_mixed_group_reads_the_same_live_and_replayed() {
     assert!(
         live_lines
             .iter()
-            .any(|l| l.contains("› 读取 1 个文件") && l.contains("搜索 1 次")),
+            .any(|l| l.contains("▸ 读取 1 个文件") && l.contains("搜索 1 次")),
         "a read and a search are one compact receipt: {live_lines:#?}"
     );
     assert_eq!(

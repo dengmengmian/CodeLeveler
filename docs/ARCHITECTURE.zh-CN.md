@@ -1226,6 +1226,18 @@ dogfood 验证，不要在后续改动中回退：
   （量化以避免 notice 行引起的抖动）；全屏 Diff 页仍显示完整 patch。
 - **Ctrl+G 跳到最终回答**：锚点复用同一份 memoized 投影；无 Final 时只提示，
   不移动视口。
+- **Transcript entry 的折叠是纯 presentation 状态**：`Collapsed` / `Truncated`
+  / `Expanded` 只属于 TUI，不进入 Runtime、事件或持久化。Thought 与 ToolGroup
+  等条目共用同一套 fold 语义；完成后的 Thought 自动折叠，running 条目的下限是
+  `Truncated`，用户手动设置的模式不会被后续事件改写。
+- **Thought 是 transcript 的一级条目**：其 rail 只覆盖自身正文，Tool 与它是
+  sibling（同一个首列锚点），不能表现成 Thought 的子节点。新的 reasoning 段
+  永远是 tail 上的那个可变条目。
+- **探索回执是 view-time fold，不是聚合覆盖**：连续 Read / Search / List 只改变
+  折叠态的呈现，原始 Tool entry 始终保留；展开必须恢复每个真实成员。Run / Edit
+  是 breaker，不和探索工具同组。
+- **折叠不得移动阅读位置**：折叠以上/以内的条目时，视口顶边锚定的那一行必须保持
+  不变；follow-tail 时不需要锚定。
 - **性能基线**：`leveler-tui` 的 `perf_bench` 是 deterministic 性能回归基线，
   `ux_experiment` 是 80×24 的 UX 回归 fixture；两者都以 `--ignored` 手动运行。
 

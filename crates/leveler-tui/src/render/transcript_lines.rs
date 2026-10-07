@@ -4,6 +4,7 @@ use unicode_width::UnicodeWidthStr;
 
 use leveler_client_protocol::UiCompletionReport;
 
+use crate::fold::DisplayMode;
 use crate::i18n::{Locale, UiText};
 use crate::theme::Theme;
 use crate::transcript::{
@@ -117,10 +118,17 @@ fn format_thought_duration(ms: u64) -> String {
 ///
 /// The header states the segment's real state — `Thinking…` while streaming,
 /// `Thought for 2.8s` when the runtime reported a clean boundary, and
-/// `Thought interrupted after 8.2s` when it did not. The body is the provider's
-/// own reasoning text under a `│` gutter; a provider that returned no text
-/// gets a header and no invented prose. Reasoning is not markdown, so the body
-/// is wrapped verbatim rather than parsed.
+/// `Thought interrupted after 8.2s` when it did not.
+///
+/// The body follows the entry's own [`DisplayMode`]: `Collapsed` paints the
+/// header alone (a finished segment's default), `Truncated` paints a bounded
+/// tail (a live segment's preview, and the floor a manual collapse lands on
+/// while running), and `Expanded` paints all of it. The body is the provider's
+/// own reasoning text under a `│` gutter; the gutter never extends past the
+/// body, so the Thought can never look like it owns the entry after it.
+/// A provider that returned no text gets a header and no invented prose.
+/// Reasoning is not markdown, so the body is wrapped verbatim rather than
+/// parsed.
 pub fn thought_lines(
     block: &ThoughtBlock,
     theme: &Theme,
@@ -140,8 +148,10 @@ pub fn thought_lines(
             None => t.thought_interrupted_bare.to_string(),
         }
     } else {
-        t.thought_for
-            .replace("{}", &format_thought_duration(block.duration_ms.unwrap_or(0)))
+        t.thought_for.replace(
+            "{}",
+            &format_thought_duration(block.duration_ms.unwrap_or(0)),
+        )
     };
     let mut out = vec![Line::from(vec![
         Span::styled("◆ ", Style::default().fg(theme.text.secondary)),
@@ -149,14 +159,19 @@ pub fn thought_lines(
     ])];
     let inner = wrap_width.saturating_sub(2).max(1);
     let body_style = Style::default().fg(theme.text.muted);
+    let rail = |text: String| {
+        Line::from(vec![
+            Span::styled("│ ", body_style),
+            Span::styled(text, body_style),
+        ])
+    };
     // A provider that returned no reasoning gets a header and nothing else.
-    if !block.text.is_empty() {
-        for line in wrap(&block.text, inner) {
-            out.push(Line::from(vec![
-                Span::styled("│ ", body_style),
-                Span::styled(line, body_style),
-            ]));
+    if !block.display.is_collapsed() && !block.text.is_empty() {
+        let mut body: Vec<Line<'static>> = wrap(&block.text, inner).into_iter().map(rail).collect();
+        if block.display != DisplayMode::Expanded {
+            crate::fold::truncate_to_tail(&mut body, rail("…".to_string()));
         }
+        out.extend(body);
     }
     if !block.done {
         out.push(Line::from(Span::styled(
@@ -1318,13 +1333,20 @@ mod tests {
 
     // ---- Reasoning is a Thought: real text, honest state, never invented ----
 
-    fn thought(text: &str, done: bool, duration_ms: Option<u64>, interrupted: bool) -> ThoughtBlock {
+    fn thought(
+        text: &str,
+        done: bool,
+        duration_ms: Option<u64>,
+        interrupted: bool,
+    ) -> ThoughtBlock {
         ThoughtBlock {
             text: text.to_string(),
             done,
             duration_ms,
             interrupted,
             live_since: None,
+            display: crate::fold::DisplayMode::Expanded,
+            display_pinned: true,
         }
     }
 
@@ -1395,7 +1417,10 @@ mod tests {
     /// of degrading to a bare spinner glyph.
     #[test]
     fn a_thought_keeps_a_meaningful_label_when_narrow() {
-        let lines = thought_rows(&thought("正在检查当前 provider catalog。", false, None, false), 12);
+        let lines = thought_rows(
+            &thought("正在检查当前 provider catalog。", false, None, false),
+            12,
+        );
         assert!(lines[0].contains("思考中"), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains('▌')), "{lines:?}");
     }
@@ -1788,7 +1813,7 @@ mod tests {
                 applied_diff: None,
             }],
             open: false,
-            expanded: false,
+            display: crate::fold::DisplayMode::Collapsed,
             round: None,
         });
         let lines = item_render(&item, &theme, 120, false, t);

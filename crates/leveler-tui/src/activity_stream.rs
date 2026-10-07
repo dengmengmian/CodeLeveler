@@ -60,14 +60,13 @@ use crate::tool_cell::{tool_action_label_for, tool_summary_pub};
 use crate::tool_taxonomy::{ActivityVisibility, activity_visibility};
 use crate::transcript::{StopRequest, ToolCallBlock, ToolGroupBlock, ToolStatus};
 
-/// Render a tool group for the Conversation activity stream.
+/// Render a tool group for the Conversation activity stream (test-only
+/// convenience wrapper over [`render_group_rows`] with a default diff budget).
 ///
 /// Every user-visible call in the group owns a row, whatever the group's
-/// state (§4). The row says which tool ran, on what, what came back, and what
-/// state it is in — four questions an aggregate ("读取 4 个文件") answers none
-/// of. Finished history keeps its clickable `▸/▾` summary as a HEADER over
-/// those rows, not in place of them: that row governs how much of each call's
-/// OUTPUT is shown, and output is the only thing a fold may hide.
+/// state. The row says which tool ran, on what, what came back, and what state
+/// it is in. A finished, non-edit group keeps a clickable `▸/▾` summary over
+/// those rows, and that row governs how much of each call's OUTPUT is shown.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_group(
@@ -77,11 +76,6 @@ pub(crate) fn render_group(
     locale: Locale,
     t: &UiText,
     now_elapsed_secs: u64,
-    // The call an open approval overlay is holding, when one is open. That
-    // call has been announced but NOT authorised, so it must not wear the
-    // running mark (§11): a `rm -rf` nobody has agreed to is not work in
-    // progress. Identity comes from the request's own `call_id` — never from
-    // "the latest running call", which would be a guess.
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
 ) -> Vec<Line<'static>> {
     let mut rows = Vec::new();
@@ -140,14 +134,39 @@ pub(crate) fn render_group_rows(
         .filter(|c| is_conversation_visible(c))
         .collect();
     // Execution-presentation contract, shape 1: Search / Read / List is ONE
-    // compact receipt. A burst of exploration is not a decision log — the files
-    // add nothing a reader acts on. Runs and edits keep their own shape below.
-    if group_is_compact_exploration(group) {
+    // view-time fold. The collapsed group paints the aggregate receipt; an
+    // expanded group paints the receipt and then every real member row, so the
+    // detail is never lost — only folded. Runs and edits keep their own shape
+    // below and break an exploration stretch.
+    let compact_exploration = group_is_compact_exploration(group);
+    let units = plan_units(&group.calls);
+    if compact_exploration {
+        // The receipt is the group's own summary row: a second header above it
+        // would say the same thing twice. It IS the disclosure row, and its
+        // children step in one level like every other fold's rows.
         let live = group.open || !group_is_finished(group);
-        out.push(exploration_receipt_line(&visible, theme, width, t, live));
+        let members = exploration_members(group);
+        out.push(exploration_receipt_line(
+            &members,
+            theme,
+            width,
+            t,
+            live,
+            group.expanded(),
+        ));
+        if group.expanded() {
+            out.extend(expanded_exploration_body(
+                &members,
+                theme,
+                width,
+                locale,
+                t,
+                now_elapsed_secs,
+                awaiting_approval,
+            ));
+        }
         return out;
     }
-    let units = plan_units(&group.calls);
     // An execution round whose calls are all one tool IS a run: it reads as a
     // tool-named head (`› 执行命令 · 完成 3 项`) with the calls as its tree,
     // instead of a stage sentence above flat rows. The round identity makes
@@ -176,11 +195,12 @@ pub(crate) fn render_group_rows(
         return out;
     }
     // A group header earns its row by ADDING what no child can. A `Run`/`Batch`
-    // unit paints its own head, so a second disclosure above it would be two
-    // parents for one stretch. Every other group is a STAGE, and its parent row
-    // states the aggregate — how many, whether any failed, and the whole
-    // stretch's duration — including when everything succeeded: the rows below
-    // are then children of a stated outcome instead of orphans.
+    // unit — or an exploration receipt, which is itself a summary row — paints
+    // its own head, so a second disclosure above it would be two parents for
+    // one stretch. Every other group is a STAGE, and its parent row states the
+    // aggregate — how many, whether any failed, and the whole stretch's
+    // duration — including when everything succeeded: the rows below are then
+    // children of a stated outcome instead of orphans.
     //
     // Ownership is STRUCTURAL, not historical: the parent row exists from the
     // moment the stage does, and `open` only decides its CONTENT (running verb
@@ -192,9 +212,12 @@ pub(crate) fn render_group_rows(
     //
     // A group's FIRST row is the click target either way (see
     // `conversation::build`), so this adds a parent without moving the target.
-    let unit_owns_head = units
-        .iter()
-        .any(|u| matches!(u, StreamUnit::Run(_) | StreamUnit::Batch(_)));
+    let unit_owns_head = units.iter().any(|u| {
+        matches!(
+            u,
+            StreamUnit::Run(_) | StreamUnit::Batch(_) | StreamUnit::ExploreRun(_)
+        )
+    });
     // Live unless the group is CLOSED and every call has settled. The group's
     // own `open` flag alone is not enough: a closed group can still hold a call
     // in flight, and a settled-but-open one is still being written to.
@@ -212,12 +235,12 @@ pub(crate) fn render_group_rows(
         && !unit_owns_head
         && (visible.len() > 1 || visible.first().is_some_and(|c| is_shell_call(c)));
     let header = if mixed_round {
-        let mut p = disclosure_presentation(&visible, group.expanded, live, t);
+        let mut p = disclosure_presentation(&visible, group.expanded(), live, t);
         p.label = round_mixed_head(&visible, live, t);
         p.ok_suffix = None;
         Some(p)
     } else {
-        stage_worthy.then(|| disclosure_presentation(&visible, group.expanded, live, t))
+        stage_worthy.then(|| disclosure_presentation(&visible, group.expanded(), live, t))
     };
     if let Some(header) = &header {
         out.push(crate::presentation::disclosure::header_line(
@@ -241,7 +264,7 @@ pub(crate) fn render_group_rows(
                     width,
                     locale,
                     t,
-                    group.expanded,
+                    group.expanded(),
                     now_elapsed_secs,
                     None,
                     awaits(call, awaiting_approval),
@@ -257,7 +280,7 @@ pub(crate) fn render_group_rows(
                     width,
                     locale,
                     t,
-                    group.expanded,
+                    group.expanded(),
                     1,
                     None,
                     now_elapsed_secs,
@@ -265,7 +288,31 @@ pub(crate) fn render_group_rows(
                     awaits(call, awaiting_approval),
                     true,
                 ));
-                push_expanded_detail(call, group.expanded, theme, width, locale, t, &mut out);
+                push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
+            }
+            StreamUnit::ExploreRun(members) => {
+                // A stretch of exploration inside a larger round: the collapsed
+                // group paints the aggregate, an expanded one keeps the
+                // aggregate header and then every real member row under it.
+                out.push(exploration_receipt_line(
+                    &members,
+                    theme,
+                    width,
+                    t,
+                    live,
+                    group.expanded(),
+                ));
+                if group.expanded() {
+                    out.extend(expanded_exploration_body(
+                        &members,
+                        theme,
+                        width,
+                        locale,
+                        t,
+                        now_elapsed_secs,
+                        awaiting_approval,
+                    ));
+                }
             }
             StreamUnit::Run(calls) => {
                 push_run(
@@ -335,7 +382,7 @@ pub(crate) fn render_group_rows(
                             width,
                             locale,
                             t,
-                            group.expanded,
+                            group.expanded(),
                             now_elapsed_secs,
                             Some(branch),
                             awaits(call, awaiting_approval),
@@ -351,7 +398,7 @@ pub(crate) fn render_group_rows(
                         width,
                         locale,
                         t,
-                        group.expanded,
+                        group.expanded(),
                         1,
                         None,
                         now_elapsed_secs,
@@ -359,7 +406,7 @@ pub(crate) fn render_group_rows(
                         awaits(call, awaiting_approval),
                         true,
                     ));
-                    push_expanded_detail(call, group.expanded, theme, width, locale, t, &mut out);
+                    push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
                 }
             }
             StreamUnit::EditMerge(calls) => {
@@ -369,7 +416,7 @@ pub(crate) fn render_group_rows(
                     width,
                     locale,
                     t,
-                    group.expanded,
+                    group.expanded(),
                     diff_preview_rows,
                 ));
             }
@@ -381,7 +428,7 @@ pub(crate) fn render_group_rows(
                     width,
                     locale,
                     t,
-                    group.expanded,
+                    group.expanded(),
                     calls.len(),
                     (total_ms >= 100).then_some(total_ms),
                     // FailMerge is a finished failure group, never live-running.
@@ -391,7 +438,15 @@ pub(crate) fn render_group_rows(
                     false,
                     true,
                 ));
-                push_expanded_detail(calls[0], group.expanded, theme, width, locale, t, &mut out);
+                push_expanded_detail(
+                    calls[0],
+                    group.expanded(),
+                    theme,
+                    width,
+                    locale,
+                    t,
+                    &mut out,
+                );
             }
         }
     }
@@ -418,6 +473,54 @@ fn awaits(
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
 ) -> bool {
     call.status == ToolStatus::Running && awaiting_approval == Some(&call.id)
+}
+
+/// The member rows an expanded exploration fold reveals, indented one level
+/// under the aggregate header.
+///
+/// This is what makes the fold VIEW-TIME only: the group still holds every real
+/// call, and opening it paints each one with its own target and detail. Members
+/// are never shell commands ([`folds_into_exploration`] admits only Search /
+/// Read / List), so none of them reports a command row.
+#[allow(clippy::too_many_arguments)]
+fn expanded_exploration_body(
+    members: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    now_elapsed_secs: u64,
+    awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+) -> Vec<Line<'static>> {
+    let body_width = width.saturating_sub(GROUP_BODY_INDENT.len());
+    let mut body = Vec::new();
+    for call in members {
+        body.extend(unit_lines(
+            call,
+            theme,
+            body_width,
+            locale,
+            t,
+            true,
+            1,
+            None,
+            now_elapsed_secs,
+            None,
+            awaits(call, awaiting_approval),
+            true,
+        ));
+        append_call_detail(call, theme, body_width, true, locale, t, &mut body);
+    }
+    for line in body.iter_mut() {
+        line.spans.insert(
+            0,
+            Span::styled(
+                GROUP_BODY_INDENT.to_string(),
+                Style::default().fg(theme.ink(Ink::Subtle)),
+            ),
+        );
+    }
+    body
 }
 
 /// The per-call output body an expanded group reveals. Silent bookkeeping that
@@ -500,12 +603,9 @@ pub(crate) fn group_has_disclosure(group: &ToolGroupBlock) -> bool {
     // `▸ 并行执行了 7 个工具`-while-running regression). History begins when
     // the group closes, not when its current members happen to be settled.
     //
-    // A compact exploration receipt has no children, so it is NOT a disclosure:
-    // there is nothing to reveal and the click would do nothing.
-    !group.open
-        && group_is_finished(group)
-        && group_is_disclosable(group)
-        && !group_is_compact_exploration(group)
+    // A compact exploration receipt IS a fold: its collapsed row is the
+    // aggregate, and expanding reveals every real member call it counted.
+    !group.open && group_is_finished(group) && group_is_disclosable(group)
 }
 
 /// Whether these calls are exploration (Search/Read/List) — the classes a
@@ -517,6 +617,34 @@ fn is_exploration_class(name: &str) -> bool {
     )
 }
 
+/// Whether this call belongs to the exploration class the receipt speaks for
+/// (Search / Read / List and the LSP lookups that read like them).
+fn is_exploration_call(call: &ToolCallBlock) -> bool {
+    is_exploration_class(&call.name)
+}
+
+/// Whether this call can join a view-time exploration fold inside a MIXED
+/// group. A failed call never does: a receipt that swallowed the failing target
+/// would hide the one row a reader needs. A call the reducer OBSERVED in a
+/// concurrent batch never does either — a burst has a stronger claim to its own
+/// tree (which names the failures), so a stretch may not steal its members. A
+/// call still in flight never does: its row IS the live activity while it runs,
+/// and only a settled stretch is history worth folding.
+fn folds_into_exploration(call: &ToolCallBlock) -> bool {
+    call.status == ToolStatus::Ok && call.batch.is_none() && is_exploration_call(call)
+}
+
+/// The visible calls an exploration receipt speaks for, in order. A whole-group
+/// receipt (`group_is_compact_exploration`) has already proved every visible
+/// member is eligible, so this is the receipt's own view of the stretch.
+fn exploration_members(group: &ToolGroupBlock) -> Vec<&ToolCallBlock> {
+    group
+        .calls
+        .iter()
+        .filter(|c| is_conversation_visible(c) && is_exploration_call(c))
+        .collect()
+}
+
 /// Whether this call is a directory listing (counted separately in the
 /// receipt: "列出 2 个目录" is a different fact from "读取 2 个文件").
 fn is_list_call(name: &str) -> bool {
@@ -526,23 +654,24 @@ fn is_list_call(name: &str) -> bool {
     )
 }
 
-/// A stretch of two or more SUCCESSFUL exploration calls with no edits — the
-/// compact-receipt shape, live or finished. A single call keeps its evidence
-/// row (aggregating it loses the target for no compactness), and a stretch
-/// containing a failure falls back to rows so the failing target stays
-/// inspectable.
+/// A stretch of two or more SUCCESSFUL exploration calls: the compact-receipt
+/// shape. Every visible call must be eligible — a single call keeps its
+/// evidence row (aggregating it loses the target for no compactness), and a
+/// failure falls back to rows so the failing target stays inspectable.
+///
+/// This is the whole-group form, so it is deliberately laxer than
+/// [`folds_into_exploration`]: a batch of exploration calls that ALL succeeded
+/// is one receipt, and its concurrency detail is what expanding restores.
 fn group_is_compact_exploration(group: &ToolGroupBlock) -> bool {
-    if group_has_edits(group) {
-        return false;
-    }
     let visible: Vec<&ToolCallBlock> = group
         .calls
         .iter()
         .filter(|c| is_conversation_visible(c))
         .collect();
     visible.len() >= 2
-        && visible.iter().all(|c| is_exploration_class(&c.name))
-        && !visible.iter().any(|c| c.status == ToolStatus::Failed)
+        && visible
+            .iter()
+            .all(|c| is_exploration_call(c) && c.status != ToolStatus::Failed)
 }
 
 /// The receipt's text: counts by KIND, so a mixed read/search stretch still
@@ -581,20 +710,24 @@ fn exploration_receipt_label(visible: &[&ToolCallBlock], t: &UiText, live: bool)
 }
 
 /// The one-line compact receipt. Exploration is not a result, so the settled
-/// form wears the execution anchor `\u{203a}` and no outcome mark; the live form
-/// wears the running `\u{25cc}`.
+/// form wears the conversation's own fold glyph (`\u{25b8}` folded / `\u{25be}`
+/// open) — the same vocabulary every other clickable disclosure row uses. The
+/// live form wears the running `\u{25cc}` and is not a fold target yet.
 fn exploration_receipt_line(
-    visible: &[&ToolCallBlock],
+    members: &[&ToolCallBlock],
     theme: &Theme,
     width: usize,
     t: &UiText,
     live: bool,
+    expanded: bool,
 ) -> Line<'static> {
-    let label = exploration_receipt_label(visible, t, live);
+    let label = exploration_receipt_label(members, t, live);
     let (glyph, color, tone) = if live {
         ("\u{25cc} ", theme.accent.primary, theme.ink(Ink::Meta))
+    } else if expanded {
+        ("\u{25be} ", theme.text.muted, theme.ink(Ink::Settled))
     } else {
-        ("\u{203a} ", theme.ink(Ink::Subtle), theme.ink(Ink::Settled))
+        ("\u{25b8} ", theme.text.muted, theme.ink(Ink::Settled))
     };
     Line::from(vec![
         Span::styled(glyph, Style::default().fg(color)),
@@ -863,6 +996,13 @@ const EXPLORED: &str = "\u{b7}";
 
 enum StreamUnit<'a> {
     Single(&'a ToolCallBlock),
+    /// Two or more consecutive non-destructive exploration calls (Search /
+    /// Read / List, and the LSP lookups that read like them). A VIEW-TIME fold:
+    /// the calls stay in the group untouched — the collapsed group paints one
+    /// aggregate receipt for them, and expanding restores every member row.
+    /// A shell run or a diff never joins one, and a failure breaks it, so a
+    /// failing target can never be folded out of sight.
+    ExploreRun(Vec<&'a ToolCallBlock>),
     /// Two or more consecutive calls of the SAME tool: one head naming the
     /// tool, a `├─`/`└─` child per call. Purely how the stretch READS — the
     /// calls themselves are untouched, and a run never spans a group boundary
@@ -885,6 +1025,34 @@ fn plan_units(calls: &[ToolCallBlock]) -> Vec<StreamUnit<'_>> {
         if !is_conversation_visible(call) {
             i += 1;
             continue;
+        }
+        if is_exploration_call(call) {
+            // The stretch is every contiguous VISIBLE exploration call, whatever
+            // its outcome: one failure un-folds the whole stretch, so the
+            // aggregate can name it and the failing target keeps its own row.
+            // A stretch that is clean throughout is ONE view-time fold — its
+            // members stay real calls, only painted as a receipt until the
+            // reader expands the group.
+            let mut members = vec![call];
+            let mut j = i + 1;
+            while j < calls.len() {
+                let next = &calls[j];
+                if !is_conversation_visible(next) {
+                    j += 1;
+                    continue;
+                }
+                if is_exploration_call(next) {
+                    members.push(next);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if members.len() > 1 && members.iter().all(|c| folds_into_exploration(c)) {
+                out.push(StreamUnit::ExploreRun(members));
+                i = j;
+                continue;
+            }
         }
         if mergeable_edit(call) {
             // Merge render-adjacent patches to the same file (hidden probes in
@@ -1332,7 +1500,7 @@ fn push_run(
                 width,
                 locale,
                 t,
-                group.expanded,
+                group.expanded(),
                 now_elapsed_secs,
                 Some(branch),
                 awaits(call, awaiting_approval),
@@ -1348,13 +1516,13 @@ fn push_run(
             width,
             locale,
             t,
-            group.expanded,
+            group.expanded(),
             now_elapsed_secs,
             branch,
             awaits(call, awaiting_approval),
         ));
         let body = out.len();
-        push_expanded_detail(call, group.expanded, theme, width, locale, t, out);
+        push_expanded_detail(call, group.expanded(), theme, width, locale, t, out);
         indent_onto_rail(&mut out[body..], &child_rail(Some(branch)), theme);
     }
 }
@@ -2526,11 +2694,13 @@ fn append_call_detail(
     out.extend(detail.into_iter().skip(1));
 }
 
-/// Tool activity is the SECOND level of the conversation: the user's prompt
-/// and the agent's prose own the content baseline, and what the agent DID to
-/// answer sits one level inside them (its own details one level deeper still).
-/// The block is rendered against the narrower inner width so the indent can
-/// never push a row past the right gutter.
+/// Tool activity is the SECOND level of the conversation for a fold's
+/// CHILDREN: the user's prompt, the agent's prose and every entry's own summary
+/// row (a Thought's `◆`, a tool group's `›`/`▸`) own the content baseline, and
+/// what a fold reveals sits one level inside. The group's summary row itself is
+/// painted at the baseline — `›` is the conversation's first-level execution
+/// anchor, exactly like `▌` for the user and `●` for the agent — so a tool can
+/// never read as a child of the Thought above it.
 pub(crate) const ACTIVITY_INDENT: &str = "  ";
 
 /// The THIRD level: a group's rows sit one step in from the group's own parent
@@ -2557,12 +2727,11 @@ pub(crate) fn render_activity(
     diff_preview_rows: usize,
     rows: &mut Vec<CommandRow>,
 ) -> Vec<Line<'static>> {
-    let inner = width.saturating_sub(ACTIVITY_INDENT.len());
     let mut group_rows = Vec::new();
     let lines = render_group_rows(
         group,
         theme,
-        inner,
+        width,
         locale,
         t,
         now_elapsed_secs,
@@ -2571,18 +2740,8 @@ pub(crate) fn render_activity(
         diff_preview_rows,
         &mut group_rows,
     );
-    // The indent shifts every line, so the reported line offsets stay in the
-    // conversation's own coordinate space.
     rows.extend(group_rows);
     lines
-        .into_iter()
-        .map(|line| {
-            let mut spans = Vec::with_capacity(line.spans.len() + 1);
-            spans.push(Span::raw(ACTIVITY_INDENT));
-            spans.extend(line.spans);
-            Line::from(spans)
-        })
-        .collect()
 }
 
 /// The Sub-agent Detail's activity body: the delegated child's own tool calls,
@@ -2853,7 +3012,7 @@ mod tests {
         ToolGroupBlock {
             calls,
             open: false,
-            expanded: false,
+            display: crate::fold::DisplayMode::Collapsed,
             round: None,
         }
     }
@@ -2862,7 +3021,7 @@ mod tests {
         ToolGroupBlock {
             calls,
             open: true,
-            expanded: false,
+            display: crate::fold::DisplayMode::Collapsed,
             round: None,
         }
     }
@@ -3024,7 +3183,11 @@ mod tests {
             .collect();
         let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
         assert_eq!(lines.len(), 1, "one live receipt: {lines:?}");
-        assert_eq!(lines[0].trim_end(), "\u{25cc} 正在读取 · 4 个文件", "{lines:?}");
+        assert_eq!(
+            lines[0].trim_end(),
+            "\u{25cc} 正在读取 · 4 个文件",
+            "{lines:?}"
+        );
         assert!(
             !lines[0].contains("f0.rs"),
             "the files are not re-listed: {lines:?}"
@@ -3039,20 +3202,42 @@ mod tests {
         );
     }
 
-    /// R3: closed exploration is history, and history is a compact receipt. The
-    /// per-call rows are gone: `读取 4 个文件` says what the burst did, and the
-    /// files themselves are not a decision log. A LONE read keeps its row (see
-    /// `a_single_read_is_one_row_naming_its_file`): aggregating one call loses
-    /// the target for no compactness.
+    /// R3: closed exploration is history, and history is a compact receipt that
+    /// is ALSO the group's fold row (`\u{25b8}`). The per-call rows are not gone —
+    /// they are folded behind the receipt; expanding restores every member row
+    /// naming its own file.
     #[test]
     fn closed_reads_are_one_compact_receipt() {
         let lines = render_group_text(&group(reads(4)), 100, Locale::Zh);
         assert_eq!(lines.len(), 1, "one line, no children: {lines:?}");
-        assert_eq!(lines[0].trim_end(), "\u{203a} 读取 4 个文件", "{lines:?}");
+        assert_eq!(lines[0].trim_end(), "\u{25b8} 读取 4 个文件", "{lines:?}");
         assert!(
             !lines[0].contains("f0.rs"),
             "the files are not re-listed: {lines:?}"
         );
+        assert!(
+            group_has_disclosure(&group(reads(4))),
+            "the collapsed receipt is a click target"
+        );
+    }
+
+    /// TOOL-GROUP-3: expanding the receipt restores EVERY real member row, so
+    /// the fold is view-time only — nothing was merged away, and the target the
+    /// receipt counted is still inspectable.
+    #[test]
+    fn expanding_a_compact_receipt_restores_every_member_row() {
+        let mut opened = group(reads(4));
+        opened.display = crate::fold::DisplayMode::Expanded;
+        let lines = render_group_text(&opened, 100, Locale::Zh);
+        assert_eq!(
+            lines[0].trim_end(),
+            "\u{25be} 读取 4 个文件",
+            "the aggregate header stays: {lines:?}"
+        );
+        let text = lines.join("\n");
+        for i in 0..4 {
+            assert!(text.contains(&format!("f{i}.rs")), "member lost: {text}");
+        }
     }
 
     /// Each evidence row answers what ran, on what, and what came back.
@@ -3411,11 +3596,15 @@ mod tests {
             "the parent states the outcome: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("  \u{203a} ") && lines[1].contains("custom_probe") && lines[1].contains("README.md"),
+            lines[1].starts_with("  \u{203a} ")
+                && lines[1].contains("custom_probe")
+                && lines[1].contains("README.md"),
             "the first call is a nested child: {lines:?}"
         );
         assert!(
-            lines[2].starts_with("  \u{203a} ") && lines[2].contains("custom_scan") && lines[2].contains("TaskStatus"),
+            lines[2].starts_with("  \u{203a} ")
+                && lines[2].contains("custom_scan")
+                && lines[2].contains("TaskStatus"),
             "the second call is a nested child: {lines:?}"
         );
     }
@@ -4022,13 +4211,7 @@ mod tests {
     #[test]
     fn a_batch_of_one_tool_reads_as_a_run_that_kept_its_parallel_fact() {
         let calls: Vec<ToolCallBlock> = (0..6)
-            .map(|i| {
-                work_batched(
-                    &format!(r#"{{"path":"p{i}.rs"}}"#),
-                    ToolStatus::Ok,
-                    Some(1),
-                )
-            })
+            .map(|i| work_batched(&format!(r#"{{"path":"p{i}.rs"}}"#), ToolStatus::Ok, Some(1)))
             .collect();
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         assert_eq!(lines.len(), 7, "one head, six children: {lines:?}");
@@ -4180,7 +4363,7 @@ mod tests {
             c.preview = Some("//! a module\npub fn a() {}\n".into());
         }
         let mut g = group(calls);
-        g.expanded = true;
+        g.display = crate::fold::DisplayMode::Expanded;
         let lines = render_group_text(&g, 100, Locale::Zh);
         let body: Vec<&String> = lines
             .iter()
@@ -4346,21 +4529,13 @@ mod tests {
     #[test]
     fn two_bursts_in_one_group_stay_two_trees() {
         let mut calls: Vec<ToolCallBlock> = (0..2)
-            .map(|i| {
-                work_b_batched(
-                    &format!(r#"{{"path":"a{i}.rs"}}"#),
-                    ToolStatus::Ok,
-                    Some(1),
-                )
-            })
+            .map(|i| work_b_batched(&format!(r#"{{"path":"a{i}.rs"}}"#), ToolStatus::Ok, Some(1)))
             .collect();
-        calls.extend((0..2).map(|i| {
-            work_b_batched(
-                &format!(r#"{{"path":"b{i}.rs"}}"#),
-                ToolStatus::Ok,
-                Some(2),
-            )
-        }));
+        calls.extend(
+            (0..2).map(|i| {
+                work_b_batched(&format!(r#"{{"path":"b{i}.rs"}}"#), ToolStatus::Ok, Some(2))
+            }),
+        );
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         assert_eq!(
             lines.iter().filter(|l| l.contains("并行")).count(),
@@ -4563,7 +4738,11 @@ mod tests {
             .collect();
         let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
         assert_eq!(lines.len(), 1, "one receipt: {lines:?}");
-        assert_eq!(lines[0].trim_end(), "\u{25cc} 正在读取 · 7 个文件", "{lines:?}");
+        assert_eq!(
+            lines[0].trim_end(),
+            "\u{25cc} 正在读取 · 7 个文件",
+            "{lines:?}"
+        );
         assert!(
             !lines[0].contains(".rs"),
             "every member is accounted for by the count, not a row: {lines:?}"
@@ -4645,16 +4824,18 @@ mod tests {
         assert!(group_has_disclosure(&shell), "commands fold on their own");
     }
 
-    /// The conversation has three levels: prompt / prose at column 0, what
-    /// the agent DID one level in, and the details of that one level deeper.
+    /// The transcript's first-level anchors all sit at the same column: `▌` for
+    /// the user, `●` for the agent, `◆` for a Thought and `›` for a tool group.
+    /// A tool is a SIBLING of the Thought above it, never its child; only a
+    /// fold's children step in one level.
     #[test]
-    fn tool_activity_renders_one_level_inside_the_narrative() {
+    fn tool_activity_renders_at_the_transcript_baseline() {
         let g = group(vec![call(
             "read_file",
             r#"{"path":"a.rs"}"#,
             ToolStatus::Ok,
         )]);
-        let indented = render_activity(
+        let lines = render_activity(
             &g,
             &Theme::no_color(),
             100,
@@ -4666,7 +4847,7 @@ mod tests {
             DIFF_PREVIEW_ROWS,
             &mut Vec::new(),
         );
-        let text: Vec<String> = indented
+        let text: Vec<String> = lines
             .iter()
             .map(|l| {
                 l.spans
@@ -4676,8 +4857,8 @@ mod tests {
             })
             .collect();
         assert!(
-            text.iter().all(|l| l.starts_with("  ")),
-            "activity sits inside the narrative: {text:?}"
+            text.iter().all(|l| l.starts_with(TOOL_ANCHOR)),
+            "tool rows sit at the transcript baseline: {text:?}"
         );
     }
 
@@ -4852,14 +5033,8 @@ mod tests {
     #[test]
     fn an_open_group_keeps_a_row_per_call_settled_or_live() {
         let g = group(vec![
-            work(
-                r#"{"path":"internal/bot/service.go"}"#,
-                ToolStatus::Ok,
-            ),
-            work(
-                r#"{"path":"internal/model/bot.go"}"#,
-                ToolStatus::Ok,
-            ),
+            work(r#"{"path":"internal/bot/service.go"}"#, ToolStatus::Ok),
+            work(r#"{"path":"internal/model/bot.go"}"#, ToolStatus::Ok),
             work_b(r#"{"pattern":"TokenPlain"}"#, ToolStatus::Running),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
@@ -5036,7 +5211,7 @@ mod tests {
             r#"{"target":"repo"}"#,
             ToolStatus::Ok,
         )]);
-        open.expanded = true;
+        open.display = crate::fold::DisplayMode::Expanded;
         let lines = render_group_text(&open, 80, Locale::Zh);
         assert!(
             !lines.iter().any(|l| l.contains("{\"target\"")),
@@ -5101,7 +5276,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_work_group_folds_to_a_generic_count() {
+    fn a_mixed_group_folds_its_exploration_stretch_only() {
         let mut failed = call(
             "run_command",
             r#"{"program":"cargo","args":["test"]}"#,
@@ -5115,8 +5290,12 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains("完成 3 项操作"),
-            "a mixed sequential batch gets the generic count: {lines:?}"
+            lines[0].starts_with('▸') && lines[0].contains("读取 1 个文件 · 搜索 1 次"),
+            "the exploration stretch is one receipt: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("cargo test")),
+            "the run keeps its own row instead of joining the receipt: {lines:?}"
         );
     }
 
@@ -5204,13 +5383,7 @@ mod tests {
     fn a_finished_batch_keeps_a_row_per_member_under_its_tree_header() {
         let g = group(
             (0..8)
-                .map(|i| {
-                    work_batched(
-                        &format!(r#"{{"path":"p{i}.rs"}}"#),
-                        ToolStatus::Ok,
-                        Some(5),
-                    )
-                })
+                .map(|i| work_batched(&format!(r#"{{"path":"p{i}.rs"}}"#), ToolStatus::Ok, Some(5)))
                 .collect(),
         );
         let lines = render_group_text(&g, 100, Locale::Zh);
@@ -5230,19 +5403,15 @@ mod tests {
     #[test]
     fn a_running_batch_shows_the_live_member_and_keeps_the_settled_ones() {
         let mut calls: Vec<ToolCallBlock> = (0..4)
-            .map(|i| {
-                work_batched(
-                    &format!(r#"{{"path":"p{i}.rs"}}"#),
-                    ToolStatus::Ok,
-                    Some(6),
-                )
-            })
+            .map(|i| work_batched(&format!(r#"{{"path":"p{i}.rs"}}"#), ToolStatus::Ok, Some(6)))
             .collect();
         calls[2].status = ToolStatus::Running;
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         let text = lines.join("\n");
         assert!(
-            lines.iter().any(|l| l.contains('\u{25cc}') && l.contains("p2.rs")),
+            lines
+                .iter()
+                .any(|l| l.contains('\u{25cc}') && l.contains("p2.rs")),
             "the live call is marked live: {text}"
         );
         for i in [0usize, 1, 3] {
@@ -5326,7 +5495,7 @@ mod tests {
                 .map(|i| work_parallel_call(&format!(r#"{{"path":"p{i}.rs"}}"#)))
                 .collect(),
         );
-        g.expanded = true;
+        g.display = crate::fold::DisplayMode::Expanded;
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
             lines.len() > 1,
@@ -5458,7 +5627,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "one receipt: {lines:?}");
         assert_eq!(
             lines[0].trim_end(),
-            "\u{203a} 读取 2 个文件 \u{b7} 搜索 2 次",
+            "\u{25b8} 读取 2 个文件 \u{b7} 搜索 2 次",
             "{lines:?}"
         );
         // A failure keeps the stretch's rows so the failing target is visible.
@@ -5618,7 +5787,7 @@ mod tests {
         let mut c = call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok);
         c.preview = Some("     1\t# 示例服务\n     2\t\n     3\tbody".into());
         let mut g = group(vec![c]);
-        g.expanded = true;
+        g.display = crate::fold::DisplayMode::Expanded;
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
             lines.iter().any(|l| l.contains("# 示例服务")),
@@ -5700,7 +5869,7 @@ mod tests {
         c.preview =
             Some("error: no such command\nlong help dump line 2\nlong help dump line 3".into());
         let g = group(vec![c]);
-        assert!(!g.expanded);
+        assert!(!g.expanded());
         let lines = render_group_text(&g, 120, Locale::Zh);
         assert_eq!(
             lines.len(),
@@ -5763,7 +5932,7 @@ mod tests {
             let mut c = call(name, r#"{"pattern":"[unclosed"}"#, ToolStatus::Failed);
             c.preview = Some("regex parse error: unclosed character class".into());
             let mut g = group(vec![c]);
-            g.expanded = true;
+            g.display = crate::fold::DisplayMode::Expanded;
             let joined = render_group_text(&g, 100, Locale::Zh).join("\n");
             assert!(
                 joined.contains("regex parse error"),
@@ -5809,7 +5978,7 @@ mod tests {
         );
         c.preview = Some("error: boom\nextra context line".into());
         let mut g = group(vec![c]);
-        g.expanded = true;
+        g.display = crate::fold::DisplayMode::Expanded;
         let lines = render_group_text(&g, 120, Locale::Zh);
         assert!(
             lines.len() > 2,
@@ -5827,7 +5996,7 @@ mod tests {
         let args =
             format!(r#"{{"cmd":"cd {home}/Develop/app/codeleveler && cargo test --workspace"}}"#);
         let mut g = group(vec![call("shell_command", &args, ToolStatus::Ok)]);
-        g.expanded = true;
+        g.display = crate::fold::DisplayMode::Expanded;
         let lines = render_group_text(&g, 100, Locale::Zh);
         let head = lines
             .iter()
@@ -6045,7 +6214,7 @@ mod tests {
             work_b(r#"{"pattern":"dist"}"#, ToolStatus::Ok),
             work_b(r#"{"pattern":"build"}"#, ToolStatus::Ok),
         ]);
-        g.expanded = true;
+        g.display = crate::fold::DisplayMode::Expanded;
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert!(lines.len() >= 2, "units + detail lines: {lines:?}");
         assert!(
@@ -6098,7 +6267,7 @@ mod compact_command_tests {
             &ToolGroupBlock {
                 calls: vec![call],
                 open: false,
-                expanded: false,
+                display: crate::fold::DisplayMode::Collapsed,
                 round: None,
             },
             theme,
@@ -6444,7 +6613,7 @@ mod compact_command_tests {
             &ToolGroupBlock {
                 calls: vec![c],
                 open: true,
-                expanded: false,
+                display: crate::fold::DisplayMode::Collapsed,
                 round: None,
             },
             &Theme::no_color(),
@@ -6660,7 +6829,7 @@ mod compact_command_tests {
             &ToolGroupBlock {
                 calls: vec![edit(200)],
                 open: false,
-                expanded: true,
+                display: crate::fold::DisplayMode::Expanded,
                 round: None,
             },
             &Theme::no_color(),

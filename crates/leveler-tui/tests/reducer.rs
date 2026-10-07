@@ -1146,7 +1146,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
         .items()
         .iter()
         .filter_map(|i| match i {
-            TranscriptItem::ToolGroup(g) => Some(g.expanded),
+            TranscriptItem::ToolGroup(g) => Some(g.expanded()),
             _ => None,
         })
         .collect();
@@ -1163,7 +1163,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
         .items()
         .iter()
         .filter_map(|i| match i {
-            TranscriptItem::ToolGroup(g) => Some(g.expanded),
+            TranscriptItem::ToolGroup(g) => Some(g.expanded()),
             _ => None,
         })
         .collect();
@@ -1204,9 +1204,9 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
             applied_diff: None,
         }),
     );
-    // A live analysis block renders nothing and is not a disclosure:
-    // even while reasoning streams, Ctrl+O goes straight to the latest
-    // tool group.
+    // The live Thought is the latest foldable entry, so Ctrl+O opens IT and
+    // leaves the settled tool group alone. Both are foldable; only the newest
+    // one is the toggle's target.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ReasoningDelta {
@@ -1222,14 +1222,22 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
         .items()
         .iter()
         .filter_map(|i| match i {
-            TranscriptItem::ToolGroup(g) => Some(g.expanded),
+            TranscriptItem::ToolGroup(g) => Some(g.expanded()),
             _ => None,
         })
         .collect();
     assert_eq!(
         groups.iter().filter(|e| **e).count(),
-        1,
-        "Ctrl+O toggles the latest tool group; analysis is not a disclosure: {groups:?}"
+        0,
+        "Ctrl+O opens the live Thought, not the settled tool group: {groups:?}"
+    );
+    let opened_thought = s.transcript.items().iter().any(|i| {
+        matches!(i, TranscriptItem::Thought(b) if b.display == leveler_tui::fold::DisplayMode::Expanded)
+    });
+    assert!(
+        opened_thought,
+        "the live Thought opened: {:?}",
+        s.transcript.items()
     );
 }
 
@@ -6295,11 +6303,12 @@ fn retry_attempt_reset_removes_divergent_transient_output() {
     // The retried attempt's reasoning is dropped, not sealed: nothing streams
     // and no Thought was archived for the abandoned attempt.
     assert!(!s.transcript.is_thinking());
-    assert!(!s
-        .transcript
-        .items()
-        .iter()
-        .any(|i| matches!(i, TranscriptItem::Thought(_))));
+    assert!(
+        !s.transcript
+            .items()
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::Thought(_)))
+    );
 }
 
 #[test]
@@ -7553,7 +7562,16 @@ fn the_memory_listing_shows_pending_candidates_and_how_to_accept() {
         !collapsed.contains("use-pnpm"),
         "entry details belong behind disclosure:\n{collapsed}"
     );
-    assert_eq!(s.transcript.toggle_last_collapsible(), Some(true));
+    let last = s
+        .transcript
+        .last_foldable_index()
+        .expect("a foldable entry");
+    assert_eq!(
+        s.transcript
+            .toggle_item_display(last)
+            .map(|m| m.is_expanded()),
+        Some(true)
+    );
     let expanded = rendered(&mut s, 120, 30);
     assert!(expanded.contains("memory_dir=/tmp/mem"), "{expanded}");
     assert!(expanded.contains("use-pnpm"), "{expanded}");
@@ -9379,6 +9397,10 @@ fn a_replayed_session_shows_every_message_in_full() {
 
 /// Reasoning is its own conversation content, never assistant prose: it gets
 /// one Thought block and the turn still has exactly one assistant block.
+///
+/// THOUGHT-FOLD-2/-4: the body is visible while the segment streams and folds
+/// away the moment the turn ends without a clean reasoning boundary; expanding
+/// the Thought brings the whole body back.
 #[test]
 fn reasoning_renders_as_a_thought_not_assistant_prose() {
     let mut s = state();
@@ -9388,12 +9410,23 @@ fn reasoning_renders_as_a_thought_not_assistant_prose() {
             delta: "The user wants me to look at PaymentRecords first".into(),
         }),
     );
+    let live = thought_rows(&s);
+    assert!(
+        live.iter().any(|row| row.contains("wants me")),
+        "the live Thought shows its body: {live:?}"
+    );
     stream(&mut s, "m1", LONG_PROSE, true);
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
-    let text = rendered(&mut s, 100, 30);
+    let folded = thought_rows(&s);
     assert!(
-        text.contains("wants me"),
-        "the provider's reasoning is shown as a Thought: {text}"
+        !folded.iter().any(|row| row.contains("wants me")),
+        "a finished Thought folds its body away: {folded:?}"
+    );
+    assert!(
+        folded
+            .first()
+            .is_some_and(|row| row.starts_with('\u{25c6}') && row.contains("\u{601d}\u{8003}")),
+        "the Thought header survives folded: {folded:?}"
     );
     assert_eq!(assistant_indexes(&s).len(), 1, "one assistant block only");
     assert_eq!(
@@ -9405,6 +9438,39 @@ fn reasoning_renders_as_a_thought_not_assistant_prose() {
         1,
         "one Thought block"
     );
+    // The body is folded, never destroyed: expanding restores it.
+    let thought = s
+        .transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::Thought(_)))
+        .expect("a Thought");
+    s.transcript
+        .set_item_display(thought, leveler_tui::fold::DisplayMode::Expanded);
+    let opened = thought_rows(&s);
+    assert!(
+        opened.iter().any(|row| row.contains("wants me")),
+        "expanding restores the reasoning body: {opened:?}"
+    );
+}
+
+/// The rendered rows of the transcript's single Thought item.
+fn thought_rows(s: &AppState) -> Vec<String> {
+    let item = s
+        .transcript
+        .items()
+        .iter()
+        .find(|i| matches!(i, TranscriptItem::Thought(_)))
+        .expect("a Thought");
+    leveler_tui::render::item_render(item, &s.theme, 100, false, s.t())
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
 }
 
 fn snapshot_child(

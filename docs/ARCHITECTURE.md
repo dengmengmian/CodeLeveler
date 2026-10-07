@@ -1284,6 +1284,22 @@ verified by deterministic tests and real dogfood — do not regress them:
 - **Responsive diff preview**: the Conversation edit-preview budget is derived
   from the conversation viewport height (quantized so a notice row cannot shift
   it); the full-screen Diff page still shows the whole patch.
+- **A transcript entry's fold is presentation state only**: `Collapsed` /
+  `Truncated` / `Expanded` belongs to the TUI and never enters the Runtime,
+  the event log or persistence. Thoughts and tool groups share ONE fold
+  vocabulary; a finished Thought folds itself, a running entry's floor is
+  `Truncated`, and a user-chosen mode is never overridden by a later event.
+- **A Thought is a first-level transcript entry**: its rail covers its own body
+  and nothing else, and the tool row that follows it is a SIBLING at the same
+  first column — never a child of the Thought. A new reasoning segment is always
+  the one mutable entry at the tail.
+- **An exploration receipt is a view-time fold, not an aggregate overlay**:
+  consecutive Read / Search / List calls only change how the collapsed group is
+  painted; every original tool entry is kept, and expanding MUST restore each
+  real member. A run or an edit is a breaker, never a member of the same fold.
+- **Folding must not move the reading position**: the line anchored at the
+  viewport's top edge keeps its place when an entry above or inside the viewport
+  is folded; while following the live tail there is no position to anchor.
 - **Ctrl+G jumps to the Final answer**: the anchor reuses the same memoized
   projection; with no Final it only notifies and never moves the viewport.
 - **Performance baseline**: `leveler-tui`'s `perf_bench` is the deterministic

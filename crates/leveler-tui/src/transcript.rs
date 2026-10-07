@@ -6,6 +6,7 @@
 
 use leveler_client_protocol::{AnswerEffect, MessageId, ToolCallId, UiCompletionReport, UiPlan};
 
+use crate::fold::{self, DisplayMode};
 use crate::markdown::MdDoc;
 
 /// The runtime's label for a harness-launched reviewer. Not a role the model
@@ -60,6 +61,13 @@ pub struct ThoughtBlock {
     /// elapsed it actually got instead of a fabricated zero; `None` once the
     /// block is frozen.
     pub live_since: Option<std::time::Instant>,
+    /// How much of the reasoning body is painted. Pure presentation: live it
+    /// opens as `Truncated` (the tail is what is being written), a clean
+    /// completion folds it to `Collapsed`, and the user may open it back up.
+    pub display: DisplayMode,
+    /// The user chose this entry's mode. A pinned mode outlives every later
+    /// event — live deltas, completion, and the next turn's reasoning.
+    pub display_pinned: bool,
 }
 
 /// The lifecycle state of a tool call.
@@ -164,10 +172,21 @@ pub struct ToolCallBlock {
 pub struct ToolGroupBlock {
     pub calls: Vec<ToolCallBlock>,
     pub open: bool,
-    /// Per-group disclosure. Ctrl+O toggles only the current (latest) group.
-    pub expanded: bool,
+    /// How much of the group is painted: `Collapsed` shows the group's summary
+    /// (an aggregate receipt for an exploration run, otherwise the head rows),
+    /// `Expanded` shows every member row and its output. One truth for the
+    /// whole group — see [`ToolGroupBlock::expanded`].
+    pub display: DisplayMode,
     /// The execution round (model step) whose response made these calls.
     pub round: Option<u32>,
+}
+
+impl ToolGroupBlock {
+    /// Whether every member's detail is revealed. Derived from [`Self::display`]
+    /// rather than stored beside it, so a fold can never disagree with itself.
+    pub fn expanded(&self) -> bool {
+        self.display.is_expanded()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +404,44 @@ pub enum TranscriptItem {
 /// of "the live Thought", used by the writer and the reader.
 fn is_open_thought(item: &TranscriptItem) -> bool {
     matches!(item, TranscriptItem::Thought(block) if !block.done)
+}
+
+/// A freshly opened reasoning block: live, unpinned, and `Truncated` — the
+/// newest lines are exactly what a reader watching the model think wants.
+fn live_thought(text: String) -> ThoughtBlock {
+    ThoughtBlock {
+        text,
+        done: false,
+        duration_ms: None,
+        interrupted: false,
+        live_since: Some(std::time::Instant::now()),
+        display: DisplayMode::Truncated,
+        display_pinned: false,
+    }
+}
+
+/// The two-state fold some blocks still carry, expressed in the shared
+/// vocabulary so no caller has to know which representation a block uses.
+fn two_state(expanded: bool) -> DisplayMode {
+    if expanded {
+        DisplayMode::Expanded
+    } else {
+        DisplayMode::Collapsed
+    }
+}
+
+/// Whether a transcript entry can be folded at all.
+fn is_foldable_item(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Thought(_)
+            | TranscriptItem::ToolGroup(_)
+            | TranscriptItem::SubAgent(_)
+            | TranscriptItem::UserShell(_)
+            | TranscriptItem::GoalRecap(_)
+            | TranscriptItem::MemoryList(_)
+            | TranscriptItem::Failure(_)
+    )
 }
 
 /// The ordered list of transcript blocks.
@@ -755,13 +812,8 @@ impl TranscriptState {
             return;
         }
         self.close_tool_group();
-        self.items.push(TranscriptItem::Thought(ThoughtBlock {
-            text: String::new(),
-            done: false,
-            duration_ms: None,
-            interrupted: false,
-            live_since: Some(std::time::Instant::now()),
-        }));
+        self.items
+            .push(TranscriptItem::Thought(live_thought(String::new())));
     }
 
     /// Append streamed reasoning to the open block, opening one if needed.
@@ -777,13 +829,8 @@ impl TranscriptState {
             return;
         }
         self.close_tool_group();
-        self.items.push(TranscriptItem::Thought(ThoughtBlock {
-            text: delta.to_string(),
-            done: false,
-            duration_ms: None,
-            interrupted: false,
-            live_since: Some(std::time::Instant::now()),
-        }));
+        self.items
+            .push(TranscriptItem::Thought(live_thought(delta.to_string())));
     }
 
     /// Freeze the open reasoning block into immutable history.
@@ -812,6 +859,12 @@ impl TranscriptState {
                     .map(|started| started.elapsed().as_millis() as u64)
             });
             block.live_since = None;
+            // The reasoning is over: its body is now evidence, not activity.
+            // Fold it unless the reader asked for it to stay open — the rule
+            // `fold::toggled` already encodes for a finished entry.
+            if !block.display_pinned {
+                block.display = fold::collapse_target(false);
+            }
         }
     }
 
@@ -862,6 +915,9 @@ impl TranscriptState {
                         .live_since
                         .map(|started| started.elapsed().as_millis() as u64);
                     b.live_since = None;
+                    if !b.display_pinned {
+                        b.display = fold::collapse_target(false);
+                    }
                 }
                 TranscriptItem::ToolGroup(group) => {
                     group.open = false;
@@ -986,7 +1042,7 @@ impl TranscriptState {
             _ => self.items.push(TranscriptItem::ToolGroup(ToolGroupBlock {
                 calls: vec![call],
                 open: true,
-                expanded: false,
+                display: DisplayMode::Collapsed,
                 round: model_step,
             })),
         }
@@ -1154,66 +1210,121 @@ impl TranscriptState {
             .position(|item| matches!(item, TranscriptItem::UserShell(shell) if &shell.id == id))
     }
 
-    /// Toggle expand/collapse on the collapsible block at `index` (a
-    /// ToolGroup or SubAgent item). The mouse path: a click on a disclosure
-    /// row targets exactly that historical group, not the latest one.
-    pub fn toggle_tool_group_at(&mut self, index: usize) -> Option<bool> {
-        let toggled = match self.items.get_mut(index)? {
-            TranscriptItem::ToolGroup(group) => {
-                group.expanded = !group.expanded;
-                Some(group.expanded)
-            }
-            TranscriptItem::SubAgent(block) => {
-                block.expanded = !block.expanded;
-                Some(block.expanded)
-            }
-            TranscriptItem::UserShell(shell) => {
-                shell.expanded = !shell.expanded;
-                Some(shell.expanded)
-            }
-            TranscriptItem::GoalRecap(block) => {
-                block.expanded = !block.expanded;
-                Some(block.expanded)
-            }
-            TranscriptItem::MemoryList(block) => {
-                block.expanded = !block.expanded;
-                Some(block.expanded)
-            }
-            _ => None,
-        };
-        if toggled.is_some() {
-            self.bump();
-        }
-        toggled
+    /// Whether a transcript entry can be folded at all.
+    pub fn is_foldable_at(&self, index: usize) -> bool {
+        self.items.get(index).is_some_and(is_foldable_item)
     }
 
-    /// Toggle expand/collapse on whichever collapsible block came last (a
-    /// tool group or sub-agent). Returns the new state, or `None` when there
-    /// is nothing collapsible.
-    pub fn toggle_last_collapsible(&mut self) -> Option<bool> {
-        self.bump();
-        for item in self.items.iter_mut().rev() {
-            match item {
-                TranscriptItem::ToolGroup(group) => {
-                    group.expanded = !group.expanded;
-                    return Some(group.expanded);
-                }
-                TranscriptItem::SubAgent(block) => {
-                    block.expanded = !block.expanded;
-                    return Some(block.expanded);
-                }
-                TranscriptItem::Failure(block) => {
-                    block.expanded = !block.expanded;
-                    return Some(block.expanded);
-                }
-                TranscriptItem::MemoryList(block) => {
-                    block.expanded = !block.expanded;
-                    return Some(block.expanded);
-                }
-                _ => {}
-            }
+    /// Toggle one entry's fold, remembering the user's choice. The mouse path:
+    /// a click on a disclosure row targets exactly that historical entry, not
+    /// the latest one. Returns the new mode, or `None` when the entry is not
+    /// foldable.
+    pub fn toggle_item_display(&mut self, index: usize) -> Option<DisplayMode> {
+        let running = self.item_running(index);
+        let current = self.item_display(index)?;
+        let next = fold::toggled(current, running);
+        self.set_item_display(index, next).then_some(next)
+    }
+
+    /// Collapse one entry to its own floor (a running entry keeps a preview).
+    pub fn collapse_item_display(&mut self, index: usize) -> Option<DisplayMode> {
+        let next = fold::collapse_target(self.item_running(index));
+        self.set_item_display(index, next).then_some(next)
+    }
+
+    /// Expand one entry to its full body.
+    pub fn expand_item_display(&mut self, index: usize) -> Option<DisplayMode> {
+        self.set_item_display(index, DisplayMode::Expanded)
+            .then_some(DisplayMode::Expanded)
+    }
+
+    /// How much of the entry at `index` is painted, when it is foldable at all.
+    pub fn item_display(&self, index: usize) -> Option<DisplayMode> {
+        match self.items.get(index)? {
+            TranscriptItem::Thought(block) => Some(block.display),
+            TranscriptItem::ToolGroup(group) => Some(group.display),
+            // These keep a two-state fold (no live body to preview); the
+            // vocabulary is shared so no caller has to know that.
+            TranscriptItem::SubAgent(block) => Some(two_state(block.expanded)),
+            TranscriptItem::UserShell(shell) => Some(two_state(shell.expanded)),
+            TranscriptItem::GoalRecap(block) => Some(two_state(block.expanded)),
+            TranscriptItem::MemoryList(block) => Some(two_state(block.expanded)),
+            TranscriptItem::Failure(block) => Some(two_state(block.expanded)),
+            _ => None,
         }
-        None
+    }
+
+    /// Whether the entry at `index` is still being written. A running entry
+    /// cannot fold away to a bare header.
+    pub fn item_running(&self, index: usize) -> bool {
+        match self.items.get(index) {
+            Some(TranscriptItem::Thought(block)) => !block.done,
+            Some(TranscriptItem::ToolGroup(group)) => {
+                group.open || group.calls.iter().any(|c| c.status == ToolStatus::Running)
+            }
+            _ => false,
+        }
+    }
+
+    /// Write one entry's fold. Returns whether the entry has a fold at all.
+    ///
+    /// The ONE write path: a fold that is set here is by definition the user's
+    /// choice, so it is pinned and no later event may fold it back.
+    pub fn set_item_display(&mut self, index: usize, mode: DisplayMode) -> bool {
+        let wrote = match self.items.get_mut(index) {
+            Some(TranscriptItem::Thought(block)) => {
+                block.display = mode;
+                block.display_pinned = true;
+                true
+            }
+            Some(TranscriptItem::ToolGroup(group)) => {
+                group.display = mode;
+                true
+            }
+            Some(TranscriptItem::SubAgent(block)) => {
+                block.expanded = mode.is_expanded();
+                true
+            }
+            Some(TranscriptItem::UserShell(shell)) => {
+                shell.expanded = mode.is_expanded();
+                true
+            }
+            Some(TranscriptItem::GoalRecap(block)) => {
+                block.expanded = mode.is_expanded();
+                true
+            }
+            Some(TranscriptItem::MemoryList(block)) => {
+                block.expanded = mode.is_expanded();
+                true
+            }
+            Some(TranscriptItem::Failure(block)) => {
+                block.expanded = mode.is_expanded();
+                true
+            }
+            _ => false,
+        };
+        if wrote {
+            self.bump();
+        }
+        wrote
+    }
+
+    /// Toggle expand/collapse on the collapsible block at `index`. Kept as the
+    /// conversation's click/fold entry point; the decision itself is
+    /// [`Self::toggle_item_display`].
+    pub fn toggle_tool_group_at(&mut self, index: usize) -> Option<bool> {
+        self.toggle_item_display(index)
+            .map(DisplayMode::is_expanded)
+    }
+
+    /// The index of the most recently folded entry — a Thought, a tool group,
+    /// a sub-agent — or `None` when the transcript holds nothing foldable.
+    ///
+    /// Callers that also own a viewport fold it through their own anchored
+    /// path; this only answers WHICH entry is the latest, so the answer cannot
+    /// drift from [`Self::is_foldable_at`].
+    pub fn last_foldable_index(&self) -> Option<usize> {
+        (0..self.items.len()).rposition(|i| self.is_foldable_at(i))
     }
 
     /// Classify replayed history, where no live event order survives: inside
@@ -2363,9 +2474,20 @@ mod tests {
                 applied_diff: None,
             }],
             open: false,
-            expanded,
+            display: if expanded {
+                crate::fold::DisplayMode::Expanded
+            } else {
+                crate::fold::DisplayMode::Collapsed
+            },
             round: None,
         }
+    }
+
+    /// Fold the last foldable entry, the way a caller with no viewport does.
+    fn toggle_last(ts: &mut TranscriptState) -> Option<bool> {
+        ts.last_foldable_index()
+            .and_then(|i| ts.toggle_item_display(i))
+            .map(DisplayMode::is_expanded)
     }
 
     #[test]
@@ -2374,26 +2496,26 @@ mod tests {
         ts.items.push(TranscriptItem::ToolGroup(group(false)));
         ts.items.push(TranscriptItem::ToolGroup(group(false)));
 
-        let new = ts.toggle_last_collapsible();
+        let new = toggle_last(&mut ts);
         assert_eq!(new, Some(true));
 
         let groups: Vec<_> = ts
             .items
             .iter()
             .filter_map(|i| match i {
-                TranscriptItem::ToolGroup(g) => Some(g.expanded),
+                TranscriptItem::ToolGroup(g) => Some(g.expanded()),
                 _ => None,
             })
             .collect();
         assert_eq!(groups, vec![false, true], "only latest group expands");
 
-        let new = ts.toggle_last_collapsible();
+        let new = toggle_last(&mut ts);
         assert_eq!(new, Some(false));
         let groups: Vec<_> = ts
             .items
             .iter()
             .filter_map(|i| match i {
-                TranscriptItem::ToolGroup(g) => Some(g.expanded),
+                TranscriptItem::ToolGroup(g) => Some(g.expanded()),
                 _ => None,
             })
             .collect();

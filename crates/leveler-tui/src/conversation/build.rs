@@ -41,7 +41,7 @@ impl AppState {
         std::rc::Rc<Vec<Line<'static>>>,
         std::rc::Rc<Vec<(usize, usize)>>,
     ) {
-        let (lines, hits, _, _) = self.conversation_build(width);
+        let (lines, hits, _, _, _) = self.conversation_build(width);
         (lines, hits)
     }
 
@@ -52,8 +52,20 @@ impl AppState {
         self.conversation_build(width).3
     }
 
-    /// The memoized build: lines, disclosure hit rows, command rows, and the
-    /// last Final answer's start line.
+    /// The absolute line span `[start, end)` of the transcript item at
+    /// `index`, for fold anchoring. Reuses the same memoized build as painting,
+    /// so a fold can never anchor against lines the reader is not looking at.
+    pub fn item_span(&self, index: usize, width: usize) -> Option<(usize, usize)> {
+        self.conversation_build(width).4.get(index).copied()
+    }
+
+    /// The first absolute line of the transcript item at `index`.
+    pub fn item_start_line(&self, index: usize, width: usize) -> Option<usize> {
+        self.item_span(index, width).map(|(start, _)| start)
+    }
+
+    /// The memoized build: lines, disclosure hit rows, command rows, the
+    /// last Final answer's start line, and every item's line span.
     #[allow(clippy::type_complexity)]
     pub(crate) fn conversation_build(
         &self,
@@ -63,14 +75,16 @@ impl AppState {
         std::rc::Rc<Vec<(usize, usize)>>,
         std::rc::Rc<Vec<super::view::CommandHit>>,
         Option<usize>,
+        std::rc::Rc<Vec<(usize, usize)>>,
     ) {
         if crate::splash::conversation_is_empty(self) {
-            let (lines, hits, commands, anchor) = build_conversation(self, width);
+            let (lines, hits, commands, anchor, starts) = build_conversation(self, width);
             return (
                 std::rc::Rc::new(lines),
                 std::rc::Rc::new(hits),
                 std::rc::Rc::new(commands),
                 anchor,
+                std::rc::Rc::new(starts),
             );
         }
         let diff_preview_rows = crate::activity_stream::diff_preview_rows_for_viewport(
@@ -88,24 +102,37 @@ impl AppState {
             diff_preview_rows,
             focused_command: self.focused_command().cloned(),
         };
-        if let Some((k, lines, hits, commands, anchor)) = self.conv.cache.borrow().as_ref()
+        if let Some((k, lines, hits, commands, anchor, starts)) = self.conv.cache.borrow().as_ref()
             && *k == key
         {
             crate::profile::add("tui.build_cache_hit_count", 1);
-            return (lines.clone(), hits.clone(), commands.clone(), *anchor);
+            return (
+                lines.clone(),
+                hits.clone(),
+                commands.clone(),
+                *anchor,
+                starts.clone(),
+            );
         }
         let started = crate::profile::start();
-        let (lines, hits, commands, anchor) = build_conversation(self, width);
+        let (lines, hits, commands, anchor, starts) = build_conversation(self, width);
         crate::profile::stop(started, "tui.projection_ms");
         crate::profile::add("tui.build_count", 1);
-        let (lines, hits, commands) = (
+        let (lines, hits, commands, starts) = (
             std::rc::Rc::new(lines),
             std::rc::Rc::new(hits),
             std::rc::Rc::new(commands),
+            std::rc::Rc::new(starts),
         );
-        *self.conv.cache.borrow_mut() =
-            Some((key, lines.clone(), hits.clone(), commands.clone(), anchor));
-        (lines, hits, commands, anchor)
+        *self.conv.cache.borrow_mut() = Some((
+            key,
+            lines.clone(),
+            hits.clone(),
+            commands.clone(),
+            anchor,
+            starts.clone(),
+        ));
+        (lines, hits, commands, anchor, starts)
     }
 
     /// The command row under content (`abs_line`, display `col`), if any.
@@ -114,7 +141,7 @@ impl AppState {
         width: usize,
         abs_line: usize,
     ) -> Option<super::view::CommandHit> {
-        let (_, _, commands, _) = self.conversation_build(width);
+        let (_, _, commands, _, _) = self.conversation_build(width);
         commands.iter().find(|hit| hit.line == abs_line).copied()
     }
 
@@ -138,7 +165,7 @@ pub fn build_conversation_lines_with_hits(
     state: &AppState,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
-    let (lines, hits, _, _) = build_conversation(state, width);
+    let (lines, hits, _, _, _) = build_conversation(state, width);
     (lines, hits)
 }
 
@@ -157,6 +184,7 @@ fn build_conversation(
     Vec<(usize, usize)>,
     Vec<super::view::CommandHit>,
     Option<usize>,
+    Vec<(usize, usize)>,
 ) {
     let theme = &state.theme;
     let t = state.t();
@@ -166,6 +194,10 @@ fn build_conversation(
     // Absolute line where the LAST Final answer begins. Tracked as items are
     // placed, so jump-to-final consumes the same projection painting does.
     let mut final_anchor: Option<usize> = None;
+    // The first absolute line of each transcript item, for fold anchoring: a
+    // fold preserves the toggled entry's position on screen by shifting the
+    // viewport by the same amount the entry moved.
+    let mut item_spans: Vec<(usize, usize)> = vec![(0, 0); state.transcript.items().len()];
     let diff_preview_rows = crate::activity_stream::diff_preview_rows_for_viewport(
         super::geometry::viewport_height(state),
     );
@@ -183,6 +215,7 @@ fn build_conversation(
             hits,
             commands,
             final_anchor,
+            item_spans,
         );
     }
 
@@ -212,6 +245,7 @@ fn build_conversation(
             out.push(Line::from(""));
             out.len() - 1
         });
+        let first_item = idx;
         let before_item = out.len();
         if let TranscriptItem::Assistant(block) = item
             && block.kind == crate::transcript::AssistantKind::Final
@@ -340,11 +374,14 @@ fn build_conversation(
         {
             out.remove(at);
         }
+        // One span per consumed item. A sub-agent run (or any future multi-item
+        // unit) renders several items as one block, so they all share it.
+        item_spans[first_item..=idx].fill((before_item, out.len()));
         idx += 1;
     }
 
     *state.conv.item_cache.borrow_mut() = super::view::ItemLineCache { units: new_units };
-    (out, hits, commands, final_anchor)
+    (out, hits, commands, final_anchor, item_spans)
 }
 
 /// Render one memoized transcript item to lines, plus its disclosure hit rows
@@ -390,6 +427,16 @@ fn render_cacheable_unit(
             // persisted checkpoint's structured sections. A memory listing uses
             // the same interaction for its details.
             hits.push((0, 0));
+            out.extend(item_render(item, theme, width, state.tools_expanded, t));
+        }
+        TranscriptItem::Thought(block) => {
+            // A Thought's header is its disclosure row, exactly like a tool
+            // group's first row: click folds or opens the reasoning body.
+            // A provider that returned no text owns nothing to reveal, so its
+            // header stays a plain row rather than a fold that does nothing.
+            if !block.text.is_empty() {
+                hits.push((0, 0));
+            }
             out.extend(item_render(item, theme, width, state.tools_expanded, t));
         }
         other => out.extend(item_render(other, theme, width, state.tools_expanded, t)),

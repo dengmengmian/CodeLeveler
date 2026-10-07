@@ -1,0 +1,632 @@
+//! The Reasoning / Thought and execution-fold presentation contract.
+//!
+//! These tests drive the REAL reducer and the REAL conversation builder, so
+//! every assertion is about the lines the terminal paints. The contract:
+//!
+//! - A Thought is a SIBLING of the tool activity that follows it, never its
+//!   parent. Its `│` rail covers its own body and nothing else.
+//! - A live Thought shows its body; a finished Thought folds to its header and
+//!   the user may open it back up.
+//! - A run of Search / Read / List is ONE view-time fold whose collapsed row is
+//!   an aggregate receipt — and expanding restores every real member row.
+//! - Folding never moves the reader's viewport.
+
+use leveler_client_protocol::{MessageId, RuntimeEvent, SessionId, ToolCallId, UiSessionSnapshot};
+use leveler_tui::action::Action;
+use leveler_tui::conversation::build::{
+    build_conversation_lines_with_hits, conversation_line_count,
+};
+use leveler_tui::conversation::interaction::toggle_fold;
+use leveler_tui::fold::DisplayMode;
+use leveler_tui::reducer::reduce;
+use leveler_tui::state::{AppState, Boot};
+use leveler_tui::theme::Theme;
+use leveler_tui::transcript::{ThoughtBlock, TranscriptItem};
+
+const W: usize = 100;
+
+fn opened() -> AppState {
+    let mut s = AppState::new(
+        Theme::no_color(),
+        Boot {
+            session_id: SessionId::new("s1"),
+            user: "麻凡".into(),
+            version: "0.1.0".into(),
+            show_welcome: false,
+            draft_path: None,
+            history_path: None,
+            context_window: 200_000,
+            locale: leveler_tui::Locale::Zh,
+            untrusted_config: Vec::new(),
+            thinking: None,
+        },
+    );
+    s.size = (W as u16, 30);
+    s.conv.rect = Some((0, 0, W as u16, 24));
+    let snap = UiSessionSnapshot {
+        id: SessionId::new("s1"),
+        repository: Some("~/x".into()),
+        task_status: None,
+        task_terminal: None,
+        goal: "g".into(),
+        model: leveler_client_protocol::ModelRef::parse("deepseek/v3"),
+        mode: leveler_client_protocol::PermissionProfile::Assisted,
+        branch: Some("main".into()),
+        status: "idle".into(),
+        finalization_stage: None,
+        messages: Vec::new(),
+        pending_interactions: Vec::new(),
+        available_models: Vec::new(),
+        vision: false,
+        last_sequence: None,
+        active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
+        plan: None,
+        diff: None,
+        checkpoints: Vec::new(),
+        recaps: Vec::new(),
+        user_shells: Vec::new(),
+        completion_report: None,
+        thinking: None,
+        work_profile: None,
+        collaboration: None,
+        children: Vec::new(),
+    };
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    // A prompt precedes every real turn; without one the welcome splash owns
+    // the viewport and the conversation builder paints the logo instead.
+    s.transcript.push_user("看下当前项目有什么 bug".into());
+    s
+}
+
+/// Close the open tool group the way the next assistant round does, so the
+/// group reads as history rather than as live activity.
+fn settle_group(s: &mut AppState) {
+    assistant(s, "settle", "看完了。");
+}
+
+fn lines(s: &AppState) -> Vec<String> {
+    build_conversation_lines_with_hits(s, W)
+        .0
+        .into_iter()
+        .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+        .collect()
+}
+
+fn text(s: &AppState) -> String {
+    lines(s).join("\n")
+}
+
+fn reasoning_start(s: &mut AppState) {
+    reduce(s, Action::Runtime(RuntimeEvent::ReasoningStarted));
+}
+
+fn reasoning(s: &mut AppState, delta: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ReasoningDelta {
+            delta: delta.into(),
+        }),
+    );
+}
+
+fn reasoning_done(s: &mut AppState, ms: u64) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ReasoningCompleted { elapsed_ms: ms }),
+    );
+}
+
+fn assistant(s: &mut AppState, id: &str, body: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: MessageId::new(id),
+        }),
+    );
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: MessageId::new(id),
+            delta: body.into(),
+        }),
+    );
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted {
+            message_id: MessageId::new(id),
+        }),
+    );
+}
+
+fn tool_started(s: &mut AppState, id: &str, name: &str, args: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new(id),
+            name: name.into(),
+            arguments: args.into(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+}
+
+fn tool_completed(s: &mut AppState, id: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new(id),
+            ok: true,
+            preview: "ok".into(),
+            duration_ms: 4,
+            applied_diff: None,
+        }),
+    );
+}
+
+fn read(s: &mut AppState, id: &str, path: &str) {
+    tool_started(s, id, "read_file", &format!(r#"{{"path":"{path}"}}"#));
+    tool_completed(s, id);
+}
+
+fn thoughts(s: &AppState) -> Vec<&ThoughtBlock> {
+    s.transcript
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            TranscriptItem::Thought(b) => Some(b),
+            _ => None,
+        })
+        .collect()
+}
+
+fn thought_index(s: &AppState) -> usize {
+    s.transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::Thought(_)))
+        .expect("a Thought")
+}
+
+// ── THOUGHT-FOLD ─────────────────────────────────────────────────────────────
+
+/// THOUGHT-FOLD-1: while the provider is reasoning, the Thought shows its body.
+#[test]
+fn thought_fold_1_a_live_thought_shows_its_body() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先看工作区和近期变更。");
+    let text = text(&s);
+    assert!(text.contains("思考中"), "{text}");
+    assert!(text.contains("先看工作区和近期变更。"), "{text}");
+}
+
+/// THOUGHT-FOLD-2: `ReasoningCompleted` folds the body away on its own.
+#[test]
+fn thought_fold_2_completion_auto_folds() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先看工作区和近期变更。");
+    reasoning_done(&mut s, 4100);
+    assert_eq!(thoughts(&s).len(), 1);
+    assert_eq!(thoughts(&s)[0].display, DisplayMode::Collapsed);
+    assert_eq!(thoughts(&s)[0].duration_ms, Some(4100));
+}
+
+/// THOUGHT-FOLD-3: a collapsed Thought paints its header and no body line.
+#[test]
+fn thought_fold_3_collapsed_thought_is_header_only() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "只有这一句推理。");
+    reasoning_done(&mut s, 4100);
+    let rows = lines(&s);
+    let header = rows
+        .iter()
+        .find(|l| l.contains("已思考 4.1s"))
+        .expect("the header");
+    assert!(header.starts_with('◆'), "{rows:?}");
+    assert!(
+        !rows.iter().any(|l| l.contains("只有这一句推理。")),
+        "the body is folded: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.starts_with('│')),
+        "no rail without a body: {rows:?}"
+    );
+}
+
+/// THOUGHT-FOLD-4 / -5: the body comes back on expand and goes away again.
+#[test]
+fn thought_fold_4_and_5_expand_and_collapse_again() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先看工作区和近期变更。\n再检查测试和错误路径。");
+    reasoning_done(&mut s, 4100);
+    let item = thought_index(&s);
+
+    s.transcript.set_item_display(item, DisplayMode::Expanded);
+    let opened = text(&s);
+    assert!(opened.contains("先看工作区和近期变更。"), "{opened}");
+    assert!(opened.contains("再检查测试和错误路径。"), "{opened}");
+
+    s.transcript.set_item_display(item, DisplayMode::Collapsed);
+    let folded = text(&s);
+    assert!(!folded.contains("先看工作区和近期变更。"), "{folded}");
+    assert!(!folded.contains("再检查测试和错误路径。"), "{folded}");
+}
+
+/// THOUGHT-FOLD-6: a manually opened historical Thought is never folded back by
+/// later live events, and its body is never rewritten.
+#[test]
+fn thought_fold_6_a_pinned_history_thought_survives_later_events() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "第一段推理。");
+    reasoning_done(&mut s, 1000);
+
+    let first = thought_index(&s);
+    toggle_fold(&mut s, first);
+    assert!(thoughts(&s)[0].display_pinned);
+
+    // Later live activity: a tool, then a second reasoning segment.
+    read(&mut s, "t1", "a.rs");
+    reasoning_start(&mut s);
+    reasoning(&mut s, "第二段推理。");
+    reasoning_done(&mut s, 2000);
+
+    assert_eq!(
+        thoughts(&s)[0].display,
+        DisplayMode::Expanded,
+        "the reader's fold is not overridden"
+    );
+    assert_eq!(thoughts(&s)[0].text, "第一段推理。");
+    assert_eq!(thoughts(&s)[0].duration_ms, Some(1000));
+    let rendered = text(&s);
+    assert!(rendered.contains("第一段推理。"), "{rendered}");
+}
+
+/// THOUGHT-FOLD-7: a new reasoning segment is the transcript's last item, and
+/// never appends to the previous Thought.
+#[test]
+fn thought_fold_7_a_new_thought_is_the_tail() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "第一段。");
+    reasoning_done(&mut s, 1000);
+    read(&mut s, "t1", "a.rs");
+
+    reasoning_start(&mut s);
+    reasoning(&mut s, "第二段。");
+
+    let items = s.transcript.items();
+    assert!(
+        matches!(items.last(), Some(TranscriptItem::Thought(b)) if b.text == "第二段。"),
+        "{items:?}"
+    );
+    assert_eq!(thoughts(&s).len(), 2, "two segments, two Thoughts");
+    assert!(thoughts(&s)[0].done);
+    assert!(!thoughts(&s)[1].done);
+}
+
+/// THOUGHT-FOLD-8: the tool row after a Thought is a SIBLING — the same
+/// column — and the Thought's `│` rail does not reach it.
+#[test]
+fn thought_fold_8_a_tool_is_a_sibling_not_a_thought_child() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先看工作区。");
+    reasoning_done(&mut s, 4100);
+    read(&mut s, "t1", "a.rs");
+    read(&mut s, "t2", "b.rs");
+    settle_group(&mut s);
+
+    let rows = lines(&s);
+    let header = rows
+        .iter()
+        .position(|l| l.contains("已思考 4.1s"))
+        .expect("the Thought header");
+    let receipt = rows
+        .iter()
+        .position(|l| l.contains("读取 2 个文件"))
+        .expect("the receipt");
+    assert_eq!(
+        rows[header].chars().take_while(|c| *c == ' ').count(),
+        rows[receipt].chars().take_while(|c| *c == ' ').count(),
+        "the tool row sits at the same column as the Thought: {rows:?}"
+    );
+    assert!(
+        rows[header..receipt]
+            .iter()
+            .all(|l| !l.starts_with('│') && !l.trim_start().starts_with('│')),
+        "no rail carries into the tool: {rows:?}"
+    );
+}
+
+// ── TOOL-GROUP ───────────────────────────────────────────────────────────────
+
+/// TOOL-GROUP-1 / -2: consecutive Read / Search / List derive ONE group whose
+/// collapsed row is an aggregate receipt.
+#[test]
+fn tool_group_1_and_2_consecutive_exploration_is_one_group() {
+    let mut s = opened();
+    read(&mut s, "t1", "README.md");
+    read(&mut s, "t2", "AGENTS.md");
+    tool_started(&mut s, "t3", "grep", r#"{"pattern":"pricing"}"#);
+    tool_completed(&mut s, "t3");
+    tool_started(&mut s, "t4", "grep", r#"{"pattern":"request_logs"}"#);
+    tool_completed(&mut s, "t4");
+    settle_group(&mut s);
+
+    let rows = lines(&s);
+    let receipts: Vec<&String> = rows
+        .iter()
+        .filter(|l| l.contains("读取 2 个文件"))
+        .collect();
+    assert_eq!(receipts.len(), 1, "one group, one receipt: {rows:?}");
+    assert!(
+        receipts[0].contains("搜索 2 次"),
+        "the receipt counts by kind: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("README.md")),
+        "collapsed: no member rows: {rows:?}"
+    );
+}
+
+/// TOOL-GROUP-3: expanding restores every real member row, naming its own
+/// target — the fold is view-time, nothing was merged away.
+#[test]
+fn tool_group_3_expanding_restores_every_member() {
+    let mut s = opened();
+    read(&mut s, "t1", "README.md");
+    read(&mut s, "t2", "AGENTS.md");
+    tool_started(&mut s, "t3", "grep", r#"{"pattern":"pricing"}"#);
+    tool_completed(&mut s, "t3");
+    settle_group(&mut s);
+
+    let group = s
+        .transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::ToolGroup(_)))
+        .expect("a group");
+    toggle_fold(&mut s, group);
+    let rows = lines(&s);
+    let text = rows.join("\n");
+    assert!(text.contains("README.md"), "{rows:?}");
+    assert!(text.contains("AGENTS.md"), "{rows:?}");
+    assert!(text.contains("pricing"), "{rows:?}");
+    assert!(
+        rows.iter().any(|l| l.starts_with('▾')),
+        "the aggregate header stays open: {rows:?}"
+    );
+}
+
+/// TOOL-GROUP-4: collapsing again returns to the single aggregate row.
+#[test]
+fn tool_group_4_collapsing_returns_to_one_row() {
+    let mut s = opened();
+    read(&mut s, "t1", "README.md");
+    read(&mut s, "t2", "AGENTS.md");
+    settle_group(&mut s);
+    let group = s
+        .transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::ToolGroup(_)))
+        .expect("a group");
+    toggle_fold(&mut s, group);
+    toggle_fold(&mut s, group);
+    let rows = lines(&s);
+    assert!(
+        !rows.iter().any(|l| l.contains("README.md")),
+        "collapsed again: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|l| l.starts_with('▸') && l.contains("读取 2 个文件")),
+        "{rows:?}"
+    );
+}
+
+/// TOOL-GROUP-5: a run or an edit is a breaker, not a member.
+#[test]
+fn tool_group_5_a_run_breaks_the_exploration_group() {
+    let mut s = opened();
+    read(&mut s, "t1", "a.rs");
+    read(&mut s, "t2", "b.rs");
+    tool_started(
+        &mut s,
+        "t3",
+        "run_command",
+        r#"{"program":"cargo","args":["test"]}"#,
+    );
+    tool_completed(&mut s, "t3");
+    settle_group(&mut s);
+
+    let rows = lines(&s);
+    let receipt = rows
+        .iter()
+        .position(|l| l.contains("读取 2 个文件"))
+        .expect("the exploration receipt");
+    let run = rows
+        .iter()
+        .position(|l| l.contains("cargo test"))
+        .expect("the run keeps its own row");
+    assert!(run > receipt, "the run follows the receipt: {rows:?}");
+}
+
+/// TOOL-GROUP-6: a failed member is never folded away — its target stays on
+/// screen with its reason.
+#[test]
+fn tool_group_6_a_failed_member_keeps_its_target() {
+    let mut s = opened();
+    read(&mut s, "t1", "a.rs");
+    read(&mut s, "t2", "b.rs");
+    tool_started(&mut s, "t3", "read_file", r#"{"path":"missing.rs"}"#);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new("t3"),
+            ok: false,
+            preview: "no such file".into(),
+            duration_ms: 2,
+            applied_diff: None,
+        }),
+    );
+    settle_group(&mut s);
+    let rendered = text(&s);
+    assert!(rendered.contains("missing.rs"), "{rendered}");
+    assert!(rendered.contains("no such file"), "{rendered}");
+}
+
+// ── RUN-FOLD ─────────────────────────────────────────────────────────────────
+
+/// RUN-FOLD-1 / -2: a settled command folds to its logical receipt and reveals
+/// its command and output on expand.
+#[test]
+fn run_fold_1_and_2_a_command_folds_and_reveals() {
+    let mut s = opened();
+    tool_started(
+        &mut s,
+        "t1",
+        "run_command",
+        r#"{"program":"echo","args":["tests-passed"]}"#,
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: Some(0),
+            stop: None,
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "tests-passed\n".into(),
+            duration_ms: 8200,
+            applied_diff: None,
+        }),
+    );
+    settle_group(&mut s);
+    let folded = text(&s);
+    assert!(
+        folded.contains("执行命令") || folded.contains("echo"),
+        "{folded}"
+    );
+
+    let group = s
+        .transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::ToolGroup(_)))
+        .expect("a group");
+    toggle_fold(&mut s, group);
+    let opened = text(&s);
+    assert!(opened.contains("$ echo tests-passed"), "{opened}");
+    assert!(opened.contains("tests-passed"), "{opened}");
+}
+
+// ── SCROLL-FOLD ──────────────────────────────────────────────────────────────
+
+/// SCROLL-FOLD-1: folding an entry above the viewport does not move the rows
+/// the reader is looking at.
+#[test]
+fn scroll_fold_1_an_above_viewport_fold_keeps_the_viewport() {
+    let mut s = opened();
+    reasoning(&mut s, "第一段很长的推理内容，用来把后面的内容推出视口。");
+    reasoning_done(&mut s, 1200);
+    for i in 0..8 {
+        assistant(&mut s, &format!("m{i}"), &format!("第 {i} 行回答"));
+    }
+
+    let total = conversation_line_count(&s, W);
+    assert!(total > 12, "the transcript must overflow: {total}");
+    s.conv.auto_scroll = false;
+    s.conv.scroll = total - 12;
+
+    let item = thought_index(&s);
+    let before = viewport_anchor(&s);
+    toggle_fold(&mut s, item);
+    let after = viewport_anchor(&s);
+    assert_eq!(
+        after, before,
+        "the line at the viewport's top edge is still the one the reader was reading"
+    );
+}
+
+/// SCROLL-FOLD-1 (collapse): the same holds when the fold shrinks the content.
+#[test]
+fn scroll_fold_1_a_collapse_above_the_viewport_keeps_the_viewport() {
+    let mut s = opened();
+    reasoning(&mut s, "第一段很长的推理内容，用来把后面的内容推出视口。");
+    reasoning_done(&mut s, 1200);
+    let item = thought_index(&s);
+    s.transcript.set_item_display(item, DisplayMode::Expanded);
+    for i in 0..8 {
+        assistant(&mut s, &format!("m{i}"), &format!("第 {i} 行回答"));
+    }
+
+    let total = conversation_line_count(&s, W);
+    s.conv.auto_scroll = false;
+    s.conv.scroll = total - 12;
+
+    let before = viewport_anchor(&s);
+    toggle_fold(&mut s, item);
+    let after = viewport_anchor(&s);
+    assert_eq!(
+        after, before,
+        "the anchored line stayed put through a collapse"
+    );
+}
+
+/// The reader's place: the transcript item painted at the viewport's top edge
+/// and that item's offset from the top edge.
+fn viewport_anchor(s: &AppState) -> (usize, i64) {
+    let height = 24usize;
+    let total = conversation_line_count(s, W);
+    let scroll = s.conv.scroll.min(total.saturating_sub(height.max(1)));
+    let item = (0..s.transcript.len())
+        .rev()
+        .find(|&i| s.item_start_line(i, W).is_some_and(|start| start <= scroll))
+        .expect("an item at the viewport top");
+    let offset = s.item_start_line(item, W).expect("a start line") as i64 - scroll as i64;
+    (item, offset)
+}
+
+// ── RESUME-FOLD ──────────────────────────────────────────────────────────────
+
+/// RESUME-FOLD-1: replayed reasoning restores its body and duration, and comes
+/// back folded — a resumed session is history, not a live segment.
+#[test]
+fn resume_fold_1_replayed_thought_is_collapsed_but_openable() {
+    let mut s = opened();
+    // The replay path is the same event sequence the durable projection emits.
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先检查工作区和近期变更。");
+    reasoning_done(&mut s, 3400);
+    assistant(&mut s, "m1", "看完了。");
+
+    let thought = &thoughts(&s)[0];
+    assert_eq!(thought.display, DisplayMode::Collapsed);
+    assert_eq!(thought.text, "先检查工作区和近期变更。");
+    assert_eq!(thought.duration_ms, Some(3400));
+    assert!(
+        !text(&s).contains("先检查工作区和近期变更。"),
+        "a restored Thought is not expanded by default"
+    );
+
+    let item = thought_index(&s);
+    toggle_fold(&mut s, item);
+    assert!(
+        text(&s).contains("先检查工作区和近期变更。"),
+        "and it opens back up"
+    );
+}

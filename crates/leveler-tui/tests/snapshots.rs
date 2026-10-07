@@ -609,7 +609,7 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
     if let Some(leveler_tui::transcript::TranscriptItem::ToolGroup(g)) =
         state.transcript.items().last()
     {
-        assert!(g.expanded, "latest group must be expanded");
+        assert!(g.expanded(), "latest group must be expanded");
     }
 }
 

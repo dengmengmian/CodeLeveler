@@ -40,15 +40,16 @@ pub struct ConvKey {
 
 /// One memoized conversation build: cache key, wrapped lines, the disclosure
 /// hit rows (absolute line index → transcript item index), the command rows,
-/// and the absolute line where the last Final answer begins. Everything is
-/// rebuilt under the same key, so no derived index can go stale relative to
-/// what is painted.
+/// the absolute line where the last Final answer begins, and every transcript
+/// item's line span (for fold anchoring). Everything is rebuilt under the same
+/// key, so no derived index can go stale relative to what is painted.
 pub type ConvCacheEntry = (
     ConvKey,
     std::rc::Rc<Vec<Line<'static>>>,
     std::rc::Rc<Vec<(usize, usize)>>,
     std::rc::Rc<Vec<CommandHit>>,
     Option<usize>,
+    std::rc::Rc<Vec<(usize, usize)>>,
 );
 
 /// A command call's clickable row in the built conversation: absolute line,

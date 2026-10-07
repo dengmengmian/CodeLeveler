@@ -131,6 +131,60 @@ pub fn jump_to_live_edge(state: &mut AppState) {
     state.conv.scroll = geometry::max_scroll(total, height);
 }
 
+/// Fold or open one transcript entry, keeping the reader's place.
+///
+/// The line at the viewport's top edge is the anchor: whatever the reader has
+/// at the top of the screen is what they are reading, so it must still be there
+/// afterwards. The fold grows or shrinks the entry the reader clicked, which
+/// moves every line below it, so the scroll offset absorbs exactly that shift.
+///
+/// While auto-following there is no position to keep — the viewport is the live
+/// edge, and folding the newest entry should simply show its new body.
+///
+/// Returns the entry's new expand state, or `None` when it is not foldable.
+pub fn toggle_fold(state: &mut AppState, item: usize) -> Option<bool> {
+    let width = geometry::content_width(state);
+    let followed = state.conv.auto_scroll && !crate::splash::conversation_is_empty(state);
+    let anchor = if followed {
+        None
+    } else {
+        top_of_viewport(state, width)
+    };
+
+    let mode = state.transcript.toggle_item_display(item)?;
+
+    if !followed
+        && let Some((anchor_item, offset)) = anchor
+        && let Some((start, end)) = state.item_span(anchor_item, width)
+    {
+        // Keep the anchored line at the top edge. The offset may sit on the
+        // blank separator right after the item, so it is clamped to the item's
+        // height, not to its last line.
+        state.conv.scroll = start + offset.min(end.saturating_sub(start));
+    }
+    // The plain-text projection backs selection and URL hit-testing; the fold
+    // changed the lines under it, so it must be rebuilt on next use.
+    state.conv.plain.clear();
+    state.conv.plain_width = 0;
+    Some(mode.is_expanded())
+}
+
+/// The transcript item and intra-item offset painted at the viewport's top
+/// edge, as the reader is currently looking at it.
+fn top_of_viewport(state: &AppState, width: usize) -> Option<(usize, usize)> {
+    let height = geometry::viewport_height(state);
+    let total = crate::conversation::build::conversation_line_count(state, width);
+    let painted = geometry::effective_scroll(state.conv.scroll, false, total, height);
+    let count = state.transcript.len();
+    let anchor = (0..count).rev().find(|&i| {
+        state
+            .item_start_line(i, width)
+            .is_some_and(|start| start <= painted)
+    })?;
+    let start = state.item_start_line(anchor, width)?;
+    Some((anchor, painted - start))
+}
+
 /// Accelerate scroll while the pointer stays in an edge hot zone.
 pub fn edge_scroll_step(streak: u32) -> usize {
     match streak {

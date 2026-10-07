@@ -773,7 +773,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                             state.active_screen = Screen::Shell;
                             state.screen_scroll = 0;
                         } else {
-                            state.transcript.toggle_tool_group_at(item);
+                            interaction::toggle_fold(state, item);
                         }
                         state.conv.plain.clear();
                         interaction::clear_selection_drag(state);
@@ -1575,7 +1575,13 @@ fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
 /// The primary product interaction is still clicking the ▸ row; this only
 /// reaches whatever is latest.
 fn toggle_current_expand(state: &mut AppState) {
-    if let Some(expanded) = state.transcript.toggle_last_collapsible() {
+    // Ctrl+O reaches whatever the transcript most recently folded — including
+    // the Thought that just finished. The anchor path is shared with the mouse
+    // so a keyboard fold never jumps the viewport either.
+    let Some(index) = state.transcript.last_foldable_index() else {
+        return;
+    };
+    if let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index) {
         state.tools_expanded = expanded;
     }
 }
@@ -1962,7 +1968,7 @@ mod disclosure_tests {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| match item {
-                TranscriptItem::ToolGroup(g) => Some((i, g.expanded)),
+                TranscriptItem::ToolGroup(g) => Some((i, g.expanded())),
                 _ => None,
             })
             .collect()
@@ -2002,7 +2008,10 @@ mod disclosure_tests {
             .iter()
             .map(crate::selection::line_to_plain)
             .collect();
-        assert!(plain.contains("先看 catalog。"), "reasoning renders: {plain}");
+        assert!(
+            plain.contains("先看 catalog。"),
+            "reasoning renders: {plain}"
+        );
         assert!(plain.contains("再补测试。"), "reasoning renders: {plain}");
 
         // The runtime reports the boundary: the Thought freezes with its own
