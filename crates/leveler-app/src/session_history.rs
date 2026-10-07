@@ -9,9 +9,10 @@
 use std::collections::HashMap;
 
 use leveler_client_protocol::{MessageId, RuntimeEvent, UiHistoryEntry, UiMessage, UiRole};
-use leveler_core::{SessionId, Timestamp};
+use leveler_core::{SessionId, Timestamp, TurnId};
 use leveler_engine::EngineEvent;
-use leveler_storage::{Database, EventStore, MessageRepository};
+use leveler_model::{ContentPart, Message, TranscriptOrigin};
+use leveler_storage::{Database, EventStore, MessageRepository, TurnRecord, TurnRepository};
 use tokio::sync::broadcast;
 
 use crate::AppError;
@@ -53,6 +54,13 @@ pub async fn load_session_history(
     {
         return Ok((Vec::new(), 0));
     }
+    // The message store is the ACTIVE MODEL CONTEXT, and `/compact` replaced
+    // the turns before its cut with a single summary row. The conversation is
+    // not the context: the user asked for a smaller next request, not for
+    // their own words to leave a session they reopen. The accepted input of
+    // every turn is still durable in its write-ahead turn row, which no epoch
+    // cut touches, so re-project it here.
+    let rebuild = rebuildable_turn_inputs(&events, db, session_id).await?;
     let messages: Vec<(Option<Timestamp>, Fact)> = MessageRepository::new(db)
         .load_timed(session_id)
         .await
@@ -79,7 +87,18 @@ pub async fn load_session_history(
             }
             facts.push(messages.next().expect("peeked"));
         }
+        // The input that opened a rebuilt turn takes the turn's own place in
+        // the chronology: the durable `TurnStarted` names the turn, and the
+        // turn row holds what the user accepted for it.
+        let rebuilt = match &event {
+            EngineEvent::TurnStarted { turn_id, .. } => rebuild.get(turn_id).cloned(),
+            _ => None,
+        };
         facts.push((at, Fact::Event(Box::new(event))));
+        if let Some(message) = rebuilt {
+            let (text, images) = user_input(&message);
+            facts.push((at, Fact::User(text, images)));
+        }
     }
     facts.extend(messages);
 
@@ -242,12 +261,7 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
     if message.is_protocol_repair() {
         return None;
     }
-    let text = message.text_content();
-    let images = message
-        .content
-        .iter()
-        .filter(|p| matches!(p, leveler_model::ContentPart::Image { .. }))
-        .count();
+    let (text, images) = user_input(&message);
     let first = text.lines().next().unwrap_or("").trim_end();
     // A message that was only a picture has no text; replaying it as nothing
     // is how a reopened session lost the turn.
@@ -258,6 +272,135 @@ fn user_text(payload: &str) -> Option<(String, usize)> {
         return None;
     }
     Some((text, images))
+}
+
+/// What a user-authored message carries: its text and how many images.
+fn user_input(message: &Message) -> (String, usize) {
+    let images = message
+        .content
+        .iter()
+        .filter(|part| matches!(part, ContentPart::Image { .. }))
+        .count();
+    (message.text_content(), images)
+}
+
+/// Which positions in the durable log a reopen rebuilds from the write-ahead
+/// turn rows instead of the message store.
+///
+/// Two epoch cuts replace the transcript, and they mean opposite things:
+///
+/// - `/compact` installs the compaction summary as the model-visible context.
+///   The conversation is re-based on it, so the turns before the cut keep
+///   their place in the conversation even though their transcript rows are
+///   gone — this is the window a reopen rebuilds.
+/// - `/clear` (and a restore all the way back to the start) installs an EMPTY
+///   context at transcript watermark zero. The user told us to start over, so
+///   the turns that cut removed never come back, however durable their turn
+///   rows are.
+///
+/// A checkpoint restore to a real position installs an empty context at a
+/// non-zero watermark: the transcript keeps the prefix it rolled back to and
+/// stays the authority, so it is neither a re-base nor a drop.
+#[derive(Default)]
+struct EpochWindow {
+    /// The last `/compact` that re-based the visible conversation.
+    rebased_at: Option<usize>,
+    /// The last cut that emptied the conversation outright.
+    dropped_at: Option<usize>,
+}
+
+impl EpochWindow {
+    fn of<'a>(events: impl Iterator<Item = &'a EngineEvent>) -> Self {
+        let mut window = Self::default();
+        for (index, event) in events.enumerate() {
+            let EngineEvent::ContextSnapshot {
+                messages,
+                through_ordinal: Some(watermark),
+            } = event
+            else {
+                continue;
+            };
+            if messages
+                .iter()
+                .any(|message| message.origin == Some(TranscriptOrigin::CompactionSummary))
+            {
+                window.rebased_at = Some(index);
+            } else if messages.is_empty() && *watermark == 0 {
+                window.dropped_at = Some(index);
+            }
+        }
+        window
+    }
+
+    /// Is the turn at `at` inside the conversation the last re-base left
+    /// behind? Turns before a re-base lost their rows to it; turns before a
+    /// `/clear` are gone by the user's own instruction.
+    fn rebuilds(&self, at: usize) -> bool {
+        self.rebased_at.is_some_and(|rebased| at < rebased)
+            && self.dropped_at.is_none_or(|dropped| at > dropped)
+    }
+}
+
+/// The accepted input of every turn the message store no longer carries, keyed
+/// by the turn that accepted it. Empty when the store still holds the visible
+/// conversation — the common case, and the only one where nothing is rebuilt.
+async fn rebuildable_turn_inputs(
+    events: &[(Option<Timestamp>, EngineEvent)],
+    db: &Database,
+    session_id: &SessionId,
+) -> Result<HashMap<TurnId, Message>, AppError> {
+    let window = EpochWindow::of(events.iter().map(|(_, event)| event));
+    if window.rebased_at.is_none() {
+        return Ok(HashMap::new());
+    }
+    let turns = TurnRepository::new(db)
+        .list(session_id)
+        .await
+        .map_err(AppError::from)?;
+    let inputs: HashMap<&str, &TurnRecord> = turns
+        .iter()
+        .filter(|turn| matches!(turn.kind.as_str(), "user" | "chat"))
+        .map(|turn| (turn.id.as_str(), turn))
+        .collect();
+    let mut rebuild = HashMap::new();
+    for (index, (_, event)) in events.iter().enumerate() {
+        let EngineEvent::TurnStarted { turn_id, .. } = event else {
+            continue;
+        };
+        if !window.rebuilds(index) {
+            continue;
+        }
+        let Some(payload) = inputs
+            .get(turn_id.as_str())
+            .and_then(|turn| turn.payload.as_deref())
+        else {
+            continue;
+        };
+        // A fresh turn always wrote a versioned write-ahead input, so a
+        // payload this boundary cannot read is corruption of the accepted
+        // request — never silently a turn without its question.
+        let message = decode_input(payload, session_id, turn_id)?;
+        if let Some(message) = message {
+            rebuild.insert(turn_id.clone(), message);
+        }
+    }
+    Ok(rebuild)
+}
+
+/// The turn's accepted input, or `None` for a continuation that legitimately
+/// carries no new message.
+fn decode_input(
+    payload: &str,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+) -> Result<Option<Message>, AppError> {
+    leveler_engine::decode_turn_initiating_message_opt(payload).map_err(|error| {
+        AppError::Engine(format!(
+            "corrupt turn input: session {} turn {}: {error}",
+            session_id.as_str(),
+            turn_id.as_str()
+        ))
+    })
 }
 
 /// A record time as written (RFC 3339); `None` when unreadable.
@@ -273,7 +416,10 @@ mod tests {
     use leveler_engine::{EngineEvent, TurnKind};
     use leveler_lifecycle::{StopReason, TaskOutcome};
     use leveler_model::{Message, ProtocolRepairKind, Role, TranscriptOrigin};
-    use leveler_storage::{EventStore, MessageRepository, SessionRecord, SessionRepository};
+    use leveler_storage::{
+        EventRepository, EventStore, MessageRepository, SessionRecord, SessionRepository,
+        TurnRepository,
+    };
 
     async fn session() -> (Database, SessionId) {
         let db = Database::connect_in_memory().await.unwrap();
@@ -316,7 +462,10 @@ mod tests {
             db,
             sid,
             t0 + ms(1000),
-            EngineEvent::AssistantMessage { text: answer.into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: answer.into(),
+                reasoning: Vec::new(),
+            },
         )
         .await;
         event(
@@ -368,7 +517,10 @@ mod tests {
             &db,
             &sid,
             t0 + ms(2),
-            EngineEvent::AssistantMessage { text: "complete earlier answer".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: "complete earlier answer".into(),
+                reasoning: Vec::new(),
+            },
         )
         .await;
         let partial = serde_json::json!({"role":"assistant","content":[{"type":"text","text":"observed partial answer"}],"incomplete":true}).to_string();
@@ -380,7 +532,10 @@ mod tests {
             &db,
             &sid,
             t0 + ms(4),
-            EngineEvent::AssistantMessage { text: "later repaired answer".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: "later repaired answer".into(),
+                reasoning: Vec::new(),
+            },
         )
         .await;
         event(
@@ -493,15 +648,11 @@ mod tests {
             .iter()
             .filter_map(|entry| match &entry.event {
                 RuntimeEvent::ReasoningStarted => Some(("started", String::new())),
-                RuntimeEvent::ReasoningDelta { delta } => {
-                    Some(("delta", delta.clone()))
-                }
+                RuntimeEvent::ReasoningDelta { delta } => Some(("delta", delta.clone())),
                 RuntimeEvent::ReasoningCompleted { elapsed_ms } => {
                     Some(("completed", elapsed_ms.to_string()))
                 }
-                RuntimeEvent::AssistantTextDelta { delta, .. } => {
-                    Some(("text", delta.clone()))
-                }
+                RuntimeEvent::AssistantTextDelta { delta, .. } => Some(("text", delta.clone())),
                 _ => None,
             })
             .collect();
@@ -588,7 +739,10 @@ mod tests {
             &db,
             &sid,
             t0 + ms(5000),
-            EngineEvent::AssistantMessage { text: "停在第 3 个 tick。".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: "停在第 3 个 tick。".into(),
+                reasoning: Vec::new(),
+            },
         )
         .await;
         event(
@@ -748,7 +902,10 @@ mod tests {
             &db,
             &sid,
             t0 + ms(1000),
-            EngineEvent::AssistantMessage { text: "解析器已修好。".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: "解析器已修好。".into(),
+                reasoning: Vec::new(),
+            },
         )
         .await;
         event(
@@ -805,5 +962,359 @@ mod tests {
             user_texts(&entries),
             vec!["Goal remains active in my notes".to_string()]
         );
+    }
+
+    // ---- compaction / epoch-cut resume (COMPACT-RESUME-*) -------------------
+
+    /// A real turn: the durable write-ahead row FIRST (it is what makes the
+    /// turn running and is the accepted request), then the turn's transcript
+    /// row, then the canonical events. Same order the engine writes them.
+    async fn durable_turn(
+        db: &Database,
+        sid: &SessionId,
+        t0: Timestamp,
+        ask: &str,
+        answer: &str,
+    ) -> TurnId {
+        let payload = serde_json::json!({
+            "version": 1,
+            "initiating_message": Message::text(Role::User, ask),
+        })
+        .to_string();
+        let record = TurnRepository::new(db)
+            .start(sid, "chat", Some(&payload), t0)
+            .await
+            .unwrap();
+        let turn_id = TurnId::new(record.id.clone());
+        event(
+            db,
+            sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        let body = serde_json::to_string(&Message::text(Role::User, ask)).unwrap();
+        MessageRepository::new(db)
+            .append_in_turn(sid, &turn_id, &[body], t0 + ms(10))
+            .await
+            .unwrap();
+        event(
+            db,
+            sid,
+            t0 + ms(1000),
+            EngineEvent::AssistantMessage {
+                text: answer.into(),
+                reasoning: Vec::new(),
+            },
+        )
+        .await;
+        event(
+            db,
+            sid,
+            t0 + ms(1500),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: Vec::new(),
+            },
+        )
+        .await;
+        TurnRepository::new(db)
+            .finish(&turn_id, "completed", t0 + ms(1500))
+            .await
+            .unwrap();
+        turn_id
+    }
+
+    fn whole_history_summary() -> Message {
+        Message::user(
+            format!(
+                "{}：\n前面的话题已折叠。",
+                leveler_client_protocol::COMPACTION_SUMMARY_PREFIX
+            ),
+            TranscriptOrigin::CompactionSummary,
+        )
+    }
+
+    /// The manual `/compact` transaction: the summary replaces the whole
+    /// transcript and the epoch events land in the same commit.
+    async fn compact(db: &Database, sid: &SessionId, from: usize, at: Timestamp) {
+        let summary = serde_json::to_string(&whole_history_summary()).unwrap();
+        let rows = epoch_rows(from, vec![whole_history_summary()], 1);
+        db.cut_context_epoch(sid, &[summary], &rows, at)
+            .await
+            .unwrap();
+    }
+
+    /// The epoch events `/compact` commits, in their canonical order.
+    fn epoch_rows(from: usize, model_visible: Vec<Message>, through: u64) -> Vec<(String, String)> {
+        let mut rows = vec![EngineEvent::Compacted {
+            from,
+            to: model_visible.len(),
+        }];
+        rows.push(EngineEvent::ContextSnapshot {
+            messages: model_visible,
+            through_ordinal: Some(through),
+        });
+        rows.into_iter()
+            .map(|event| event.to_row().unwrap())
+            .collect()
+    }
+
+    /// `/clear`: the transcript is emptied and the epoch snapshot installs an
+    /// empty model context at watermark zero.
+    async fn clear(db: &Database, sid: &SessionId, at: Timestamp) {
+        MessageRepository::new(db)
+            .truncate_after(sid, 0)
+            .await
+            .unwrap();
+        let (tag, payload) = EngineEvent::ContextSnapshot {
+            messages: Vec::new(),
+            through_ordinal: Some(0),
+        }
+        .to_row()
+        .unwrap();
+        EventRepository::new(db)
+            .append(sid, None, &tag, &payload, at)
+            .await
+            .unwrap();
+    }
+
+    /// COMPACT-RESUME-1: `/compact` changes what the next provider request
+    /// carries. It must not erase the user's own words from a session they
+    /// reopen — the accepted input of every turn survives in its turn row.
+    #[tokio::test]
+    async fn compaction_keeps_the_first_user_turn_on_a_reopen() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        durable_turn(
+            &db,
+            &sid,
+            t0,
+            "第一个问题：入口在哪？",
+            "在 crates/leveler-cli。",
+        )
+        .await;
+        durable_turn(
+            &db,
+            &sid,
+            t0 + ms(10_000),
+            "第二个问题：测试怎么跑？",
+            "用 cargo test。",
+        )
+        .await;
+        compact(&db, &sid, 4, t0 + ms(20_000)).await;
+        durable_turn(
+            &db,
+            &sid,
+            t0 + ms(30_000),
+            "压缩后继续：还有别的吗？",
+            "没有了。",
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(
+            user_texts(&entries),
+            vec![
+                "第一个问题：入口在哪？".to_string(),
+                "第二个问题：测试怎么跑？".to_string(),
+                "压缩后继续：还有别的吗？".to_string(),
+            ],
+            "the reopened conversation keeps its head and its order: {entries:#?}"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.turn_start
+                    && matches!(entry.event, RuntimeEvent::UserMessageAdded { .. }))
+                .count(),
+            3,
+            "each rebuilt turn opens its own turn at its input: {entries:#?}"
+        );
+        assert!(
+            user_texts(&entries)
+                .iter()
+                .all(|text| !text.contains(leveler_client_protocol::COMPACTION_SUMMARY_PREFIX)),
+            "the internal summary is a context artifact, not a conversation row"
+        );
+    }
+
+    /// COMPACT-RESUME-2: compaction twice. A rebuilt turn must not be
+    /// projected on top of a transcript row that still exists.
+    #[tokio::test]
+    async fn two_compactions_do_not_duplicate_a_user_turn() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        durable_turn(&db, &sid, t0, "一问", "一答").await;
+        compact(&db, &sid, 2, t0 + ms(10_000)).await;
+        durable_turn(&db, &sid, t0 + ms(20_000), "二问", "二答").await;
+        compact(&db, &sid, 4, t0 + ms(30_000)).await;
+        durable_turn(&db, &sid, t0 + ms(40_000), "三问", "三答").await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(
+            user_texts(&entries),
+            vec!["一问".to_string(), "二问".to_string(), "三问".to_string()],
+            "{entries:#?}"
+        );
+    }
+
+    /// COMPACT-RESUME-3: rebuilding the transcript is a READ projection. The
+    /// model's request surface stays exactly what the compaction left.
+    #[tokio::test]
+    async fn a_reopen_does_not_widen_the_provider_request_surface() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        durable_turn(&db, &sid, t0, "一问", "一答").await;
+        durable_turn(&db, &sid, t0 + ms(10_000), "二问", "二答").await;
+        compact(&db, &sid, 4, t0 + ms(20_000)).await;
+        let after_compact = MessageRepository::new(&db).load(&sid).await.unwrap();
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(user_texts(&entries).len(), 2, "the conversation is rebuilt");
+
+        let after_replay = MessageRepository::new(&db).load(&sid).await.unwrap();
+        assert_eq!(
+            after_replay, after_compact,
+            "replaying history must not write anything back into the model context"
+        );
+        assert_eq!(
+            after_replay.len(),
+            1,
+            "the summary is the whole request surface"
+        );
+        // And nothing was appended to the log either: the projection is derived.
+        let events = EventRepository::new(&db).load(&sid).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.event_type == "user_message_added")
+                .count(),
+            0
+        );
+    }
+
+    /// The opposite instruction: `/clear` empties the conversation, so the
+    /// turns it removed stay gone even though their turn rows are durable.
+    #[tokio::test]
+    async fn a_cleared_conversation_does_not_come_back() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        durable_turn(&db, &sid, t0, "清空前的追问", "清空前的回答").await;
+        clear(&db, &sid, t0 + ms(10_000)).await;
+        durable_turn(&db, &sid, t0 + ms(20_000), "清空后的追问", "清空后的回答").await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(
+            user_texts(&entries),
+            vec!["清空后的追问".to_string()],
+            "{entries:#?}"
+        );
+    }
+
+    /// A checkpoint restore keeps the prefix it rolled back to. Its transcript
+    /// rows are still the authority, so a rebuilt row must not double it.
+    #[tokio::test]
+    async fn a_restore_of_the_prefix_does_not_duplicate_a_user_turn() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        durable_turn(&db, &sid, t0, "保留的一问", "保留的一答").await;
+        // Roll back to the first message: the prefix survives, the snapshot
+        // records the watermark it superseded.
+        MessageRepository::new(&db)
+            .truncate_after(&sid, 1)
+            .await
+            .unwrap();
+        let (tag, payload) = EngineEvent::ContextSnapshot {
+            messages: Vec::new(),
+            through_ordinal: Some(1),
+        }
+        .to_row()
+        .unwrap();
+        EventRepository::new(&db)
+            .append(&sid, None, &tag, &payload, t0 + ms(10_000))
+            .await
+            .unwrap();
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(
+            user_texts(&entries),
+            vec!["保留的一问".to_string()],
+            "{entries:#?}"
+        );
+    }
+
+    /// A compaction that happened inside a running turn (the automatic fold)
+    /// never replaced the transcript, so its turn keeps the single row the
+    /// message store already holds.
+    #[tokio::test]
+    async fn an_in_loop_compaction_does_not_double_a_user_turn() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        let ask = "在跑的回合里折叠上下文";
+        let payload = serde_json::json!({
+            "version": 1,
+            "initiating_message": Message::text(Role::User, ask),
+        })
+        .to_string();
+        let record = TurnRepository::new(&db)
+            .start(&sid, "chat", Some(&payload), t0)
+            .await
+            .unwrap();
+        let turn_id = TurnId::new(record.id.clone());
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        let body = serde_json::to_string(&Message::text(Role::User, ask)).unwrap();
+        MessageRepository::new(&db)
+            .append_in_turn(&sid, &turn_id, &[body], t0 + ms(10))
+            .await
+            .unwrap();
+        event(
+            &db,
+            &sid,
+            t0 + ms(500),
+            EngineEvent::Compacted { from: 30, to: 3 },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(600),
+            EngineEvent::ContextSnapshot {
+                messages: vec![whole_history_summary()],
+                through_ordinal: None,
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1500),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: Vec::new(),
+            },
+        )
+        .await;
+
+        let (entries, _) = load_session_history(&db, &sid).await.unwrap();
+        assert_eq!(user_texts(&entries), vec![ask.to_string()], "{entries:#?}");
     }
 }
