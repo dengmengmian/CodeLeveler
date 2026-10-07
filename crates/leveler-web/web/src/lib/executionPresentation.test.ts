@@ -36,6 +36,7 @@ import fixtureC10 from '../../../testdata/execution_presentation/v1/C10.json?raw
 import fixtureC11 from '../../../testdata/execution_presentation/v1/C11.json?raw';
 import fixtureC12 from '../../../testdata/execution_presentation/v1/C12.json?raw';
 import fixtureC13 from '../../../testdata/execution_presentation/v1/C13.json?raw';
+import fixtureC14 from '../../../testdata/execution_presentation/v1/C14.json?raw';
 
 const FIXTURE_SOURCES: readonly string[] = [
   fixtureC1,
@@ -51,6 +52,7 @@ const FIXTURE_SOURCES: readonly string[] = [
   fixtureC11,
   fixtureC12,
   fixtureC13,
+  fixtureC14,
 ];
 
 const localStore = new Map<string, string>();

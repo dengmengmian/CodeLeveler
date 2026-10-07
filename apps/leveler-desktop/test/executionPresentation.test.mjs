@@ -118,8 +118,10 @@ test('execution presentation contract v1 (desktop)', () => {
     }
   }
   assert.deepEqual(failures, []);
-  assert.equal(compared.size >= 13, true, `every fixture compared: ${[...compared]}`);
-  assert.deepEqual([...deferred], ['C10/replay']);
+  assert.equal(compared.size >= 14, true, `every fixture compared: ${[...compared]}`);
+  // C14's replay path is the same pre-existing gap as C10's: with no snapshot
+  // behind it, a history-only load yields no messages (and no answer to keep).
+  assert.deepEqual([...deferred], ['C10/replay', 'C14/replay']);
 });
 
 test('desktop cannot rebuild a transcript from durable history alone', () => {
@@ -144,7 +146,7 @@ test('desktop cannot rebuild a transcript from durable history alone', () => {
 
 test('the corpus declares the frozen C-cases', () => {
   const ids = fixtures().map((fixture) => fixture.id);
-  for (let index = 1; index <= 13; index += 1) {
+  for (let index = 1; index <= 14; index += 1) {
     assert.ok(ids.includes(`C${index}`), `missing C${index}`);
   }
 });

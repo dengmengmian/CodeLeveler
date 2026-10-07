@@ -402,7 +402,7 @@ fn execution_presentation_contract_v1() {
 #[test]
 fn the_fixture_corpus_covers_the_frozen_cases() {
     let ids: Vec<String> = fixtures().into_iter().map(|(_, f)| f.id).collect();
-    for required in 1..=13 {
+    for required in 1..=14 {
         let id = format!("C{required}");
         assert!(ids.contains(&id), "missing fixture {id}: have {ids:?}");
     }

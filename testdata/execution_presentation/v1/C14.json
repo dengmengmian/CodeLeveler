@@ -1,0 +1,593 @@
+{
+  "expect": {
+    "items": [
+      {
+        "kind": "assistant_text",
+        "text": "我先把计划记一下。"
+      },
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 1,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t1",
+            "name": "update_plan",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "assistant_text",
+        "text": "名字是 update_plan，但运行时说这次是工作，所以前面那句不是答案。"
+      },
+      {
+        "all_ok": true,
+        "batches": [],
+        "kind": "execution_round",
+        "model_step": 2,
+        "status": "ok",
+        "tools": [
+          {
+            "id": "t2",
+            "name": "brand_new_tool",
+            "status": "ok"
+          },
+          {
+            "id": "t3",
+            "name": "another_new_tool",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "final_answer",
+        "text": "未声明的未知工具按工作处理，所以这一句才是答案。"
+      },
+      {
+        "kind": "turn_end",
+        "status": "answered"
+      }
+    ],
+    "reasoning_visible": false,
+    "user_texts": [
+      "按权威分类，不按名字"
+    ]
+  },
+  "id": "C14",
+  "invariant": "a surface decides whether a call invalidates a committed FinalAnswer from the runtime's stated answer_effect alone: a call whose name looks like bookkeeping but is stated as work demotes the answer, an unclassified tool stated as bookkeeping preserves it, and a call whose effect is unstated is read conservatively as work",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "message": {
+            "id": "u1",
+            "role": "user",
+            "text": "按权威分类，不按名字"
+          },
+          "type": "user_message_added"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m1",
+          "type": "assistant_message_started"
+        }
+      },
+      {
+        "event": {
+          "delta": "我先把计划记一下。",
+          "message_id": "m1",
+          "type": "assistant_text_delta"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m1",
+          "type": "assistant_message_completed"
+        }
+      },
+      {
+        "event": {
+          "answer_effect": "work",
+          "arguments": "{\"steps\":[]}",
+          "id": "t1",
+          "model_step": 1,
+          "name": "update_plan",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 2,
+          "exit_code": 0,
+          "id": "t1",
+          "ok": true,
+          "preview": "ok",
+          "stop": null,
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m2",
+          "type": "assistant_message_started"
+        }
+      },
+      {
+        "event": {
+          "delta": "名字是 update_plan，但运行时说这次是工作，所以前面那句不是答案。",
+          "message_id": "m2",
+          "type": "assistant_text_delta"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m2",
+          "type": "assistant_message_completed"
+        }
+      },
+      {
+        "event": {
+          "answer_effect": "bookkeeping",
+          "arguments": "{\"x\":1}",
+          "id": "t2",
+          "model_step": 2,
+          "name": "brand_new_tool",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "exit_code": 0,
+          "id": "t2",
+          "ok": true,
+          "preview": "ok",
+          "stop": null,
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "arguments": "{\"y\":2}",
+          "id": "t3",
+          "model_step": 2,
+          "name": "another_new_tool",
+          "parallel": false,
+          "type": "tool_call_started"
+        }
+      },
+      {
+        "event": {
+          "duration_ms": 1,
+          "exit_code": 0,
+          "id": "t3",
+          "ok": true,
+          "preview": "ok",
+          "stop": null,
+          "type": "tool_call_completed"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m3",
+          "type": "assistant_message_started"
+        }
+      },
+      {
+        "event": {
+          "delta": "未声明的未知工具按工作处理，所以这一句才是答案。",
+          "message_id": "m3",
+          "type": "assistant_text_delta"
+        }
+      },
+      {
+        "event": {
+          "message_id": "m3",
+          "type": "assistant_message_completed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_answered"
+        }
+      }
+    ],
+    "reconnect": [
+      {
+        "snapshot": {
+          "session": {
+            "branch": null,
+            "goal": "fixture",
+            "id": "s1",
+            "messages": [
+              {
+                "id": "u1",
+                "role": "user",
+                "text": "按权威分类，不按名字"
+              },
+              {
+                "id": "m1",
+                "role": "assistant",
+                "text": "我先把计划记一下。"
+              },
+              {
+                "id": "m2",
+                "role": "assistant",
+                "text": "名字是 update_plan，但运行时说这次是工作，所以前面那句不是答案。"
+              },
+              {
+                "id": "m3",
+                "role": "assistant",
+                "text": "未声明的未知工具按工作处理，所以这一句才是答案。"
+              }
+            ],
+            "mode": "assisted",
+            "model": null,
+            "repository": "/repo",
+            "status": "idle"
+          },
+          "type": "session_opened"
+        }
+      },
+      {
+        "history": [
+          {
+            "event": {
+              "message": {
+                "id": "u1",
+                "role": "user",
+                "text": "按权威分类，不按名字"
+              },
+              "type": "user_message_added"
+            },
+            "turn_elapsed_ms": 0,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m1",
+              "type": "assistant_message_started"
+            },
+            "turn_elapsed_ms": 100,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "delta": "我先把计划记一下。",
+              "message_id": "m1",
+              "type": "assistant_text_delta"
+            },
+            "turn_elapsed_ms": 150,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m1",
+              "type": "assistant_message_completed"
+            },
+            "turn_elapsed_ms": 200,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "answer_effect": "work",
+              "arguments": "{\"steps\":[]}",
+              "id": "t1",
+              "model_step": 1,
+              "name": "update_plan",
+              "parallel": false,
+              "type": "tool_call_started"
+            },
+            "turn_elapsed_ms": 300,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "duration_ms": 2,
+              "exit_code": 0,
+              "id": "t1",
+              "ok": true,
+              "preview": "ok",
+              "stop": null,
+              "type": "tool_call_completed"
+            },
+            "turn_elapsed_ms": 320,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m2",
+              "type": "assistant_message_started"
+            },
+            "turn_elapsed_ms": 400,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "delta": "名字是 update_plan，但运行时说这次是工作，所以前面那句不是答案。",
+              "message_id": "m2",
+              "type": "assistant_text_delta"
+            },
+            "turn_elapsed_ms": 450,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m2",
+              "type": "assistant_message_completed"
+            },
+            "turn_elapsed_ms": 500,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "answer_effect": "bookkeeping",
+              "arguments": "{\"x\":1}",
+              "id": "t2",
+              "model_step": 2,
+              "name": "brand_new_tool",
+              "parallel": false,
+              "type": "tool_call_started"
+            },
+            "turn_elapsed_ms": 600,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "duration_ms": 1,
+              "exit_code": 0,
+              "id": "t2",
+              "ok": true,
+              "preview": "ok",
+              "stop": null,
+              "type": "tool_call_completed"
+            },
+            "turn_elapsed_ms": 620,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "arguments": "{\"y\":2}",
+              "id": "t3",
+              "model_step": 2,
+              "name": "another_new_tool",
+              "parallel": false,
+              "type": "tool_call_started"
+            },
+            "turn_elapsed_ms": 700,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "duration_ms": 1,
+              "exit_code": 0,
+              "id": "t3",
+              "ok": true,
+              "preview": "ok",
+              "stop": null,
+              "type": "tool_call_completed"
+            },
+            "turn_elapsed_ms": 720,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m3",
+              "type": "assistant_message_started"
+            },
+            "turn_elapsed_ms": 800,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "delta": "未声明的未知工具按工作处理，所以这一句才是答案。",
+              "message_id": "m3",
+              "type": "assistant_text_delta"
+            },
+            "turn_elapsed_ms": 850,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m3",
+              "type": "assistant_message_completed"
+            },
+            "turn_elapsed_ms": 900,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "type": "turn_answered"
+            },
+            "turn_elapsed_ms": 1000,
+            "turn_start": false
+          }
+        ]
+      }
+    ],
+    "replay": [
+      {
+        "history": [
+          {
+            "event": {
+              "message": {
+                "id": "u1",
+                "role": "user",
+                "text": "按权威分类，不按名字"
+              },
+              "type": "user_message_added"
+            },
+            "turn_elapsed_ms": 0,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m1",
+              "type": "assistant_message_started"
+            },
+            "turn_elapsed_ms": 100,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "delta": "我先把计划记一下。",
+              "message_id": "m1",
+              "type": "assistant_text_delta"
+            },
+            "turn_elapsed_ms": 150,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m1",
+              "type": "assistant_message_completed"
+            },
+            "turn_elapsed_ms": 200,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "answer_effect": "work",
+              "arguments": "{\"steps\":[]}",
+              "id": "t1",
+              "model_step": 1,
+              "name": "update_plan",
+              "parallel": false,
+              "type": "tool_call_started"
+            },
+            "turn_elapsed_ms": 300,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "duration_ms": 2,
+              "exit_code": 0,
+              "id": "t1",
+              "ok": true,
+              "preview": "ok",
+              "stop": null,
+              "type": "tool_call_completed"
+            },
+            "turn_elapsed_ms": 320,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m2",
+              "type": "assistant_message_started"
+            },
+            "turn_elapsed_ms": 400,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "delta": "名字是 update_plan，但运行时说这次是工作，所以前面那句不是答案。",
+              "message_id": "m2",
+              "type": "assistant_text_delta"
+            },
+            "turn_elapsed_ms": 450,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m2",
+              "type": "assistant_message_completed"
+            },
+            "turn_elapsed_ms": 500,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "answer_effect": "bookkeeping",
+              "arguments": "{\"x\":1}",
+              "id": "t2",
+              "model_step": 2,
+              "name": "brand_new_tool",
+              "parallel": false,
+              "type": "tool_call_started"
+            },
+            "turn_elapsed_ms": 600,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "duration_ms": 1,
+              "exit_code": 0,
+              "id": "t2",
+              "ok": true,
+              "preview": "ok",
+              "stop": null,
+              "type": "tool_call_completed"
+            },
+            "turn_elapsed_ms": 620,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "arguments": "{\"y\":2}",
+              "id": "t3",
+              "model_step": 2,
+              "name": "another_new_tool",
+              "parallel": false,
+              "type": "tool_call_started"
+            },
+            "turn_elapsed_ms": 700,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "duration_ms": 1,
+              "exit_code": 0,
+              "id": "t3",
+              "ok": true,
+              "preview": "ok",
+              "stop": null,
+              "type": "tool_call_completed"
+            },
+            "turn_elapsed_ms": 720,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m3",
+              "type": "assistant_message_started"
+            },
+            "turn_elapsed_ms": 800,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "delta": "未声明的未知工具按工作处理，所以这一句才是答案。",
+              "message_id": "m3",
+              "type": "assistant_text_delta"
+            },
+            "turn_elapsed_ms": 850,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "message_id": "m3",
+              "type": "assistant_message_completed"
+            },
+            "turn_elapsed_ms": 900,
+            "turn_start": false
+          },
+          {
+            "event": {
+              "type": "turn_answered"
+            },
+            "turn_elapsed_ms": 1000,
+            "turn_start": false
+          }
+        ]
+      }
+    ]
+  },
+  "title": "the runtime's answer classification is the authority, not the tool name"
+}

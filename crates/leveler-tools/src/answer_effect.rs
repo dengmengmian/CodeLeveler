@@ -150,3 +150,95 @@ fn shell_c_probe(args: &[&str]) -> bool {
         "ls" | "tree" | "find" | "pwd" | "stat" | "test" | "which" | "[" | "dirname" | "basename"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_after_a_message_makes_it_narration() {
+        assert!(acts_on_answer("read_file", r#"{"path":"a"}"#));
+        assert!(acts_on_answer("grep", r#"{"pattern":"x"}"#));
+        assert!(acts_on_answer("apply_patch", r#"{"patch":"p"}"#));
+        assert!(acts_on_answer("run_command", r#"{"program":"cargo"}"#));
+        assert!(acts_on_answer("shell_command", r#"{"cmd":"cargo test"}"#));
+        assert!(acts_on_answer("write_file", r#"{"path":"a"}"#));
+    }
+
+    #[test]
+    fn bookkeeping_after_the_answer_keeps_it() {
+        // `update_plan` is presented loudly and is still bookkeeping.
+        assert!(!acts_on_answer("update_plan", r#"{"steps":[]}"#));
+        assert!(!acts_on_answer(
+            "update_goal",
+            r#"{"status":"complete","summary":"done"}"#
+        ));
+        for name in [
+            "list_files",
+            "get_task",
+            "wait_task",
+            "git_status",
+            "create_checkpoint",
+            "expand_tools",
+            "memory",
+            "consolidate_memory",
+            "spawn_agent",
+        ] {
+            assert!(!acts_on_answer(name, "{}"), "{name} is bookkeeping");
+        }
+    }
+
+    #[test]
+    fn a_blocked_goal_is_a_boundary_not_the_answer() {
+        assert!(acts_on_answer(
+            "update_goal",
+            r#"{"status":"blocked","summary":"缺密钥"}"#
+        ));
+        // Anything else the goal tool reports — complete, or an unreadable
+        // payload a rejected call would carry — is bookkeeping. That is the
+        // frozen v1 outcome (the TUI's `activity_visibility` read it the same
+        // way), and it is the safe direction: a rejected plan/goal call did no
+        // work, so it never demotes an answer.
+        assert!(!acts_on_answer("update_goal", "not json"));
+        assert!(!acts_on_answer("update_goal", r#"{"status":"complete"}"#));
+    }
+
+    #[test]
+    fn observation_probes_are_not_work() {
+        for arguments in [
+            r#"{"program":"ls","args":["-la"]}"#,
+            r#"{"program":"/bin/find","args":["."]}"#,
+            r#"{"program":"pwd"}"#,
+            r#"{"program":"test","args":["-f","x"]}"#,
+            r#"{"cmd":"ls -la"}"#,
+            r#"{"cmd":"bash -c ls"}"#,
+        ] {
+            assert!(
+                !acts_on_answer("run_command", arguments),
+                "{arguments} is a probe"
+            );
+            assert!(
+                !acts_on_answer("shell_command", arguments),
+                "{arguments} is a probe"
+            );
+        }
+        // A one-shot probe is not a whole script, and the probe predicate reads
+        // the command line as written: `bash -c 'ls'` is a quoted argument, not
+        // a bare lookup, so it stays work. Both are the frozen v1 outcome.
+        assert!(acts_on_answer(
+            "shell_command",
+            r#"{"cmd":"bash -c 'cargo test'"}"#
+        ));
+        assert!(acts_on_answer("shell_command", r#"{"cmd":"bash -c 'ls'"}"#));
+    }
+
+    /// The conservative default the contract's `I9` depends on: an
+    /// unclassified call — a tool that does not exist yet, an MCP tool — is
+    /// work, so it demotes a committed answer rather than promoting stale prose
+    /// into `FinalAnswer`.
+    #[test]
+    fn an_unknown_tool_acts_on_the_answer() {
+        assert!(acts_on_answer("brand_new_tool", "{}"));
+        assert!(acts_on_answer("mcp__server__tool", r#"{"x":1}"#));
+    }
+}

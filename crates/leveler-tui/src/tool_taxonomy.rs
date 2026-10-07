@@ -850,4 +850,49 @@ mod tests {
             ActivityVisibility::Important
         );
     }
+
+    /// The answer lifecycle has one owner (`leveler_tools::acts_on_answer`) and
+    /// the presentation table must not contradict it.
+    ///
+    /// This table only decides how loudly a row is shown — a different
+    /// question — but the two coincide by design: a call that is not work is
+    /// not a Conversation row either, and `update_plan` is the single name
+    /// that is bookkeeping and still Important.
+    #[test]
+    fn the_table_agrees_with_the_answer_lifecycle_owner() {
+        for entry in BUILTIN_TAXONOMY {
+            let silent = entry.visibility == ActivityVisibility::Silent;
+            let plan_row = entry.kind == ToolKind::Plan;
+            assert_eq!(
+                silent || plan_row,
+                !leveler_tools::acts_on_answer(entry.name, "{}"),
+                "{}: the presentation table and the shared answer-effect owner disagree",
+                entry.name
+            );
+        }
+    }
+
+    /// The shell-probe predicate is shared vocabulary, not a presentation
+    /// opinion: the client's copy has to answer exactly what the owner does.
+    #[test]
+    fn the_shell_probe_predicate_matches_the_owner() {
+        for (name, arguments) in [
+            ("run_command", r#"{"program":"ls","args":["-la"]}"#),
+            ("run_command", r#"{"program":"cargo"}"#),
+            ("shell_command", r#"{"cmd":"git status"}"#),
+            ("shell_command", r#"{"cmd":"pwd"}"#),
+            ("read_file", r#"{"path":"a"}"#),
+        ] {
+            assert_eq!(
+                is_silent_shell_probe(name, arguments),
+                leveler_tools::is_silent_shell_probe(name, arguments),
+                "{name} {arguments}"
+            );
+            assert_eq!(
+                activity_visibility(name, arguments) == ActivityVisibility::Silent,
+                leveler_tools::is_silent_shell_probe(name, arguments),
+                "{name} {arguments}: a probe is the only silent non-bookkeeping call"
+            );
+        }
+    }
 }

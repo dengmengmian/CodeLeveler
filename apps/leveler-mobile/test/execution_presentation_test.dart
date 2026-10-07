@@ -146,7 +146,7 @@ void main() {
 
     test('the corpus declares the frozen C-cases', () {
       final ids = _fixtures().map((fixture) => fixture['id']).toSet();
-      for (var index = 1; index <= 13; index++) {
+      for (var index = 1; index <= 14; index++) {
         expect(ids, contains('C$index'));
       }
     });
@@ -185,29 +185,32 @@ void main() {
       final messages = [
         ProjectedMessage(role: 'assistant', text: '改好了。', seq: 0),
       ];
-      // The runtime states the classification; the app reads the fact.
-      final tools = [
-        ToolFact(
-            id: 't1',
-            name: 'update_plan',
-            status: ToolStatus.ok,
-            seq: 1,
-            answerEffect: AnswerEffect.bookkeeping),
-        ToolFact(
-            id: 't2',
-            name: 'update_goal',
-            status: ToolStatus.ok,
-            seq: 2,
-            answerEffect: AnswerEffect.bookkeeping),
+      // The runtime states the classification; the name is irrelevant. This is
+      // C14's invariant at the pure-function level.
+      ToolFact fact(String id, String name, int seq, AnswerEffect effect) =>
+          ToolFact(id: id, name: name, status: ToolStatus.ok, seq: seq, answerEffect: effect);
+      final bookkeeping = [
+        fact('t1', 'update_plan', 1, AnswerEffect.bookkeeping),
+        fact('t2', 'update_goal', 2, AnswerEffect.bookkeeping),
       ];
-      expect(committedFinalAnswer(messages, tools), '改好了。');
+      expect(committedFinalAnswer(messages, bookkeeping), '改好了。');
+      // A name the app has never heard of is bookkeeping when the runtime says
+      // so — the app does not classify it.
+      expect(
+        committedFinalAnswer(messages, [
+          fact('t3', 'brand_new_tool', 1, AnswerEffect.bookkeeping),
+        ]),
+        '改好了。',
+      );
+      // A name that looks like bookkeeping demotes when the runtime says work.
+      expect(
+        committedFinalAnswer(messages, [
+          fact('t4', 'update_plan', 1, AnswerEffect.work),
+        ]),
+        isNull,
+      );
       final work = [
-        ToolFact(
-            id: 't3',
-            name: 'read_file',
-            status: ToolStatus.ok,
-            seq: 1,
-            answerEffect: AnswerEffect.work),
+        fact('t5', 'read_file', 1, AnswerEffect.work),
       ];
       expect(committedFinalAnswer(messages, work), isNull);
       expect(
