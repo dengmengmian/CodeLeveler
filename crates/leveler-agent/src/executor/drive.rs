@@ -1324,12 +1324,20 @@ impl AgentHarness for Drive<'_> {
         rt: &mut LoopContext,
         attempt: &leveler_model::ModelAttempt,
     ) -> Result<(), AgentError> {
-        let record = super::model_attempt_record(
+        let mut record = super::model_attempt_record(
             attempt,
             &self.executor.model,
             crate::ModelCallKind::Round,
             self.executor.policy.reasoning_effort,
         );
+        // The reasoning channel of the SAME projection this round admitted
+        // itself on. The drive captured it from the `ContextUsage` of the
+        // request it is about to send — the one place the estimate exists —
+        // and the ledger row for that round is where it belongs. Without this
+        // the number was computed every round and dropped, so "how much of
+        // what we sent was replayed thinking?" could only be answered by
+        // reconstructing the request offline.
+        record.projected_reasoning_tokens = self.last_projected_reasoning_tokens;
         self.progress.has_unpriced_model_attempt |= record.cost_usd_micros.is_none();
         self.persist_request(record).await?;
         if let Some(text) = &attempt.partial_text {

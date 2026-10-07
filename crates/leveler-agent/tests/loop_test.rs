@@ -9426,3 +9426,93 @@ async fn volatile_execution_state_trails_the_transcript_on_the_projected_wire() 
     assert!(p2.messages().len() > p1.messages().len());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The route contract a provider that replays captured reasoning resolves to
+/// (`openai_chat` with `reasoning_replay_scope = always`).
+fn reasoning_replay_contract() -> leveler_model::ReasoningReplayContract {
+    leveler_model::ReasoningReplayContract::raw_field(
+        leveler_model::ReasoningReplayScope::Always,
+        leveler_model::MissingReasoningReplay::Omit,
+    )
+}
+
+/// A round's ledger row carries the reasoning channel of the SAME projection
+/// the round admitted itself on.
+///
+/// The drive computed this number every round (it is what the context
+/// accounting shows the user) and then dropped it, so the durable row could
+/// never answer "of the input this round sent, how much was replayed
+/// thinking?" — a number the provider prices like any other input token. The
+/// answer needed a captured request, which is exactly what a ledger row is for.
+#[tokio::test]
+async fn a_round_row_records_the_projection_s_reasoning_channel() {
+    let dir = std::env::temp_dir().join(format!(
+        "leveler-agent-projected-reasoning-{}",
+        std::process::id() as u64 * 43 + 17
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+    let workspace = Workspace::new(&dir).unwrap();
+
+    let reasoning = "为什么先读这个文件 ".repeat(300);
+    let first = ModelResponse {
+        request_id: RequestId::generate(),
+        message: Message {
+            origin: None,
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::Reasoning {
+                    text: reasoning.clone(),
+                },
+                ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new("c1"),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path": "src/lib.rs"}),
+                    },
+                },
+            ],
+        },
+        finish_reason: FinishReason::ToolCalls,
+        usage: TokenUsage::default(),
+    };
+    let runtime = Arc::new(MockRuntime::new(vec![first, assistant_text("done")]));
+
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    Executor::new(
+        runtime,
+        Arc::new(default_registry()),
+        ToolContext::new(workspace, PermissionProfile::Assisted),
+        ModelRef::new("mock", "m"),
+        10,
+    )
+    .with_reasoning_replay(reasoning_replay_contract())
+    .run(
+        "read it",
+        &mut |_| {},
+        &mut SpendSink(recorded.clone()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let rows = recorded.lock().unwrap().clone();
+    let rounds: Vec<_> = rows
+        .iter()
+        .filter(|row| row.kind == leveler_agent::ModelCallKind::Round)
+        .collect();
+    assert_eq!(rounds.len(), 2, "two rounds ran: {rows:?}");
+    assert_eq!(
+        rounds[0].projected_reasoning_tokens,
+        Some(0),
+        "a round with nothing to replay records zero, not an unknown"
+    );
+    let replayed = rounds[1]
+        .projected_reasoning_tokens
+        .expect("the projection's reasoning channel is recorded, never NULL");
+    assert!(
+        replayed > 0,
+        "the second round spanned the first one's captured reasoning, so it paid for it: {replayed}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
