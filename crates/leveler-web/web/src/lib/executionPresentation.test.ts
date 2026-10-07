@@ -8,7 +8,7 @@
 // A path that needs durable history replay is DEFERRED here, not silently
 // skipped: the Web client has no `query_session_history` consumer yet, so a
 // session opened from a snapshot cannot rebuild its finished tool rounds. See
-// `docs/EXECUTION_PRESENTATION_CONTRACT.md` §7 (C10) and the Web test
+// contract v1 §I10 (fixture C10) and the Web test
 // `a snapshot-opened session cannot rebuild durable tool rounds yet`.
 
 import { beforeEach, describe, expect, it } from 'vitest';

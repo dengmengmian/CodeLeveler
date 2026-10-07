@@ -11,8 +11,9 @@
 //! is called once, in the client projection), and every surface reads the
 //! stamped value. A surface must never re-derive it from the tool name.
 //!
-//! The outcome is frozen by `docs/EXECUTION_PRESENTATION_CONTRACT.md` §I9 and
-//! covered by the shared fixture corpus (C4 / C5 / C9 / C14).
+//! The outcome is frozen by execution presentation contract v1 (§I9) and
+//! covered by the shared fixture corpus (`testdata/execution_presentation/v1/`,
+//! C4 / C5 / C9 / C14).
 //!
 //! `update_plan` is the sharp edge of the question: it is an `Important`
 //! presentation row — the reader should see the plan change — yet it is pure

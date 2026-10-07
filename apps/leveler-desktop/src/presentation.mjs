@@ -97,7 +97,7 @@ export function commandCandidates(text,commands){const match=/^\/([a-z-]*)$/.exe
 export function activateSettingsShortcut(state,open){if(state.composing||state.modalOpen||state.settingsOpen)return false;open();return true;}
 
 // ── Execution Presentation Contract v1 ────────────────────────────────
-// The Desktop projection of docs/EXECUTION_PRESENTATION_CONTRACT.md. Pure
+// The Desktop projection of the execution presentation contract v1. Pure
 // functions only: the renderer paints what they return, and the conformance
 // test reads the same ones (test/executionPresentation.test.mjs). Nothing here
 // guesses a boundary — the round is the runtime's `model_step`, the batch is an

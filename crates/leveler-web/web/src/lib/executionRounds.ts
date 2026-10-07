@@ -1,5 +1,5 @@
-// Execution presentation projection — the Web implementation of
-// `docs/EXECUTION_PRESENTATION_CONTRACT.md` v1.
+// Execution presentation projection — the Web implementation of the
+// execution presentation contract v1.
 //
 // One pure function per contract invariant, so rendering and the conformance
 // test read the SAME projection. Nothing here invents a boundary: the round is

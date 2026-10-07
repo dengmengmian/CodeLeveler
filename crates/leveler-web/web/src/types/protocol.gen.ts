@@ -3,7 +3,7 @@
 // （schema 由 `UPDATE_SCHEMAS=1 cargo test -p leveler-client-protocol --features schema` 守护）。
 // web 网关自有帧（UpFrame/DownFrame/REST DTO）不在此文件，见 protocol.ts。
 
-/** Whether a started call acts on the turn's answer. A protocol-owned DTO: the runtime decides this once (in its client projection, via the tool vocabulary) and every surface reads the stamped value instead of re-classifying the tool name. Four renderers each guessing is what made `FinalAnswer` a second truth source. The outcome is frozen by `docs/EXECUTION_PRESENTATION_CONTRACT.md` §I9. */
+/** Whether a started call acts on the turn's answer. A protocol-owned DTO: the runtime decides this once (in its client projection, via the tool vocabulary) and every surface reads the stamped value instead of re-classifying the tool name. Four renderers each guessing is what made `FinalAnswer` a second truth source. The outcome is frozen by execution presentation contract v1 (§I9) and locked by the shared fixture corpus (`testdata/execution_presentation/v1/`). */
 export type AnswerEffect =
   /** Substantive work: a message before it was interim narration, not the turn's answer. */
   | 'work'

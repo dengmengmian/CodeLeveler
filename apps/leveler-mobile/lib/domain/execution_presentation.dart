@@ -1,9 +1,9 @@
 /// Execution Presentation Contract v1 — the App's projection.
 ///
 /// The same pure functions the Web and Desktop surfaces implement, for the
-/// remote-control app. `docs/EXECUTION_PRESENTATION_CONTRACT.md` is the
-/// authority; `testdata/execution_presentation/v1/*.json` is the shared oracle
-/// this file is checked against (`test/execution_presentation_test.dart`).
+/// remote-control app. Execution presentation contract v1 is the authority;
+/// `testdata/execution_presentation/v1/*.json` is the shared oracle this file
+/// is checked against (`test/execution_presentation_test.dart`).
 ///
 /// Nothing here reads prose or invents a boundary: the round is the runtime's
 /// `model_step`, a batch is an observed overlap, and Final vs Progress is

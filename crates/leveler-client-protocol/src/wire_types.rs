@@ -33,7 +33,8 @@ pub enum PermissionProfile {
 /// value instead of re-classifying the tool name. Four renderers each guessing
 /// is what made `FinalAnswer` a second truth source.
 ///
-/// The outcome is frozen by `docs/EXECUTION_PRESENTATION_CONTRACT.md` §I9.
+/// The outcome is frozen by execution presentation contract v1 (§I9) and
+/// locked by the shared fixture corpus (`testdata/execution_presentation/v1/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]

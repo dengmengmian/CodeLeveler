@@ -1,8 +1,8 @@
 //! Execution Presentation Contract v1 — the reference conformance suite.
 //!
-//! The contract is frozen in `docs/EXECUTION_PRESENTATION_CONTRACT.md` and its
-//! fixtures live in `testdata/execution_presentation/v1/` as wire-native
-//! runtime facts plus their expected *semantic* tree. The tree is deliberately
+//! The contract v1 is frozen by its fixtures in
+//! `testdata/execution_presentation/v1/`: wire-native runtime facts plus their
+//! expected *semantic* tree. The tree is deliberately
 //! surface-neutral: it names AssistantText, ExecutionRound (with its tool
 //! membership and truthful statuses), FinalAnswer and the turn terminal — never
 //! a glyph, a color or a widget.
