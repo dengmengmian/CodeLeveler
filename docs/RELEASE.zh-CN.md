@@ -61,6 +61,13 @@ Auto 权限也向普通开发对齐：临时文件、进程与系统观测、可
 
 ## 修复
 
+- **权限变更可能被静默撤销。** 一个回合在暂存时捕获了会话的权限模式，并在每次
+  构建 engine 时把这份快照写回会话的 live profile，于是这期间落地的
+  `SetPermissionProfile` 被覆盖：UI（已从 runtime config 收到确认）显示 `full`，
+  而策略层读到的仍是旧的 `assisted`，对破坏性命令发出了审批请求。现在 live
+  profile 只在首次使用时播种，之后的变更只走 live setter；headless 的持久化覆盖
+  也会同步 live cell，`/clear` 也不会再把客户端的启动默认值写回它刚持久化的配置
+  之上。
 - **重连会丢掉运行中工具的执行轮次。** live view 在折叠进 reconnect snapshot
   时丢掉了轮次标识，于是重连的客户端只能按工具种类和时序重新猜轮次，甚至把
   第二个轮次焊到第一个上。现在 snapshot 会声明 runtime 早已知道的轮次。

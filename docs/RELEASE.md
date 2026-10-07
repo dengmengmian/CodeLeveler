@@ -78,6 +78,15 @@ daemon socket or in-process, and `leveler run` keeps driving a Goal.
 
 ## Fixed
 
+- **A permission change could be silently undone.** A turn captured the
+  session's permission mode when it was staged and wrote that snapshot back into
+  the session's live profile on every engine build, so a `SetPermissionProfile`
+  that landed in between was overwritten: the UI — already acknowledged from the
+  runtime config — showed `full` while policy read the stale `assisted` and
+  produced an approval for a destructive command. The live profile is now seeded
+  once, later changes go through the live setter, the headless durable override
+  moves it too, and `/clear` no longer re-installs the client's launch default
+  over the config it just persisted.
 - **A reconnect lost the running tool's execution round.** The live view
   dropped the round identity on its way into the reconnect snapshot, so a
   reconnected client re-guessed the round from tool kinds and timing and could

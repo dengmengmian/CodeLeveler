@@ -32,6 +32,7 @@ development, and an interactive session is a Chat session on both transports.
 
 ### Fixed
 
+- A permission change could be silently undone: a staged turn wrote its captured permission mode back into the session's live profile on every engine build, so the UI could show `full` while policy read the stale `assisted` and asked for approval on a destructive command
 - A reconnect lost the running tool's execution round, so a reconnected client re-guessed it from tool kinds and timing
 - A command's failure reason could be a runtime note (`[execution policy] …`, `exit: N`, a timeout) instead of the command's own output, and the note was counted as output
 - A busy row wider than the status strip collapsed to a bare spinner and dropped its elapsed, tool and token parts
