@@ -1205,7 +1205,11 @@ mod contract_tests {
             DataClass::LocalOnly
         );
         assert_eq!(
-            EngineEvent::AssistantMessage { text: "x".into(), reasoning: Vec::new() }.data_class(),
+            EngineEvent::AssistantMessage {
+                text: "x".into(),
+                reasoning: Vec::new()
+            }
+            .data_class(),
             DataClass::LocalOnly
         );
         assert_eq!(
@@ -1320,7 +1324,10 @@ mod contract_tests {
     #[test]
     fn source_and_model_content_have_no_public_projection() {
         for event in [
-            EngineEvent::AssistantMessage { text: "source".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: "source".into(),
+                reasoning: Vec::new(),
+            },
             EngineEvent::ToolCallStarted {
                 call_id: "call".into(),
                 name: "run_command".into(),

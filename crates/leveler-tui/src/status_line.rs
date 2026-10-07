@@ -885,7 +885,9 @@ mod tests {
     fn streaming_reasoning_is_not_reported_as_waiting() {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
-        state.transcript.append_thought(&"先确认环境，再决定怎么落盘……".repeat(20));
+        state
+            .transcript
+            .append_thought(&"先确认环境，再决定怎么落盘……".repeat(20));
         let status = status_line_content(&state, 120).to_string();
         assert!(status.contains("思考"), "status: {status}");
         assert!(!status.contains("等待模型"), "status: {status}");

@@ -276,9 +276,7 @@ pub enum AgentEvent {
     /// The current reasoning segment ended cleanly at the next non-reasoning
     /// output or at message completion. `elapsed_ms` is the kernel's own
     /// measurement. A segment that never receives this was interrupted.
-    ReasoningCompleted {
-        elapsed_ms: u64,
-    },
+    ReasoningCompleted { elapsed_ms: u64 },
     /// The model produced assistant text this round (the whole message; also
     /// marks the end of any streamed deltas for the round). `reasoning`
     /// carries the round's displayable reasoning segments, each with the

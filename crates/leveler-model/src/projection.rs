@@ -1215,9 +1215,7 @@ mod tests {
             "a displayed Thought must not add a single request token"
         );
         assert!(
-            with.messages()
-                .iter()
-                .all(|m| !m.reasoning.is_present()),
+            with.messages().iter().all(|m| !m.reasoning.is_present()),
             "no reasoning reaches a route that has no channel"
         );
         assert_eq!(with.summary().carried_turns, 0);

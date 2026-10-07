@@ -242,7 +242,10 @@ fn a_homogeneous_read_round_reads_as_one_receipt() {
         .iter()
         .find(|l| l.contains("读取") && l.contains("3 个文件"))
         .unwrap_or_else(|| panic!("the read round is a receipt: {t:?}"));
-    assert!(!head.contains("完成 3 项"), "it is not a run head: {head:?}");
+    assert!(
+        !head.contains("完成 3 项"),
+        "it is not a run head: {head:?}"
+    );
     assert!(
         !t.iter().any(|l| l.contains("src/a.rs")),
         "no per-file waterfall: {t:?}"
@@ -262,7 +265,10 @@ fn a_homogeneous_search_round_reads_as_one_receipt() {
         .iter()
         .find(|l| l.contains("搜索") && l.contains("2 次"))
         .unwrap_or_else(|| panic!("the search round is a receipt: {t:?}"));
-    assert!(!head.contains("完成 2 项"), "it is not a run head: {head:?}");
+    assert!(
+        !head.contains("完成 2 项"),
+        "it is not a run head: {head:?}"
+    );
 }
 
 /// A mixed round (a command and a read) still reads as one lightweight node:

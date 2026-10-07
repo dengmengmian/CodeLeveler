@@ -64,7 +64,10 @@ async fn minimal_turn(
         modified_files: Vec::new(),
     };
 
-    ports.emitter.emit(EngineEvent::AssistantMessage { text: format!("minimal harness accepted `{input}`"), reasoning: Vec::new() });
+    ports.emitter.emit(EngineEvent::AssistantMessage {
+        text: format!("minimal harness accepted `{input}`"),
+        reasoning: Vec::new(),
+    });
     ports
         .sink
         .append(&[

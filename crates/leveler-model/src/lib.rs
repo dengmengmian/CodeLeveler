@@ -48,8 +48,8 @@ pub use estimate::{
 };
 pub use event::{FinishReason, ModelEvent, TokenUsage};
 pub use message::{
-    ContentPart, ImageSource, Message, ReasoningSegment, Role, ToolCall, ToolChoice, ToolDefinition,
-    ToolResultContent,
+    ContentPart, ImageSource, Message, ReasoningSegment, Role, ToolCall, ToolChoice,
+    ToolDefinition, ToolResultContent,
 };
 pub use profile::{
     CompatibilityConfig, ModelCapabilities, ModelLimits, ModelPricing, ModelProfile, ProtocolKind,

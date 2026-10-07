@@ -512,7 +512,9 @@ fn close_reasoning_segment(
 ) {
     if let Some((started, text)) = segment.take() {
         let duration_ms = started.elapsed().as_millis() as u64;
-        on_event(AgentEvent::ReasoningCompleted { elapsed_ms: duration_ms });
+        on_event(AgentEvent::ReasoningCompleted {
+            elapsed_ms: duration_ms,
+        });
         segments.push(ReasoningSegment { text, duration_ms });
     }
 }
@@ -661,7 +663,11 @@ async fn stream_round(
             Ok(ModelEvent::TextDelta { delta }) if !completed => {
                 if !delta.is_empty() {
                     // Answer text is the reasoning segment's clean end.
-                    close_reasoning_segment(&mut reasoning_segment, &mut reasoning_segments, on_event);
+                    close_reasoning_segment(
+                        &mut reasoning_segment,
+                        &mut reasoning_segments,
+                        on_event,
+                    );
                     output_estimate.add_text(&delta);
                     text.push_str(&delta);
                     on_event(AgentEvent::AssistantDelta(delta));
@@ -2128,7 +2134,10 @@ mod reasoning_assembly_tests {
         .await
         .expect("scripted stream completes");
 
-        assert_eq!(reasoning_shape(&events), vec!["started", "delta", "completed"]);
+        assert_eq!(
+            reasoning_shape(&events),
+            vec!["started", "delta", "completed"]
+        );
     }
 
     /// REASONING-A3: one message may carry several reasoning segments (block
@@ -2141,11 +2150,15 @@ mod reasoning_assembly_tests {
                 ModelEvent::MessageStarted {
                     request_id: leveler_core::RequestId::new("r"),
                 },
-                ModelEvent::ReasoningDelta { delta: "one".into() },
+                ModelEvent::ReasoningDelta {
+                    delta: "one".into(),
+                },
                 ModelEvent::TextDelta {
                     delta: "mid".into(),
                 },
-                ModelEvent::ReasoningDelta { delta: "two".into() },
+                ModelEvent::ReasoningDelta {
+                    delta: "two".into(),
+                },
                 ModelEvent::MessageCompleted {
                     finish_reason: FinishReason::Stop,
                 },
@@ -2163,7 +2176,15 @@ mod reasoning_assembly_tests {
 
         assert_eq!(
             reasoning_shape(&events),
-            vec!["started", "delta", "completed", "assistant", "started", "delta", "completed"]
+            vec![
+                "started",
+                "delta",
+                "completed",
+                "assistant",
+                "started",
+                "delta",
+                "completed"
+            ]
         );
     }
 

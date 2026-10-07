@@ -20,10 +20,9 @@ impl From<AgentEvent> for EngineEvent {
             A::ReasoningStarted => EngineEvent::ReasoningStarted,
             A::ReasoningDelta(text) => EngineEvent::ReasoningDelta { text },
             A::ReasoningCompleted { elapsed_ms } => EngineEvent::ReasoningCompleted { elapsed_ms },
-            A::AssistantText { text, reasoning } => EngineEvent::AssistantMessage {
-                text,
-                reasoning,
-            },
+            A::AssistantText { text, reasoning } => {
+                EngineEvent::AssistantMessage { text, reasoning }
+            }
             A::ToolCall {
                 id,
                 name,

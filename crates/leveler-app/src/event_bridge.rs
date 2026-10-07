@@ -1884,7 +1884,10 @@ mod bridge_tests {
         );
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: summary.into(),
+                reasoning: Vec::new(),
+            },
         );
         // The harness re-drives the quiet round; THAT is what opens the fold.
         bridge.forward(closeout_nudge());
@@ -1896,7 +1899,10 @@ mod bridge_tests {
         );
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: repeat, reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: repeat,
+                reasoning: Vec::new(),
+            },
         );
 
         let events = drain(&mut rx);
@@ -1977,13 +1983,19 @@ mod bridge_tests {
         let mut bridge = EventBridge::new(tx);
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: "好的,收到。".into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: "好的,收到。".into(),
+                reasoning: Vec::new(),
+            },
         );
         // Inside the nudge-opened round, so the length guard is what stops it.
         bridge.forward(closeout_nudge());
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: "好的,收到。".into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: "好的,收到。".into(),
+                reasoning: Vec::new(),
+            },
         );
         let events = drain(&mut rx);
         let completed = events
@@ -2004,7 +2016,10 @@ mod bridge_tests {
         let summary = "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。";
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: summary.into(),
+                reasoning: Vec::new(),
+            },
         );
         forward_agent(
             &mut bridge,
@@ -2021,8 +2036,9 @@ mod bridge_tests {
         forward_agent(
             &mut bridge,
             leveler_agent::AgentEvent::AssistantText {
-                text: "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。(重复)"
-                    .into(),
+                text:
+                    "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。(重复)"
+                        .into(),
                 reasoning: Vec::new(),
             },
         );
@@ -2058,7 +2074,10 @@ mod bridge_tests {
         let summary = "这一轮的总结足够长，足以触发近重复折叠的判定阈值。";
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: summary.into(),
+                reasoning: Vec::new(),
+            },
         );
         bridge.forward(closeout_nudge());
         bridge.forward(EngineEvent::TurnStarted {
@@ -2067,7 +2086,10 @@ mod bridge_tests {
         });
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: summary.into(),
+                reasoning: Vec::new(),
+            },
         );
         let events = drain(&mut rx);
         let completed = events
@@ -2094,7 +2116,10 @@ mod bridge_tests {
     fn drive_closeout_fold_scope(bridge: &mut EventBridge, tool_only_round: bool) -> String {
         forward_agent(
             bridge,
-            leveler_agent::AgentEvent::AssistantText { text: FOLD_SCOPE_SUMMARY.into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: FOLD_SCOPE_SUMMARY.into(),
+                reasoning: Vec::new(),
+            },
         );
         bridge.forward(closeout_nudge());
         if tool_only_round {
@@ -2137,7 +2162,10 @@ mod bridge_tests {
         let progress = drive_closeout_fold_scope(&mut bridge, /*tool_only_round*/ true);
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: progress, reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: progress,
+                reasoning: Vec::new(),
+            },
         );
         let events = drain(&mut rx);
 
@@ -2177,7 +2205,10 @@ mod bridge_tests {
         let repeat = drive_closeout_fold_scope(&mut bridge, /*tool_only_round*/ false);
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: repeat, reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: repeat,
+                reasoning: Vec::new(),
+            },
         );
         let events = drain(&mut rx);
 
@@ -2208,14 +2239,20 @@ mod bridge_tests {
                        持久化层保持不变。";
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: summary.into(),
+                reasoning: Vec::new(),
+            },
         );
         // The fold needs the closeout nudge that re-drove the round; without it
         // the second text is ordinary narration and stays.
         bridge.forward(closeout_nudge());
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
+            leveler_agent::AgentEvent::AssistantText {
+                text: summary.into(),
+                reasoning: Vec::new(),
+            },
         );
         let events = drain(&mut rx);
         let started = events
@@ -2459,7 +2496,11 @@ mod projection_equivalence {
             .collect();
         assert_eq!(
             reasoning,
-            vec!["reasoning_start", "reasoning:先查 catalog。", "reasoning_done:1600"],
+            vec![
+                "reasoning_start",
+                "reasoning:先查 catalog。",
+                "reasoning_done:1600"
+            ],
             "one live Thought, not two"
         );
     }
@@ -2685,7 +2726,10 @@ mod projection_equivalence {
             EngineEvent::StreamAttemptStarted,
             EngineEvent::AssistantDelta { text: "he".into() },
             EngineEvent::AssistantDelta { text: "llo".into() },
-            EngineEvent::AssistantMessage { text: "hello".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: "hello".into(),
+                reasoning: Vec::new(),
+            },
         ]);
         assert_eq!(
             shapes,
@@ -2705,7 +2749,10 @@ mod projection_equivalence {
             EngineEvent::AssistantDelta { text: "a".into() },
             EngineEvent::StreamAttemptStarted,
             EngineEvent::AssistantDelta { text: "b".into() },
-            EngineEvent::AssistantMessage { text: "b".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: "b".into(),
+                reasoning: Vec::new(),
+            },
         ]);
         assert_eq!(
             shapes,
@@ -2723,19 +2770,34 @@ mod projection_equivalence {
     #[test]
     fn non_streamed_text_synthesizes_a_whole_message() {
         assert_eq!(
-            project(vec![EngineEvent::AssistantMessage { text: "hi".into(), reasoning: Vec::new() }]),
+            project(vec![EngineEvent::AssistantMessage {
+                text: "hi".into(),
+                reasoning: Vec::new()
+            }]),
             ["msg_start", "delta:hi", "msg_done"]
         );
-        assert!(project(vec![EngineEvent::AssistantMessage { text: "".into(), reasoning: Vec::new() }]).is_empty());
+        assert!(
+            project(vec![EngineEvent::AssistantMessage {
+                text: "".into(),
+                reasoning: Vec::new()
+            }])
+            .is_empty()
+        );
     }
 
     #[test]
     fn near_duplicate_summary_folds_to_a_notification() {
         let text = "这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。".to_string();
         let shapes = project(vec![
-            EngineEvent::AssistantMessage { text: text.clone(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text: text.clone(),
+                reasoning: Vec::new(),
+            },
             closeout_nudge(),
-            EngineEvent::AssistantMessage { text, reasoning: Vec::new() },
+            EngineEvent::AssistantMessage {
+                text,
+                reasoning: Vec::new(),
+            },
         ]);
         assert_eq!(
             shapes[..3],
@@ -2951,7 +3013,10 @@ mod projection_equivalence {
             phase: "cleanup".into(),
             at: leveler_core::now(),
         });
-        bridge.forward(EngineEvent::AssistantMessage { text: "post-terminal review".into(), reasoning: Vec::new() });
+        bridge.forward(EngineEvent::AssistantMessage {
+            text: "post-terminal review".into(),
+            reasoning: Vec::new(),
+        });
         bridge.forward(EngineEvent::AssistantDelta {
             text: "ignored".into(),
         });
