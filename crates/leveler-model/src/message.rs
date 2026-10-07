@@ -103,6 +103,27 @@ impl Message {
     }
 }
 
+/// One displayable reasoning segment of a completed assistant message, with
+/// the timing the runtime itself measured.
+///
+/// This rides on the durable assistant-message projection so a reopened
+/// transcript can render a completed Thought with its real duration without
+/// guessing. It is *presentation* metadata: the model-context authority for
+/// reasoning is the assistant [`Message`]'s [`ContentPart::Reasoning`] block in
+/// the message store, and no protocol encoder or [`crate::RequestProjection`]
+/// ever reads this type. One message may carry several segments (block
+/// protocols may emit more than one thinking block), so this is a per-segment
+/// record, never a single message-level duration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningSegment {
+    /// The provider-returned reasoning text of this segment, exactly as the
+    /// model produced it. Never synthesized by the harness.
+    pub text: String,
+    /// How long the model reasoned in this segment, from its first delta to
+    /// the boundary that closed it.
+    pub duration_ms: u64,
+}
+
 /// A discrete piece of message content. The enum is intentionally wider than
 /// the currently supported blocks (`Text`/`ToolCall`/`ToolResult`) so protocol types
 /// never need to change to add images or reasoning later (spec §10.3).

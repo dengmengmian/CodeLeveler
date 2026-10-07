@@ -7,7 +7,8 @@ use leveler_client_protocol::UiCompletionReport;
 use crate::i18n::{Locale, UiText};
 use crate::theme::Theme;
 use crate::transcript::{
-    AssistantBlock, AssistantKind, ToolStatus, TranscriptItem, TurnEndBlock, TurnEndStatus,
+    AssistantBlock, AssistantKind, ThoughtBlock, ToolStatus, TranscriptItem, TurnEndBlock,
+    TurnEndStatus,
 };
 
 use super::text::wrap;
@@ -96,6 +97,76 @@ pub fn assistant_render(
     assistant_split(block, theme, wrap_width).0
 }
 
+/// A duration for a Thought header, e.g. `2.8s`, `48.0s`, `1m 5s`. A segment
+/// too short to round to a tenth reads `<0.1s`: `0.0s` looked like no time at
+/// all, which is a claim the measurement does not make.
+fn format_thought_duration(ms: u64) -> String {
+    if ms < 100 {
+        return "<0.1s".to_string();
+    }
+    let secs = ms as f64 / 1000.0;
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let total = ms / 1000;
+        format!("{}m {}s", total / 60, total % 60)
+    }
+}
+
+/// Render one reasoning segment as a Thought.
+///
+/// The header states the segment's real state — `Thinking…` while streaming,
+/// `Thought for 2.8s` when the runtime reported a clean boundary, and
+/// `Thought interrupted after 8.2s` when it did not. The body is the provider's
+/// own reasoning text under a `│` gutter; a provider that returned no text
+/// gets a header and no invented prose. Reasoning is not markdown, so the body
+/// is wrapped verbatim rather than parsed.
+pub fn thought_lines(
+    block: &ThoughtBlock,
+    theme: &Theme,
+    wrap_width: usize,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let header_style = Style::default()
+        .fg(theme.text.secondary)
+        .add_modifier(Modifier::ITALIC);
+    let header = if !block.done {
+        t.thought_live.to_string()
+    } else if block.interrupted {
+        match block.duration_ms {
+            Some(ms) => t
+                .thought_interrupted
+                .replace("{}", &format_thought_duration(ms)),
+            None => t.thought_interrupted_bare.to_string(),
+        }
+    } else {
+        t.thought_for
+            .replace("{}", &format_thought_duration(block.duration_ms.unwrap_or(0)))
+    };
+    let mut out = vec![Line::from(vec![
+        Span::styled("◆ ", Style::default().fg(theme.text.secondary)),
+        Span::styled(header, header_style),
+    ])];
+    let inner = wrap_width.saturating_sub(2).max(1);
+    let body_style = Style::default().fg(theme.text.muted);
+    // A provider that returned no reasoning gets a header and nothing else.
+    if !block.text.is_empty() {
+        for line in wrap(&block.text, inner) {
+            out.push(Line::from(vec![
+                Span::styled("│ ", body_style),
+                Span::styled(line, body_style),
+            ]));
+        }
+    }
+    if !block.done {
+        out.push(Line::from(Span::styled(
+            "▌",
+            Style::default().fg(theme.text.secondary),
+        )));
+    }
+    out
+}
+
 /// Render one transcript item to styled lines (no leading separator).
 pub fn item_render(
     item: &TranscriptItem,
@@ -129,6 +200,9 @@ pub fn item_render(
         }
         TranscriptItem::Assistant(block) => {
             out.extend(assistant_render(block, theme, wrap_width));
+        }
+        TranscriptItem::Thought(block) => {
+            out.extend(thought_lines(block, theme, wrap_width, t));
         }
         TranscriptItem::ToolGroup(group) => {
             // Same product surface as workbench Conversation: Silent tools
@@ -583,6 +657,7 @@ fn localized_turn_detail<'a>(detail: &'a str, t: &'a crate::i18n::UiText) -> &'a
 pub fn item_is_final(item: &TranscriptItem) -> bool {
     match item {
         TranscriptItem::Assistant(b) => b.done,
+        TranscriptItem::Thought(b) => b.done,
         TranscriptItem::ToolGroup(group) => {
             !group.open
                 && group
@@ -1239,6 +1314,90 @@ mod tests {
             .iter()
             .map(line_text)
             .collect()
+    }
+
+    // ---- Reasoning is a Thought: real text, honest state, never invented ----
+
+    fn thought(text: &str, done: bool, duration_ms: Option<u64>, interrupted: bool) -> ThoughtBlock {
+        ThoughtBlock {
+            text: text.to_string(),
+            done,
+            duration_ms,
+            interrupted,
+            live_since: None,
+        }
+    }
+
+    fn thought_rows(block: &ThoughtBlock, width: usize) -> Vec<String> {
+        thought_lines(block, &Theme::no_color(), width, Locale::Zh.text())
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    /// REASONING-8: a provider that returned no reasoning text gets a header
+    /// and NO body — the harness never invents a Thought.
+    #[test]
+    fn a_thought_without_provider_text_has_no_invented_body() {
+        let lines = thought_rows(&thought("", true, Some(1200), false), 60);
+        assert!(lines[0].contains("已思考"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains('│')),
+            "no body without provider text: {lines:?}"
+        );
+    }
+
+    /// A segment too short to round to a tenth says `<0.1s`, not `0.0s`: a
+    /// duration that reads as no time at all is a claim the measurement does
+    /// not make.
+    #[test]
+    fn a_sub_tenth_thought_does_not_read_as_zero() {
+        let lines = thought_rows(&thought("快", true, Some(40), false), 60);
+        assert!(lines[0].contains("<0.1s"), "{lines:?}");
+        assert!(!lines[0].contains("0.0s"), "{lines:?}");
+    }
+
+    /// A cut Thought whose elapsed could not be measured says so without
+    /// inventing a time.
+    #[test]
+    fn an_unmeasured_interrupted_thought_shows_no_duration() {
+        let lines = thought_rows(&thought("半句", true, None, true), 60);
+        assert!(lines[0].contains("思考中断"), "{lines:?}");
+        assert!(!lines[0].contains('s'), "no invented duration: {lines:?}");
+    }
+
+    /// A completed segment states the runtime's own measurement and shows the
+    /// provider's words verbatim under the gutter.
+    #[test]
+    fn a_completed_thought_shows_its_measured_duration() {
+        let lines = thought_rows(&thought("先查 catalog。", true, Some(2800), false), 60);
+        assert!(lines[0].contains("已思考 2.8s"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("先查 catalog。")),
+            "{lines:?}"
+        );
+    }
+
+    /// A segment that never reached a clean boundary is never labelled as a
+    /// finished one.
+    #[test]
+    fn an_interrupted_thought_is_not_labelled_finished() {
+        let lines = thought_rows(&thought("半句话", true, None, true), 60);
+        assert!(lines[0].contains("思考中断"), "{lines:?}");
+        assert!(
+            !lines[0].contains("已思考"),
+            "interrupted is not completed: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("半句话")), "{lines:?}");
+    }
+
+    /// REASONING-narrow: a meaningful label survives a narrow terminal instead
+    /// of degrading to a bare spinner glyph.
+    #[test]
+    fn a_thought_keeps_a_meaningful_label_when_narrow() {
+        let lines = thought_rows(&thought("正在检查当前 provider catalog。", false, None, false), 12);
+        assert!(lines[0].contains("思考中"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains('▌')), "{lines:?}");
     }
 
     /// The two kinds differ in marker GLYPH and in marker INK: a faint `●` for

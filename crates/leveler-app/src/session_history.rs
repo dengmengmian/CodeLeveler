@@ -205,7 +205,6 @@ fn is_live_only(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::AgentActivity { .. }
             | RuntimeEvent::CommandProgress { .. }
             | RuntimeEvent::TokenUsage { .. }
-            | RuntimeEvent::ReasoningDelta { .. }
             | RuntimeEvent::Notification { .. }
     )
 }
@@ -317,9 +316,7 @@ mod tests {
             db,
             sid,
             t0 + ms(1000),
-            EngineEvent::AssistantMessage {
-                text: answer.into(),
-            },
+            EngineEvent::AssistantMessage { text: answer.into(), reasoning: Vec::new() },
         )
         .await;
         event(
@@ -371,9 +368,7 @@ mod tests {
             &db,
             &sid,
             t0 + ms(2),
-            EngineEvent::AssistantMessage {
-                text: "complete earlier answer".into(),
-            },
+            EngineEvent::AssistantMessage { text: "complete earlier answer".into(), reasoning: Vec::new() },
         )
         .await;
         let partial = serde_json::json!({"role":"assistant","content":[{"type":"text","text":"observed partial answer"}],"incomplete":true}).to_string();
@@ -385,9 +380,7 @@ mod tests {
             &db,
             &sid,
             t0 + ms(4),
-            EngineEvent::AssistantMessage {
-                text: "later repaired answer".into(),
-            },
+            EngineEvent::AssistantMessage { text: "later repaired answer".into(), reasoning: Vec::new() },
         )
         .await;
         event(
@@ -440,6 +433,96 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// REASONING-4 / REASONING-9: a reopened session restores the provider's
+    /// reasoning as completed Thought segments, in order, before the answer
+    /// text. The durable assistant-message projection carries it; the message
+    /// store stays the model-context authority. More than one segment is
+    /// preserved as more than one Thought — never collapsed into one duration.
+    #[tokio::test]
+    async fn resume_restores_completed_thoughts_before_the_answer() {
+        let (db, sid) = session().await;
+        let t0 = now();
+        event(
+            &db,
+            &sid,
+            t0,
+            EngineEvent::TurnStarted {
+                turn_id: TurnId::generate(),
+                kind: TurnKind::Chat,
+            },
+        )
+        .await;
+        user(&db, &sid, t0 + ms(10), "看下最新模型").await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1000),
+            EngineEvent::AssistantMessage {
+                text: "已同步。".into(),
+                reasoning: vec![
+                    leveler_model::ReasoningSegment {
+                        text: "先查 catalog。".into(),
+                        duration_ms: 1600,
+                    },
+                    leveler_model::ReasoningSegment {
+                        text: "再补一条失败测试。".into(),
+                        duration_ms: 900,
+                    },
+                ],
+            },
+        )
+        .await;
+        event(
+            &db,
+            &sid,
+            t0 + ms(1500),
+            EngineEvent::TaskFinished {
+                outcome: TaskOutcome::Completed,
+                reason: None,
+                failure: None,
+                stop: Some(StopReason::Answered),
+                warnings: Vec::new(),
+            },
+        )
+        .await;
+
+        let (history, _) = load_session_history(&db, &sid).await.unwrap();
+        let shaped: Vec<(&'static str, String)> = history
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                RuntimeEvent::ReasoningStarted => Some(("started", String::new())),
+                RuntimeEvent::ReasoningDelta { delta } => {
+                    Some(("delta", delta.clone()))
+                }
+                RuntimeEvent::ReasoningCompleted { elapsed_ms } => {
+                    Some(("completed", elapsed_ms.to_string()))
+                }
+                RuntimeEvent::AssistantTextDelta { delta, .. } => {
+                    Some(("text", delta.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shaped,
+            vec![
+                ("started", String::new()),
+                ("delta", "先查 catalog。".into()),
+                ("completed", "1600".into()),
+                ("started", String::new()),
+                ("delta", "再补一条失败测试。".into()),
+                ("completed", "900".into()),
+                ("text", "已同步。".into()),
+            ],
+            "each durable segment replays as its own Thought, before the answer"
+        );
+        // The reasoning is a UI projection, not a turn-shape change.
+        assert_eq!(
+            tags(&history).last().map(String::as_str),
+            Some("turn_answered")
+        );
     }
 
     /// A stopped command reads as stopped after a reopen: the user's words,
@@ -505,9 +588,7 @@ mod tests {
             &db,
             &sid,
             t0 + ms(5000),
-            EngineEvent::AssistantMessage {
-                text: "停在第 3 个 tick。".into(),
-            },
+            EngineEvent::AssistantMessage { text: "停在第 3 个 tick。".into(), reasoning: Vec::new() },
         )
         .await;
         event(
@@ -667,9 +748,7 @@ mod tests {
             &db,
             &sid,
             t0 + ms(1000),
-            EngineEvent::AssistantMessage {
-                text: "解析器已修好。".into(),
-            },
+            EngineEvent::AssistantMessage { text: "解析器已修好。".into(), reasoning: Vec::new() },
         )
         .await;
         event(

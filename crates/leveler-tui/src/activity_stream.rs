@@ -2,8 +2,28 @@
 //!
 //! Product surface, not a tool trace — but evidence, not a summary. Every
 //! user-visible call owns a row that answers four questions: which tool ran, on
-//! what, what came back, and what state it is in. An aggregate that replaced
-//! those rows ("读取 4 个文件", "检查代码库") answered none of them.
+//! what, what came back, and what state it is in.
+//!
+//! **One execution-presentation contract, three shapes:**
+//!
+//! - **Search / Read / List — compact receipt.** A stretch of two or more
+//!   successful exploration calls collapses to ONE line that counts by kind
+//!   (`› 读取 7 个文件 · 搜索 2 次`). A burst of reads is not a decision log:
+//!   the files add nothing a reader acts on, and a row each is the
+//!   execution-log waterfall this contract removes. A LONE exploration call
+//!   keeps its evidence row (aggregating one call loses the target for no
+//!   compactness), and a stretch containing a FAILURE falls back to rows so the
+//!   failing target stays inspectable.
+//! - **Run / Shell / Test — one logical execution.** A run keeps its command
+//!   and its outcome (`› 执行命令 · 完成 1 项` / `└─ ✓ $ cargo test · 8.2s`).
+//!   The started/completed/waiting lifecycle is NEVER written into history as
+//!   separate rows: it lives in the single live activity while the command runs
+//!   and freezes to the receipt on completion.
+//! - **Edit — inline diff.** A diff IS the result, so it is never folded into
+//!   a count; consecutive same-file patches merge into one node.
+//!
+//! Mixed stretches that are not exploration keep the per-call rows below their
+//! disclosure header.
 //!
 //! - **Silent** tools (ls/find probes, goal bookkeeping): hidden per-call.
 //! - **User-visible**: every Normal/Important call renders a head row (`›`
@@ -119,6 +139,14 @@ pub(crate) fn render_group_rows(
         .iter()
         .filter(|c| is_conversation_visible(c))
         .collect();
+    // Execution-presentation contract, shape 1: Search / Read / List is ONE
+    // compact receipt. A burst of exploration is not a decision log — the files
+    // add nothing a reader acts on. Runs and edits keep their own shape below.
+    if group_is_compact_exploration(group) {
+        let live = group.open || !group_is_finished(group);
+        out.push(exploration_receipt_line(&visible, theme, width, t, live));
+        return out;
+    }
     let units = plan_units(&group.calls);
     // An execution round whose calls are all one tool IS a run: it reads as a
     // tool-named head (`› 执行命令 · 完成 3 项`) with the calls as its tree,
@@ -471,7 +499,110 @@ pub(crate) fn group_has_disclosure(group: &ToolGroupBlock) -> bool {
     // as completed history paints active work as done (the real
     // `▸ 并行执行了 7 个工具`-while-running regression). History begins when
     // the group closes, not when its current members happen to be settled.
-    !group.open && group_is_finished(group) && group_is_disclosable(group)
+    //
+    // A compact exploration receipt has no children, so it is NOT a disclosure:
+    // there is nothing to reveal and the click would do nothing.
+    !group.open
+        && group_is_finished(group)
+        && group_is_disclosable(group)
+        && !group_is_compact_exploration(group)
+}
+
+/// Whether these calls are exploration (Search/Read/List) — the classes a
+/// compact receipt may speak for.
+fn is_exploration_class(name: &str) -> bool {
+    matches!(
+        disclosure_class(name),
+        DisclosureClass::Read | DisclosureClass::Search
+    )
+}
+
+/// Whether this call is a directory listing (counted separately in the
+/// receipt: "列出 2 个目录" is a different fact from "读取 2 个文件").
+fn is_list_call(name: &str) -> bool {
+    matches!(
+        crate::tool_taxonomy::lookup(name).map(|e| e.kind),
+        Some(crate::tool_taxonomy::ToolKind::ListDir)
+    )
+}
+
+/// A stretch of two or more SUCCESSFUL exploration calls with no edits — the
+/// compact-receipt shape, live or finished. A single call keeps its evidence
+/// row (aggregating it loses the target for no compactness), and a stretch
+/// containing a failure falls back to rows so the failing target stays
+/// inspectable.
+fn group_is_compact_exploration(group: &ToolGroupBlock) -> bool {
+    if group_has_edits(group) {
+        return false;
+    }
+    let visible: Vec<&ToolCallBlock> = group
+        .calls
+        .iter()
+        .filter(|c| is_conversation_visible(c))
+        .collect();
+    visible.len() >= 2
+        && visible.iter().all(|c| is_exploration_class(&c.name))
+        && !visible.iter().any(|c| c.status == ToolStatus::Failed)
+}
+
+/// The receipt's text: counts by KIND, so a mixed read/search stretch still
+/// says what it did instead of one vague verb. `live` picks the progress verb,
+/// so a running stretch never claims a past-tense outcome.
+fn exploration_receipt_label(visible: &[&ToolCallBlock], t: &UiText, live: bool) -> String {
+    let lists = visible.iter().filter(|c| is_list_call(&c.name)).count();
+    let reads = visible
+        .iter()
+        .filter(|c| !is_list_call(&c.name) && disclosure_class(&c.name) == DisclosureClass::Read)
+        .count();
+    let searches = visible
+        .iter()
+        .filter(|c| !is_list_call(&c.name) && disclosure_class(&c.name) == DisclosureClass::Search)
+        .count();
+    let (read, search, list) = if live {
+        (
+            t.receipt_running_read,
+            t.receipt_running_search,
+            t.receipt_running_list,
+        )
+    } else {
+        (t.receipt_read, t.receipt_search, t.receipt_list)
+    };
+    let mut parts = Vec::new();
+    if reads > 0 {
+        parts.push(read.replace("{}", &reads.to_string()));
+    }
+    if searches > 0 {
+        parts.push(search.replace("{}", &searches.to_string()));
+    }
+    if lists > 0 {
+        parts.push(list.replace("{}", &lists.to_string()));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// The one-line compact receipt. Exploration is not a result, so the settled
+/// form wears the execution anchor `\u{203a}` and no outcome mark; the live form
+/// wears the running `\u{25cc}`.
+fn exploration_receipt_line(
+    visible: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+    live: bool,
+) -> Line<'static> {
+    let label = exploration_receipt_label(visible, t, live);
+    let (glyph, color, tone) = if live {
+        ("\u{25cc} ", theme.accent.primary, theme.ink(Ink::Meta))
+    } else {
+        ("\u{203a} ", theme.ink(Ink::Subtle), theme.ink(Ink::Settled))
+    };
+    Line::from(vec![
+        Span::styled(glyph, Style::default().fg(color)),
+        Span::styled(
+            truncate_display(&label, width.saturating_sub(2).max(1)),
+            Style::default().fg(tone),
+        ),
+    ])
 }
 
 /// Whether a disclosure may speak for this group's calls at all: not an edit
@@ -2877,12 +3008,11 @@ mod tests {
         assert!(!text.contains('\u{2713}'), "nothing succeeded yet: {text}");
     }
 
-    /// R2: settled inside a still-open burst keeps its own evidence row. The
-    /// aggregate that used to REPLACE these rows ("· 已读取 4 个文件") answered
-    /// none of the four questions a tool row owes the reader: which file, and
-    /// what came back.
+    /// R2: a live exploration burst is ONE running receipt. The per-call rows
+    /// are exactly the execution-log waterfall this contract removes; the
+    /// receipt says what the burst is doing and how much of it there is.
     #[test]
-    fn settled_reads_in_an_open_burst_keep_their_own_rows() {
+    fn live_read_burst_is_one_running_receipt() {
         let calls: Vec<ToolCallBlock> = (0..4)
             .map(|i| {
                 call(
@@ -2893,52 +3023,36 @@ mod tests {
             })
             .collect();
         let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
-        let text = lines.join("\n");
-        for i in 0..4 {
-            assert!(text.contains(&format!("f{i}.rs")), "{text}");
-        }
+        assert_eq!(lines.len(), 1, "one live receipt: {lines:?}");
+        assert_eq!(lines[0].trim_end(), "\u{25cc} 正在读取 · 4 个文件", "{lines:?}");
         assert!(
-            !text.contains("已读取 4 个文件"),
-            "an aggregate must not stand in for the rows: {text}"
+            !lines[0].contains("f0.rs"),
+            "the files are not re-listed: {lines:?}"
         );
         assert!(
-            !text.contains('\u{2713}'),
-            "reading is still not a result: {text}"
+            !lines[0].contains('\u{2713}'),
+            "reading is still not a result: {lines:?}"
         );
         assert!(
-            !text.contains('\u{25b8}'),
-            "an open burst is not history yet: {text}"
+            !lines[0].contains('\u{25b8}'),
+            "an open burst is not history yet: {lines:?}"
         );
     }
 
-    /// R3: closed exploration is history, and history keeps its evidence. The
-    /// clickable summary row survives as a HEADER over the per-call rows — it
-    /// used to be all that was left of them.
+    /// R3: closed exploration is history, and history is a compact receipt. The
+    /// per-call rows are gone: `读取 4 个文件` says what the burst did, and the
+    /// files themselves are not a decision log. A LONE read keeps its row (see
+    /// `a_single_read_is_one_row_naming_its_file`): aggregating one call loses
+    /// the target for no compactness.
     #[test]
-    fn closed_reads_keep_a_row_each_under_their_summary() {
-        let calls: Vec<ToolCallBlock> = (0..4)
-            .map(|i| {
-                call(
-                    "read_file",
-                    &format!(r#"{{"path":"f{i}.rs"}}"#),
-                    ToolStatus::Ok,
-                )
-            })
-            .collect();
-        let lines = render_group_text(&group(calls), 100, Locale::Zh);
-        assert_eq!(
-            lines[0].trim_end(),
-            "\u{203a} 读取文件",
-            "the run head names the tool and stays the click target: {lines:?}"
+    fn closed_reads_are_one_compact_receipt() {
+        let lines = render_group_text(&group(reads(4)), 100, Locale::Zh);
+        assert_eq!(lines.len(), 1, "one line, no children: {lines:?}");
+        assert_eq!(lines[0].trim_end(), "\u{203a} 读取 4 个文件", "{lines:?}");
+        assert!(
+            !lines[0].contains("f0.rs"),
+            "the files are not re-listed: {lines:?}"
         );
-        let text = lines.join("\n");
-        for i in 0..4 {
-            assert!(
-                text.contains(&format!("f{i}.rs")),
-                "history lost file f{i}.rs: {lines:?}"
-            );
-        }
-        assert_eq!(lines.len(), 5, "one header, four evidence rows: {lines:?}");
     }
 
     /// Each evidence row answers what ran, on what, and what came back.
@@ -3102,13 +3216,7 @@ mod tests {
     #[test]
     fn silent_probes_contribute_neither_rows_nor_counts() {
         let mut calls: Vec<ToolCallBlock> = (0..3)
-            .map(|i| {
-                call(
-                    "read_file",
-                    &format!(r#"{{"path":"f{i}.rs"}}"#),
-                    ToolStatus::Ok,
-                )
-            })
+            .map(|i| work(&format!(r#"{{"path":"p{i}.rs"}}"#), ToolStatus::Ok))
             .collect();
         calls.extend((0..2).map(|i| {
             call(
@@ -3151,6 +3259,46 @@ mod tests {
             .collect()
     }
 
+    // Run/tree/batch mechanics are about the SHAPE. A uniform exploration
+    // stretch is a compact receipt now, so a mechanics fixture must use a
+    // NON-exploration tool — otherwise the test would be measuring the receipt
+    // it is not about.
+    const WORK: &str = "custom_probe";
+    const WORK_B: &str = "custom_scan";
+    const WORK_C: &str = "custom_check";
+
+    fn work(args: &str, status: ToolStatus) -> ToolCallBlock {
+        call(WORK, args, status)
+    }
+
+    fn work_b(args: &str, status: ToolStatus) -> ToolCallBlock {
+        call(WORK_B, args, status)
+    }
+
+    fn work_c(args: &str, status: ToolStatus) -> ToolCallBlock {
+        call(WORK_C, args, status)
+    }
+
+    /// `n` consecutive calls of one non-exploration tool, each with a
+    /// renderable target — the run fixture.
+    fn works(n: usize) -> Vec<ToolCallBlock> {
+        (0..n)
+            .map(|i| work(&format!(r#"{{"path":"p{i}.rs"}}"#), ToolStatus::Ok))
+            .collect()
+    }
+
+    fn work_batched(args: &str, status: ToolStatus, batch: Option<u32>) -> ToolCallBlock {
+        batched(WORK, args, status, batch)
+    }
+
+    fn work_b_batched(args: &str, status: ToolStatus, batch: Option<u32>) -> ToolCallBlock {
+        batched(WORK_B, args, status, batch)
+    }
+
+    fn work_parallel_call(args: &str) -> ToolCallBlock {
+        parallel_call(WORK, args)
+    }
+
     /// One call is not a run: its own row already names the tool and the file,
     /// and a head above it would be that row said twice.
     #[test]
@@ -3188,26 +3336,26 @@ mod tests {
     /// Two is already a run: one head naming the tool, children under it.
     #[test]
     fn two_consecutive_calls_form_a_tool_run() {
-        let lines = render_group_text(&group(reads(2)), 100, Locale::Zh);
+        let lines = render_group_text(&group(works(2)), 100, Locale::Zh);
         assert_eq!(lines.len(), 3, "a head and two children: {lines:?}");
         assert!(
-            lines[0].starts_with("\u{203a} 读取文件"),
+            lines[0].starts_with("\u{203a} custom_probe"),
             "the head wears the anchor and names the tool: {lines:?}"
         );
         assert!(
-            !lines[0].contains("个文件"),
-            "the head must not count what the rows below show: {lines:?}"
+            !lines[0].contains("p0.rs"),
+            "the head must not list what the rows below show: {lines:?}"
         );
         assert!(
-            lines[1].contains("\u{251c}\u{2500} ") && lines[1].contains("f0.rs"),
+            lines[1].contains("\u{251c}\u{2500} ") && lines[1].contains("p0.rs"),
             "{lines:?}"
         );
         assert!(
-            lines[2].contains("\u{2514}\u{2500} ") && lines[2].contains("f1.rs"),
+            lines[2].contains("\u{2514}\u{2500} ") && lines[2].contains("p1.rs"),
             "{lines:?}"
         );
         assert!(
-            !lines[1].contains("读取文件") && !lines[2].contains("读取文件"),
+            !lines[1].contains("custom_probe") && !lines[2].contains("custom_probe"),
             "a child must not repeat the head's label: {lines:?}"
         );
     }
@@ -3215,23 +3363,23 @@ mod tests {
     /// A long run stays complete: no truncation policy rides along with this.
     #[test]
     fn a_long_tool_run_shows_every_child() {
-        let lines = render_group_text(&group(reads(15)), 100, Locale::Zh);
+        let lines = render_group_text(&group(works(15)), 100, Locale::Zh);
         assert_eq!(lines.len(), 16, "a head and fifteen children: {lines:?}");
         let text = lines.join("\n");
         for i in 0..15 {
-            assert!(text.contains(&format!("f{i}.rs")), "lost f{i}.rs: {text}");
+            assert!(text.contains(&format!("p{i}.rs")), "lost p{i}.rs: {text}");
         }
-        assert!(!text.contains("个文件"), "no count header: {text}");
         assert!(!text.contains('\u{2026}'), "nothing elided: {text}");
     }
 
-    /// The run is how the burst reads WHILE it runs, not a shape applied to
-    /// finished history: two settled reads inside an open group are a run too.
+    /// The run is how a non-exploration burst reads WHILE it runs, not a shape
+    /// applied to finished history: two settled calls inside an open group are
+    /// a run too. (Exploration is a receipt at every stage now.)
     #[test]
     fn a_tool_run_forms_while_the_burst_is_still_open() {
-        let lines = render_group_text(&open_group(reads(2)), 100, Locale::Zh);
+        let lines = render_group_text(&open_group(works(2)), 100, Locale::Zh);
         assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[0].contains("读取文件"), "{lines:?}");
+        assert!(lines[0].contains("custom_probe"), "{lines:?}");
         assert!(
             !lines[0].contains('\u{25b8}'),
             "an open burst is not history yet: {lines:?}"
@@ -3251,24 +3399,24 @@ mod tests {
     #[test]
     fn a_clean_mixed_group_keeps_a_parent_header_above_its_rows() {
         let g = group(vec![
-            call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok),
-            call("grep", r#"{"pattern":"TaskStatus"}"#, ToolStatus::Ok),
+            work(r#"{"path":"README.md"}"#, ToolStatus::Ok),
+            work_b(r#"{"pattern":"TaskStatus"}"#, ToolStatus::Ok),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert_eq!(lines.len(), 3, "one parent, one row per call: {lines:?}");
         assert!(
             lines[0].starts_with('\u{25b8}')
-                && lines[0].contains("检查代码库")
+                && lines[0].contains("完成 2 项操作")
                 && lines[0].contains("全部成功"),
             "the parent states the outcome: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("  \u{203a} 读取文件") && lines[1].contains("README.md"),
-            "the read is a nested child: {lines:?}"
+            lines[1].starts_with("  \u{203a} ") && lines[1].contains("custom_probe") && lines[1].contains("README.md"),
+            "the first call is a nested child: {lines:?}"
         );
         assert!(
-            lines[2].starts_with("  \u{203a} 搜索代码") && lines[2].contains("TaskStatus"),
-            "the search is a nested child: {lines:?}"
+            lines[2].starts_with("  \u{203a} ") && lines[2].contains("custom_scan") && lines[2].contains("TaskStatus"),
+            "the second call is a nested child: {lines:?}"
         );
     }
 
@@ -3277,9 +3425,9 @@ mod tests {
     #[test]
     fn three_different_tools_stay_three_rows() {
         let g = group(vec![
-            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
-            call("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok),
-            call("diagnostics", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            work(r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            work_b(r#"{"pattern":"x"}"#, ToolStatus::Ok),
+            work_c(r#"{"path":"a.rs"}"#, ToolStatus::Ok),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert_eq!(lines.len(), 4, "parent plus three rows: {lines:?}");
@@ -3335,8 +3483,8 @@ mod tests {
     /// `⊘ 已停止` row sitting right under it in the same group.
     #[test]
     fn a_stage_only_claims_all_ok_when_every_visible_call_succeeded() {
-        let read = || call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok);
-        let grep = |status| call("grep", r#"{"pattern":"x"}"#, status);
+        let read = || work(r#"{"path":"a.rs"}"#, ToolStatus::Ok);
+        let grep = |status| work_b(r#"{"pattern":"x"}"#, status);
 
         // A: the control — two successes do claim it.
         let all_ok = render_group_text(&group(vec![read(), grep(ToolStatus::Ok)]), 100, Locale::Zh);
@@ -3808,8 +3956,8 @@ mod tests {
     #[test]
     fn a_running_mixed_group_keeps_its_live_rows() {
         let g = open_group(vec![
-            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
-            call("grep", r#"{"pattern":"x"}"#, ToolStatus::Running),
+            work(r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            work_b(r#"{"pattern":"x"}"#, ToolStatus::Running),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert_eq!(lines.len(), 3, "a live parent plus two rows: {lines:?}");
@@ -3849,10 +3997,8 @@ mod tests {
     /// even inside one group — reads and searches are two segments, in order.
     #[test]
     fn a_different_tool_ends_the_run() {
-        let mut calls = reads(2);
-        calls.extend(
-            (0..2).map(|i| call("grep", &format!(r#"{{"pattern":"p{i}"}}"#), ToolStatus::Ok)),
-        );
+        let mut calls = works(2);
+        calls.extend((0..2).map(|i| work_b(&format!(r#"{{"path":"q{i}.rs"}}"#), ToolStatus::Ok)));
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         let heads: Vec<usize> = lines
             .iter()
@@ -3861,11 +4007,11 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(heads.len(), 2, "two runs, two heads: {lines:?}");
-        assert!(lines[heads[0]].contains("读取文件"), "{lines:?}");
-        assert!(lines[heads[1]].contains("搜索代码"), "{lines:?}");
+        assert!(lines[heads[0]].contains("custom_probe"), "{lines:?}");
+        assert!(lines[heads[1]].contains("custom_scan"), "{lines:?}");
         assert!(
-            lines[heads[1] - 1].contains("f1.rs"),
-            "the read run closes before the search run opens: {lines:?}"
+            lines[heads[1] - 1].contains("p1.rs"),
+            "the first run closes before the second opens: {lines:?}"
         );
     }
 
@@ -3877,9 +4023,8 @@ mod tests {
     fn a_batch_of_one_tool_reads_as_a_run_that_kept_its_parallel_fact() {
         let calls: Vec<ToolCallBlock> = (0..6)
             .map(|i| {
-                batched(
-                    "read_file",
-                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                work_batched(
+                    &format!(r#"{{"path":"p{i}.rs"}}"#),
                     ToolStatus::Ok,
                     Some(1),
                 )
@@ -3888,20 +4033,20 @@ mod tests {
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         assert_eq!(lines.len(), 7, "one head, six children: {lines:?}");
         assert!(
-            lines[0].starts_with("\u{203a} 读取文件") && lines[0].contains("并行"),
+            lines[0].starts_with("\u{203a} custom_probe") && lines[0].contains("并行"),
             "the head names the tool once and keeps the concurrency: {lines:?}"
         );
         assert!(
-            !lines[0].contains("个文件"),
-            "the count of files is what the children show: {lines:?}"
+            !lines[0].contains("t0"),
+            "the head must not list what the children show: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("  \u{251c}\u{2500} f0.rs")
-                && lines[6].starts_with("  \u{2514}\u{2500} f5.rs"),
+            lines[1].starts_with("  \u{251c}\u{2500} \u{2713} p0.rs")
+                && lines[6].starts_with("  \u{2514}\u{2500} \u{2713} p5.rs"),
             "children carry only their target: {lines:?}"
         );
         assert!(
-            !lines[1].contains("读取文件"),
+            !lines[1].contains("custom_probe"),
             "a child must not repeat the tool: {lines:?}"
         );
     }
@@ -4030,7 +4175,7 @@ mod tests {
     /// so `└ 1 //! alpha module` read as another branch of the run.
     #[test]
     fn an_opened_run_keeps_its_output_inside_the_tree() {
-        let mut calls = reads(2);
+        let mut calls = works(2);
         for c in &mut calls {
             c.preview = Some("//! a module\npub fn a() {}\n".into());
         }
@@ -4057,14 +4202,14 @@ mod tests {
     #[test]
     fn a_mixed_batch_still_names_every_tool() {
         let calls = vec![
-            batched("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(1)),
-            batched("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok, Some(1)),
+            work_batched(r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(1)),
+            work_b_batched(r#"{"pattern":"x"}"#, ToolStatus::Ok, Some(1)),
         ];
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         let text = lines.join("\n");
         assert!(text.contains("并行"), "{lines:?}");
         assert!(
-            text.contains("读取文件") && text.contains("搜索代码"),
+            text.contains("custom_probe") && text.contains("custom_scan"),
             "{lines:?}"
         );
     }
@@ -4101,9 +4246,9 @@ mod tests {
     #[test]
     fn one_observed_batch_renders_as_a_tree() {
         let calls = vec![
-            batched("grep", r#"{"pattern":"a"}"#, ToolStatus::Ok, Some(7)),
-            batched("grep", r#"{"pattern":"b"}"#, ToolStatus::Ok, Some(7)),
-            batched("read_file", r#"{"path":"c.rs"}"#, ToolStatus::Ok, Some(7)),
+            work_b_batched(r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(7)),
+            work_b_batched(r#"{"path":"b.rs"}"#, ToolStatus::Ok, Some(7)),
+            work_batched(r#"{"path":"c.rs"}"#, ToolStatus::Ok, Some(7)),
         ];
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         let text = lines.join("\n");
@@ -4154,15 +4299,15 @@ mod tests {
     #[test]
     fn unbatched_calls_never_render_as_parallel() {
         let calls = vec![
-            batched("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok, None),
-            batched("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Ok, None),
+            work_batched(r#"{"path":"a.rs"}"#, ToolStatus::Ok, None),
+            work_batched(r#"{"path":"b.rs"}"#, ToolStatus::Ok, None),
         ];
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         let text = lines.join("\n");
         assert!(!text.contains("并行"), "no batch, no claim: {text}");
         assert!(
-            lines[0].starts_with(&format!("{TOOL_ANCHOR} 读取文件")),
-            "consecutive reads are a run, which claims no concurrency: {lines:?}"
+            lines[0].starts_with(&format!("{TOOL_ANCHOR} custom_probe")),
+            "consecutive calls are a run, which claims no concurrency: {lines:?}"
         );
     }
 
@@ -4202,18 +4347,16 @@ mod tests {
     fn two_bursts_in_one_group_stay_two_trees() {
         let mut calls: Vec<ToolCallBlock> = (0..2)
             .map(|i| {
-                batched(
-                    "grep",
-                    &format!(r#"{{"pattern":"a{i}"}}"#),
+                work_b_batched(
+                    &format!(r#"{{"path":"a{i}.rs"}}"#),
                     ToolStatus::Ok,
                     Some(1),
                 )
             })
             .collect();
         calls.extend((0..2).map(|i| {
-            batched(
-                "grep",
-                &format!(r#"{{"pattern":"b{i}"}}"#),
+            work_b_batched(
+                &format!(r#"{{"path":"b{i}.rs"}}"#),
                 ToolStatus::Ok,
                 Some(2),
             )
@@ -4233,9 +4376,8 @@ mod tests {
     fn a_wide_live_burst_shows_every_member() {
         let calls: Vec<ToolCallBlock> = (0..17)
             .map(|i| {
-                batched(
-                    "read_file",
-                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                work_batched(
+                    &format!(r#"{{"path":"p{i}.rs"}}"#),
                     ToolStatus::Running,
                     Some(4),
                 )
@@ -4244,8 +4386,8 @@ mod tests {
         let text = render_group_text(&open_group(calls), 100, Locale::Zh).join("\n");
         for i in 0..17 {
             assert!(
-                text.contains(&format!("f{i}.rs")),
-                "member f{i} hidden: {text}"
+                text.contains(&format!("p{i}.rs")),
+                "member p{i} hidden: {text}"
             );
         }
     }
@@ -4405,11 +4547,10 @@ mod tests {
         }
     }
 
-    /// CASE B: a wide read burst gets one header that counts it and one child
-    /// row per file, each naming the file. Every member is accounted for on
-    /// screen, not in a summary.
+    /// CASE B: a wide live read burst is ONE running receipt. It counts the
+    /// burst and names no file — a per-file row is the waterfall, not evidence.
     #[test]
-    fn a_wide_read_burst_shows_one_header_and_a_row_per_file() {
+    fn a_wide_live_read_burst_is_one_running_receipt() {
         let calls: Vec<ToolCallBlock> = (0..7)
             .map(|i| {
                 batched(
@@ -4421,22 +4562,11 @@ mod tests {
             })
             .collect();
         let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
+        assert_eq!(lines.len(), 1, "one receipt: {lines:?}");
+        assert_eq!(lines[0].trim_end(), "\u{25cc} 正在读取 · 7 个文件", "{lines:?}");
         assert!(
-            lines[0].contains('7'),
-            "the header counts the batch: {lines:?}"
-        );
-        assert_eq!(
-            lines.iter().filter(|l| l.contains(".rs")).count(),
-            7,
-            "every member is on screen: {lines:?}"
-        );
-        assert!(
-            lines[0].contains("读取文件"),
-            "the head names the tool in user language: {lines:?}"
-        );
-        assert!(
-            lines.iter().skip(1).all(|l| !l.contains("读取文件")),
-            "and no child repeats it: {lines:?}"
+            !lines[0].contains(".rs"),
+            "every member is accounted for by the count, not a row: {lines:?}"
         );
     }
 
@@ -4497,8 +4627,8 @@ mod tests {
     #[test]
     fn an_edit_group_does_not_keep_its_neighbours_expanded() {
         let reads = group(vec![
-            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
-            call("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Ok),
+            work(r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            work(r#"{"path":"b.rs"}"#, ToolStatus::Ok),
         ]);
         let edit = group(vec![call(
             "apply_patch",
@@ -4558,13 +4688,7 @@ mod tests {
     #[test]
     fn an_open_group_with_all_members_settled_is_not_history() {
         let mut calls: Vec<ToolCallBlock> = (0..7)
-            .map(|i| {
-                call(
-                    "read_file",
-                    &format!(r#"{{"path":"f{i}.rs"}}"#),
-                    ToolStatus::Ok,
-                )
-            })
+            .map(|i| work(&format!(r#"{{"path":"p{i}.rs"}}"#), ToolStatus::Ok))
             .collect();
         for c in &mut calls {
             c.parallel = true;
@@ -4604,8 +4728,8 @@ mod tests {
     #[test]
     fn every_group_class_obeys_the_open_is_not_history_invariant() {
         let cases: [(&str, &str); 4] = [
-            ("read_file", r#"{"path":"a.rs"}"#),
-            ("grep", r#"{"pattern":"BrowserSession"}"#),
+            (WORK, r#"{"path":"a.rs"}"#),
+            (WORK_B, r#"{"pattern":"BrowserSession"}"#),
             ("run_command", r#"{"program":"cargo","args":["test"]}"#),
             ("mcp__demo__inspect", r#"{"target":"repo"}"#),
         ];
@@ -4706,8 +4830,7 @@ mod tests {
     fn a_wide_live_burst_counts_nothing_because_it_hides_nothing() {
         let calls: Vec<ToolCallBlock> = (0..7)
             .map(|i| {
-                batched(
-                    "read_file",
+                work_batched(
                     &format!(r#"{{"path":"file{i}.rs"}}"#),
                     ToolStatus::Running,
                     Some(8),
@@ -4729,17 +4852,15 @@ mod tests {
     #[test]
     fn an_open_group_keeps_a_row_per_call_settled_or_live() {
         let g = group(vec![
-            call(
-                "read_file",
+            work(
                 r#"{"path":"internal/bot/service.go"}"#,
                 ToolStatus::Ok,
             ),
-            call(
-                "read_file",
+            work(
                 r#"{"path":"internal/model/bot.go"}"#,
                 ToolStatus::Ok,
             ),
-            call("grep", r#"{"pattern":"TokenPlain"}"#, ToolStatus::Running),
+            work_b(r#"{"pattern":"TokenPlain"}"#, ToolStatus::Running),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert_eq!(lines.len(), 4, "a row per call: {lines:?}");
@@ -4780,14 +4901,9 @@ mod tests {
     #[test]
     fn batch_members_change_glyph_in_place_as_they_finish() {
         let g = group(vec![
-            batched("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(2)),
-            batched(
-                "read_file",
-                r#"{"path":"b.rs"}"#,
-                ToolStatus::Running,
-                Some(2),
-            ),
-            batched("grep", r#"{"pattern":"x"}"#, ToolStatus::Running, Some(2)),
+            work_batched(r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(2)),
+            work_batched(r#"{"path":"b.rs"}"#, ToolStatus::Running, Some(2)),
+            work_b_batched(r#"{"pattern":"x"}"#, ToolStatus::Running, Some(2)),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert_eq!(live_member_rows(&lines), 2, "two still running: {lines:?}");
@@ -4795,7 +4911,7 @@ mod tests {
             .iter()
             .find(|l| l.contains("a.rs"))
             .expect("the finished member keeps its row");
-        assert!(settled.contains('\u{b7}'), "settled exploration: {settled}");
+        assert!(settled.contains('\u{2713}'), "settled work: {settled}");
     }
 
     /// A folded batch whose commands all need the network is not a batch that
@@ -4841,9 +4957,9 @@ mod tests {
     #[test]
     fn a_finished_group_folds_and_drops_the_live_rendering() {
         let g = group(vec![
-            call("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok),
-            call("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Ok),
-            call("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok),
+            work(r#"{"path":"a.rs"}"#, ToolStatus::Ok),
+            work(r#"{"path":"b.rs"}"#, ToolStatus::Ok),
+            work_b(r#"{"path":"x"}"#, ToolStatus::Ok),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(lines[0].starts_with(TOOL_ANCHOR), "{lines:?}");
@@ -5089,9 +5205,8 @@ mod tests {
         let g = group(
             (0..8)
                 .map(|i| {
-                    batched(
-                        "read_file",
-                        &format!(r#"{{"path":"f{i}.rs"}}"#),
+                    work_batched(
+                        &format!(r#"{{"path":"p{i}.rs"}}"#),
                         ToolStatus::Ok,
                         Some(5),
                     )
@@ -5106,8 +5221,8 @@ mod tests {
         );
         for i in 0..8 {
             assert!(
-                text.contains(&format!("f{i}.rs")),
-                "member f{i} lost: {text}"
+                text.contains(&format!("p{i}.rs")),
+                "member p{i} lost: {text}"
             );
         }
     }
@@ -5116,9 +5231,8 @@ mod tests {
     fn a_running_batch_shows_the_live_member_and_keeps_the_settled_ones() {
         let mut calls: Vec<ToolCallBlock> = (0..4)
             .map(|i| {
-                batched(
-                    "read_file",
-                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                work_batched(
+                    &format!(r#"{{"path":"p{i}.rs"}}"#),
                     ToolStatus::Ok,
                     Some(6),
                 )
@@ -5128,19 +5242,15 @@ mod tests {
         let lines = render_group_text(&group(calls), 100, Locale::Zh);
         let text = lines.join("\n");
         assert!(
-            lines.iter().any(|l| l.contains('◌') && l.contains("f2.rs")),
+            lines.iter().any(|l| l.contains('\u{25cc}') && l.contains("p2.rs")),
             "the live call is marked live: {text}"
         );
         for i in [0usize, 1, 3] {
             assert!(
-                text.contains(&format!("f{i}.rs")),
-                "member f{i} lost: {text}"
+                text.contains(&format!("p{i}.rs")),
+                "member p{i} lost: {text}"
             );
         }
-        assert!(
-            !lines.iter().any(|l| l.contains('\u{2713}')),
-            "reading is still not a result: {text}"
-        );
     }
 
     #[test]
@@ -5213,7 +5323,7 @@ mod tests {
         // Collapsing is the default, not a wall: the detail is one key away.
         let mut g = group(
             (0..4)
-                .map(|i| parallel_call("read_file", &format!(r#"{{"path":"f{i}.rs"}}"#)))
+                .map(|i| work_parallel_call(&format!(r#"{{"path":"p{i}.rs"}}"#)))
                 .collect(),
         );
         g.expanded = true;
@@ -5228,9 +5338,9 @@ mod tests {
     #[test]
     fn an_observed_batch_keeps_its_concurrency_header_of_its_own() {
         let g = group(vec![
-            batched("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(1)),
-            batched("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok, Some(1)),
-            batched("read_file", r#"{"path":"b.rs"}"#, ToolStatus::Ok, Some(1)),
+            work_batched(r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(1)),
+            work_b_batched(r#"{"pattern":"x"}"#, ToolStatus::Ok, Some(1)),
+            work_batched(r#"{"path":"b.rs"}"#, ToolStatus::Ok, Some(1)),
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
@@ -5246,8 +5356,8 @@ mod tests {
     #[test]
     fn the_batch_header_is_localized() {
         let g = group(vec![
-            batched("read_file", r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(1)),
-            batched("grep", r#"{"pattern":"x"}"#, ToolStatus::Ok, Some(1)),
+            work_batched(r#"{"path":"a.rs"}"#, ToolStatus::Ok, Some(1)),
+            work_b_batched(r#"{"pattern":"x"}"#, ToolStatus::Ok, Some(1)),
         ]);
         let lines = render_group_text(&g, 100, Locale::En);
         assert!(
@@ -5324,10 +5434,12 @@ mod tests {
         );
     }
 
-    /// Reads and searches together are ONE exploration for the purpose of the
-    /// summary label, and four separate pieces of evidence below it.
+    /// Reads and searches together are ONE exploration receipt that counts by
+    /// KIND (`2 files, 2 searches`) — the reader still learns what the stretch
+    /// did, without a row per call. A failure is NOT folded: the failing target
+    /// must stay inspectable, so the stretch keeps its rows.
     #[test]
-    fn exploration_calls_share_one_summary_and_keep_four_rows() {
+    fn exploration_burst_is_one_receipt_counting_by_kind() {
         let g = group(vec![
             call(
                 "read_file",
@@ -5343,28 +5455,22 @@ mod tests {
             ),
         ]);
         let lines = render_group_text(&g, 80, Locale::Zh);
-        assert!(
-            lines[0].contains("检查代码库") && lines[0].contains("全部成功"),
-            "reads and searches together are one stage: {lines:?}"
+        assert_eq!(lines.len(), 1, "one receipt: {lines:?}");
+        assert_eq!(
+            lines[0].trim_end(),
+            "\u{203a} 读取 2 个文件 \u{b7} 搜索 2 次",
+            "{lines:?}"
         );
-        // …and when one of them fails, the stretch is named and counted.
+        // A failure keeps the stretch's rows so the failing target is visible.
         let mut with_failure = g.clone();
         with_failure.calls[1].status = ToolStatus::Failed;
         with_failure.calls[1].preview = Some("invalid regex".into());
         let failed_lines = render_group_text(&with_failure, 80, Locale::Zh);
+        let failed_text = failed_lines.join("\n");
+        assert!(failed_text.contains("invalid regex"), "{failed_lines:?}");
         assert!(
-            failed_lines[0].contains("检查代码库") && failed_lines[0].contains("失败"),
-            "reads and searches together are one exploration: {failed_lines:?}"
-        );
-        assert_eq!(
-            lines.iter().filter(|l| l.contains("读取文件")).count(),
-            2,
-            "both reads keep a row without expanding: {lines:?}"
-        );
-        assert_eq!(
-            lines.iter().filter(|l| l.contains("搜索代码")).count(),
-            2,
-            "both searches keep a row without expanding: {lines:?}"
+            failed_text.contains("dist"),
+            "the failing target stays on screen: {failed_lines:?}"
         );
     }
 
@@ -5936,8 +6042,8 @@ mod tests {
     #[test]
     fn expanded_group_reveals_output_details() {
         let mut g = group(vec![
-            call("grep", r#"{"pattern":"dist"}"#, ToolStatus::Ok),
-            call("grep", r#"{"pattern":"build"}"#, ToolStatus::Ok),
+            work_b(r#"{"pattern":"dist"}"#, ToolStatus::Ok),
+            work_b(r#"{"pattern":"build"}"#, ToolStatus::Ok),
         ]);
         g.expanded = true;
         let lines = render_group_text(&g, 80, Locale::Zh);

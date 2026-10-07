@@ -1486,7 +1486,7 @@ second line ignored"
     #[test]
     fn child_detail_does_not_include_reasoning_fields() {
         let mut state = test_state();
-        state.live_reasoning = "hidden chain of thought".into();
+        state.transcript.append_thought("hidden chain of thought");
         state
             .team
             .children

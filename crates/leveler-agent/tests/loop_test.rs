@@ -1082,7 +1082,7 @@ async fn revert_request_ends_with_one_summary_and_no_stall() {
     // 总结块 == 1: exactly one user-visible summary.
     let summaries = events
         .iter()
-        .filter(|e| matches!(e, AgentEvent::AssistantText(t) if !t.trim().is_empty()))
+        .filter(|e| matches!(e, AgentEvent::AssistantText { text, .. } if !text.trim().is_empty()))
         .count();
     assert_eq!(summaries, 1, "exactly one summary block: {events:?}");
     // 无冗余验证轮: revert + summary + resolve — nothing extra, and no hidden

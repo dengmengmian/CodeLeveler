@@ -84,11 +84,11 @@ fn streaming_output_estimate(state: &AppState) -> Option<u32> {
         })
         .map(estimate_tokens)
         .unwrap_or(0);
-    let thinking = if state.live_reasoning.is_empty() {
-        0
-    } else {
-        estimate_tokens(&state.live_reasoning)
-    };
+    let thinking = state
+        .transcript
+        .live_thought_text()
+        .map(estimate_tokens)
+        .unwrap_or(0);
     let total = visible.saturating_add(thinking);
     (total > 0).then_some(total)
 }
@@ -519,9 +519,9 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
                 {
                     t.reconnected.to_string()
                 } else {
-                    match (waiting_on_model, state.live_reasoning.is_empty()) {
-                        (true, false) => t.thinking.to_string(),
-                        (true, true) => t.waiting_model.to_string(),
+                    match (waiting_on_model, state.transcript.is_thinking()) {
+                        (true, true) => t.thinking.to_string(),
+                        (true, false) => t.waiting_model.to_string(),
                         (false, _) => state
                             .activity
                             .clone()
@@ -885,7 +885,7 @@ mod tests {
     fn streaming_reasoning_is_not_reported_as_waiting() {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
-        state.live_reasoning = "先确认环境，再决定怎么落盘……".repeat(20);
+        state.transcript.append_thought(&"先确认环境，再决定怎么落盘……".repeat(20));
         let status = status_line_content(&state, 120).to_string();
         assert!(status.contains("思考"), "status: {status}");
         assert!(!status.contains("等待模型"), "status: {status}");
@@ -897,7 +897,7 @@ mod tests {
     fn a_running_command_still_outranks_streaming_reasoning() {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
-        state.live_reasoning = "……".repeat(40);
+        state.transcript.append_thought(&"……".repeat(40));
         state.activity = Some("运行 cargo test".into());
         let status = status_line_content(&state, 120).to_string();
         assert!(status.contains("运行 cargo test"), "status: {status}");
@@ -1236,7 +1236,7 @@ mod tests {
         state.token_input = 51_360;
         state.token_output = 633;
         // Current round is streaming reasoning and nothing else yet.
-        state.live_reasoning = "思考".repeat(400);
+        state.transcript.append_thought(&"思考".repeat(400));
         let status = status_line_content(&state, 160).to_string();
         assert!(
             status.contains('~'),

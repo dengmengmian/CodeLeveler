@@ -769,7 +769,7 @@ async fn run_prepared_sub_agent(
                 *guard = ledger.findings.clone();
             }
         }
-        AgentEvent::AssistantText(text) if !text.trim().is_empty() => {
+        AgentEvent::AssistantText { text, .. } if !text.trim().is_empty() => {
             if let Ok(mut guard) = said_obs.lock() {
                 *guard = text.clone();
             }

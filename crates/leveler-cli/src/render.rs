@@ -34,10 +34,12 @@ fn render_event_text(event: AgentEvent) {
         // running totals reach the screen as SubAgentProgress instead.
         AgentEvent::SubAgentModelRequest { .. } => {}
         AgentEvent::AssistantDelta(_) => {}
+        AgentEvent::ReasoningStarted => {}
         AgentEvent::ReasoningDelta(_) => {}
+        AgentEvent::ReasoningCompleted { .. } => {}
         // Live command output; the finished tool result carries the record.
         AgentEvent::ToolOutput { .. } => {}
-        AgentEvent::AssistantText(text) => {
+        AgentEvent::AssistantText { text, .. } => {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
                 println!("{} {trimmed}", console::style("»").cyan());
@@ -285,11 +287,23 @@ fn event_jsonl(event: AgentEvent) -> serde_json::Value {
         AgentEvent::AssistantDelta(delta) => {
             serde_json::json!({ "type": "assistant_delta", "delta": delta })
         }
+        AgentEvent::ReasoningStarted => {
+            serde_json::json!({ "type": "reasoning_started" })
+        }
         AgentEvent::ReasoningDelta(delta) => {
             serde_json::json!({ "type": "reasoning_delta", "delta": delta })
         }
-        AgentEvent::AssistantText(text) => {
-            serde_json::json!({ "type": "assistant_text", "text": text })
+        AgentEvent::ReasoningCompleted { elapsed_ms } => {
+            serde_json::json!({ "type": "reasoning_completed", "elapsed_ms": elapsed_ms })
+        }
+        AgentEvent::AssistantText {
+            text, reasoning, ..
+        } => {
+            serde_json::json!({
+                "type": "assistant_text",
+                "text": text,
+                "reasoning": reasoning,
+            })
         }
         AgentEvent::ToolCall {
             id,

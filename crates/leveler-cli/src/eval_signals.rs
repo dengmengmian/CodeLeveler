@@ -202,8 +202,10 @@ impl SignalCollector {
             AgentEvent::StreamAttemptStarted
             | AgentEvent::AdvisoryStarted { .. }
             | AgentEvent::AssistantDelta(_)
+            | AgentEvent::ReasoningStarted
             | AgentEvent::ReasoningDelta(_)
-            | AgentEvent::AssistantText(_)
+            | AgentEvent::ReasoningCompleted { .. }
+            | AgentEvent::AssistantText { .. }
             | AgentEvent::ToolCall { .. }
             | AgentEvent::ToolResult { .. }
             | AgentEvent::PlanUpdated { .. }

@@ -653,6 +653,14 @@ pub struct UiText {
     // Reasoning / queue footer
     pub thinking: &'static str,
     pub thinking_lines: &'static str, // " · {} 行"
+    /// Header of a Thought while its reasoning still streams.
+    pub thought_live: &'static str,
+    /// Header of a completed Thought; `{}` is the measured duration.
+    pub thought_for: &'static str,
+    /// Header of a Thought whose stream was cut; `{}` is the elapsed it got.
+    pub thought_interrupted: &'static str,
+    /// Header of a cut Thought whose elapsed could not be measured.
+    pub thought_interrupted_bare: &'static str,
 
     // Slash command descriptions (same order as screen::SLASH_COMMANDS)
     pub slash: SlashText,
@@ -963,6 +971,16 @@ pub struct UiText {
     pub disclosure_search: &'static str,
     /// Closed mixed exploration.
     pub disclosure_explore: &'static str,
+    /// Compact exploration receipt (Search/Read/List): counts by KIND in one
+    /// line instead of a row per call. `{}` is the count.
+    pub receipt_read: &'static str,
+    pub receipt_search: &'static str,
+    pub receipt_list: &'static str,
+    /// The live counterpart of the receipt, so a running stretch states a
+    /// progress verb instead of a past-tense outcome.
+    pub receipt_running_read: &'static str,
+    pub receipt_running_search: &'static str,
+    pub receipt_running_list: &'static str,
     pub disclosure_parallel: &'static str,
     /// The LIVE counterpart of the labels above: what a group's stage row says
     /// while the stretch is still in flight. Only a running verb plus the count
@@ -1532,6 +1550,10 @@ static ZH: UiText = UiText {
     candidate_files: "候选文件（{}）",
     thinking: "思考",
     thinking_lines: " · {} 行",
+    thought_live: "思考中…",
+    thought_for: "已思考 {}",
+    thought_interrupted: "思考中断 · {}",
+    thought_interrupted_bare: "思考中断",
     slash: SlashText {
         model: "切换使用的 AI 模型",
         thinking: "调整模型思考强度：/thinking [auto|off|minimal|low|medium|high|max|reset]",
@@ -1821,6 +1843,12 @@ static ZH: UiText = UiText {
     disclosure_read_many: "读取 {} 个文件",
     disclosure_search: "搜索代码库",
     disclosure_explore: "检查代码库",
+    receipt_read: "读取 {} 个文件",
+    receipt_search: "搜索 {} 次",
+    receipt_list: "列出 {} 个目录",
+    receipt_running_read: "正在读取 · {} 个文件",
+    receipt_running_search: "正在搜索 · {} 次",
+    receipt_running_list: "正在列出 · {} 个目录",
     disclosure_parallel: "并行完成 {} 项操作",
     disclosure_running_shell_one: "正在执行 · 1 个命令",
     disclosure_running_shell_many: "正在执行 · {} 个命令",
@@ -2292,6 +2320,10 @@ static EN: UiText = UiText {
     candidate_files: "Candidate files ({})",
     thinking: "thinking",
     thinking_lines: " · {} lines",
+    thought_live: "Thinking…",
+    thought_for: "Thought for {}",
+    thought_interrupted: "Thought interrupted after {}",
+    thought_interrupted_bare: "Thought interrupted",
     slash: SlashText {
         model: "switch AI model",
         thinking: "how hard the model thinks: /thinking [auto|off|minimal|low|medium|high|max|reset]",
@@ -2581,6 +2613,12 @@ static EN: UiText = UiText {
     disclosure_read_many: "Read {} files",
     disclosure_search: "Searched codebase",
     disclosure_explore: "Inspected the codebase",
+    receipt_read: "Read {} files",
+    receipt_search: "Searched {} patterns",
+    receipt_list: "Listed {} dirs",
+    receipt_running_read: "Reading {} files",
+    receipt_running_search: "Searching {} patterns",
+    receipt_running_list: "Listing {} dirs",
     disclosure_parallel: "Completed {} operations in parallel",
     disclosure_running_shell_one: "Running · 1 shell command",
     disclosure_running_shell_many: "Running · {} shell commands",

@@ -227,9 +227,10 @@ fn a_homogeneous_shell_round_names_the_tool() {
     );
 }
 
-/// B — three reads in one round read as `读取文件 · 完成 3 项`.
+/// B — three reads in one round read as ONE compact receipt (`读取 3 个文件`),
+/// not a row per file and not a per-tool count line.
 #[test]
-fn a_homogeneous_read_round_names_the_tool() {
+fn a_homogeneous_read_round_reads_as_one_receipt() {
     let mut s = opened();
     next_assistant(&mut s, "a1");
     read_in_round(&mut s, "r1", "src/a.rs", 1);
@@ -239,18 +240,18 @@ fn a_homogeneous_read_round_names_the_tool() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("读取文件"))
-        .unwrap_or_else(|| panic!("the read round names the tool: {t:?}"));
-    assert!(head.contains("完成 3 项"), "it counts all three: {head:?}");
+        .find(|l| l.contains("读取") && l.contains("3 个文件"))
+        .unwrap_or_else(|| panic!("the read round is a receipt: {t:?}"));
+    assert!(!head.contains("完成 3 项"), "it is not a run head: {head:?}");
     assert!(
-        !head.contains("项操作"),
-        "it is not the mixed fallback: {head:?}"
+        !t.iter().any(|l| l.contains("src/a.rs")),
+        "no per-file waterfall: {t:?}"
     );
 }
 
-/// C — two searches in one round read as `搜索代码 · 完成 2 项`.
+/// C — two searches in one round read as `搜索 2 次`.
 #[test]
-fn a_homogeneous_search_round_names_the_tool() {
+fn a_homogeneous_search_round_reads_as_one_receipt() {
     let mut s = opened();
     next_assistant(&mut s, "a1");
     search_in_round(&mut s, "g1", "fn main", 1);
@@ -259,13 +260,9 @@ fn a_homogeneous_search_round_names_the_tool() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("搜索代码"))
-        .unwrap_or_else(|| panic!("the search round names the tool: {t:?}"));
-    assert!(head.contains("完成 2 项"), "it counts both: {head:?}");
-    assert!(
-        !head.contains("项操作"),
-        "it is not the mixed fallback: {head:?}"
-    );
+        .find(|l| l.contains("搜索") && l.contains("2 次"))
+        .unwrap_or_else(|| panic!("the search round is a receipt: {t:?}"));
+    assert!(!head.contains("完成 2 项"), "it is not a run head: {head:?}");
 }
 
 /// A mixed round (a command and a read) still reads as one lightweight node:

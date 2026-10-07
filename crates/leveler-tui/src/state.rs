@@ -248,12 +248,6 @@ pub struct AppState {
     /// state. Never part of the main transcript, and never merged into the
     /// main run's context.
     pub btw: crate::btw::BtwThread,
-    /// Live raw-reasoning scratch. Feeds ONLY the status line's thinking
-    /// indicator/token estimate — never rendered into the conversation, never
-    /// persisted, cleared at every segment boundary (tool start, assistant
-    /// start, turn end). Raw reasoning is not conversation content, and there
-    /// is deliberately no historical representation of it at all.
-    pub live_reasoning: String,
     /// Background task id → chrome, remembered from the start event so the
     /// status line can name what is running and its exit can name what
     /// finished. The exit event carries only the id. A terminal entry is kept
@@ -576,7 +570,6 @@ impl AppState {
             transcript: TranscriptState::new(),
             surface: crate::btw::SurfaceFocus::Main,
             btw: crate::btw::BtwThread::default(),
-            live_reasoning: String::new(),
             background_task_labels: std::collections::HashMap::new(),
             team: crate::multi_agent::TaskTeamView::default(),
             unfinished_goals: Vec::new(),

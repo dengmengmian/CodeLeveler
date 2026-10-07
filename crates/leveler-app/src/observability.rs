@@ -585,7 +585,9 @@ fn project_event(rec: &EventRecord, ev: &EngineEvent) -> Option<UiObservationRow
         | EngineEvent::SubAgentTranscriptAppended { .. }
         | EngineEvent::AssistantMessage { .. }
         | EngineEvent::AssistantDelta { .. }
+        | EngineEvent::ReasoningStarted
         | EngineEvent::ReasoningDelta { .. }
+        | EngineEvent::ReasoningCompleted { .. }
         | EngineEvent::EvidenceLedgerUpdated { .. }
         | EngineEvent::ProgressUpdated { .. }
         | EngineEvent::TokenUsage { .. } => return None,

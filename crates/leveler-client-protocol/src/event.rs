@@ -254,6 +254,14 @@ pub enum RuntimeEvent {
     },
     /// A chunk of model reasoning/summary, rendered separately from the answer.
     ReasoningDelta { delta: String },
+    /// A model reasoning segment began. Presentation opens ONE mutable
+    /// reasoning block on this; it must not append a new transcript item.
+    ReasoningStarted,
+    /// The current reasoning segment ended cleanly. `elapsed_ms` is the
+    /// runtime's own measurement of the segment. Presentation freezes its
+    /// mutable block into an immutable history item on this. A segment that
+    /// never receives this was interrupted, not completed.
+    ReasoningCompleted { elapsed_ms: u64 },
     /// The assistant message is complete.
     AssistantMessageCompleted { message_id: MessageId },
     /// The assistant has produced its final response, while the runtime is

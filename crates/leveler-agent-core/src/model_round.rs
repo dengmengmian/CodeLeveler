@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use leveler_model::{
     ContentPart, DeliveryState, FinishReason, Message, ModelError, ModelErrorKind, ModelEvent,
-    ModelRequest, ModelRuntime, Role, StreamProgress, TokenUsage, ToolCall, TransportFault,
+    ModelRequest, ModelRuntime, ReasoningSegment, Role, StreamProgress, TokenUsage, ToolCall,
+    TransportFault,
 };
 
 use crate::error::AgentCoreError;
@@ -48,6 +49,12 @@ pub struct ModelRound {
     /// The transcript estimate that stood in for usage when the provider
     /// reported none; `None` when usage was reported.
     pub estimated_tokens: Option<u64>,
+    /// Displayable reasoning segments the model produced this round, each with
+    /// the runtime's own measured duration, in the order they were produced.
+    /// Empty when the model reasoned nothing. A host records this on the
+    /// durable assistant-message projection so a reopened transcript can
+    /// render a completed Thought; it never enters the model context.
+    pub reasoning_segments: Vec<ReasoningSegment>,
 }
 
 impl ModelRound {
@@ -490,6 +497,26 @@ async fn wait_for_deadline(deadline: Option<std::time::Instant>) {
     }
 }
 
+/// Close an open reasoning segment at a real stream boundary. `None` is a
+/// no-op, so every boundary can call it unconditionally.
+///
+/// The segment lifecycle is synthesized here, not carried by the provider:
+/// [`ModelEvent`] normalizes reasoning *content* only, and this is the one
+/// place that observes the boundaries between reasoning and the answer or a
+/// tool call. The closed segment is recorded with its measured duration so a
+/// host can persist one displayable Thought per segment.
+fn close_reasoning_segment(
+    segment: &mut Option<(std::time::Instant, String)>,
+    segments: &mut Vec<ReasoningSegment>,
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
+) {
+    if let Some((started, text)) = segment.take() {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        on_event(AgentEvent::ReasoningCompleted { elapsed_ms: duration_ms });
+        segments.push(ReasoningSegment { text, duration_ms });
+    }
+}
+
 /// Stream one model round, preserving the provider's terminal reason. A
 /// stream that ends without a terminal event is never treated as success.
 #[derive(Default)]
@@ -552,6 +579,17 @@ async fn stream_round(
     // text never enters the user-visible transcript.
     let mut reasoning = String::new();
     let mut reasoning_started = false;
+    // The open reasoning SEGMENT, if any. `Some` from the segment's first
+    // delta until a real boundary (answer text, a tool call, canonical
+    // content, message completion, or a clean stream end). A segment that
+    // never closes cleanly was interrupted: no `ReasoningCompleted` is
+    // emitted for it, so presentation cannot mistake it for a finished
+    // Thought. One message may carry several segments (Anthropic thinking
+    // blocks), so this is per-segment state, never a single message-level
+    // duration.
+    let mut reasoning_segment: Option<(std::time::Instant, String)> = None;
+    // Segments closed cleanly this attempt, for the durable projection.
+    let mut reasoning_segments: Vec<ReasoningSegment> = Vec::new();
     let mut calls: Vec<ToolCall> = Vec::new();
     // Whether the model had begun describing a tool call before a cut. An
     // unfinished call is never executed, but it IS output the model produced,
@@ -617,10 +655,13 @@ async fn stream_round(
         }
         match event {
             Ok(ModelEvent::MessageContent { content }) if !completed => {
+                close_reasoning_segment(&mut reasoning_segment, &mut reasoning_segments, on_event);
                 canonical_content = Some(content)
             }
             Ok(ModelEvent::TextDelta { delta }) if !completed => {
                 if !delta.is_empty() {
+                    // Answer text is the reasoning segment's clean end.
+                    close_reasoning_segment(&mut reasoning_segment, &mut reasoning_segments, on_event);
                     output_estimate.add_text(&delta);
                     text.push_str(&delta);
                     on_event(AgentEvent::AssistantDelta(delta));
@@ -628,6 +669,16 @@ async fn stream_round(
             }
             Ok(ModelEvent::ReasoningDelta { delta }) if !completed => {
                 if !delta.is_empty() {
+                    if reasoning_segment.is_none() {
+                        reasoning_segment = Some((std::time::Instant::now(), String::new()));
+                        on_event(AgentEvent::ReasoningStarted);
+                    }
+                    // The segment's own text is what the durable projection
+                    // records; `reasoning` below stays the provider's joined
+                    // field for passback.
+                    if let Some((_, segment_text)) = reasoning_segment.as_mut() {
+                        segment_text.push_str(&delta);
+                    }
                     reasoning_started = true;
                     output_estimate.add_text(&delta);
                     reasoning.push_str(&delta);
@@ -638,20 +689,26 @@ async fn stream_round(
                 reasoning_started |= bytes > 0;
                 output_estimate.add_opaque_bytes(bytes);
             }
-            Ok(ModelEvent::ToolCallCompleted { call }) if !completed => calls.push(call),
+            Ok(ModelEvent::ToolCallCompleted { call }) if !completed => {
+                close_reasoning_segment(&mut reasoning_segment, &mut reasoning_segments, on_event);
+                calls.push(call)
+            }
             // A tool call the model began describing but had not finished. The
             // arguments are never joined, so the call is not executable; the
             // fact that output started is what matters for retry safety.
             Ok(ModelEvent::ToolCallArgumentsDelta { delta, .. }) if !completed => {
+                close_reasoning_segment(&mut reasoning_segment, &mut reasoning_segments, on_event);
                 output_estimate.add_tool(&delta);
                 tool_args_started = true;
             }
             Ok(ModelEvent::ToolCallStarted { .. }) if !completed => {
+                close_reasoning_segment(&mut reasoning_segment, &mut reasoning_segments, on_event);
                 tool_args_started = true;
             }
             Ok(ModelEvent::MessageCompleted {
                 finish_reason: reason,
             }) => {
+                close_reasoning_segment(&mut reasoning_segment, &mut reasoning_segments, on_event);
                 finish_reason = Some(reason);
                 diagnostics.finish_reason = Some(reason);
                 completed = true;
@@ -780,6 +837,7 @@ async fn stream_round(
         retry_count: 0,
         cost_usd_micros: None,
         estimated_tokens: None,
+        reasoning_segments,
     })
 }
 
@@ -1978,6 +2036,170 @@ mod reasoning_assembly_tests {
             e,
             AgentEvent::AssistantDelta(d) if d == "answer"
         )));
+    }
+
+    fn reasoning_request() -> ModelRequest {
+        ModelRequest::new(
+            leveler_model::ModelRef::new("mock", "m"),
+            vec![Message::text(Role::User, "hi")],
+        )
+    }
+
+    /// The reasoning lifecycle as the consumer sees it, in order.
+    fn reasoning_shape(events: &[AgentEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ReasoningStarted => Some("started"),
+                AgentEvent::ReasoningDelta(_) => Some("delta"),
+                AgentEvent::ReasoningCompleted { .. } => Some("completed"),
+                AgentEvent::AssistantDelta(_) => Some("assistant"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// REASONING-A1: answer text closes the segment cleanly, once, after every
+    /// delta and before the answer delta.
+    #[tokio::test]
+    async fn answer_text_brackets_one_reasoning_segment() {
+        let runtime = ScriptedStreamRuntime {
+            events: vec![
+                ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::new("r"),
+                },
+                ModelEvent::ReasoningDelta { delta: "a".into() },
+                ModelEvent::ReasoningDelta { delta: "b".into() },
+                ModelEvent::TextDelta {
+                    delta: "answer".into(),
+                },
+                ModelEvent::MessageCompleted {
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        };
+        let mut events = Vec::new();
+        run_model_round(
+            &runtime,
+            reasoning_request(),
+            &CancellationToken::new(),
+            &mut |e| events.push(e),
+        )
+        .await
+        .expect("scripted stream completes");
+
+        assert_eq!(
+            reasoning_shape(&events),
+            vec!["started", "delta", "delta", "completed", "assistant"]
+        );
+    }
+
+    /// REASONING-A2: a tool call is a real boundary too — reasoning is frozen
+    /// before the call, not left dangling into the tool execution.
+    #[tokio::test]
+    async fn tool_call_closes_the_reasoning_segment() {
+        let runtime = ScriptedStreamRuntime {
+            events: vec![
+                ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::new("r"),
+                },
+                ModelEvent::ReasoningDelta {
+                    delta: "think".into(),
+                },
+                ModelEvent::ToolCallCompleted {
+                    call: ToolCall {
+                        id: leveler_core::ToolCallId::new("c1"),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+                ModelEvent::MessageCompleted {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+        };
+        let mut events = Vec::new();
+        run_model_round(
+            &runtime,
+            reasoning_request(),
+            &CancellationToken::new(),
+            &mut |e| events.push(e),
+        )
+        .await
+        .expect("scripted stream completes");
+
+        assert_eq!(reasoning_shape(&events), vec!["started", "delta", "completed"]);
+    }
+
+    /// REASONING-A3: one message may carry several reasoning segments (block
+    /// protocols such as Anthropic thinking blocks). Each is bracketed on its
+    /// own, so a single message-level duration would be wrong.
+    #[tokio::test]
+    async fn each_reasoning_segment_is_bracketed_separately() {
+        let runtime = ScriptedStreamRuntime {
+            events: vec![
+                ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::new("r"),
+                },
+                ModelEvent::ReasoningDelta { delta: "one".into() },
+                ModelEvent::TextDelta {
+                    delta: "mid".into(),
+                },
+                ModelEvent::ReasoningDelta { delta: "two".into() },
+                ModelEvent::MessageCompleted {
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        };
+        let mut events = Vec::new();
+        run_model_round(
+            &runtime,
+            reasoning_request(),
+            &CancellationToken::new(),
+            &mut |e| events.push(e),
+        )
+        .await
+        .expect("scripted stream completes");
+
+        assert_eq!(
+            reasoning_shape(&events),
+            vec!["started", "delta", "completed", "assistant", "started", "delta", "completed"]
+        );
+    }
+
+    /// REASONING-A4: a stream that breaks mid-reasoning never emits
+    /// `ReasoningCompleted`. Presentation must therefore treat an open segment
+    /// as interrupted, never as a finished Thought.
+    #[tokio::test]
+    async fn interrupted_reasoning_never_reports_completed() {
+        let runtime = ScriptedStreamRuntime {
+            events: vec![
+                ModelEvent::MessageStarted {
+                    request_id: leveler_core::RequestId::new("r"),
+                },
+                ModelEvent::ReasoningDelta {
+                    delta: "half a thought".into(),
+                },
+                ModelEvent::Error {
+                    error: ModelError::new(ModelErrorKind::Decode, "malformed chunk"),
+                },
+            ],
+        };
+        let mut events = Vec::new();
+        let result = run_model_round_with(
+            &runtime,
+            reasoning_request(),
+            &CancellationToken::new(),
+            &mut |e| events.push(e),
+            RetryPolicy {
+                max_retries: 0,
+                delay_scale: 0.0,
+            },
+        )
+        .await;
+
+        assert!(result.is_err(), "the broken stream is not a success");
+        assert_eq!(reasoning_shape(&events), vec!["started", "delta"]);
     }
 }
 

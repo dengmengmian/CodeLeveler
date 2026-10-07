@@ -3256,7 +3256,7 @@ fn switching_session_resets_per_session_state_but_resync_keeps_it() {
     s.context_tokens = 4242;
     s.token_input = 100;
     s.diff_selected = 3;
-    s.live_reasoning = "old thinking".into();
+    s.transcript.append_thought("old thinking");
 
     // Open a DIFFERENT session → per-session view state must reset.
     let mut other = snapshot();
@@ -3269,7 +3269,7 @@ fn switching_session_resets_per_session_state_but_resync_keeps_it() {
     assert_eq!(s.token_input, 0);
     assert_eq!(s.diff_selected, 0);
     assert!(
-        s.live_reasoning.is_empty(),
+        !s.transcript.is_thinking(),
         "switching sessions must not carry another session's live reasoning"
     );
 
@@ -5624,16 +5624,21 @@ fn activity_clears_when_the_tool_completes() {
         s.activity.is_none(),
         "a finished tool must not linger in the status line while the model thinks"
     );
-    // Raw reasoning has no conversation representation at all: the tool
-    // boundary spent the status scratch, and no transcript item ever existed.
-    assert!(s.live_reasoning.is_empty(), "scratch spent at the boundary");
-    assert!(
-        !s.transcript
-            .items()
-            .iter()
-            .any(|i| { format!("{i:?}").contains("previous-step analysis") }),
-        "raw reasoning must not survive anywhere in the transcript"
-    );
+    // The reasoning that preceded the tool is now a frozen Thought in history
+    // (the runtime never reported a boundary, so it reads interrupted), not a
+    // status scratch that vanishes.
+    assert!(!s.transcript.is_thinking());
+    let thought = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|i| match i {
+            TranscriptItem::Thought(b) => Some(b),
+            _ => None,
+        })
+        .expect("reasoning is preserved as a Thought");
+    assert!(thought.done && thought.interrupted);
+    assert_eq!(thought.text, "previous-step analysis");
 }
 
 /// One background lifecycle reads as one named activity: the start names
@@ -6193,7 +6198,7 @@ fn ctrl_down_also_requests_jump_to_bottom() {
 }
 
 #[test]
-fn a_new_model_step_replaces_the_previous_step_reasoning() {
+fn a_new_model_step_opens_a_new_thought_history_keeps_the_old() {
     let mut s = opened();
     // Step 1: the model thinks, then calls a tool. A tool-only step never emits
     // assistant text, so nothing closes the thought except the tool call itself.
@@ -6228,7 +6233,8 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
     );
 
     // Step 2: the model thinks again. This is a new thought, not a continuation
-    // of the last one — it must replace it, not concatenate onto it.
+    // of the last one — it must be its own Thought, and step 1's must be frozen
+    // history rather than overwritten.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ReasoningDelta {
@@ -6236,17 +6242,21 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
         }),
     );
 
-    // The new step's reasoning replaces the old in the status scratch —
-    // the earlier step's text was spent at the tool boundary and has no
-    // representation anywhere.
-    assert_eq!(s.live_reasoning, "再补测试");
-    assert!(
-        !s.transcript
-            .items()
-            .iter()
-            .any(|i| { format!("{i:?}").contains("先读一遍源码") }),
-        "the previous step's reasoning is gone, not archived"
-    );
+    let thoughts: Vec<&leveler_tui::transcript::ThoughtBlock> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            TranscriptItem::Thought(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thoughts.len(), 2, "each model step is its own Thought");
+    assert!(thoughts[0].done, "step 1's Thought is frozen history");
+    assert_eq!(thoughts[0].text, "先读一遍源码");
+    assert!(!thoughts[1].done);
+    assert_eq!(thoughts[1].text, "再补测试");
+    assert!(s.transcript.is_thinking());
 }
 
 #[test]
@@ -6282,9 +6292,14 @@ fn retry_attempt_reset_removes_divergent_transient_output() {
     assert!(s.transcript.items().iter().all(|item| {
         !matches!(item, TranscriptItem::Assistant(block) if block.text == "wrong prefix")
     }));
-    // The retried attempt's reasoning is sealed history, not live state:
-    // nothing streams until the retry produces a new delta.
-    assert!(s.live_reasoning.is_empty());
+    // The retried attempt's reasoning is dropped, not sealed: nothing streams
+    // and no Thought was archived for the abandoned attempt.
+    assert!(!s.transcript.is_thinking());
+    assert!(!s
+        .transcript
+        .items()
+        .iter()
+        .any(|i| matches!(i, TranscriptItem::Thought(_))));
 }
 
 #[test]
@@ -9362,10 +9377,10 @@ fn a_replayed_session_shows_every_message_in_full() {
     );
 }
 
-/// Reasoning is status scratch, not conversation content — the bound must not
-/// have turned it into a foldable transcript block.
+/// Reasoning is its own conversation content, never assistant prose: it gets
+/// one Thought block and the turn still has exactly one assistant block.
 #[test]
-fn raw_reasoning_still_never_reaches_the_conversation() {
+fn reasoning_renders_as_a_thought_not_assistant_prose() {
     let mut s = state();
     reduce(
         &mut s,
@@ -9377,10 +9392,19 @@ fn raw_reasoning_still_never_reaches_the_conversation() {
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
     let text = rendered(&mut s, 100, 30);
     assert!(
-        !text.contains("wants me"),
-        "raw reasoning leaked into the conversation: {text}"
+        text.contains("wants me"),
+        "the provider's reasoning is shown as a Thought: {text}"
     );
     assert_eq!(assistant_indexes(&s).len(), 1, "one assistant block only");
+    assert_eq!(
+        s.transcript
+            .items()
+            .iter()
+            .filter(|i| matches!(i, TranscriptItem::Thought(_)))
+            .count(),
+        1,
+        "one Thought block"
+    );
 }
 
 fn snapshot_child(

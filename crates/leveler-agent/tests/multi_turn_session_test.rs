@@ -865,7 +865,7 @@ async fn engine_chat_command_spend_forces_budget_on_next_request() {
         EngineEvent::TurnFinished { stop_reason, .. } => {
             stop_reason.contains("Budget") || stop_reason.contains("budget")
         }
-        EngineEvent::AssistantMessage { text } => {
+        EngineEvent::AssistantMessage { text, .. } => {
             text.contains("command") && text.contains("budget")
         }
         _ => false,

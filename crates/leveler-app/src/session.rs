@@ -55,8 +55,14 @@ pub fn engine_event_to_agent(event: EngineEvent) -> Option<AgentEvent> {
     Some(match event {
         EngineEvent::StreamAttemptStarted => AgentEvent::StreamAttemptStarted,
         EngineEvent::AssistantDelta { text } => AgentEvent::AssistantDelta(text),
+        EngineEvent::ReasoningStarted => AgentEvent::ReasoningStarted,
         EngineEvent::ReasoningDelta { text } => AgentEvent::ReasoningDelta(text),
-        EngineEvent::AssistantMessage { text } => AgentEvent::AssistantText(text),
+        EngineEvent::ReasoningCompleted { elapsed_ms } => {
+            AgentEvent::ReasoningCompleted { elapsed_ms }
+        }
+        EngineEvent::AssistantMessage { text, reasoning } => {
+            AgentEvent::AssistantText { text, reasoning }
+        }
         EngineEvent::ToolCallStarted {
             call_id,
             name,

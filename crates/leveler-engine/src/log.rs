@@ -989,9 +989,7 @@ mod tests {
 
         // The forward closure runs the durability check: at forward time the
         // row must already be readable.
-        let event = EngineEvent::AssistantMessage {
-            text: "hi".to_string(),
-        };
+        let event = EngineEvent::AssistantMessage { text: "hi".to_string(), reasoning: Vec::new() };
         // Peek from inside a sync closure via a channel; assert afterwards.
         let (tx, rx) = std::sync::mpsc::channel();
         log.append(None, event.clone(), &mut |forwarded| {
@@ -1472,20 +1470,12 @@ mod tests {
         let (db, session) = db_with_session().await;
         let log = EventLog::new(&db, session.clone());
         let events = [
-            EngineEvent::AssistantMessage {
-                text: "starting".into(),
-            },
+            EngineEvent::AssistantMessage { text: "starting".into(), reasoning: Vec::new() },
             // The R007 accident narration (ends with `PASSWORD:` at the string
             // boundary) plus a real secret in the same session.
-            EngineEvent::AssistantMessage {
-                text: "Secrets 标签页有 \"Add new\" 按钮。点击添加 secret PASSWORD:".into(),
-            },
-            EngineEvent::AssistantMessage {
-                text: "and the value is password: hunter2-durable-secret".into(),
-            },
-            EngineEvent::AssistantMessage {
-                text: "done".into(),
-            },
+            EngineEvent::AssistantMessage { text: "Secrets 标签页有 \"Add new\" 按钮。点击添加 secret PASSWORD:".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage { text: "and the value is password: hunter2-durable-secret".into(), reasoning: Vec::new() },
+            EngineEvent::AssistantMessage { text: "done".into(), reasoning: Vec::new() },
         ];
         for event in events {
             log.append(None, event, &mut |_| {}).await.unwrap();
@@ -1507,7 +1497,7 @@ mod tests {
         assert_eq!(replayed.len(), 4);
         assert!(matches!(
             &replayed[1],
-            EngineEvent::AssistantMessage { text } if text.ends_with("PASSWORD:")
+            EngineEvent::AssistantMessage { text, .. } if text.ends_with("PASSWORD:")
         ));
     }
 
@@ -1522,7 +1512,7 @@ mod tests {
         let log = EventLog::new(&store, session.clone());
         log.append(
             None,
-            EngineEvent::AssistantMessage { text: "ok".into() },
+            EngineEvent::AssistantMessage { text: "ok".into(), reasoning: Vec::new() },
             &mut |_| {},
         )
         .await

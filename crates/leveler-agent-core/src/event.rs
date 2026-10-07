@@ -12,9 +12,21 @@ pub enum AgentEvent {
     StreamAttemptStarted,
     /// A streamed chunk of assistant text.
     AssistantDelta(String),
+    /// A model reasoning segment began. Synthesized from the first non-empty
+    /// [`AgentEvent::ReasoningDelta`] of the segment — never from a provider
+    /// lifecycle event, because the normalized provider vocabulary carries
+    /// reasoning content only (see `model_round::stream_round`). Transient:
+    /// presentation opens one mutable reasoning block on this.
+    ReasoningStarted,
     /// A streamed chunk of model reasoning, rendered separately from the
     /// final assistant answer.
     ReasoningDelta(String),
+    /// The current reasoning segment ended at the next non-reasoning output
+    /// (answer text or a tool call) or at the end of the message, cleanly.
+    /// `elapsed_ms` measures from the segment's first delta to this boundary.
+    /// Transient: presentation freezes its mutable block into history on this.
+    /// A segment that never reaches this event was interrupted, not completed.
+    ReasoningCompleted { elapsed_ms: u64 },
     /// Token usage the model reported for a request (may arrive mid-stream or
     /// at the end).
     Usage(TokenUsage),

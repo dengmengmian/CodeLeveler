@@ -41,6 +41,27 @@ pub struct AssistantBlock {
     pub kind: AssistantKind,
 }
 
+/// One model reasoning segment, presented as a Thought.
+///
+/// It carries the provider's own reasoning text and nothing else: if the
+/// provider returned no reasoning, no Thought is created. Live while deltas
+/// stream, immutable once `done`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThoughtBlock {
+    pub text: String,
+    pub done: bool,
+    /// The runtime's measured duration, once completed. `None` while live and
+    /// on an interrupted segment, where no clean boundary was reached.
+    pub duration_ms: Option<u64>,
+    /// The segment never received the runtime's completion (cancel, timeout,
+    /// stream break). Presentation only: it is never presented as finished.
+    pub interrupted: bool,
+    /// When the live block opened. Lets an interrupted segment report the
+    /// elapsed it actually got instead of a fabricated zero; `None` once the
+    /// block is frozen.
+    pub live_since: Option<std::time::Instant>,
+}
+
 /// The lifecycle state of a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -333,6 +354,9 @@ pub const USER_SHELL_OUTPUT_CAP: usize = 64 * 1024;
 pub enum TranscriptItem {
     User(String),
     Assistant(AssistantBlock),
+    /// Model reasoning, persisted from the provider's own reasoning text. Live
+    /// while streaming, immutable once done.
+    Thought(ThoughtBlock),
     ToolGroup(ToolGroupBlock),
     /// Visible model reasoning. Not a disclosure: rendered directly.
     SubAgent(SubAgentBlock),
@@ -355,6 +379,12 @@ pub enum TranscriptItem {
     Recap(RecapBlock),
     /// Durable goal checkpoint presentation (`✽ 阶段回顾`), click-expandable.
     GoalRecap(GoalRecapBlock),
+}
+
+/// Whether this item is a reasoning block still streaming. The ONE definition
+/// of "the live Thought", used by the writer and the reader.
+fn is_open_thought(item: &TranscriptItem) -> bool {
+    matches!(item, TranscriptItem::Thought(block) if !block.done)
 }
 
 /// The ordered list of transcript blocks.
@@ -717,6 +747,99 @@ impl TranscriptState {
         }
     }
 
+    /// Open a live reasoning block. A second start for the same segment is a
+    /// no-op, so a duplicate event cannot create two Thought blocks.
+    pub fn begin_thought(&mut self) {
+        self.bump();
+        if self.has_open_thought() {
+            return;
+        }
+        self.close_tool_group();
+        self.items.push(TranscriptItem::Thought(ThoughtBlock {
+            text: String::new(),
+            done: false,
+            duration_ms: None,
+            interrupted: false,
+            live_since: Some(std::time::Instant::now()),
+        }));
+    }
+
+    /// Append streamed reasoning to the open block, opening one if needed.
+    ///
+    /// This is what keeps a live Thought a SINGLE mutable block: every delta
+    /// grows the same item in place instead of appending a new transcript item.
+    pub fn append_thought(&mut self, delta: &str) {
+        self.bump();
+        if let Some(index) = self.items.iter().rposition(is_open_thought) {
+            if let Some(TranscriptItem::Thought(block)) = self.items.get_mut(index) {
+                block.text.push_str(delta);
+            }
+            return;
+        }
+        self.close_tool_group();
+        self.items.push(TranscriptItem::Thought(ThoughtBlock {
+            text: delta.to_string(),
+            done: false,
+            duration_ms: None,
+            interrupted: false,
+            live_since: Some(std::time::Instant::now()),
+        }));
+    }
+
+    /// Freeze the open reasoning block into immutable history.
+    ///
+    /// `duration_ms` is the runtime's own measurement. `None` means the runtime
+    /// never reported a clean boundary, so the segment is marked interrupted —
+    /// an interrupted Thought is never presented as a finished one.
+    pub fn finish_thought(&mut self, duration_ms: Option<u64>) {
+        if !self.has_open_thought() {
+            return;
+        }
+        self.bump();
+        let open = self.items.iter().rposition(is_open_thought);
+        if let Some(TranscriptItem::Thought(block)) =
+            open.and_then(|index| self.items.get_mut(index))
+        {
+            // A clean completion reports the runtime's own measurement. A
+            // boundary without one is INTERRUPTED, and reports the elapsed the
+            // segment actually got — never a fabricated zero and never a
+            // completion claim.
+            block.done = true;
+            block.interrupted = duration_ms.is_none();
+            block.duration_ms = duration_ms.or_else(|| {
+                block
+                    .live_since
+                    .map(|started| started.elapsed().as_millis() as u64)
+            });
+            block.live_since = None;
+        }
+    }
+
+    /// Discard an open reasoning block. A retried attempt's partial reasoning is
+    /// spent with the deltas it arrived in, not a Thought.
+    pub fn reset_thought(&mut self) {
+        self.bump();
+        self.items.retain(|item| !is_open_thought(item));
+    }
+
+    fn has_open_thought(&self) -> bool {
+        self.items.iter().any(is_open_thought)
+    }
+
+    /// Whether a reasoning block is currently streaming. The status line reads
+    /// this instead of keeping its own copy of the reasoning text.
+    pub fn is_thinking(&self) -> bool {
+        self.has_open_thought()
+    }
+
+    /// The reasoning text still streaming, when there is one.
+    pub fn live_thought_text(&self) -> Option<&str> {
+        self.items.iter().rev().find_map(|item| match item {
+            TranscriptItem::Thought(block) if !block.done => Some(block.text.as_str()),
+            _ => None,
+        })
+    }
+
     /// Finalize any block left in-flight when a turn ends (fail/cancel/lag can
     /// drop the `Completed` event). Without this, a running tool/sub-agent block
     /// or an unfinished assistant message stays "live" forever — never committing
@@ -729,6 +852,16 @@ impl TranscriptState {
                 TranscriptItem::Assistant(b) if !b.done => {
                     b.done = true;
                     b.rendered = Some(MdDoc::parse(&b.text));
+                }
+                // No `ReasoningCompleted` ever reached this view: freeze what
+                // actually arrived and mark it interrupted, never finished.
+                TranscriptItem::Thought(b) if !b.done => {
+                    b.done = true;
+                    b.interrupted = true;
+                    b.duration_ms = b
+                        .live_since
+                        .map(|started| started.elapsed().as_millis() as u64);
+                    b.live_since = None;
                 }
                 TranscriptItem::ToolGroup(group) => {
                     group.open = false;

@@ -323,6 +323,42 @@
       }
     },
     {
+      "description": "A model reasoning segment began. Presentation opens ONE mutable reasoning block on this; it must not append a new transcript item.",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "reasoning_started"
+          ]
+        }
+      }
+    },
+    {
+      "description": "The current reasoning segment ended cleanly. `elapsed_ms` is the runtime's own measurement of the segment. Presentation freezes its mutable block into an immutable history item on this. A segment that never receives this was interrupted, not completed.",
+      "type": "object",
+      "required": [
+        "elapsed_ms",
+        "type"
+      ],
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "reasoning_completed"
+          ]
+        }
+      }
+    },
+    {
       "description": "The assistant message is complete.",
       "type": "object",
       "required": [
@@ -3457,6 +3493,42 @@
               "type": "string",
               "enum": [
                 "reasoning_delta"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A model reasoning segment began. Presentation opens ONE mutable reasoning block on this; it must not append a new transcript item.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "reasoning_started"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The current reasoning segment ended cleanly. `elapsed_ms` is the runtime's own measurement of the segment. Presentation freezes its mutable block into an immutable history item on this. A segment that never receives this was interrupted, not completed.",
+          "type": "object",
+          "required": [
+            "elapsed_ms",
+            "type"
+          ],
+          "properties": {
+            "elapsed_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "reasoning_completed"
               ]
             }
           }

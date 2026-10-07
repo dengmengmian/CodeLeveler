@@ -266,12 +266,28 @@ pub enum AgentEvent {
     StreamAttemptStarted,
     /// A streamed chunk of assistant text (token-level, spec §16).
     AssistantDelta(String),
+    /// A model reasoning segment began (synthesized by the kernel loop from the
+    /// segment's first reasoning delta). Presentation opens ONE mutable
+    /// reasoning block; transient and never durable.
+    ReasoningStarted,
     /// A streamed chunk of model reasoning/summary, rendered separately from
     /// the final assistant answer.
     ReasoningDelta(String),
+    /// The current reasoning segment ended cleanly at the next non-reasoning
+    /// output or at message completion. `elapsed_ms` is the kernel's own
+    /// measurement. A segment that never receives this was interrupted.
+    ReasoningCompleted {
+        elapsed_ms: u64,
+    },
     /// The model produced assistant text this round (the whole message; also
-    /// marks the end of any streamed deltas for the round).
-    AssistantText(String),
+    /// marks the end of any streamed deltas for the round). `reasoning`
+    /// carries the round's displayable reasoning segments, each with the
+    /// runtime's measured duration, so a durable projection can render a
+    /// completed Thought; it is empty when the model reasoned nothing.
+    AssistantText {
+        text: String,
+        reasoning: Vec<leveler_model::ReasoningSegment>,
+    },
     /// The model requested a tool call. `id` correlates with the matching
     /// [`AgentEvent::ToolResult`] (the two are NOT emitted adjacently once
     /// read-only tools run in parallel, so a UI must pair by id, not by order).

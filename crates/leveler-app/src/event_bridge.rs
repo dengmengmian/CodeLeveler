@@ -325,6 +325,13 @@ pub struct EventBridge {
     tool_starts: HashMap<String, Instant>,
     /// The in-flight assistant message id, open while deltas stream (spec §16).
     open_assistant: Option<MessageId>,
+    /// Whether the CURRENT round already streamed reasoning as live deltas.
+    /// Live rounds set this from the transient reasoning events, so the
+    /// durable assistant-message event must NOT re-emit the same reasoning as
+    /// a second Thought. A REPLAY never sees the transient events (they are
+    /// not persisted), so the flag stays false and the durable event is the
+    /// only carrier of the reasoning. Reset at every stream attempt.
+    reasoning_streamed: bool,
     /// Recently completed assistant texts this turn, for the near-duplicate
     /// fold (a nudged model repeating its "task complete" summary). Display
     /// layer only — the persisted transcript keeps every message.
@@ -512,6 +519,7 @@ impl EventBridge {
             events,
             tool_starts: HashMap::new(),
             open_assistant: None,
+            reasoning_streamed: false,
             recent_assistant_texts: std::collections::VecDeque::new(),
             round_after_closeout_nudge: false,
             child_roles: HashMap::new(),
@@ -570,6 +578,9 @@ impl EventBridge {
             }
             EngineEvent::FinalizationPhaseFinished { .. } => {}
             EngineEvent::StreamAttemptStarted => {
+                // A fresh attempt discards in-flight deltas; any reasoning the
+                // previous attempt streamed is spent with them.
+                self.reasoning_streamed = false;
                 let message_id = self.open_assistant.take();
                 let _ = self
                     .events
@@ -590,8 +601,18 @@ impl EventBridge {
                     });
                 }
             }
+            EngineEvent::ReasoningStarted => {
+                self.reasoning_streamed = true;
+                let _ = self.events.send(RuntimeEvent::ReasoningStarted);
+            }
             EngineEvent::ReasoningDelta { text: delta } => {
+                self.reasoning_streamed = true;
                 let _ = self.events.send(RuntimeEvent::ReasoningDelta { delta });
+            }
+            EngineEvent::ReasoningCompleted { elapsed_ms } => {
+                let _ = self
+                    .events
+                    .send(RuntimeEvent::ReasoningCompleted { elapsed_ms });
             }
             EngineEvent::RuntimeInjection { kind, .. } => {
                 // The ONE lifecycle opening that scopes the fold below: the
@@ -604,7 +625,12 @@ impl EventBridge {
                 // the reader into the next turn.
                 self.round_after_closeout_nudge = false;
             }
-            EngineEvent::AssistantMessage { text } => {
+            EngineEvent::AssistantMessage { text, reasoning } => {
+                // Live rounds already streamed their reasoning as deltas, and
+                // the transient `ReasoningCompleted` already froze it; re-emitting
+                // it here would render the same Thought twice. A replay never sees
+                // those transient events, so the durable event is its only carrier.
+                let streamed = std::mem::take(&mut self.reasoning_streamed);
                 // Near-duplicate fold: a nudged model that re-states the
                 // summary the nudge answered is collapsed into one notice
                 // instead of rendering the repeat. Display only — the
@@ -637,6 +663,24 @@ impl EventBridge {
                     self.recent_assistant_texts.push_back(text.clone());
                     if self.recent_assistant_texts.len() > FOLD_LOOKBACK {
                         self.recent_assistant_texts.pop_front();
+                    }
+                }
+                // Replayed / non-streamed path: the durable event is the only
+                // carrier of this round's reasoning, so render each segment as a
+                // completed Thought before the answer text. The model context is
+                // untouched — it reads reasoning from the message store, never
+                // from this projection.
+                if !streamed {
+                    for segment in reasoning {
+                        let _ = self.events.send(RuntimeEvent::ReasoningStarted);
+                        if !segment.text.is_empty() {
+                            let _ = self.events.send(RuntimeEvent::ReasoningDelta {
+                                delta: segment.text,
+                            });
+                        }
+                        let _ = self.events.send(RuntimeEvent::ReasoningCompleted {
+                            elapsed_ms: segment.duration_ms,
+                        });
                     }
                 }
                 // Streamed path: close the open message. Non-streamed fallback:
@@ -1840,7 +1884,7 @@ mod bridge_tests {
         );
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(summary.into()),
+            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
         );
         // The harness re-drives the quiet round; THAT is what opens the fold.
         bridge.forward(closeout_nudge());
@@ -1852,7 +1896,7 @@ mod bridge_tests {
         );
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(repeat),
+            leveler_agent::AgentEvent::AssistantText { text: repeat, reasoning: Vec::new() },
         );
 
         let events = drain(&mut rx);
@@ -1895,17 +1939,19 @@ mod bridge_tests {
         let mut bridge = EventBridge::new(tx);
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(
-                "第一部分结论:closeout 决策点已统一,三个 nudge 机制合并为共享预算。".into(),
-            ),
+            leveler_agent::AgentEvent::AssistantText {
+                text: "第一部分结论:closeout 决策点已统一,三个 nudge 机制合并为共享预算。".into(),
+                reasoning: Vec::new(),
+            },
         );
         // Even inside the nudge-opened round, a genuinely different answer is
         // not a restatement and must render.
         bridge.forward(closeout_nudge());
-        forward_agent(&mut bridge, leveler_agent::AgentEvent::AssistantText(
-            "补充遗漏的分支:event_bridge 的重复检测只作用于展示层,持久化与 resume 上下文都保持原样。"
+        forward_agent(&mut bridge, leveler_agent::AgentEvent::AssistantText {
+            text: "补充遗漏的分支:event_bridge 的重复检测只作用于展示层,持久化与 resume 上下文都保持原样。"
                 .into(),
-        ));
+            reasoning: Vec::new(),
+        });
         let events = drain(&mut rx);
         let completed = events
             .iter()
@@ -1931,13 +1977,13 @@ mod bridge_tests {
         let mut bridge = EventBridge::new(tx);
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
+            leveler_agent::AgentEvent::AssistantText { text: "好的,收到。".into(), reasoning: Vec::new() },
         );
         // Inside the nudge-opened round, so the length guard is what stops it.
         bridge.forward(closeout_nudge());
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText("好的,收到。".into()),
+            leveler_agent::AgentEvent::AssistantText { text: "好的,收到。".into(), reasoning: Vec::new() },
         );
         let events = drain(&mut rx);
         let completed = events
@@ -1958,7 +2004,7 @@ mod bridge_tests {
         let summary = "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。";
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(summary.into()),
+            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
         );
         forward_agent(
             &mut bridge,
@@ -1974,10 +2020,11 @@ mod bridge_tests {
         // was never set, so this second, near-identical text is kept.
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(
-                "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。(重复)"
+            leveler_agent::AgentEvent::AssistantText {
+                text: "目前确认 statusOverride 只存在于前端渲染层，后端 action 没有真正实现。(重复)"
                     .into(),
-            ),
+                reasoning: Vec::new(),
+            },
         );
         let events = drain(&mut rx);
         let completed = events
@@ -2011,7 +2058,7 @@ mod bridge_tests {
         let summary = "这一轮的总结足够长，足以触发近重复折叠的判定阈值。";
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(summary.into()),
+            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
         );
         bridge.forward(closeout_nudge());
         bridge.forward(EngineEvent::TurnStarted {
@@ -2020,7 +2067,7 @@ mod bridge_tests {
         });
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(summary.into()),
+            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
         );
         let events = drain(&mut rx);
         let completed = events
@@ -2047,7 +2094,7 @@ mod bridge_tests {
     fn drive_closeout_fold_scope(bridge: &mut EventBridge, tool_only_round: bool) -> String {
         forward_agent(
             bridge,
-            leveler_agent::AgentEvent::AssistantText(FOLD_SCOPE_SUMMARY.into()),
+            leveler_agent::AgentEvent::AssistantText { text: FOLD_SCOPE_SUMMARY.into(), reasoning: Vec::new() },
         );
         bridge.forward(closeout_nudge());
         if tool_only_round {
@@ -2090,7 +2137,7 @@ mod bridge_tests {
         let progress = drive_closeout_fold_scope(&mut bridge, /*tool_only_round*/ true);
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(progress),
+            leveler_agent::AgentEvent::AssistantText { text: progress, reasoning: Vec::new() },
         );
         let events = drain(&mut rx);
 
@@ -2130,7 +2177,7 @@ mod bridge_tests {
         let repeat = drive_closeout_fold_scope(&mut bridge, /*tool_only_round*/ false);
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(repeat),
+            leveler_agent::AgentEvent::AssistantText { text: repeat, reasoning: Vec::new() },
         );
         let events = drain(&mut rx);
 
@@ -2161,14 +2208,14 @@ mod bridge_tests {
                        持久化层保持不变。";
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(summary.into()),
+            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
         );
         // The fold needs the closeout nudge that re-drove the round; without it
         // the second text is ordinary narration and stays.
         bridge.forward(closeout_nudge());
         forward_agent(
             &mut bridge,
-            leveler_agent::AgentEvent::AssistantText(summary.into()),
+            leveler_agent::AgentEvent::AssistantText { text: summary.into(), reasoning: Vec::new() },
         );
         let events = drain(&mut rx);
         let started = events
@@ -2383,6 +2430,86 @@ mod projection_equivalence {
         out
     }
 
+    /// REASONING-LIVE-1: a live round streams reasoning as transient deltas;
+    /// the durable assistant-message event must NOT re-emit the same reasoning
+    /// as a second Thought.
+    #[test]
+    fn live_streamed_reasoning_is_not_re_emitted_by_the_assistant_message() {
+        let shapes = project(vec![
+            EngineEvent::StreamAttemptStarted,
+            EngineEvent::ReasoningStarted,
+            EngineEvent::ReasoningDelta {
+                text: "先查 catalog。".into(),
+            },
+            EngineEvent::ReasoningCompleted { elapsed_ms: 1600 },
+            EngineEvent::AssistantDelta {
+                text: "已同步。".into(),
+            },
+            EngineEvent::AssistantMessage {
+                text: "已同步。".into(),
+                reasoning: vec![leveler_model::ReasoningSegment {
+                    text: "先查 catalog。".into(),
+                    duration_ms: 1600,
+                }],
+            },
+        ]);
+        let reasoning: Vec<&String> = shapes
+            .iter()
+            .filter(|s| s.starts_with("reasoning"))
+            .collect();
+        assert_eq!(
+            reasoning,
+            vec!["reasoning_start", "reasoning:先查 catalog。", "reasoning_done:1600"],
+            "one live Thought, not two"
+        );
+    }
+
+    /// REASONING-REPLAY-1: a replay never sees the transient deltas, so the
+    /// durable assistant message is the only carrier of the reasoning — and it
+    /// does render the Thought, before the answer text.
+    #[test]
+    fn replayed_assistant_message_carries_the_reasoning() {
+        let shapes = project(vec![EngineEvent::AssistantMessage {
+            text: "已同步。".into(),
+            reasoning: vec![leveler_model::ReasoningSegment {
+                text: "先查 catalog。".into(),
+                duration_ms: 1600,
+            }],
+        }]);
+        assert_eq!(
+            shapes,
+            vec![
+                "reasoning_start",
+                "reasoning:先查 catalog。",
+                "reasoning_done:1600",
+                "msg_start",
+                "delta:已同步。",
+                "msg_done",
+            ]
+        );
+    }
+
+    /// A tool-only round carries reasoning but no answer text. Replay must still
+    /// render its Thought and open no empty assistant block.
+    #[test]
+    fn a_tool_only_round_replays_its_reasoning_without_an_assistant_block() {
+        let shapes = project(vec![EngineEvent::AssistantMessage {
+            text: String::new(),
+            reasoning: vec![leveler_model::ReasoningSegment {
+                text: "搜索结果里没有可用的浏览器工具。".into(),
+                duration_ms: 700,
+            }],
+        }]);
+        assert_eq!(
+            shapes,
+            vec![
+                "reasoning_start",
+                "reasoning:搜索结果里没有可用的浏览器工具。",
+                "reasoning_done:700",
+            ]
+        );
+    }
+
     /// Stable, id-free shape of a RuntimeEvent for table comparison.
     fn shape(ev: &RuntimeEvent) -> String {
         match ev {
@@ -2392,7 +2519,11 @@ mod projection_equivalence {
             RuntimeEvent::AssistantMessageStarted { .. } => "msg_start".into(),
             RuntimeEvent::AssistantTextDelta { delta, .. } => format!("delta:{delta}"),
             RuntimeEvent::AssistantMessageCompleted { .. } => "msg_done".into(),
+            RuntimeEvent::ReasoningStarted => "reasoning_start".into(),
             RuntimeEvent::ReasoningDelta { delta } => format!("reasoning:{delta}"),
+            RuntimeEvent::ReasoningCompleted { elapsed_ms } => {
+                format!("reasoning_done:{elapsed_ms}")
+            }
             RuntimeEvent::ToolCallStarted {
                 id, name, parallel, ..
             } => {
@@ -2554,9 +2685,7 @@ mod projection_equivalence {
             EngineEvent::StreamAttemptStarted,
             EngineEvent::AssistantDelta { text: "he".into() },
             EngineEvent::AssistantDelta { text: "llo".into() },
-            EngineEvent::AssistantMessage {
-                text: "hello".into(),
-            },
+            EngineEvent::AssistantMessage { text: "hello".into(), reasoning: Vec::new() },
         ]);
         assert_eq!(
             shapes,
@@ -2576,7 +2705,7 @@ mod projection_equivalence {
             EngineEvent::AssistantDelta { text: "a".into() },
             EngineEvent::StreamAttemptStarted,
             EngineEvent::AssistantDelta { text: "b".into() },
-            EngineEvent::AssistantMessage { text: "b".into() },
+            EngineEvent::AssistantMessage { text: "b".into(), reasoning: Vec::new() },
         ]);
         assert_eq!(
             shapes,
@@ -2594,19 +2723,19 @@ mod projection_equivalence {
     #[test]
     fn non_streamed_text_synthesizes_a_whole_message() {
         assert_eq!(
-            project(vec![EngineEvent::AssistantMessage { text: "hi".into() }]),
+            project(vec![EngineEvent::AssistantMessage { text: "hi".into(), reasoning: Vec::new() }]),
             ["msg_start", "delta:hi", "msg_done"]
         );
-        assert!(project(vec![EngineEvent::AssistantMessage { text: "".into() }]).is_empty());
+        assert!(project(vec![EngineEvent::AssistantMessage { text: "".into(), reasoning: Vec::new() }]).is_empty());
     }
 
     #[test]
     fn near_duplicate_summary_folds_to_a_notification() {
         let text = "这是一个足够长的总结内容，用来触发近重复折叠的判定逻辑。".to_string();
         let shapes = project(vec![
-            EngineEvent::AssistantMessage { text: text.clone() },
+            EngineEvent::AssistantMessage { text: text.clone(), reasoning: Vec::new() },
             closeout_nudge(),
-            EngineEvent::AssistantMessage { text },
+            EngineEvent::AssistantMessage { text, reasoning: Vec::new() },
         ]);
         assert_eq!(
             shapes[..3],
@@ -2822,9 +2951,7 @@ mod projection_equivalence {
             phase: "cleanup".into(),
             at: leveler_core::now(),
         });
-        bridge.forward(EngineEvent::AssistantMessage {
-            text: "post-terminal review".into(),
-        });
+        bridge.forward(EngineEvent::AssistantMessage { text: "post-terminal review".into(), reasoning: Vec::new() });
         bridge.forward(EngineEvent::AssistantDelta {
             text: "ignored".into(),
         });

@@ -126,7 +126,17 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::UserMessageAdded { message } => {
             let shown = state.message_with_images(message.images, &message.text);
-            state.transcript.push_user_if_new(shown);
+            if message.kind == Some(leveler_client_protocol::UiMessageKind::RuntimeNotice) {
+                // The runtime authored this into the model's context on the user
+                // transport role; the person did not write it. It gets the
+                // runtime-notice presentation, never the user author bar — and
+                // it is never reasoning, so it is never a Thought.
+                if !shown.trim().is_empty() {
+                    state.transcript.push_note(shown);
+                }
+            } else {
+                state.transcript.push_user_if_new(shown);
+            }
         }
         RuntimeEvent::AssistantMessageStarted { message_id } => {
             mark_turn_busy(state);
@@ -144,17 +154,30 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 state.reconnected_until =
                     Some(std::time::Instant::now() + crate::state::RECONNECTED_NOTICE);
             }
-            seal_analysis_segment(state);
+            // The previous attempt's partial reasoning is spent with the deltas
+            // it arrived in: a retry is not a Thought.
+            state.transcript.reset_thought();
         }
         RuntimeEvent::AssistantTextDelta { message_id, delta } => {
             mark_turn_busy(state);
             state.transcript.append_assistant(&message_id, &delta);
         }
+        RuntimeEvent::ReasoningStarted => {
+            mark_turn_busy(state);
+            state.transcript.begin_thought();
+        }
         RuntimeEvent::ReasoningDelta { delta } => {
             mark_turn_busy(state);
-            // Raw reasoning never enters the transcript: it only keeps the
-            // status line's thinking indicator honest while the model works.
-            state.live_reasoning.push_str(&delta);
+            // The ONE mutable reasoning block: every delta grows the same
+            // transcript item in place, so a stream never appends Thought after
+            // Thought.
+            state.transcript.append_thought(&delta);
+        }
+        RuntimeEvent::ReasoningCompleted { elapsed_ms } => {
+            mark_turn_busy(state);
+            // Freeze the live block with the runtime's own measurement. The
+            // text stays on screen as immutable history from here on.
+            state.transcript.finish_thought(Some(elapsed_ms));
         }
         RuntimeEvent::AssistantMessageCompleted { message_id } => {
             state.transcript.finish_assistant(&message_id);
@@ -219,9 +242,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         } => {
             mark_turn_busy(state);
             state.turn_tool_calls = state.turn_tool_calls.saturating_add(1);
-            // Acting on the thought ends the reasoning segment: the status
-            // scratch is spent, and nothing else ever held that text.
-            state.live_reasoning.clear();
+            // Acting on the thought ends the reasoning segment: freeze what
+            // arrived. A clean completion already froze it; an interrupted one
+            // is marked, not claimed as finished.
+            state.transcript.finish_thought(None);
             // Status line shows what the tool is DOING ("运行 cargo check -p x"),
             // not the internal tool name ("运行 run_command").
             let verb = crate::tool_taxonomy::presentation_label(&name, state.locale);
@@ -1487,11 +1511,11 @@ pub(super) fn start_turn(state: &mut AppState) {
     crate::active_goal::begin(state, staged, std::time::Instant::now());
 }
 
-/// A segment boundary (tool start, assistant start, turn end): the live
-/// reasoning scratch is spent — drop it. Nothing renders it, nothing keeps
-/// it; only the status line's thinking indicator ever read it.
+/// A segment boundary (assistant start, turn end): freeze any reasoning block
+/// still streaming. A clean completion already froze it; one that never got the
+/// runtime's completion is marked interrupted rather than presented as done.
 fn seal_analysis_segment(state: &mut AppState) {
-    state.live_reasoning.clear();
+    state.transcript.finish_thought(None);
 }
 
 fn mark_turn_busy(state: &mut AppState) {

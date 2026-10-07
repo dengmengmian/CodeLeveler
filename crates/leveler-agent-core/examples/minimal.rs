@@ -216,7 +216,10 @@ async fn main() {
             "[usage] in={} out={}",
             usage.input_tokens, usage.output_tokens
         ),
-        AgentEvent::StreamAttemptStarted | AgentEvent::ReasoningDelta(_) => {}
+        AgentEvent::StreamAttemptStarted
+        | AgentEvent::ReasoningStarted
+        | AgentEvent::ReasoningDelta(_)
+        | AgentEvent::ReasoningCompleted { .. } => {}
         AgentEvent::ContextUsage(acc) => {
             println!(
                 "[context] used={} categories={}",

@@ -201,12 +201,30 @@ pub enum EngineEvent {
     AssistantDelta {
         text: String,
     },
+    /// TRANSIENT: a model reasoning segment began (synthesized by the loop at
+    /// the segment's first reasoning delta). Presentation opens one mutable
+    /// reasoning block on it; nothing durable is created.
+    ReasoningStarted,
     /// TRANSIENT: streamed reasoning text.
     ReasoningDelta {
         text: String,
     },
+    /// TRANSIENT: the current reasoning segment ended cleanly at the next
+    /// non-reasoning output or at message completion. A segment that never
+    /// reaches this was interrupted, not completed.
+    ReasoningCompleted {
+        elapsed_ms: u64,
+    },
     AssistantMessage {
         text: String,
+        /// Displayable reasoning segments the model produced this round, each
+        /// with the runtime's measured duration, in production order. Durable
+        /// so a reopened transcript can render a completed Thought. This is a
+        /// UI/audit projection only: the model context reads reasoning from the
+        /// assistant `Message` in the message store, and no protocol encoder or
+        /// `RequestProjection` reads this field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning: Vec<leveler_model::ReasoningSegment>,
     },
     ToolCallStarted {
         call_id: String,
@@ -681,7 +699,9 @@ impl EngineEvent {
                 | EngineEvent::UserShellOutput { .. }
                 | EngineEvent::ToolCallOutput { .. }
                 | EngineEvent::AssistantDelta { .. }
+                | EngineEvent::ReasoningStarted
                 | EngineEvent::ReasoningDelta { .. }
+                | EngineEvent::ReasoningCompleted { .. }
                 | EngineEvent::TokenUsage { .. }
                 | EngineEvent::ContextUsage { .. }
                 | EngineEvent::SubAgentProgress { .. }
@@ -758,7 +778,9 @@ impl EngineEvent {
             EngineEvent::StreamAttemptStarted
             | EngineEvent::ContextUsage { .. }
             | EngineEvent::AssistantDelta { .. }
+            | EngineEvent::ReasoningStarted
             | EngineEvent::ReasoningDelta { .. }
+            | EngineEvent::ReasoningCompleted { .. }
             | EngineEvent::AssistantMessage { .. }
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallFinished { .. }
@@ -921,7 +943,9 @@ impl EngineEvent {
 
             EngineEvent::StreamAttemptStarted
             | EngineEvent::AssistantDelta { .. }
+            | EngineEvent::ReasoningStarted
             | EngineEvent::ReasoningDelta { .. }
+            | EngineEvent::ReasoningCompleted { .. }
             | EngineEvent::AssistantMessage { .. }
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallFinished { .. }
@@ -1181,7 +1205,7 @@ mod contract_tests {
             DataClass::LocalOnly
         );
         assert_eq!(
-            EngineEvent::AssistantMessage { text: "x".into() }.data_class(),
+            EngineEvent::AssistantMessage { text: "x".into(), reasoning: Vec::new() }.data_class(),
             DataClass::LocalOnly
         );
         assert_eq!(
@@ -1296,9 +1320,7 @@ mod contract_tests {
     #[test]
     fn source_and_model_content_have_no_public_projection() {
         for event in [
-            EngineEvent::AssistantMessage {
-                text: "source".into(),
-            },
+            EngineEvent::AssistantMessage { text: "source".into(), reasoning: Vec::new() },
             EngineEvent::ToolCallStarted {
                 call_id: "call".into(),
                 name: "run_command".into(),

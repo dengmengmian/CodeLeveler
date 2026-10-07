@@ -17,8 +17,13 @@ impl From<AgentEvent> for EngineEvent {
         match event {
             A::StreamAttemptStarted => EngineEvent::StreamAttemptStarted,
             A::AssistantDelta(text) => EngineEvent::AssistantDelta { text },
+            A::ReasoningStarted => EngineEvent::ReasoningStarted,
             A::ReasoningDelta(text) => EngineEvent::ReasoningDelta { text },
-            A::AssistantText(text) => EngineEvent::AssistantMessage { text },
+            A::ReasoningCompleted { elapsed_ms } => EngineEvent::ReasoningCompleted { elapsed_ms },
+            A::AssistantText { text, reasoning } => EngineEvent::AssistantMessage {
+                text,
+                reasoning,
+            },
             A::ToolCall {
                 id,
                 name,

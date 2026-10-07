@@ -996,8 +996,8 @@ fn clicking_a_mixed_group_header_opens_every_call_in_it() {
     let mut s = state();
     s.transcript.push_user("看看状态".into());
     for (id, name, args) in [
-        ("t1", "read_file", r#"{"path":"README.md"}"#),
-        ("t2", "grep", r#"{"pattern":"TaskStatus"}"#),
+        ("t1", "custom_probe", r#"{"path":"README.md"}"#),
+        ("t2", "custom_scan", r#"{"pattern":"TaskStatus"}"#),
     ] {
         reduce(
             &mut s,
@@ -1027,18 +1027,18 @@ fn clicking_a_mixed_group_header_opens_every_call_in_it() {
 
     // The stage header is the parent row, and it is the click target.
     assert!(
-        plain(&s).iter().any(|l| l.contains("检查代码库")),
+        plain(&s).iter().any(|l| l.contains("完成 2 项操作")),
         "{:?}",
         plain(&s)
     );
-    let (line, _) = row_with(&s, "README.md").expect("the read row");
+    let (line, _) = row_with(&s, "README.md").expect("the first row");
     assert!(
         plain(&s)[..line].iter().any(|l| l.contains('\u{25b8}')),
         "the parent folds above it: {:?}",
         plain(&s)
     );
 
-    let (col, row) = cell_of(&s, "检查代码库");
+    let (col, row) = cell_of(&s, "完成 2 项操作");
     click(&mut s, col, row);
     assert!(
         plain(&s).iter().any(|l| l.contains("t1 output line"))
@@ -1047,7 +1047,7 @@ fn clicking_a_mixed_group_header_opens_every_call_in_it() {
         plain(&s)
     );
     // The open group is taller, so the row moved: ask again where it is.
-    let (col, row) = cell_of(&s, "检查代码库");
+    let (col, row) = cell_of(&s, "完成 2 项操作");
     click(&mut s, col, row);
     assert!(
         !plain(&s).iter().any(|l| l.contains("t1 output line")),

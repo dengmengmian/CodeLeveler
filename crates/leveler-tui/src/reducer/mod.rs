@@ -1968,47 +1968,84 @@ mod disclosure_tests {
             .collect()
     }
 
-    /// Raw reasoning never enters the transcript: no item, no rendered
-    /// prose, no disclosure row, no click target — live or sealed. Only the
-    /// status line's thinking scratch sees it, and a segment boundary
-    /// (tool start) spends it.
+    /// Reasoning is provider-returned semantic content: it renders as ONE
+    /// mutable Thought block while it streams, and a boundary freezes it as
+    /// immutable history. No delta appends a second item, and a second segment
+    /// is its own Thought.
     #[test]
-    fn raw_reasoning_never_reaches_the_conversation() {
+    fn reasoning_streams_one_mutable_thought_then_freezes_it() {
         let mut s = test_state();
         s.transcript.push_user("详细看下这是一个什么项目？".into());
         let items_before = s.transcript.items().len();
-        let version_before = s.transcript.version();
+        reduce(&mut s, Action::Runtime(RuntimeEvent::ReasoningStarted));
         reduce(
             &mut s,
             Action::Runtime(RuntimeEvent::ReasoningDelta {
-                delta: "The user wants me to look at the project...".into(),
+                delta: "先看 catalog。".into(),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReasoningDelta {
+                delta: "再补测试。".into(),
             }),
         );
         assert_eq!(
             s.transcript.items().len(),
-            items_before,
-            "no transcript item for reasoning"
+            items_before + 1,
+            "one Thought block for the whole stream, not one per delta"
         );
-        assert_eq!(
-            s.transcript.version(),
-            version_before,
-            "the conversation cache is not invalidated by invisible content"
-        );
-        assert!(!s.live_reasoning.is_empty(), "the status scratch sees it");
+        assert!(s.transcript.is_thinking());
         let plain: String = s
             .conversation_lines_and_hits(80)
             .0
             .iter()
             .map(crate::selection::line_to_plain)
             .collect();
-        assert!(!plain.contains("分析"), "no analysis label: {plain}");
-        assert!(
-            !plain.contains("wants me"),
-            "no raw reasoning prose: {plain}"
+        assert!(plain.contains("先看 catalog。"), "reasoning renders: {plain}");
+        assert!(plain.contains("再补测试。"), "reasoning renders: {plain}");
+
+        // The runtime reports the boundary: the Thought freezes with its own
+        // measured duration and stops being the live block.
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReasoningCompleted { elapsed_ms: 1600 }),
         );
-        let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
-        assert!(hits.is_empty(), "no disclosure row for reasoning: {hits:?}");
-        // A tool boundary spends the scratch.
+        assert!(!s.transcript.is_thinking());
+        // A later segment is a NEW Thought; the frozen one cannot be reopened.
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReasoningDelta {
+                delta: "第二轮。".into(),
+            }),
+        );
+        let thoughts: Vec<&crate::transcript::ThoughtBlock> = s
+            .transcript
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Thought(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thoughts.len(), 2);
+        assert!(thoughts[0].done && !thoughts[0].interrupted);
+        assert_eq!(thoughts[0].duration_ms, Some(1600));
+        assert!(!thoughts[1].done);
+    }
+
+    /// A segment that never receives the runtime's completion is frozen as
+    /// interrupted, never presented as a finished Thought.
+    #[test]
+    fn interrupted_reasoning_is_marked_not_completed() {
+        let mut s = test_state();
+        reduce(&mut s, Action::Runtime(RuntimeEvent::ReasoningStarted));
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ReasoningDelta {
+                delta: "半句话".into(),
+            }),
+        );
         reduce(
             &mut s,
             Action::Runtime(RuntimeEvent::ToolCallStarted {
@@ -2020,10 +2057,22 @@ mod disclosure_tests {
                 answer_effect: None,
             }),
         );
+        let thought = s
+            .transcript
+            .items()
+            .iter()
+            .find_map(|i| match i {
+                TranscriptItem::Thought(b) => Some(b),
+                _ => None,
+            })
+            .expect("the Thought stays on screen");
         assert!(
-            s.live_reasoning.is_empty(),
-            "a segment boundary clears the scratch"
+            thought.done && thought.interrupted,
+            "a boundary without completion is an interrupted Thought"
         );
+        // The elapsed it actually got is reported, never a fabricated zero.
+        assert!(thought.duration_ms.is_some());
+        assert!(!s.transcript.is_thinking());
     }
 
     /// Interim prose between tool calls is communication: however long, it
@@ -2302,6 +2351,85 @@ mod disclosure_tests {
         assert_eq!(
             s.conv.scroll, live_scroll,
             "pin must capture the painted scroll, not a stale or guessed one"
+        );
+    }
+
+    /// DF-TUI-REASONING-7: a user who scrolled up is not dragged back to the
+    /// bottom by a reasoning stream. Auto-follow stays off, the pinned scroll
+    /// does not move, and the growth is counted as unread instead of painted.
+    #[test]
+    fn a_reasoning_delta_does_not_pull_a_scrolled_up_viewport() {
+        let mut s = test_state();
+        s.conv.rect = Some((0, 5, 80, 22));
+        for i in 0..60 {
+            s.transcript.push_user(format!("history row {i}"));
+        }
+        s.conv.auto_scroll = false;
+        s.conv.scroll = 5;
+        s.conv.last_len = crate::conversation::build::conversation_line_count(&s, 80);
+
+        reduce(&mut s, Action::Runtime(RuntimeEvent::ReasoningStarted));
+        for i in 0..40 {
+            reduce(
+                &mut s,
+                Action::Runtime(RuntimeEvent::ReasoningDelta {
+                    delta: format!("推理片段 {i} 很长很长很长很长\n"),
+                }),
+            );
+        }
+        crate::conversation::sync_scroll(&mut s);
+
+        assert!(
+            !s.conv.auto_scroll,
+            "a live reasoning update must not resume auto-follow"
+        );
+        assert_eq!(s.conv.scroll, 5, "the pinned viewport must not move");
+        assert!(s.conv.unread > 0, "the growth is counted, not painted");
+    }
+
+    /// DF-TUI-REASONING-11: a runtime-authored notice rides the user transport
+    /// role but is not user input, and it is not model reasoning. It must wear
+    /// neither the user author bar nor a Thought header.
+    #[test]
+    fn a_runtime_notice_message_is_not_styled_as_user_or_thought() {
+        use leveler_client_protocol::{MessageId, UiMessage, UiMessageKind, UiRole};
+        let mut s = test_state();
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::UserMessageAdded {
+                message: UiMessage {
+                    id: MessageId::new("m1"),
+                    role: UiRole::User,
+                    text: "Goal remains active. I wrote this myself.".into(),
+                    ordinal: None,
+                    kind: Some(UiMessageKind::RuntimeNotice),
+                    images: 0,
+                },
+            }),
+        );
+        assert!(
+            !s.transcript
+                .items()
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::User(_))),
+            "a runtime notice must not be a user message: {:?}",
+            s.transcript.items()
+        );
+        assert!(
+            !s.transcript
+                .items()
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::Thought(_))),
+            "a runtime notice must not be a Thought: {:?}",
+            s.transcript.items()
+        );
+        assert!(
+            s.transcript
+                .items()
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::Note(_))),
+            "it is a runtime notice: {:?}",
+            s.transcript.items()
         );
     }
 

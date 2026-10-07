@@ -1191,6 +1191,38 @@ mod tests {
         );
     }
 
+    /// REASONING-6 (P0): however much reasoning the durable transcript carries
+    /// for the UI, a route with no reasoning channel pays NOTHING for it. Forget
+    /// "UI persistence implies passback": the projection, not presentation,
+    /// decides what the provider sees.
+    #[test]
+    fn ui_reasoning_costs_nothing_when_the_route_has_no_reasoning_channel() {
+        let without = RequestProjection::project(
+            &history(None, false),
+            &[],
+            ReasoningReplayContract::NONE,
+            ReasoningRetention::All,
+        );
+        let with = RequestProjection::project(
+            &history(Some(&"分析".repeat(400)), false),
+            &[],
+            ReasoningReplayContract::NONE,
+            ReasoningRetention::All,
+        );
+        assert_eq!(
+            with.estimated_tokens(),
+            without.estimated_tokens(),
+            "a displayed Thought must not add a single request token"
+        );
+        assert!(
+            with.messages()
+                .iter()
+                .all(|m| !m.reasoning.is_present()),
+            "no reasoning reaches a route that has no channel"
+        );
+        assert_eq!(with.summary().carried_turns, 0);
+    }
+
     /// The channel is priced where the accounting can see it, and an empty
     /// channel is worth nothing.
     #[test]

@@ -682,7 +682,11 @@ impl<'a> Drive<'a> {
         let projected = match event {
             Kernel::StreamAttemptStarted => AgentEvent::StreamAttemptStarted,
             Kernel::AssistantDelta(delta) => AgentEvent::AssistantDelta(delta),
+            Kernel::ReasoningStarted => AgentEvent::ReasoningStarted,
             Kernel::ReasoningDelta(delta) => AgentEvent::ReasoningDelta(delta),
+            Kernel::ReasoningCompleted { elapsed_ms } => {
+                AgentEvent::ReasoningCompleted { elapsed_ms }
+            }
             Kernel::Usage(usage) => AgentEvent::Usage {
                 input_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
                 output_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
@@ -1747,7 +1751,21 @@ impl AgentHarness for Drive<'_> {
                 self.continued_text.push_str(&text);
                 self.last_text = self.continued_text.clone();
             }
-            (self.observer)(AgentEvent::AssistantText(self.last_text.clone()));
+        }
+        // A round that reasoned but produced no answer prose still has a durable
+        // projection: its reasoning segments must survive a resume. Emitting the
+        // event with empty text is what carries them — the projection renders a
+        // Thought and no assistant block. `last_text` is left alone so an empty
+        // round cannot claim the turn's answer.
+        if !text.trim().is_empty() || !round_result.reasoning_segments.is_empty() {
+            (self.observer)(AgentEvent::AssistantText {
+                text: if text.trim().is_empty() {
+                    String::new()
+                } else {
+                    self.last_text.clone()
+                },
+                reasoning: round_result.reasoning_segments.clone(),
+            });
         }
         Ok(Flow::Continue)
     }

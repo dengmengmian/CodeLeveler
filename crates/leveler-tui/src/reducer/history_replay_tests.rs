@@ -637,17 +637,14 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
     let live_lines = shape(&live);
     let replayed_lines = shape(&replayed);
     assert!(
-        live_lines
-            .iter()
-            .any(|l| l.contains("› 读取文件") && !l.contains("lib.rs"))
-            && live_lines.iter().any(|l| l.contains("├─ ")),
-        "the two consecutive reads are a run: {live_lines:#?}"
+        live_lines.iter().any(|l| l.contains("› 读取 2 个文件")),
+        "the two consecutive reads are one compact receipt: {live_lines:#?}"
     );
     assert!(
         live_lines
             .iter()
             .any(|l| l.contains("› 读取文件") && l.contains("doctor.rs")),
-        "the read after the narration is a lone call, not a run: {live_lines:#?}"
+        "a lone read after the narration keeps its own row: {live_lines:#?}"
     );
     assert_eq!(
         replayed_lines, live_lines,
@@ -988,13 +985,8 @@ fn a_mixed_group_reads_the_same_live_and_replayed() {
     assert!(
         live_lines
             .iter()
-            .any(|l| l.contains("检查代码库") && l.contains("全部成功")),
-        "the stage states its own outcome: {live_lines:#?}"
-    );
-    assert!(
-        live_lines.iter().any(|l| l.contains("› 搜索代码"))
-            && live_lines.iter().any(|l| l.contains("› 读取文件")),
-        "each tool speaks for itself: {live_lines:#?}"
+            .any(|l| l.contains("› 读取 1 个文件") && l.contains("搜索 1 次")),
+        "a read and a search are one compact receipt: {live_lines:#?}"
     );
     assert_eq!(
         shape(&replayed),
