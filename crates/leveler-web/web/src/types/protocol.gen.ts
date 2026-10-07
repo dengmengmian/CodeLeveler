@@ -3,6 +3,13 @@
 // （schema 由 `UPDATE_SCHEMAS=1 cargo test -p leveler-client-protocol --features schema` 守护）。
 // web 网关自有帧（UpFrame/DownFrame/REST DTO）不在此文件，见 protocol.ts。
 
+/** Whether a started call acts on the turn's answer. A protocol-owned DTO: the runtime decides this once (in its client projection, via the tool vocabulary) and every surface reads the stamped value instead of re-classifying the tool name. Four renderers each guessing is what made `FinalAnswer` a second truth source. The outcome is frozen by `docs/EXECUTION_PRESENTATION_CONTRACT.md` §I9. */
+export type AnswerEffect =
+  /** Substantive work: a message before it was interim narration, not the turn's answer. */
+  | 'work'
+  /** Answer-preserving bookkeeping or observation: an answer written before it survives. */
+  | 'bookkeeping';
+
 export type ApprovalDecision = 'approve_once' | 'approve_session' | 'approve_project' | 'approve_always' | 'deny';
 
 /** Identifies a pending permission approval request. */
@@ -347,7 +354,7 @@ export type RuntimeEvent =
   /** Project behavior constraints loaded for this turn. Sources are workspace-relative paths; instruction contents never enter UI chrome. */
   | { type: 'project_rules_loaded'; sources: string[] }
   /** A tool call started . */
-  | { type: 'tool_call_started'; arguments: string; id: ToolCallId; model_step?: number | null; name: string; parallel?: boolean }
+  | { type: 'tool_call_started'; answer_effect?: AnswerEffect | null; arguments: string; id: ToolCallId; model_step?: number | null; name: string; parallel?: boolean }
   /** A tool call finished. `preview` is the runtime's truncated output; `duration_ms` is measured client-side. */
   | { type: 'tool_call_completed'; applied_diff?: string | null; duration_ms: number; exit_code?: number | null; id: ToolCallId; ok: boolean; preview: string; stop?: UiCommandStop | null }
   /** Live output from a running command tool call. `stream` is `stdout` or `stderr`; `chunk` is one or more whole, sanitized lines. Transient: clients keep a bounded buffer and the completed preview is the record. */
@@ -497,6 +504,8 @@ export interface UiActiveBackgroundTask {
 
 /** A tool invocation that was still running when a client took its snapshot. */
 export interface UiActiveToolCall {
+  /** Whether this call acts on the turn's answer — carried so a reconnected client decides the `FinalAnswer` boundary exactly as the live one did, instead of re-classifying the tool name (see the same field on [`RuntimeEvent::ToolCallStarted`]). A snapshot from a peer that omits it is read as [`AnswerEffect::unstated`]. [`RuntimeEvent::ToolCallStarted`]: crate::RuntimeEvent::ToolCallStarted [`AnswerEffect::unstated`]: crate::AnswerEffect::unstated */
+  answer_effect?: AnswerEffect | null;
   arguments: string;
   /** How long the call had been running when the snapshot was taken, by the runtime's clock, so a reconnecting client does not restart it at zero. */
   elapsed_ms?: number;

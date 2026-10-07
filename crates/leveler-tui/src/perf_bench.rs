@@ -213,6 +213,7 @@ fn push_history(state: &mut AppState, turns: usize, bytes_per_message: usize) {
                 arguments: format!("{{\"path\":\"src/file_{i}.rs\"}}"),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             },
         );
         runtime(
@@ -462,6 +463,7 @@ fn perf_tool_stream_curve() {
                     arguments: format!("{{\"path\":\"src/module_{i}.rs\"}}"),
                     parallel: false,
                     model_step: None,
+                    answer_effect: None,
                 },
             );
             runtime(
@@ -876,6 +878,7 @@ fn synth_mixed() -> Vec<crate::record::RecordedEvent> {
                     arguments: "{\"command\":\"cargo check\"}".into(),
                     parallel: false,
                     model_step: None,
+                    answer_effect: None,
                 },
             ));
             seq += 1;

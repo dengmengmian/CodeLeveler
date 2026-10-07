@@ -327,6 +327,7 @@ fn tui_session_commands_ui_and_logic() {
             arguments: r#"{"program":"vitest"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(

@@ -110,7 +110,7 @@ pub use snapshot::{
 pub use version::{
     PROTOCOL_VERSION, ProtocolCapability, ProtocolEnvelope, ProtocolError, ProtocolVersion,
 };
-pub use wire_types::{ApprovalDecision, ApprovalPolicy, PermissionProfile};
+pub use wire_types::{AnswerEffect, ApprovalDecision, ApprovalPolicy, PermissionProfile};
 
 #[cfg(feature = "testing")]
 pub mod mock;

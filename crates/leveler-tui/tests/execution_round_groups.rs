@@ -88,6 +88,7 @@ fn start(s: &mut AppState, id: &str, program: &str, args: &str, model_step: u32)
             arguments: format!(r#"{{"program":"{program}","args":[{args}]}}"#),
             parallel: false,
             model_step: Some(model_step),
+            answer_effect: None,
         }),
     );
 }
@@ -103,6 +104,7 @@ fn start_read(s: &mut AppState, id: &str, path: &str, model_step: u32) {
             arguments: format!(r#"{{"path":"{path}"}}"#),
             parallel: false,
             model_step: Some(model_step),
+            answer_effect: None,
         }),
     );
 }
@@ -124,6 +126,7 @@ fn start_search(s: &mut AppState, id: &str, pattern: &str, model_step: u32) {
             arguments: format!(r#"{{"pattern":"{pattern}"}}"#),
             parallel: false,
             model_step: Some(model_step),
+            answer_effect: None,
         }),
     );
 }
@@ -562,6 +565,7 @@ fn replaying_the_recorded_rounds_groups_identically() {
                 arguments: format!(r#"{{"program":"{program}","args":[{args}]}}"#),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             }),
         );
         finish(&mut legacy, id, true);

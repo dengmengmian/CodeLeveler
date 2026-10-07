@@ -13,6 +13,7 @@ use super::approval::{UiApprovalRequest, UiClarificationRequest};
 use super::media::AttachmentRef;
 use super::progress::{FinalizationStage, UiCompletionReport, UiDiff, UiPlan};
 use super::snapshot::{MessageId, UiCheckpoint, UiMessage, UiSessionSnapshot, UiSessionSummary};
+use super::wire_types::AnswerEffect;
 
 /// Severity for a transient notification .
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +296,14 @@ pub enum RuntimeEvent {
         /// than invent a boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_step: Option<u32>,
+        /// Whether this call acts on the turn's answer — the runtime's own
+        /// classification, stated once so no surface re-derives it from the
+        /// tool name. A peer that omits it is read as
+        /// [`AnswerEffect::unstated`].
+        ///
+        /// [`AnswerEffect::unstated`]: crate::AnswerEffect::unstated
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer_effect: Option<AnswerEffect>,
     },
     /// A tool call finished. `preview` is the runtime's truncated output;
     /// `duration_ms` is measured client-side.
@@ -1147,6 +1156,7 @@ mod tests {
                 arguments: "{}".to_string(),
                 parallel: false,
                 model_step: Some(2),
+                answer_effect: None,
             },
             "tool_call_started",
         );

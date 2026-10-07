@@ -102,6 +102,7 @@ fn start(s: &mut AppState, id: &str) {
             arguments: CMD.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
 }
@@ -360,6 +361,7 @@ fn a_backgrounded_command_says_it_started_not_that_it_finished() {
                 .into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -560,6 +562,7 @@ fn a_sandbox_policy_note_is_not_rendered_as_a_failure_reason() {
             arguments: r#"{"program":"git","args":["grep","ZZZ_NOT_FOUND_ZZZ_9f3a"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -903,6 +906,7 @@ fn parallel_commands_keep_independent_identity() {
                 arguments: format!(r#"{{"program":"echo","args":["{id}"]}}"#),
                 parallel: true,
                 model_step: None,
+                answer_effect: None,
             }),
         );
     }
@@ -964,6 +968,7 @@ fn a_reconnect_restores_the_running_clock_and_output() {
         output_tail: "Processing renewal\n".into(),
         output_truncated: false,
         model_step: None,
+        answer_effect: None,
     }];
     s.elapsed_secs = 0;
     reduce(
@@ -1002,6 +1007,7 @@ fn clicking_a_mixed_group_header_opens_every_call_in_it() {
                 arguments: args.into(),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             }),
         );
         reduce(

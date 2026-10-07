@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::PermissionProfile;
+use crate::wire_types::AnswerEffect;
 use leveler_core::{SessionId, ToolCallId};
 use leveler_model::{ModelRef, ThinkingLevel};
 
@@ -472,6 +473,16 @@ pub struct UiActiveToolCall {
     /// [`RuntimeEvent::ToolCallStarted`]: crate::RuntimeEvent::ToolCallStarted
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_step: Option<u32>,
+    /// Whether this call acts on the turn's answer — carried so a reconnected
+    /// client decides the `FinalAnswer` boundary exactly as the live one did,
+    /// instead of re-classifying the tool name (see the same field on
+    /// [`RuntimeEvent::ToolCallStarted`]). A snapshot from a peer that omits it
+    /// is read as [`AnswerEffect::unstated`].
+    ///
+    /// [`RuntimeEvent::ToolCallStarted`]: crate::RuntimeEvent::ToolCallStarted
+    /// [`AnswerEffect::unstated`]: crate::AnswerEffect::unstated
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_effect: Option<AnswerEffect>,
 }
 
 /// One user shell execution (`!command`) as the reconnect snapshot carries

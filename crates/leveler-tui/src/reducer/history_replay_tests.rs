@@ -3,8 +3,9 @@
 //! and how they ended, the turn terminals — instead of the snapshot's text.
 
 use leveler_client_protocol::{
-    ClientCommand, CommandId, MessageId, PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId,
-    ToolCallId, UiCommandStop, UiHistoryEntry, UiMessage, UiRole, UiSessionSnapshot,
+    AnswerEffect, ClientCommand, CommandId, MessageId, PermissionProfile, RuntimeEvent,
+    RuntimeStatus, SessionId, ToolCallId, UiCommandStop, UiHistoryEntry, UiMessage, UiRole,
+    UiSessionSnapshot,
 };
 
 use super::reduce;
@@ -112,6 +113,7 @@ fn stopped_turn() -> Vec<UiHistoryEntry> {
                 arguments: r#"{"program":"./scripts/soak.sh"}"#.into(),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             },
         ),
         entry(
@@ -299,6 +301,7 @@ fn a_replayed_session_hides_background_wait_polls() {
             arguments: r#"{"program":"make","args":["up"],"background":true}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("bg"),
@@ -315,6 +318,7 @@ fn a_replayed_session_hides_background_wait_polls() {
             arguments: r#"{"task_id":"t-1","timeout_seconds":120}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: Some(AnswerEffect::Bookkeeping),
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("w1"),
@@ -331,6 +335,7 @@ fn a_replayed_session_hides_background_wait_polls() {
             arguments: r#"{"task_id":"t-1"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: Some(AnswerEffect::Bookkeeping),
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("w2"),
@@ -463,6 +468,7 @@ fn a_delivery_snapshot_keeps_the_tool_rows_already_on_screen() {
             arguments: r#"{"program":"./scripts/soak.sh"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("c1"),
@@ -665,6 +671,12 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
 #[test]
 fn bookkeeping_after_the_answer_reads_the_same_live_and_replayed() {
     let bookkeeping = |id: &str, name: &str, arguments: &str| -> [RuntimeEvent; 2] {
+        // The runtime states the classification; the owner decides it.
+        let effect = if leveler_tools::acts_on_answer(name, arguments) {
+            AnswerEffect::Work
+        } else {
+            AnswerEffect::Bookkeeping
+        };
         [
             RuntimeEvent::ToolCallStarted {
                 id: ToolCallId::new(id),
@@ -672,6 +684,7 @@ fn bookkeeping_after_the_answer_reads_the_same_live_and_replayed() {
                 arguments: arguments.into(),
                 parallel: false,
                 model_step: Some(2),
+                answer_effect: Some(effect),
             },
             RuntimeEvent::ToolCallCompleted {
                 id: ToolCallId::new(id),
@@ -781,6 +794,7 @@ fn a_browser_run_reads_the_same_live_and_replayed() {
             arguments: r#"{"action":"navigate","url":"http://localhost:3000"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("b1"),
@@ -797,6 +811,7 @@ fn a_browser_run_reads_the_same_live_and_replayed() {
             arguments: r#"{"action":"snapshot"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("b2"),
@@ -874,6 +889,7 @@ fn read_started(id: &str, path: &str) -> RuntimeEvent {
         arguments: serde_json::json!({ "path": path }).to_string(),
         parallel: false,
         model_step: None,
+        answer_effect: None,
     }
 }
 
@@ -905,6 +921,7 @@ fn a_mixed_group_reads_the_same_live_and_replayed() {
             arguments: r#"{"pattern":"TaskStatus"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("c1"),
@@ -1004,6 +1021,7 @@ fn a_settled_command_reads_as_one_row_live_and_replayed() {
             arguments: r#"{"program":"cargo","args":["test","-p","leveler-update"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         },
         RuntimeEvent::ToolCallOutput {
             id: ToolCallId::new("t1"),

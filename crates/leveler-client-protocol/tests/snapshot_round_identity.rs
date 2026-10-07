@@ -28,6 +28,7 @@ fn active_tool(id: &str, model_step: Option<u32>) -> UiActiveToolCall {
         output_tail: String::new(),
         output_truncated: false,
         model_step,
+        answer_effect: None,
     }
 }
 

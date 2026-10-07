@@ -9,6 +9,7 @@ import { isCompactionSummaryText, isTurnUser } from '../lib/presentationKind';
 import { finalizationStageLabel, type TurnOutcome } from '../lib/turn';
 import { useImmerReducer } from '../lib/useImmerReducer';
 import type {
+  AnswerEffect,
   AttachmentRef,
   ChildOutcome,
   ChildStop,
@@ -80,6 +81,10 @@ export interface ToolCallView {
   modelStep: number | null;
   /** Observed concurrent burst inside the round, or null when it ran alone. */
   batch: number | null;
+  /** The runtime's answer classification for this call (`AnswerEffect`), or
+   *  `'work'` when an older peer did not state it — the conservative read. A
+   *  surface never classifies the tool name itself. */
+  answerEffect: AnswerEffect;
   /** 时间线排序戳（越小越早） */
   seq: number;
 }
@@ -332,6 +337,7 @@ export type Action =
       arguments: string;
       parallel: boolean;
       modelStep: number | null;
+      answerEffect: AnswerEffect;
     }
   | {
       type: 'tool_completed';
@@ -432,6 +438,7 @@ function viewFromSnapshot(
     durationMs: null,
     parallel: false,
     modelStep: t.model_step ?? null,
+    answerEffect: t.answer_effect ?? 'work',
     batch: null,
     seq: nextSeq(),
   }));
@@ -830,6 +837,7 @@ export function reducer(state: AppState, action: Action): void {
         durationMs: null,
         parallel: action.parallel,
         modelStep: action.modelStep,
+        answerEffect: action.answerEffect,
         batch,
         seq: nextSeq(),
       });

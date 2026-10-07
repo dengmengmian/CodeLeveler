@@ -385,6 +385,7 @@ mod tests {
             false,
             started as i64,
             None,
+            None,
         );
         state.activity = Some("等待任务".into());
     }
@@ -455,6 +456,7 @@ mod tests {
             serde_json::json!({ "profile": "worker", "task": "run cargo check" }).to_string(),
             false,
             0,
+            None,
             None,
         );
         state
@@ -551,6 +553,7 @@ mod tests {
             false,
             0,
             None,
+            None,
         );
         assert!(
             project(&state).is_none(),
@@ -642,6 +645,7 @@ mod tests {
                 serde_json::json!({ "task_id": id }).to_string(),
                 true,
                 0,
+                None,
                 None,
             );
         }

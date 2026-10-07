@@ -2793,7 +2793,7 @@ mod tests {
     fn spawn_call_then(state: &mut crate::state::AppState, ok: bool, preview: &str) {
         use crate::action::Action;
         use crate::reducer::reduce;
-        use leveler_client_protocol::{RuntimeEvent, ToolCallId};
+        use leveler_client_protocol::{AnswerEffect, RuntimeEvent, ToolCallId};
         reduce(
             state,
             Action::Runtime(RuntimeEvent::ToolCallStarted {
@@ -2803,6 +2803,7 @@ mod tests {
                     .to_string(),
                 parallel: false,
                 model_step: None,
+                answer_effect: Some(AnswerEffect::Bookkeeping),
             }),
         );
         if ok {
@@ -3314,6 +3315,7 @@ mod tests {
                         arguments: serde_json::json!({ "path": path }).to_string(),
                         parallel: false,
                         model_step: None,
+                        answer_effect: None,
                     },
                 ),
             );
@@ -3532,6 +3534,7 @@ mod tests {
             false,
             0,
             None,
+            None,
         );
         s.transcript.complete_tool(
             &first,
@@ -3547,6 +3550,7 @@ mod tests {
             r#"{"pattern":"TODO","path":"crates"}"#.into(),
             false,
             0,
+            None,
             None,
         );
         s.transcript
@@ -3963,6 +3967,7 @@ mod tests {
                 "{}".into(),
                 false,
                 0,
+                None,
                 None,
             );
             transcript.complete_tool(&id, true, "ok".into(), 1, None);

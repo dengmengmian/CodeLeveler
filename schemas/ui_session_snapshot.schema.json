@@ -219,6 +219,25 @@
     }
   },
   "definitions": {
+    "AnswerEffect": {
+      "description": "Whether a started call acts on the turn's answer.\n\nA protocol-owned DTO: the runtime decides this once (in its client projection, via the tool vocabulary) and every surface reads the stamped value instead of re-classifying the tool name. Four renderers each guessing is what made `FinalAnswer` a second truth source.\n\nThe outcome is frozen by `docs/EXECUTION_PRESENTATION_CONTRACT.md` §I9.",
+      "oneOf": [
+        {
+          "description": "Substantive work: a message before it was interim narration, not the turn's answer.",
+          "type": "string",
+          "enum": [
+            "work"
+          ]
+        },
+        {
+          "description": "Answer-preserving bookkeeping or observation: an answer written before it survives.",
+          "type": "string",
+          "enum": [
+            "bookkeeping"
+          ]
+        }
+      ]
+    },
     "ApprovalId": {
       "description": "Identifies a pending permission approval request.",
       "type": "string"
@@ -471,6 +490,17 @@
         "name"
       ],
       "properties": {
+        "answer_effect": {
+          "description": "Whether this call acts on the turn's answer — carried so a reconnected client decides the `FinalAnswer` boundary exactly as the live one did, instead of re-classifying the tool name (see the same field on [`RuntimeEvent::ToolCallStarted`]). A snapshot from a peer that omits it is read as [`AnswerEffect::unstated`].\n\n[`RuntimeEvent::ToolCallStarted`]: crate::RuntimeEvent::ToolCallStarted [`AnswerEffect::unstated`]: crate::AnswerEffect::unstated",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnswerEffect"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "arguments": {
           "type": "string"
         },

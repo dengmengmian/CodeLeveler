@@ -39,10 +39,14 @@ function applyToolEvent(state, event) {
           for (const t of inFlight) t.batch = batch;
         }
       }
-      tools.push({id:event.id,name:event.name,arguments:event.arguments,status:'running',preview:event.output_tail??'',anchor:'anchor' in event?event.anchor:state.messages?.at(-1)?.id,parallel:!!event.parallel,modelStep:event.model_step??null,batch,seq:'anchor' in event?undefined:nextSeq++});
+      tools.push({id:event.id,name:event.name,arguments:event.arguments,status:'running',preview:event.output_tail??'',anchor:'anchor' in event?event.anchor:state.messages?.at(-1)?.id,parallel:!!event.parallel,modelStep:event.model_step??null,
+        // The runtime's answer classification. `?? 'work'` is the conservative
+        // read of a peer that did not state it (AnswerEffect::unstated), never
+        // a local decision about the tool name.
+        answerEffect:event.answer_effect??'work',batch,seq:'anchor' in event?undefined:nextSeq++});
     }
   } else if (event.type === 'tool_call_completed' || event.type === 'tool_call_output') {
-    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',parallel:false,modelStep:null,batch:null}; tools.push(tool);}
+    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',parallel:false,modelStep:null,answerEffect:'work',batch:null}; tools.push(tool);}
     if (event.type === 'tool_call_completed') Object.assign(tool,{status:toolStatusFromOutcome(event.ok,event.stop),preview:event.preview,exit_code:event.exit_code});
     else tool.preview = (tool.preview + event.chunk).slice(-16000);
   }

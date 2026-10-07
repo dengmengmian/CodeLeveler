@@ -8,9 +8,9 @@ use leveler_core::ToolCallId;
 use leveler_engine::EngineEvent;
 
 use leveler_client_protocol::{
-    ChildContribution, FailureCategory, FailureDelivery, FailureRetryability, FailureSource,
-    FinalizationStage, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent, UiFailure,
-    UiPlan, UiPlanStep,
+    AnswerEffect, ChildContribution, FailureCategory, FailureDelivery, FailureRetryability,
+    FailureSource, FinalizationStage, MessageId, NotificationLevel, PlanStepStatus, RuntimeEvent,
+    UiFailure, UiPlan, UiPlanStep,
 };
 
 use crate::AppError;
@@ -492,6 +492,21 @@ fn closeout_nudge() -> EngineEvent {
 }
 
 impl EventBridge {
+    /// The runtime's one classification of what a call does to the answer.
+    ///
+    /// Stated here, at the boundary where the runtime's facts become client
+    /// facts, using the tool vocabulary's single owner. Every surface reads the
+    /// stamped value: re-deciding it per renderer is what made `FinalAnswer` a
+    /// second truth source. An unclassified call is `Work` (see
+    /// [`leveler_tools::acts_on_answer`]).
+    fn answer_effect(name: &str, arguments: &str) -> AnswerEffect {
+        if leveler_tools::acts_on_answer(name, arguments) {
+            AnswerEffect::Work
+        } else {
+            AnswerEffect::Bookkeeping
+        }
+    }
+
     pub fn new(events: broadcast::Sender<RuntimeEvent>) -> Self {
         Self {
             events,
@@ -677,12 +692,14 @@ impl EventBridge {
                 // never mistaken for the nudge response.
                 self.round_after_closeout_nudge = false;
                 self.tool_starts.insert(id.clone(), Instant::now());
+                let answer_effect = Self::answer_effect(&name, &arguments);
                 let _ = self.events.send(RuntimeEvent::ToolCallStarted {
                     id: ToolCallId::new(id),
                     name,
                     arguments,
                     parallel,
                     model_step,
+                    answer_effect: Some(answer_effect),
                 });
             }
             EngineEvent::ToolCallFinished {
@@ -704,6 +721,12 @@ impl EventBridge {
                 let start = match self.tool_starts.remove(&id) {
                     Some(start) => start,
                     None => {
+                        // Same for the answer: the runtime recorded no
+                        // arguments with this result, so the call is
+                        // classified at the name level. That is what the
+                        // reference implementation did here too — an
+                        // argument-dependent call with no arguments is work.
+                        let answer_effect = Self::answer_effect(&name, "");
                         let _ = self.events.send(RuntimeEvent::ToolCallStarted {
                             id: ToolCallId::new(id.clone()),
                             name,
@@ -713,6 +736,7 @@ impl EventBridge {
                             // a client keeps its old grouping rather than
                             // invent a boundary (see the arm above).
                             model_step: None,
+                            answer_effect: Some(answer_effect),
                         });
                         Instant::now()
                     }

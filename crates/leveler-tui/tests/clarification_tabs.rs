@@ -428,6 +428,7 @@ fn a_replayed_clarification_shows_the_answers_with_no_active_focus() {
             arguments,
             parallel: false,
             model_step: None,
+            answer_effect: None,
         },
         RuntimeEvent::ToolCallCompleted {
             id: ToolCallId::new("t1"),

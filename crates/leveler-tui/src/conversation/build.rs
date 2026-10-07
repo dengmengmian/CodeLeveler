@@ -555,6 +555,7 @@ mod tests {
             false,
             0,
             None,
+            None,
         );
         s.transcript
             .complete_tool(&id, true, "patched".into(), 5, Some(diff));

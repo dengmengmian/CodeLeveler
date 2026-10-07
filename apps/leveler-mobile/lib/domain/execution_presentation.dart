@@ -41,6 +41,7 @@ class ToolFact {
     this.parallel = false,
     this.batch,
     this.preview = '',
+    this.answerEffect = AnswerEffect.work,
   });
 
   final String id;
@@ -53,6 +54,13 @@ class ToolFact {
   final bool parallel;
   int? batch;
   String preview;
+
+  /// The runtime's classification of what this call does to the answer.
+  ///
+  /// The runtime stamps it on every call it projects; the App reads it and
+  /// never re-decides it from [name]. [AnswerEffect.work] is the conservative
+  /// read when an older peer did not state the fact.
+  AnswerEffect answerEffect;
 }
 
 /// A burst of calls from one model response.
@@ -78,26 +86,21 @@ class ExecutionRoundView {
   final List<List<String>> batches;
 }
 
-/// Tools whose presence never demotes a committed answer and never becomes one.
+/// Whether a started call acts on the turn's answer.
 ///
-/// Mirrors the reference implementation's Silent observation rows plus Plan
-/// bookkeeping (`crates/leveler-tui/src/tool_taxonomy.rs`).
-const Set<String> bookkeepingTools = {
-  'update_plan',
-  'update_goal',
-  'list_files',
-  'get_task',
-  'wait_task',
-  'git_status',
-  'create_checkpoint',
-  'expand_tools',
-  'memory',
-  'consolidate_memory',
-  'spawn_agent',
-};
+/// The classification is the RUNTIME's, stated on the wire as the call's
+/// `answer_effect` (`leveler_tools::acts_on_answer` is its one owner). This
+/// reads that fact — the App must never re-derive it from the tool name, which
+/// is what made `FinalAnswer` a second truth source.
+enum AnswerEffect {
+  work,
+  bookkeeping;
 
-/// Whether a call proves the prose before it was interim narration.
-bool actsOnAnswer(String name) => !bookkeepingTools.contains(name);
+  static AnswerEffect parse(Object? raw) =>
+      raw == 'bookkeeping' ? AnswerEffect.bookkeeping : AnswerEffect.work;
+
+  bool get actsOnAnswer => this == AnswerEffect.work;
+}
 
 const List<String> _runtimeNoteTags = [
   '[execution policy] ',
@@ -339,7 +342,7 @@ List<ProjectedItem> projectTurn(
       continue;
     }
     final tool = entry.tool!;
-    if (actsOnAnswer(tool.name)) {
+    if (tool.answerEffect.actsOnAnswer) {
       for (final node in nodes) {
         if (node.round == null) node.demoted = true;
       }

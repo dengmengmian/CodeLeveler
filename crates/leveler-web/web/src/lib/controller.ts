@@ -201,6 +201,7 @@ export class RuntimeBridge {
           arguments: ev.arguments,
           parallel: ev.parallel ?? false,
           modelStep: ev.model_step ?? null,
+          answerEffect: ev.answer_effect ?? 'work',
         });
         break;
       case 'tool_call_completed':

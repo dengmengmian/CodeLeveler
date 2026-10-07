@@ -3034,6 +3034,7 @@ mod tests {
             false,
             0,
             None,
+            None,
         );
         s.transcript
             .complete_tool(&call, true, "ok".into(), 1, None);

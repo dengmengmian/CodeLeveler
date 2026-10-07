@@ -215,6 +215,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             arguments,
             parallel,
             model_step,
+            answer_effect,
         } => {
             mark_turn_busy(state);
             state.turn_tool_calls = state.turn_tool_calls.saturating_add(1);
@@ -247,6 +248,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 parallel,
                 started as i64,
                 model_step,
+                answer_effect,
             );
         }
         RuntimeEvent::ToolCallCompleted {
@@ -1864,6 +1866,9 @@ fn apply_session_with(
         // transcript groups the calls exactly as the live stream did. A legacy
         // snapshot carries `None`, and the reducer keeps its old fallback.
         let model_step = tool.model_step;
+        // Same for the answer classification: a reconnected client decides the
+        // FinalAnswer boundary exactly as the live one did.
+        let answer_effect = tool.answer_effect;
         state.transcript.push_tool_started(
             tool.id,
             tool.name,
@@ -1871,6 +1876,7 @@ fn apply_session_with(
             false,
             started,
             model_step,
+            answer_effect,
         );
         state.transcript.append_tool_output(&id, &tool.output_tail);
     }

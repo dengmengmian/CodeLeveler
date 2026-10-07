@@ -4,7 +4,7 @@
 //! independently. It carries the blocks the base shell needs; extensions
 //! add Tool/Plan/Diff/Verification/Attachment/Agent blocks.
 
-use leveler_client_protocol::{MessageId, ToolCallId, UiCompletionReport, UiPlan};
+use leveler_client_protocol::{AnswerEffect, MessageId, ToolCallId, UiCompletionReport, UiPlan};
 
 use crate::markdown::MdDoc;
 
@@ -810,6 +810,7 @@ impl TranscriptState {
         parallel: bool,
         started_elapsed_secs: i64,
         model_step: Option<u32>,
+        answer_effect: Option<AnswerEffect>,
     ) {
         self.bump();
         let mut call = ToolCallBlock {
@@ -837,13 +838,14 @@ impl TranscriptState {
         }
         self.assign_batch(&mut call);
         // Work acting on the prose is the proof that the prose was not the
-        // answer. Silent calls never are — and neither is bookkeeping that only
-        // records state, even when it is Important: a real run ends
-        // `answer → update_plan → update_goal(complete) → turn end`, and
-        // counting the plan row as a boundary folded the answer away. This is
-        // the answer lifecycle's own predicate, deliberately separate from
-        // `is_grouping_visible`'s presentation question.
-        if crate::tool_taxonomy::acts_on_answer(&call.name, &call.arguments) {
+        // answer. The classification is the RUNTIME's — stamped on the event
+        // by the one owner (`leveler_tools::acts_on_answer`) — so this reads it
+        // instead of re-deciding it from the tool name. A runtime that did not
+        // state it is read conservatively, as work.
+        if answer_effect
+            .unwrap_or_else(AnswerEffect::unstated)
+            .acts_on_answer()
+        {
             self.decide_pending_assistants(AssistantKind::Progress);
         }
         match self.items.last_mut() {
@@ -1455,6 +1457,7 @@ mod tests {
             false,
             0,
             None,
+            None,
         );
         let v2 = t.version();
         assert!(v2 > v1, "push_tool_started must bump");
@@ -1470,6 +1473,18 @@ mod tests {
 
     // ── Semantic activity boundaries ────────────────────────────────────────
 
+    /// What a runtime of this build states for a call: the shared owner's
+    /// answer (`leveler_tools::acts_on_answer`). The transcript no longer
+    /// classifies a tool name itself, so these tests supply the fact exactly as
+    /// the runtime would and exercise the use of it.
+    fn stated(name: &str, args: &str) -> Option<AnswerEffect> {
+        Some(if leveler_tools::acts_on_answer(name, args) {
+            AnswerEffect::Work
+        } else {
+            AnswerEffect::Bookkeeping
+        })
+    }
+
     /// Push one call and settle it, so the next push sees a fully settled
     /// (but still open) group — the shape a sequential model turn produces.
     fn settled(t: &mut TranscriptState, id: &str, name: &str, args: &str) {
@@ -1480,6 +1495,7 @@ mod tests {
             false,
             0,
             None,
+            stated(name, args),
         );
         t.complete_tool(&ToolCallId::new(id), true, "ok".into(), 1, None);
     }
@@ -1497,6 +1513,7 @@ mod tests {
             parallel,
             0,
             None,
+            stated(name, args),
         );
     }
 
@@ -1548,6 +1565,7 @@ mod tests {
             false,
             0,
             Some(round),
+            None,
         );
         t.complete_tool(&ToolCallId::new(id), true, "ok".into(), 1, None);
     }
@@ -1567,6 +1585,7 @@ mod tests {
             parallel,
             0,
             Some(round),
+            None,
         );
     }
 
@@ -1867,6 +1886,7 @@ mod tests {
             true,
             0,
             None,
+            None,
         );
         t.push_tool_started(
             ToolCallId::new("e1"),
@@ -1874,6 +1894,7 @@ mod tests {
             r#"{"patch":"x"}"#.into(),
             true,
             0,
+            None,
             None,
         );
         assert_eq!(group_shapes(&t).len(), 1, "{:?}", group_shapes(&t));

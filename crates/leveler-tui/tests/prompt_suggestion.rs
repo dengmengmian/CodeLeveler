@@ -10,8 +10,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use leveler_client_protocol::{
-    ClientCommand, MessageId, PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId,
-    ToolCallId, UiSessionSnapshot,
+    AnswerEffect, ClientCommand, MessageId, PermissionProfile, RuntimeEvent, RuntimeStatus,
+    SessionId, ToolCallId, UiSessionSnapshot,
 };
 use leveler_tui::action::{Action, Effect};
 use leveler_tui::reducer::reduce;
@@ -343,6 +343,7 @@ fn goal_turn_with_args(s: &mut AppState, args: serde_json::Value, ok: bool) {
             arguments: args.to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: Some(AnswerEffect::Bookkeeping),
         }),
     );
     reduce(
@@ -747,6 +748,7 @@ fn a5_cancelled_and_failed_turns_offer_nothing() {
             .to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: Some(AnswerEffect::Bookkeeping),
         }),
     );
     reduce(

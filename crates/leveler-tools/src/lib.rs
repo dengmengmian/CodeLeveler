@@ -6,6 +6,7 @@
 //! `git_status`, `git_diff`.
 #![forbid(unsafe_code)]
 
+pub mod answer_effect;
 pub mod capabilities;
 pub mod mcp;
 pub(crate) mod network;
@@ -15,6 +16,9 @@ pub mod tool;
 pub mod tools;
 pub(crate) mod workspace;
 
+pub use answer_effect::{
+    BOOKKEEPING_TOOLS, acts_on_answer, is_silent_shell_probe, update_goal_is_blocked,
+};
 pub use capabilities::Capabilities;
 pub use registry::{
     CapabilityPacks, MODEL_SURFACE_TOOLS, OBSERVE_CLASS_TOOLS, ToolRegistry, core_surface,

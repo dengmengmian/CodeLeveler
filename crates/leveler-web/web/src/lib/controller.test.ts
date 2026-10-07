@@ -481,6 +481,7 @@ describe('session_updated vs session_opened', () => {
       arguments: '{"path":"README.md"}',
       parallel: false,
       modelStep: null,
+      answerEffect: 'work',
     });
     reducer(state, { type: 'tool_completed', id: 't1', ok: true, preview: 'ok', durationMs: 8, stop: null });
     apply({
@@ -514,6 +515,7 @@ describe('session_updated vs session_opened', () => {
       arguments: '{}',
       parallel: false,
       modelStep: null,
+      answerEffect: 'work',
     });
     apply({
       type: 'session_opened',

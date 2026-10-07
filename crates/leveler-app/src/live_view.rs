@@ -78,6 +78,7 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
             name,
             arguments,
             model_step,
+            answer_effect,
             ..
         } => {
             view.active_tools.retain(|tool| tool.id != *id);
@@ -93,6 +94,10 @@ fn fold(view: &mut LiveSessionView, event: &RuntimeEvent) {
                 // The live view carries the round so a reconnect restores the
                 // SAME rounds, not a re-derived approximation.
                 model_step: *model_step,
+                // And it carries the answer classification for the same
+                // reason: a reconnected client must not re-decide the
+                // FinalAnswer boundary from the tool name.
+                answer_effect: *answer_effect,
             });
         }
         RuntimeEvent::ToolCallCompleted { id, .. } => {
@@ -169,6 +174,7 @@ mod tests {
                 arguments: r#"{"cmd":"cargo test"}"#.to_string(),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             },
         );
         assert_eq!(views.view(&session_id).active_tools.len(), 1);
@@ -203,6 +209,7 @@ mod tests {
                     arguments: "{}".to_string(),
                     parallel: true,
                     model_step: Some(4),
+                    answer_effect: None,
                 },
             );
         }
@@ -215,6 +222,7 @@ mod tests {
                 arguments: "{}".to_string(),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             },
         );
 
@@ -250,6 +258,7 @@ mod tests {
                 arguments: r#"{"cmd":"cargo test"}"#.to_string(),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             },
         );
         views.apply(
@@ -352,6 +361,7 @@ mod task_cancel_cleanup_tests {
                 arguments: "{}".into(),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             },
         );
         views.apply(

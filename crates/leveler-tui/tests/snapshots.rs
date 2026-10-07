@@ -7,7 +7,7 @@ use ratatui::backend::TestBackend;
 use unicode_width::UnicodeWidthStr;
 
 use leveler_client_protocol::{
-    ApprovalId, MessageId, PermissionProfile, RuntimeEvent, SessionId, ToolCallId,
+    AnswerEffect, ApprovalId, MessageId, PermissionProfile, RuntimeEvent, SessionId, ToolCallId,
     UiApprovalRequest, UiMessage, UiRole, UiSessionSnapshot,
 };
 use leveler_tui::action::Action;
@@ -477,6 +477,7 @@ fn renders_failed_tool_inline_and_tools_screen() {
             arguments: "cargo test".into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -552,6 +553,7 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
             arguments: r#"{"program":"cargo","args":["test"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -640,6 +642,7 @@ fn command_result_renders_as_important_activity_not_file_list() {
             arguments: r#"{"program":"cargo","args":["test","-p","leveler-tui"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -702,6 +705,7 @@ fn running_command_renders_as_progress_activity() {
             arguments: r#"{"program":"cargo","args":["check"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
 
@@ -732,6 +736,7 @@ fn list_files_scan_stays_out_of_conversation() {
                 arguments: format!(r#"{{"path":"{path}"}}"#),
                 parallel: false,
                 model_step: None,
+                answer_effect: Some(AnswerEffect::Bookkeeping),
             }),
         );
         reduce(
@@ -756,6 +761,7 @@ fn list_files_scan_stays_out_of_conversation() {
             arguments: r#"{"patch":"*** Begin Patch\n*** Update File: internal/admin/web/web.go\n*** End Patch"}"#.into(),
             parallel: false,
         model_step: None,
+                    answer_effect: None,
         }),
     );
     reduce(
@@ -1054,6 +1060,7 @@ fn recap_does_not_render_raw_markdown_markers() {
             .to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: Some(AnswerEffect::Bookkeeping),
         }),
     );
     reduce(
@@ -1242,6 +1249,7 @@ fn a_silent_tool_group_leaves_no_hole() {
             arguments: r#"{"program":"ls","args":["-la"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(

@@ -26,6 +26,42 @@ pub enum PermissionProfile {
     FullAccess,
 }
 
+/// Whether a started call acts on the turn's answer.
+///
+/// A protocol-owned DTO: the runtime decides this once (in its client
+/// projection, via the tool vocabulary) and every surface reads the stamped
+/// value instead of re-classifying the tool name. Four renderers each guessing
+/// is what made `FinalAnswer` a second truth source.
+///
+/// The outcome is frozen by `docs/EXECUTION_PRESENTATION_CONTRACT.md` §I9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerEffect {
+    /// Substantive work: a message before it was interim narration, not the
+    /// turn's answer.
+    Work,
+    /// Answer-preserving bookkeeping or observation: an answer written before
+    /// it survives.
+    Bookkeeping,
+}
+
+impl AnswerEffect {
+    /// Whether a message in front of this call was still the turn's answer.
+    pub const fn acts_on_answer(self) -> bool {
+        matches!(self, Self::Work)
+    }
+
+    /// What a peer that started before this fact existed must be read as.
+    ///
+    /// Unstated is `Work`: the conservative direction, which demotes rather
+    /// than promotes. A new runtime always states the field, so this only ever
+    /// applies to an older peer.
+    pub const fn unstated() -> Self {
+        Self::Work
+    }
+}
+
 /// Whether a session prompts for approval of risky actions or auto-approves
 /// them. Unlike [`PermissionProfile`] (which actions are *allowed*), this is
 /// about whether the approval overlay is shown. It is a per-session property so

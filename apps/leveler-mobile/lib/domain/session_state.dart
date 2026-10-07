@@ -495,6 +495,7 @@ class SessionState extends ChangeNotifier {
         if (_timelineById('tool-$toolId') != null) break;
         final parallel = event['parallel'] as bool? ?? false;
         final modelStep = (event['model_step'] as num?)?.toInt();
+        final answerEffect = AnswerEffect.parse(event['answer_effect']);
         final batch = observedBatch(_toolFacts, parallel: parallel);
         if (batch != null) {
           for (final fact in _toolFacts) {
@@ -510,6 +511,7 @@ class SessionState extends ChangeNotifier {
           modelStep: modelStep,
           parallel: parallel,
           batch: batch,
+          answerEffect: answerEffect,
         ));
         timeline.add(TimelineItem(
           id: 'tool-$toolId',

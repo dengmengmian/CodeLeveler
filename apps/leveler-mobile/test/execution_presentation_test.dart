@@ -185,13 +185,29 @@ void main() {
       final messages = [
         ProjectedMessage(role: 'assistant', text: '改好了。', seq: 0),
       ];
+      // The runtime states the classification; the app reads the fact.
       final tools = [
-        ToolFact(id: 't1', name: 'update_plan', status: ToolStatus.ok, seq: 1),
-        ToolFact(id: 't2', name: 'update_goal', status: ToolStatus.ok, seq: 2),
+        ToolFact(
+            id: 't1',
+            name: 'update_plan',
+            status: ToolStatus.ok,
+            seq: 1,
+            answerEffect: AnswerEffect.bookkeeping),
+        ToolFact(
+            id: 't2',
+            name: 'update_goal',
+            status: ToolStatus.ok,
+            seq: 2,
+            answerEffect: AnswerEffect.bookkeeping),
       ];
       expect(committedFinalAnswer(messages, tools), '改好了。');
       final work = [
-        ToolFact(id: 't3', name: 'read_file', status: ToolStatus.ok, seq: 1),
+        ToolFact(
+            id: 't3',
+            name: 'read_file',
+            status: ToolStatus.ok,
+            seq: 1,
+            answerEffect: AnswerEffect.work),
       ];
       expect(committedFinalAnswer(messages, work), isNull);
       expect(

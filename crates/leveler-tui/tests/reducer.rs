@@ -4,10 +4,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use leveler_client_protocol::ToolCallId;
 use leveler_client_protocol::{
-    ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId, PermissionProfile,
-    RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest, UiCheckpoint,
-    UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiRole, UiSessionSnapshot, UiThinkingAccess,
-    UiThinkingState,
+    AnswerEffect, ApprovalDecision, ApprovalId, ClientCommand, FinalizationStage, MessageId,
+    PermissionProfile, RuntimeEvent, RuntimeStatus, SessionId, UiActiveToolCall, UiApprovalRequest,
+    UiCheckpoint, UiCompletionReport, UiMessage, UiPlan, UiPlanStep, UiRole, UiSessionSnapshot,
+    UiThinkingAccess, UiThinkingState,
 };
 use leveler_tui::action::{Action, Effect, EffectCompletion};
 use leveler_tui::btw::{BtwToolState, BtwTurnState, SurfaceFocus};
@@ -1083,6 +1083,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             arguments: r#"{"path":"old.rs"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -1124,6 +1125,7 @@ fn ctrl_o_expands_only_the_latest_tool_group() {
             arguments: r#"{"program":"ls"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -1187,6 +1189,7 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
             arguments: r#"{"path":"a.rs"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -1720,6 +1723,7 @@ fn an_approval_request_stops_its_call_reading_as_running() {
             arguments: r#"{"program":"rm","args":["-rf","stale"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     let running = rendered(&mut s, 120, 40);
@@ -1881,6 +1885,7 @@ fn interim_narration_does_not_satisfy_the_completion_footer() {
             arguments: r#"{"path":"worker.go"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -1980,7 +1985,18 @@ fn a_model_spawned_child_still_demotes_the_prose_before_it() {
 }
 
 /// Reduce one settled tool call, the way a real turn records it.
+/// The answer classification the runtime states for a call, from its single
+/// owner — the same call the runtime's client projection makes.
+fn stated(name: &str, arguments: &str) -> Option<AnswerEffect> {
+    Some(if leveler_tools::acts_on_answer(name, arguments) {
+        AnswerEffect::Work
+    } else {
+        AnswerEffect::Bookkeeping
+    })
+}
+
 fn tool_call(s: &mut AppState, id: &str, name: &str, arguments: &str) {
+    let effect = stated(name, arguments);
     reduce(
         s,
         Action::Runtime(RuntimeEvent::ToolCallStarted {
@@ -1989,6 +2005,7 @@ fn tool_call(s: &mut AppState, id: &str, name: &str, arguments: &str) {
             arguments: arguments.into(),
             parallel: false,
             model_step: Some(1),
+            answer_effect: effect,
         }),
     );
     reduce(
@@ -2625,6 +2642,7 @@ fn reconnect_snapshot_restores_running_turn_render_state() {
         output_tail: String::new(),
         output_truncated: false,
         model_step: None,
+        answer_effect: None,
         id: ToolCallId::new("tool-1"),
         name: "run_command".to_string(),
         arguments: r#"{"cmd":"cargo test"}"#.to_string(),
@@ -3154,6 +3172,7 @@ fn ctrl_m_opens_model_picker() {
 // ---- Phase 3: tool blocks + Tools screen -----------------------------------
 
 fn tool_started(s: &mut AppState, id: &str, name: &str, args: &str) {
+    let effect = stated(name, args);
     reduce(
         s,
         Action::Runtime(RuntimeEvent::ToolCallStarted {
@@ -3162,6 +3181,7 @@ fn tool_started(s: &mut AppState, id: &str, name: &str, args: &str) {
             arguments: args.into(),
             parallel: false,
             model_step: None,
+            answer_effect: effect,
         }),
     );
 }
@@ -5135,6 +5155,7 @@ fn goal_completion_uses_structured_summary_only_for_the_input_suggestion() {
             .to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: Some(AnswerEffect::Bookkeeping),
         }),
     );
     reduce(
@@ -5177,6 +5198,7 @@ fn goal_completion_without_structured_next_step_has_no_suggestion() {
             .to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: Some(AnswerEffect::Bookkeeping),
         }),
     );
     reduce(
@@ -5582,6 +5604,7 @@ fn activity_clears_when_the_tool_completes() {
             arguments: r#"{"path":"src/lib.rs"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     assert!(s.activity.is_some());
@@ -6188,6 +6211,7 @@ fn a_new_model_step_replaces_the_previous_step_reasoning() {
             arguments: "{}".into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -9187,6 +9211,7 @@ fn tool(s: &mut AppState, id: &str) {
             arguments: r#"{"path":"a.rs"}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(

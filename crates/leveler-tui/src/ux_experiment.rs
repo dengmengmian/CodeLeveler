@@ -157,6 +157,7 @@ fn tool(s: &mut AppState, id: &str, name: &str, args: &str, ok: bool, preview: &
             arguments: args.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -233,6 +234,7 @@ fn edit(s: &mut AppState, id: &str, path: &str, changes: usize) {
             arguments: serde_json::json!({ "patch": patch }).to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(

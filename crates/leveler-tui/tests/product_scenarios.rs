@@ -143,6 +143,7 @@ fn tool(s: &mut AppState, id: &str, name: &str, args: &str, ok: bool, preview: &
             arguments: args.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -177,6 +178,7 @@ fn edit(s: &mut AppState, id: &str, path: &str, applied: &str) {
             arguments: serde_json::json!({ "patch": patch }).to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -420,6 +422,7 @@ fn s11_command_focus_and_stop() {
             .to_string(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     s.elapsed_secs = 34;
@@ -641,6 +644,7 @@ fn s03_long_task() {
             arguments: r#"{"program":"cargo","args":["test","--workspace"]}"#.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
     reduce(
@@ -838,6 +842,7 @@ fn d02_applied_diff_line_count() {
         }).to_string(),
         parallel: false,
     model_step: None,
+                    answer_effect: None,
     }));
     reduce(
         &mut s,

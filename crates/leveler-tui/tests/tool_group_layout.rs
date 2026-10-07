@@ -120,6 +120,7 @@ fn start(s: &mut AppState, id: &str, args: &str) {
             arguments: args.into(),
             parallel: false,
             model_step: None,
+            answer_effect: None,
         }),
     );
 }

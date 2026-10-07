@@ -1379,6 +1379,7 @@ second line ignored"
             false,
             2,
             None,
+            None,
         );
         let wait = crate::wait_status::project(&state).expect("wait");
         assert_eq!(wait.kind, crate::wait_status::WaitKind::BackgroundTask);
@@ -1398,6 +1399,7 @@ second line ignored"
             serde_json::json!({ "profile": "worker", "task": "check" }).to_string(),
             false,
             0,
+            None,
             None,
         );
         state

@@ -7,10 +7,10 @@
 // Final/Progress split is decided by event order (never by reading prose).
 //
 // Shared packaging notes:
-// - The work/bookkeeping classification mirrors the reference implementation
-//   (`crates/leveler-tui/tool_taxonomy.rs`: `ActivityVisibility::Silent` +
-//   `ToolKind::Plan`). The contract freezes the OUTCOME; the fixture corpus
-//   (C4/C5/C9) is what keeps this list honest.
+// - The Final/Progress split is decided by event order plus the runtime's
+//   stated `answerEffect` on the call (never by reading prose, and never by
+//   classifying the tool name: `leveler-tools` owns that classification and the
+//   runtime stamps it on the wire).
 // - Runtime notes (`[execution policy]`, `[mutation rejected]`, …) state HOW a
 //   command ran; they are never WHY it failed (C8).
 
@@ -39,32 +39,8 @@ export type ProjectedItem =
   | { kind: 'execution_round'; round: ExecutionRoundView; seq: number };
 
 /**
- * Tools whose presence never demotes a committed answer and never becomes one:
- * the reference implementation's Silent observation rows plus Plan bookkeeping.
- * Deliberately a name allowlist — a new tool must be classified on purpose.
+ * Runtime rows about HOW a command ran, never why it failed (Contract §I8).
  */
-const BOOKKEEPING_TOOLS: ReadonlySet<string> = new Set([
-  // ToolKind::Plan
-  'update_plan',
-  // ActivityVisibility::Silent
-  'update_goal',
-  'list_files',
-  'get_task',
-  'wait_task',
-  'git_status',
-  'create_checkpoint',
-  'expand_tools',
-  'memory',
-  'consolidate_memory',
-  'spawn_agent',
-]);
-
-/** Whether a call proves the prose before it was interim narration. */
-export function actsOnAnswer(name: string): boolean {
-  return !BOOKKEEPING_TOOLS.has(name);
-}
-
-/** Runtime rows about HOW a command ran, never why it failed (Contract §I8). */
 const RUNTIME_NOTE_TAGS: readonly string[] = [
   '[execution policy] ',
   '[mutation rejected] ',
@@ -266,7 +242,10 @@ export function projectTurn(
     }
     const tool = entry.tool;
     if (!tool) continue;
-    if (actsOnAnswer(tool.name)) {
+    // The runtime's own classification, read verbatim. A surface that
+    // re-derived this from `tool.name` would be the second truth source the
+    // contract removed.
+    if (tool.answerEffect === 'work') {
       for (const node of nodes) {
         if (node.kind === 'assistant') node.demoted = true;
       }

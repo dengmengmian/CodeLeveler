@@ -1915,6 +1915,7 @@ mod disclosure_tests {
             false,
             0,
             None,
+            None,
         );
         s.transcript
             .complete_tool(&ToolCallId::new(id), true, "done".into(), 1200, None);
@@ -2016,6 +2017,7 @@ mod disclosure_tests {
                 arguments: r#"{"path":"a.rs"}"#.into(),
                 parallel: false,
                 model_step: None,
+                answer_effect: None,
             }),
         );
         assert!(
@@ -2190,6 +2192,7 @@ mod disclosure_tests {
             r#"{"program":"ls"}"#.into(),
             false,
             0,
+            None,
             None,
         );
         s.transcript
@@ -2394,6 +2397,7 @@ mod disclosure_tests {
             r#"{"program":"cargo"}"#.into(),
             false,
             0,
+            None,
             None,
         );
         let running_idx = s.transcript.items().len() - 1;

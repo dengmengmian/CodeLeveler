@@ -109,6 +109,9 @@ fn active_tool(
         output_tail: String::new(),
         output_truncated: false,
         model_step,
+        // These fixtures describe the round; the answer classification is the
+        // caller's, and the reconnect tests below pass it through `start`.
+        answer_effect: None,
     }
 }
 
@@ -121,6 +124,9 @@ fn start(s: &mut AppState, id: &str, name: &str, arguments: &str, model_step: Op
             arguments: arguments.into(),
             parallel: false,
             model_step,
+            // These fixtures are about the execution round; the tools they use
+            // (reads, greps, shell runs) all act on the answer.
+            answer_effect: None,
         }),
     );
 }

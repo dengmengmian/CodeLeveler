@@ -110,10 +110,14 @@ export function contractToolStatus(status){
 /** @param {boolean} ok @param {string|null|undefined} stop */
 export function toolStatusFromOutcome(ok,stop){if(stop==='confirmed')return 'cancelled';if(stop==='unconfirmed')return 'unknown';return ok?'success':'failed';}
 
-/** Tools whose presence never demotes a committed answer and never becomes one. */
-const BOOKKEEPING_TOOLS=new Set(['update_plan','update_goal','list_files','get_task','wait_task','git_status','create_checkpoint','expand_tools','memory','consolidate_memory','spawn_agent']);
-/** @param {string} name */
-export function actsOnAnswer(name){return !BOOKKEEPING_TOOLS.has(name);}
+/** Whether the runtime stated this call as substantive work.
+ *
+ * The classification belongs to the runtime, which stamps `answer_effect` on
+ * every tool call it projects (`leveler_tools::acts_on_answer` is its one
+ * owner). Desktop reads the fact; it must never re-derive it from the tool
+ * name, which is what made `FinalAnswer` a second truth source.
+ * @param {ExecutionToolRow} tool */
+export function actsOnAnswer(tool){return (tool?.answerEffect??'work')==='work';}
 
 const RUNTIME_NOTE_TAGS=['[execution policy] ','[mutation rejected] ','[note] '];
 /** A runtime row about HOW a command ran, never why it failed. @param {string} line */
@@ -135,7 +139,7 @@ export function displayPreview(tool){if(!tool.preview)return null;if(!['run_comm
 /** Activity class for the legacy fallback only. @param {string} name */
 function activityClass(name){const n=name.toLowerCase();if(/apply_patch|edit|write|patch/.test(n))return 'edit';if(/read|cat|open|view/.test(n))return 'read';if(/search|grep|find|glob|list/.test(n))return 'search';if(/bash|shell|exec|command|run|terminal|cargo|npm|git_(?!diff)/.test(n))return 'command';return 'other';}
 
-/** @typedef {{id:string,name:string,status:string,parallel?:boolean,modelStep?:number|null,batch?:number|null}} ExecutionToolRow */
+/** @typedef {{id:string,name:string,status:string,parallel?:boolean,modelStep?:number|null,batch?:number|null,answerEffect?:string}} ExecutionToolRow */
 /** @typedef {{modelStep:number|null,tools:ExecutionToolRow[],status:string,allOk:boolean,batches:string[][]}} ExecutionRoundView */
 
 /** @param {ExecutionRoundView} round @param {ExecutionToolRow} tool */
@@ -237,7 +241,7 @@ export function projectTurn(messages,tools,turnEnded){
   }
   const tool=entry.tool;
   if(!tool)continue;
-  if(actsOnAnswer(tool.name)){for(const node of nodes){if(node.kind==='assistant')node.demoted=true;}}
+  if(actsOnAnswer(tool)){for(const node of nodes){if(node.kind==='assistant')node.demoted=true;}}
   const last=nodes[nodes.length-1];
   if(last&&last.kind==='round'&&!startsNewRound(last.round,tool)){last.round.tools.push(tool);}
   else nodes.push({kind:'round',seq:entry.seq,round:{modelStep:tool.modelStep??null,tools:[tool],status:'running',allOk:false,batches:[]}});
