@@ -32,6 +32,7 @@ pub mod fold;
 pub mod i18n;
 mod layout;
 pub mod markdown;
+pub mod motion;
 pub mod multi_agent;
 mod observability;
 pub mod overlay;

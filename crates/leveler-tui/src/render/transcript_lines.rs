@@ -129,6 +129,12 @@ fn format_thought_duration(ms: u64) -> String {
 /// A provider that returned no text gets a header and no invented prose.
 /// Reasoning is not markdown, so the body is wrapped verbatim rather than
 /// parsed.
+///
+/// A LIVE segment wears the live ink on its bullet and header
+/// ([`thinking_ink`]); a settled one recedes to plain secondary ink. The
+/// reasoning BODY keeps its own muted ink either way, and the rail's moving
+/// highlight is painted later, over the frame's window — see
+/// [`paint_reasoning_rail`].
 pub fn thought_lines(
     block: &ThoughtBlock,
     theme: &Theme,
@@ -136,7 +142,7 @@ pub fn thought_lines(
     t: &crate::i18n::UiText,
 ) -> Vec<Line<'static>> {
     let header_style = Style::default()
-        .fg(theme.text.secondary)
+        .fg(thinking_ink(block.done, theme))
         .add_modifier(Modifier::ITALIC);
     let header = if !block.done {
         t.thought_live.to_string()
@@ -154,14 +160,14 @@ pub fn thought_lines(
         )
     };
     let mut out = vec![Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(theme.text.secondary)),
+        Span::styled("◆ ", Style::default().fg(thinking_ink(block.done, theme))),
         Span::styled(header, header_style),
     ])];
     let inner = wrap_width.saturating_sub(2).max(1);
     let body_style = Style::default().fg(theme.text.muted);
     let rail = |text: String| {
         Line::from(vec![
-            Span::styled("│ ", body_style),
+            Span::styled(REASONING_RAIL_GUTTER, body_style),
             Span::styled(text, body_style),
         ])
     };
@@ -180,6 +186,112 @@ pub fn thought_lines(
         )));
     }
     out
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Live rail animation
+// ───────────────────────────────────────────────────────────────────────────
+//
+// A running Thought's rail carries a short highlight that sweeps from the top
+// of the body to the bottom and loops. It is a STYLE-ONLY overlay over lines
+// that were already wrapped: no span is added, removed, reordered or
+// re-texted, so the block's height, its wrapping, the scroll anchor and every
+// downstream hit row are untouched — and because it runs on the painted window
+// rather than inside the memoized projection, history never re-wraps and no
+// cache entry is invalidated.
+
+/// The gutter a Thought body rides. Its presence as a line's leading span is
+/// what identifies a rail row; nothing else paints `│ ` at line start.
+pub const REASONING_RAIL_GUTTER: &str = "│ ";
+
+/// Rows of a live Thought's rail the moving highlight covers.
+pub const REASONING_RAIL_SEGMENT_ROWS: usize = 2;
+
+/// One full top-to-bottom sweep. Inside the 1.2–1.8s band the motion was
+/// specified in: slow enough to read as "still working", never a flicker.
+pub const REASONING_RAIL_PERIOD: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The live ink a running Thought wears: its bullet, its header and the rail's
+/// moving highlight. It is the app's existing "work in flight" accent — the
+/// same token a running tool action and the status line's live label use — so
+/// a live Thought cannot introduce a second, competing blue.
+fn thinking_ink(done: bool, theme: &Theme) -> ratatui::style::Color {
+    if done {
+        theme.text.secondary
+    } else {
+        theme.accent.secondary
+    }
+}
+
+/// Whether this line carries a Thought rail.
+pub fn is_reasoning_rail_row(line: &Line<'static>) -> bool {
+    line.spans
+        .first()
+        .is_some_and(|span| span.content.as_ref() == REASONING_RAIL_GUTTER)
+}
+
+/// Window-relative indices of the rail rows among `lines`, in paint order.
+pub fn reasoning_rail_rows(lines: &[Line<'static>]) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_reasoning_rail_row(line))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The moving highlight as a half-open row range over a body of `rows` rail
+/// rows, at motion-clock time `phase`.
+///
+/// The range sweeps the whole rail exactly once per [`REASONING_RAIL_PERIOD`],
+/// spending one slot on each legal head position so the bottom is reached
+/// before the loop restarts. A body no taller than the segment has nowhere to
+/// travel and holds a still highlight rather than flickering.
+pub fn reasoning_rail_segment(rows: usize, phase: std::time::Duration) -> std::ops::Range<usize> {
+    if rows == 0 {
+        return 0..0;
+    }
+    let height = REASONING_RAIL_SEGMENT_ROWS.min(rows);
+    let travel = rows - height;
+    if travel == 0 {
+        return 0..height;
+    }
+    let period = REASONING_RAIL_PERIOD.as_millis().max(1) as usize;
+    let at = (phase.as_millis() as usize) % period;
+    let head = at * (travel + 1) / period;
+    head..head + height
+}
+
+/// Repaint the highlight over a Thought's rail.
+///
+/// `rail_rows` are that rail's rows as ABSOLUTE line indices, in paint order —
+/// the WHOLE rail, not just its visible part, so the sweep is defined by the
+/// rail itself and scrolling never moves the highlight along it. A covered row
+/// that `scroll` puts outside `lines` is simply not painted. Only each covered
+/// row's rail span is recoloured: the reasoning body keeps its own ink, and no
+/// other row moves.
+pub fn paint_reasoning_rail(
+    lines: &mut [Line<'static>],
+    scroll: usize,
+    rail_rows: &[usize],
+    theme: &Theme,
+    phase: std::time::Duration,
+) {
+    let segment = reasoning_rail_segment(rail_rows.len(), phase);
+    let Some(covered) = rail_rows.get(segment) else {
+        return;
+    };
+    for &row in covered {
+        let Some(offset) = row.checked_sub(scroll) else {
+            continue;
+        };
+        if let Some(span) = lines
+            .get_mut(offset)
+            .and_then(|line| line.spans.first_mut())
+        {
+            span.style = span.style.fg(theme.accent.secondary);
+        }
+    }
 }
 
 /// Render one transcript item to styled lines (no leading separator).
@@ -1354,6 +1466,116 @@ mod tests {
             .iter()
             .map(line_text)
             .collect()
+    }
+
+    // ---- The live rail: a style-only sweep, never a layout change ----
+
+    /// A running Thought announces itself in the app's live accent, so its
+    /// bullet and header match the rail highlight that is moving under it. A
+    /// settled Thought recedes to plain secondary ink.
+    #[test]
+    fn a_live_thought_header_wears_the_live_accent_and_a_settled_one_does_not() {
+        let theme = Theme::dark();
+        let live = thought("查 catalog", false, None, false);
+        let settled = thought("查 catalog", true, Some(2800), false);
+        for (block, expected, label) in [
+            (&live, theme.accent.secondary, "live"),
+            (&settled, theme.text.secondary, "settled"),
+        ] {
+            let lines = thought_lines(block, &theme, 60, Locale::Zh.text());
+            assert_eq!(
+                lines[0].spans[0].content.as_ref(),
+                "◆ ",
+                "{label}: bullet first"
+            );
+            assert_eq!(lines[0].spans[0].style.fg, Some(expected), "{label} bullet");
+            assert_eq!(lines[0].spans[1].style.fg, Some(expected), "{label} header");
+        }
+    }
+
+    /// The highlight sweeps the whole rail once per period, top to bottom,
+    /// and its segment is never taller than the rail it rides.
+    #[test]
+    fn the_rail_highlight_sweeps_top_to_bottom_once_per_period() {
+        let rows = 11;
+        let period = REASONING_RAIL_PERIOD;
+        let head =
+            |ms: u64| reasoning_rail_segment(rows, std::time::Duration::from_millis(ms)).start;
+        assert_eq!(head(0), 0, "starts at the top");
+        assert_eq!(
+            reasoning_rail_segment(rows, period - std::time::Duration::from_millis(1)),
+            rows - REASONING_RAIL_SEGMENT_ROWS..rows,
+            "reaches the bottom before the loop restarts"
+        );
+        assert_eq!(head(period.as_millis() as u64), 0, "and loops");
+        let mut previous = 0;
+        for ms in (0..period.as_millis() as u64).step_by(10) {
+            let at = head(ms);
+            assert!(at >= previous, "never moves backwards at {ms}ms");
+            previous = at;
+        }
+    }
+
+    /// A rail no taller than the highlight has nowhere to travel: it holds
+    /// still rather than flickering on and off.
+    #[test]
+    fn a_rail_no_taller_than_the_highlight_holds_still() {
+        for ms in [0, 750, 1499, 1500, 3000] {
+            let phase = std::time::Duration::from_millis(ms);
+            assert_eq!(reasoning_rail_segment(2, phase), 0..2, "two rows at {ms}ms");
+            assert_eq!(reasoning_rail_segment(1, phase), 0..1, "one row at {ms}ms");
+            assert_eq!(reasoning_rail_segment(0, phase), 0..0, "no rail at {ms}ms");
+        }
+    }
+
+    /// The overlay recolours the rail gutter only. The reasoning body keeps its
+    /// own ink, and the block's line count and every line's width are exactly
+    /// what the wrap produced — which is what keeps the scroll anchor still.
+    #[test]
+    fn the_highlight_touches_the_rail_only_and_moves_nothing() {
+        let theme = Theme::dark();
+        let block = thought(
+            "第一行推理。第二行推理。第三行推理。第四行推理。第五行推理。",
+            false,
+            None,
+            false,
+        );
+        let mut lines = thought_lines(&block, &theme, 24, Locale::Zh.text());
+        let rail_rows = reasoning_rail_rows(&lines);
+        assert!(
+            rail_rows.len() > REASONING_RAIL_SEGMENT_ROWS,
+            "a body long enough to show movement: {rail_rows:?}"
+        );
+        let widths: Vec<usize> = lines.iter().map(Line::width).collect();
+
+        paint_reasoning_rail(&mut lines, 0, &rail_rows, &theme, REASONING_RAIL_PERIOD / 2);
+
+        assert_eq!(
+            lines.iter().map(Line::width).collect::<Vec<_>>(),
+            widths,
+            "no line grew or shrank"
+        );
+        let covered = reasoning_rail_segment(rail_rows.len(), REASONING_RAIL_PERIOD / 2);
+        for (position, &row) in rail_rows.iter().enumerate() {
+            let line = &lines[row];
+            let expected = if covered.contains(&position) {
+                theme.accent.secondary
+            } else {
+                theme.text.muted
+            };
+            assert_eq!(line.spans[0].content.as_ref(), REASONING_RAIL_GUTTER);
+            assert_eq!(line.spans[0].style.fg, Some(expected), "rail row {row}");
+            assert_eq!(
+                line.spans[1].style.fg,
+                Some(theme.text.muted),
+                "the reasoning body keeps its own ink on row {row}"
+            );
+        }
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(theme.accent.secondary),
+            "the header is not part of the sweep"
+        );
     }
 
     /// REASONING-8: a provider that returned no reasoning text gets a header

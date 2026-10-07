@@ -1295,14 +1295,24 @@ verified by deterministic tests and real dogfood — do not regress them:
   and nothing else, and the tool row that follows it is a SIBLING at the same
   first column — never a child of the Thought. A new reasoning segment is always
   the one mutable entry at the tail.
+- **A Thought's relation to an exploration fold has exactly three, mutually
+  exclusive states**: a finished Thought that is NOT part of a run is its own
+  collapsed header and no receipt speaks for it; a finished Thought that is
+  still `Collapsed` inside a run is a participant — a collapsed run hides it
+  with the members and it never counts toward the aggregate label, but its
+  semantic item is kept and opening the run restores its header with every tool
+  member in real chronology; a Thought the reader opened is PINNED, so no run
+  state hides it. The word "hidden" never applies to an open Thought. Only a
+  Thought restored (or standing) on screen is itself clickable, and opening it
+  paints its full reasoning body.
 - **An exploration receipt is a view-time fold, not an aggregate overlay**:
   consecutive Read / Search / List calls, plus the finished default-collapsed
   Thoughts between them, only change how the collapsed run is painted; every
   original Thought / tool entry is kept, and expanding MUST restore each Thought
   and member in real chronology. A run, an edit, an MCP dispatch, a permission
-  hold, a failure, narration and the Final are breakers. The label counts tools
-  only and never invents an execution-stage name; Thoughts never count, and a
-  failed exploration target is always directly visible.
+  hold, a failure, narration and the Final are breakers. The aggregate label
+  counts tools only and never invents an execution-stage name; Thoughts never
+  count, and a failed exploration target is always directly visible.
 - **Tool detail is collapsed by default**: Read / Search / List / Run paint only a
   header and outcome unless asked; a failure summary and a running command's
   short live tail are the only bodies shown unasked. Running Thinking,

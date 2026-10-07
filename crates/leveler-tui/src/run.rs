@@ -253,6 +253,10 @@ pub async fn run(
     let mut term_events = EventStream::new();
     let mut tick = tokio::time::interval(BUSY_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Origin of the UI's motion clock. Live animations sweep on elapsed time
+    // against it, so a burst of stream deltas (many loop iterations, many
+    // repaints per second) cannot make an animation run faster than its period.
+    let motion_origin = Instant::now();
     let mut selection_tick = tokio::time::interval(SELECTION_TICK);
     selection_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -429,6 +433,7 @@ pub async fn run(
 
         // Busy spinner + elapsed clock.
         state.tick = state.tick.wrapping_add(1);
+        state.motion_clock = motion_origin.elapsed();
         if state.is_busy() {
             let start = *state.turn_started_at.get_or_insert_with(Instant::now);
             state.elapsed_secs = start.elapsed().as_secs();

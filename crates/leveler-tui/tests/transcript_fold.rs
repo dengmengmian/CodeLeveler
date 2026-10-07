@@ -9,6 +9,10 @@
 //!   the user may open it back up.
 //! - A run of Search / Read / List is ONE view-time fold whose collapsed row is
 //!   an aggregate receipt — and expanding restores every real member row.
+//! - A finished collapsed Thought inside such a run is a participant: the
+//!   collapsed receipt hides it and counts tools only, while its semantic item
+//!   is kept and expanding restores it in real chronology. A Thought the reader
+//!   opened is pinned and no run state hides it.
 //! - Folding never moves the reader's viewport.
 
 use leveler_client_protocol::{MessageId, RuntimeEvent, SessionId, ToolCallId, UiSessionSnapshot};
@@ -316,8 +320,10 @@ fn thought_fold_7_a_new_thought_is_the_tail() {
     assert!(!thoughts(&s)[1].done);
 }
 
-/// THOUGHT-FOLD-8: the tool row after a Thought is a SIBLING — the same
-/// column — and the Thought's `│` rail does not reach it.
+/// THOUGHT-FOLD-8: a tool row is a SIBLING of the Thought, not its child —
+/// the same first column, and the Thought's `│` rail never reaches it. A lone
+/// read outside any run is the clean case: nothing is folded, so the Thought
+/// header and the tool row are both drawn at the entry column.
 #[test]
 fn thought_fold_8_a_tool_is_a_sibling_not_a_thought_child() {
     let mut s = opened();
@@ -325,7 +331,6 @@ fn thought_fold_8_a_tool_is_a_sibling_not_a_thought_child() {
     reasoning(&mut s, "先看工作区。");
     reasoning_done(&mut s, 4100);
     read(&mut s, "t1", "a.rs");
-    read(&mut s, "t2", "b.rs");
     settle_group(&mut s);
 
     let rows = lines(&s);
@@ -333,17 +338,18 @@ fn thought_fold_8_a_tool_is_a_sibling_not_a_thought_child() {
         .iter()
         .position(|l| l.contains("已思考 4.1s"))
         .expect("the Thought header");
-    let receipt = rows
+    let tool = rows
         .iter()
-        .position(|l| l.contains("读取 2 个文件"))
-        .expect("the receipt");
+        .position(|l| l.contains("a.rs"))
+        .expect("the tool row");
+    assert!(header < tool, "the tool follows its Thought: {rows:?}");
     assert_eq!(
         rows[header].chars().take_while(|c| *c == ' ').count(),
-        rows[receipt].chars().take_while(|c| *c == ' ').count(),
+        rows[tool].chars().take_while(|c| *c == ' ').count(),
         "the tool row sits at the same column as the Thought: {rows:?}"
     );
     assert!(
-        rows[header..receipt]
+        rows[header..tool]
             .iter()
             .all(|l| !l.starts_with('│') && !l.trim_start().starts_with('│')),
         "no rail carries into the tool: {rows:?}"
@@ -488,6 +494,174 @@ fn tool_group_6_a_failed_member_keeps_its_target() {
     let rendered = text(&s);
     assert!(rendered.contains("missing.rs"), "{rendered}");
     assert!(rendered.contains("no such file"), "{rendered}");
+}
+
+// ── RUN-THOUGHT ──────────────────────────────────────────────────────────────
+//
+// The one place a Thought and a fold interact. The contract has three mutually
+// exclusive states: outside a run it is its own header; folded in a run it is a
+// hidden participant that never counts; opened by the reader it is pinned and
+// no run state hides it.
+
+/// RUN-THOUGHT-1: a finished collapsed Thought between the reads is a
+/// participant of the run — the collapsed receipt speaks for it, its text is
+/// off screen, and it is not counted in the aggregate label.
+#[test]
+fn run_thought_1_a_folded_thought_is_a_participant_of_the_run() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先读 pricing。");
+    reasoning_done(&mut s, 800);
+    read(&mut s, "t1", "src/pricing.rs");
+    read(&mut s, "t2", "src/catalog.rs");
+    settle_group(&mut s);
+
+    let rows = lines(&s);
+    let receipt = rows
+        .iter()
+        .find(|l| l.contains("读取 2 个文件"))
+        .expect("the run receipt");
+    assert!(
+        !receipt.contains("思考"),
+        "the label counts tools only: {receipt}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("已思考")),
+        "the collapsed receipt speaks for the Thought: {rows:?}"
+    );
+    assert!(
+        !text(&s).contains("先读 pricing。"),
+        "its body is folded away: {rows:?}"
+    );
+    // Folded out of sight, not out of the transcript.
+    assert_eq!(thoughts(&s).len(), 1, "the semantic item is kept");
+    assert_eq!(thoughts(&s)[0].display, DisplayMode::Collapsed);
+}
+
+/// RUN-THOUGHT-2: opening the run restores the Thought and every member in real
+/// chronology — the Thought that preceded the first read stays first.
+#[test]
+fn run_thought_2_opening_the_run_restores_thought_and_members_in_order() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先读 pricing。");
+    reasoning_done(&mut s, 800);
+    read(&mut s, "t1", "src/pricing.rs");
+    read(&mut s, "t2", "src/catalog.rs");
+    settle_group(&mut s);
+
+    let anchor = s
+        .transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::ToolGroup(_)))
+        .expect("the run anchor group");
+    toggle_fold(&mut s, anchor);
+
+    let rows = lines(&s);
+    let thought = rows
+        .iter()
+        .position(|l| l.contains("已思考"))
+        .expect("the restored Thought header");
+    let first = rows
+        .iter()
+        .position(|l| l.contains("pricing.rs"))
+        .expect("the first member");
+    let second = rows
+        .iter()
+        .position(|l| l.contains("catalog.rs"))
+        .expect("the second member");
+    assert!(
+        thought < first && first < second,
+        "real chronology: {rows:?}"
+    );
+}
+
+/// RUN-THOUGHT-3: only after the run restored it is the Thought itself
+/// clickable; opening it paints the full reasoning body.
+#[test]
+fn run_thought_3_a_restored_thought_opens_its_reasoning_body() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先读 pricing。");
+    reasoning_done(&mut s, 800);
+    read(&mut s, "t1", "src/pricing.rs");
+    read(&mut s, "t2", "src/catalog.rs");
+    settle_group(&mut s);
+
+    let anchor = s
+        .transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::ToolGroup(_)))
+        .expect("the run anchor group");
+    toggle_fold(&mut s, anchor);
+    // The run is open; the reader now opens the Thought inside it.
+    let thought = thought_index(&s);
+    toggle_fold(&mut s, thought);
+    let body = text(&s);
+    assert!(body.contains("先读 pricing。"), "{body}");
+    assert_eq!(thoughts(&s)[0].display, DisplayMode::Expanded);
+}
+
+/// RUN-THOUGHT-4: a Thought the reader opened is pinned. The run still folds
+/// its tool members, but it never folds this Thought away.
+#[test]
+fn run_thought_4_an_open_thought_survives_the_collapsed_run() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先读 pricing。");
+    reasoning_done(&mut s, 800);
+    // The reader opens it before any exploration arrives.
+    let thought = thought_index(&s);
+    toggle_fold(&mut s, thought);
+    read(&mut s, "t1", "src/pricing.rs");
+    read(&mut s, "t2", "src/catalog.rs");
+    settle_group(&mut s);
+
+    let rows = lines(&s);
+    assert!(
+        rows.iter().any(|l| l.contains("读取 2 个文件")),
+        "the run still forms and folds its members: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("catalog.rs")),
+        "tool members are folded: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("已思考")),
+        "the open Thought is not hidden by the run: {rows:?}"
+    );
+    assert!(
+        text(&s).contains("先读 pricing。"),
+        "and its body stays painted: {rows:?}"
+    );
+}
+
+/// RUN-THOUGHT-5: a finished Thought that no run folds is its own header, and
+/// the lone read beside it keeps its own row — no receipt is invented.
+#[test]
+fn run_thought_5_a_thought_outside_a_run_keeps_its_own_header() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "先看工作区。");
+    reasoning_done(&mut s, 4100);
+    read(&mut s, "t1", "README.md");
+    settle_group(&mut s);
+
+    let rows = lines(&s);
+    assert!(
+        rows.iter().any(|l| l.contains("已思考")),
+        "its own collapsed header: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("README.md")),
+        "a lone read keeps its own row: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("读取 1 个文件")),
+        "no receipt for a single read: {rows:?}"
+    );
 }
 
 // ── RUN-FOLD ─────────────────────────────────────────────────────────────────

@@ -1120,12 +1120,15 @@ mod transcript_lines;
 pub(crate) use footer::background_footer_spans;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
+#[cfg(test)]
+pub(crate) use transcript_lines::REASONING_RAIL_SEGMENT_ROWS;
 pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
     sub_agent_tree_lines,
 };
 pub(crate) use transcript_lines::{
-    sub_agent_detail, thought_lines, turn_end_marker, user_shell_lines,
+    paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail, thought_lines, turn_end_marker,
+    user_shell_lines,
 };
 
 pub(crate) use panes::pad_line_to_width;

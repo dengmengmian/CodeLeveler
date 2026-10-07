@@ -242,16 +242,7 @@ fn build_conversation(
                 out.push(Line::from(""));
             }
             let before_item = out.len();
-            render_exploration_fold(
-                state,
-                fold,
-                &mut out,
-                &mut hits,
-                &mut commands,
-                width,
-                theme,
-                t,
-            );
+            render_exploration_fold(state, fold, &mut out, &mut hits, width, theme, t);
             // The memo is positional over cacheable items: consume one stale
             // unit per cacheable item the fold covers and push a
             // never-matching placeholder, so items AFTER the fold keep their
@@ -435,15 +426,46 @@ fn build_conversation(
 // is painted as ONE aggregate receipt until the reader opens it. Nothing is
 // merged or reordered — the same semantic items stay in the transcript, and
 // opening the fold restores them in their real order.
+//
+// The Thought contract inside such a run (the one place a Thought and a fold
+// interact) is exactly:
+//
+//   - a finished Thought is folded away by the receipt only while it is
+//     `Collapsed` — it is hidden like any member, it never counts toward the
+//     receipt's label, and its semantic item is kept in the transcript;
+//   - a Thought the reader opened is PINNED: the run never folds it back, so
+//     its body stays on screen whether the run is collapsed or open;
+//   - opening the run restores every folded Thought and member in real
+//     chronology, and a Thought restored that way can then be opened itself.
+//
+// A finished Thought OUTSIDE any run has no fold over it at all: it is its own
+// collapsed header and is not governed by the receipt.
+
+/// How one item behaves inside a view-time exploration run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    /// A settled exploration group the collapsed receipt speaks for.
+    MemberGroup,
+    /// A finished, default-collapsed Thought the receipt folds over.
+    FoldedThought,
+    /// A finished Thought the reader opened. It is pinned, so no run state
+    /// hides it: the collapsed receipt never speaks for an open Thought.
+    OpenThought,
+}
+
+impl SlotKind {
+    /// Whether the collapsed receipt speaks for this slot, i.e. whether the
+    /// run hides it while collapsed. Only an open (pinned) Thought is exempt.
+    const fn hidden_while_collapsed(self) -> bool {
+        !matches!(self, Self::OpenThought)
+    }
+}
 
 /// One item inside a view-time exploration run.
 #[derive(Debug)]
 struct FoldSlot {
     item: usize,
-    /// Hidden while the fold is collapsed. A participant is a finished
-    /// collapsed Thought or a settled exploration group; a transparent slot is
-    /// one the reader already opened and must keep seeing.
-    participant: bool,
+    kind: SlotKind,
 }
 
 /// One derived exploration run. `end` is exclusive.
@@ -466,41 +488,30 @@ struct ExplorationFolds {
     runs: Vec<ExplorationFold>,
 }
 
-/// How one transcript item behaves inside an exploration run.
-enum FoldClass {
-    /// A settled exploration group that the folded receipt speaks for.
-    ParticipantGroup,
-    /// A finished, default-collapsed Thought the receipt folds over.
-    ParticipantThought,
-    /// A member the reader already opened: kept visible, never hidden.
-    Transparent,
-    /// Anything else ends the run.
-    Break,
-}
-
-fn classify_fold_item(item: &TranscriptItem) -> FoldClass {
+/// Classify one transcript item for a run, or `None` when it ends the run.
+///
+/// The only Thought that participates as a `FoldedThought` is a finished,
+/// still-`Collapsed` one. A Thought the reader opened is `OpenThought`: it
+/// does not split the run, but the receipt may not hide it either.
+fn classify_fold_item(item: &TranscriptItem) -> Option<SlotKind> {
     match item {
-        TranscriptItem::Thought(block) if block.done => {
-            if block.display.is_collapsed() {
-                FoldClass::ParticipantThought
-            } else {
-                // A Thought the reader opened keeps its body visible. It does
-                // not split the run: the fold still speaks for its groups.
-                FoldClass::Transparent
-            }
-        }
+        TranscriptItem::Thought(block) if block.done => Some(if block.display.is_collapsed() {
+            SlotKind::FoldedThought
+        } else {
+            SlotKind::OpenThought
+        }),
         // A live Thought is the tail itself; a run never folds around it.
-        TranscriptItem::Thought(_) => FoldClass::Break,
+        TranscriptItem::Thought(_) => None,
         TranscriptItem::ToolGroup(group)
             if crate::activity_stream::group_is_exploration_fold_member(group) =>
         {
             // The run's fold state is the fold SET, not the group's own
             // drawer: a member that was opened before the fold formed is still
-            // claimed by the receipt, and its drawer is restored when the
+            // claimed by the receipt, and its member rows are restored when the
             // receipt is opened.
-            FoldClass::ParticipantGroup
+            Some(SlotKind::MemberGroup)
         }
-        _ => FoldClass::Break,
+        _ => None,
     }
 }
 
@@ -523,31 +534,20 @@ fn plan_exploration_folds(items: &[TranscriptItem]) -> ExplorationFolds {
         let mut anchor: Option<usize> = None;
         let mut j = i;
         while j < items.len() {
-            match classify_fold_item(&items[j]) {
-                FoldClass::ParticipantGroup => {
-                    if let Some(TranscriptItem::ToolGroup(group)) = items.get(j) {
-                        for (ci, call) in group.calls.iter().enumerate() {
-                            if crate::activity_stream::is_exploration_fold_call(call) {
-                                members.push((j, ci));
-                            }
+            let Some(kind) = classify_fold_item(&items[j]) else {
+                break;
+            };
+            if kind == SlotKind::MemberGroup {
+                if let Some(TranscriptItem::ToolGroup(group)) = items.get(j) {
+                    for (ci, call) in group.calls.iter().enumerate() {
+                        if crate::activity_stream::is_exploration_fold_call(call) {
+                            members.push((j, ci));
                         }
                     }
-                    anchor.get_or_insert(j);
-                    slots.push(FoldSlot {
-                        item: j,
-                        participant: true,
-                    });
                 }
-                FoldClass::ParticipantThought => slots.push(FoldSlot {
-                    item: j,
-                    participant: true,
-                }),
-                FoldClass::Transparent => slots.push(FoldSlot {
-                    item: j,
-                    participant: false,
-                }),
-                FoldClass::Break => break,
+                anchor.get_or_insert(j);
             }
+            slots.push(FoldSlot { item: j, kind });
             j += 1;
         }
         match anchor {
@@ -639,7 +639,6 @@ fn render_exploration_fold(
     fold: &ExplorationFold,
     out: &mut Vec<Line<'static>>,
     hits: &mut Vec<(usize, usize)>,
-    commands: &mut Vec<super::view::CommandHit>,
     width: usize,
     theme: &crate::theme::Theme,
     t: &crate::i18n::UiText,
@@ -665,9 +664,10 @@ fn render_exploration_fold(
         .saturating_sub(crate::activity_stream::GROUP_BODY_INDENT.len())
         .max(1);
     for slot in &fold.slots {
-        // A collapsed fold shows nothing of its participants: the receipt
-        // already speaks for them. Transparent slots stay visible either way.
-        if !expanded && slot.participant {
+        // The collapsed receipt speaks for every folded slot, so a collapsed
+        // run paints none of them. An OPEN (pinned) Thought is never folded:
+        // the reader already asked for it to stay, so it shows at both states.
+        if !expanded && slot.kind.hidden_while_collapsed() {
             continue;
         }
         match items.get(slot.item) {
@@ -675,7 +675,7 @@ fn render_exploration_fold(
                 hits.push((out.len(), slot.item));
                 out.extend(crate::render::thought_lines(block, theme, child_width, t));
             }
-            Some(TranscriptItem::ToolGroup(group)) if slot.participant => {
+            Some(TranscriptItem::ToolGroup(group)) => {
                 let calls = crate::activity_stream::group_exploration_fold_calls(group);
                 out.extend(crate::activity_stream::exploration_fold_member_lines(
                     &calls,
@@ -686,31 +686,6 @@ fn render_exploration_fold(
                     state.elapsed_secs,
                     state.approval_gated_call(),
                 ));
-            }
-            Some(TranscriptItem::ToolGroup(group)) => {
-                // A member the reader already opened keeps its own drawer.
-                if crate::activity_stream::group_has_disclosure(group) {
-                    hits.push((out.len(), slot.item));
-                }
-                let base = out.len();
-                let mut rows = Vec::new();
-                out.extend(crate::activity_stream::render_activity(
-                    group,
-                    theme,
-                    child_width,
-                    state.locale,
-                    t,
-                    state.elapsed_secs,
-                    state.approval_gated_call(),
-                    state.focused_command(),
-                    &mut rows,
-                ));
-                commands.extend(rows.into_iter().map(|row| super::view::CommandHit {
-                    line: base + row.line,
-                    item: slot.item,
-                    call: row.call,
-                    stoppable: row.stoppable,
-                }));
             }
             _ => {}
         }

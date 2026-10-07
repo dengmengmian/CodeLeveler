@@ -535,6 +535,15 @@ pub struct AppState {
 
     /// Monotonic frame counter driving the busy spinner animation.
     pub tick: u64,
+    /// The UI's monotonic motion clock, sampled by the event loop each
+    /// iteration. Live animations read ELAPSED TIME from it, never the frame
+    /// counter: a burst of stream deltas repaints many frames a second, and a
+    /// frame-counted phase would sweep proportionally faster than its period.
+    pub motion_clock: std::time::Duration,
+    /// Whether live animations are painted at all. Resolved once from
+    /// [`crate::motion::ENV_ANIMATION`]; false degrades every animated surface
+    /// to its static form.
+    pub live_animation: bool,
     /// When the current busy turn began (managed by the event loop).
     pub turn_started_at: Option<std::time::Instant>,
     /// Elapsed seconds of the current busy turn (recomputed each frame).
@@ -677,6 +686,8 @@ impl AppState {
             resumable_task: false,
             quit_armed: false,
             tick: 0,
+            motion_clock: std::time::Duration::ZERO,
+            live_animation: crate::motion::live_animation_enabled(),
             turn_started_at: None,
             elapsed_secs: 0,
             dark,

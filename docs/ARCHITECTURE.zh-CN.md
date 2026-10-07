@@ -1235,10 +1235,18 @@ dogfood 验证，不要在后续改动中回退：
 - **Thought 是 transcript 的一级条目**：其 rail 只覆盖自身正文，Tool 与它是
   sibling（同一个首列锚点），不能表现成 Thought 的子节点。新的 reasoning 段
   永远是 tail 上的那个可变条目。
+- **Thought 与 exploration fold 的关系只有三种互斥状态**：不在 run 中的已完成
+  Thought 是它自己的 collapsed header，没有任何回执替它折叠；在 run 中且仍为
+  `Collapsed` 的已完成 Thought 与 Tool 成员一样被折叠——collapsed run 把它与
+  成员一起隐藏，它不计入聚合标签，但 semantic data 不删除，展开 run 时按真实
+  chronology 恢复它的 header 与每个 Tool 成员；读者手动展开过的 Thought 是
+  pinned，任何折叠态都不隐藏它，“隐藏”永远不适用于 open Thought。只有已显示在
+  屏幕上的 Thought（独立存在、或被 run 展开恢复）才可点击，点击后展开完整
+  reasoning body。
 - **探索回执是 view-time fold，不是聚合覆盖**：连续 Read / Search / List，以及
   它们之间已完成的默认折叠 Thought，只改变折叠态的呈现；原始 Thought / Tool
   entry 始终保留，展开必须按真实 chronology 恢复每个 Thought 与成员。Run / Edit
-  / MCP / 权限 / 失败 / Narration / Final 是 breaker。折叠标签只统计工具，不发明
+  / MCP / 权限 / 失败 / Narration / Final 是 breaker。聚合标签只统计工具，不发明
   执行阶段名（如“后端验证”），Thought 不计入标签；失败的探索目标永远直接可见。
 - **工具详细内容默认折叠**：Read / Search / List / Run 默认只画 header 与结果；
   失败摘要与 running 的极短 live tail 是唯一未经请求就显示的 body。running
