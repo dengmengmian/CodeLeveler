@@ -175,8 +175,56 @@ fn tool_completed(s: &mut AppState, id: &str) {
     );
 }
 
+/// The same call, requested in a specific execution round (`model_step`). This
+/// is the real shape of a model turn: every tool from one response shares one
+/// round, which is what made a lone Read wear a `完成 1 项` head.
+fn tool_started_in_round(s: &mut AppState, id: &str, name: &str, args: &str, step: u32) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new(id),
+            name: name.into(),
+            arguments: args.into(),
+            parallel: false,
+            model_step: Some(step),
+            answer_effect: None,
+        }),
+    );
+}
+
+fn tool_failed(s: &mut AppState, id: &str, preview: &str) {
+    reduce(
+        s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            exit_code: None,
+            stop: None,
+            id: ToolCallId::new(id),
+            ok: false,
+            preview: preview.into(),
+            duration_ms: 4,
+            applied_diff: None,
+        }),
+    );
+}
+
 fn read(s: &mut AppState, id: &str, path: &str) {
     tool_started(s, id, "read_file", &format!(r#"{{"path":"{path}"}}"#));
+    tool_completed(s, id);
+}
+
+fn read_in_round(s: &mut AppState, id: &str, path: &str, step: u32) {
+    tool_started_in_round(s, id, "read_file", &format!(r#"{{"path":"{path}"}}"#), step);
+    tool_completed(s, id);
+}
+
+fn search_in_round(s: &mut AppState, id: &str, pattern: &str, step: u32) {
+    tool_started_in_round(
+        s,
+        id,
+        "grep",
+        &format!(r#"{{"pattern":"{pattern}"}}"#),
+        step,
+    );
     tool_completed(s, id);
 }
 
@@ -234,7 +282,7 @@ fn thought_fold_3_collapsed_thought_is_header_only() {
     let rows = lines(&s);
     let header = rows
         .iter()
-        .find(|l| l.contains("已思考 4.1s"))
+        .find(|l| l.contains("思考 · 4.1s"))
         .expect("the header");
     assert!(header.starts_with('◆'), "{rows:?}");
     assert!(
@@ -336,7 +384,7 @@ fn thought_fold_8_a_tool_is_a_sibling_not_a_thought_child() {
     let rows = lines(&s);
     let header = rows
         .iter()
-        .position(|l| l.contains("已思考 4.1s"))
+        .position(|l| l.contains("思考 · 4.1s"))
         .expect("the Thought header");
     let tool = rows
         .iter()
@@ -526,7 +574,7 @@ fn run_thought_1_a_folded_thought_is_a_participant_of_the_run() {
         "the label counts tools only: {receipt}"
     );
     assert!(
-        !rows.iter().any(|l| l.contains("已思考")),
+        !rows.iter().any(|l| l.contains("思考 ·")),
         "the collapsed receipt speaks for the Thought: {rows:?}"
     );
     assert!(
@@ -561,7 +609,7 @@ fn run_thought_2_opening_the_run_restores_thought_and_members_in_order() {
     let rows = lines(&s);
     let thought = rows
         .iter()
-        .position(|l| l.contains("已思考"))
+        .position(|l| l.contains("思考 ·"))
         .expect("the restored Thought header");
     let first = rows
         .iter()
@@ -629,7 +677,7 @@ fn run_thought_4_an_open_thought_survives_the_collapsed_run() {
         "tool members are folded: {rows:?}"
     );
     assert!(
-        rows.iter().any(|l| l.contains("已思考")),
+        rows.iter().any(|l| l.contains("思考 ·")),
         "the open Thought is not hidden by the run: {rows:?}"
     );
     assert!(
@@ -651,7 +699,7 @@ fn run_thought_5_a_thought_outside_a_run_keeps_its_own_header() {
 
     let rows = lines(&s);
     assert!(
-        rows.iter().any(|l| l.contains("已思考")),
+        rows.iter().any(|l| l.contains("思考 ·")),
         "its own collapsed header: {rows:?}"
     );
     assert!(
@@ -803,4 +851,180 @@ fn resume_fold_1_replayed_thought_is_collapsed_but_openable() {
         text(&s).contains("先检查工作区和近期变更。"),
         "and it opens back up"
     );
+}
+
+// ── THOUGHT-LABEL ────────────────────────────────────────────────────────────
+//
+// The Thought header is wording only. A completed segment reads `思考 · 0.9s`
+// (bare verb + measurement), a streaming one keeps `思考中…`, and a cut one
+// stays explicit. The lifecycle, `DisplayMode` and persistence are untouched.
+
+/// THOUGHT-LABEL-1: a completed Thought's Chinese header is `思考 · {duration}`.
+#[test]
+fn thought_label_1_completed_header_is_verb_dot_duration() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "看完了。");
+    reasoning_done(&mut s, 900);
+    let text = text(&s);
+    assert!(text.contains("◆ 思考 · 0.9s"), "{text}");
+    assert!(!text.contains("已思考"), "{text}");
+}
+
+/// THOUGHT-LABEL-2: a streaming Thought still reads `思考中…`.
+#[test]
+fn thought_label_2_running_header_is_unchanged() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    let text = text(&s);
+    assert!(text.contains("◆ 思考中…"), "{text}");
+}
+
+/// THOUGHT-LABEL-3: a segment that never reached a clean boundary says so, and
+/// never wears the completed form.
+#[test]
+fn thought_label_3_interrupted_header_stays_explicit() {
+    let mut s = opened();
+    reasoning_start(&mut s);
+    reasoning(&mut s, "半句话");
+    // A boundary without a completion freezes the segment as interrupted.
+    tool_started_in_round(&mut s, "t1", "read_file", r#"{"path":"a.rs"}"#, 1);
+    tool_completed(&mut s, "t1");
+    let text = text(&s);
+    assert!(text.contains("◆ 思考中断"), "{text}");
+    assert!(!text.contains("思考 ·"), "{text}");
+}
+
+// ── SINGLE-EXPLORE ───────────────────────────────────────────────────────────
+//
+// One Read/Search/List is not a stretch: it shows its own target under the same
+// verb the aggregate receipt counts in. Two or more still fold into one receipt.
+
+/// SINGLE-EXPLORE-1: one Read in a round is its own row — verb, real target,
+/// result — with no `完成 1 项` parent and no tree child under it.
+#[test]
+fn single_explore_1_a_lone_read_shows_its_target() {
+    let mut s = opened();
+    read_in_round(
+        &mut s,
+        "r1",
+        "backend/internal/modules/sourcing/handler/rfq.go",
+        1,
+    );
+    settle_group(&mut s);
+    let text = text(&s);
+    assert!(
+        text.contains("› 读取 backend/internal/modules/sourcing/handler/rfq.go"),
+        "{text}"
+    );
+    assert!(!text.contains("完成 1 项"), "{text}");
+    assert!(!text.contains('\u{2514}'), "no tree child: {text}");
+}
+
+/// SINGLE-EXPLORE-2: one Search in a round shows the query it ran and its
+/// result summary directly.
+#[test]
+fn single_explore_2_a_lone_search_shows_query_and_result() {
+    let mut s = opened();
+    search_in_round(&mut s, "g1", "missing model", 1);
+    settle_group(&mut s);
+    let text = text(&s);
+    assert!(text.contains("› 搜索 \"missing model\""), "{text}");
+    assert!(text.contains("· 1 行"), "the result summary: {text}");
+    assert!(!text.contains("完成 1 项"), "{text}");
+}
+
+/// SINGLE-EXPLORE-3: one List shows its target with the List verb.
+///
+/// A SUCCESSFUL `list_files` is `Silent` by design — it never enters
+/// Conversation at all — so the visible instance is a failed scan, whose target
+/// is exactly what the reader needs.
+#[test]
+fn single_explore_3_a_lone_list_shows_its_target() {
+    let mut s = opened();
+    tool_started_in_round(
+        &mut s,
+        "l1",
+        "list_files",
+        r#"{"path":"backend/internal/modules/sourcing"}"#,
+        1,
+    );
+    tool_failed(&mut s, "l1", "permission denied");
+    settle_group(&mut s);
+    let text = text(&s);
+    assert!(
+        text.contains("› ✗ 列出 backend/internal/modules/sourcing"),
+        "{text}"
+    );
+    assert!(!text.contains("完成 1 项"), "{text}");
+}
+
+/// SINGLE-EXPLORE-4: two exploration calls still fold into one aggregate
+/// receipt — the single-row form never manufactures a group of one.
+#[test]
+fn single_explore_4_two_or_more_still_aggregate() {
+    let mut s = opened();
+    read_in_round(&mut s, "r1", "a.rs", 1);
+    read_in_round(&mut s, "r2", "b.rs", 1);
+    settle_group(&mut s);
+    let text = text(&s);
+    assert!(text.contains("▸ 读取 2 个文件"), "{text}");
+    assert!(!text.contains("a.rs"), "members stay folded: {text}");
+}
+
+/// SINGLE-EXPLORE-5: opening the receipt restores members as direct single-tool
+/// rows, each naming its own target.
+#[test]
+fn single_explore_5_expanded_members_use_direct_rows() {
+    let mut s = opened();
+    read_in_round(&mut s, "r1", "a.rs", 1);
+    search_in_round(&mut s, "g1", "missing model", 1);
+    settle_group(&mut s);
+    let group = s
+        .transcript
+        .items()
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::ToolGroup(_)))
+        .expect("a group");
+    toggle_fold(&mut s, group);
+    let text = text(&s);
+    assert!(text.contains("▾ 读取 1 个文件 · 搜索 1 次"), "{text}");
+    assert!(text.contains("› 读取 a.rs"), "{text}");
+    assert!(text.contains("› 搜索 \"missing model\""), "{text}");
+}
+
+/// NARROW-EXPLORE-1: a long target shortens by DISPLAY width — CJK included —
+/// so a narrow terminal never overruns its gutter.
+#[test]
+fn narrow_explore_1_a_long_target_does_not_break_the_layout() {
+    let mut s = opened();
+    read_in_round(
+        &mut s,
+        "r1",
+        "backend/internal/modules/sourcing/handler/非常长的中文目录名/rfq.go",
+        1,
+    );
+    settle_group(&mut s);
+    let width = 40usize;
+    let rows: Vec<String> = build_conversation_lines_with_hits(&s, width)
+        .0
+        .into_iter()
+        .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+        .collect();
+    let text = rows.join("\n");
+    assert!(text.contains("› 读取 "), "{text}");
+    let row = rows
+        .iter()
+        .find(|l| l.contains("› 读取 "))
+        .expect("the read row");
+    assert!(
+        row.contains('…'),
+        "the long target is shortened, not clipped: {row:?}"
+    );
+    for line in &rows {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(line.as_str()) <= width,
+            "line exceeds {width} columns: {line:?}\n{text}"
+        );
+    }
 }

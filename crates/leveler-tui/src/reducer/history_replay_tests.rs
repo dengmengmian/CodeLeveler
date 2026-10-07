@@ -643,7 +643,7 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
     assert!(
         live_lines
             .iter()
-            .any(|l| l.contains("› 读取文件") && l.contains("doctor.rs")),
+            .any(|l| l.contains("› 读取 ") && l.contains("doctor.rs")),
         "a lone read after the narration keeps its own row: {live_lines:#?}"
     );
     assert_eq!(

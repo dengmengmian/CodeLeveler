@@ -981,6 +981,12 @@ pub struct UiText {
     pub receipt_running_read: &'static str,
     pub receipt_running_search: &'static str,
     pub receipt_running_list: &'static str,
+    /// The bare verb a SINGLE exploration row wears, so one Read/Search/List
+    /// reads with the receipt's vocabulary ("读取 2 个文件") instead of the
+    /// tool-catalogue noun ("读取文件"). One verb per receipt kind.
+    pub explore_verb_read: &'static str,
+    pub explore_verb_search: &'static str,
+    pub explore_verb_list: &'static str,
     pub disclosure_parallel: &'static str,
     /// The LIVE counterpart of the labels above: what a group's stage row says
     /// while the stretch is still in flight. Only a running verb plus the count
@@ -1551,7 +1557,7 @@ static ZH: UiText = UiText {
     thinking: "思考",
     thinking_lines: " · {} 行",
     thought_live: "思考中…",
-    thought_for: "已思考 {}",
+    thought_for: "思考 · {}",
     thought_interrupted: "思考中断 · {}",
     thought_interrupted_bare: "思考中断",
     slash: SlashText {
@@ -1849,6 +1855,9 @@ static ZH: UiText = UiText {
     receipt_running_read: "正在读取 · {} 个文件",
     receipt_running_search: "正在搜索 · {} 次",
     receipt_running_list: "正在列出 · {} 个目录",
+    explore_verb_read: "读取",
+    explore_verb_search: "搜索",
+    explore_verb_list: "列出",
     disclosure_parallel: "并行完成 {} 项操作",
     disclosure_running_shell_one: "正在执行 · 1 个命令",
     disclosure_running_shell_many: "正在执行 · {} 个命令",
@@ -2321,7 +2330,7 @@ static EN: UiText = UiText {
     thinking: "thinking",
     thinking_lines: " · {} lines",
     thought_live: "Thinking…",
-    thought_for: "Thought for {}",
+    thought_for: "Thought · {}",
     thought_interrupted: "Thought interrupted after {}",
     thought_interrupted_bare: "Thought interrupted",
     slash: SlashText {
@@ -2619,6 +2628,9 @@ static EN: UiText = UiText {
     receipt_running_read: "Reading {} files",
     receipt_running_search: "Searching {} patterns",
     receipt_running_list: "Listing {} dirs",
+    explore_verb_read: "Read",
+    explore_verb_search: "Search",
+    explore_verb_list: "List",
     disclosure_parallel: "Completed {} operations in parallel",
     disclosure_running_shell_one: "Running · 1 shell command",
     disclosure_running_shell_many: "Running · {} shell commands",

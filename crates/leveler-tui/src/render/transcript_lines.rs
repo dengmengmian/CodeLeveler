@@ -117,7 +117,7 @@ fn format_thought_duration(ms: u64) -> String {
 /// Render one reasoning segment as a Thought.
 ///
 /// The header states the segment's real state — `Thinking…` while streaming,
-/// `Thought for 2.8s` when the runtime reported a clean boundary, and
+/// `Thought · 2.8s` when the runtime reported a clean boundary, and
 /// `Thought interrupted after 8.2s` when it did not.
 ///
 /// The body follows the entry's own [`DisplayMode`]: `Collapsed` paints the
@@ -1583,7 +1583,7 @@ mod tests {
     #[test]
     fn a_thought_without_provider_text_has_no_invented_body() {
         let lines = thought_rows(&thought("", true, Some(1200), false), 60);
-        assert!(lines[0].contains("已思考"), "{lines:?}");
+        assert!(lines[0].contains("思考 ·"), "{lines:?}");
         assert!(
             !lines.iter().any(|l| l.contains('│')),
             "no body without provider text: {lines:?}"
@@ -1614,7 +1614,7 @@ mod tests {
     #[test]
     fn a_completed_thought_shows_its_measured_duration() {
         let lines = thought_rows(&thought("先查 catalog。", true, Some(2800), false), 60);
-        assert!(lines[0].contains("已思考 2.8s"), "{lines:?}");
+        assert!(lines[0].contains("思考 · 2.8s"), "{lines:?}");
         assert!(
             lines.iter().any(|l| l.contains("先查 catalog。")),
             "{lines:?}"
@@ -1628,7 +1628,7 @@ mod tests {
         let lines = thought_rows(&thought("半句话", true, None, true), 60);
         assert!(lines[0].contains("思考中断"), "{lines:?}");
         assert!(
-            !lines[0].contains("已思考"),
+            !lines[0].contains("思考 ·"),
             "interrupted is not completed: {lines:?}"
         );
         assert!(lines.iter().any(|l| l.contains("半句话")), "{lines:?}");
@@ -1674,7 +1674,7 @@ mod tests {
         block.display_pinned = false;
         let lines = thought_rows(&block, 60);
         assert_eq!(lines.len(), 1, "header only: {lines:?}");
-        assert!(lines[0].contains("已思考 4.1s"), "{lines:?}");
+        assert!(lines[0].contains("思考 · 4.1s"), "{lines:?}");
         assert!(
             !lines.iter().any(|l| l.contains("body that must not show")),
             "the body is collapsed: {lines:?}"

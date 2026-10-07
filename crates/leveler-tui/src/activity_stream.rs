@@ -172,6 +172,7 @@ pub(crate) fn render_group_rows(
         && group_is_disclosable(group)
         && !visible.is_empty()
         && visible.iter().all(|c| c.name == visible[0].name)
+        && !is_lone_exploration(&visible)
     {
         push_run(
             &visible,
@@ -226,7 +227,8 @@ pub(crate) fn render_group_rows(
     let mixed_round = group.round.is_some()
         && !visible.is_empty()
         && !group_has_edits(group)
-        && group_is_disclosable(group);
+        && group_is_disclosable(group)
+        && !is_lone_exploration(&visible);
     let stage_worthy = !mixed_round
         && group_is_disclosable(group)
         && !unit_owns_head
@@ -284,6 +286,7 @@ pub(crate) fn render_group_rows(
                     None,
                     awaits(call, awaiting_approval),
                     true,
+                    is_exploration_call(call),
                 ));
                 push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
             }
@@ -402,6 +405,7 @@ pub(crate) fn render_group_rows(
                         Some(branch),
                         awaits(call, awaiting_approval),
                         true,
+                        false,
                     ));
                     push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
                 }
@@ -430,6 +434,7 @@ pub(crate) fn render_group_rows(
                     // A settled failure is not waiting on anybody.
                     false,
                     true,
+                    false,
                 ));
                 push_expanded_detail(
                     calls[0],
@@ -500,6 +505,7 @@ fn expanded_exploration_body(
             now_elapsed_secs,
             None,
             awaits(call, awaiting_approval),
+            true,
             true,
         ));
         append_call_detail(call, theme, body_width, true, locale, t, &mut body);
@@ -721,6 +727,32 @@ fn is_list_call(name: &str) -> bool {
         crate::tool_taxonomy::lookup(name).map(|e| e.kind),
         Some(crate::tool_taxonomy::ToolKind::ListDir)
     )
+}
+
+/// The bare verb a lone exploration row wears: the same vocabulary the
+/// aggregate receipt counts in, so `› 读取 a.rs` and `▸ 读取 2 个文件` read as
+/// one family instead of a sentence beside a tool-catalogue entry.
+///
+/// Mirrors [`exploration_receipt_label`]'s kind split exactly — List, then
+/// Read, then Search — so single and aggregate can never disagree about what a
+/// call is.
+fn exploration_verb(name: &str, t: &UiText) -> &'static str {
+    if is_list_call(name) {
+        t.explore_verb_list
+    } else if disclosure_class(name) == DisclosureClass::Read {
+        t.explore_verb_read
+    } else {
+        t.explore_verb_search
+    }
+}
+
+/// Whether a group's whole visible activity is ONE exploration call.
+///
+/// A lone Read/Search/List is not a stretch, so it is painted as its own direct
+/// row (`› 读取 a.rs · 12 行`) instead of under an aggregate parent: a receipt
+/// for one item states `完成 1 项` over the only row there is.
+fn is_lone_exploration(visible: &[&ToolCallBlock]) -> bool {
+    matches!(visible, [only] if is_exploration_call(only))
 }
 
 /// A stretch of two or more SUCCESSFUL exploration calls: the compact-receipt
@@ -1310,6 +1342,10 @@ fn unit_lines(
     awaiting_approval: bool,
     // False for a run child, whose head already named the tool.
     show_action: bool,
+    // True for a lone exploration call: its action wears the receipt's bare
+    // verb (读取/搜索/列出) rather than the tool's noun label, so a single Read
+    // reads in the same vocabulary as the aggregate receipt above it.
+    exploration_row: bool,
 ) -> Vec<Line<'static>> {
     // Plan/goal guard rejections carry internal English validation text for the
     // model — show a warning glyph and a localized note instead. Other failures
@@ -1322,7 +1358,9 @@ fn unit_lines(
     } else {
         status_glyph(call, theme)
     };
-    let action = if call.name == "task" {
+    let action = if exploration_row {
+        exploration_verb(&call.name, t).to_string()
+    } else if call.name == "task" {
         t.unsupported_task_action.to_string()
     } else {
         crate::tool_cell::tool_call_label(&call.name, &call.arguments, locale)
@@ -1387,8 +1425,10 @@ fn unit_lines(
     // when the run head already carries the tool's own label AND the target
     // differs; anything else — a more specific action, or no target at all —
     // would leave elapsed time and a line count standing alone.
-    let render_action =
-        show_action || !has_summary || action != tool_action_label_for(&call.name, locale);
+    let render_action = exploration_row
+        || show_action
+        || !has_summary
+        || action != tool_action_label_for(&call.name, locale);
     if render_action {
         let action_ink = if call.status == ToolStatus::Running && !awaiting_approval {
             theme.accent.secondary
@@ -1403,19 +1443,20 @@ fn unit_lines(
     if has_summary {
         let shell = is_shell_call(call)
             && crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
+        let gap = if exploration_row { 1 } else { 2 };
         let used: usize = head
             .iter()
             .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
             .sum::<usize>()
-            + usize::from(render_action) * 2
+            + usize::from(render_action) * gap
             + usize::from(shell) * 2;
         let avail = width
             .saturating_sub(used + UnicodeWidthStr::width(tail.as_str()) + 8)
             .max(8);
         // The label needs a gap before its target; a branch or anchor already
-        // ended in one.
+        // ended in one. A bare verb is one word, so it needs one space.
         if render_action {
-            head.push(Span::raw("  "));
+            head.push(Span::raw(if exploration_row { " " } else { "  " }));
         }
         if shell {
             head.push(Span::styled(
@@ -1691,6 +1732,9 @@ fn run_child_lines(
         now_elapsed_secs,
         Some(branch),
         awaiting_approval,
+        false,
+        // A run child rides under a head that already named the tool; it keeps
+        // the tool's own label and never borrows the exploration verb.
         false,
     )
 }
@@ -3121,7 +3165,7 @@ mod tests {
             )],
             &theme,
         );
-        let action = tool_action_label_for("read_file", Locale::Zh);
+        let action = exploration_verb("read_file", Locale::Zh.text());
         let action_fg = lines.iter().find_map(|line| {
             line.spans
                 .iter()
@@ -3274,7 +3318,10 @@ mod tests {
         let mut c = call("grep", r#"{"pattern":"WorkerQueueGroups"}"#, ToolStatus::Ok);
         c.preview = Some((0..13).map(|i| format!("hit {i}\n")).collect());
         let text = render_group_text(&group(vec![c]), 100, Locale::Zh).join("\n");
-        assert!(text.contains("搜索代码"), "the tool: {text}");
+        assert!(
+            text.contains(Locale::Zh.text().explore_verb_search),
+            "the tool: {text}"
+        );
         assert!(text.contains("WorkerQueueGroups"), "the target: {text}");
         assert!(text.contains("13"), "the result size: {text}");
     }
@@ -3300,7 +3347,10 @@ mod tests {
             Locale::Zh,
         );
         let text = lines.join("\n");
-        assert!(text.contains("搜索代码"), "{text}");
+        assert!(
+            text.contains(Locale::Zh.text().explore_verb_search),
+            "{text}"
+        );
         assert!(
             text.contains("owner"),
             "the pattern it searched for: {text}"
@@ -3518,8 +3568,14 @@ mod tests {
     fn a_lone_call_is_not_a_tool_run() {
         let lines = render_group_text(&group(reads(1)), 100, Locale::Zh);
         assert_eq!(lines.len(), 1, "one call, one row: {lines:?}");
-        assert!(lines[0].contains("读取文件"), "{lines:?}");
-        assert!(lines[0].contains("f0.rs"), "{lines:?}");
+        assert!(
+            lines[0].starts_with("\u{203a} 读取 f0.rs"),
+            "the row names the bare verb and the file: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains("读取文件"),
+            "not the tool noun: {lines:?}"
+        );
         assert!(!lines[0].contains('\u{251c}'), "no tree: {lines:?}");
         assert!(!lines[0].contains('\u{2514}'), "no tree: {lines:?}");
     }
@@ -3532,7 +3588,7 @@ mod tests {
     fn a_tool_row_opens_with_the_execution_anchor() {
         let lines = render_group_text(&group(reads(1)), 100, Locale::Zh);
         assert!(
-            lines[0].starts_with("\u{203a} 读取文件"),
+            lines[0].starts_with("\u{203a} 读取 f0.rs"),
             "the anchor opens the row: {lines:?}"
         );
         assert!(
@@ -5682,8 +5738,10 @@ mod tests {
         )]);
         let lines = render_group_text(&g, 80, Locale::Zh);
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("读取文件"), "{lines:?}");
-        assert!(lines[0].contains("src/auth.go"), "{lines:?}");
+        assert!(
+            lines[0].starts_with("\u{203a} 读取 src/auth.go"),
+            "the row is the evidence: {lines:?}"
+        );
         assert!(
             !lines[0].contains("读取 1 个文件"),
             "no summary over a single row: {lines:?}"

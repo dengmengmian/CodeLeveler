@@ -1126,7 +1126,7 @@ mod exploration_fold_tests {
             "\u{25b8} 读取 2 个文件 \u{b7} 搜索 1 次"
         );
         assert!(
-            !lines.iter().any(|l| l.contains("已思考")),
+            !lines.iter().any(|l| l.contains("思考 ·")),
             "no Thought header while folded: {lines:#?}"
         );
         assert!(
@@ -1166,7 +1166,7 @@ mod exploration_fold_tests {
         let thoughts: Vec<usize> = open
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.contains("已思考"))
+            .filter(|(_, l)| l.contains("思考 ·"))
             .map(|(i, _)| i)
             .collect();
         assert_eq!(thoughts.len(), 2, "both Thoughts are restored: {open:#?}");
