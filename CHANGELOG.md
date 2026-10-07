@@ -4,6 +4,46 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
+## [1.0.12] - 2026-10-07
+
+Makes the terminal's execution presentation a frozen contract with one
+authority, and gives a session one axis on every transport. The terminal, Web,
+Desktop and App derive the same semantic tree from the same runtime facts, and
+the work / bookkeeping classification behind the final answer lives once on the
+wire instead of in four renderers. Auto permission now matches ordinary
+development, and an interactive session is a Chat session on both transports.
+
+### Added
+
+- The execution presentation contract, frozen as a language-neutral fixture corpus (`testdata/execution_presentation/v1/`, C1..C14) that every surface checks itself against: the terminal as the reference implementation, plus Web, Desktop and App
+- Tool rows grouped by the real execution round, with the observed concurrent burst kept as a batch inside it and the stage named while it runs
+- A truthful round head: "all ok" only when every visible call succeeded, and `no_final_answer` for a prose-free turn instead of a green completion
+- One answer lifecycle: a committed answer survives `update_plan` / `update_goal(complete)` bookkeeping, real work after it demotes it, and the classification reaches every surface as the stated `answer_effect` fact (an unrecognized tool counts as work)
+- `/btw` side questions get their own observe-only surface and never join the main transcript, answer or plan
+- Auto permission covers ordinary development: temporary files, process and system inspection, relocated read-only Git (`-C`, `--git-dir`, `--work-tree`) and ordinary network, while destructive operations still ask
+
+### Changed
+
+- `--permission` has no default value: omitted, a new session uses the project/default profile and a resume keeps the profile it persisted; supplied, it overrides it
+- An interactive session is a Chat session on every transport (`leveler` / `leveler tui` over the daemon socket and `--in-process`); `leveler run` keeps the Goal default and resume keeps the persisted axis
+- The client protocol is at minor 14 (major 1, unchanged); every added field is optional
+- The narrow composer chip reserves collaboration and permission before shortening the model, and interim narration is visually subordinate to the answer
+- Web, Desktop and App no longer render raw model reasoning as transcript content
+
+### Fixed
+
+- A reconnect lost the running tool's execution round, so a reconnected client re-guessed it from tool kinds and timing
+- A command's failure reason could be a runtime note (`[execution policy] …`, `exit: N`, a timeout) instead of the command's own output, and the note was counted as output
+- A busy row wider than the status strip collapsed to a bare spinner and dropped its elapsed, tool and token parts
+- Prefixed text (`※ 回顾:`) wrapped by character count, clipping the wide glyph on a narrow terminal
+- The narrow status chip dropped collaboration and permission before the model
+- A protocol repair could reappear as a user-authored message in replayed history and in the session snapshot
+- Pending approvals were not superseded when the permission profile changed, and the selected mode did not survive a resume
+- A completed user shell's output tail was dropped when live delivery dropped
+- Closeout folding could fold a message belonging to an earlier model round
+- A runtime-host revival race could spawn a second runtime instead of adopting the one serving
+- `leveler update` retried only one transient exec failure while validating a download
+
 ## [1.0.11] - 2026-10-02
 
 Reworks how a model request is assembled, folded, and paid for: the control

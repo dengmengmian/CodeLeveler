@@ -4,6 +4,44 @@
 
 发布说明：[`docs/RELEASE.zh-CN.md`](docs/RELEASE.zh-CN.md)。
 
+## [1.0.12] - 2026-10-07
+
+把终端的执行展示冻结成一份只有唯一权威的 contract，并让一个会话在所有传输路径
+上只有一条轴。终端、Web、Desktop 和 App 从同一批 runtime 事实推出同一棵语义树；
+回答背后的 work / bookkeeping 分类只存在一份、通过 wire 传递，而不是复制进四个
+渲染器。Auto 权限与普通开发对齐，交互式打开的会话在两条传输上都是 Chat。
+
+### 新增
+
+- 执行展示 contract，用语言无关的 fixture 语料库冻结（`testdata/execution_presentation/v1/`，C1..C14），每个 surface 都对着它自查：终端是参考实现，另有 Web、Desktop 和 App
+- 工具行按真实执行轮次分组，同一轮里观测到的并发批次作为 batch 保留，运行中会标出阶段
+- 真实的轮次标题：只有每个可见调用都成功才声称「全部完成」，没有正文的回合以 `no_final_answer` 结束，而不是绿色的「已完成」
+- 统一的回答生命周期：已提交的回答不会被 `update_plan` / `update_goal(complete)` 覆盖，其后真实的工作会把它降级；该分类以 wire 事实 `answer_effect` 到达每个 surface（无法识别的工具按工作处理）
+- `/btw` 侧问有自己的只读 surface，不会进入主会话记录、回答或计划
+- Auto 权限覆盖普通开发：临时文件、进程与系统观测、可重定位的只读 Git（`-C`、`--git-dir`、`--work-tree`）与普通网络；破坏性操作仍然询问
+
+### 变更
+
+- `--permission` 不再有默认值：不传时新会话使用项目 / 默认 profile，resume 保留会话持久化的 profile；传入则显式覆盖
+- 交互式会话在所有传输路径上都是 Chat（`leveler` / `leveler tui` 走 daemon 套接字和 `--in-process` 都是）；`leveler run` 保持 Goal 默认值，resume 保留持久化的轴
+- 客户端协议升到 minor 14（major 仍为 1），新增字段全部可选
+- 窄终端的状态 chip 先保住 collaboration 与 permission，再缩短模型名；过渡性叙述在视觉上退到回答之下
+- Web、Desktop 和 App 不再把模型的原始推理当作会话记录渲染
+
+### 修复
+
+- 重连会丢掉运行中工具的执行轮次，导致重连的客户端按工具种类和时序重新猜轮次
+- 命令的失败原因可能是 runtime 自己写的行（`[execution policy] …`、`exit: N`、超时），而不是命令自己的输出，并且该行还被算作输出
+- 比状态条更宽的在忙行会塌缩成裸 spinner，并丢掉耗时、工具数和 token 信息
+- 带前缀的文本（`※ 回顾:`）按字符数换行，窄终端上会裁掉宽字符
+- 窄状态 chip 先丢掉 collaboration 和 permission，再丢模型名
+- ProtocolRepair 可能重新以用户消息出现在重放历史和会话快照里
+- permission profile 变化时待审批没有作废，选中的模式也无法跨 resume 保留
+- 用户 shell 已完成的输出尾部在 live 投递断开时丢失
+- closeout 折叠可能折到属于更早轮次的消息
+- runtime host 的 revive 竞态可能再 spawn 一个 runtime，而不是 adopt 正在服务的那个
+- `leveler update` 在校验下载时只重试一次瞬时 exec 失败
+
 ## [1.0.11] - 2026-10-02
 
 重做了模型请求的组装、折叠和计量方式：控制上下文与会话记录分离，每一段提示词

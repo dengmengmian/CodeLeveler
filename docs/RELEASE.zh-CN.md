@@ -2,91 +2,88 @@
 
 英文版：[`RELEASE.md`](RELEASE.md)
 
-这一版重做了模型请求的组装、折叠和计量方式：控制上下文与会话记录分离，
-每一段提示词都有唯一的来源和权威，每一次模型尝试都记入请求账本。
-推理也多了一套面向用户的词：Thinking Level 表达的是意图（`auto`、`off`、
-`minimal`、`low`、`medium`、`high`、`max`），而不是服务商的参数；`/thinking`
-为当前会话设置，配置文件里写的是同一套词（可全局也可按模型），默认是 `high`。
-已安装的稳定版可以自动更新，也可以执行 `leveler update` 或 `/update`。
+这一版把终端的执行展示冻结成一份只有唯一权威的 contract，并让一个会话在所有
+传输路径上只有一条轴。终端、Web、Desktop 和移动 App 现在从同一批 runtime
+事实推出同一棵语义树——执行轮次、真实的轮次状态、以及这一回合真正提交的回答；
+而回答背后的 work / bookkeeping 分类只存在一份、通过 wire 传递，不再被复制进
+四个渲染器。
+Auto 权限也向普通开发对齐：临时文件、进程与系统观测、可重定位的只读 Git，
+以及普通网络访问都不再询问，而破坏性操作仍然会问。
+交互式打开的会话是一条 Chat 会话，无论它走 daemon 套接字还是 in-process；
+`leveler run` 仍然驱动 Goal。
 
 ## 新增
 
-- **CodeLeveler Desktop**：`apps/leveler-desktop/` 下的 Electron 客户端。任务、
-  对话、工具、审批和持久化仍然来自 Rust Runtime。Renderer 只能通过 sandbox
-  preload 的固定 IPC 面访问 Electron Main，拿不到 Runtime 凭据，也没有 Node
-  访问权；Main 只能通过内部 `leveler desktop-bridge` JSONL 适配器访问 Runtime，
-  因此 Runtime 的 discovery、spawn、adopt、revive 和 handoff 仍由 Runtime Host
-  拥有。它从仓库构建（在 `apps/leveler-desktop` 下 `npm ci` 后 `npm start`）；
-  发布包内仍只有 `leveler` 二进制。
-- 桌面客户端提供任务导航、支持安全 Markdown 的对话视图、可关闭的工作台
-  （Plan、Changes 和手动 Browser 标签）、按会话生效的模型与权限菜单，以及
-  有上限的附件上传。
-- Desktop bridge 对它转发的每条命令都按各自的明确上界校验：仅 PNG 的图片附件
-  上限 20 MiB、64 位十六进制摘要、边长 1..=2048 像素，非空且有界的 query id，
-  有界的可观测窗口，经校验的 agent 名，以及仅作用于所选会话的模型、权限、重命名
-  和归档命令。其余一律拒绝。
-- **所有模型共用一套 Thinking Level。** `/thinking` 与 `/thinking <level>` 可为
-  当前会话设置 `auto`、`off`、`minimal`、`low`、`medium`、`high` 或 `max`，
-  `~/.leveler/config.toml` 里写的是同一套词，可全局设置也可按模型设置。默认是
-  `high`。`max` 表示「该模型声明的最高档」，而不是某个固定的服务商取值，因此它
-  会随模型变化重新解析，而不是钉死某个 route 恰好读取的参数。选择器只列出真实
-  有区别的档位，因此 `high` 与 `max` 不会被当成两个请求列两次；状态栏显示的也
-  是这套统一词汇里的档位。
+- **执行展示 contract，用 fixture 冻结。** 一个回合投影出的语义树——可选的
+  assistant 文本、带成员与真实状态的执行轮次、可选的最终回答、回合终态——由
+  `testdata/execution_presentation/v1/` 里的语言无关语料库（C1..C14）钉住，
+  每个 surface 都对着同一份语料自查：终端（参考实现，跑真实 reducer）、Web、
+  Desktop 和移动 App。一个 fixture 可以声明 live 路径、reconnect snapshot 和
+  durable history replay；所有声明的路径必须投影出同一棵树。
+- **工具行按真实执行轮次分组。** 终端把一次模型响应里的调用归到一个轮次标题下，
+  而不是平铺列表；同一轮里观测到的并发批次作为一个 batch 保留，轮次运行中会
+  标出阶段。
+- **真实的轮次标题。** 只有每个可见调用都成功时才会声称「全部完成」；已结束的
+  轮次里若有取消、失败或未知的调用会如实说明；没有正文的回合以
+  `no_final_answer` 结束，而不是绿色的「已完成」。
+- **统一的回答生命周期。** 已提交的回答不会被 bookkeeping（`update_plan`、
+  `update_goal(complete)`）覆盖；而其后真实的 read / search / edit / shell
+  会把它降级为进行中。这个分类只有一个 owner（`leveler_tools::acts_on_answer`），
+  并以 wire 事实（`answer_effect`）到达每个 surface；surface 不会根据工具名
+  自行判定，无法识别的工具一律按「工作」处理。
+- **`/btw` 侧问有自己的 surface。** 侧问的只读工具活动只出现在侧问 surface，
+  永远不会进入主回合的会话记录、回答或计划。
+- **Auto 权限覆盖普通开发。** 写临时文件（`/tmp`、`$TMPDIR`）不再以 `EPERM`
+  失败；进程与系统观测可运行；可重定位的只读 Git（`git -C <dir> status`、
+  `--git-dir`、`--work-tree`）仍然是读操作，不再升级为 ASK；Auto 的普通网络
+  ALLOW 也会真正落到 sandbox 上，并以 permission DENY 失败作为负向对照。
+  破坏性操作仍然询问。
+- Web 客户端与移动 App 也会显示桌面风格的轮次树，包括用命令自己的失败原因
+  （已去掉 runtime 的执行行）。
 
 ## 变更
 
-- 提示词组装让每一段投递内容都有唯一的来源、权威和生命周期。Provider 可以
-  改变某一段在链路上的表示形式（system message 或顶层 system 字段），但不能
-  改变它的顺序、来源或权威；控制上下文不再作为会话记录的一部分传递。
-- 链路编码与上下文统计读取同一个「已投影请求」，报告出的输入规模与实际发送的
-  字节不会再互相矛盾。折叠压力按已投影请求判定，作用于某个目录的项目规则在
-  折叠后被逐字保留，历史推理遵循路由自己的回放契约。
-- 每一次模型尝试都记入请求账本和资源预算，包括失败、重试、压缩摘要和子任务
-  调用。恢复时消费量由该作用域已持久化的请求事实重建，后台子任务不会再继续
-  花费过期的余额快照。
-- 规则投递按请求额度分配：即使规则文件只有一部分能逐字放入，每条规则仍保持
-  权威。
-- 附件导入结果现在携带产生它的那条命令的身份，客户端因此可以把一次成功保存
-  或一次失败对应回自己的请求，而不必按附件名猜测。该字段在链路上可选，raw-send
-  导入不带它。
-- 以 `runtime` lifetime 启动的后台任务由 Execution Host 拥有，而不是由启动它的
-  那个 runtime generation 拥有：dev server 或 watcher 因此可以跨版本更新存活——
-  启动它的 generation 退出时不会停掉它，替换上来的 generation 会重新接上它。
-  较早协议 major 的 Execution Host 继续管理它已经在跑的服务；跨属主控制仍然被
-  拒绝，而不是降级放行。
-- 发布产物中记录了仓库的 `./dev` 开发入口，用于本地验证和发布资格判定。
-- `auto` 的含义是「不覆盖」，不再是 CodeLeveler 自己的调参：它不会再变成模型
-  profile 声明的 default，后者只留给 harness 自己发起的调用（压缩、记忆抽取）
-  以及评测接入点或 agent manifest 发出的显式 native 请求。模型无法精确表达的
-  档位也不再被四舍五入到相邻档位——它不可用，请求不带覆盖，`leveler doctor`
-  会列出该模型真正支持的档位。
-- 会话的 Thinking Level 会到达主请求，`/btw` 旁问继承它，内部压缩保留自己的
-  策略。`off` 会变成 route 级别的关闭，而不是在 executor policy 与请求之间丢失；
-  新会话从配置默认值开始，而不是继承上一段对话的覆盖。
+- **`--permission` 不再有默认值。** 不传时，新会话使用项目 / 默认 profile，
+  而 resume 会保留会话自己持久化的 profile；传入则是显式覆盖。之前缺少该参数
+  时按 `assisted` 处理，这也让 resume 无法区分「未改动」和「设为 assisted」。
+- **交互式会话在所有传输路径上都是 Chat。** `leveler` 与 `leveler tui` 过去走
+  daemon 套接字时记录 `chat`，而 in-process 时记录 `goal`，因为内嵌路径是按
+  进程默认值解析轴的。现在交互轴只声明一次、两条传输都写它；`leveler run`
+  保持 Goal 默认值，resume 则保留会话创建时的轴。
+- **客户端协议升到 minor 14**（major 仍为 1）。新增字段都是可选的：省略它的
+  peer 保持原有行为，Web / Desktop / App 的连接方式不变。
+- 窄终端的状态 chip 会先保住 collaboration 与 permission，然后才缩短模型名，
+  这两个控制项不再是最先消失的东西。
+- 过渡性叙述在视觉上退到回答之下；混合工具的轮次只给一个简化标签，不再按种类
+  罗列。
+- Web、Desktop 和 App 不再把模型的原始推理当作会话记录渲染；运行状态仍然会
+  说明模型正在思考。
 
 ## 修复
 
-- 缩减上下文的 route 可以声明比自身 `context_window` 更大的
-  `max_output_tokens`。把整段补全预留在窗口上，曾把可用输入容量压到 `0`，
-  于是每个请求都被判为超出硬容量，运行在第一批工具调用后即以
-  `context management failure: ... capacity 0` 中止。容量为 0 不是模型声明的
-  界限，因此现在只按质量边界折叠；预留能放进窗口的 route 行为不变。
-- 请求前产生的上下文快照现在会送达调用方的 observer，不再被丢弃。
-- 模型消费作用域切换时，不再丢弃当前任务纪元剩余的命令预算。
-- 批次在一轮中途被取消时，已完成命令的消费会被结清，不再随被取消的那一轮丢失。
-- 子任务渲染出的 spawn brief 会持久化在子任务 spec 上并在 resume 时复用，
-  恢复后的子任务看到的是它启动时的那份 brief。
-- `/btw` 的只读调用改为通过 ToolHost 准入管线，不再绕过它。
-- 后台任务写入被限制在 OS 执行边界内，任务变更在整个工作负载结束后才结算，
-  运行中的 stdout、stderr 通道设有上限，并在截断处给出明确标记，不会无限增长。
-- 记忆列表现在会报告导致它的 store 失败，而不会把一次失败的读取当作空列表。
-- 状态栏与 Web 客户端显示的是统一词汇里的档位（`high`、`max`），而不是服务商的
-  参数；`xhigh`、`reasoning_effort`、`output_config` 和 `budget_tokens` 不再有
-  任何路径出现在用户看到的内容里。
-- 对已删除的会话调用 `SetThinkingLevel` 会返回 `SessionNotFound`，而不是更新零行
-  却报告成功。
-- 仓库内置模型未声明档位时会解析到全局默认值，因此内置的 `high` 也能到达
-  YAML/model 加载路径；显式 `auto` 不会告警，也不会变成 `high`。
+- **重连会丢掉运行中工具的执行轮次。** live view 在折叠进 reconnect snapshot
+  时丢掉了轮次标识，于是重连的客户端只能按工具种类和时序重新猜轮次，甚至把
+  第二个轮次焊到第一个上。现在 snapshot 会声明 runtime 早已知道的轮次。
+- **命令的失败原因可能是 runtime 自己写的行。** preview 里混着命令的输出和
+  runtime 写的行（`exit: N`、流标题、`[execution policy] …`、超时）。这些行
+  说明的是「怎么跑的」，把它们当成「为什么失败」，就会把 sandbox 的写入限制
+  说明当成 `git grep` 无匹配退出 1 的原因，还会把该行算作输出。现在这些行只
+  分类一次，并从失败原因、展开正文和输出行数里排除；超时会明确写成超时。
+- 比状态条更宽的在忙行会塌缩成一个裸 spinner，并静默丢弃它后面的耗时、工具数、
+  token 信息。
+- 带前缀的文本（`※ 回顾:`）按字符数换行，窄终端上会把宽字符裁掉。
+- 窄状态 chip 会先丢掉 collaboration 和 permission，再丢模型名，把两个优先级
+  更高的控制项藏了起来。
+- **ProtocolRepair 可能重新变成用户消息。** goal closeout 仍然会在 resume 时
+  送给模型，但重放的历史和会话快照不再把它投影成用户撰写的文本；live 客户端
+  原本就已经隐藏它。
+- 审批状态可能在触发它的 profile 消失后仍然存在：permission profile 变化时
+  待审批会被作废，选中的模式也能跨 resume 保留。
+- 用户 shell 已完成的输出尾部在 live 投递断开时会丢失（移动 App）。
+- closeout 折叠可能折到属于更早轮次的消息；现在会被限制在自己的轮次内。
+- runtime host 的 revive 竞态可能再 spawn 一个 runtime，而不是 adopt 已经在
+  服务的那个。
+- `leveler update` 在校验下载时只重试一次瞬时 exec 失败。
 
 ## 已知限制
 
@@ -96,6 +93,9 @@
   网络仍开放时继续跑
 - Windows 没有本地 daemon 套接字。会话和 `resume` 仍然可用
 - Windows 上受隔离的 `!command` 结束后才打印输出，不会边跑边刷
+- 非终端 surface 的 durable-history 重放仍不完整：Web 与 App 没有
+  `query_session_history` 消费者，Desktop 无法仅凭历史重建一个回合。各自的
+  conformance 测试会断言这些缺口，而不是把它藏起来
 
 安装与使用见 [README](../README.zh-CN.md)。
 更新见 [README · 更新](../README.zh-CN.md#更新)。
