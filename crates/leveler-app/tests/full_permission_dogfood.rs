@@ -524,6 +524,68 @@ impl Path {
     }
 }
 
+// This fixture models an operator re-observing a live permission waiter after
+// a rejected CAS. Production clients still expose the conflict to the user.
+async fn supersede_live_waiter(
+    app: &Application,
+    client: &InProcessRuntimeClient,
+    session_id: &SessionId,
+    approval: &UiApprovalRequest,
+) {
+    for attempt in 0..8 {
+        let observed = client.snapshot(session_id).await.unwrap();
+        assert_eq!(observed.mode, WirePermission::Assisted);
+        assert!(
+            observed.pending_interactions.iter().any(|item| {
+                matches!(item, UiPendingInteraction::Approval(current) if current.id == approval.id)
+            }),
+            "the original Auto waiter must remain live before a new intent"
+        );
+        let expected = observed.last_sequence.unwrap_or(0);
+        let envelope = leveler_client_protocol::CommandEnvelope {
+            command_id: leveler_core::CommandId::generate(),
+            session_id: session_id.clone(),
+            expected_version: Some(expected),
+            issued_at: leveler_core::now().to_rfc3339(),
+            command: ClientCommand::SetPermissionProfile {
+                session_id: session_id.clone(),
+                mode: WirePermission::FullAccess,
+            },
+        };
+        match client.deliver(envelope).await {
+            Ok(()) => return,
+            Err(leveler_client_protocol::ClientError::Runtime(message))
+                if message.starts_with("version conflict:") =>
+            {
+                let current = client.snapshot(session_id).await.unwrap();
+                assert_eq!(
+                    current.mode, observed.mode,
+                    "a refused CAS cannot change permission"
+                );
+                assert!(current.pending_interactions.iter().any(|item| {
+                    matches!(item, UiPendingInteraction::Approval(pending) if pending.id == approval.id)
+                }), "a refused CAS cannot replace the original waiter");
+                let actual = current.last_sequence.unwrap_or(0);
+                assert!(actual > expected, "conflict requires canonical advancement");
+                let db = app.open_database().await.unwrap();
+                let delta = leveler_storage::EventRepository::new(&db)
+                    .load_after(session_id, expected)
+                    .await
+                    .unwrap();
+                eprintln!(
+                    "full permission fixture explicit resync attempt={attempt} expected={expected} actual={actual} events={:?}",
+                    delta
+                        .iter()
+                        .map(|row| (row.sequence, row.event_type.as_str()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            Err(error) => panic!("permission intent failed: {error:?}"),
+        }
+    }
+    panic!("canonical execution never stabilized for a fresh permission intent");
+}
+
 /// Run one operation through one entry path under the global checker.
 async fn run_case(path: Path, op: &Op, workroot: &std::path::Path) -> (Case, Vec<Violation>) {
     let case_id = format!("{}/{}", path.as_str(), op.id);
@@ -630,13 +692,7 @@ async fn run_case(path: Path, op: &Op, workroot: &std::path::Path) -> (Case, Vec
             }
         };
         // Supersede by switching to Full.
-        client
-            .send_observed(ClientCommand::SetPermissionProfile {
-                session_id: session_id.clone(),
-                mode: WirePermission::FullAccess,
-            })
-            .await
-            .unwrap();
+        supersede_live_waiter(&app, &client, &session_id, &approval).await;
         pump_until(
             &mut events,
             &mut watcher,
