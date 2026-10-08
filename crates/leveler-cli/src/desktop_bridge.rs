@@ -251,13 +251,25 @@ impl Bridge {
                 result["session"] = serde_json::to_value(self.client()?.snapshot(&session).await?)?;
                 Ok(result)
             }
-            "create" => {
+            "create" | "create_identified" => {
+                let request_id = params
+                    .get("request_id")
+                    .filter(|v| !v.is_null())
+                    .cloned()
+                    .map(serde_json::from_value::<leveler_client_protocol::CommandId>)
+                    .transpose()?;
+                if method == "create_identified"
+                    && request_id.as_ref().is_none_or(|id| id.as_str().is_empty())
+                {
+                    anyhow::bail!("identified creation requires a nonempty request_id");
+                }
                 let client = self.client()?;
                 let workspace = self
                     .layout
                     .as_ref()
                     .and_then(|layout| layout.primary_workspace());
                 let request = CreateSessionRequest {
+                    request_id,
                     collaboration: requested_collaboration(&params)?,
                     workspace: workspace.map_or(CreateWorkspaceSelection::None, |root| {
                         CreateWorkspaceSelection::Workspace {

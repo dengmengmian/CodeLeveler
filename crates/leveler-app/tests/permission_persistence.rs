@@ -191,6 +191,7 @@ async fn daemon_create_and_restart_keeps_full() {
     let daemon1 = client(&app1, PermissionProfile::Assisted);
     let bootstrap = daemon1
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "daemon full".to_string(),

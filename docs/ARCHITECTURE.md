@@ -1119,6 +1119,21 @@ One Runtime can therefore serve multiple clients:
               TUI     Web    Mobile
 ```
 
+Interactive creation uses `create_session_identified` (Web: `/api/sessions/identified`;
+Desktop: an explicit identified IPC operation). Clients retain one `request_id` across
+unknown-response retries. IDs share the global CommandId namespace: another original
+request or an ordinary command using the same ID causes an explicit conflict.
+TaskCreationStore atomically writes the session, task, original-request fingerprint,
+and existing command receipt. The session row durably contains its initial model,
+workspace, permission, sandbox, and collaboration. Replay returns the original session's
+current snapshot without rewriting later settings; changed defaults do not change the
+caller request identity. Explicit session deletion also deletes its receipt, so dedup
+retention follows the durable session lifetime. ApprovalPolicy retains its existing
+runtime and transport trust owner; the creation receipt adds no durable permission truth.
+Legacy requests without request_id remain non-idempotent and cannot be automatically
+retried after an unknown response. Old peers must reject the distinct identified operation;
+clients never fall back to legacy creation or infer support from ignored fields.
+
 The client and Runtime do not need to live on the same machine.
 
 ### 13.1 What is shipped today

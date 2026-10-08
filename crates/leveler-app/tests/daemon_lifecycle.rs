@@ -170,6 +170,7 @@ async fn client_disconnect_does_not_cancel_and_explicit_cancel_fires_once() {
 
     let bootstrap = client1
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -270,6 +271,7 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
 
     let session_a = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -283,6 +285,7 @@ async fn session_scoped_subscription_never_sees_another_sessions_events() {
         .id;
     let session_b = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -558,6 +561,7 @@ async fn a_child_that_exited_still_leaves_a_named_stoppable_blocker() {
     );
     let session_id = runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -760,6 +764,7 @@ async fn registry_background_lifecycle_reaches_the_session_event_stream() {
     );
     let session_id = runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -848,6 +853,7 @@ async fn cancel_background_task_command_stops_the_owned_task() {
     );
     let session_id = runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -935,6 +941,7 @@ async fn background_task_output_reaches_the_session_event_stream() {
     );
     let session_id = runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1011,6 +1018,7 @@ async fn a_running_turn_holds_the_handover_open() {
 
     let bootstrap = runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1035,6 +1043,7 @@ async fn a_running_turn_holds_the_handover_open() {
     // starts, a turn submitted for it must be refused, not silently admitted.
     let other = runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1196,6 +1205,7 @@ async fn active_work_blocks_idle_eviction() {
     wait_for_clients(&h, 1).await;
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1361,6 +1371,7 @@ async fn retiring_health_names_the_running_turn_as_a_blocker() {
     let bootstrap = h
         .runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1425,6 +1436,7 @@ async fn force_retire_ends_a_turn_that_plain_retirement_waits_for() {
 
     let bootstrap = runtime
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,

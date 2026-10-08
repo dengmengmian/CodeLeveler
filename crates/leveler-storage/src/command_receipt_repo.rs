@@ -51,6 +51,26 @@ impl<'a> CommandReceiptRepository<'a> {
         Self { db }
     }
 
+    /// Read the aggregate bound to a completed logical creation. This read
+    /// does not claim a receipt; the creation transaction rechecks absence.
+    pub async fn completed_creation(
+        &self,
+        command_id: &CommandId,
+        fingerprint: &str,
+    ) -> Result<Option<SessionId>, StorageError> {
+        let row: Option<(String, String, String)> = sqlx::query_as("SELECT session_id, command_fingerprint, status FROM command_receipts WHERE command_id = ?1")
+            .bind(command_id.as_str()).fetch_optional(self.db.pool()).await?;
+        match row {
+            None => Ok(None),
+            Some((session, stored, status)) if stored == fingerprint && status == "completed" => {
+                Ok(Some(SessionId::new(session)))
+            }
+            Some(_) => Err(StorageError::InvalidData(
+                "creation identity conflicts with an existing command or request".into(),
+            )),
+        }
+    }
+
     /// Classify an existing terminal receipt without creating or claiming one.
     /// `None` means either unseen or explicitly retryable (`failed`), so the
     /// caller must perform normal command validation before calling `admit`.

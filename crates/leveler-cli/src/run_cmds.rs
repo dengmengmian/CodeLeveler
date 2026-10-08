@@ -872,6 +872,7 @@ fn interactive_session_request(
     auto_approve: bool,
 ) -> CreateSessionRequest {
     CreateSessionRequest {
+        request_id: Some(leveler_client_protocol::CommandId::generate()),
         collaboration: interactive_session_collaboration(),
         workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
         goal: "interactive session".to_string(),

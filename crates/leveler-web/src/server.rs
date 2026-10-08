@@ -122,6 +122,7 @@ fn build_router_with(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", post(create_session))
+        .route("/api/sessions/identified", post(create_session_identified))
         .route("/api/sessions/{id}/snapshot", get(session_snapshot))
         .route("/api/sessions/{id}/file", get(crate::repo::read_file))
         .route("/api/sessions/{id}/files", get(crate::repo::list_files))
@@ -266,6 +267,23 @@ struct WebCreateSessionRequest {
     /// lifecycle) is honored as-is.
     #[serde(default)]
     collaboration: Option<leveler_local_transport::CollaborationMode>,
+}
+
+async fn create_session_identified(
+    state: State<AppState>,
+    request: Json<WebCreateSessionRequest>,
+) -> Result<Json<SessionBootstrap>, ApiError> {
+    if request
+        .inner
+        .request_id
+        .as_ref()
+        .is_none_or(|id| id.as_str().is_empty())
+    {
+        return Err(ApiError(ClientError::Runtime(
+            "identified creation requires a nonempty request_id".into(),
+        )));
+    }
+    create_session(state, request).await
 }
 
 async fn create_session(

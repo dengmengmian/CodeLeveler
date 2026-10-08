@@ -106,6 +106,10 @@ pub enum CreateWorkspaceSelection {
 /// Everything the daemon needs to create a new interactive session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
+    /// Stable logical creation identity. Omission preserves legacy semantics;
+    /// identified clients must reuse this ID after an unknown response.
+    #[serde(default)]
+    pub request_id: Option<leveler_client_protocol::CommandId>,
     #[serde(default)]
     pub workspace: CreateWorkspaceSelection,
     pub goal: String,
@@ -292,6 +296,12 @@ enum WireRequest {
         #[serde(default)]
         client_kind: ClientKind,
     },
+    /// Distinct verb: old daemons cannot ignore the id and create before retry.
+    CreateSessionIdentified {
+        request: CreateSessionRequest,
+        #[serde(default)]
+        client_kind: ClientKind,
+    },
     /// Explicit workspace selection has a distinct verb so an older daemon
     /// cannot ignore the new request field and create in its default repository.
     CreateSessionSelected {
@@ -346,11 +356,11 @@ impl WireRequest {
     /// outcome is unknown. Reads (Ping/Snapshot/LocalWaiters/RuntimeInfo)
     /// are always safe; Deliver is safe because the daemon deduplicates by
     /// CommandEnvelope command_id (the replay carries the SAME id, so the
-    /// mutation runs at most once). Raw Send and CreateSession have no
+    /// mutation runs at most once). Identified creation similarly carries its
+    /// durable logical request_id. Raw Send and legacy CreateSession have no
     /// idempotency key: their first attempt may already have mutated state,
     /// so they must never be auto-replayed. Subscribe never goes through
     /// the request path (it has its own reconnect loop).
-    /// Whether a request may be replayed after a transport failure.
     fn safe_to_retry_after_transport_failure(&self) -> bool {
         match self {
             WireRequest::Ping
@@ -362,6 +372,7 @@ impl WireRequest {
             // transport failure converges to the same state.
             | WireRequest::AttachSessionPolicy { .. }
             | WireRequest::Deliver(_) => true,
+            WireRequest::CreateSessionIdentified { request, .. } => request.request_id.as_ref().is_some_and(|id| !id.as_str().is_empty()),
             WireRequest::Send(_)
             | WireRequest::CreateSession { .. }
             | WireRequest::CreateSessionSelected { .. }
@@ -381,9 +392,9 @@ impl WireRequest {
             WireRequest::Send(_) => "send",
             WireRequest::Deliver(_) => "deliver",
             WireRequest::Snapshot { .. } => "snapshot",
-            WireRequest::CreateSession { .. } | WireRequest::CreateSessionSelected { .. } => {
-                "create_session"
-            }
+            WireRequest::CreateSession { .. }
+            | WireRequest::CreateSessionSelected { .. }
+            | WireRequest::CreateSessionIdentified { .. } => "create_session",
             WireRequest::AttachSessionPolicy { .. } => "attach_session_policy",
             WireRequest::LocalWaiters => "local_waiters",
             WireRequest::RuntimeInfo => "runtime_info",
@@ -622,6 +633,16 @@ mod transport {
             )
             .await;
         }
+        if matches!(&request, WireRequest::CreateSessionIdentified { request, .. } if request.request_id.as_ref().is_none_or(|id| id.as_str().is_empty()))
+        {
+            return send_result(
+                &mut stream,
+                Err(ClientError::Runtime(
+                    "identified creation requires a nonempty request_id".into(),
+                )),
+            )
+            .await;
+        }
         match request {
             WireRequest::Ping => send_response(&mut stream, WireResponse::Ack).await,
             WireRequest::Send(command) => {
@@ -698,6 +719,10 @@ mod transport {
                 client_kind,
             }
             | WireRequest::CreateSessionSelected {
+                mut request,
+                client_kind,
+            }
+            | WireRequest::CreateSessionIdentified {
                 mut request,
                 client_kind,
             } => {
@@ -1208,19 +1233,22 @@ mod transport {
             request: CreateSessionRequest,
         ) -> Result<SessionBootstrap, ClientError> {
             match self
-                .request(
-                    if request.workspace == CreateWorkspaceSelection::RuntimeDefault {
-                        WireRequest::CreateSession {
-                            request,
-                            client_kind: self.client_kind,
-                        }
-                    } else {
-                        WireRequest::CreateSessionSelected {
-                            request,
-                            client_kind: self.client_kind,
-                        }
-                    },
-                )
+                .request(if request.request_id.is_some() {
+                    WireRequest::CreateSessionIdentified {
+                        request,
+                        client_kind: self.client_kind,
+                    }
+                } else if request.workspace == CreateWorkspaceSelection::RuntimeDefault {
+                    WireRequest::CreateSession {
+                        request,
+                        client_kind: self.client_kind,
+                    }
+                } else {
+                    WireRequest::CreateSessionSelected {
+                        request,
+                        client_kind: self.client_kind,
+                    }
+                })
                 .await
                 .map_err(transport_client_error)?
             {
@@ -2249,6 +2277,40 @@ mod tests {
     }
 
     #[test]
+    fn only_distinct_identified_creation_allows_transport_retry() {
+        let request: CreateSessionRequest = serde_json::from_value(
+            serde_json::json!({"goal":"g", "model":null, "mode":"assisted"}),
+        )
+        .unwrap();
+        assert_eq!(request.request_id, None, "legacy wire remains decodable");
+        assert!(
+            !WireRequest::CreateSession {
+                request: request.clone(),
+                client_kind: ClientKind::LocalInteractive
+            }
+            .safe_to_retry_after_transport_failure()
+        );
+        assert!(
+            !WireRequest::CreateSessionIdentified {
+                request: request.clone(),
+                client_kind: ClientKind::LocalInteractive
+            }
+            .safe_to_retry_after_transport_failure()
+        );
+        let request = CreateSessionRequest {
+            request_id: Some(leveler_client_protocol::CommandId::new("logical-create")),
+            ..request
+        };
+        assert!(
+            WireRequest::CreateSessionIdentified {
+                request,
+                client_kind: ClientKind::LocalInteractive
+            }
+            .safe_to_retry_after_transport_failure()
+        );
+    }
+
+    #[test]
     fn omitted_workspace_selection_remains_distinct_from_explicit_none() {
         let legacy = serde_json::json!({"goal":"chat", "model":null, "mode":"assisted"});
         let request: CreateSessionRequest = serde_json::from_value(legacy.clone()).unwrap();
@@ -2342,8 +2404,76 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let result = client
             .create_session(CreateSessionRequest {
+                request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::None,
+                goal: "without workspace".into(),
+                model: None,
+                mode: PermissionProfile::Assisted,
+                approval_policy: ApprovalPolicy::Interactive,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "legacy daemon must never claim a repository session fulfilled None"
+        );
+        assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identified_creation_is_refused_by_legacy_daemon_without_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = creates.clone();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server = tokio::spawn(async move {
+            let mut subscriptions = Vec::new();
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = stop.cancelled() => return,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let length = stream.read_u32().await.unwrap() as usize;
+                let mut bytes = vec![0; length];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let kind = request["body"]["type"].as_str().unwrap();
+                // This predates workspace selection: unknown request variants
+                // are refused, while unknown fields of CreateSession were ignored.
+                let response = match kind {
+                    "subscribe" => serde_json::json!({"type":"ack"}),
+                    "create_session" => {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        serde_json::json!({"type":"session_created","body":{"session":TestRuntime::new().snapshot.lock().unwrap().clone(),"context_window":128000}})
+                    }
+                    _ => {
+                        serde_json::json!({"type":"error","body":{"message":"unsupported legacy request","session_id":null}})
+                    }
+                };
+                let reply = serde_json::to_vec(
+                    &serde_json::json!({"protocol":{"major":1,"minor":12},"body":response}),
+                )
+                .unwrap();
+                stream.write_u32(reply.len() as u32).await.unwrap();
+                stream.write_all(&reply).await.unwrap();
+                if kind == "subscribe" {
+                    subscriptions.push(stream);
+                }
+            }
+        });
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let result = client
+            .create_session(CreateSessionRequest {
+                request_id: Some(leveler_client_protocol::CommandId::new("identified-create")),
+                collaboration: CollaborationMode::Chat,
+                workspace: CreateWorkspaceSelection::RuntimeDefault,
                 goal: "without workspace".into(),
                 model: None,
                 mode: PermissionProfile::Assisted,
@@ -2473,6 +2603,7 @@ mod tests {
             "s3cret-token",
             WireRequest::CreateSession {
                 request: CreateSessionRequest {
+                    request_id: None,
                     collaboration: CollaborationMode::Chat,
                     workspace: CreateWorkspaceSelection::RuntimeDefault,
                     approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -2812,6 +2943,7 @@ mod tests {
 
         let error = client
             .create_session(CreateSessionRequest {
+                request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -3026,6 +3158,7 @@ mod tests {
         let received = deadend_server(&path);
         let error = client
             .create_session(CreateSessionRequest {
+                request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -3160,6 +3293,7 @@ mod tests {
 
     fn create_req(policy: ApprovalPolicy) -> CreateSessionRequest {
         CreateSessionRequest {
+            request_id: None,
             collaboration: CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "s".to_string(),
@@ -3431,6 +3565,7 @@ mod tests {
             .unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -3606,6 +3741,7 @@ mod tests {
         let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
         let bootstrap = client
             .create_session(CreateSessionRequest {
+                request_id: None,
                 collaboration: CollaborationMode::Chat,
                 workspace: CreateWorkspaceSelection::RuntimeDefault,
                 approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,

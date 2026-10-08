@@ -252,6 +252,7 @@ async fn start_service(
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::AutoApprove,

@@ -204,6 +204,7 @@ async fn a_reconnect_returns_the_same_running_tool_with_its_round() {
     let (client_a, shutdown_a, task_a) = attach(&h.runtime, &h.socket).await;
     let bootstrap = client_a
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: ApprovalPolicy::Interactive,

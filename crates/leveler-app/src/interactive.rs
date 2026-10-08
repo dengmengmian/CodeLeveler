@@ -5460,6 +5460,41 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             },
             _ => return Err(ClientError::Runtime("no-workspace session belongs to the no-workspace runtime source; connect to its owner".into())),
         }
+        let fingerprint = format!(
+            "create_session:{}",
+            serde_json::to_string(&request)
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+        );
+        if let Some(request_id) = request.request_id.as_ref() {
+            let db = self
+                .app
+                .open_database()
+                .await
+                .map_err(|e| ClientError::Runtime(e.to_string()))?;
+            if let Some(session_id) = leveler_storage::CommandReceiptRepository::new(&db)
+                .completed_creation(request_id, &fingerprint)
+                .await
+                .map_err(|e| ClientError::Runtime(e.to_string()))?
+            {
+                let session = self.snapshot(&session_id).await?;
+                let model = session
+                    .model
+                    .as_ref()
+                    .ok_or_else(|| ClientError::Runtime("created session has no model".into()))?;
+                let context_window = self
+                    .app
+                    .registry
+                    .profile(model)
+                    .await
+                    .map_err(|e| ClientError::Runtime(e.to_string()))?
+                    .limits
+                    .context_window;
+                return Ok(leveler_local_transport::SessionBootstrap {
+                    session,
+                    context_window,
+                });
+            }
+        }
         let model = request
             .model
             .unwrap_or_else(|| self.default_runtime.model.clone());
@@ -5468,39 +5503,84 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 "model `{model}` is not configured"
             )));
         }
-        let session_id = self
-            .app
-            .create_daemon_session(
-                &model,
-                &request.goal,
-                execution_mode(request.mode),
-                request.collaboration,
+        let (session_id, inserted) = if let Some(request_id) = request.request_id.as_ref() {
+            let db = self
+                .app
+                .open_database()
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?;
+            self.app
+                .task_engine(&db)
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+                .create_task_identified(
+                    &leveler_engine::NewSession {
+                        workspace: self
+                            .app
+                            .layout
+                            .primary_workspace()
+                            .map(|root| root.display().to_string()),
+                        goal: request.goal.clone(),
+                        model: model.to_string(),
+                        mode: execution_mode(request.mode).as_str().to_string(),
+                        sandbox: self.default_runtime.sandbox,
+                        kind: leveler_engine::ExecutionKind::Direct,
+                        axes: Some(leveler_engine::NewSessionAxes {
+                            collaboration: request.collaboration.as_str().to_string(),
+                        }),
+                    },
+                    request_id,
+                    &fingerprint,
+                )
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+        } else {
+            (
+                self.app
+                    .create_daemon_session(
+                        &model,
+                        &request.goal,
+                        execution_mode(request.mode),
+                        request.collaboration,
+                    )
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?,
+                true,
             )
-            .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))?;
-        self.persist_runtime_config(
-            &session_id,
-            SessionRuntimeConfig {
+        };
+        if inserted {
+            let config = SessionRuntimeConfig {
                 model: model.clone(),
                 mode: execution_mode(request.mode),
                 sandbox: self.default_runtime.sandbox,
-                // The axis the client asked for, written to the row above and
-                // mirrored here so the first turn runs under it without a
-                // re-read. One resolution, two views of the same fact.
                 collaboration: request.collaboration.as_str().to_string(),
                 approval_policy: request.approval_policy,
                 thinking: None,
-            },
-        )
-        .await?;
+            };
+            if request.request_id.is_some() {
+                // All durable profile fields already committed with the receipt.
+                // Install only this boot's live projection; retries never rewrite it.
+                self.app
+                    .set_live_permission_profile(session_id.as_str(), config.mode);
+                self.session_runtime
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.clone(), config);
+            } else {
+                self.persist_runtime_config(&session_id, config).await?;
+            }
+        }
         let session = self.snapshot(&session_id).await?;
-        let context_window = self
-            .app
-            .registry
-            .profile(&model)
-            .await
-            .map(|profile| profile.limits.context_window)
-            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let context_window =
+            self.app
+                .registry
+                .profile(
+                    session.model.as_ref().ok_or_else(|| {
+                        ClientError::Runtime("created session has no model".into())
+                    })?,
+                )
+                .await
+                .map(|profile| profile.limits.context_window)
+                .map_err(|error| ClientError::Runtime(error.to_string()))?;
         Ok(leveler_local_transport::SessionBootstrap {
             session,
             context_window,

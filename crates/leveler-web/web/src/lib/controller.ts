@@ -52,6 +52,7 @@ export class RuntimeBridge {
    *  scratch reducer, so the ONE event mapping feeds both paths. */
   private sink: Dispatch<Action>;
   /** selectSession 后等待的目标会话 id（防止采纳别会话的广播整量） */
+  private pendingCreation: { key: string; id: string } | null = null;
   private pendingSessionId: SessionId | null = null;
   /** Only this client's latest list-memory query may replace its Memory view. */
   private pendingMemoryQueryId: string | null = null;
@@ -797,12 +798,16 @@ export class RuntimeBridge {
     if (state.draft || !state.current) {
       // 空状态首条消息 = 新会话 goal：REST 建会话 → WS 订阅 → submit_message
       try {
+        const creationKey = JSON.stringify([text, state.current?.model ?? null, state.current?.permission ?? 'assisted', state.draftProject ?? state.selectedProject ?? null]);
+        if (this.pendingCreation?.key !== creationKey) this.pendingCreation = { key: creationKey, id: crypto.randomUUID() };
         const bootstrap = await api.createSession(
           text,
           state.current?.model ?? null,
           state.current?.permission ?? 'assisted',
           state.draftProject ?? state.selectedProject ?? undefined,
+          this.pendingCreation.id,
         );
+        this.pendingCreation = null;
         this.sink({
           type: 'snapshot',
           session: bootstrap.session,

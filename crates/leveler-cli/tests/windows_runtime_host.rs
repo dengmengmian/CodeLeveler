@@ -121,6 +121,7 @@ async fn run(root: &Path) {
     assert_ne!(first.pid, std::process::id());
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             goal: "Windows Host contract".into(),

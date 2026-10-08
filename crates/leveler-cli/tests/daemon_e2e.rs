@@ -848,6 +848,7 @@ async fn sigkill_during_a_task_recovers_on_restart_without_duplication_body() {
     let client = LocalSocketRuntimeClient::connect(&socket).await.unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -991,6 +992,7 @@ async fn live_processes_keep_their_turns_and_only_a_killed_ones_turn_is_reaped_b
         .unwrap();
     let daemon_session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1130,6 +1132,7 @@ async fn a_live_daemons_user_shell_holds_the_session_only_while_it_runs_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1236,6 +1239,7 @@ async fn sigkill_after_durable_ack_before_transcript_append_recovers_once_body()
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1386,6 +1390,7 @@ async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart_body()
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1565,6 +1570,7 @@ async fn committed_cancelled_terminal_survives_a_crash_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1659,6 +1665,7 @@ async fn sigkill_after_cancel_current_turn_ack_stays_resumable_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -1773,6 +1780,7 @@ async fn sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -2038,6 +2046,7 @@ async fn connected_client_recovers_after_daemon_sigkill_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -2155,6 +2164,7 @@ async fn no_workspace_host_durably_admits_and_restores_after_process_restart_bod
     let first_info = LocalRuntimeService::runtime_info(&client).await.unwrap();
     let bootstrap = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::None,
             goal: "no workspace persisted task".into(),
@@ -2342,6 +2352,7 @@ async fn global_open_resolves_repo_b_owner_while_repo_a_runtime_is_connected_bod
         .unwrap();
     let boot_a = client_a
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "A history".into(),
@@ -2487,6 +2498,7 @@ async fn collaboration_entry_smoke_body() {
     //    path: its own request states the interactive axis (chat) explicitly.
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::default(),
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -2658,6 +2670,7 @@ async fn cancelled_unknown_tool_effect_is_not_replayed_after_sigkill_body() {
         .unwrap();
     let session = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
@@ -2808,4 +2821,146 @@ async fn cancelled_unknown_tool_effect_is_not_replayed_after_sigkill_body() {
     drop(recovered);
     drop(db);
     stop_daemon(&mut replacement);
+}
+
+#[cfg(unix)]
+#[test]
+fn create_session_lost_response_retries_one_durable_logical_identity() {
+    leveler_test_support::bounded_test(
+        "create_session_lost_response_retries_one_durable_logical_identity",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        create_session_lost_response_retries_one_durable_logical_identity_body,
+    );
+}
+
+#[cfg(unix)]
+async fn create_session_lost_response_retries_one_durable_logical_identity_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let env = test_env("http://127.0.0.1:9");
+    let ready = env.home.join("ready-create-identity.json");
+    let mut daemon = spawn_serve(&env, &ready);
+    wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    let request = serde_json::json!({
+        "type": "create_session_identified", "body": { "request": {
+            "request_id": "create-lost-response", "goal": "CREATE_IDENTITY_MARKER",
+            "model": null, "mode": "request_approval", "collaboration": "chat",
+        }},
+    });
+    let frame =
+        serde_json::to_vec(&leveler_client_protocol::ProtocolEnvelope::wrap(request)).unwrap();
+    let socket = find_socket(&env);
+    let mut lost = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    lost.write_u32(frame.len() as u32).await.unwrap();
+    lost.write_all(&frame).await.unwrap();
+    lost.flush().await.unwrap();
+    // Drop without ever reading the server's response. Durable creation is
+    // observed independently, so the retry is a known lost-response window.
+    drop(lost);
+    let db = leveler_storage::Database::connect(&find_state_dir(&env).join("sessions.db"))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let matching: Vec<_> = leveler_storage::SessionRepository::new(&db)
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|session| session.goal == "CREATE_IDENTITY_MARKER")
+                .collect();
+            if matching.len() == 1 {
+                break matching[0].id.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first request must commit before retry");
+    let session_id = SessionId::new(first.clone());
+    assert_eq!(
+        leveler_storage::SessionRepository::new(&db)
+            .execution(&session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        "request_approval",
+        "initial requested profile commits with its receipt"
+    );
+    leveler_storage::SessionRepository::new(&db)
+        .set_execution(
+            &session_id,
+            "full_access",
+            false,
+            "direct",
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    leveler_storage::SessionRepository::new(&db)
+        .set_axes(&session_id, "plan", "single", leveler_core::now())
+        .await
+        .unwrap();
+    let original_pid = daemon.id();
+    daemon.kill().unwrap();
+    assert!(
+        !daemon.wait().unwrap().success(),
+        "original daemon was killed"
+    );
+    let ready2 = env.home.join("ready-create-identity-restart.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+    assert_ne!(daemon.id(), original_pid);
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "replacement daemon is live"
+    );
+    let mut retry = tokio::net::UnixStream::connect(find_socket(&env))
+        .await
+        .unwrap();
+    retry.write_u32(frame.len() as u32).await.unwrap();
+    retry.write_all(&frame).await.unwrap();
+    retry.flush().await.unwrap();
+    let length = retry.read_u32().await.unwrap();
+    let mut response = vec![0; length as usize];
+    retry.read_exact(&mut response).await.unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(
+        reply["body"]["type"], "session_created",
+        "retry must confirm successful original creation: {reply}"
+    );
+    assert_eq!(
+        reply["body"]["body"]["session"]["id"].as_str(),
+        Some(first.as_str()),
+        "reply must return original aggregate"
+    );
+    let sessions: Vec<_> = leveler_storage::SessionRepository::new(&db)
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|session| session.goal == "CREATE_IDENTITY_MARKER")
+        .collect();
+    stop_daemon(&mut daemon);
+    assert_eq!(
+        sessions.len(),
+        1,
+        "same logical creation retry must not create another session: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(sessions[0].id, first);
+    assert_eq!(
+        sessions[0].collaboration, "plan",
+        "replay preserves later metadata"
+    );
+    assert_eq!(
+        leveler_storage::SessionRepository::new(&db)
+            .execution(&session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        "full_access",
+        "replay preserves later permission"
+    );
 }

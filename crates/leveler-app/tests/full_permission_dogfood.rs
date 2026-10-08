@@ -562,6 +562,7 @@ async fn run_case(path: Path, op: &Op, workroot: &std::path::Path) -> (Case, Vec
     };
     let bootstrap = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "full permission dogfood".to_string(),
@@ -913,6 +914,7 @@ async fn run_mode_persistence(workroot: &std::path::Path) -> (Vec<Case>, Vec<Vio
     let daemon = app_client(app.clone(), PermissionProfile::Assisted).await;
     let daemon_id = daemon
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "daemon full".to_string(),
@@ -1267,6 +1269,7 @@ async fn run_auto_operation(
     let client = app_client(app.clone(), PermissionProfile::Assisted).await;
     let session_id = client
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: CreateWorkspaceSelection::RuntimeDefault,
             goal: "auto matrix".to_string(),

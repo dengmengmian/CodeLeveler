@@ -573,6 +573,25 @@ impl TaskEngine {
     /// Create and persist the session row, including its execution config,
     /// and the durable task row associated with it.
     pub async fn create_task(&self, session: &NewSession) -> Result<SessionId, EngineError> {
+        Ok(self.create_task_with_identity(session, None).await?.0)
+    }
+
+    /// Create using an issuer identity bound to the caller's original intent.
+    pub async fn create_task_identified(
+        &self,
+        session: &NewSession,
+        request_id: &leveler_core::CommandId,
+        fingerprint: &str,
+    ) -> Result<(SessionId, bool), EngineError> {
+        self.create_task_with_identity(session, Some((request_id, fingerprint)))
+            .await
+    }
+
+    async fn create_task_with_identity(
+        &self,
+        session: &NewSession,
+        identity: Option<(&leveler_core::CommandId, &str)>,
+    ) -> Result<(SessionId, bool), EngineError> {
         let now = leveler_core::now();
         let mut record = match &session.workspace {
             Some(workspace) => SessionRecord::new(
@@ -588,6 +607,21 @@ impl TaskEngine {
         if let Some(axes) = &session.axes {
             record = record.with_axes(&axes.collaboration, "single");
         }
+        if let Some((request_id, fingerprint)) = identity {
+            let (task, inserted) = self
+                .stores
+                .task_creation
+                .create_task_identified(
+                    &record,
+                    &session.mode,
+                    session.sandbox,
+                    session.kind.as_str(),
+                    request_id,
+                    fingerprint,
+                )
+                .await?;
+            return Ok((SessionId::new(task.as_str()), inserted));
+        }
         let id = SessionId::new(record.id.clone());
         self.stores
             .task_creation
@@ -598,7 +632,7 @@ impl TaskEngine {
                 session.kind.as_str(),
             )
             .await?;
-        Ok(id)
+        Ok((id, true))
     }
 
     /// Load the transcript a request needs, reading only the tail when both

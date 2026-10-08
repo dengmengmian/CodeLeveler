@@ -141,6 +141,7 @@ fn request(
     collaboration: leveler_local_transport::CollaborationMode,
 ) -> leveler_local_transport::CreateSessionRequest {
     leveler_local_transport::CreateSessionRequest {
+        request_id: None,
         workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
         goal: goal.to_string(),
         model: None,
@@ -224,6 +225,7 @@ async fn interactive_bootstrap_axis_reaches_row_and_snapshot_as_chat() {
     let (_tmp, _server, app, client) = harness(vec![]).await;
     let bootstrap = client
         .create_session(leveler_local_transport::CreateSessionRequest {
+            request_id: None,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             goal: "interactive session".to_string(),
             model: None,

@@ -57,6 +57,7 @@ export interface ProjectInfo {
 // ── leveler-local-transport：REST DTO ───────────────────────────────
 /** CreateSessionRequest（leveler-local-transport/src/lib.rs；`project` 是 WebUI 聚合层扩展） */
 export interface CreateSessionRequest {
+  request_id?: string;
   goal: string;
   model: ModelRef | null;
   mode: PermissionProfile;

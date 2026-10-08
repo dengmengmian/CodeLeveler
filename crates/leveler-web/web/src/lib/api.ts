@@ -47,9 +47,10 @@ export function createSession(
   model: ModelRef | null,
   mode: PermissionProfile,
   project?: string,
+  requestId?: string,
 ): Promise<SessionBootstrap> {
-  const body: CreateSessionRequest = { goal, model, mode, ...(project ? { project } : {}) };
-  return request<SessionBootstrap>('/api/sessions', {
+  const body: CreateSessionRequest = { goal, model, mode, ...(requestId ? { request_id: requestId } : {}), ...(project ? { project } : {}) };
+  return request<SessionBootstrap>(requestId ? '/api/sessions/identified' : '/api/sessions', {
     method: 'POST',
     body: JSON.stringify(body),
   });

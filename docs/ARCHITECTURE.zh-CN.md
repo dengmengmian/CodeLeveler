@@ -1162,6 +1162,18 @@ Web 保留项目 registry、路由、状态和它启动的子进程的监控与�
 Web 页面访问用的 token 仍是 Web 产品边界，不是 daemon 认证 token。
 embedded 模式仍使用同一套 `leveler-app` 运行时实现，不要求另起 daemon。
 
+交互客户端创建会话使用 `create_session_identified`（Web 为 `/api/sessions/identified`，
+Desktop 为显式 identified IPC），并在未知响应重试中复用同一个 `request_id`。
+该 ID 复用 CommandId 的全局命名空间；不同原始请求或已有普通命令占用同一 ID
+都会显式冲突。TaskCreationStore 在同一事务内写 session、task、原始请求 fingerprint
+及已有 command receipt，初始 model、workspace、permission、sandbox、collaboration
+由该 session row 持久化。重试返回原 session 的当前快照，不重写后续用户设置；默认
+模型变化不会改变原请求身份。receipt 随 session 显式删除而删除，其去重有效期与
+session 的持久生命周期一致。ApprovalPolicy 保持既有运行时 / transport 信任边界，
+不被此 creation receipt 包装为新增的持久权限事实。
+旧 wire 省略 request_id 仍是非幂等创建，不允许响应未知时自动重试。identified
+操作在旧 peer 上必须明确失败，客户端不退回 legacy 创建；不通过忽略字段推测兼容。
+
 客户端协议之下的 transport 使用同一套 framing、命令处理与重连逻辑：
 
 ```text

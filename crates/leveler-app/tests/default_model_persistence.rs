@@ -239,6 +239,7 @@ async fn a_new_session_starts_on_the_persisted_default() {
         InProcessRuntimeClient::new(app.clone(), resolved, PermissionProfile::Assisted, false);
     let bootstrap = restarted
         .create_session(CreateSessionRequest {
+            request_id: None,
             collaboration: leveler_local_transport::CollaborationMode::Chat,
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             goal: "restarted".to_string(),

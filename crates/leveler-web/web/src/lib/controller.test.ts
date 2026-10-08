@@ -691,3 +691,26 @@ describe('event closure', () => {
     expect(state.current?.activity).toBe('收口中 · verification');
   });
 });
+
+describe('logical creation identity', () => {
+  it('keeps the request identity after a lost response and replaces it for changed intent', async () => {
+    const { bridge, state } = harness();
+    state.current = null;
+    const priorFetch = globalThis.fetch;
+    const calls: {url: string; body: {request_id: string; goal: string}}[] = [];
+    globalThis.fetch = async (input, init) => {
+      calls.push({url: String(input), body: JSON.parse(String(init?.body))});
+      throw new Error('lost response');
+    };
+    try {
+      await bridge.sendUserMessage('create me');
+      await bridge.sendUserMessage('create me');
+      await bridge.sendUserMessage('different intent');
+      expect(calls).toHaveLength(3);
+      expect(calls.every(call => call.url.includes('/api/sessions/identified'))).toBe(true);
+      expect(calls[0].body.request_id).toBeTruthy();
+      expect(calls[1].body.request_id).toBe(calls[0].body.request_id);
+      expect(calls[2].body.request_id).not.toBe(calls[0].body.request_id);
+    } finally { globalThis.fetch = priorFetch; }
+  });
+});
