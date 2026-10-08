@@ -201,6 +201,15 @@ async fn settled(app: &Application, session: &leveler_core::SessionId, min_turns
 /// task's goal, seeds its plan, and carries the amendment as an addition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn continuation_resumes_the_logical_task_and_seeds_its_plan() {
+    assert_continuation_preserves_task(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_submit_continuation_preserves_original_goal_and_seeds_plan() {
+    assert_continuation_preserves_task(true).await;
+}
+
+async fn assert_continuation_preserves_task(ordinary_submit: bool) {
     let f = fixture(interrupted_work(), leveler_agent::CollaborationMode::Goal).await;
     let model = ModelRef::new("mock", "m");
 
@@ -258,13 +267,19 @@ async fn continuation_resumes_the_logical_task_and_seeds_its_plan() {
         false,
     ));
     let client: Arc<dyn InteractiveRuntimeClient> = client;
-    client
-        .send(ClientCommand::ResumeTask {
+    let command = if ordinary_submit {
+        ClientCommand::SubmitMessage {
             session_id: f.session.clone(),
             content: "继续，但是先不要跑测试".to_string(),
-        })
-        .await
-        .unwrap();
+            attachments: Vec::new(),
+        }
+    } else {
+        ClientCommand::ResumeTask {
+            session_id: f.session.clone(),
+            content: "继续，但是先不要跑测试".to_string(),
+        }
+    };
+    client.send(command).await.unwrap();
     settled(&f.app, &f.session, 2).await;
 
     let db = f.app.open_database().await.unwrap();
@@ -351,6 +366,15 @@ async fn continuation_resumes_the_logical_task_and_seeds_its_plan() {
 /// No resumable task: `继续` is an ordinary message, not a resume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn continuation_without_a_resumable_task_is_an_ordinary_message() {
+    assert_fresh_continuation_is_ordinary(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_submit_continuation_without_task_is_an_ordinary_message() {
+    assert_fresh_continuation_is_ordinary(true).await;
+}
+
+async fn assert_fresh_continuation_is_ordinary(ordinary_submit: bool) {
     let f = fixture(
         vec![sse(vec![
             serde_json::json!({"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]})
@@ -365,13 +389,19 @@ async fn continuation_without_a_resumable_task_is_an_ordinary_message() {
         PermissionProfile::Assisted,
         false,
     ));
-    client
-        .send(ClientCommand::ResumeTask {
+    let command = if ordinary_submit {
+        ClientCommand::SubmitMessage {
             session_id: f.session.clone(),
             content: "继续".to_string(),
-        })
-        .await
-        .unwrap();
+            attachments: Vec::new(),
+        }
+    } else {
+        ClientCommand::ResumeTask {
+            session_id: f.session.clone(),
+            content: "继续".to_string(),
+        }
+    };
+    client.send(command).await.unwrap();
     settled(&f.app, &f.session, 1).await;
 
     let db = f.app.open_database().await.unwrap();
@@ -381,4 +411,120 @@ async fn continuation_without_a_resumable_task_is_an_ordinary_message() {
         turns[0].kind, "chat",
         "with nothing to resume, `继续` stays an ordinary chat turn"
     );
+}
+
+async fn bounded_interrupted_fixture() -> Fixture {
+    let f = fixture(interrupted_work(), leveler_agent::CollaborationMode::Goal).await;
+    f.app
+        .run_in_session_bounded(
+            &f.session,
+            &ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            "finish the inventory work",
+            Arc::new(AutoApprove),
+            false,
+            &mut |_| {},
+            CancellationToken::new(),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+    f
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_submit_continuation_cannot_reopen_cancelled_task() {
+    let f = bounded_interrupted_fixture().await;
+    let client = InProcessRuntimeClient::new(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    client
+        .send(ClientCommand::CancelTask {
+            session_id: f.session.clone(),
+        })
+        .await
+        .unwrap();
+    let error = client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "继续".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("已被取消"), "{error}");
+    let db = f.app.open_database().await.unwrap();
+    assert_eq!(
+        TurnRepository::new(&db)
+            .list(&f.session)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let terminal = EventRepository::new(&db)
+        .load_last_by_type(&f.session, "task_finished", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(terminal.payload.contains("cancelled"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuation_with_attachment_keeps_ordinary_content_validation() {
+    let f = bounded_interrupted_fixture().await;
+    let client = InProcessRuntimeClient::new(
+        f.app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+    );
+    // A text-only model must reject this image. Routing it through Resume
+    // would silently drop the attachment and start the interrupted work.
+    let attachment = leveler_client_protocol::AttachmentRef {
+        id: leveler_client_protocol::AttachmentId::new("continuation-image"),
+        kind: leveler_client_protocol::AttachmentKind::Image,
+        name: "continuation.png".into(),
+        mime_type: "image/png".into(),
+        size_bytes: 1,
+        sha256: "not-imported".into(),
+        width: Some(1),
+        height: Some(1),
+    };
+    let error = client
+        .send(ClientCommand::SubmitMessage {
+            session_id: f.session.clone(),
+            content: "继续".into(),
+            attachments: vec![attachment],
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("图片") || error.to_string().contains("图像"),
+        "{error}"
+    );
+    let db = f.app.open_database().await.unwrap();
+    assert_eq!(
+        TurnRepository::new(&db)
+            .list(&f.session)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let stores = EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&f.session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].objective, "finish the inventory work");
+    assert_eq!(goals[0].state, GoalState::Running);
 }

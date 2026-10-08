@@ -1010,6 +1010,8 @@ error, never a success ACK. No response or a dropped connection cannot be read
 as "the command did not run": receipts keep their existing dedup semantics and
 an unknown outcome never authorizes an automatic rerun.
 
+For an attachment-free `SubmitMessage`, the App command entry recognizes continuation with the existing `parse_continuation` and invokes the existing `ResumeTask` handler. It preserves the original task, Goal and plan, treating amendments as additions to the original objective. The existing Runtime owner still decides resumability, rejects explicitly cancelled tasks, and treats continuation without resumable work as an ordinary message. Submissions with attachments retain the content and image validation path; clients do not add separate continuation parsers.
+
 #### Cancellation ACK: requested ≠ delivered ≠ terminated
 
 A command ACK answers delivery, not execution. Cancellation makes that a

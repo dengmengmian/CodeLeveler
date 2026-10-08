@@ -3951,8 +3951,17 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 content,
                 attachments,
             } => {
-                self.handle_submit_message(session_id, content, attachments)
-                    .await
+                // Continuation is an App intent, shared by every client. Keep
+                // attachments on the content path rather than discarding them
+                // when invoking the existing attachment-free Resume command.
+                if attachments.is_empty()
+                    && leveler_client_protocol::parse_continuation(&content).is_some()
+                {
+                    self.handle_resume_task(session_id, content).await
+                } else {
+                    self.handle_submit_message(session_id, content, attachments)
+                        .await
+                }
             }
             ClientCommand::ResumeTask {
                 session_id,

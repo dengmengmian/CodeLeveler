@@ -960,6 +960,8 @@ daemon 只有在这个边界提交后才发送 wire ACK。如果进程在正常 
 
 对每个交互客户端来说，ACK 契约是同一个：启动或继续 Turn 的命令，只有在对应的持久化接收边界提交后才返回成功。进程内 TUI、`leveler serve` 暴露的 daemon、该进程服务的 `/web` UI，以及连接的 WebUI 都遵守这一条；Embedded 与 Daemon 之间不再存在不同的 Turn ACK 契约。成功 ACK 只表示执行输入已被持久接收（`EngineEvent::TurnStarted` 在 `TurnStore::start_owned` 提交后发出），不表示 Turn 已完成，也不表示工具副作用 exactly-once。被拒绝的 Turn 必须返回明确错误，而不是成功 ACK。无响应或断线不能推导命令未执行：凭证仍按原语义去重，未知结果不授权自动重跑。
 
+无附件的 `SubmitMessage` 若被既有 `parse_continuation` 识别为“继续”，由 App 命令入口统一进入已有 `ResumeTask` handler：沿原任务、Goal 和计划继续，并把补充要求追加到原目标。是否可恢复、显式取消拒绝和无可恢复任务时的普通消息语义，仍由原 Runtime owner 判定；带附件的提交保留内容与图像校验路径。客户端不各自新增“继续”解析器。
+
 #### 取消 ACK：请求 ≠ 送达 ≠ 已终止
 
 命令 ACK 回答的是“送达”，不是“执行完成”。取消让这条区分变得关键，其语义阶段可以拆开表达：
