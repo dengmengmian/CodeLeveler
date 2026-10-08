@@ -1039,6 +1039,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_first_clarification_answer_is_accepted() {
+        let pending: PendingClarifications = Arc::new(Mutex::new(HashMap::new()));
+        let insert = |id: &str| {
+            let request = ClarificationRequest {
+                id: ClarificationId::new(id),
+                turn_id: Some(TurnId::new("turn-a")),
+                tool: "ask_user".into(),
+                call_id: id.into(),
+                action_fingerprint: id.into(),
+                question: "which?".into(),
+                options: vec![],
+                questions: vec![],
+            };
+            let (reply, answer) = oneshot::channel();
+            pending.lock().unwrap().insert(
+                request.id.clone(),
+                PendingClarification {
+                    binding: PendingBinding::for_clarification(
+                        SessionId::new("session-a"),
+                        &request,
+                    ),
+                    request: UiClarificationRequest::single(request.id.clone(), "which?", vec![]),
+                    reply,
+                },
+            );
+            (request.id, answer)
+        };
+        let (first_id, first_answer) = insert("clarification-first");
+        resolve_clarification(&pending, &first_id, "first choice".into()).unwrap();
+        assert_eq!(first_answer.await.unwrap(), "first choice");
+
+        let (next_id, mut next_answer) = insert("clarification-next");
+        let duplicate =
+            resolve_clarification(&pending, &first_id, "late choice".into()).unwrap_err();
+        assert!(duplicate.to_string().contains("already resolved"));
+        assert!(matches!(
+            next_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        resolve_clarification(&pending, &next_id, "next choice".into()).unwrap();
+        assert_eq!(next_answer.await.unwrap(), "next choice");
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn answered_and_skipped_clarifications_stay_distinct() {
         for (wire_answer, expected) in [
             (
