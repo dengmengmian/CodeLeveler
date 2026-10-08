@@ -148,6 +148,15 @@ pub fn project_task(
             None,
         ));
     }
+    // The latest durable interrupted turn is recovery evidence even after
+    // its session row has been reconciled. It is not a TaskFinished terminal.
+    if facts
+        .turns
+        .last()
+        .is_some_and(|turn| turn.status == "interrupted")
+    {
+        return Ok((UiTaskStatus::Interrupted, None));
+    }
     if facts.session.status == leveler_lifecycle::SessionStatus::Running {
         return Ok((UiTaskStatus::Interrupted, None));
     }
@@ -186,6 +195,30 @@ mod tests {
             latest_start_sequence: None,
         }
     }
+    #[test]
+    fn a_recovered_interrupted_turn_remains_interrupted_without_a_task_terminal() {
+        let mut row = facts();
+        row.session.status = leveler_lifecycle::SessionStatus::Interrupted;
+        row.turns.push(leveler_storage::TurnRecord {
+            id: "recovered".into(),
+            session_id: row.session.id.clone(),
+            ordinal: 1,
+            kind: "chat".into(),
+            payload: None,
+            status: "interrupted".into(),
+            created_at: "t".into(),
+            finished_at: Some("t".into()),
+            owner_boot_id: Some("dead".into()),
+        });
+        let (status, terminal) =
+            project_task(&row, &Probe(BootLiveness::Dead), false, false).unwrap();
+        assert_eq!(status, UiTaskStatus::Interrupted);
+        assert_eq!(
+            terminal, None,
+            "turn recovery must not fabricate TaskFinished"
+        );
+    }
+
     fn finish(facts: &mut SessionFacts, stop: StopReason) {
         let (tag, payload) = leveler_engine::EngineEvent::TaskFinished {
             outcome: TaskOutcome::Completed,

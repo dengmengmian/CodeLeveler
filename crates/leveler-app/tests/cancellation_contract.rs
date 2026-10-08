@@ -625,13 +625,10 @@ async fn cancelling_one_session_leaves_the_other_sessions_turn_running() {
     settled(&f.app, &other).await;
 }
 
-/// Gate 4 / CANCEL-12 — crash recovery reaps the dead boot's running TURN but
-/// leaves `sessions.status` stale at `running`. The status projection
-/// compensates by reporting `interrupted`, so the column and the projection
-/// disagree. This is the known Runtime-vs-sessions.row discrepancy, pinned so
-/// it can be fixed deliberately instead of by accident.
+/// Gate 4 / CANCEL-12 — crash recovery atomically interrupts the latest turn
+/// and its running session; the runtime projection reports the same fact.
 #[tokio::test]
-async fn a_reaped_dead_boot_leaves_sessions_status_running() {
+async fn a_reaped_dead_boot_keeps_session_and_projection_consistent() {
     use leveler_app::session_projection::project_task;
     use leveler_client_protocol::UiTaskStatus;
     use leveler_lifecycle::SessionStatus;
@@ -697,7 +694,7 @@ async fn a_reaped_dead_boot_leaves_sessions_status_running() {
         "the reaper settles the turn as interrupted"
     );
 
-    // ...but the SESSION row still says the task is running.
+    // The SESSION row is settled in the same transaction.
     let record = SessionRepository::new(&db)
         .get(&session)
         .await
@@ -705,12 +702,11 @@ async fn a_reaped_dead_boot_leaves_sessions_status_running() {
         .expect("the session row exists");
     assert_eq!(
         record.status,
-        SessionStatus::Running,
-        "DEFECT: finish_turn_owned updates only the turns row, so sessions.status \
-         keeps saying `running` after a crash reap"
+        SessionStatus::Interrupted,
+        "the durable session and reaped turn must agree after crash recovery"
     );
 
-    // The status projection reads the stale column and compensates.
+    // The runtime projection agrees with the durable lifecycle.
     let facts = db
         .session_facts(false)
         .await
@@ -865,16 +861,8 @@ async fn cancel_task_leaves_another_sessions_turn_running() {
     settled(&f.app, &other).await;
 }
 
-/// Gate 7 / G-2 RED anchor — after a crash reap, the durable `sessions.status`
-/// must agree with the turn the reaper just interrupted.
-///
-/// Today `finish_turn_owned` updates only the `turns` row, so `sessions.status`
-/// stays `running` after the reaper settles a dead boot's turn. The status
-/// projection compensates, but the durable column and the projection disagree.
-/// This is the Phase 2C Terminal Recovery target: ignored here and deliberately
-/// NOT part of the release gate. See `a_reaped_dead_boot_leaves_sessions_status_running`
-/// for the current behaviour it will replace.
-#[ignore = "Phase 2C Terminal Recovery: finish_turn_owned does not update sessions.status"]
+/// Gate 7 / G-2 — a crash reap leaves a resumable durable session rather than
+/// stale Running state. Kept as the original Phase 2C regression anchor.
 #[tokio::test]
 async fn a_reaped_dead_boot_does_not_leave_stale_session_status() {
     use leveler_lifecycle::SessionStatus;
@@ -939,6 +927,6 @@ async fn a_reaped_dead_boot_does_not_leave_stale_session_status() {
         record.status,
         SessionStatus::Interrupted,
         "G-2: after a crash reap the durable session status must agree with the \
-         interrupted turn; today it stays `running`"
+         interrupted turn"
     );
 }

@@ -564,7 +564,32 @@ impl TerminalStore for MemoryTerminalStore {
         };
         ownership
             .with_current(token, || {
-                self.finish_turn_sync(session_id, turn_id, event_type, payload, outcome, now)
+                let event =
+                    self.finish_turn_sync(session_id, turn_id, event_type, payload, outcome, now)?;
+                let latest = self
+                    .turns
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|turn| turn.session_id == session_id.as_str())
+                    .max_by_key(|turn| turn.ordinal)
+                    .is_some_and(|turn| turn.id == turn_id.as_str());
+                if outcome == TurnOutcome::Interrupted && latest {
+                    if let Some(session) = self
+                        .sessions
+                        .rows
+                        .lock()
+                        .unwrap()
+                        .get_mut(session_id.as_str())
+                    {
+                        if session.status == SessionStatus::Running && session.outcome.is_none() {
+                            session.status = SessionStatus::Interrupted;
+                            session.state = AgentState::Execute;
+                        }
+                    }
+                }
+                Ok(event)
             })?
             .map_err(crate::OwnershipError::Storage)
     }
@@ -697,6 +722,78 @@ mod tests {
             events.as_ref(),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn memory_owned_interruption_projects_only_the_latest_running_session() {
+        let authority = Arc::new(MemoryOwnershipState::new());
+        let session = SessionId::new("interruption-session");
+        let task = TaskId::new(session.as_str());
+        authority.register_task(&task);
+        let owner = MemoryOwnershipStore::new(authority.clone());
+        let token = owner
+            .acquire(
+                &task,
+                &RuntimeId::new("runtime"),
+                &leveler_core::BootId::new("boot"),
+                OwnerEpoch::UNOWNED,
+            )
+            .await
+            .unwrap();
+        let sessions = Arc::new(MemorySessionStore::new().with_ownership(authority.clone()));
+        let turns = Arc::new(MemoryTurnStore::new().with_ownership(authority.clone()));
+        let events = Arc::new(MemoryEventStore::new().with_ownership(authority.clone()));
+        let terminal = MemoryTerminalStore::new(sessions.clone(), turns.clone(), events)
+            .with_ownership(authority);
+        sessions
+            .create(&SessionRecord {
+                id: session.as_str().into(),
+                status: SessionStatus::Running,
+                state: AgentState::VerifyTask,
+                ..SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now())
+            })
+            .await
+            .unwrap();
+        let old = turns
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let latest = turns
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        terminal
+            .finish_turn_owned(
+                &token,
+                &session,
+                &TurnId::new(old.id),
+                "turn_finished",
+                "{}",
+                TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions.lifecycle(&session).unwrap().0,
+            SessionStatus::Running
+        );
+        terminal
+            .finish_turn_owned(
+                &token,
+                &session,
+                &TurnId::new(latest.id),
+                "turn_finished",
+                "{}",
+                TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let (status, state) = sessions.lifecycle(&session).unwrap();
+        assert_eq!(status, SessionStatus::Interrupted);
+        assert_eq!(state, AgentState::Execute);
+        assert_eq!(sessions.execution(&session).await.unwrap().unwrap().3, None);
     }
 
     #[tokio::test]

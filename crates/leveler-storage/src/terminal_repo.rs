@@ -347,6 +347,23 @@ impl TerminalRepository<'_> {
                 return Err(crate::OwnershipError::Storage(error.into()));
             }
         }
+        // A turn interruption is resumable, not a TaskFinished fact. Project
+        // it only for the latest turn while this fenced session is still live.
+        // An older reaped turn must not overwrite a newly admitted turn or a
+        // previously committed task terminal.
+        if outcome == TurnOutcome::Interrupted {
+            sqlx::query(
+                "UPDATE sessions SET status = 'interrupted', state = 'execute', updated_at = ?3 \
+                 WHERE id = ?1 AND status = 'running' AND outcome IS NULL \
+                 AND ?2 = (SELECT id FROM turns WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT 1)",
+            )
+            .bind(session_id.as_str())
+            .bind(turn_id.as_str())
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+        }
         tx.commit()
             .await
             .map_err(StorageError::from)
@@ -473,6 +490,225 @@ mod tests {
             .await
             .unwrap();
         (db, session, token, goal)
+    }
+
+    #[tokio::test]
+    async fn interrupted_latest_owned_turn_updates_only_a_running_session() {
+        let (db, session, token, _) = db_with_owned_goal().await;
+        sqlx::query("UPDATE sessions SET status = 'running', state = 'verify_task' WHERE id = ?1")
+            .bind(session.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let old = TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let latest = TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let terminal = TerminalRepository::new(&db);
+        terminal
+            .finish_turn_owned(
+                &token,
+                &session,
+                &TurnId::new(old.id),
+                "turn_finished",
+                "{}",
+                TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            SessionRepository::new(&db)
+                .get(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Running,
+            "an older turn must not change the newer turn's session"
+        );
+        terminal
+            .finish_turn_owned(
+                &token,
+                &session,
+                &TurnId::new(latest.id),
+                "turn_finished",
+                "{}",
+                TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let record = SessionRepository::new(&db)
+            .get(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, SessionStatus::Interrupted);
+        assert_eq!(record.state, AgentState::Execute);
+        assert_eq!(
+            SessionStore::execution(&db, &session)
+                .await
+                .unwrap()
+                .unwrap()
+                .3,
+            None,
+            "a turn interruption is not a task terminal"
+        );
+        sqlx::query("UPDATE sessions SET status = 'completed', state = 'complete', outcome = 'completed' WHERE id = ?1")
+            .bind(session.as_str()).execute(db.pool()).await.unwrap();
+        let newer = TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        terminal
+            .finish_turn_owned(
+                &token,
+                &session,
+                &TurnId::new(newer.id),
+                "turn_finished",
+                "{}",
+                TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        let record = SessionRepository::new(&db)
+            .get(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.status,
+            SessionStatus::Completed,
+            "recovery cannot overwrite a task terminal"
+        );
+        assert_eq!(record.state, AgentState::Complete);
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_and_owner_takeover_preserve_the_new_running_turn() {
+        let (db, session, token, _) = db_with_owned_goal().await;
+        sqlx::query("UPDATE sessions SET status = 'running' WHERE id = ?1")
+            .bind(session.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let old = TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let recover = async {
+            TerminalRepository::new(&db)
+                .finish_turn_owned(
+                    &token,
+                    &session,
+                    &TurnId::new(old.id),
+                    "turn_finished",
+                    "{}",
+                    TurnOutcome::Interrupted,
+                    leveler_core::now(),
+                )
+                .await
+        };
+        let take_over = async {
+            let next = db
+                .acquire(
+                    &token.task_id,
+                    &RuntimeId::new("new-runtime"),
+                    &leveler_core::BootId::new("new-boot"),
+                    token.owner_epoch,
+                )
+                .await
+                .unwrap();
+            sqlx::query("UPDATE sessions SET status = 'running', state = 'execute' WHERE id = ?1")
+                .bind(session.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let turn = TurnRepository::new(&db)
+                .start(&session, "chat", None, leveler_core::now())
+                .await
+                .unwrap();
+            (next, turn)
+        };
+        let (_recovery, (next, turn)) = tokio::join!(recover, take_over);
+        assert_eq!(
+            SessionRepository::new(&db)
+                .get(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Running
+        );
+        let latest = TurnRepository::new(&db)
+            .list(&session)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(latest.id, turn.id);
+        assert_eq!(latest.status, "running");
+        db.release(&next).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_owner_recovery_cannot_interrupt_a_new_owner_session() {
+        let (db, session, token, _) = db_with_owned_goal().await;
+        let turn = TurnRepository::new(&db)
+            .start(&session, "chat", None, leveler_core::now())
+            .await
+            .unwrap();
+        let new = db
+            .acquire(
+                &token.task_id,
+                &RuntimeId::new("replacement"),
+                &leveler_core::BootId::new("replacement-boot"),
+                token.owner_epoch,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET status = 'running' WHERE id = ?1")
+            .bind(session.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            TerminalRepository::new(&db)
+                .finish_turn_owned(
+                    &token,
+                    &session,
+                    &TurnId::new(turn.id),
+                    "turn_finished",
+                    "{}",
+                    TurnOutcome::Interrupted,
+                    leveler_core::now()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            SessionRepository::new(&db)
+                .get(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Running
+        );
+        assert!(
+            EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.release(&new).await.unwrap();
     }
 
     #[tokio::test]
