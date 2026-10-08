@@ -226,6 +226,8 @@ export interface SessionView {
   /** 本回合已完成的推理段（reasoning_completed）：折叠的 Thought 历史。
    *  以事件到达顺序排列，和工具行一样属于本轮的过程。 */
   thoughts: ThoughtView[];
+  /** How many older turns the durable replay left out (0 when none). */
+  historyOmittedTurns: number;
   /** 当前回合开始时间（epoch ms）；空闲时为 null，用于运行计时 */
   turnStartedAt: number | null;
   /** 上一回合终态（7 值保真）；新回合开始时清空 */
@@ -248,6 +250,18 @@ export interface SessionView {
 }
 
 export type ConnectionStatus = 'connecting' | 'online';
+
+/** The transcript fields a durable-history replay replaces — and nothing else.
+ *
+ *  Live runtime state (turnActive, activity, plan, diff, approvals, tokens)
+ *  describes NOW, not the past: a replay must never overwrite it. */
+export interface HistoryView {
+  messages: ChatMessage[];
+  tools: ToolCallView[];
+  thoughts: ThoughtView[];
+  traces: TurnTrace[];
+  lastTurn: LastTurn | null;
+}
 
 /** Central workspace surface. `execution` is a Phase 1 slot only (no observatory). */
 export type StageView = 'chat' | 'diff' | 'execution';
@@ -352,6 +366,17 @@ export type Action =
   | { type: 'assistant_delta'; id: string; delta: string }
   | { type: 'assistant_completed'; id: string }
   | { type: 'reasoning_delta'; delta: string }
+  | {
+      /** The durable conversation the runtime rebuilt from its own log.
+       *
+       *  A transcript projection, never a model-context one: the replay
+       *  replaces what is PAINTED and nothing else, so a reopened session reads
+       *  the way it ran instead of the way the next request was trimmed. */
+      type: 'history_replaced';
+      view: HistoryView;
+      /** Turns the runtime left out to bound the response. */
+      omittedTurns: number;
+    }
   | {
       /** A completed reasoning segment: the runtime's own elapsed and the text
        *  it accumulated. Never inferred by the UI. */
@@ -515,6 +540,7 @@ function viewFromSnapshot(
     reasoning: sameSession ? prev.reasoning : '',
     reasoningSuperseded: sameSession ? prev.reasoningSuperseded : false,
     thoughts: sameSession ? prev.thoughts : [],
+    historyOmittedTurns: sameSession ? (prev.historyOmittedTurns ?? 0) : 0,
     turnStartedAt: sameSession ? prev.turnStartedAt : turnActive ? Date.now() : null,
     lastTurn: sameSession ? prev.lastTurn : null,
     model: snap.model ?? null,
@@ -824,6 +850,24 @@ export function reducer(state: AppState, action: Action): void {
       // 替换而不是续写（TUI 同款规则）。
       if (state.current.reasoningSuperseded) resetReasoning(state.current);
       state.current.reasoning += action.delta;
+      return;
+    }
+    case 'history_replaced': {
+      if (!state.current) return;
+      // The durable log is the authority for the conversation; the snapshot's
+      // message list is the ACTIVE MODEL CONTEXT (`/compact` leaves one summary
+      // row there). Adopting the replay is what keeps a reopened session's
+      // chronology whole, and it is a paint-only change.
+      state.current.messages = action.view.messages;
+      state.current.tools = action.view.tools;
+      state.current.thoughts = action.view.thoughts;
+      state.current.traces = action.view.traces;
+      state.current.lastTurn = action.view.lastTurn;
+      state.current.historyOmittedTurns = action.omittedTurns;
+      // A replay carries no live segment: the running one is a live fact.
+      state.current.reasoning = '';
+      state.current.reasoningSuperseded = false;
+      for (const message of state.current.messages) message.streaming = false;
       return;
     }
     case 'reasoning_completed': {

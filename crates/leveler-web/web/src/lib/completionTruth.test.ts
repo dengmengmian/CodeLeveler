@@ -8,7 +8,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     messages: [], tools: [], traces: [], agents: [], backgroundTasks: [],
     pendingApprovals: [], pendingClarifications: [], plan: null, diff: null,
     checkpoints: [], completionReport: null, memory: null, turnActive: false,
-    activity: null, reasoning: '', reasoningSuperseded: false, thoughts: [], turnStartedAt: null,
+    activity: null, reasoning: '', reasoningSuperseded: false, thoughts: [], historyOmittedTurns: 0, turnStartedAt: null,
     lastTurn: null, model: null, availableModels: [], permission: 'assisted',
     collaboration: 'chat', reasoningEffort: null,
     tokens: { input: 0, output: 0 }, contextTokens: 0, contextWindow: null,

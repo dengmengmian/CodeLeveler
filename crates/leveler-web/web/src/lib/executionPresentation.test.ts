@@ -193,15 +193,22 @@ function runPath(steps: Array<Record<string, unknown>>): Harness {
   const h = harness();
   h.apply(DEFAULT_SNAPSHOT);
   for (const step of steps) {
+    // A durable-history step is answered the way the runtime answers a client's
+    // own query: one `session_history_loaded` carrying normalized events. The
+    // client replays them through the SAME reducer the live stream uses.
+    if (step.history !== undefined) {
+      h.apply({
+        type: 'session_history_loaded',
+        session_id: 's1',
+        entries: step.history as never,
+      } as RuntimeEvent);
+      continue;
+    }
     const payload = step.event ?? step.snapshot;
-    if (!payload) continue; // a `history` step: deferred, see the header.
+    if (!payload) continue;
     h.apply(payload as RuntimeEvent);
   }
   return h;
-}
-
-function needsHistory(steps: Array<Record<string, unknown>>): boolean {
-  return steps.some((step) => step.history !== undefined);
 }
 
 describe('execution presentation contract v1 (web)', () => {
@@ -209,7 +216,6 @@ describe('execution presentation contract v1 (web)', () => {
     it(`${fixture.id} — ${fixture.title}`, () => {
       let compared = 0;
       for (const [name, steps] of Object.entries(fixture.paths)) {
-        if (needsHistory(steps)) continue; // DEFERRED: durable history replay.
         const h = runPath(steps);
         const current = h.state.current;
         expect(current, `${fixture.id}/${name}: no session`).not.toBeNull();
@@ -234,13 +240,60 @@ describe('execution presentation contract v1 (web)', () => {
   }
 });
 
-describe('contract gaps the web still owes', () => {
-  it('a snapshot-opened session cannot rebuild durable tool rounds yet', () => {
-    // C10's reconnect/replay paths need `query_session_history`; the Web client
-    // has no consumer for it, so a reopened session shows the answer but not
-    // what ran. This test states the gap instead of letting the fixture suite
-    // imply coverage it does not have.
-    const snapshot = runPath([{ snapshot: DEFAULT_SNAPSHOT }]);
-    expect(snapshot.state.current?.tools ?? []).toHaveLength(0);
+describe('durable history replay (the gap this closed)', () => {
+  it('a reopened session replays its whole conversation, not the model context', () => {
+    // Before the replay consumer existed, a session opened from a snapshot
+    // showed `snapshot.messages` — the ACTIVE MODEL CONTEXT, which `/compact`
+    // trims to one summary row. The durable log is what a reopen must paint.
+    const compacted = {
+      type: 'session_opened',
+      session: {
+        ...(DEFAULT_SNAPSHOT as unknown as { session: Record<string, unknown> }).session,
+        // Everything `/compact` leaves in the model context.
+        messages: [{ id: 'summary', role: 'user', text: '对话摘要（已压缩历史）：前面聊过解析器。' }],
+      },
+    } as unknown as RuntimeEvent;
+    const history = [
+      { turn_start: true, event: { type: 'user_message_added', message: { id: 'u1', role: 'user', text: '看下解析器' } } },
+      { turn_start: false, event: { type: 'assistant_message_started', message_id: 'm1' } },
+      { turn_start: false, event: { type: 'assistant_text_delta', message_id: 'm1', delta: '解析器没问题。' } },
+      { turn_start: false, event: { type: 'assistant_message_completed', message_id: 'm1' } },
+      { turn_start: false, event: { type: 'turn_answered' } },
+      { turn_start: true, event: { type: 'context_compacted', from: 4, to: 1 } },
+    ];
+    const h = harness();
+    h.apply(compacted);
+    // The snapshot alone cannot see the conversation: only the summary row.
+    expect(h.state.current?.messages.map((m) => m.text)).toEqual([
+      '对话摘要（已压缩历史）：前面聊过解析器。',
+    ]);
+    h.apply({
+      type: 'session_history_loaded',
+      session_id: 's1',
+      entries: history as never,
+    } as RuntimeEvent);
+    const texts = h.state.current?.messages.map((m) => m.text) ?? [];
+    expect(texts).toContain('看下解析器');
+    expect(texts).toContain('解析器没问题。');
+    // The internal summary is a context artifact, never a conversation row.
+    expect(texts.some((text) => text.includes('对话摘要（已压缩历史）'))).toBe(false);
+    expect(h.state.current?.lastTurn?.outcome).toBe('answered');
+  });
+
+  it('an empty history answer keeps the snapshot the client already has', () => {
+    const h = harness();
+    h.apply({
+      type: 'session_opened',
+      session: {
+        ...(DEFAULT_SNAPSHOT as unknown as { session: Record<string, unknown> }).session,
+        messages: [{ id: 'm1', role: 'assistant', text: '你好。' }],
+      },
+    } as unknown as RuntimeEvent);
+    h.apply({
+      type: 'session_history_loaded',
+      session_id: 's1',
+      entries: [],
+    } as RuntimeEvent);
+    expect(h.state.current?.messages.map((m) => m.text)).toEqual(['你好。']);
   });
 });

@@ -20,6 +20,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     messages: [],
     tools: [],
     thoughts: [],
+    historyOmittedTurns: 0,
     traces: [],
     agents: [],
     backgroundTasks: [],

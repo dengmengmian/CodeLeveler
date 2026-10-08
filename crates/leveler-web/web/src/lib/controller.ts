@@ -16,7 +16,13 @@ import {
   turnProgressLabel,
 } from './turn';
 import { deliverFrame, WsClient } from './ws';
-import type { Action, AppState } from '../state/store';
+import {
+  initialState,
+  reducer,
+  type Action,
+  type AppState,
+  type SessionView,
+} from '../state/store';
 import type {
   ApprovalDecision,
   CheckpointId,
@@ -26,6 +32,7 @@ import type {
   PermissionProfile,
   RuntimeEvent,
   SessionId,
+  UiHistoryEntry,
   UiAgentDraft,
   UiAgentScope,
   UiMemoryKind,
@@ -41,6 +48,9 @@ export class RuntimeBridge {
   private readonly ws: WsClient;
   private readonly dispatch: Dispatch<Action>;
   private readonly getState: GetState;
+  /** Where actions currently go. A durable-history replay swaps this for a
+   *  scratch reducer, so the ONE event mapping feeds both paths. */
+  private sink: Dispatch<Action>;
   /** selectSession 后等待的目标会话 id（防止采纳别会话的广播整量） */
   private pendingSessionId: SessionId | null = null;
   /** Only this client's latest list-memory query may replace its Memory view. */
@@ -49,16 +59,27 @@ export class RuntimeBridge {
   private pendingAgentDetailQueryId: string | null = null;
   private readonly pendingAgentMutationQueryIds = new Set<string>();
   private pendingDiffQueryId: string | null = null;
+  /** The client's own in-flight session-history query, so a foreign or stale
+   *  answer never replaces this client's transcript. */
+  private pendingHistoryQueryId: string | null = null;
+  /** Sessions whose durable history this connection already loaded. */
+  private readonly historyLoaded = new Set<SessionId>();
+  /** True while durable history is being replayed into a scratch view. The
+   *  event mapping then reads THAT view, not the live one: "does this turn have
+   *  a committed answer?" must be asked of the transcript being rebuilt. */
+  private replaying = false;
+  private replayView: SessionView | null = null;
   /** `/clear` 已发出、等待宿主返回新会话。新会话 id 由宿主分配，事先不知道，
    *  所以只能标记"下一个 session_opened 就是它"，并在采纳时切换 WS 订阅。 */
   private awaitingNewSession = false;
 
   constructor(dispatch: Dispatch<Action>, getState: GetState) {
     this.dispatch = dispatch;
+    this.sink = dispatch;
     this.getState = getState;
     this.ws = new WsClient(getToken(), {
       onFrame: (frame) => this.handleFrame(frame),
-      onStatus: (status) => this.dispatch({ type: 'connection', status }),
+      onStatus: (status) => this.sink({ type: 'connection', status }),
     });
   }
 
@@ -70,6 +91,7 @@ export class RuntimeBridge {
 
   dispose(): void {
     this.ws.dispose();
+    this.sink = this.dispatch;
   }
 
   // ── 下行帧 ────────────────────────────────────────────────────────
@@ -85,7 +107,7 @@ export class RuntimeBridge {
       case 'ack':
         return; // 送达回执，目前无需展示
       case 'project_status':
-        this.dispatch({ type: 'project_status', path: frame.path, status: frame.status });
+        this.sink({ type: 'project_status', path: frame.path, status: frame.status });
         // 后台发现（历史项目自动注册）带来的新项目不在已拉取的列表里：
         // 状态帧到达时补拉一次，让分组立即出现。
         if (!this.getState().projects.some((p) => p.path === frame.path)) {
@@ -93,7 +115,7 @@ export class RuntimeBridge {
         }
         return;
       case 'error':
-        this.dispatch({ type: 'notice', message: `服务端错误 ${frame.code}: ${frame.message}` });
+        this.sink({ type: 'notice', message: `服务端错误 ${frame.code}: ${frame.message}` });
         return;
       default:
         return; // 未知帧：忽略不崩
@@ -104,7 +126,7 @@ export class RuntimeBridge {
     const id = sessionId ?? this.getState().current?.id;
     if (!id) return;
     const queryId = crypto.randomUUID();
-    this.dispatch({ type: 'observation_loading', queryId });
+    this.sink({ type: 'observation_loading', queryId });
     this.deliver({
       type: 'query_observability',
       session_id: id,
@@ -114,9 +136,96 @@ export class RuntimeBridge {
     });
   }
 
+  /**
+   * Ask the runtime to project its own durable log into the same client events
+   * a live session produced, and adopt it as the conversation.
+   *
+   * The snapshot's `messages` are the ACTIVE MODEL CONTEXT: `/compact` leaves a
+   * single summary row there, so a reopened session would otherwise read as if
+   * it started mid-task. The runtime already answers this command with
+   * normalized `RuntimeEvent`s (user, reasoning, tool calls with their applied
+   * diff, notices, terminals) — this client replays them through the SAME
+   * reducer the live stream uses.
+   */
+  private requestSessionHistory(sessionId: SessionId): void {
+    const current = this.getState().current;
+    if (!current || current.id !== sessionId) return;
+    // A running turn owns the transcript: replaying under it would fight the
+    // live events for the same rows.
+    if (current.turnActive) return;
+    if (this.pendingHistoryQueryId !== null) return;
+    const queryId = crypto.randomUUID();
+    this.pendingHistoryQueryId = queryId;
+    this.deliver({
+      type: 'query_session_history',
+      session_id: sessionId,
+      query_id: queryId,
+    });
+  }
+
+  /**
+   * Replay durable history through the one event mapping.
+   *
+   * The mapping lives in `applyEvent`; swapping the action sink for a scratch
+   * reducer reuses it instead of growing a second, drifting one. Only the
+   * transcript fields are adopted back, so live state (turnActive, activity,
+   * plan, diff, approvals, tokens) is never overwritten by the past.
+   */
+  private replayHistory(entries: UiHistoryEntry[], omittedTurns: number): void {
+    const current = this.getState().current;
+    if (!current || entries.length === 0) return;
+    let scratch: AppState = structuredClone(initialState);
+    scratch.draft = false;
+    scratch.current = {
+      ...structuredClone(current),
+      messages: [],
+      tools: [],
+      thoughts: [],
+      traces: [],
+      lastTurn: null,
+      historyOmittedTurns: omittedTurns,
+      reasoning: '',
+      reasoningSuperseded: false,
+      turnActive: false,
+      turnStartedAt: null,
+      activity: null,
+    };
+    const live = this.sink;
+    this.replaying = true;
+    this.replayView = scratch.current;
+    this.sink = (action: Action) => {
+      // The reducer mutates in place, exactly as it does on the live path.
+      reducer(scratch, action);
+      this.replayView = scratch.current;
+    };
+    try {
+      for (const entry of entries) this.applyEvent(entry.event);
+    } finally {
+      this.sink = live;
+      this.replaying = false;
+      this.replayView = null;
+    }
+    const rebuilt = scratch.current;
+    if (!rebuilt) return;
+    this.sink({
+      type: 'history_replaced',
+      view: {
+        messages: rebuilt.messages,
+        tools: rebuilt.tools,
+        thoughts: rebuilt.thoughts,
+        traces: rebuilt.traces,
+        lastTurn: rebuilt.lastTurn,
+      },
+      omittedTurns,
+    });
+  }
+
   private applySnapshot(snap: UiSessionSnapshot, contextWindow?: number | null): void {
     const { current, draft } = this.getState();
     const previousId = current?.id;
+    // A reopen (this client is being handed a session it was not showing) is
+    // the other moment the durable log, not the model context, is the truth.
+    const reopen = previousId !== undefined && previousId !== snap.id;
     // 广播流里可能夹带别会话的 session_opened：只接收当前会话的整量；
     // 例外一是 selectSession 后等待目标会话 snapshot 的窗口期；
     // 例外二是 `/clear`：宿主刚建的新会话 id 与当前不同，正是要切过去的那个。
@@ -126,15 +235,19 @@ export class RuntimeBridge {
       // 会一直举着，把之后任意一个无关快照当成自己的新会话切过去。
       if (!this.awaitingNewSession || snap.messages.length > 0) return;
       this.awaitingNewSession = false;
-      this.dispatch({ type: 'select_session', id: snap.id });
+      this.sink({ type: 'select_session', id: snap.id });
       this.ws.setSession(snap.id);
     }
     if (!current && (draft || (this.pendingSessionId !== null && snap.id !== this.pendingSessionId))) {
       return;
     }
     this.pendingSessionId = null;
-    this.dispatch({ type: 'snapshot', session: snap, contextWindow });
+    this.sink({ type: 'snapshot', session: snap, contextWindow });
     saveLastSession(snap.id);
+    if (reopen) {
+      this.historyLoaded.delete(snap.id);
+      this.requestSessionHistory(snap.id);
+    }
     if (previousId !== snap.id || this.getState().observation === null) {
       this.queryObservability(snap.id);
     }
@@ -146,18 +259,23 @@ export class RuntimeBridge {
   private applySessionMeta(snap: UiSessionSnapshot): void {
     const { current } = this.getState();
     if (!current || current.id !== snap.id) return;
-    this.dispatch({ type: 'session_meta', session: snap });
+    this.sink({ type: 'session_meta', session: snap });
   }
 
   private applyEvent(ev: RuntimeEvent): void {
     const state = this.getState();
     switch (ev.type) {
       case 'session_list':
-        this.dispatch({ type: 'session_list', sessions: ev.sessions });
+        this.sink({ type: 'session_list', sessions: ev.sessions });
         this.maybeRestoreLastSession();
         return;
       case 'session_opened':
         this.applySnapshot(ev.session);
+        // The runtime pushed a snapshot, which means the transcript may have
+        // changed under us (`/compact`, a restored checkpoint, a resumed
+        // session). Re-read the durable log rather than trusting the model
+        // context the snapshot carries.
+        this.requestSessionHistory(ev.session.id);
         return;
       case 'session_updated':
         this.applySessionMeta(ev.session);
@@ -169,12 +287,14 @@ export class RuntimeBridge {
         break;
     }
 
-    const current = state.current;
+    // A replay feeds the scratch view; the live stream feeds the live one. Same
+    // mapping, one source of truth about what is currently on screen.
+    const current = this.replayView ?? state.current;
     if (!current) return; // 事件不带会话维度：无当前会话时无法落位，忽略
 
     switch (ev.type) {
       case 'user_message_added':
-        this.dispatch({
+        this.sink({
           type: 'user_message',
           id: ev.message.id,
           text: ev.message.text,
@@ -182,19 +302,19 @@ export class RuntimeBridge {
         });
         break;
       case 'assistant_message_started':
-        this.dispatch({ type: 'assistant_started', id: ev.message_id, time: formatClock() });
+        this.sink({ type: 'assistant_started', id: ev.message_id, time: formatClock() });
         break;
       case 'assistant_attempt_reset':
-        this.dispatch({ type: 'assistant_reset', id: ev.message_id ?? null });
+        this.sink({ type: 'assistant_reset', id: ev.message_id ?? null });
         break;
       case 'assistant_text_delta':
-        this.dispatch({ type: 'assistant_delta', id: ev.message_id, delta: ev.delta });
+        this.sink({ type: 'assistant_delta', id: ev.message_id, delta: ev.delta });
         break;
       case 'assistant_message_completed':
-        this.dispatch({ type: 'assistant_completed', id: ev.message_id });
+        this.sink({ type: 'assistant_completed', id: ev.message_id });
         break;
       case 'tool_call_started':
-        this.dispatch({
+        this.sink({
           type: 'tool_started',
           id: ev.id,
           name: ev.name,
@@ -205,7 +325,7 @@ export class RuntimeBridge {
         });
         break;
       case 'tool_call_completed':
-        this.dispatch({
+        this.sink({
           type: 'tool_completed',
           id: ev.id,
           ok: ev.ok,
@@ -218,71 +338,83 @@ export class RuntimeBridge {
         });
         break;
       case 'approval_requested':
-        this.dispatch({ type: 'approval_requested', request: ev.request });
+        this.sink({ type: 'approval_requested', request: ev.request });
         break;
       case 'approval_resolved':
-        this.dispatch({ type: 'approval_resolved', requestId: ev.id });
+        this.sink({ type: 'approval_resolved', requestId: ev.id });
         break;
       case 'clarification_requested':
-        this.dispatch({ type: 'clarification_requested', request: ev.request });
+        this.sink({ type: 'clarification_requested', request: ev.request });
         break;
       case 'clarification_resolved':
-        this.dispatch({ type: 'clarification_resolved', requestId: ev.id });
+        this.sink({ type: 'clarification_resolved', requestId: ev.id });
         break;
       case 'plan_updated':
-        this.dispatch({ type: 'plan', plan: ev.plan });
+        this.sink({ type: 'plan', plan: ev.plan });
         break;
       case 'diff_updated':
         if (ev.query_id) {
           if (ev.query_id !== this.pendingDiffQueryId) break;
           this.pendingDiffQueryId = null;
         }
-        this.dispatch({ type: 'diff', diff: ev.diff });
+        this.sink({ type: 'diff', diff: ev.diff });
         break;
       case 'checkpoint_created':
-        this.dispatch({ type: 'checkpoint_added', checkpoint: ev.checkpoint });
+        this.sink({ type: 'checkpoint_added', checkpoint: ev.checkpoint });
         break;
       case 'session_completed':
-        this.dispatch({ type: 'completion', report: ev.report });
+        this.sink({ type: 'completion', report: ev.report });
         break;
       case 'token_usage':
-        this.dispatch({
+        this.sink({
           type: 'token_usage',
           input: ev.input_tokens,
           output: ev.output_tokens,
         });
         break;
       case 'btw_started':
-        this.dispatch({ type: 'btw_started', question: ev.question, time: formatClock() });
+        this.sink({ type: 'btw_started', question: ev.question, time: formatClock() });
         break;
       case 'btw_text_delta':
-        this.dispatch({ type: 'btw_delta', delta: ev.delta });
+        this.sink({ type: 'btw_delta', delta: ev.delta });
         break;
       case 'btw_completed':
-        this.dispatch({ type: 'btw_done' });
+        this.sink({ type: 'btw_done' });
         break;
       case 'btw_failed':
-        this.dispatch({ type: 'btw_done' });
-        this.dispatch({ type: 'notice', message: `btw 失败：${ev.error}` });
+        this.sink({ type: 'btw_done' });
+        this.sink({ type: 'notice', message: `btw 失败：${ev.error}` });
         break;
       case 'agent_activity':
-        this.dispatch({ type: 'agent_activity', label: ev.label });
+        this.sink({ type: 'agent_activity', label: ev.label });
         break;
       case 'attachment_added':
-        this.dispatch({ type: 'attachment_added', attachment: ev.attachment });
+        this.sink({ type: 'attachment_added', attachment: ev.attachment });
         break;
       case 'attachment_processing_failed':
-        this.dispatch({ type: 'notice', message: `附件处理失败：${ev.error}` });
+        this.sink({ type: 'notice', message: `附件处理失败：${ev.error}` });
         break;
       case 'notification':
         // info 也展示：runtime 的结构化事实（bg 任务、memory 提示等）不许静默丢。
-        this.dispatch({ type: 'notice', message: ev.message });
+        this.sink({ type: 'notice', message: ev.message });
         break;
       case 'reasoning_delta':
-        this.dispatch({ type: 'reasoning_delta', delta: ev.delta });
+        this.sink({ type: 'reasoning_delta', delta: ev.delta });
         break;
+      case 'session_history_loaded': {
+        // Only this client's own answer, for the session on screen.
+        if (this.pendingHistoryQueryId !== null && ev.query_id === this.pendingHistoryQueryId) {
+          this.pendingHistoryQueryId = null;
+        } else if (ev.query_id !== undefined && ev.query_id !== null) {
+          break;
+        }
+        if (ev.session_id !== current.id) break;
+        this.historyLoaded.add(ev.session_id);
+        this.replayHistory(ev.entries ?? [], ev.omitted_turns ?? 0);
+        break;
+      }
       case 'reasoning_completed':
-        this.dispatch({
+        this.sink({
           type: 'reasoning_completed',
           elapsedMs: ev.elapsed_ms,
           // The segment's text is what the live row accumulated; the runtime
@@ -291,21 +423,21 @@ export class RuntimeBridge {
         });
         break;
       case 'command_progress':
-        this.dispatch({
+        this.sink({
           type: 'agent_activity',
           label: commandProgressLabel(ev.label, ev.elapsed_ms),
         });
         break;
       case 'turn_progress': {
         const label = turnProgressLabel(ev.phase, ev.closing, ev.no_progress_streak);
-        if (label) this.dispatch({ type: 'agent_activity', label });
+        if (label) this.sink({ type: 'agent_activity', label });
         break;
       }
       case 'turn_finalizing':
-        this.dispatch({ type: 'agent_activity', label: finalizationStageLabel(ev.stage) });
+        this.sink({ type: 'agent_activity', label: finalizationStageLabel(ev.stage) });
         break;
       case 'sub_agent_updated':
-        this.dispatch({
+        this.sink({
           type: 'sub_agent_updated',
           id: ev.id,
           nickname: ev.nickname,
@@ -323,10 +455,10 @@ export class RuntimeBridge {
         });
         break;
       case 'sub_agent_state_changed':
-        this.dispatch({ type: 'sub_agent_state_changed', id: ev.id, state: ev.state });
+        this.sink({ type: 'sub_agent_state_changed', id: ev.id, state: ev.state });
         break;
       case 'sub_agent_progress':
-        this.dispatch({
+        this.sink({
           type: 'sub_agent_progress',
           id: ev.id,
           active: ev.active,
@@ -339,11 +471,11 @@ export class RuntimeBridge {
         // TUI 同款：完成的一步带 ✓/✗，进行中的只显示工具名。
         const step =
           ev.phase === 'tool_finished' ? `${ev.tool} ${ev.is_error ? '✗' : '✓'}` : ev.tool;
-        this.dispatch({ type: 'sub_agent_activity', id: ev.id, step });
+        this.sink({ type: 'sub_agent_activity', id: ev.id, step });
         break;
       }
       case 'background_task_started':
-        this.dispatch({
+        this.sink({
           type: 'background_started',
           taskId: ev.task_id,
           program: ev.program,
@@ -351,7 +483,7 @@ export class RuntimeBridge {
         });
         break;
       case 'background_task_exited':
-        this.dispatch({
+        this.sink({
           type: 'background_exited',
           taskId: ev.task_id,
           exitCode: ev.exit_code ?? null,
@@ -362,7 +494,7 @@ export class RuntimeBridge {
       case 'memory_list':
         if (!ev.query_id || ev.query_id !== this.pendingMemoryQueryId) break;
         this.pendingMemoryQueryId = null;
-        this.dispatch({
+        this.sink({
           type: 'memory_list',
           dir: ev.memory_dir,
           active: ev.active,
@@ -373,12 +505,12 @@ export class RuntimeBridge {
       case 'agents_loaded':
         if (!ev.query_id || ev.query_id !== this.pendingAgentListQueryId) break;
         this.pendingAgentListQueryId = null;
-        this.dispatch({ type: 'agents_loaded', entries: ev.agents, problems: ev.problems ?? [] });
+        this.sink({ type: 'agents_loaded', entries: ev.agents, problems: ev.problems ?? [] });
         break;
       case 'agent_loaded':
         if (!ev.query_id || ev.query_id !== this.pendingAgentDetailQueryId) break;
         this.pendingAgentDetailQueryId = null;
-        this.dispatch({
+        this.sink({
           type: 'agent_loaded',
           name: ev.name,
           agent: ev.agent ?? null,
@@ -387,7 +519,7 @@ export class RuntimeBridge {
         break;
       case 'agent_mutated':
         if (!ev.query_id || !this.pendingAgentMutationQueryIds.delete(ev.query_id)) break;
-        this.dispatch({
+        this.sink({
           type: 'agent_mutated',
           name: ev.name,
           ok: ev.ok,
@@ -398,19 +530,19 @@ export class RuntimeBridge {
         if (ev.ok) this.listAgents();
         break;
       case 'context_updated':
-        this.dispatch({ type: 'context_estimate', tokens: ev.estimated_tokens });
+        this.sink({ type: 'context_estimate', tokens: ev.estimated_tokens });
         break;
       case 'context_compacted':
-        this.dispatch({ type: 'notice', message: `上下文已压缩 ${ev.from} → ${ev.to} 条` });
+        this.sink({ type: 'notice', message: `上下文已压缩 ${ev.from} → ${ev.to} 条` });
         break;
       case 'context_expanded':
-        this.dispatch({
+        this.sink({
           type: 'notice',
           message: `上下文预算已扩张 ${ev.from_tokens} → ${ev.to_tokens} tokens`,
         });
         break;
       case 'observability_loaded':
-        this.dispatch({
+        this.sink({
           type: 'observation_loaded',
           observation: ev.observation,
           queryId: ev.query_id ?? null,
@@ -422,7 +554,14 @@ export class RuntimeBridge {
         break;
     }
 
-    if (ev.type !== 'observability_loaded' && shouldRefreshObservability(ev)) {
+    // A replay is a paint of the past: it must not fire live queries or touch
+    // the live queue. It still needs the turn terminal (that IS a transcript
+    // fact), which is why this gate is per side effect and not an early return.
+    if (
+      !this.replaying &&
+      ev.type !== 'observability_loaded' &&
+      shouldRefreshObservability(ev)
+    ) {
       this.queryObservability(current.id);
     }
 
@@ -437,9 +576,11 @@ export class RuntimeBridge {
         committedFinalAnswer(current.messages, current.tools) === null
           ? 'no_final_answer'
           : end.outcome;
-      this.dispatch({ type: 'turn_terminal', outcome, detail: end.detail });
-      // dispatch 是异步的，getState() 还没落地，强制跳过 turnActive 检查
-      this.flushQueue(true);
+      this.sink({ type: 'turn_terminal', outcome, detail: end.detail });
+      if (!this.replaying) {
+        // dispatch 是异步的，getState() 还没落地，强制跳过 turnActive 检查
+        this.flushQueue(true);
+      }
     }
   }
 
@@ -465,7 +606,7 @@ export class RuntimeBridge {
     // An explicit pick supersedes a pending `/clear`.
     this.awaitingNewSession = false;
     this.pendingSessionId = id;
-    this.dispatch({ type: 'select_session', id });
+    this.sink({ type: 'select_session', id });
     this.ws.setSession(id);
     saveLastSession(id);
     // 让 runtime 把该会话 transcript 载入视图（网关也会主动推 snapshot，双保险）
@@ -475,7 +616,7 @@ export class RuntimeBridge {
   newDraft(project?: string): void {
     const state = this.getState();
     const path = project ?? state.selectedProject ?? (state.repository || null);
-    this.dispatch({ type: 'new_draft', project: path });
+    this.sink({ type: 'new_draft', project: path });
     saveLastSession(null);
     this.leaveSessionSubscription();
   }
@@ -492,8 +633,8 @@ export class RuntimeBridge {
 
   selectProject(path: string): void {
     const before = this.getState().current?.id ?? null;
-    this.dispatch({ type: 'select_project', path });
-    this.dispatch({ type: 'set_rail_nav', nav: 'sessions' });
+    this.sink({ type: 'select_project', path });
+    this.sink({ type: 'set_rail_nav', nav: 'sessions' });
     if (before && this.getState().current?.id !== before) {
       this.leaveSessionSubscription();
     }
@@ -511,7 +652,7 @@ export class RuntimeBridge {
   async refreshProjects(): Promise<void> {
     try {
       const { projects } = await api.listProjects();
-      this.dispatch({ type: 'projects', projects });
+      this.sink({ type: 'projects', projects });
     } catch {
       // 单项目模式（无聚合层）或瞬时失败：静默，项目分组仍按会话列表渲染
     }
@@ -519,7 +660,7 @@ export class RuntimeBridge {
 
   /** 把文本注入输入框（空状态快捷操作用）；Composer 消费后回传 null 清空。 */
   seedComposer(text: string | null): void {
-    this.dispatch({ type: 'seed_composer', text });
+    this.sink({ type: 'seed_composer', text });
   }
 
   /** 重新运行 / 重试：取当前会话最后一条用户消息重发。 */
@@ -534,7 +675,7 @@ export class RuntimeBridge {
     try {
       await api.addProject(path);
       await this.refreshProjects();
-      this.dispatch({ type: 'select_project', path });
+      this.sink({ type: 'select_project', path });
       this.requestSessionList();
       return true;
     } catch (err) {
@@ -647,7 +788,7 @@ export class RuntimeBridge {
           state.current?.permission ?? 'assisted',
           state.draftProject ?? state.selectedProject ?? undefined,
         );
-        this.dispatch({
+        this.sink({
           type: 'snapshot',
           session: bootstrap.session,
           contextWindow: bootstrap.context_window,
@@ -659,10 +800,10 @@ export class RuntimeBridge {
           content: text,
         });
         // 乐观置位：在 user_message_added 回包之前就进入排队语义
-        this.dispatch({ type: 'turn_active', value: true });
+        this.sink({ type: 'turn_active', value: true });
         this.requestSessionList();
       } catch (err) {
-        this.dispatch({
+        this.sink({
           type: 'notice',
           message: `创建会话失败：${err instanceof Error ? err.message : String(err)}`,
         });
@@ -672,7 +813,7 @@ export class RuntimeBridge {
 
     if (state.current.turnActive) {
       // 回合进行中：FIFO 排队，turn 终态后自动发下一条
-      this.dispatch({
+      this.sink({
         type: 'enqueue',
         item: { id: crypto.randomUUID(), sessionId: state.current.id, text },
       });
@@ -687,8 +828,8 @@ export class RuntimeBridge {
         ? { attachments: state.pendingAttachments }
         : {}),
     });
-    if (state.pendingAttachments.length > 0) this.dispatch({ type: 'attachments_cleared' });
-    this.dispatch({ type: 'turn_active', value: true });
+    if (state.pendingAttachments.length > 0) this.sink({ type: 'attachments_cleared' });
+    this.sink({ type: 'turn_active', value: true });
   }
 
   /** turn 终态 / 重连恢复后：把当前会话队首消息发出去。force 用于刚 dispatch 完 turn_terminal 的窗口。 */
@@ -697,28 +838,28 @@ export class RuntimeBridge {
     if (!state.current || (!force && state.current.turnActive)) return;
     const next = state.queue.find((q) => q.sessionId === state.current?.id);
     if (!next) return;
-    this.dispatch({ type: 'dequeue', id: next.id });
+    this.sink({ type: 'dequeue', id: next.id });
     this.deliver({
       type: 'submit_message',
       session_id: next.sessionId,
       content: next.text,
     });
-    this.dispatch({ type: 'turn_active', value: true });
+    this.sink({ type: 'turn_active', value: true });
   }
 
   cancelQueued(id: string): void {
-    this.dispatch({ type: 'dequeue', id });
+    this.sink({ type: 'dequeue', id });
   }
 
   /** 调整排队消息顺序（纯客户端队列，dir=-1 上移 / 1 下移）。 */
   moveQueued(id: string, dir: -1 | 1): void {
-    this.dispatch({ type: 'queue_move', id, dir });
+    this.sink({ type: 'queue_move', id, dir });
   }
 
   // ── 审批 / 澄清（固定 command_id，重试幂等）────────────────────────
 
   decideApproval(requestId: string, decision: ApprovalDecision): void {
-    this.dispatch({ type: 'approval_resolved', requestId });
+    this.sink({ type: 'approval_resolved', requestId });
     this.deliver(
       { type: 'approval_decision', request_id: requestId, decision },
       `approval:${requestId}`,
@@ -726,7 +867,7 @@ export class RuntimeBridge {
   }
 
   answerClarification(requestId: string, answer: string): void {
-    this.dispatch({ type: 'clarification_resolved', requestId });
+    this.sink({ type: 'clarification_resolved', requestId });
     this.deliver(
       { type: 'answer_clarification', request_id: requestId, answer },
       `clarification:${requestId}`,
@@ -750,13 +891,13 @@ export class RuntimeBridge {
 
   setPermission(mode: PermissionProfile): void {
     const current = this.getState().current;
-    this.dispatch({ type: 'set_permission', mode });
+    this.sink({ type: 'set_permission', mode });
     if (current) this.deliver({ type: 'set_permission_profile', session_id: current.id, mode });
   }
 
   setModel(model: ModelRef): void {
     const current = this.getState().current;
-    this.dispatch({ type: 'set_model', model });
+    this.sink({ type: 'set_model', model });
     if (current) this.deliver({ type: 'select_model', session_id: current.id, model });
   }
 
@@ -770,7 +911,7 @@ export class RuntimeBridge {
       this.notice('回合运行中不能切换运行轴，先停止或等它结束');
       return;
     }
-    this.dispatch({ type: 'set_axes', collaboration });
+    this.sink({ type: 'set_axes', collaboration });
     this.deliver({
       type: 'set_product_axes',
       session_id: current.id,
@@ -842,7 +983,7 @@ export class RuntimeBridge {
     if (!current) return null;
     const queryId = crypto.randomUUID();
     this.pendingAgentListQueryId = queryId;
-    this.dispatch({ type: 'agents_loading' });
+    this.sink({ type: 'agents_loading' });
     this.deliver({ type: 'list_agents', session_id: current.id, query_id: queryId });
     return queryId;
   }
@@ -908,25 +1049,25 @@ export class RuntimeBridge {
 
   openChanges(): void {
     this.requestDiff();
-    this.dispatch({ type: 'stage_view', view: 'diff' });
+    this.sink({ type: 'stage_view', view: 'diff' });
   }
 
   openMemory(): void {
     this.listMemory();
-    this.dispatch({ type: 'set_inspector_more', open: true });
+    this.sink({ type: 'set_inspector_more', open: true });
   }
 
   /** 仅从待发列表移除附件（服务端已注册的无法撤回） */
   removeAttachment(id: string): void {
-    this.dispatch({ type: 'attachment_removed', id });
+    this.sink({ type: 'attachment_removed', id });
   }
 
   dismissNotice(): void {
-    this.dispatch({ type: 'notice', message: null });
+    this.sink({ type: 'notice', message: null });
   }
 
   notice(message: string): void {
-    this.dispatch({ type: 'notice', message });
+    this.sink({ type: 'notice', message });
   }
 
   // ── 斜杠命令（mockup 里的 10 条）───────────────────────────────────
@@ -937,7 +1078,7 @@ export class RuntimeBridge {
     const current = this.getState().current;
     const needSession = (): SessionId | null => {
       if (!current) {
-        this.dispatch({ type: 'notice', message: '该命令需要先进入一个会话' });
+        this.sink({ type: 'notice', message: '该命令需要先进入一个会话' });
         return null;
       }
       return current.id;
@@ -952,7 +1093,7 @@ export class RuntimeBridge {
           (m) => m.model === arg || modelRefString(m) === arg,
         );
         if (!hit) {
-          this.dispatch({ type: 'notice', message: `未知模型：${arg}` });
+          this.sink({ type: 'notice', message: `未知模型：${arg}` });
           return;
         }
         this.setModel(hit);
@@ -962,7 +1103,7 @@ export class RuntimeBridge {
         if (!arg) return; // 无参数：由 Composer 打开协作弹层
         const collab = arg.toLowerCase();
         if (!(COLLABORATIONS as readonly string[]).includes(collab)) {
-          this.dispatch({ type: 'notice', message: '用法：/collab chat|plan|goal' });
+          this.sink({ type: 'notice', message: '用法：/collab chat|plan|goal' });
           return;
         }
         const cur = this.getState().current;
@@ -979,7 +1120,7 @@ export class RuntimeBridge {
         };
         const profile = map[arg.toLowerCase()];
         if (!profile) {
-          this.dispatch({ type: 'notice', message: '用法：/perm ask|assist|full' });
+          this.sink({ type: 'notice', message: '用法：/perm ask|assist|full' });
           return;
         }
         this.setPermission(profile);
@@ -1013,7 +1154,7 @@ export class RuntimeBridge {
         const sid = needSession();
         if (!sid) return;
         if (!arg) {
-          this.dispatch({ type: 'notice', message: '用法：/checkpoint <id>（CKPT 面板可点选）' });
+          this.sink({ type: 'notice', message: '用法：/checkpoint <id>（CKPT 面板可点选）' });
           return;
         }
         this.deliver({ type: 'restore_checkpoint', session_id: sid, checkpoint_id: arg });
@@ -1023,7 +1164,7 @@ export class RuntimeBridge {
         const sid = needSession();
         if (!sid) return;
         this.listMemory();
-        this.dispatch({ type: 'notice', message: '记忆已刷新，见右栏「记忆」' });
+        this.sink({ type: 'notice', message: '记忆已刷新，见右栏「记忆」' });
         return;
       }
       case '/cancel': {
@@ -1034,14 +1175,14 @@ export class RuntimeBridge {
         const sid = needSession();
         if (!sid) return;
         if (!arg) {
-          this.dispatch({ type: 'notice', message: '用法：/btw <问题>' });
+          this.sink({ type: 'notice', message: '用法：/btw <问题>' });
           return;
         }
         this.deliver({ type: 'btw', session_id: sid, question: arg });
         return;
       }
       default:
-        this.dispatch({ type: 'notice', message: `未知命令：${head}（输入 / 查看命令面板）` });
+        this.sink({ type: 'notice', message: `未知命令：${head}（输入 / 查看命令面板）` });
     }
   }
 }
