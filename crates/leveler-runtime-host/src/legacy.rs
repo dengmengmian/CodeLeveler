@@ -220,44 +220,126 @@ fn current_uid() -> Option<u32> {
     }
 }
 
-/// How strongly the *endpoint* — not the runtime's own claim — is tied to the
-/// process this migration is about to signal.
+/// How strongly the *endpoint* is tied to the process this migration is about
+/// to signal, and that the process is a runtime for THIS repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnershipEvidence {
     /// The process holds the very socket object this endpoint is, proven from
     /// the kernel's own file-descriptor table.
     HoldsEndpointSocket,
-    /// The process could not be tied to the socket object directly, but it is
-    /// this user's process, it is alive, its start time is witnessed, and the
-    /// endpoint answers as the same runtime throughout.
-    SameUserWitnessOnly,
+    /// The process could not be tied to the socket object directly, but its
+    /// command line identifies it as a `serve` runtime for this very workspace
+    /// (or a workspace-free runtime, for an endpoint that has no workspace).
+    /// This is the same identification the project's own tooling uses to find a
+    /// repository's daemons.
+    ServesThisWorkspace,
 }
 
-/// Prove the process holds the endpoint socket, where the kernel publishes
-/// enough to do so.
+/// The full command line of `pid`, so a pid can be identified as a runtime for
+/// a particular workspace.
 ///
-/// Linux: scanning the target's file-descriptor table for
-/// `socket:[<inode>]` matching the socket path decides it outright. Other
-/// platforms have no equivalent without an unverified platform shim, so they
-/// report the weaker [`OwnershipEvidence`] honestly instead of pretending.
-pub fn socket_ownership(pid: u32, socket: SocketObject) -> OwnershipEvidence {
+/// `-ww` matters: without it `ps` truncates, and a truncated command line would
+/// read as "not a runtime for this workspace", turning every migration into a
+/// refusal.
+pub fn process_command(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("ps")
+            .env("LC_ALL", "C")
+            .arg("-ww")
+            .arg("-o")
+            .arg("command=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let command = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!command.is_empty()).then_some(command)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether a command line is a runtime serving `workspace`.
+///
+/// Two facts, both required: the process runs the `serve` subcommand, and it was
+/// pointed at this repository (or explicitly at no workspace, which is the one
+/// legitimate case for an endpoint with no repository). Splitting on whitespace
+/// deliberately: a substring test would accept `not-serve` and a path that
+/// merely *contains* the workspace.
+pub fn serves_workspace(command: &str, workspace: Option<&Path>) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if !tokens.contains(&"serve") {
+        return false;
+    }
+    match workspace {
+        Some(workspace) => {
+            // Compare RESOLVED paths: a layout may hold the canonical form while
+            // the process was launched with the symlinked one (macOS `/var` vs
+            // `/private/var`), and a textual comparison would then refuse a
+            // runtime that is in fact serving this very repository.
+            let wanted =
+                std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+            tokens.iter().any(|token| {
+                let token = Path::new(token.trim_matches('"'));
+                token == wanted
+                    || std::fs::canonicalize(token)
+                        .is_ok_and(|resolved| resolved == wanted)
+            })
+        }
+        None => tokens.contains(&"--no-workspace"),
+    }
+}
+
+/// Prove the process holds the endpoint socket (Linux) or, where the kernel
+/// publishes no file-descriptor table, that its command line is a runtime for
+/// this workspace.
+///
+/// The second is weaker than the first and is reported as such: it ties the pid
+/// to *a* runtime for this repository, not to the exact socket object.
+/// It exists because the alternative is worse — a runtime that names an
+/// unrelated live pid would otherwise be obeyed on every platform without
+/// `/proc`.
+pub fn ownership_evidence(
+    pid: u32,
+    socket: SocketObject,
+    workspace: Option<&Path>,
+) -> Option<OwnershipEvidence> {
+    if holds_endpoint_socket(pid, socket) {
+        return Some(OwnershipEvidence::HoldsEndpointSocket);
+    }
+    let command = process_command(pid)?;
+    serves_workspace(&command, workspace).then_some(OwnershipEvidence::ServesThisWorkspace)
+}
+
+/// Whether the process's own file-descriptor table contains the endpoint
+/// socket object, where the kernel publishes one.
+///
+/// Linux: scanning `/proc/<pid>/fd` for `socket:[<inode>]` matching the socket
+/// path decides it outright. Other platforms have no equivalent without an
+/// unverified platform shim, so they answer `false` and the caller falls back
+/// to the command-line evidence — honestly weaker, never pretend-strong.
+pub fn holds_endpoint_socket(pid: u32, socket: SocketObject) -> bool {
     #[cfg(target_os = "linux")]
     {
         let wanted = format!("socket:[{}]", socket.inode);
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            return OwnershipEvidence::SameUserWitnessOnly;
+            return false;
         };
-        for fd in fds.flatten() {
-            if std::fs::read_link(fd.path()).is_ok_and(|link| link.to_string_lossy() == wanted) {
-                return OwnershipEvidence::HoldsEndpointSocket;
-            }
-        }
-        OwnershipEvidence::SameUserWitnessOnly
+        fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path()).is_ok_and(|link| link.to_string_lossy() == wanted)
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (pid, socket);
-        OwnershipEvidence::SameUserWitnessOnly
+        false
     }
 }
 
@@ -334,6 +416,7 @@ pub fn verify_target(
     reported_runtime_id: &str,
     reported_build: &BuildIdentity,
     expected_build: &BuildIdentity,
+    workspace: Option<&Path>,
 ) -> Result<LegacyRuntimeTarget, MigrationRefusal> {
     if reported_pid == 0 || reported_runtime_id.is_empty() || !reported_build.is_known() {
         return Err(MigrationRefusal::IdentityUnknown(format!(
@@ -392,13 +475,26 @@ pub fn verify_target(
             )));
         }
     }
+    // Ownership: the pid must be tied to THIS endpoint. The strong proof is the
+    // kernel's own file-descriptor table; where that does not exist, the process
+    // must at least identify itself as a `serve` runtime for this very
+    // workspace. Without one of the two, a runtime that names an unrelated live
+    // pid would be obeyed, which is precisely the process this check exists to
+    // refuse.
+    let ownership = ownership_evidence(reported_pid, socket, workspace).ok_or_else(|| {
+        MigrationRefusal::ProcessUnverifiable(format!(
+            "pid {reported_pid} is not tied to {}: it neither holds the endpoint socket \
+             nor identifies itself as a runtime for this workspace",
+            socket_path.display()
+        ))
+    })?;
     Ok(LegacyRuntimeTarget {
         pid: reported_pid,
         runtime_id: reported_runtime_id.to_string(),
         build: reported_build.clone(),
         socket,
         witness,
-        ownership: socket_ownership(reported_pid, socket),
+        ownership,
     })
 }
 
@@ -453,7 +549,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (socket, _listener) = socket_at(&dir);
         let current = build("same");
-        let refusal = verify_target(&socket, 42, "rt-1", &current, &current).unwrap_err();
+        let refusal =
+            verify_target(&socket, 42, "rt-1", &current, &current, None).unwrap_err();
         assert!(matches!(refusal, MigrationRefusal::IdentityUnknown(_)));
     }
 
@@ -462,8 +559,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let not_a_socket = dir.path().join("plain.txt");
         std::fs::write(&not_a_socket, b"hello").unwrap();
-        let refusal =
-            verify_target(&not_a_socket, 42, "rt-1", &build("old"), &build("new")).unwrap_err();
+        let refusal = verify_target(&not_a_socket, 42, "rt-1", &build("old"), &build("new"), None)
+            .unwrap_err();
         assert!(
             matches!(refusal, MigrationRefusal::ProcessUnverifiable(_)),
             "{refusal:?}"
@@ -481,7 +578,7 @@ mod tests {
         ];
         for (pid, runtime_id, reported) in candidates {
             let refusal =
-                verify_target(&socket, pid, runtime_id, &reported, &build("new")).unwrap_err();
+                verify_target(&socket, pid, runtime_id, &reported, &build("new"), None).unwrap_err();
             assert!(
                 matches!(refusal, MigrationRefusal::IdentityUnknown(_)),
                 "{refusal:?}"
@@ -499,6 +596,7 @@ mod tests {
             "rt-1",
             &build("old"),
             &build("new"),
+            None,
         )
         .unwrap_err();
         assert!(matches!(refusal, MigrationRefusal::IdentityUnknown(_)));
@@ -514,7 +612,7 @@ mod tests {
             return;
         }
         let refusal =
-            verify_target(&socket, pid, "rt-1", &build("old"), &build("new")).unwrap_err();
+            verify_target(&socket, pid, "rt-1", &build("old"), &build("new"), None).unwrap_err();
         assert!(
             matches!(refusal, MigrationRefusal::ProcessUnverifiable(_)),
             "{refusal:?}"
@@ -550,7 +648,7 @@ mod tests {
                 inode: 1,
             },
             witness: process_witness(pid).unwrap(),
-            ownership: OwnershipEvidence::SameUserWitnessOnly,
+            ownership: OwnershipEvidence::ServesThisWorkspace,
         };
         assert!(revalidate(&target).is_ok());
         target.witness.started.push_str("-stale");
@@ -558,6 +656,34 @@ mod tests {
             matches!(revalidate(&target), Err(MigrationRefusal::TargetReused { .. })),
             "a changed start marker must read as a reused pid"
         );
+    }
+
+    #[test]
+    fn a_command_line_identifies_a_runtime_for_this_workspace() {
+        let workspace = std::path::Path::new("/tmp/example-repo");
+        assert!(serves_workspace(
+            "leveler --repo /tmp/example-repo serve",
+            Some(workspace)
+        ));
+        assert!(serves_workspace(
+            "/usr/local/bin/leveler serve --no-workspace",
+            None
+        ));
+        // The refusals this rule exists for: a process that is not a serve
+        // runtime, and one serving a DIFFERENT repository.
+        for (command, expected) in [
+            ("sleep 600", false),
+            ("/bin/sh -c 'leveler --repo /tmp/other serve'", false),
+            ("leveler --repo /tmp/example-repository serve", false),
+            ("leveler --repo /tmp/example-repo", false),
+        ] {
+            assert_eq!(
+                serves_workspace(command, Some(workspace)),
+                expected,
+                "{command:?}"
+            );
+        }
+        assert!(!serves_workspace("sleep 600", None));
     }
 
     #[cfg(unix)]

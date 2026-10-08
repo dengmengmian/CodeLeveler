@@ -602,6 +602,7 @@ pub async fn observe_retiring_runtime(
         HANDOVER_CANCEL_GRACE,
         ui,
         None,
+        None,
     )
     .await
 }
@@ -615,6 +616,7 @@ async fn observe_retiring_runtime_with_grace(
     grace: Duration,
     ui: &dyn HandoffUi,
     requested: Option<RestartReason>,
+    workspace: Option<&Path>,
 ) -> DrainOutcome {
     let mut last = String::new();
     let mut input: Option<UnboundedReceiver<HandoffAction>> = None;
@@ -721,7 +723,7 @@ async fn observe_retiring_runtime_with_grace(
                     // process serving this socket is PROVEN to be the one this
                     // client examined. Any refusal is terminal and reported:
                     // a guess here is a signal delivered to the wrong process.
-                    match force_migrate_legacy_runtime(socket_path, reason, ui).await {
+                    match force_migrate_legacy_runtime(socket_path, workspace, reason, ui).await {
                         Ok(()) => pending = None,
                         Err(refusal) => {
                             tracing::warn!(%refusal, "refusing to force-migrate the previous runtime");
@@ -891,6 +893,7 @@ async fn observe_endpoint(socket_path: &Path) -> Option<(u32, String)> {
 #[cfg(any(unix, windows))]
 async fn force_migrate_legacy_runtime(
     socket_path: &Path,
+    workspace: Option<&Path>,
     reason: RestartReason,
     ui: &dyn HandoffUi,
 ) -> Result<(), crate::legacy::MigrationRefusal> {
@@ -919,6 +922,7 @@ async fn force_migrate_legacy_runtime(
         info.runtime_id.as_str(),
         &info.build,
         &expected,
+        workspace,
     )?;
 
     tracing::info!(
@@ -1026,6 +1030,7 @@ async fn retire_runtime(
     socket_path: &Path,
     reason: RestartReason,
     ui: &dyn HandoffUi,
+    workspace: Option<&Path>,
 ) -> anyhow::Result<()> {
     let observed_pid = LocalRuntimeService::runtime_info(client)
         .await
@@ -1039,6 +1044,7 @@ async fn retire_runtime(
         HANDOVER_CANCEL_GRACE,
         ui,
         Some(reason),
+        workspace,
     )
     .await;
     match outcome {
@@ -1146,14 +1152,28 @@ pub async fn reconcile_runtime_generation(
                 expected = %expected.short(),
                 "local runtime is a different build; asking it to retire"
             );
-            retire_runtime(&client, socket_path, RestartReason::BuildMismatch, ui).await?;
+            retire_runtime(
+                &client,
+                socket_path,
+                RestartReason::BuildMismatch,
+                ui,
+                layout.primary_workspace(),
+            )
+            .await?;
             Ok(None)
         }
         RuntimeConsistency::ConfigChanged => {
             tracing::info!(
                 "local runtime loaded a different configuration generation; asking it to retire"
             );
-            retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui).await?;
+            retire_runtime(
+                &client,
+                socket_path,
+                RestartReason::ConfigChanged,
+                ui,
+                layout.primary_workspace(),
+            )
+            .await?;
             Ok(None)
         }
     }

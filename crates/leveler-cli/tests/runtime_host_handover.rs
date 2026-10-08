@@ -41,6 +41,11 @@ use tokio_util::sync::CancellationToken;
 
 const BUDGET_SECS: u64 = 1;
 
+/// The drain budget is process-global, and these tests set DIFFERENT values, so
+/// they must not run at the same time. A failure here would be a test artifact,
+/// not a finding: one test would observe the other's budget.
+static BUDGET_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 struct Env {
     _tmp: tempfile::TempDir,
     home: std::path::PathBuf,
@@ -275,8 +280,9 @@ async fn serve(
 async fn an_unanswerable_shell_is_reported_promptly_instead_of_waiting() {
     // The budget is deliberately longer than the assertion below: the point is
     // that the answer does not come from the budget at all.
-    // SAFETY: this test target owns its process, and the budget is read once per
-    // handover, so no other test in this binary can observe the mutation.
+    let _budget = BUDGET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: this test target owns its process, and `BUDGET_ENV_LOCK` keeps
+    // every other budget-mutating test out of the way while it is set.
     unsafe {
         std::env::set_var(
             "LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS",
@@ -357,6 +363,7 @@ async fn an_unanswerable_shell_is_reported_promptly_instead_of_waiting() {
 /// cannot safely signal must produce a refusal, not a signal.
 #[tokio::test]
 async fn a_legacy_runtime_without_a_provable_identity_is_refused_without_a_signal() {
+    let _budget = BUDGET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: this test target owns its process.
     unsafe { std::env::set_var("LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS", "1") };
 
@@ -404,6 +411,7 @@ async fn a_legacy_runtime_without_a_provable_identity_is_refused_without_a_signa
 /// completes the handover as soon as a replacement owns the endpoint.
 #[tokio::test]
 async fn an_answerable_shell_keeps_waiting_and_reports_that_it_is_waiting() {
+    let _budget = BUDGET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: see the test above.
     unsafe {
         std::env::set_var(
@@ -572,6 +580,7 @@ impl LocalRuntimeService for AnonymousRuntime {
 /// An unidentifiable runtime is refused, not silently reused and not replaced.
 #[tokio::test]
 async fn a_runtime_without_a_usable_identity_is_refused() {
+    let _budget = BUDGET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: this test target owns its process.
     unsafe { std::env::set_var("LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS", "1") };
 
@@ -693,6 +702,7 @@ async fn an_unanswered_request_is_bounded_and_never_revives() {
 /// verdict on the process.
 #[tokio::test]
 async fn a_daemon_that_is_still_starting_is_not_killed() {
+    let _budget = BUDGET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: this test target owns its process.
     unsafe { std::env::set_var("LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS", "1") };
 
@@ -819,7 +829,21 @@ async fn a_legacy_runtime_is_verified_and_terminated_before_replacement() {
     let env = env();
     let layout = layout(&env);
     let socket = layout.socket_path();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    // The stand-in declares, in its own command line, what it stands in for: a
+    // `serve` runtime for THIS workspace. That identification is what the
+    // migration checks, because it is the only portable way to tie a pid to a
+    // repository's runtime — and it is exactly what an UNRELATED process cannot
+    // satisfy, which is the case that must be refused.
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    {
+        use std::os::unix::process::CommandExt;
+        command.arg0(format!(
+            "{} --repo {} serve",
+            std::env::current_exe().unwrap().display(),
+            env.repo.display()
+        ));
+    }
+    let mut child = command
         .arg("--exact")
         .arg("legacy_runtime_child_helper")
         .arg("--nocapture")

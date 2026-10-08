@@ -23,7 +23,8 @@ mod owned;
 pub use legacy::{
     LegacyRuntimeTarget, MigrationRefusal, OwnershipEvidence, ProcessWitness, SocketObject,
     TerminationSignal, platform_supports_forced_migration, process_alive, process_uid,
-    process_witness, revalidate, signal_process, socket_object, socket_ownership, verify_target,
+    process_command, process_witness, revalidate, serves_workspace, signal_process,
+    socket_object, holds_endpoint_socket, ownership_evidence, verify_target,
 };
 pub use owned::{
     EnsureOwnedError, OwnedRuntime, OwnedRuntimeError, OwnedRuntimeLaunch,
