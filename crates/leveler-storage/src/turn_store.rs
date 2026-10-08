@@ -34,6 +34,14 @@ pub trait TurnStore: Send + Sync {
         session_id: Option<&SessionId>,
     ) -> Result<Vec<TurnRecord>, StorageError>;
 
+    /// Orphan turns plus finished turns whose durable task cancellation still
+    /// awaits its task terminal. Recovery must survive a crash between these
+    /// two distinct lifecycle commits.
+    async fn list_recovery_candidates(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<TurnRecord>, StorageError>;
+
     /// All turns for one session in ordinal order. Resume uses the durable
     /// turn payload to recover the exact work lineage that failed.
     async fn list_for_session(
@@ -74,6 +82,24 @@ impl TurnStore for Database {
         session_id: Option<&SessionId>,
     ) -> Result<Vec<TurnRecord>, StorageError> {
         TurnRepository::new(self).list_running(session_id).await
+    }
+
+    async fn list_recovery_candidates(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<TurnRecord>, StorageError> {
+        Ok(sqlx::query_as::<_, TurnRecord>(
+            "SELECT t.* FROM turns t WHERE (?1 IS NULL OR t.session_id = ?1) AND \
+             (t.status = 'running' OR (t.ordinal = (SELECT MAX(ordinal) FROM turns \
+             WHERE session_id = t.session_id) AND EXISTS(SELECT 1 FROM events e \
+             WHERE e.session_id = t.session_id AND e.turn_id = t.id \
+             AND e.type = 'task_cancel_requested' AND NOT EXISTS(SELECT 1 FROM events terminal \
+             WHERE terminal.session_id = e.session_id AND terminal.type = 'task_finished' \
+             AND terminal.sequence > e.sequence)))) ORDER BY t.session_id, t.ordinal",
+        )
+        .bind(session_id.map(SessionId::as_str))
+        .fetch_all(self.pool())
+        .await?)
     }
 
     async fn list_for_session(
@@ -138,6 +164,7 @@ impl TurnStore for Database {
 pub struct MemoryTurnStore {
     pub(crate) rows: Mutex<Vec<TurnRecord>>,
     ownership: std::sync::OnceLock<std::sync::Arc<crate::MemoryOwnershipState>>,
+    events: std::sync::OnceLock<std::sync::Arc<crate::MemoryEventStore>>,
 }
 
 impl MemoryTurnStore {
@@ -150,6 +177,16 @@ impl MemoryTurnStore {
     pub fn with_ownership(self, state: std::sync::Arc<crate::MemoryOwnershipState>) -> Self {
         let _ = self.ownership.set(state);
         self
+    }
+
+    /// Couple to the canonical event log for durable cancellation recovery.
+    pub fn with_events(self, events: std::sync::Arc<crate::MemoryEventStore>) -> Self {
+        let _ = self.events.set(events);
+        self
+    }
+
+    pub(crate) fn connect_events(&self, events: std::sync::Arc<crate::MemoryEventStore>) {
+        let _ = self.events.set(events);
     }
 
     /// Test hook: the status of one turn (the port itself has no per-turn
@@ -219,6 +256,50 @@ impl TurnStore for MemoryTurnStore {
                 .then(a.ordinal.cmp(&b.ordinal))
         });
         Ok(out)
+    }
+
+    async fn list_recovery_candidates(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<TurnRecord>, StorageError> {
+        let events = self
+            .events
+            .get()
+            .ok_or_else(|| {
+                StorageError::InvalidData(
+                    "memory recovery requires the canonical event store".to_string(),
+                )
+            })?
+            .recovery_events();
+        let rows = self.rows.lock().unwrap();
+        let mut candidates: Vec<_> = rows
+            .iter()
+            .filter(|turn| {
+                session_id.is_none_or(|session| turn.session_id == session.as_str())
+                    && (turn.status == "running"
+                        || (rows
+                            .iter()
+                            .filter(|row| row.session_id == turn.session_id)
+                            .all(|row| row.ordinal <= turn.ordinal)
+                            && events.iter().any(|event| {
+                                event.session_id == turn.session_id
+                                    && event.turn_id.as_deref() == Some(turn.id.as_str())
+                                    && event.event_type == "task_cancel_requested"
+                                    && !events.iter().any(|terminal| {
+                                        terminal.session_id == event.session_id
+                                            && terminal.event_type == "task_finished"
+                                            && terminal.sequence > event.sequence
+                                    })
+                            })))
+            })
+            .cloned()
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.session_id
+                .cmp(&b.session_id)
+                .then(a.ordinal.cmp(&b.ordinal))
+        });
+        Ok(candidates)
     }
 
     async fn list_for_session(
@@ -379,5 +460,118 @@ mod tests {
         let ended = TurnRepository::new(&db).list(&session).await.unwrap();
         assert_eq!(ended[0].status, "completed");
         assert_eq!(ended[0].owner_boot_id.as_deref(), Some("boot-1"));
+    }
+    async fn assert_pending_cancel_recovery_contract(
+        turns: &dyn TurnStore,
+        events: &dyn crate::EventStore,
+        terminal: &dyn crate::TerminalStore,
+        sessions: &dyn crate::SessionStore,
+    ) {
+        let record = crate::SessionRecord::new("/repo", "goal", "mock/m", leveler_core::now());
+        sessions.create(&record).await.unwrap();
+        let session = SessionId::new(record.id);
+        let turn = turns
+            .start(&session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        events
+            .append(
+                &session,
+                Some(&TurnId::new(turn.id.clone())),
+                "task_cancel_requested",
+                &serde_json::json!({"type":"task_cancel_requested", "payload":{
+                    "task_id":session.as_str(), "turn_id":turn.id, "boot_id":"dead", "owner_epoch":1
+                }})
+                .to_string(),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        terminal
+            .finish_turn(
+                &session,
+                &TurnId::new(turn.id.clone()),
+                "turn_finished",
+                "{}",
+                leveler_lifecycle::TurnOutcome::Interrupted,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert!(turns.list_running(Some(&session)).await.unwrap().is_empty());
+        assert_eq!(
+            turns
+                .list_recovery_candidates(Some(&session))
+                .await
+                .unwrap()[0]
+                .id,
+            turn.id,
+            "a task intent survives its already committed turn interruption"
+        );
+        terminal
+            .finish_task(
+                &session,
+                "task_finished",
+                "{}",
+                leveler_lifecycle::TaskOutcome::Cancelled,
+                leveler_lifecycle::SessionStatus::Cancelled,
+                leveler_lifecycle::AgentState::Cancelled,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            turns
+                .list_recovery_candidates(Some(&session))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a committed task terminal ends cancellation recovery"
+        );
+        let new = turns
+            .start(&session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        let candidates = turns
+            .list_recovery_candidates(Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].id, new.id,
+            "an old intent cannot recover over a new turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_pending_cancel_recovers_after_turn_terminal() {
+        let db = Database::connect_in_memory().await.unwrap();
+        assert_pending_cancel_recovery_contract(&db, &db, &db, &db).await;
+    }
+
+    #[tokio::test]
+    async fn memory_pending_cancel_recovers_after_turn_terminal() {
+        let sessions = std::sync::Arc::new(crate::MemorySessionStore::new());
+        let turns = std::sync::Arc::new(MemoryTurnStore::new());
+        let events = std::sync::Arc::new(crate::MemoryEventStore::new());
+        let terminal =
+            crate::MemoryTerminalStore::new(sessions.clone(), turns.clone(), events.clone());
+        assert_pending_cancel_recovery_contract(
+            turns.as_ref(),
+            events.as_ref(),
+            &terminal,
+            sessions.as_ref(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn memory_recovery_without_event_authority_fails_explicitly() {
+        assert!(
+            MemoryTurnStore::new()
+                .list_recovery_candidates(None)
+                .await
+                .is_err()
+        );
     }
 }

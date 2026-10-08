@@ -1860,7 +1860,7 @@ impl InProcessRuntimeClient {
         &self,
         session: Option<&SessionId>,
         scope: leveler_engine::ReapScope,
-    ) -> Vec<leveler_engine::ReapConflict> {
+    ) -> Result<Vec<leveler_engine::ReapConflict>, ClientError> {
         let engine = match self
             .app
             .open_database()
@@ -1870,12 +1870,17 @@ impl InProcessRuntimeClient {
             Ok(engine) => engine,
             Err(error) => {
                 tracing::warn!("cannot reap running turns: {error}");
-                return Vec::new();
+                return Err(ClientError::Runtime(error.to_string()));
             }
         };
         match leveler_engine::reap_after_restart(&engine, session, scope).await {
             Ok(outcome) => {
-                crate::session::checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await;
+                if let Err(error) =
+                    crate::session::checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions)
+                        .await
+                {
+                    return Err(ClientError::Runtime(error.to_string()));
+                }
                 for conflict in &outcome.conflicts {
                     tracing::warn!(
                         session = conflict.session_id.as_str(),
@@ -1890,11 +1895,11 @@ impl InProcessRuntimeClient {
                         "reaped zombie running turns"
                     );
                 }
-                outcome.conflicts
+                Ok(outcome.conflicts)
             }
             Err(error) => {
                 tracing::warn!("failed to reap running turns: {error}");
-                Vec::new()
+                Err(ClientError::Runtime(error.to_string()))
             }
         }
     }
@@ -1909,7 +1914,7 @@ impl InProcessRuntimeClient {
                 Some(session_id),
                 leveler_engine::ReapScope::OwnAndEndedBoots,
             )
-            .await;
+            .await?;
         if conflicts
             .iter()
             .any(|conflict| conflict.refusal == leveler_engine::ReapRefusal::LiveBoot)
@@ -4573,7 +4578,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // A running turn carries the flag to its terminal, so the
                 // engine records `cancelled` (not resumable `interrupted`).
                 // With nothing running, commit that terminal here.
-                if !self.active.cancel_task(&session_id) {
+                let delivered = self
+                    .app
+                    .request_active_task_cancel(&session_id)
+                    .await
+                    .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                if delivered {
+                    self.active.cancel_task(&session_id);
+                } else {
                     match self.app.cancel_task(&session_id).await {
                         Ok(Some(event)) => {
                             let mut bridge = EventBridge::new(self.events_for(&session_id));
@@ -4584,7 +4596,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             "没有可取消的任务；直接描述新任务即可".to_string(),
                         ),
                         Err(error) => {
-                            self.notify_error(&session_id, error.to_string());
+                            return Err(ClientError::Runtime(error.to_string()));
                         }
                     }
                 }
@@ -4927,7 +4939,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 // Only this boot's own: a sibling process sharing the
                 // repository keeps running its turns.
                 self.reap_running_turns(None, leveler_engine::ReapScope::OwnBoot)
-                    .await;
+                    .await?;
                 // Runtime-owned OS resources must not outlive the runtime:
                 // local (goal-scoped) background tasks and the browser tree are
                 // reaped explicitly — Drop never runs on exit paths that call

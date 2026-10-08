@@ -1203,7 +1203,8 @@ impl EventBridge {
                     slot.insert(Instant::now());
                 }
             }
-            EngineEvent::TaskStarted { .. }
+            EngineEvent::TaskCancelRequested { .. }
+            | EngineEvent::TaskStarted { .. }
             | EngineEvent::TurnFinished { .. }
             | EngineEvent::ApprovalRequested { .. }
             | EngineEvent::ApprovalResolved { .. }

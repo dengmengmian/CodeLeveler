@@ -1747,7 +1747,6 @@ async fn sigkill_after_cancel_current_turn_ack_stays_resumable_body() {
 /// `cargo test -p leveler-cli --features test-crash-barrier --test daemon_e2e \
 ///   sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent -- --ignored`
 #[cfg(feature = "test-crash-barrier")]
-#[ignore = "Phase 2C: an acknowledged CancelTask intent is lost across a crash"]
 #[test]
 fn sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent() {
     leveler_test_support::bounded_test(
@@ -1826,6 +1825,16 @@ async fn sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent_body() {
     // B. The ACK is out and the terminal is not durable yet.
     wait_for_cancel_terminal_barrier(&barrier, &mut daemon, Duration::from_secs(15));
     let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let intents = leveler_storage::EventRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert!(
+        intents
+            .iter()
+            .any(|event| event.event_type == "task_cancel_requested"),
+        "ACK must follow durable cancellation intent: {intents:?}"
+    );
     let (outcome, count) = task_terminal_state(&db, &session).await;
     assert!(
         outcome.is_none() && count == 0,
@@ -1910,6 +1919,55 @@ async fn sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent_body() {
          `cancelled`; recovery settled task terminal {outcome:?} (count {count}), \
          turns {turn_statuses:?}, session {session_status}"
     );
+    assert_eq!(count, 1, "recovery commits exactly one task terminal");
+    let record = leveler_storage::SessionRepository::new(&db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, leveler_lifecycle::SessionStatus::Cancelled);
+    let owner =
+        leveler_storage::OwnershipStore::current(&db, &leveler_core::TaskId::new(session.as_str()))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        owner.runtime.is_none() && owner.boot.is_none(),
+        "terminal releases ownership"
+    );
+    assert_eq!(
+        turn_statuses.len(),
+        1,
+        "receipt retry must not start another turn"
+    );
+    let recovered = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let resume = recovered
+        .send(ClientCommand::ResumeTask {
+            session_id: session.clone(),
+            content: "继续".to_string(),
+        })
+        .await;
+    assert!(
+        resume.is_err(),
+        "a cancelled task explicitly rejects Resume: {resume:?}"
+    );
+    let after_resume = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_resume.len(),
+        1,
+        "Resume rejection never admits execution"
+    );
+    assert_eq!(
+        task_terminal_state(&db, &session).await,
+        (Some("cancelled".to_string()), 1)
+    );
+    drop(recovered);
+
     drop(db);
     stop_daemon(&mut daemon);
 }

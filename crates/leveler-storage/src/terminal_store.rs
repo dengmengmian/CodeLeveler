@@ -284,6 +284,7 @@ impl MemoryTerminalStore {
         turns: std::sync::Arc<crate::MemoryTurnStore>,
         events: std::sync::Arc<crate::MemoryEventStore>,
     ) -> Self {
+        turns.connect_events(events.clone());
         Self {
             sessions,
             turns,
@@ -532,6 +533,61 @@ impl TerminalStore for MemoryTerminalStore {
                     .is_some()
             },
             || {
+                let events = self.events.recovery_events();
+                let lifecycle = self
+                    .sessions
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .get(session_id.as_str())
+                    .cloned();
+                if outcome == TaskOutcome::Cancelled
+                    && self
+                        .events
+                        .task_terminal_for_epoch(session_id, token)
+                        .is_none()
+                    && lifecycle.is_some_and(|session| {
+                        session.status != SessionStatus::Running
+                            && matches!(
+                                session.outcome,
+                                Some(TaskOutcome::Completed | TaskOutcome::Cancelled)
+                            )
+                    })
+                {
+                    let event = events
+                        .iter()
+                        .filter(|event| {
+                            event.session_id == session_id.as_str()
+                                && event.event_type == "task_finished"
+                        })
+                        .max_by_key(|event| event.sequence)
+                        .cloned()
+                        .ok_or_else(|| {
+                            StorageError::InvalidData(
+                                "closed task lacks its canonical terminal".to_string(),
+                            )
+                        })?;
+                    return Ok(TaskTerminalCommit {
+                        event,
+                        inserted: false,
+                    });
+                }
+                if outcome != TaskOutcome::Cancelled
+                    && events.iter().any(|event| {
+                        event.session_id == session_id.as_str()
+                            && event.event_type == "task_cancel_requested"
+                            && serde_json::from_str::<serde_json::Value>(&event.payload)
+                                .ok()
+                                .is_some_and(|value| {
+                                    value["payload"]["task_id"].as_str()
+                                        == Some(token.task_id.as_str())
+                                        && value["payload"]["owner_epoch"].as_u64()
+                                            == Some(token.owner_epoch.get())
+                                })
+                    })
+                {
+                    return Err(crate::OwnershipError::CancelRequested);
+                }
                 self.finish_task_sync(
                     Some(token),
                     session_id,
@@ -543,6 +599,7 @@ impl TerminalStore for MemoryTerminalStore {
                     goal,
                     now,
                 )
+                .map_err(crate::OwnershipError::Storage)
             },
         )
     }

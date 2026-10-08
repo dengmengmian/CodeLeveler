@@ -625,3 +625,99 @@ async fn a_lost_race_nobody_holds_stays_stale() {
         "{lost:?}"
     );
 }
+
+#[tokio::test]
+async fn durable_cancel_recovers_again_if_the_recovery_boot_dies_before_task_terminal() {
+    let world = World::new().await;
+    let session = world.session().await;
+    let token = world.running_turn("b1", &session).await;
+    leveler_storage::TerminalRepository::new(&world.db)
+        .request_task_cancel(&token, &session)
+        .await
+        .unwrap();
+    world.set("b1", BootLiveness::Dead);
+    let first = reap_after_restart(&world.boot("b2"), Some(&session), ReapScope::EndedBoots)
+        .await
+        .unwrap();
+    assert_eq!(first.reaped_sessions.len(), 1);
+    assert!(first.reaped_sessions[0].cancel_requested);
+    assert_eq!(world.statuses(&session).await, vec!["interrupted"]);
+    // No Harness terminal, no release: the recovering boot dies in the exact
+    // turn-terminal / task-terminal window.
+    world.set("b2", BootLiveness::Dead);
+    let second = reap_after_restart(&world.boot("b3"), Some(&session), ReapScope::EndedBoots)
+        .await
+        .unwrap();
+    assert_eq!(second.reaped_sessions.len(), 1);
+    assert!(second.reaped_sessions[0].cancel_requested);
+    assert!(
+        second.reaped_sessions[0].token.owner_epoch > first.reaped_sessions[0].token.owner_epoch
+    );
+    assert!(
+        second.events.is_empty(),
+        "already interrupted turns have no second terminal"
+    );
+    let events = leveler_storage::EventRepository::new(&world.db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "turn_finished")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn corrupt_durable_cancel_is_an_explicit_recovery_error() {
+    let world = World::new().await;
+    let session = world.session().await;
+    let token = world.running_turn("b1", &session).await;
+    leveler_storage::TerminalRepository::new(&world.db)
+        .request_task_cancel(&token, &session)
+        .await
+        .unwrap();
+    let turn = world.turns(&session).await.remove(0);
+    leveler_storage::EventStore::append_owned(
+        &world.db,
+        &token,
+        &session,
+        Some(&leveler_core::TurnId::new(turn.id)),
+        "task_cancel_requested",
+        "{}",
+        leveler_core::now(),
+    )
+    .await
+    .unwrap();
+    world.set("b1", BootLiveness::Dead);
+    let result = reap_after_restart(&world.boot("b2"), Some(&session), ReapScope::EndedBoots).await;
+    assert!(matches!(result, Err(EngineError::Corrupt(_))), "{result:?}");
+    assert!(
+        !leveler_storage::EventRepository::new(&world.db)
+            .load(&session)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "task_finished")
+    );
+}
+
+#[test]
+fn durable_cancel_intent_is_canonical_replayable_and_never_public_terminal() {
+    let event = leveler_engine::EngineEvent::TaskCancelRequested {
+        task_id: TaskId::new("task"),
+        turn_id: leveler_core::TurnId::new("turn"),
+        boot_id: BootId::new("boot"),
+        owner_epoch: OwnerEpoch::new(1),
+    };
+    let (kind, payload) = event.to_row().unwrap();
+    assert_eq!(kind, "task_cancel_requested");
+    assert_eq!(
+        leveler_engine::EngineEvent::from_payload(&payload).unwrap(),
+        event
+    );
+    assert!(!event.is_transient());
+    assert!(event.public_projection().is_none());
+}

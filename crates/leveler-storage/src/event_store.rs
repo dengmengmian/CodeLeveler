@@ -486,6 +486,10 @@ impl MemoryEventStore {
         Self::default()
     }
 
+    pub(crate) fn recovery_events(&self) -> Vec<EventRecord> {
+        self.events.lock().unwrap().clone()
+    }
+
     /// Canonical terminal event already committed for an ownership epoch.
     pub(crate) fn task_terminal_for_epoch(
         &self,

@@ -130,6 +130,13 @@ pub enum EngineEvent {
         #[serde(default)]
         task_id: Option<leveler_core::TaskId>,
     },
+    /// Durable acceptance of logical cancellation; never a task terminal.
+    TaskCancelRequested {
+        task_id: leveler_core::TaskId,
+        turn_id: TurnId,
+        boot_id: leveler_core::BootId,
+        owner_epoch: leveler_core::OwnerEpoch,
+    },
     TurnStarted {
         turn_id: TurnId,
         kind: TurnKind,
@@ -822,7 +829,8 @@ impl EngineEvent {
             | EngineEvent::UserShellOutput { .. }
             | EngineEvent::UserShellFinished { .. }
             // Raw command output — local-sensitive like the user shell's.
-            | EngineEvent::ToolCallOutput { .. } => LocalOnly,
+            | EngineEvent::ToolCallOutput { .. }
+            | EngineEvent::TaskCancelRequested { .. } => LocalOnly,
         }
     }
 
@@ -941,7 +949,8 @@ impl EngineEvent {
                 blocking: *blocking,
             },
 
-            EngineEvent::StreamAttemptStarted
+            EngineEvent::TaskCancelRequested { .. }
+            | EngineEvent::StreamAttemptStarted
             | EngineEvent::AssistantDelta { .. }
             | EngineEvent::ReasoningStarted
             | EngineEvent::ReasoningDelta { .. }

@@ -89,6 +89,9 @@ pub enum EngineError {
     /// surface a recovery fault, never synthesize a client terminal event.
     #[error("task terminal was not committed: {0}")]
     TerminalCommitFailed(String),
+    /// A durable cancellation won; the Harness must revise its terminal proposal.
+    #[error("durable task cancellation requires a cancelled terminal proposal")]
+    TaskCancellationRequested,
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("configuration error: {0}")]

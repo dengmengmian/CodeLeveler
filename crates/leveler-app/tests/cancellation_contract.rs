@@ -819,7 +819,6 @@ async fn a_reaped_dead_boot_keeps_session_and_projection_consistent() {
 /// it changes terminal-persistence semantics, which this round deliberately
 /// does not do. Ignored so the reproduction stays as the Phase 2C evidence
 /// instead of a red release gate.
-#[ignore = "Phase 2C: a late CancelTask currently overwrites a committed completed terminal"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_cancel_task_does_not_overwrite_a_committed_completed() {
     let f = fixture(vec![sse(vec![text_frame("done")])]).await;

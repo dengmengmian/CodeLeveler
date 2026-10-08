@@ -297,6 +297,7 @@ pub struct TaskExecution {
 ///
 /// The engine persists these values atomically. It does not derive the
 /// outcome, workflow state, or goal disposition.
+#[derive(Clone)]
 pub struct TaskTerminal {
     /// How the harness says the task ended.
     pub outcome: TaskOutcome,
@@ -334,22 +335,12 @@ impl TaskEngine {
         terminal: TaskTerminal,
         observer: &mut (dyn FnMut(EngineEvent) + Send),
     ) -> Result<(), EngineError> {
-        let TaskTerminal {
-            outcome,
-            reason,
-            failure,
-            stop,
-            status,
-            state,
-            goal,
-            warnings,
-        } = terminal;
         let event = EngineEvent::TaskFinished {
-            outcome,
-            reason,
-            failure,
-            stop,
-            warnings,
+            outcome: terminal.outcome,
+            reason: terminal.reason,
+            failure: terminal.failure,
+            stop: terminal.stop,
+            warnings: terminal.warnings,
         };
         let (event_type, payload) = event.to_row()?;
         let commit = self
@@ -360,14 +351,19 @@ impl TaskEngine {
                 session_id,
                 &event_type,
                 &payload,
-                outcome,
-                status,
-                state,
-                goal.as_ref(),
+                terminal.outcome,
+                terminal.status,
+                terminal.state,
+                terminal.goal.as_ref(),
                 leveler_core::now(),
             )
             .await
-            .map_err(|error| EngineError::TerminalCommitFailed(error.to_string()))?;
+            .map_err(|error| match error {
+                leveler_storage::OwnershipError::CancelRequested => {
+                    EngineError::TaskCancellationRequested
+                }
+                error => EngineError::TerminalCommitFailed(error.to_string()),
+            })?;
         if commit.inserted {
             observer(event);
         }

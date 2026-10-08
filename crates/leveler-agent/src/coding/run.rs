@@ -1359,7 +1359,7 @@ impl CodingRuntime {
         // may be admitted as soon as TaskFinished is projected; a later
         // session-wide lookup could otherwise kill processes owned by that new
         // turn.
-        let mut cleanup_ticket = if !interrupted && !goal_continues {
+        let mut cleanup_ticket = if explicit_task_cancel || (!interrupted && !goal_continues) {
             match self.factory.tool_context.session_scope.as_deref() {
                 Some(scope) => Some(self.factory.background_tasks.detach_cleanup(scope).await),
                 None => None,
@@ -1372,7 +1372,7 @@ impl CodingRuntime {
         // No await may appear between this decision and entering finish_task:
         // cancellation owns the outcome throughout Finalizing, right up to
         // the canonical terminal commit's invocation.
-        let cancelled_at_commit = cancellation.is_cancelled();
+        let mut cancelled_at_commit = cancellation.is_cancelled();
         // The generic cancellation guard rewrites a finalizing window to
         // resumable `interrupted`. An explicit task cancel is a stronger,
         // user-declared outcome and keeps its terminal.
@@ -1396,10 +1396,35 @@ impl CodingRuntime {
         if interrupted {
             crate::test_barrier::hit_before_cancel_terminal_persist();
         }
-        let settled = self
+        let mut settled = self
             .engine
-            .finish_task(token, session_id, terminal, observer)
+            .finish_task(token, session_id, terminal.clone(), observer)
             .await;
+        if matches!(settled, Err(EngineError::TaskCancellationRequested)) {
+            // Storage arbitrated the race. Coding owns the revised goal and
+            // cleanup disposition; Engine never derives these Harness facts.
+            terminal.outcome = TaskOutcome::Cancelled;
+            terminal.reason = Some("user_cancelled_task".to_string());
+            terminal.failure = None;
+            terminal.stop = None;
+            terminal.status = SessionStatus::Cancelled;
+            terminal.state = AgentState::Cancelled;
+            terminal.warnings.clear();
+            if let Some(goal) = terminal.goal.as_mut() {
+                goal.settle = true;
+            }
+            cancelled_at_commit = true;
+            if cleanup_ticket.is_none() {
+                cleanup_ticket = match self.factory.tool_context.session_scope.as_deref() {
+                    Some(scope) => Some(self.factory.background_tasks.detach_cleanup(scope).await),
+                    None => None,
+                };
+            }
+            settled = self
+                .engine
+                .finish_task(token, session_id, terminal, observer)
+                .await;
+        }
         if let Some(started) = publishing_phase {
             tracing::debug!(
                 session = %session_id,

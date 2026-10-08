@@ -266,6 +266,9 @@ pub(crate) fn app_error_from_engine(error: EngineError) -> AppError {
             model: Some(error), ..
         } => AppError::Model(error),
         EngineError::Execution { detail, .. } => AppError::Engine(detail),
+        EngineError::TaskCancellationRequested => {
+            AppError::Agent(leveler_agent::AgentError::Cancelled)
+        }
         EngineError::Cancelled => AppError::Agent(leveler_agent::AgentError::Cancelled),
         EngineError::StaleOwnership(m) => {
             AppError::Agent(leveler_agent::AgentError::StaleOwnership(m))
@@ -311,9 +314,43 @@ pub(crate) fn mode_from_str(s: &str) -> Option<PermissionProfile> {
 pub(crate) async fn checkpoint_reaped_sessions(
     engine: &leveler_engine::TaskEngine,
     reaped_sessions: &[leveler_engine::ReapedSession],
-) {
+) -> Result<(), AppError> {
     let stores = &engine.stores;
     for reaped in reaped_sessions {
+        if reaped.cancel_requested {
+            // Goal settlement is supplied by Coding's recovery owner; the
+            // engine commits only the mechanical lifecycle aggregate.
+            let goal = stores
+                .goals
+                .for_task(&reaped.token.task_id)
+                .await?
+                .into_iter()
+                .find(|goal| goal.state == leveler_storage::GoalState::Running)
+                .map(|goal| leveler_storage::GoalTerminalUpdate {
+                    goal_id: goal.id,
+                    windows_delta: 0,
+                    settle: true,
+                });
+            engine
+                .finish_task(
+                    &reaped.token,
+                    &reaped.session_id,
+                    leveler_engine::TaskTerminal {
+                        outcome: TaskOutcome::Cancelled,
+                        reason: Some("user_cancelled_task".to_string()),
+                        failure: None,
+                        stop: None,
+                        status: leveler_lifecycle::SessionStatus::Cancelled,
+                        state: leveler_lifecycle::AgentState::Cancelled,
+                        goal,
+                        warnings: Vec::new(),
+                    },
+                    &mut |_| {},
+                )
+                .await
+                .map_err(app_error_from_engine)?;
+            continue;
+        }
         let scope = match leveler_agent::coding::latest_session_goal_checkpoint_scope(
             stores,
             &reaped.session_id,
@@ -364,7 +401,13 @@ pub(crate) async fn checkpoint_reaped_sessions(
             ),
         }
     }
-    leveler_engine::release_reaped(engine, reaped_sessions).await;
+    let interrupted: Vec<_> = reaped_sessions
+        .iter()
+        .filter(|reaped| !reaped.cancel_requested)
+        .cloned()
+        .collect();
+    leveler_engine::release_reaped(engine, &interrupted).await;
+    Ok(())
 }
 
 /// Run one turn under a resolved collaboration execution.
@@ -472,6 +515,15 @@ impl Application {
     /// authority, which is what makes it safe from any host on a repository
     /// other processes share: a live boot's turn — this process's own
     /// included — and a turn whose boot cannot be probed are left alone.
+    /// Finish Harness-owned recovery facts before releasing recovered ownership.
+    pub async fn finish_reaped_sessions(
+        &self,
+        engine: &leveler_engine::TaskEngine,
+        reaped: &[leveler_engine::ReapedSession],
+    ) -> Result<(), AppError> {
+        checkpoint_reaped_sessions(engine, reaped).await
+    }
+
     pub async fn reap_zombie_turns(
         &self,
         db: &leveler_storage::Database,
@@ -485,7 +537,7 @@ impl Application {
         )
         .await
         .map_err(app_error_from_engine)?;
-        checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await;
+        checkpoint_reaped_sessions(&engine, &outcome.reaped_sessions).await?;
         for conflict in &outcome.conflicts {
             tracing::warn!(
                 session = conflict.session_id.as_str(),
@@ -954,6 +1006,37 @@ impl Application {
             .await
             .map_err(app_error_from_engine)?;
         closed.map_err(app_error_from_engine)
+    }
+
+    /// Persist cancellation for the turn owned by this runtime boot. A
+    /// successful result precedes the in-memory execution cancellation signal.
+    pub(crate) async fn request_active_task_cancel(
+        &self,
+        session_id: &leveler_core::SessionId,
+    ) -> Result<bool, AppError> {
+        let db = self.open_database().await?;
+        let engine = self.task_engine(&db)?;
+        let Some(task) = engine.stores.tasks.task_for_session(session_id).await? else {
+            return Ok(false);
+        };
+        let Some(owner) = engine.stores.ownership.current(&task).await? else {
+            return Ok(false);
+        };
+        if owner.runtime.as_ref() != Some(&engine.runtime_id)
+            || owner.boot.as_ref() != Some(&engine.boot.id)
+        {
+            return Ok(false);
+        }
+        let token = leveler_core::OwnershipToken {
+            task_id: task,
+            runtime_id: engine.runtime_id.clone(),
+            boot_id: engine.boot.id.clone(),
+            owner_epoch: owner.epoch,
+        };
+        leveler_storage::TerminalRepository::new(&db)
+            .request_task_cancel(&token, session_id)
+            .await
+            .map_err(|error| app_error_from_engine(error.into()))
     }
 
     /// Cancel the logical task behind `session_id` when no turn is running.

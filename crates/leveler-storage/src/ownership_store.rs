@@ -48,6 +48,9 @@ pub enum OwnershipError {
         /// The actual current epoch.
         actual_epoch: OwnerEpoch,
     },
+    /// A durable cancellation won the race with this terminal proposal.
+    #[error("durable task cancellation must be committed before releasing ownership")]
+    CancelRequested,
     /// The epoch space is exhausted. Practically unreachable; failing loudly
     /// is the only acceptable behavior (a wrapped epoch would resurrect old
     /// tokens).
@@ -258,7 +261,7 @@ impl MemoryOwnershipState {
         &self,
         token: &OwnershipToken,
         recorded: impl FnOnce() -> bool,
-        commit: impl FnOnce() -> Result<crate::TaskTerminalCommit, StorageError>,
+        commit: impl FnOnce() -> Result<crate::TaskTerminalCommit, OwnershipError>,
     ) -> Result<crate::TaskTerminalCommit, OwnershipError> {
         let mut owners = self.owners.lock().unwrap();
         let current = Self::is_current_locked(&owners, token);
@@ -271,7 +274,7 @@ impl MemoryOwnershipState {
             return Err(Self::stale_locked(&owners, token));
         }
         let commit = commit()?;
-        if commit.inserted && !Self::release_locked(&mut owners, token) {
+        if current && !Self::release_locked(&mut owners, token) {
             return Err(Self::stale_locked(&owners, token));
         }
         Ok(commit)

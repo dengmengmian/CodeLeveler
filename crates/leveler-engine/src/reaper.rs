@@ -35,6 +35,9 @@ async fn interrupt_turns_owned(
 ) -> Result<Vec<EngineEvent>, EngineError> {
     let mut events = Vec::with_capacity(running.len());
     for turn in running {
+        if turn.status != "running" {
+            continue;
+        }
         let session_id = SessionId::new(turn.session_id.clone());
         let turn_id = TurnId::new(turn.id.clone());
         // Fresh user/chat turns carry their initiating input in the same row
@@ -124,6 +127,8 @@ pub struct ReapConflict {
 pub struct ReapedSession {
     pub session_id: SessionId,
     pub token: OwnershipToken,
+    /// A durable logical cancellation bound to a recovered turn.
+    pub cancel_requested: bool,
 }
 
 /// What a reap did: the reaped events, plus every session whose running turns
@@ -147,7 +152,7 @@ pub async fn reap_after_restart(
     scope: ReapScope,
 ) -> Result<ReapOutcome, EngineError> {
     let stores = &engine.stores;
-    let running = stores.turns.list_running(session_id).await?;
+    let running = stores.turns.list_recovery_candidates(session_id).await?;
     let mut outcome = ReapOutcome::default();
     // Running rows come ordered by session, so each session is one run.
     let mut candidates: Vec<(SessionId, Vec<TurnRecord>)> = Vec::new();
@@ -193,6 +198,7 @@ pub async fn reap_after_restart(
                         &[ReapedSession {
                             session_id: session,
                             token,
+                            cancel_requested: false,
                         }],
                     )
                     .await;
@@ -236,9 +242,45 @@ async fn reap_session(
     log.interrupt_open_children(&mut |event| marked.push(event))
         .await?;
     outcome.events.extend(marked);
+    // The intent belongs to the dead turn, not to the newly acquired recovery
+    // epoch. Recovery never replays its unknown tools; it settles the task.
+    let mut cancelled = false;
+    for event in stores.events.load(session).await? {
+        if event.event_type != "task_cancel_requested" {
+            continue;
+        }
+        let EngineEvent::TaskCancelRequested {
+            task_id,
+            turn_id,
+            boot_id,
+            owner_epoch,
+        } = EngineEvent::from_payload(&event.payload)?
+        else {
+            return Err(EngineError::Corrupt(
+                "task cancellation row has a different event variant".to_string(),
+            ));
+        };
+        if let Some(turn) = turns
+            .iter()
+            .find(|turn| event.turn_id.as_deref() == Some(turn.id.as_str()))
+        {
+            if task_id != token.task_id
+                || turn_id.as_str() != turn.id
+                || Some(boot_id.as_str()) != turn.owner_boot_id.as_deref()
+                || owner_epoch.get() == 0
+                || owner_epoch >= token.owner_epoch
+            {
+                return Err(EngineError::Corrupt(
+                    "task cancellation intent has invalid ownership binding".to_string(),
+                ));
+            }
+            cancelled = true;
+        }
+    }
     outcome.reaped_sessions.push(ReapedSession {
         session_id: session.clone(),
         token: token.clone(),
+        cancel_requested: cancelled,
     });
     outcome.events.extend(events);
     Ok(())

@@ -964,7 +964,7 @@ CancelRequested → CancelDelivered → ExecutionTerminated → TerminalPersiste
 
 这些是语义阶段，不是新的 wire 类型。`CancelCurrentTurn` 返回成功只表示请求已经到达拥有该 Turn 的 Runtime；Turn 在终态提交前始终是 `running`。客户端从持久终态（`TaskFinished` 及对应 `RuntimeEvent`）得知真正的结束，而不是从 ACK 推断，并且在 Turn 仍存活时显示“正在停止”，而不是“已停止”。
 
-`CancelTask` 的差别在意图，不在 ACK 强度：它要求提交终态 `cancelled`、结清 Goal 并拒绝之后的继续；而 `CancelCurrentTurn` 留下可恢复的 `interrupted`。目前运行中的路径只在内存中携带该意图（turn lease 的 cancel flag）。如果 boot 在 `CancelTask` ACK 之后、`cancelled` 终态提交之前死亡，该意图就会丢失，恢复会把孤儿 Turn 结算为可恢复的 `interrupted`。这是一个已知且尚未修复的持久化缺口：任何 ACK 都不能被表述成“执行已经终止”。
+`CancelTask` 的差别在意图，不在 ACK 强度：它要求提交终态 `cancelled`、结清 Goal 并拒绝之后的继续；而 `CancelCurrentTurn` 留下可恢复的 `interrupted`。运行中的取消请求在 ACK 前写入现有事件日志，绑定精确 task、turn、boot 和 owner epoch，并与终态提交共用持久写入事务边界。取消先提交则终态必须为 `cancelled`；已提交的完成结果不会被迟到取消覆盖。boot 在 ACK 后死亡时，运行时只回收已证明死亡的 turn，Harness 依据该 turn 的持久取消意图供给 Goal 结算，终态与会话投影和 Ownership 释放原子提交。恢复不重放结果未知的工具调用，ACK 始终不能被表述成“执行已经终止”。
 
 ---
 

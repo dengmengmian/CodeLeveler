@@ -113,7 +113,8 @@ pub async fn prepare_daemon(
     let reap =
         leveler_engine::reap_after_restart(&engine, None, leveler_engine::ReapScope::EndedBoots)
             .await?;
-    leveler_engine::release_reaped(&engine, &reap.reaped_sessions).await;
+    app.finish_reaped_sessions(&engine, &reap.reaped_sessions)
+        .await?;
     for conflict in &reap.conflicts {
         tracing::warn!(session = conflict.session_id.as_str(), refusal = ?conflict.refusal,
             "not reaping running turns without proof their boot has ended");

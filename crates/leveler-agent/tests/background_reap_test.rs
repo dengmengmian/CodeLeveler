@@ -30,12 +30,14 @@ const SESSION_SCOPE: &str = "sess-under-test";
 
 struct MockRuntime {
     responses: Mutex<VecDeque<ModelResponse>>,
+    cancel_before_closeout: Mutex<Option<(Database, leveler_core::SessionId)>>,
 }
 
 impl MockRuntime {
     fn new(responses: Vec<ModelResponse>) -> Self {
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
+            cancel_before_closeout: Mutex::new(None),
         }
     }
 }
@@ -47,9 +49,37 @@ impl ModelRuntime for MockRuntime {
         _request: ModelRequest,
         _cancellation: CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+        let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             ModelError::new(leveler_model::ModelErrorKind::Other, "no more responses")
-        })
+        })?;
+        if response.message.content.iter().any(
+            |part| matches!(part, ContentPart::ToolCall { call } if call.name == "update_goal"),
+        ) {
+            let pending = self.cancel_before_closeout.lock().unwrap().take();
+            if let Some((db, session)) = pending {
+                let task = leveler_storage::TaskStore::task_for_session(&db, &session)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let owner = leveler_storage::OwnershipStore::current(&db, &task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let token = leveler_core::OwnershipToken {
+                    task_id: task,
+                    runtime_id: owner.runtime.unwrap(),
+                    boot_id: owner.boot.unwrap(),
+                    owner_epoch: owner.epoch,
+                };
+                assert!(
+                    leveler_storage::TerminalRepository::new(&db)
+                        .request_task_cancel(&token, &session)
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+        Ok(response)
     }
 
     async fn stream(
@@ -167,6 +197,7 @@ struct Harness {
     db: Database,
     dir: tempfile::TempDir,
     registry: Arc<BackgroundTaskRegistry>,
+    runtime: Arc<MockRuntime>,
 }
 
 async fn harness(responses: Vec<ModelResponse>) -> Harness {
@@ -209,7 +240,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
             resource_grants: std::sync::Arc::new(
                 leveler_storage::MemoryResourceGrantStore::default(),
             ),
-            runtime,
+            runtime: runtime.clone(),
             registry: Arc::new(tool_registry),
             tool_context,
             model: ModelRef::new("mock", "m"),
@@ -238,6 +269,7 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         db,
         dir,
         registry,
+        runtime,
     }
 }
 
@@ -329,6 +361,74 @@ async fn direct_run_terminal_reaps_session_owned_background_tasks() {
 
     assert_terminal_within(&h.registry, "bg-1", "direct path").await;
     assert_eq!(h.registry.kill_scope(SESSION_SCOPE).await, 0);
+}
+
+/// A durable cancellation wins even when the model reports completion and
+/// neither the executor token nor the in-memory task-cancel flag was signalled.
+#[tokio::test]
+async fn durable_cancel_wins_completed_goal_and_cleans_exact_background_targets() {
+    let h = harness(vec![
+        spawn_sleep_server(),
+        tool_call(
+            "closeout",
+            "update_goal",
+            serde_json::json!({"status": "complete", "summary": "done"}),
+        ),
+    ])
+    .await;
+    let s = spec(&h, "start a service and finish");
+    let session = h.engine.create_task(&s).await.unwrap();
+    *h.runtime.cancel_before_closeout.lock().unwrap() = Some((h.db.clone(), session.clone()));
+    let result = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(result, Err(leveler_engine::EngineError::Cancelled)),
+        "{result:?}"
+    );
+    assert!(
+        !h.engine.task_cancel.load(Ordering::SeqCst),
+        "only durable intent arbitrated the race"
+    );
+    assert_terminal_within(&h.registry, "bg-1", "durable cancellation race").await;
+    let task = leveler_storage::TaskStore::task_for_session(&h.db, &session)
+        .await
+        .unwrap()
+        .unwrap();
+    let goals = leveler_storage::GoalStore::for_task(&h.db, &task)
+        .await
+        .unwrap();
+    assert!(!goals.is_empty());
+    assert!(
+        goals
+            .iter()
+            .all(|goal| goal.state == leveler_storage::GoalState::Settled)
+    );
+    let events = leveler_storage::EventRepository::new(&h.db)
+        .load(&session)
+        .await
+        .unwrap();
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "task_finished")
+        .collect();
+    assert_eq!(terminals.len(), 1);
+    assert!(matches!(
+        leveler_engine::EngineEvent::from_payload(&terminals[0].payload).unwrap(),
+        leveler_engine::EngineEvent::TaskFinished {
+            outcome: leveler_lifecycle::TaskOutcome::Cancelled,
+            ..
+        }
+    ));
+    assert!(
+        leveler_storage::OwnershipStore::current(&h.db, &task)
+            .await
+            .unwrap()
+            .unwrap()
+            .runtime
+            .is_none()
+    );
 }
 
 /// A user can explicitly ask a dev server to outlive the goal that launched

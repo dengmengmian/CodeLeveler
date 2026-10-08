@@ -1451,7 +1451,8 @@ pub(crate) async fn cmd_web(
                 leveler_engine::ReapScope::EndedBoots,
             )
             .await?;
-            leveler_engine::release_reaped(&engine, &reap.reaped_sessions).await;
+            app.finish_reaped_sessions(&engine, &reap.reaped_sessions)
+                .await?;
             if !reap.events.is_empty() {
                 tracing::warn!(
                     reaped = reap.events.len(),

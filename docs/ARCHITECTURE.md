@@ -1000,12 +1000,15 @@ the ACK, and render "stopping" rather than "stopped" while the turn is live.
 
 `CancelTask` differs in intent, not in ACK strength: it asks for a terminal
 `cancelled` outcome that settles the goal and refuses a later continuation,
-whereas `CancelCurrentTurn` leaves a resumable `interrupted`. Today the running
-path carries that intent only in memory (the turn lease's cancel flag). If the
-boot dies after the `CancelTask` ACK but before the `cancelled` terminal
-commits, the intent is lost and recovery settles the orphan turn as resumable
-`interrupted`. This is a known, unfixed durability gap: an ACK must not be
-presented as execution terminated.
+whereas `CancelCurrentTurn` leaves a resumable `interrupted`. A running task's
+cancellation is committed to the existing event log before ACK, bound to its
+exact task, turn, boot and owner epoch. Cancellation and terminal commits share
+the same durable writer boundary: a cancellation that wins requires `cancelled`,
+while a completed terminal cannot be overwritten by a late cancel. After a boot
+dies, the runtime reaps only turns proven dead and the Harness supplies goal
+settlement from that turn's durable intent. The terminal, session projection and
+ownership release commit atomically. Recovery does not replay tools with unknown
+results, and ACK must never be presented as execution terminated.
 
 ---
 

@@ -123,6 +123,79 @@ impl<'a> TerminalRepository<'a> {
 }
 
 impl TerminalRepository<'_> {
+    /// Persist a logical cancellation before signalling execution. The same
+    /// SQLite writer boundary arbitrates cancellation against task completion.
+    pub async fn request_task_cancel(
+        &self,
+        token: &leveler_core::OwnershipToken,
+        session_id: &SessionId,
+    ) -> Result<bool, crate::OwnershipError> {
+        let mut tx = self
+            .db
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StorageError::from)?;
+        let owner = task_owner_in_tx(&mut tx, token, session_id).await?;
+        let boot_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND owner_boot_id = ?2)",
+        )
+        .bind(token.task_id.as_str())
+        .bind(token.boot_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        if !owner_is_current(owner.as_ref(), token) || !boot_current {
+            // A terminal that beat this request already released this epoch.
+            if owner.as_ref().is_some_and(|(runtime, epoch)| {
+                runtime.is_none() && *epoch == token.owner_epoch.get() as i64
+            }) {
+                tx.commit().await.map_err(StorageError::from)?;
+                return Ok(false);
+            }
+            tx.rollback().await.map_err(StorageError::from)?;
+            return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        let turn: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM turns WHERE session_id = ?1 AND status = 'running' \
+             AND owner_boot_id = ?2 AND ordinal = (SELECT MAX(ordinal) FROM turns WHERE session_id = ?1) ORDER BY ordinal DESC LIMIT 1")
+            .bind(session_id.as_str()).bind(token.boot_id.as_str())
+            .fetch_optional(&mut *tx).await.map_err(StorageError::from)?;
+        let Some(turn) = turn else {
+            tx.commit().await.map_err(StorageError::from)?;
+            return Ok(false);
+        };
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 AND turn_id = ?2 \
+             AND type = 'task_cancel_requested')",
+        )
+        .bind(session_id.as_str())
+        .bind(&turn)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StorageError::from)?;
+        if !exists {
+            let payload = serde_json::json!({
+                "type": "task_cancel_requested", "payload": {
+                    "task_id": token.task_id.as_str(), "owner_epoch": token.owner_epoch.get(),
+                    "boot_id": token.boot_id.as_str(), "turn_id": turn,
+                },
+            })
+            .to_string();
+            append_event(
+                &mut tx,
+                session_id,
+                Some(&TurnId::new(turn)),
+                "task_cancel_requested",
+                &payload,
+                &leveler_core::now(),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(StorageError::from)?;
+        Ok(true)
+    }
+
     /// Fenced [`Self::finish_task`]: the ownership assertion runs INSIDE the
     /// same transaction as the terminal event and the projection update —
     /// assert, append, project, COMMIT, with any failure rolling back all of
@@ -204,6 +277,51 @@ impl TerminalRepository<'_> {
         if !current {
             let _ = tx.rollback().await;
             return Err(crate::ownership_store::sqlite_stale_error(self.db, token).await);
+        }
+        // Closed logical tasks cannot be cancelled through a newly acquired
+        // recovery epoch. This read and the terminal insert share the writer lock.
+        if outcome == TaskOutcome::Cancelled {
+            let closed: bool = sqlx::query_scalar(
+                "SELECT COALESCE(status != 'running' AND outcome IN ('completed', 'cancelled'), 0) \
+                 FROM sessions WHERE id = ?1",
+            )
+            .bind(session_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+            if closed {
+                let event = sqlx::query_as::<_, EventRecord>(
+                    "SELECT id, session_id, turn_id, sequence, type AS event_type, payload, \
+                     created_at, schema_version FROM events WHERE session_id = ?1 \
+                     AND type = 'task_finished' ORDER BY sequence DESC LIMIT 1",
+                )
+                .bind(session_id.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(StorageError::from)?;
+                crate::ownership_store::release_owner(&mut tx, token).await?;
+                tx.commit().await.map_err(StorageError::from)?;
+                return Ok(TaskTerminalCommit {
+                    event,
+                    inserted: false,
+                });
+            }
+        } else {
+            let requested: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 \
+                 AND type = 'task_cancel_requested' AND json_extract(payload, '$.payload.task_id') = ?2 \
+                 AND json_extract(payload, '$.payload.owner_epoch') = ?3)",
+            )
+            .bind(session_id.as_str())
+            .bind(token.task_id.as_str())
+            .bind(token.owner_epoch.get() as i64)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(StorageError::from)?;
+            if requested {
+                tx.rollback().await.map_err(StorageError::from)?;
+                return Err(crate::OwnershipError::CancelRequested);
+            }
         }
         let event = append_event(&mut tx, session_id, None, event_type, &payload, &now)
             .await
@@ -490,6 +608,161 @@ mod tests {
             .await
             .unwrap();
         (db, session, token, goal)
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_and_completion_arbitrate_under_one_writer() {
+        for cancel_first in [true, false] {
+            let (db, session, token, _) = db_with_owned_goal().await;
+            crate::TurnStore::start_owned(&db, &token, &session, "user", None, leveler_core::now())
+                .await
+                .unwrap();
+            let repo = TerminalRepository::new(&db);
+            if cancel_first {
+                assert!(repo.request_task_cancel(&token, &session).await.unwrap());
+                assert!(repo.request_task_cancel(&token, &session).await.unwrap());
+            }
+            let completed = repo
+                .finish_task_owned(
+                    &token,
+                    &session,
+                    "task_finished",
+                    r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                    TaskOutcome::Completed,
+                    SessionStatus::Completed,
+                    AgentState::Complete,
+                    None,
+                    leveler_core::now(),
+                )
+                .await;
+            if cancel_first {
+                assert!(matches!(
+                    completed,
+                    Err(crate::OwnershipError::CancelRequested)
+                ));
+                repo.finish_task_owned(
+                    &token,
+                    &session,
+                    "task_finished",
+                    r#"{"type":"task_finished","payload":{"outcome":"cancelled"}}"#,
+                    TaskOutcome::Cancelled,
+                    SessionStatus::Cancelled,
+                    AgentState::Cancelled,
+                    None,
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            } else {
+                completed.unwrap();
+                assert!(!repo.request_task_cancel(&token, &session).await.unwrap());
+            }
+            let events = EventRepository::new(&db).load(&session).await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.event_type == "task_finished")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.event_type == "task_cancel_requested")
+                    .count(),
+                usize::from(cancel_first)
+            );
+            assert!(
+                db.current(&token.task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .runtime
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_and_complete_have_one_terminal_winner() {
+        let (db, session, token, _) = db_with_owned_goal().await;
+        crate::TurnStore::start_owned(&db, &token, &session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        let repo = TerminalRepository::new(&db);
+        let (cancel, complete) = tokio::join!(
+            repo.request_task_cancel(&token, &session),
+            repo.finish_task_owned(
+                &token,
+                &session,
+                "task_finished",
+                r#"{"type":"task_finished","payload":{"outcome":"completed"}}"#,
+                TaskOutcome::Completed,
+                SessionStatus::Completed,
+                AgentState::Complete,
+                None,
+                leveler_core::now()
+            )
+        );
+        match complete {
+            Ok(_) => assert!(!cancel.unwrap()),
+            Err(crate::OwnershipError::CancelRequested) => {
+                assert!(cancel.unwrap());
+                repo.finish_task_owned(
+                    &token,
+                    &session,
+                    "task_finished",
+                    r#"{"type":"task_finished","payload":{"outcome":"cancelled"}}"#,
+                    TaskOutcome::Cancelled,
+                    SessionStatus::Cancelled,
+                    AgentState::Cancelled,
+                    None,
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            }
+            Err(error) => panic!("unexpected completion failure: {error}"),
+        }
+        assert_eq!(
+            EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "task_finished")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn old_boot_cannot_cancel_after_new_epoch_takes_over() {
+        let (db, session, token, _) = db_with_owned_goal().await;
+        crate::TurnStore::start_owned(&db, &token, &session, "user", None, leveler_core::now())
+            .await
+            .unwrap();
+        db.acquire(
+            &token.task_id,
+            &token.runtime_id,
+            &leveler_core::BootId::new("next-boot"),
+            token.owner_epoch,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            TerminalRepository::new(&db)
+                .request_task_cancel(&token, &session)
+                .await,
+            Err(crate::OwnershipError::Stale { .. })
+        ));
+        assert!(
+            EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
