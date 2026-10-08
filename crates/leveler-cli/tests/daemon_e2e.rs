@@ -2615,3 +2615,197 @@ async fn collaboration_entry_smoke_body() {
     drop(resumed);
     stop_daemon(&mut daemon);
 }
+
+/// A side effect completed outside SQLite, but its tool never returned a
+/// successful result. Recovery of an acknowledged logical cancel must not
+/// replay that uncertain operation or admit it again through Resume.
+#[cfg(feature = "test-crash-barrier")]
+#[test]
+fn cancelled_unknown_tool_effect_is_not_replayed_after_sigkill() {
+    leveler_test_support::bounded_test(
+        "cancelled_unknown_tool_effect_is_not_replayed_after_sigkill",
+        Duration::from_secs(90),
+        cancelled_unknown_tool_effect_is_not_replayed_after_sigkill_body,
+    );
+}
+
+#[cfg(feature = "test-crash-barrier")]
+async fn cancelled_unknown_tool_effect_is_not_replayed_after_sigkill_body() {
+    let call = "uncertain-side-effect";
+    let script = "import pathlib, threading; p = pathlib.Path('effect-count'); p.open('a').write('executed\\n'); print('effect-committed', flush=True); threading.Event().wait(120); pathlib.Path('effect-result').write_text('completed')";
+    let server = leveler_test_support::MockServer::start(vec![smoke_sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": call, "type": "function",
+            "function": {"name": "run_command", "arguments": serde_json::json!({
+                "program": "python3", "args": ["-c", script]
+            }).to_string()}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])])
+    .await;
+    let env = test_env(&server.base_url());
+    let effect = env.repo.join("effect-count");
+    let completion = env.repo.join("effect-result");
+    let ready = env.home.join("ready-unknown-tool-1.json");
+    let barrier = env.home.join(format!(
+        ".test-crash-barrier-{}",
+        leveler_core::new_uuid_string()
+    ));
+    let mut daemon = spawn_serve_with_cancel_terminal_barrier(&env, &ready, &barrier);
+    wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "cancel uncertain external side effect".into(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::FullAccess,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    let before = client.runtime_info().await.unwrap();
+    let mut events = client.subscribe_session(&session);
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "execute the controlled operation once".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let RuntimeEvent::ToolCallOutput { id, chunk, .. } = events.recv().await.unwrap()
+                && id.as_str() == call
+                && chunk.contains("effect-committed")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("external effect and readiness output must occur before cancellation");
+    assert_eq!(std::fs::read_to_string(&effect).unwrap(), "executed\n");
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let log = leveler_storage::EventRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert!(
+        log.iter()
+            .any(|row| row.event_type == "tool_call_started" && row.payload.contains(call))
+    );
+    assert!(
+        !log.iter()
+            .any(|row| row.event_type == "tool_call_finished" && row.payload.contains(call)),
+        "the externally observable effect must precede the tool result commit"
+    );
+    let cancel = leveler_client_protocol::CommandEnvelope {
+        command_id: leveler_client_protocol::CommandId::new("cancel-uncertain-effect"),
+        session_id: session.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::CancelTask {
+            session_id: session.clone(),
+        },
+    };
+    client
+        .deliver(cancel.clone())
+        .await
+        .expect("durable CancelTask ACK");
+    wait_for_cancel_terminal_barrier(&barrier, &mut daemon, Duration::from_secs(15));
+    assert_eq!(
+        task_terminal_state(&db, &session).await,
+        (None, 0),
+        "ACK is not a task terminal"
+    );
+    let at_crash = leveler_storage::EventRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    for row in at_crash
+        .iter()
+        .filter(|row| row.event_type == "tool_call_finished" && row.payload.contains(call))
+    {
+        let event = leveler_engine::EngineEvent::from_payload(&row.payload).unwrap();
+        assert!(
+            matches!(
+                event,
+                leveler_engine::EngineEvent::ToolCallFinished { is_error: true, .. }
+            ),
+            "the tool never returned a successful result before SIGKILL"
+        );
+    }
+    assert!(
+        !completion.exists(),
+        "the controlled tool never published its completion result"
+    );
+    eprintln!(
+        "[unknown-tool-crash] external_count=1; initial_tool_results=0; error_results_before_crash={}",
+        at_crash
+            .iter()
+            .filter(|row| row.event_type == "tool_call_finished" && row.payload.contains(call))
+            .count()
+    );
+    daemon
+        .kill()
+        .expect("SIGKILL only the isolated test daemon");
+    daemon.wait().unwrap();
+    drop(client);
+    let ready = env.home.join("ready-unknown-tool-2.json");
+    let mut replacement = spawn_serve(&env, &ready);
+    wait_ready(&ready, &mut replacement, Duration::from_secs(30));
+    let recovered = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let after = recovered.runtime_info().await.unwrap();
+    assert_eq!(before.runtime_id, after.runtime_id);
+    assert_ne!(
+        before.pid, after.pid,
+        "recovery must run in the replacement daemon process"
+    );
+    assert_eq!(
+        task_terminal_state(&db, &session).await,
+        (Some("cancelled".into()), 1)
+    );
+    recovered
+        .deliver(cancel)
+        .await
+        .expect("receipt retry is an identical completed command");
+    assert!(
+        recovered
+            .send(ClientCommand::ResumeTask {
+                session_id: session.clone(),
+                content: "继续".into()
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        leveler_storage::TurnRepository::new(&db)
+            .list(&session)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(&effect).unwrap(),
+        "executed\n",
+        "recovery and refused Resume must not replay the external effect"
+    );
+    assert!(
+        !completion.exists(),
+        "recovery must not finish or replay the uncertain tool"
+    );
+    drop(recovered);
+    drop(db);
+    stop_daemon(&mut replacement);
+}
