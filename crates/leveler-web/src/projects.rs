@@ -247,7 +247,7 @@ impl ProjectManager {
         let repo = repo.canonicalize().unwrap_or(repo);
         if repo == self.router.primary_repo() {
             return Ok(self.info_for(&repo, ProjectStatus::Online));
-        }        // Explicit open overrides an earlier removal.
+        } // Explicit open overrides an earlier removal.
         self.state.ignored.lock().unwrap().remove(&repo);
         {
             let mut entries = self.state.entries.lock().unwrap();
@@ -386,7 +386,10 @@ impl ProjectManager {
                     .unwrap()
                     .insert(repo.clone(), entry);
                 self.state.set_status(&repo, ProjectStatus::Online);
-                return Err(ProjectError::lifecycle(refusal.state(), refusal.refusal_message()));
+                return Err(ProjectError::lifecycle(
+                    refusal.state(),
+                    refusal.refusal_message(),
+                ));
             }
         }
         self.router.remove_daemon(&repo);
@@ -544,9 +547,7 @@ impl ProjectManager {
                     OwnedRuntimeError::InvalidReadyJson(error) => {
                         format!("无法解析 daemon 就绪信息：{error}")
                     }
-                    OwnedRuntimeError::MissingSocket => {
-                        "daemon 就绪信息缺少 socket 字段".into()
-                    }
+                    OwnedRuntimeError::MissingSocket => "daemon 就绪信息缺少 socket 字段".into(),
                     OwnedRuntimeError::ChildExited(status) => {
                         format!("daemon 启动即退出（{status}）——多半是该仓库已有 daemon 或配置错误")
                     }
@@ -555,9 +556,9 @@ impl ProjectManager {
                 EnsureOwnedError::Connect(error) => {
                     format!("daemon 已就绪但连接失败：{error}")
                 }
-                EnsureOwnedError::Generation { reason, .. } => format!(
-                    "该项目运行时不是当前代际，且无法自动切换：{reason}"
-                ),
+                EnsureOwnedError::Generation { reason, .. } => {
+                    format!("该项目运行时不是当前代际，且无法自动切换：{reason}")
+                }
             };
             let state = error.lifecycle_state();
             ProjectError::lifecycle(state, message)
@@ -758,7 +759,9 @@ impl OwnedRetirement {
                 "该项目运行时仍在执行任务（轮次 {active_turns} · 后台任务 {active_background_tasks}），已拒绝重启；请先完成或停止这些任务"
             ),
             Self::Unavailable { reason } => {
-                format!("无法确认该项目运行时是否空闲（{reason}），已拒绝重启；请从启动它的客户端停止它")
+                format!(
+                    "无法确认该项目运行时是否空闲（{reason}），已拒绝重启；请从启动它的客户端停止它"
+                )
             }
         }
     }
@@ -1405,10 +1408,12 @@ mod tests {
             .expect_err("a runtime of another generation must not be adopted");
         assert_eq!(
             error.state,
-            Some(leveler_runtime_host::RuntimeLifecycleState::UpgradeDeferred {
-                active_turns: 1,
-                active_background_tasks: 0,
-            }),
+            Some(
+                leveler_runtime_host::RuntimeLifecycleState::UpgradeDeferred {
+                    active_turns: 1,
+                    active_background_tasks: 0,
+                }
+            ),
             "the deferral must be named, not swallowed: {error}"
         );
         assert!(
@@ -1424,7 +1429,10 @@ mod tests {
             .await
             .expect("the deferred runtime keeps serving");
         assert_eq!(
-            LocalRuntimeService::runtime_info(&client).await.unwrap().pid,
+            LocalRuntimeService::runtime_info(&client)
+                .await
+                .unwrap()
+                .pid,
             std::process::id(),
             "no replacement may take an endpoint whose owner was not released"
         );
@@ -1439,7 +1447,8 @@ mod tests {
     async fn an_unprovable_runtime_of_another_generation_is_a_named_failure() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("legacy.sock");
-        let service = ForeignBuildService::new(leveler_client_protocol::RetireDecision::Unsupported);
+        let service =
+            ForeignBuildService::new(leveler_client_protocol::RetireDecision::Unsupported);
         let server = LocalSocketServer::bind(&socket, service).await.unwrap();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let serve_shutdown = shutdown.clone();

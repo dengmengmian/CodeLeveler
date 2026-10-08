@@ -289,19 +289,29 @@ pub enum HandoffEvent {
     /// [`Self::UpgradeDeferred`] is a decision from the runtime; this is the
     /// absence of one. Nothing was signalled and nothing was changed: a client
     /// that cannot tell "busy" from "mute" must not act on either.
-    MigrationFailed { reason: String },
+    MigrationFailed {
+        reason: String,
+    },
     /// A runtime too old to retire atomically was verified and is being
     /// replaced.
     ///
     /// Reported as its OWN event rather than a task outcome: this runtime's
     /// in-flight work is interrupted, and a reader must never see that as a
     /// normal `TaskFinished`.
-    MigrationStarted { pid: u32, version: String },
+    MigrationStarted {
+        pid: u32,
+        version: String,
+    },
     /// The signal that was sent to that runtime, and whether it was the forced
     /// escalation.
-    MigrationTerminating { pid: u32, force: bool },
+    MigrationTerminating {
+        pid: u32,
+        force: bool,
+    },
     /// The old runtime released the endpoint; the replacement may start.
-    MigrationTerminated { pid: u32 },
+    MigrationTerminated {
+        pid: u32,
+    },
 }
 
 /// The shell supplies its own locale, text, stderr and terminal input.
@@ -947,9 +957,7 @@ async fn force_migrate_legacy_runtime(
             None => break,
             // A different runtime already owns the endpoint. The old
             // generation is gone; this migration has nothing left to do.
-            Some((pid, runtime_id))
-                if pid != target.pid || runtime_id != target.runtime_id =>
-            {
+            Some((pid, runtime_id)) if pid != target.pid || runtime_id != target.runtime_id => {
                 tracing::info!(
                     pid,
                     %runtime_id,
@@ -992,9 +1000,7 @@ async fn force_migrate_legacy_runtime(
                     force: true,
                 });
             }
-            Some(TerminationSignal::Kill)
-                if elapsed >= LEGACY_TERMINATION_GRACE * 2 =>
-            {
+            Some(TerminationSignal::Kill) if elapsed >= LEGACY_TERMINATION_GRACE * 2 => {
                 return Err(MigrationRefusal::DidNotExit {
                     pid: target.pid,
                     waited_secs: elapsed.as_secs(),

@@ -65,10 +65,9 @@ impl EnsureOwnedError {
     pub fn lifecycle_state(&self) -> RuntimeLifecycleState {
         match self {
             Self::Generation { state, .. } => *state,
-            Self::NoLauncher { .. }
-            | Self::Spawn(_)
-            | Self::Ready(_)
-            | Self::Connect(_) => RuntimeLifecycleState::Unresponsive,
+            Self::NoLauncher { .. } | Self::Spawn(_) | Self::Ready(_) | Self::Connect(_) => {
+                RuntimeLifecycleState::Unresponsive
+            }
         }
     }
 }

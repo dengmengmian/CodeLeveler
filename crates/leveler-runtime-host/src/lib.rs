@@ -9,9 +9,9 @@ mod lifecycle_state;
 mod server;
 #[cfg(any(unix, windows))]
 pub use client::{
-    DaemonReviver, DetachedRuntimeLaunch, DrainOutcome, NonInteractiveHandoffUi, StartupObservation,
-    connect_global_task_runtime, ensure_default_runtime, observe_retiring_runtime,
-    reconcile_runtime_generation,
+    DaemonReviver, DetachedRuntimeLaunch, DrainOutcome, NonInteractiveHandoffUi,
+    StartupObservation, connect_global_task_runtime, ensure_default_runtime,
+    observe_retiring_runtime, reconcile_runtime_generation,
 };
 pub use client::{
     EnsureError, HandoffAction, HandoffEvent, HandoffUi, RuntimeConsistency, classify_runtime,
@@ -22,9 +22,9 @@ pub use lifecycle_state::{LifecycleAction, RuntimeLifecycleState};
 mod owned;
 pub use legacy::{
     LegacyRuntimeTarget, MigrationRefusal, OwnershipEvidence, ProcessWitness, SocketObject,
-    TerminationSignal, platform_supports_forced_migration, process_alive, process_uid,
-    process_command, process_witness, revalidate, serves_workspace, signal_process,
-    socket_object, holds_endpoint_socket, ownership_evidence, verify_target,
+    TerminationSignal, holds_endpoint_socket, ownership_evidence,
+    platform_supports_forced_migration, process_alive, process_command, process_uid,
+    process_witness, revalidate, serves_workspace, signal_process, socket_object, verify_target,
 };
 pub use owned::{
     EnsureOwnedError, OwnedRuntime, OwnedRuntimeError, OwnedRuntimeLaunch,

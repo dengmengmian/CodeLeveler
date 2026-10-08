@@ -397,9 +397,11 @@ async fn a_legacy_runtime_without_a_provable_identity_is_refused_without_a_signa
     );
     // Refused, not terminated: this process is still here, and so is the
     // runtime on the endpoint.
-    assert!(LocalSocketRuntimeClient::connect(&layout.socket_path())
-        .await
-        .is_ok());
+    assert!(
+        LocalSocketRuntimeClient::connect(&layout.socket_path())
+            .await
+            .is_ok()
+    );
     assert!(
         old.commands().is_empty(),
         "a refusal must not command the previous runtime"
@@ -816,7 +818,10 @@ async fn await_endpoint(socket: &std::path::Path) -> LocalSocketRuntimeClient {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the fake legacy runtime never answered on {}", socket.display());
+    panic!(
+        "the fake legacy runtime never answered on {}",
+        socket.display()
+    );
 }
 
 /// A runtime that cannot retire atomically is replaced in a CONTROLLED way: its
@@ -879,7 +884,9 @@ async fn a_legacy_runtime_is_verified_and_terminated_before_replacement() {
         Err(error) => error,
     };
     assert!(
-        error.downcast_ref::<leveler_runtime_host::EnsureError>().is_none(),
+        error
+            .downcast_ref::<leveler_runtime_host::EnsureError>()
+            .is_none(),
         "the handover must not be the failure; it must fail at the launch: {error}"
     );
 

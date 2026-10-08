@@ -579,7 +579,9 @@ async fn host_refuses_to_replace_an_old_build_it_cannot_verify_body() {
     let still_there = LocalSocketRuntimeClient::connect(&layout.socket_path())
         .await
         .expect("the old build is still serving");
-    let info = LocalRuntimeService::runtime_info(&still_there).await.unwrap();
+    let info = LocalRuntimeService::runtime_info(&still_there)
+        .await
+        .unwrap();
     assert_eq!(info.build, old_build);
     assert_eq!(info.pid, std::process::id());
 
