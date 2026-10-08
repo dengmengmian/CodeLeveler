@@ -952,6 +952,8 @@ stdout/stderr 的实时通道和行缓冲都有容量上限。消费者变慢时
 
 daemon 只有在这个边界提交后才发送 wire ACK。如果进程在正常 transcript 追加之前退出，重启恢复会在当前 ownership token 下，以 turn id 而不是消息内容作为身份键，恰好一次地补齐 initiating message，然后才结算孤儿 turn。`UserMessageAdded` 是乐观的客户端通知；它不是权威输入、持久化命令或 durability witness。
 
+对每个交互客户端来说，ACK 契约是同一个：启动或继续 Turn 的命令，只有在对应的持久化接收边界提交后才返回成功。进程内 TUI、`leveler serve` 暴露的 daemon、该进程服务的 `/web` UI，以及连接的 WebUI 都遵守这一条；Embedded 与 Daemon 之间不再存在不同的 Turn ACK 契约。成功 ACK 只表示执行输入已被持久接收（`EngineEvent::TurnStarted` 在 `TurnStore::start_owned` 提交后发出），不表示 Turn 已完成，也不表示工具副作用 exactly-once。被拒绝的 Turn 必须返回明确错误，而不是成功 ACK。无响应或断线不能推导命令未执行：凭证仍按原语义去重，未知结果不授权自动重跑。
+
 ---
 
 ## 12. 模型接入与能力协商
@@ -1197,7 +1199,7 @@ Session、TaskEngine 和 Runtime 只有一套实现。Session 的 `repository` �
 
 `session_projection` 从持久 turn/event 顺序、boot 存活证据和实际 live waiter 派生 `task_status` 与 `task_terminal`，供本地列表、snapshot 和全局索引共享。原 `status` 保留 Session lifecycle 语义。唯一权威 terminal 是已提交 `TaskFinished`；Answered 表示回答，stop=Completed 是领域完成声明，均不代表独立验收。旧 TaskFinished 的 outcome=Completed、stop=None 保留原终态兼容，不补造领域声明。已提交 terminal 优先于尚未清理的旧 live lease；其后新受理 turn 的 durable identity/ordinal 和事件顺序阻止旧 terminal 覆盖新活动。没有 terminal 的最终正文或工具成功不能显示 completed。只读全局索引能够证明 owner 正在运行，却不能凭持久审批记录证明 waiter 存活；可操作 WaitingUser 从连接后的 owner snapshot 获得。
 
-断线后 snapshot 恢复持久正文、plan、终态和仍存活的 approval/clarification waiter。答复、超时、取消或 runtime restart 后的旧 interaction 不能重新操作；取消期间 future 被丢弃也必须清除 waiter。runtime 重启读取持久事实，旧 provider 流不自动续跑，旧 turn 按 owner epoch 表达 interrupted/unknown。未来 Desktop 使用 daemon 的 durable wire ACK 路径；默认 in-process 乐观 ACK 不作为 durable admission。ACK 丢失查询相同 command identity，未知结果不授权自动重跑。
+断线后 snapshot 恢复持久正文、plan、终态和仍存活的 approval/clarification waiter。答复、超时、取消或 runtime restart 后的旧 interaction 不能重新操作；取消期间 future 被丢弃也必须清除 waiter。runtime 重启读取持久事实，旧 provider 流不自动续跑，旧 turn 按 owner epoch 表达 interrupted/unknown。Desktop 与其他交互客户端一样使用同一个 durable ACK 路径：in-process embedded 与 daemon 不再有不同 Turn ACK 契约，in-process ACK 也是 durable admission。ACK 丢失查询相同 command identity，未知结果不授权自动重跑。
 
 `optional_workspace` capability 在本地连接入口协商。旧客户端连接项目 source 时 `repository` 仍为 JSON string；支持该 capability 的新客户端才能进入 No Workspace source 并接收 null。JSON schema 与 TS DTO 通过既有生成流程同步；Mobile Dart 使用手写 JSON map 消费者，没有单独生成器。nullable repository migration 仅由 source owner 写连接执行，保留旧关联、外键、索引、trigger 和原任务事实；全局只读查询不迁移来源。
 

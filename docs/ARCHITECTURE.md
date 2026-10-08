@@ -964,12 +964,24 @@ durable running turn
 durable replayable initiating input
 ```
 
-The daemon's wire ACK is emitted only after this boundary commits. If the
+The wire ACK is emitted only after this boundary commits. If the
 process dies before the normal transcript append, restart recovery projects the
 initiating message exactly once under the current ownership token, using the
 turn id rather than message content as identity, and only then settles the
 orphan turn. `UserMessageAdded` is an optimistic client notification; it is
 neither the canonical input, a persistence command, nor a durability witness.
+
+Every interactive client holds the same ACK contract: a command that starts or
+continues a turn returns success only after the corresponding durable admission
+boundary commits. The in-process TUI, the daemon `leveler serve` exposes, the
+`/web` UI that process serves, and a connected WebUI all wait on it; Embedded
+and Daemon no longer have different turn-ACK contracts. A success ACK means the
+execution input was durably admitted (`EngineEvent::TurnStarted` is emitted
+after `TurnStore::start_owned` commits) — not that the turn finished, and not
+that tool side effects are exactly-once. A refused turn returns an explicit
+error, never a success ACK. No response or a dropped connection cannot be read
+as "the command did not run": receipts keep their existing dedup semantics and
+an unknown outcome never authorizes an automatic rerun.
 
 ---
 
@@ -1249,7 +1261,7 @@ The `leveler-app` Global Task Index scans existing project stores and the No Wor
 
 `session_projection` derives `task_status` and `task_terminal` from durable turn/event order, boot liveness, and actual live waiters for local lists, snapshots, and the global index. Existing `status` retains Session lifecycle semantics. Only committed `TaskFinished` establishes an authoritative terminal. Answered means an answer; stop=Completed means a domain completion declaration, not independent acceptance. Legacy TaskFinished with outcome=Completed and stop=None retains its terminal compatibility without inventing a declaration. A committed terminal outranks its old live lease during cleanup. A later admitted turn's durable identity/ordinal and event order prevent the old terminal from overriding new activity. Final prose and successful tools without a terminal cannot imply completed. Read-only discovery can establish a running owner but cannot infer waiter liveness from persisted approval records; actionable WaitingUser comes from the connected owner's snapshot.
 
-Reconnect snapshots restore durable prose, plans, terminals, and surviving approval/clarification waiters. Answered, timed-out, cancelled, or restarted interactions cannot become actionable again; dropping a future during cancellation must also remove its waiter. Runtime restart restores durable facts without automatically resuming provider streams; old turns report interrupted/unknown according to owner epoch. Future Desktop clients use the daemon's durable wire ACK path. Default in-process optimistic ACK is not durable admission. Lost ACKs are resolved using the same command identity; unknown outcomes do not authorize automatic reruns.
+Reconnect snapshots restore durable prose, plans, terminals, and surviving approval/clarification waiters. Answered, timed-out, cancelled, or restarted interactions cannot become actionable again; dropping a future during cancellation must also remove its waiter. Runtime restart restores durable facts without automatically resuming provider streams; old turns report interrupted/unknown according to owner epoch. Desktop uses the same durable ACK path as every other interactive client: embedded in-process and daemon no longer differ in their turn-ACK contract, and the in-process ACK is durable admission too. Lost ACKs are resolved using the same command identity; unknown outcomes do not authorize automatic reruns.
 
 The local connection entry negotiates `optional_workspace`. Legacy clients entering project sources still receive a JSON string `repository`; only capable new clients may enter No Workspace sources and receive null. JSON schemas and TS DTOs use the existing generation workflow; Mobile Dart uses handwritten JSON-map consumers without a separate generator. Nullable repository migration runs only on the source owner's write connection and preserves old associations, foreign keys, indexes, triggers, and task facts. Global read-only discovery never migrates a source.
 
