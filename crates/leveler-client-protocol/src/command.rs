@@ -29,6 +29,14 @@ pub enum RestartReason {
     /// A newer artifact is installed and waiting to take over. Reserved for
     /// the updater; nothing sends it yet.
     UpdateReady,
+    /// An operator asked this project's runtime to restart (the Web project
+    /// action, or any client acting on a person's explicit request).
+    ///
+    /// Distinct from the generation reasons on purpose: `BuildMismatch` and
+    /// `ConfigChanged` describe WHY a new generation is wanted, and reporting
+    /// either for a plain operator restart would be a lie in the health a
+    /// waiting client reads.
+    RestartRequested,
 }
 
 /// A command from a UI client to the runtime.

@@ -502,7 +502,7 @@ pub(crate) enum ContinuationState {
 }
 
 use crate::Application;
-use crate::active_turns::ActiveTurns;
+use crate::active_turns::{ActiveTurns, RetireAdmission};
 
 /// A session's `/btw` side thread: its own model conversation and the cancel
 /// handle of its in-flight answer.
@@ -5615,6 +5615,108 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
             },
         })
     }
+
+    /// Ask whether this runtime may retire NOW, and commit the answer.
+    ///
+    /// The decision is the runtime's, taken from its own authority:
+    ///
+    /// 1. the generation the caller observed must be the one answering, or the
+    ///    answer is `GenerationChanged` (nothing is touched);
+    /// 2. an already-retiring runtime reports `AlreadyRetiring` with the reason
+    ///    already recorded, so a second client adopts the in-flight handover
+    ///    instead of inventing a competing one;
+    /// 3. work still owed — a main turn, or a runtime-owned background task
+    ///    (a local build outliving its turn is exactly the work a replacement
+    ///    would destroy) — yields `Busy`, and NOTHING is changed: admission
+    ///    stays open and other clients keep working;
+    /// 4. only an idle runtime commits, atomically with closing admission.
+    ///
+    /// A task owned by the persistent Execution Host is deliberately NOT owed
+    /// work here: it outlives the generation that launched it, and the
+    /// replacement keeps it running.
+    async fn try_retire_if_idle(
+        &self,
+        request: leveler_client_protocol::RetireRequest,
+    ) -> Result<leveler_client_protocol::RetireDecision, ClientError> {
+        use leveler_client_protocol::RetireDecision;
+
+        // The generation proof comes first and changes nothing: a decision
+        // about a runtime the caller never examined would be worthless.
+        let info = self.runtime_info().await?;
+        if (request.expected_pid != 0 && request.expected_pid != info.pid)
+            || !self_matches_generation(&request.expected_build, &info.build)
+        {
+            return Ok(RetireDecision::GenerationChanged);
+        }
+        if self.active.is_retiring() {
+            let reason = self
+                .retiring_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .to_owned();
+            return Ok(RetireDecision::AlreadyRetiring { reason });
+        }
+
+        // Read the background accounting BEFORE committing. It is a separate
+        // owner from turn admission, so it cannot be folded into the same
+        // critical section; reading it first can only make the decision more
+        // conservative, never optimistically wrong.
+        let (active_turns, capacity) = self.active.load();
+        let background = self
+            .app
+            .background_tasks()
+            .try_update_blockers()
+            .await
+            .map_err(ClientError::Runtime)?
+            .len() as u32;
+        if background > 0 {
+            return Ok(RetireDecision::Busy {
+                active_turns: active_turns as u32,
+                active_background_tasks: background,
+            });
+        }
+        let _ = capacity;
+
+        // Commit: decide, close admission and record the reason. A caller that
+        // then sees `Accepted` knows no new work can be admitted, and this
+        // runtime exits once whatever it still holds finishes.
+        match self.active.retire_if_idle() {
+            RetireAdmission::Accepted => {
+                *self
+                    .retiring_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.reason);
+                tracing::info!(reason = ?request.reason, "runtime accepted retirement while idle");
+                spawn_retire_drain(self);
+                Ok(RetireDecision::Accepted)
+            }
+            RetireAdmission::Busy { active_turns } => Ok(RetireDecision::Busy {
+                active_turns,
+                active_background_tasks: 0,
+            }),
+            RetireAdmission::AlreadyRetiring => {
+                let reason = self
+                    .retiring_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .to_owned();
+                Ok(RetireDecision::AlreadyRetiring { reason })
+            }
+        }
+    }
+}
+
+/// Whether `expected` really is the build serving this request.
+///
+/// `matches` (fingerprint when both carry one) is the comparison the rest of
+/// the handover uses, so a dirty development build recognises its own artifact
+/// instead of being retired on every launch. An unknown identity on either side
+/// is NOT a match: nothing is not evidence of agreement.
+fn self_matches_generation(
+    expected: &leveler_core::BuildIdentity,
+    serving: &leveler_core::BuildIdentity,
+) -> bool {
+    expected.is_known() && serving.is_known() && expected.matches(serving)
 }
 
 /// Largest tail of a background task's output carried in a runtime-health

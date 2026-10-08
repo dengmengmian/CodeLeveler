@@ -199,6 +199,19 @@ pub trait LocalRuntimeService: InteractiveRuntimeClient {
         ))
     }
 
+    /// Ask whether this runtime may retire now, and commit the answer.
+    ///
+    /// The default is [`RetireDecision::Unsupported`] rather than a guess: a
+    /// service that cannot make the atomic decision must say so, so the caller
+    /// falls back to an explicit, visible path instead of believing a verdict
+    /// nobody issued.
+    async fn try_retire_if_idle(
+        &self,
+        _request: leveler_client_protocol::RetireRequest,
+    ) -> Result<leveler_client_protocol::RetireDecision, ClientError> {
+        Ok(leveler_client_protocol::RetireDecision::Unsupported)
+    }
+
     /// Load a registered attachment by its content hash.
     ///
     /// Default: unsupported. Production runtimes override. Callers must not
@@ -227,6 +240,29 @@ pub enum TransportError {
     },
     #[error("local transport is unavailable: {0}")]
     Unavailable(String),
+    /// The peer closed the connection without sending a single response byte.
+    ///
+    /// This is the shape an older runtime produces for a request whose tag it
+    /// cannot decode: it reads the envelope, fails on the unknown request, and
+    /// drops the connection. Kept apart from [`Self::Io`] because the two mean
+    /// different things to a caller: a truncated or half-written reply may
+    /// still have executed the request, while a peer that answered *nothing*
+    /// never got as far as running it. Only a caller that can also prove the
+    /// peer is still alive may read this as a capability statement.
+    #[error("the local runtime closed the connection without answering")]
+    PeerClosed,
+    /// The endpoint accepted the call but did not answer within the deadline.
+    ///
+    /// Deliberately NOT `Io` and NOT a disconnect: a slow runtime is not a dead
+    /// runtime, and this error must never authorize reviving, replaying or
+    /// killing anything. It says only "no answer within the bound", which is
+    /// exactly what a startup probe, a retirement status read and a client
+    /// request each need to know.
+    #[error("local runtime did not answer {operation} within {timeout_ms}ms")]
+    NoAnswer {
+        operation: &'static str,
+        timeout_ms: u64,
+    },
     /// A request failed mid-flight and was NOT replayed: its first attempt
     /// may already have taken effect. Callers must not treat this as a
     /// transient error and re-send the same mutation automatically.
@@ -280,6 +316,17 @@ enum WireRequest {
     /// before this variant fails the request, which clients treat as
     /// "identity unknown", never as a fatal error.
     RuntimeInfo,
+    /// Ask the runtime whether it may retire NOW, and get its answer back.
+    ///
+    /// Distinct from `Send(ShutdownWhenIdle)`, which is a commitment the sender
+    /// cannot take back: this one is refused outright while work is owed, so an
+    /// upgrade request from one client cannot stop another client's runtime
+    /// from admitting work. Additive: a daemon built before this variant fails
+    /// the request, which the caller reports as `Unsupported` and falls back to
+    /// the fire-and-forget path rather than assuming an answer.
+    TryRetireIfIdle {
+        request: leveler_client_protocol::RetireRequest,
+    },
     /// Load a registered attachment by sha256. A read: safe to retry.
     FetchAttachment {
         sha256: String,
@@ -303,6 +350,7 @@ impl WireRequest {
     /// idempotency key: their first attempt may already have mutated state,
     /// so they must never be auto-replayed. Subscribe never goes through
     /// the request path (it has its own reconnect loop).
+    /// Whether a request may be replayed after a transport failure.
     fn safe_to_retry_after_transport_failure(&self) -> bool {
         match self {
             WireRequest::Ping
@@ -317,8 +365,54 @@ impl WireRequest {
             WireRequest::Send(_)
             | WireRequest::CreateSession { .. }
             | WireRequest::CreateSessionSelected { .. }
+            // Retiring is a state change AND the verdict is load-bearing: a
+            // replayed attempt could close admission on a stale premise even
+            // if a later attempt would have said Busy.
+            | WireRequest::TryRetireIfIdle { .. }
             | WireRequest::Subscribe { .. } => false,
         }
+    }
+
+    /// The operation name a timeout reports. Deliberately the wire verb, not a
+    /// human sentence: it is a fact about which call went unanswered.
+    fn operation_name(&self) -> &'static str {
+        match self {
+            WireRequest::Ping => "ping",
+            WireRequest::Send(_) => "send",
+            WireRequest::Deliver(_) => "deliver",
+            WireRequest::Snapshot { .. } => "snapshot",
+            WireRequest::CreateSession { .. } | WireRequest::CreateSessionSelected { .. } => {
+                "create_session"
+            }
+            WireRequest::AttachSessionPolicy { .. } => "attach_session_policy",
+            WireRequest::LocalWaiters => "local_waiters",
+            WireRequest::RuntimeInfo => "runtime_info",
+            WireRequest::TryRetireIfIdle { .. } => "try_retire_if_idle",
+            WireRequest::FetchAttachment { .. } => "fetch_attachment",
+            WireRequest::Subscribe { .. } => "subscribe",
+        }
+    }
+}
+
+/// Deadline for one request/response round trip (and for the subscribe
+/// handshake). `None` disables it — an explicit operator choice, never a
+/// default, because these calls are the ones a client waits on.
+///
+/// This is a LIVENESS bound, not a performance budget: no request in the local
+/// protocol waits for a turn to finish (`Deliver` is acknowledged after the
+/// input is durable, not after the turn), so a call that has not answered in
+/// this long is not going to answer for a client that is still waiting.
+#[cfg(any(unix, windows))]
+fn request_timeout() -> Option<std::time::Duration> {
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
+    const ENV: &str = "LEVELER_IPC_REQUEST_TIMEOUT_SECS";
+    match std::env::var(ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => Some(DEFAULT),
+        },
+        Err(_) => Some(DEFAULT),
     }
 }
 
@@ -332,6 +426,8 @@ enum WireResponse {
     Event(RuntimeEvent),
     LocalWaiters(usize),
     RuntimeInfo(leveler_client_protocol::RuntimeInfo),
+    /// The runtime's answer to `TryRetireIfIdle`. A decision, not an ack.
+    RetireDecision(leveler_client_protocol::RetireDecision),
     Attachment {
         mime_type: String,
         data_base64: String,
@@ -700,6 +796,16 @@ mod transport {
                 )
                 .await
             }
+            WireRequest::TryRetireIfIdle { request } => {
+                send_result(
+                    &mut stream,
+                    runtime
+                        .try_retire_if_idle(request)
+                        .await
+                        .map(WireResponse::RetireDecision),
+                )
+                .await
+            }
             WireRequest::FetchAttachment { sha256 } => {
                 send_result(
                     &mut stream,
@@ -977,7 +1083,7 @@ mod transport {
         }
 
         async fn open(endpoint: Endpoint, client_kind: ClientKind) -> Result<Self, TransportError> {
-            let stream = open_subscription(&endpoint, None, client_kind).await?;
+            let stream = open_subscription_deadline(&endpoint, None, client_kind).await?;
             let (events, _) = broadcast::channel(2048);
             let session_events = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let shutdown = CancellationToken::new();
@@ -1011,6 +1117,24 @@ mod transport {
         async fn request(&self, request: WireRequest) -> Result<WireResponse, TransportError> {
             match request_endpoint(&self.endpoint, request.clone()).await {
                 Ok(response) => Ok(response),
+                // A timeout proves nothing about the process, so it must not
+                // reach the revive-and-replay path below: reviving starts a
+                // SECOND daemon against one that is merely slow (a losing racer
+                // whose bind then fails), and replaying a mutation could double
+                // its effect. The only truthful answer is the bound that ran
+                // out; a non-idempotent request reports outcome-unknown because
+                // its first attempt may still have taken effect.
+                Err(error @ TransportError::NoAnswer { .. }) => {
+                    if request.safe_to_retry_after_transport_failure() {
+                        Err(error)
+                    } else {
+                        Err(TransportError::OutcomeUnknown(format!(
+                            "the local runtime connection did not answer mid-request; the request \
+                             was NOT replayed because its first attempt may already have taken \
+                             effect ({error})"
+                        )))
+                    }
+                }
                 Err(error) => {
                     // Only REPLAY a request whose outcome cannot have mutated
                     // anything (reads) or that the daemon deduplicates
@@ -1056,9 +1180,12 @@ mod transport {
             if let Some(events) = self.session_events.lock().unwrap().get(session_id).cloned() {
                 return Ok(events);
             }
-            let stream =
-                open_subscription(&self.endpoint, Some(session_id.clone()), self.client_kind)
-                    .await?;
+            let stream = open_subscription_deadline(
+                &self.endpoint,
+                Some(session_id.clone()),
+                self.client_kind,
+            )
+            .await?;
             let (events, _) = broadcast::channel(2048);
             self.session_events
                 .lock()
@@ -1176,6 +1303,47 @@ mod transport {
             }
         }
 
+        /// Ask the runtime whether it may retire now.
+        ///
+        /// A daemon that predates the request cannot answer it, and the honest
+        /// reading of that is `Unsupported` — never `Busy` and never
+        /// `Accepted`. Every other failure (a transport failure, a timeout, a
+        /// lost reply) keeps its own meaning and is returned as an error: the
+        /// caller must not turn "I did not understand the answer" into a
+        /// decision it can act on.
+        async fn try_retire_if_idle(
+            &self,
+            request: leveler_client_protocol::RetireRequest,
+        ) -> Result<leveler_client_protocol::RetireDecision, ClientError> {
+            // Deliberately NOT `self.request`. That path exists to decide
+            // whether a failed mutation may be REPLAYED, and its answer for a
+            // non-idempotent call is `OutcomeUnknown` — which would hide the
+            // one distinction this call is about. Retiring is never replayed
+            // (a second attempt could close admission on a premise the first
+            // attempt already invalidated), so the raw transport error is both
+            // safe and more informative here.
+            match request_endpoint(&self.endpoint, WireRequest::TryRetireIfIdle { request }).await {
+                Ok(WireResponse::RetireDecision(decision)) => Ok(decision),
+                Ok(WireResponse::Error(error)) => Err(error.into_client_error()),
+                Ok(response) => Err(unexpected_response(response)),
+                // A runtime that cannot DECODE the request answers nothing at
+                // all: an older build reads the envelope, fails on the unknown
+                // request tag, and drops the connection. That is the "no atomic
+                // retirement" fact, expressed as the value that says so, so
+                // callers have one branch instead of two. A reply that decoded
+                // as garbage is the same statement by other means.
+                Err(TransportError::PeerClosed)
+                | Err(TransportError::Json(_))
+                | Err(TransportError::Protocol(_)) => {
+                    Ok(leveler_client_protocol::RetireDecision::Unsupported)
+                }
+                // A timeout, a refused connection, a permission failure and a
+                // truncated reply all keep their own meaning: none of them is a
+                // statement about what the peer can understand.
+                Err(error) => Err(transport_client_error(error)),
+            }
+        }
+
         async fn fetch_attachment(&self, sha256: &str) -> Result<AttachmentBytes, ClientError> {
             match self
                 .request(WireRequest::FetchAttachment {
@@ -1266,7 +1434,12 @@ mod transport {
             let reviver = self.reviver.clone();
             tokio::spawn(async move {
                 loop {
-                    match open_subscription(&endpoint, Some(session_id.clone()), client_kind).await
+                    match open_subscription_deadline(
+                        &endpoint,
+                        Some(session_id.clone()),
+                        client_kind,
+                    )
+                    .await
                     {
                         Ok(stream) => {
                             subscription_loop(
@@ -1363,12 +1536,94 @@ mod transport {
         endpoint: &Endpoint,
         request: WireRequest,
     ) -> Result<WireResponse, TransportError> {
+        let operation = request.operation_name();
+        match request_timeout() {
+            // No deadline configured: the operator has explicitly accepted an
+            // unbounded wait, so nothing here invents one.
+            None => request_endpoint_inner(endpoint, request).await,
+            Some(timeout) => {
+                match tokio::time::timeout(timeout, request_endpoint_inner(endpoint, request)).await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(TransportError::NoAnswer {
+                        operation,
+                        timeout_ms: timeout.as_millis() as u64,
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn request_endpoint_inner(
+        endpoint: &Endpoint,
+        request: WireRequest,
+    ) -> Result<WireResponse, TransportError> {
         let mut stream = connect_endpoint(endpoint).await?;
         write_frame(&mut stream, &ProtocolEnvelope::wrap(request)).await?;
-        read_frame::<WireResponse>(&mut stream)
-            .await?
-            .into_body()
-            .map_err(Into::into)
+        read_response_frame(&mut stream).await
+    }
+
+    /// Read one response frame, preserving the difference between "the peer
+    /// answered nothing at all" and "the peer started to answer and stopped".
+    ///
+    /// [`read_frame`] cannot express it: an EOF before the header and an EOF in
+    /// the middle of the payload both surface as `UnexpectedEof`. The first is
+    /// what a runtime that could not decode the request does; the second means
+    /// a reply was lost, which says nothing about whether the request ran.
+    async fn read_response_frame<S: AsyncRead + Unpin>(
+        stream: &mut S,
+    ) -> Result<WireResponse, TransportError> {
+        let mut header = [0u8; 4];
+        let mut filled = 0;
+        while filled < 4 {
+            let read = stream.read(&mut header[filled..]).await?;
+            if read == 0 {
+                if filled == 0 {
+                    return Err(TransportError::PeerClosed);
+                }
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the local runtime closed the connection mid-frame",
+                )));
+            }
+            filled += read;
+        }
+        let length = u32::from_be_bytes(header) as usize;
+        if length > MAX_FRAME_BYTES {
+            return Err(TransportError::FrameTooLarge {
+                max_bytes: MAX_FRAME_BYTES,
+                actual_bytes: length,
+            });
+        }
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).await?;
+        let envelope: ProtocolEnvelope<WireResponse> = serde_json::from_slice(&bytes)?;
+        envelope.into_body().map_err(Into::into)
+    }
+
+    /// The `Subscribe` handshake, bounded the same way a request is. The event
+    /// STREAM that follows it is long-lived and is deliberately not bounded:
+    /// an idle session has nothing to say, and that is not a fault.
+    async fn open_subscription_deadline(
+        endpoint: &Endpoint,
+        session_id: Option<SessionId>,
+        client_kind: ClientKind,
+    ) -> Result<ClientStream, TransportError> {
+        match request_timeout() {
+            None => open_subscription(endpoint, session_id, client_kind).await,
+            Some(timeout) => match tokio::time::timeout(
+                timeout,
+                open_subscription(endpoint, session_id, client_kind),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(TransportError::NoAnswer {
+                    operation: "subscribe",
+                    timeout_ms: timeout.as_millis() as u64,
+                }),
+            },
+        }
     }
 
     async fn open_subscription(
@@ -1425,7 +1680,7 @@ mod transport {
             }
 
             while !shutdown.is_cancelled() {
-                match open_subscription(&endpoint, session_id.clone(), client_kind).await {
+                match open_subscription_deadline(&endpoint, session_id.clone(), client_kind).await {
                     Ok(new_stream) => {
                         stream = new_stream;
                         // Say that the stream broke. This loop reconnects, and
@@ -1449,11 +1704,14 @@ mod transport {
                         }
                         break;
                     }
-                    Err(_) => {
-                        // Nobody is answering: if a reviver is installed, try
-                        // to bring the daemon back (idempotent ensure; losing
-                        // a concurrent revival race is fine). Then retry.
-                        if let Some(reviver) = reviver.get()
+                    // A timeout means nobody ANSWERED. Reviving would start a
+                    // second daemon against one that is merely slow, so the
+                    // endpoint gets another attempt, not a competitor — the
+                    // same distinction `request` makes.
+                    Err(error) => {
+                        if matches!(error, TransportError::NoAnswer { .. }) {
+                            tracing::warn!(%error, "local runtime did not answer; retrying without reviving");
+                        } else if let Some(reviver) = reviver.get()
                             && let Err(error) = reviver.revive().await
                         {
                             tracing::warn!(%error, "local runtime revival failed; retrying");

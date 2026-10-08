@@ -58,6 +58,17 @@ struct ActiveTurn {
     last_activity_at: Instant,
 }
 
+/// The outcome of an atomic retirement decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetireAdmission {
+    /// Admission is now closed and nothing was owed.
+    Accepted,
+    /// Work is still owed. NOTHING was changed: the runtime keeps admitting.
+    Busy { active_turns: u32 },
+    /// A previous request already closed admission.
+    AlreadyRetiring,
+}
+
 /// A read-only view of one active turn, copied out without holding the map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveTurnSnapshot {
@@ -109,10 +120,18 @@ impl ActiveTurns {
     }
 
     pub(crate) fn admit(&self, session_id: &SessionId) -> Result<TurnLease, TurnAdmissionError> {
+        // Take the admission lock BEFORE reading the retirement flag: retirement
+        // is decided and committed inside this same lock (see
+        // [`Self::retire_if_idle`]), so a turn can never be admitted after an
+        // `Accepted` verdict, and a retirement can never be accepted while a
+        // turn is mid-admission.
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.retiring.load(Ordering::SeqCst) {
             return Err(TurnAdmissionError::Retiring);
         }
-        let mut active = self.active.lock().unwrap();
         if active.contains_key(session_id) {
             return Err(TurnAdmissionError::Busy(session_id.clone()));
         }
@@ -139,6 +158,41 @@ impl ActiveTurns {
             cancellation: token,
             task_cancel,
         })
+    }
+
+    /// Decide whether this runtime may retire now, and commit the decision.
+    ///
+    /// ONE critical section decides and closes admission, which is the whole
+    /// point: reading `active_turns == 0` outside the admission lock and
+    /// setting the flag afterwards would let a turn slip in between the two,
+    /// so the caller would be told "idle" about a runtime that is no longer
+    /// idle. Sharing `admit`'s lock makes that interleaving impossible.
+    ///
+    /// Returns the turns still running rather than a bare verdict, so the
+    /// caller can report what blocked it without a second, later read.
+    pub(crate) fn retire_if_idle(&self) -> RetireAdmission {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.retiring.load(Ordering::SeqCst) {
+            return RetireAdmission::AlreadyRetiring;
+        }
+        if !active.is_empty() {
+            return RetireAdmission::Busy {
+                active_turns: active.len() as u32,
+            };
+        }
+        // Commit while still holding the lock: from this instant no new turn can
+        // be admitted, and the emptiness this decision was based on cannot
+        // change underneath it.
+        self.retiring.store(true, Ordering::SeqCst);
+        RetireAdmission::Accepted
+    }
+
+    /// Whether admission is closed for retirement.
+    pub(crate) fn is_retiring(&self) -> bool {
+        self.retiring.load(Ordering::SeqCst)
     }
 
     /// Whether a main turn is currently running for this session.
@@ -265,6 +319,93 @@ mod tests {
             matches!(turns.admit(&session), Err(TurnAdmissionError::Retiring)),
             "a retiring runtime must refuse work, not merely report that it would"
         );
+    }
+
+    /// The retirement decision itself: `Busy` is a refusal that changes
+    /// NOTHING. This is the difference between asking and telling — the old
+    /// fire-and-forget shutdown stopped admitting work even when it was asked
+    /// by a client that was wrong about the runtime being idle.
+    #[test]
+    fn a_busy_retirement_decision_leaves_admission_open() {
+        let turns = ActiveTurns::default();
+        let running = SessionId::new("running");
+        let lease = turns.admit(&running).unwrap();
+
+        assert_eq!(
+            turns.retire_if_idle(),
+            RetireAdmission::Busy { active_turns: 1 }
+        );
+        assert!(!turns.is_retiring(), "a refusal must not close admission");
+        assert!(
+            !lease.cancellation().is_cancelled(),
+            "a refusal must not touch the running work"
+        );
+        assert!(
+            turns.admit(&SessionId::new("other")).is_ok(),
+            "other sessions must keep working after a deferred upgrade"
+        );
+    }
+
+    /// An idle runtime commits: admission closes in the same critical section
+    /// the emptiness was read in, so nothing can slip in behind the verdict.
+    #[test]
+    fn an_idle_retirement_decision_closes_admission_atomically() {
+        let turns = ActiveTurns::default();
+        assert_eq!(turns.retire_if_idle(), RetireAdmission::Accepted);
+        assert!(turns.is_retiring());
+        assert!(matches!(
+            turns.admit(&SessionId::new("late")),
+            Err(TurnAdmissionError::Retiring)
+        ));
+        assert_eq!(turns.retire_if_idle(), RetireAdmission::AlreadyRetiring);
+    }
+
+    /// The race the atomic decision exists for: a turn must never be admitted
+    /// after an `Accepted` verdict, however the two interleave. Both sides take
+    /// the same lock, so exactly one of the two orders is possible.
+    #[test]
+    fn a_turn_is_never_admitted_after_an_accepted_retirement() {
+        for attempt in 0..200 {
+            let turns = Arc::new(ActiveTurns::default());
+            let admitted = Arc::new(AtomicBool::new(false));
+
+            let retirer = {
+                let turns = turns.clone();
+                std::thread::spawn(move || turns.retire_if_idle())
+            };
+            let admitter = {
+                let turns = turns.clone();
+                let admitted = admitted.clone();
+                std::thread::spawn(move || {
+                    if turns.admit(&SessionId::new("racer")).is_ok() {
+                        admitted.store(true, Ordering::SeqCst);
+                    }
+                })
+            };
+            let verdict = retirer.join().unwrap();
+            admitter.join().unwrap();
+
+            if verdict == RetireAdmission::Accepted {
+                assert!(
+                    !admitted.load(Ordering::SeqCst),
+                    "attempt {attempt}: a turn was admitted after the runtime committed to retire"
+                );
+            } else {
+                assert_eq!(
+                    verdict,
+                    RetireAdmission::Busy { active_turns: 1 },
+                    "attempt {attempt}: only Busy or Accepted is possible"
+                );
+                assert!(
+                    admitted.load(Ordering::SeqCst),
+                    "attempt {attempt}: Busy must mean the turn is genuinely admitted"
+                );
+                assert!(
+                    !turns.is_retiring(),
+                    "attempt {attempt}: Busy changed state"
+                );
+            }
+        }
     }
 
     #[test]

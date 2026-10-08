@@ -51,6 +51,7 @@ mod media;
 mod observability;
 mod origin;
 mod progress;
+mod retirement;
 /// WebSocket framing for a session: the shapes every session client speaks.
 pub mod session_wire;
 mod skills;
@@ -100,6 +101,7 @@ pub use origin::ClientOrigin;
 pub use progress::{
     FinalizationStage, PlanStepStatus, UiCompletionReport, UiDiff, UiDiffFile, UiPlan, UiPlanStep,
 };
+pub use retirement::{RetireDecision, RetireRequest};
 pub use session_wire::{DownstreamMessage, ProjectStatus, UpstreamMessage};
 pub use snapshot::{
     MessageId, RuntimeHealth, RuntimeInfo, RuntimeStatus, STALE_TURN_WARN_AFTER,
