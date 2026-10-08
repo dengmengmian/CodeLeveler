@@ -42,7 +42,12 @@ async function recordIdleExit(pid){
  catch(error){await writeFile(path.join(output,'cleanup-evidence.json'),JSON.stringify({pid,normal_idle_exit_observed:false,signaled:false,error:error.message},null,2)+'\n');throw error;}
 }
 try{
- await launch();const creationId=randomUUID();const created=await page.evaluate(requestId=>window.desktop.createTask(null,requestId),creationId);const id=created.session.id;runtime=await page.evaluate(()=>window.desktop.runtimeInfo());
+ await launch();
+ const assetStatuses=await application.evaluate(async({net})=>{const paths=['command-policy.gen.mjs','packages/conversation-presentation/conversation.mjs','unknown.mjs','%2e%2e%2fsecret','index.html'];const urls=paths.map(path=>'leveler-desktop://desktop/'+path).concat('leveler-desktop://unknown/index.html');return Promise.all(urls.map(async url=>({url,status:(await net.fetch(url)).status})));});
+ assert.deepEqual(assetStatuses.map(asset=>asset.status),[200,200,404,404,200,404]);
+ await page.waitForFunction(()=>document.querySelector('#desktop-version')?.textContent.startsWith('v'));
+ await writeFile(path.join(output,'renderer-assets-evidence.json'),JSON.stringify({asset_statuses:assetStatuses,renderer_initialized:true},null,2)+'\n');
+ const creationId=randomUUID();const created=await page.evaluate(requestId=>window.desktop.createTask(null,requestId),creationId);const id=created.session.id;runtime=await page.evaluate(()=>window.desktop.runtimeInfo());
  const duplicateCreate=await page.evaluate(requestId=>window.desktop.createTask(null,requestId),creationId);assert.equal(duplicateCreate.session.id,id);
  const initialTask=(await index()).tasks.find(task=>task.id===id);assert.ok(initialTask);
  assert.equal(rows(initialTask.source_id,'SELECT COUNT(*) AS count FROM sessions')[0].count,1);
