@@ -33,9 +33,7 @@ impl HandoffUi for DesktopHandoff {
         // ask a human here, so the only thing it can do with a handover is show
         // it — and a `Debug` rendering is prose that silently drifts the moment
         // a variant is renamed. A client branches on `kind`.
-        let _ = self
-            .0
-            .try_send(json!({"event": "handoff", "data": event}));
+        let _ = self.0.try_send(json!({"event": "handoff", "data": event}));
     }
     fn input(&self) -> Option<mpsc::UnboundedReceiver<HandoffAction>> {
         None
@@ -370,9 +368,7 @@ pub(crate) async fn run(config_dir: Option<PathBuf>) -> anyhow::Result<std::proc
 }
 /// The typed lifecycle state of a failed request, when the failure is a runtime
 /// lifecycle fact rather than a protocol error.
-fn lifecycle_state(
-    error: &anyhow::Error,
-) -> Option<leveler_runtime_host::RuntimeLifecycleState> {
+fn lifecycle_state(error: &anyhow::Error) -> Option<leveler_runtime_host::RuntimeLifecycleState> {
     error
         .downcast_ref::<leveler_runtime_host::EnsureError>()
         .map(leveler_runtime_host::RuntimeLifecycleState::from_ensure_error)

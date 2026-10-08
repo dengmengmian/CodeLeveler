@@ -289,8 +289,7 @@ pub fn serves_workspace(command: &str, workspace: Option<&Path>) -> bool {
             tokens.iter().any(|token| {
                 let token = Path::new(token.trim_matches('"'));
                 token == wanted
-                    || std::fs::canonicalize(token)
-                        .is_ok_and(|resolved| resolved == wanted)
+                    || std::fs::canonicalize(token).is_ok_and(|resolved| resolved == wanted)
             })
         }
         None => tokens.contains(&"--no-workspace"),
@@ -439,17 +438,20 @@ pub fn verify_target(
             "the runtime already reports the current build".to_string(),
         ));
     }
+    // Platform FIRST: on a platform with no verified process witness there is
+    // nothing further to examine, and `PlatformUnsupported` says exactly that
+    // instead of blaming the socket.
+    if !platform_supports_forced_migration() {
+        return Err(MigrationRefusal::PlatformUnsupported(
+            std::env::consts::OS.to_string(),
+        ));
+    }
     let socket = socket_object(socket_path).ok_or_else(|| {
         MigrationRefusal::ProcessUnverifiable(format!(
             "{} is not a socket owned by a runtime",
             socket_path.display()
         ))
     })?;
-    if !platform_supports_forced_migration() {
-        return Err(MigrationRefusal::PlatformUnsupported(
-            std::env::consts::OS.to_string(),
-        ));
-    }
     let witness = process_witness(reported_pid).ok_or_else(|| {
         MigrationRefusal::ProcessUnverifiable(format!(
             "no process identity is available for pid {reported_pid}"
@@ -536,7 +538,9 @@ mod tests {
         }
     }
 
-    fn socket_at(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
+    fn socket_at(
+        dir: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
         let socket = dir.path().join("x.sock");
         // Kept alive by the caller: the path stays a socket object for the
         // whole test, and the listener is closed when the test ends.
@@ -549,8 +553,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (socket, _listener) = socket_at(&dir);
         let current = build("same");
-        let refusal =
-            verify_target(&socket, 42, "rt-1", &current, &current, None).unwrap_err();
+        let refusal = verify_target(&socket, 42, "rt-1", &current, &current, None).unwrap_err();
         assert!(matches!(refusal, MigrationRefusal::IdentityUnknown(_)));
     }
 
@@ -559,8 +562,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let not_a_socket = dir.path().join("plain.txt");
         std::fs::write(&not_a_socket, b"hello").unwrap();
-        let refusal = verify_target(&not_a_socket, 42, "rt-1", &build("old"), &build("new"), None)
-            .unwrap_err();
+        let refusal = verify_target(
+            &not_a_socket,
+            42,
+            "rt-1",
+            &build("old"),
+            &build("new"),
+            None,
+        )
+        .unwrap_err();
         assert!(
             matches!(refusal, MigrationRefusal::ProcessUnverifiable(_)),
             "{refusal:?}"
@@ -577,8 +587,8 @@ mod tests {
             (42, "rt-1", BuildIdentity::default()),
         ];
         for (pid, runtime_id, reported) in candidates {
-            let refusal =
-                verify_target(&socket, pid, runtime_id, &reported, &build("new"), None).unwrap_err();
+            let refusal = verify_target(&socket, pid, runtime_id, &reported, &build("new"), None)
+                .unwrap_err();
             assert!(
                 matches!(refusal, MigrationRefusal::IdentityUnknown(_)),
                 "{refusal:?}"
@@ -653,7 +663,10 @@ mod tests {
         assert!(revalidate(&target).is_ok());
         target.witness.started.push_str("-stale");
         assert!(
-            matches!(revalidate(&target), Err(MigrationRefusal::TargetReused { .. })),
+            matches!(
+                revalidate(&target),
+                Err(MigrationRefusal::TargetReused { .. })
+            ),
             "a changed start marker must read as a reused pid"
         );
     }
