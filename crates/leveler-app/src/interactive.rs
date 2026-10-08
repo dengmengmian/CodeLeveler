@@ -2489,7 +2489,9 @@ impl InProcessRuntimeClient {
     /// recoverable provider/network fault is resumable. A task the user
     /// explicitly cancelled is reported as such (a continuation must not
     /// reopen it); everything else — completed, blocked, non-recoverably
-    /// failed, or no terminal at all — has simply nothing to resume.
+    /// failed — has simply nothing to resume. A fenced recovery interruption
+    /// without TaskFinished can resume only its latest valid input after the
+    /// recovery owner has released the task.
     async fn continuation_state(
         &self,
         session_id: &SessionId,
@@ -2503,30 +2505,80 @@ impl InProcessRuntimeClient {
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
         let stores = leveler_storage::EngineStores::from_database(&db);
-        let Some(row) = stores
-            .events
-            .load_last_by_type(session_id, "task_finished", None)
+        let Some(facts) = db
+            .session_facts_for(session_id)
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?
         else {
             return Ok(ContinuationState::NotResumable);
         };
-        let event = leveler_engine::EngineEvent::from_payload(&row.payload)
-            .map_err(|error| ClientError::Runtime(error.to_string()))?;
-        let leveler_engine::EngineEvent::TaskFinished {
-            outcome,
-            failure,
-            stop,
-            ..
-        } = event
-        else {
-            return Ok(ContinuationState::NotResumable);
-        };
-        if outcome == leveler_lifecycle::TaskOutcome::Cancelled {
-            return Ok(ContinuationState::Cancelled);
-        }
-        if !task_outcome_is_resumable(&outcome, stop, failure.as_ref()) {
-            return Ok(ContinuationState::NotResumable);
+        // Only a genuinely later admitted turn supersedes a terminal. A late
+        // TurnFinished for the same turn cannot reopen Cancelled/Completed.
+        let newer_turn = facts.turns.last().is_some_and(|turn| {
+            facts
+                .terminal_turn_ordinal
+                .is_some_and(|ordinal| turn.ordinal > ordinal)
+        });
+        if let Some(row) = facts.terminal.as_ref().filter(|_| !newer_turn) {
+            if row.schema_version > leveler_storage::EVENT_SCHEMA_VERSION {
+                return Err(ClientError::Runtime(
+                    "task terminal schema is newer than this reader".into(),
+                ));
+            }
+            let event = leveler_engine::EngineEvent::from_payload(&row.payload)
+                .map_err(|error| ClientError::Runtime(error.to_string()))?;
+            let leveler_engine::EngineEvent::TaskFinished {
+                outcome,
+                failure,
+                stop,
+                ..
+            } = event
+            else {
+                return Err(ClientError::Runtime(
+                    "task_finished row carried a different event".into(),
+                ));
+            };
+            if outcome == leveler_lifecycle::TaskOutcome::Cancelled {
+                return Ok(ContinuationState::Cancelled);
+            }
+            if !task_outcome_is_resumable(&outcome, stop, failure.as_ref()) {
+                return Ok(ContinuationState::NotResumable);
+            }
+        } else {
+            let Some(turn) = facts.turns.last().filter(|turn| {
+                turn.status == "interrupted" && matches!(turn.kind.as_str(), "user" | "chat")
+            }) else {
+                return Ok(ContinuationState::NotResumable);
+            };
+            // Recovery committed this input under fencing. Do not let legacy
+            // resume's compatibility search skip a corrupt latest input and
+            // quietly bind continuation to an unrelated older objective.
+            let payload = turn.payload.as_deref().ok_or_else(|| {
+                ClientError::Runtime("recovered interrupted turn has no initiating payload".into())
+            })?;
+            leveler_engine::decode_turn_initiating_message_opt(payload)
+                .map_err(|error| ClientError::Runtime(error.to_string()))?;
+            let Some(task) = stores
+                .tasks
+                .task_for_session(session_id)
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+            else {
+                return Ok(ContinuationState::NotResumable);
+            };
+            let Some(owner) = stores
+                .ownership
+                .current(&task)
+                .await
+                .map_err(|error| ClientError::Runtime(error.to_string()))?
+            else {
+                return Ok(ContinuationState::NotResumable);
+            };
+            if owner.boot.is_some() || owner.runtime.is_some() {
+                return Ok(ContinuationState::NotResumable);
+            }
+            // Eligibility is a read, not an ownership grant. The unchanged
+            // stage/admission path must still win the current engine CAS.
         }
         // Resume rebuilds from the transcript; an empty one has nothing to
         // continue and would be refused by the engine anyway.
@@ -7442,6 +7494,184 @@ mod memory_listing_tests {
                 }
             ));
             assert!(receiver.try_recv().is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovered_continuation_tests {
+    use super::*;
+    use leveler_lifecycle::TaskOutcome;
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        InProcessRuntimeClient,
+        SessionId,
+        leveler_storage::Database,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let app = Arc::new(
+            Application::assemble(leveler_project::Layout::from_parts(
+                temporary.path().to_path_buf(),
+                temporary.path().join("configs"),
+                temporary.path().join("state"),
+            ))
+            .unwrap(),
+        );
+        let db = app.open_database().await.unwrap();
+        let row = leveler_storage::SessionRecord::new(
+            "/repo",
+            "original objective",
+            "mock/m",
+            leveler_core::now(),
+        );
+        SessionRepository::new(&db).create(&row).await.unwrap();
+        let session = SessionId::new(row.id);
+        leveler_storage::TaskStore::ensure_for_session(&db, &session, leveler_core::now())
+            .await
+            .unwrap();
+        let client = InProcessRuntimeClient::new(
+            app,
+            ModelRef::new("mock", "m"),
+            PermissionProfile::Assisted,
+            false,
+        );
+        (temporary, client, session, db)
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_later_interrupted_input_can_supersede_old_closed_terminal() {
+        let (_temporary, client, session, db) = fixture().await;
+        for outcome in [TaskOutcome::Cancelled, TaskOutcome::Completed] {
+            let first = leveler_storage::TurnRepository::new(&db)
+                .start(&session, "chat", None, leveler_core::now())
+                .await
+                .unwrap();
+            let event = leveler_engine::EngineEvent::TaskFinished {
+                outcome,
+                reason: None,
+                stop: None,
+                failure: None,
+                warnings: Vec::new(),
+            };
+            let (kind, payload) = event.to_row().unwrap();
+            leveler_storage::EventRepository::new(&db)
+                .append(
+                    &session,
+                    Some(&leveler_core::TurnId::new(first.id)),
+                    &kind,
+                    &payload,
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            let message = Message::user_input("a distinct admitted objective");
+            let payload = serde_json::json!({"version":1,"initiating_message":message}).to_string();
+            let later = leveler_storage::TurnRepository::new(&db)
+                .start(&session, "chat", Some(&payload), leveler_core::now())
+                .await
+                .unwrap();
+            leveler_storage::TurnRepository::new(&db)
+                .finish(
+                    &leveler_core::TurnId::new(later.id),
+                    "interrupted",
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            MessageRepository::new(&db)
+                .append(
+                    &session,
+                    &[serde_json::to_string(&message).unwrap()],
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                client.continuation_state(&session).await.unwrap(),
+                ContinuationState::Resumable
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_latest_recovered_input_is_an_error_not_an_older_goal_fallback() {
+        let (_temporary, client, session, db) = fixture().await;
+        for payload in [
+            None,
+            Some(r#"{"version":1,"initiating_message":{"role":"assistant","content":[]}}"#),
+            Some(r#"{"version":99}"#),
+        ] {
+            let turn = leveler_storage::TurnRepository::new(&db)
+                .start(&session, "chat", payload, leveler_core::now())
+                .await
+                .unwrap();
+            leveler_storage::TurnRepository::new(&db)
+                .finish(
+                    &leveler_core::TurnId::new(turn.id),
+                    "interrupted",
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                client.continuation_state(&session).await.is_err(),
+                "corrupt latest input must fail explicitly: {payload:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn late_finish_of_closed_turn_cannot_supersede_cancelled_or_completed() {
+        let (_temporary, client, session, db) = fixture().await;
+        let turn = leveler_storage::TurnRepository::new(&db).start(&session, "chat", Some(r#"{"version":1,"initiating_message":{"role":"user","content":[{"type":"text","text":"original objective"}]}}"#), leveler_core::now()).await.unwrap();
+        let turn_id = leveler_core::TurnId::new(turn.id);
+        leveler_storage::TurnRepository::new(&db)
+            .finish(&turn_id, "interrupted", leveler_core::now())
+            .await
+            .unwrap();
+        for (outcome, expected) in [
+            (TaskOutcome::Cancelled, ContinuationState::Cancelled),
+            (TaskOutcome::Completed, ContinuationState::NotResumable),
+        ] {
+            let event = leveler_engine::EngineEvent::TaskFinished {
+                outcome,
+                reason: None,
+                stop: None,
+                failure: None,
+                warnings: Vec::new(),
+            };
+            let (kind, payload) = event.to_row().unwrap();
+            leveler_storage::EventRepository::new(&db)
+                .append(
+                    &session,
+                    Some(&turn_id),
+                    &kind,
+                    &payload,
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            let late = leveler_engine::EngineEvent::TurnFinished {
+                stop: None,
+                turn_id: turn_id.clone(),
+                outcome: leveler_lifecycle::TurnOutcome::Interrupted,
+                stop_reason: "unclean process exit".into(),
+                model_steps: 0,
+                modified_files: Vec::new(),
+            };
+            let (kind, payload) = late.to_row().unwrap();
+            leveler_storage::EventRepository::new(&db)
+                .append(
+                    &session,
+                    Some(&turn_id),
+                    &kind,
+                    &payload,
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.continuation_state(&session).await.unwrap(), expected);
         }
     }
 }

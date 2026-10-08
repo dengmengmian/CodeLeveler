@@ -2037,8 +2037,34 @@ fn connected_client_recovers_after_daemon_sigkill() {
     );
 }
 
+#[test]
+fn recovered_interrupted_without_task_terminal_continues_original_lineage() {
+    leveler_test_support::bounded_test(
+        "recovered_interrupted_without_task_terminal_continues_original_lineage",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        || connected_client_recovers_after_daemon_sigkill_scenario(true),
+    );
+}
+
 async fn connected_client_recovers_after_daemon_sigkill_body() {
+    connected_client_recovers_after_daemon_sigkill_scenario(false).await;
+}
+
+async fn connected_client_recovers_after_daemon_sigkill_scenario(resume_recovered: bool) {
     let (base_url, _model) = hold_open_model_endpoint().await;
+    let plan_server = if resume_recovered {
+        Some(leveler_test_support::MockServer::start(vec![
+            smoke_sse(vec![serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"recover-plan","type":"function","function":{"name":"update_plan","arguments":serde_json::json!({"plan":[{"step":"retain original inventory objective","status":"in_progress"},{"step":"validate original inventory","status":"pending"}]}).to_string()}}]}}]}), serde_json::json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})]),
+            leveler_test_support::MockResponse::NeverResponds,
+            leveler_test_support::MockResponse::NeverResponds,
+        ]).await)
+    } else {
+        None
+    };
+    let base_url = plan_server
+        .as_ref()
+        .map(|server| server.base_url())
+        .unwrap_or(base_url);
     let env = test_env(&base_url);
     let ready1 = env.home.join("ready1.json");
     let mut daemon = spawn_serve(&env, &ready1);
@@ -2051,7 +2077,11 @@ async fn connected_client_recovers_after_daemon_sigkill_body() {
     let session = client
         .create_session(CreateSessionRequest {
             request_id: None,
-            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            collaboration: if resume_recovered {
+                leveler_local_transport::CollaborationMode::Goal
+            } else {
+                leveler_local_transport::CollaborationMode::Chat
+            },
             workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
             approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
             goal: "survive the crash".to_string(),
@@ -2084,6 +2114,23 @@ async fn connected_client_recovers_after_daemon_sigkill_body() {
         }
         assert!(Instant::now() < deadline, "turn never became durable");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if resume_recovered {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let plan = leveler_storage::EventRepository::new(&db)
+                .load_last_by_type(&session, "plan_updated", None)
+                .await
+                .unwrap();
+            if plan.is_some() && plan_server.as_ref().unwrap().request_count() >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "original plan and next model request must be durable before SIGKILL"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
     let task = leveler_storage::TaskStore::task_for_session(&db, &session)
         .await
@@ -2140,6 +2187,93 @@ async fn connected_client_recovers_after_daemon_sigkill_body() {
         .await
         .unwrap();
     assert!(turns.iter().all(|t| t.status != "running"));
+
+    if resume_recovered {
+        assert_eq!(
+            snapshot.task_status,
+            Some(leveler_client_protocol::UiTaskStatus::Interrupted)
+        );
+        assert!(
+            snapshot.task_terminal.is_none(),
+            "recovery must not invent TaskFinished"
+        );
+        assert_eq!(turns.len(), 1);
+        let original = &turns[0];
+        assert_eq!(original.status, "interrupted");
+        client
+            .send(ClientCommand::ResumeTask {
+                session_id: session.clone(),
+                content: "继续，preserve original objective".into(),
+            })
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let resumed = loop {
+            let turns = leveler_storage::TurnRepository::new(&db)
+                .list(&session)
+                .await
+                .unwrap();
+            if turns.len() == 2 {
+                break turns[1].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "continuation was not durably admitted"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let lineage = leveler_engine::decode_turn_continuation(
+            resumed
+                .payload
+                .as_deref()
+                .expect("durable continuation input"),
+        )
+        .unwrap();
+        assert_eq!(
+            lineage.root_turn_id.as_ref().map(|id| id.as_str()),
+            Some(original.id.as_str()),
+            "recovery continuation must enter Harness resume, not a fresh submit"
+        );
+        assert_eq!(lineage.objective.primary.as_deref(), Some("MARKER"));
+        let original_lineage =
+            leveler_engine::decode_turn_continuation(original.payload.as_deref().unwrap()).unwrap();
+        assert!(original_lineage.goal_id.is_some());
+        assert_eq!(
+            lineage.goal_id, original_lineage.goal_id,
+            "recovery must continue the original Goal"
+        );
+        let stores = leveler_storage::EngineStores::from_database(&db);
+        let goals = stores.goals.for_task(&task).await.unwrap();
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].id, original_lineage.goal_id.unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let seeded = loop {
+            let rows = leveler_storage::EventRepository::new(&db)
+                .load(&session)
+                .await
+                .unwrap();
+            if let Some(row) = rows.into_iter().find(|row| {
+                row.turn_id.as_deref() == Some(resumed.id.as_str())
+                    && row.event_type == "plan_updated"
+            }) {
+                break row;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "resumed Goal must seed its original plan"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(seeded.payload.contains("validate original inventory"));
+        assert_eq!(resumed.kind, original.kind);
+        assert_ne!(resumed.owner_boot_id, original.owner_boot_id);
+        client
+            .send(ClientCommand::CancelCurrentTurn {
+                session_id: session.clone(),
+            })
+            .await
+            .unwrap();
+    }
 
     drop(client);
     stop_daemon(&mut daemon);
@@ -2967,4 +3101,192 @@ async fn create_session_lost_response_retries_one_durable_logical_identity_body(
         "full_access",
         "replay preserves later permission"
     );
+}
+
+#[test]
+fn recovered_unknown_tool_requires_reconciliation_without_replaying_effect() {
+    leveler_test_support::bounded_test(
+        "recovered_unknown_tool_requires_reconciliation_without_replaying_effect",
+        Duration::from_secs(90),
+        recovered_unknown_tool_requires_reconciliation_without_replaying_effect_body,
+    );
+}
+
+async fn recovered_unknown_tool_requires_reconciliation_without_replaying_effect_body() {
+    let call = "uncertain-side-effect";
+    let script = r#"import pathlib,time; p = pathlib.Path('effect-count'); p.open('a').write('executed\n'); print('effect-committed', flush=True); exec("while p.parent.exists() and not pathlib.Path('effect-release').exists():\n time.sleep(0.05)"); pathlib.Path('effect-result').write_text('completed')"#;
+    let server = leveler_test_support::MockServer::start(vec![smoke_sse(vec![
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": call, "type": "function",
+            "function": {"name": "run_command", "arguments": serde_json::json!({
+                "program": "python3", "args": ["-c", script]
+            }).to_string()}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])])
+    .await;
+    let env = test_env(&server.base_url());
+    let effect = env.repo.join("effect-count");
+    let ready = env.home.join("ready-unknown-tool-1.json");
+    let mut daemon = spawn_serve(&env, &ready);
+    wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            request_id: None,
+            collaboration: leveler_local_transport::CollaborationMode::Goal,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "cancel uncertain external side effect".into(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::FullAccess,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    let before = client.runtime_info().await.unwrap();
+    let mut events = client.subscribe_session(&session);
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "execute the controlled operation once".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let RuntimeEvent::ToolCallOutput { id, chunk, .. } = events.recv().await.unwrap()
+                && id.as_str() == call
+                && chunk.contains("effect-committed")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("external effect and readiness output must occur before cancellation");
+    assert_eq!(std::fs::read_to_string(&effect).unwrap(), "executed\n");
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let log = leveler_storage::EventRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert!(
+        log.iter()
+            .any(|row| row.event_type == "tool_call_started" && row.payload.contains(call))
+    );
+    assert!(
+        !log.iter()
+            .any(|row| row.event_type == "tool_call_finished" && row.payload.contains(call)),
+        "the externally observable effect must precede the tool result commit"
+    );
+    daemon.kill().expect("SIGKILL owned isolated daemon");
+    daemon.wait().unwrap();
+    std::fs::write(
+        env.repo.join("effect-release"),
+        "release owned fixture tool",
+    )
+    .unwrap();
+    let ready = env.home.join("ready-uncertain-recovery-2.json");
+    let mut replacement = spawn_serve(&env, &ready);
+    wait_ready(&ready, &mut replacement, Duration::from_secs(30));
+    let recovered = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let after = recovered.runtime_info().await.unwrap();
+    assert_eq!(before.runtime_id, after.runtime_id);
+    assert_ne!(before.pid, after.pid);
+    let snapshot = recovered.snapshot(&session).await.unwrap();
+    assert_eq!(
+        snapshot.task_status,
+        Some(leveler_client_protocol::UiTaskStatus::Interrupted)
+    );
+    assert!(snapshot.task_terminal.is_none());
+    let original = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap()[0]
+        .clone();
+    let original_lineage =
+        leveler_engine::decode_turn_continuation(original.payload.as_deref().unwrap()).unwrap();
+    let stores = leveler_storage::EngineStores::from_database(&db);
+    let task = stores
+        .tasks
+        .task_for_session(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(original_goals.len(), 1);
+    assert_eq!(
+        original_lineage.goal_id.as_ref(),
+        Some(&original_goals[0].id)
+    );
+    let request_count = server.request_count();
+    let error = recovered
+        .send(ClientCommand::ResumeTask {
+            session_id: session.clone(),
+            content: "继续".into(),
+        })
+        .await
+        .expect_err(
+            "uncertain mutating tool must require human reconciliation before model re-drive",
+        );
+    assert!(
+        error.to_string().contains("--confirm-recovery"),
+        "explicit uncertain-tool error required: {error}"
+    );
+    assert_eq!(
+        server.request_count(),
+        request_count,
+        "unsafe recovery must not re-drive the model"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&effect).unwrap(),
+        "executed\n",
+        "the uncertain external effect must not execute twice"
+    );
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "unsafe resume must not start a replacement objective"
+    );
+    let after_lineage =
+        leveler_engine::decode_turn_continuation(turns[0].payload.as_deref().unwrap()).unwrap();
+    assert_eq!(after_lineage, original_lineage);
+    let after_goals = stores.goals.for_task(&task).await.unwrap();
+    assert_eq!(
+        after_goals.len(),
+        1,
+        "blocked recovery must not create a new Goal"
+    );
+    assert_eq!(after_goals[0].id, original_goals[0].id);
+    assert_eq!(after_goals[0].objective, original_goals[0].objective);
+    assert_eq!(
+        after_goals[0].state, original_goals[0].state,
+        "blocked recovery must not reset or settle the unfinished Goal"
+    );
+
+    let events = leveler_storage::EventRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|row| row.event_type == "tool_call_finished" && row.payload.contains(call)),
+        "unknown tool result must not be fabricated as success"
+    );
+    drop(recovered);
+    drop(client);
+    stop_daemon(&mut replacement);
 }

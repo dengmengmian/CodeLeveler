@@ -974,7 +974,7 @@ CancelRequested → CancelDelivered → ExecutionTerminated → TerminalPersiste
 
 这些是语义阶段，不是新的 wire 类型。`CancelCurrentTurn` 返回成功只表示请求已经到达拥有该 Turn 的 Runtime；Turn 在终态提交前始终是 `running`。客户端从持久终态（`TaskFinished` 及对应 `RuntimeEvent`）得知真正的结束，而不是从 ACK 推断，并且在 Turn 仍存活时显示“正在停止”，而不是“已停止”。
 
-`CancelTask` 的差别在意图，不在 ACK 强度：它要求提交终态 `cancelled`、结清 Goal 并拒绝之后的继续；而 `CancelCurrentTurn` 留下可恢复的 `interrupted`。运行中的取消请求在 ACK 前写入现有事件日志，绑定精确 task、turn、boot 和 owner epoch，并与终态提交共用持久写入事务边界。取消先提交则终态必须为 `cancelled`；已提交的完成结果不会被迟到取消覆盖。boot 在 ACK 后死亡时，运行时只回收已证明死亡的 turn，Harness 依据该 turn 的持久取消意图供给 Goal 结算，终态与会话投影和 Ownership 释放原子提交。恢复不重放结果未知的工具调用，ACK 始终不能被表述成“执行已经终止”。
+`CancelTask` 的差别在意图，不在 ACK 强度：它要求提交终态 `cancelled`、结清 Goal 并拒绝之后的继续；而 `CancelCurrentTurn` 留下可恢复的 `interrupted`。运行中的取消请求在 ACK 前写入现有事件日志，绑定精确 task、turn、boot 和 owner epoch，并与终态提交共用持久写入事务边界。取消先提交则终态必须为 `cancelled`；已提交的完成结果不会被迟到取消覆盖。boot 在 ACK 后死亡时，运行时只回收已证明死亡的 turn，Harness 依据该 turn 的持久取消意图供给 Goal 结算，终态与会话投影和 Ownership 释放原子提交。恢复不重放结果未知的工具调用，ACK 始终不能被表述成“执行已经终止”。 当 boot 崩溃后只有 fenced recovery 写入的最新 Interrupted turn、尚无该工作窗口的 TaskFinished 时，App 使用同一持久 SessionFacts 的 turn ordinal 与终态边界判断可恢复性，并要求有效的 user/chat initiating payload 和已释放的 Task owner。迟到的同 turn finish 不能让 Cancelled/Completed 重新可继续。Harness 继续拥有原 objective、Goal、计划与 ledger 的重建；未知结果的变更工具要求显式人工 reconciliation，不能自动重放或伪造成功。
 
 ---
 

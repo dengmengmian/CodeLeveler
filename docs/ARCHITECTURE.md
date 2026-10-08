@@ -1039,7 +1039,7 @@ while a completed terminal cannot be overwritten by a late cancel. After a boot
 dies, the runtime reaps only turns proven dead and the Harness supplies goal
 settlement from that turn's durable intent. The terminal, session projection and
 ownership release commit atomically. Recovery does not replay tools with unknown
-results, and ACK must never be presented as execution terminated.
+results, and ACK must never be presented as execution terminated. When a crashed boot leaves only the latest fenced recovery Interrupted turn without a TaskFinished for that work window, App determines eligibility from the same durable SessionFacts turn ordinals and terminal boundary, requiring a valid user/chat initiating payload and released Task ownership. A late finish on the same turn cannot reopen Cancelled/Completed. Harness retains original objective, Goal, plan, and ledger reconstruction. Mutating tools with unknown outcomes require explicit human reconciliation; recovery cannot automatically replay them or fabricate success.
 
 ---
 
