@@ -55,6 +55,25 @@ export function messageRoleLabel(message){return message.kind==='runtime_notice'
 /** @template {{role:string,kind?:string}} T @param {T[]} messages @returns {T[]} */
 export function historyQuestions(messages){return messages.filter(message=>messageKind(message)==='user');}
 
+/** @typedef {{appliedDiff?:string|null,status?:string,name?:string}} DiffTool */
+
+/**
+ * The runtime's CONFIRMED diff for an edit, or null.
+ *
+ * `applied_diff` is the applied result; the tool's arguments are the requested
+ * patch. They are different facts, and a presentation that rebuilt the diff
+ * from the arguments would show what was asked for, not what changed. A call
+ * that did not confirm an edit has nothing to show.
+ * @param {DiffTool} tool @returns {string|null}
+ */
+export function confirmedDiff(tool){if(!tool)return null;if(!['ok','success','done'].includes(tool.status??''))return null;const patch=tool.appliedDiff;return typeof patch==='string'&&patch!==''?patch:null;}
+
+/** Changed lines of a patch: `[added, removed]`, header markers excluded. @param {string} patch */
+export function diffCounts(patch){const lines=patch.split('\n');return [lines.filter(line=>line.startsWith('+')&&!line.startsWith('+++')).length,lines.filter(line=>line.startsWith('-')&&!line.startsWith('---')).length];}
+
+/** Every line a confirmed diff must display. Full display is the contract, so this never truncates. @param {string} patch */
+export function diffLines(patch){return patch.split('\n');}
+
 /** @param {string} status */
 export function planStepLabel(status){const labels=/** @type {Record<string,string>} */({pending:'待执行',running:'进行中',done:'已完成',failed:'失败',skipped:'已跳过'});return labels[status]??`未知状态：${status}`;}
 /** @param {{plan?:{steps:unknown[]}|null,diff?:unknown,diffError?:string|null,hasWorkspace?:boolean}} state */

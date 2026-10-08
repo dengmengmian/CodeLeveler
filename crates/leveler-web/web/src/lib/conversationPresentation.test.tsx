@@ -19,7 +19,7 @@ import {
   turnBlocks,
   type FoldedThought,
 } from './conversationPresentation';
-import { groupExecutionRounds } from './executionRounds';
+import { failureReason, groupExecutionRounds } from './executionRounds';
 import { ConfirmedDiffBlock } from '../components/ConfirmedDiffBlock';
 import { ExplorationReceiptRow } from '../components/ExplorationReceiptRow';
 import { ThoughtRow } from '../components/ThoughtRow';
@@ -145,17 +145,20 @@ function project(view: SessionView): { items: Record<string, unknown>[] } {
     }
     const failed = block.round.tools.filter((tool) => tool.status === 'fail');
     if (failed.length > 0) {
+      const first = failed[0];
       items.push({
         kind: 'run_receipt',
         folded: true,
         status: 'failed',
         failure_visible: true,
         exit_code: 101,
-        failure_line: 'error: test failed',
+        // The client's own selection, compared against the reference's: the
+        // corpus is what proves they name the same line.
+        failure_line: failureReason(first.preview ?? ''),
       });
     }
   }
-  for (const tool of confirmed) {
+  for (const _tool of confirmed) {
     items.push({
       kind: 'edit_diff',
       paths: ['src/models.rs'],
@@ -235,8 +238,8 @@ describe('conversation presentation contract (Web)', () => {
     const { view } = drive(fixture);
     const tool = view.tools.find((candidate) => candidate.id === 't1');
     expect(tool?.status).toBe('fail');
-    // The command's OWN failure line, never a runtime note.
-    expect(tool?.preview).toContain('error: test failed');
+    // The first line that reports the failure — the reference's own rule.
+    expect(failureReason(tool?.preview ?? '')).toBe('test mapping::recommended ... FAILED');
     expect(project(view).items).toContainEqual(
       fixture.expect.items.find((item) => item.kind === 'run_receipt'),
     );

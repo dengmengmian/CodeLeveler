@@ -65,14 +65,53 @@ export function commandOutputBody(preview: string): string[] {
 }
 
 /**
+ * Whether a lowercased line says something FAILED, as opposed to counting zero
+ * of them ("11 passed; 0 failed", "# fail 0") — the reference's own rule,
+ * ported so both clients name the same line.
+ */
+function countsAFailure(lower: string): boolean {
+  const nonzero = (token: string | undefined): boolean | undefined =>
+    token === undefined || token === '' ? undefined : [...token].some((c) => c !== '0');
+  const numberBefore = (at: number): boolean | undefined => {
+    const head = lower.slice(0, at).trimEnd();
+    const token = head.split(/[^0-9]/).pop() ?? '';
+    return nonzero(token);
+  };
+  const numberAfter = (at: number): boolean | undefined => {
+    const tail = lower.slice(at).replace(/^[a-z:= ]+/i, '');
+    const token = (tail.split(/[^0-9]/)[0] ?? '').trim();
+    return nonzero(token);
+  };
+  let from = 0;
+  while (true) {
+    const offset = lower.indexOf('fail', from);
+    if (offset < 0) return false;
+    const at = offset;
+    const verdict = numberBefore(at) ?? numberAfter(at) ?? true;
+    if (verdict) return true;
+    from = at + 4;
+  }
+}
+
+/**
  * The line that says what actually failed: the first line reporting a failure
- * (`error…`, `FAIL`, `✗`, `panic`), else the first thing the command printed —
- * never a runtime note.
+ * (`error…`, `FAIL`, `✗`, `panic`, or a nonzero failure count), else the first
+ * thing the command printed — never a runtime note. The reference (TUI
+ * `shell_failure_line`) is the authority for the choice; a client that named a
+ * different line would be a second presentation of the same fact.
  */
 export function failureReason(preview: string): string | null {
   const lines = commandOutputBody(preview);
-  const failure = lines.find((line) => /^(error|fail|✗|panic)/i.test(line.trim()));
-  return failure ?? lines[0] ?? null;
+  const reportsFailure = (line: string): boolean => {
+    const lower = line.toLowerCase();
+    return (
+      lower.startsWith('error') ||
+      lower.includes('panic') ||
+      line.includes('✗') ||
+      countsAFailure(lower)
+    );
+  };
+  return lines.find(reportsFailure) ?? lines[0] ?? null;
 }
 
 /** Whether a tool names a command/shell call, whose preview mixes runtime rows. */

@@ -43,11 +43,11 @@ function applyToolEvent(state, event) {
         // The runtime's answer classification. `?? 'work'` is the conservative
         // read of a peer that did not state it (AnswerEffect::unstated), never
         // a local decision about the tool name.
-        answerEffect:event.answer_effect??'work',batch,seq:'anchor' in event?undefined:nextSeq++});
+        answerEffect:event.answer_effect??'work',appliedDiff:null,batch,seq:'anchor' in event?undefined:nextSeq++});
     }
   } else if (event.type === 'tool_call_completed' || event.type === 'tool_call_output') {
-    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',parallel:false,modelStep:null,answerEffect:'work',batch:null}; tools.push(tool);}
-    if (event.type === 'tool_call_completed') Object.assign(tool,{status:toolStatusFromOutcome(event.ok,event.stop),preview:event.preview,exit_code:event.exit_code});
+    if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',appliedDiff:null,parallel:false,modelStep:null,answerEffect:'work',batch:null}; tools.push(tool);}
+    if (event.type === 'tool_call_completed') Object.assign(tool,{status:toolStatusFromOutcome(event.ok,event.stop),preview:event.preview,exit_code:event.exit_code,appliedDiff:event.applied_diff??null});
     else tool.preview = (tool.preview + event.chunk).slice(-16000);
   }
   return {...state,tools,nextSeq};

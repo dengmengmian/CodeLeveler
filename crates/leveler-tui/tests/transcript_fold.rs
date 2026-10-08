@@ -1028,3 +1028,140 @@ fn narrow_explore_1_a_long_target_does_not_break_the_layout() {
         );
     }
 }
+
+// ── The shared conversation-presentation corpus ─────────────────────────────
+//
+// `testdata/conversation_presentation/v1/` is the language-neutral oracle for
+// the conversation contract. The terminal is the reference implementation, so
+// this is where the corpus is anchored: the same wire events the Web and
+// Desktop clients consume are driven through the real TUI reducer and asserted
+// against the same expectation. The other surfaces prove conformance against
+// these same JSON files.
+
+fn corpus(id: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/conversation_presentation/v1")
+        .join(format!("{id}.json"));
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_str(&raw).expect("fixture json")
+}
+
+/// Drive one fixture's live path through the real reducer.
+fn drive_corpus(id: &str) -> (AppState, serde_json::Value) {
+    let doc = corpus(id);
+    let mut s = opened();
+    for entry in doc["paths"]["live"].as_array().expect("live path") {
+        let event: RuntimeEvent =
+            serde_json::from_value(entry["event"].clone()).expect("wire event");
+        reduce(&mut s, Action::Runtime(event));
+    }
+    (s, doc)
+}
+
+/// Every `expect.items` entry of the fixture with the given `kind`.
+fn expected_item(doc: &serde_json::Value, kind: &str) -> serde_json::Value {
+    doc["expect"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["kind"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} in {}", doc["id"]))
+        .clone()
+}
+
+/// CONV-C1: a confirmed edit is displayed in full — every changed line, no
+/// click, no `… +N lines` substitution, no diffstat-only row.
+#[test]
+fn conversation_c1_a_confirmed_edit_is_painted_in_full() {
+    let (s, doc) = drive_corpus("C1");
+    let expected = expected_item(&doc, "edit_diff");
+    assert_eq!(expected["rendered_in_full"], true);
+    assert_eq!(expected["needs_click"], false);
+    let painted = text(&s);
+    assert!(
+        painted.contains("- const RECOMMENDED"),
+        "the removed line is on screen: {painted}"
+    );
+    assert!(
+        painted.contains("+ const RECOMMENDED"),
+        "the added line is on screen: {painted}"
+    );
+    assert!(
+        painted.contains("gpt-6"),
+        "the applied value is on screen: {painted}"
+    );
+    for substitution in ["+1 −1 lines", "… +", "展开"] {
+        assert!(
+            !painted.contains(substitution),
+            "a confirmed diff is never summarised or gated ({substitution}): {painted}"
+        );
+    }
+}
+
+/// CONV-C2: consecutive read-only exploration is ONE collapsed receipt whose
+/// members are not painted until it opens.
+#[test]
+fn conversation_c2_exploration_is_one_collapsed_receipt() {
+    let (s, doc) = drive_corpus("C2");
+    let expected = expected_item(&doc, "exploration_receipt");
+    assert_eq!(expected["folded"], true);
+    assert_eq!(expected["members_visible"], false);
+    let painted = text(&s);
+    assert!(
+        painted.contains("读取 2 个文件 · 搜索 1 次"),
+        "the merged receipt is on screen: {painted}"
+    );
+    assert!(
+        !painted.contains("src/models.rs"),
+        "a collapsed receipt does not paint a member waterfall: {painted}"
+    );
+}
+
+/// CONV-C3: provider reasoning is a folded Thought with the runtime's own
+/// duration — never assistant prose, and never open by default.
+#[test]
+fn conversation_c3_a_completed_thought_is_folded() {
+    let (s, doc) = drive_corpus("C3");
+    let mut expected = expected_item(&doc, "thought");
+    assert_eq!(expected["folded"], true);
+    assert_eq!(expected["body_visible"], false);
+    let painted = text(&s);
+    assert!(
+        painted.contains("思考 · 1.6s"),
+        "the Thought header carries the runtime's measurement: {painted}"
+    );
+    assert!(
+        !painted.contains("先看解析器的入口。"),
+        "a completed Thought comes back folded: {painted}"
+    );
+    // No raw reasoning was promoted into the transcript as prose.
+    assert_eq!(
+        expected["body"], "先看解析器的入口。再看它的调用方。",
+        "the corpus body is the durable segment: {painted}"
+    );
+    expected["state"] = serde_json::json!("completed");
+    assert_eq!(expected["state"], "completed");
+}
+
+/// CONV-C4: a failed Run is collapsed AND readable — the command's own failure
+/// line is on screen before anything is expanded.
+#[test]
+fn conversation_c4_a_failed_run_shows_its_failure_collapsed() {
+    let (s, doc) = drive_corpus("C4");
+    let expected = expected_item(&doc, "run_receipt");
+    assert_eq!(expected["folded"], true);
+    assert_eq!(expected["failure_visible"], true);
+    let painted = text(&s);
+    assert!(
+        painted.contains("test mapping::recommended ... FAILED"),
+        "the first line reporting the failure is on the collapsed row: {painted}"
+    );
+    assert!(
+        !painted.contains("exit: 101"),
+        "a runtime execution row is never the failure reason: {painted}"
+    );
+    assert!(
+        painted.contains("✗") || painted.contains("失败"),
+        "the row states it failed: {painted}"
+    );
+}
