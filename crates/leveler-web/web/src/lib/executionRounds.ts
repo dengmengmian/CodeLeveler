@@ -14,6 +14,7 @@
 // - Runtime notes (`[execution policy]`, `[mutation rejected]`, …) state HOW a
 //   command ran; they are never WHY it failed (C8).
 
+import * as shared from '../../../../../packages/conversation-presentation/conversation.mjs';
 import { isTurnUser } from './presentationKind';
 import type { ChatMessage, ToolCallView } from '../state/store';
 /** Tool lifecycle — the frozen five-way reading of a call. */
@@ -39,95 +40,17 @@ export type ProjectedItem =
   | { kind: 'execution_round'; round: ExecutionRoundView; seq: number };
 
 /**
- * Runtime rows about HOW a command ran, never why it failed (Contract §I8).
+ * Runtime execution rows: they say HOW a command ran, never why it failed
+ * (Contract §I8). The rules live once, in
+ * `packages/conversation-presentation/conversation.mjs`, because the Web client
+ * and the Desktop renderer must name the same failure line and the reference
+ * implementation (`leveler-tui`'s `shell_failure_line`) is the authority.
  */
-const RUNTIME_NOTE_TAGS: readonly string[] = [
-  '[execution policy] ',
-  '[mutation rejected] ',
-  '[note] ',
-];
-
-export function isRuntimeNote(line: string): boolean {
-  const trimmed = line.trimEnd();
-  if (trimmed.startsWith('exit: ')) return true;
-  if (trimmed.startsWith('--- ') && trimmed.endsWith(' ---')) return true;
-  if (trimmed === '[timed out]') return true;
-  if (trimmed.startsWith('[timed out after ') && trimmed.endsWith(']')) return true;
-  return RUNTIME_NOTE_TAGS.some((tag) => trimmed.startsWith(tag));
-}
-
-/** The command's own output, with the runtime's execution rows removed. */
-export function commandOutputBody(preview: string): string[] {
-  return preview
-    .split('\n')
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim() !== '' && !isRuntimeNote(line));
-}
-
-/**
- * Whether a lowercased line says something FAILED, as opposed to counting zero
- * of them ("11 passed; 0 failed", "# fail 0") — the reference's own rule,
- * ported so both clients name the same line.
- */
-function countsAFailure(lower: string): boolean {
-  const nonzero = (token: string | undefined): boolean | undefined =>
-    token === undefined || token === '' ? undefined : [...token].some((c) => c !== '0');
-  const numberBefore = (at: number): boolean | undefined => {
-    const head = lower.slice(0, at).trimEnd();
-    const token = head.split(/[^0-9]/).pop() ?? '';
-    return nonzero(token);
-  };
-  const numberAfter = (at: number): boolean | undefined => {
-    const tail = lower.slice(at).replace(/^[a-z:= ]+/i, '');
-    const token = (tail.split(/[^0-9]/)[0] ?? '').trim();
-    return nonzero(token);
-  };
-  let from = 0;
-  while (true) {
-    const offset = lower.indexOf('fail', from);
-    if (offset < 0) return false;
-    const at = offset;
-    const verdict = numberBefore(at) ?? numberAfter(at) ?? true;
-    if (verdict) return true;
-    from = at + 4;
-  }
-}
-
-/**
- * The line that says what actually failed: the first line reporting a failure
- * (`error…`, `FAIL`, `✗`, `panic`, or a nonzero failure count), else the first
- * thing the command printed — never a runtime note. The reference (TUI
- * `shell_failure_line`) is the authority for the choice; a client that named a
- * different line would be a second presentation of the same fact.
- */
-export function failureReason(preview: string): string | null {
-  const lines = commandOutputBody(preview);
-  const reportsFailure = (line: string): boolean => {
-    const lower = line.toLowerCase();
-    return (
-      lower.startsWith('error') ||
-      lower.includes('panic') ||
-      line.includes('✗') ||
-      countsAFailure(lower)
-    );
-  };
-  return lines.find(reportsFailure) ?? lines[0] ?? null;
-}
-
-/** Whether a tool names a command/shell call, whose preview mixes runtime rows. */
-export function isCommandTool(name: string): boolean {
-  // The reference implementation's `is_shell_call`: only the two shell tools
-  // mix their own output with the runtime's execution rows.
-  return name === 'run_command' || name === 'shell_command';
-}
-
-/** The preview a row renders: a command's output without the runtime's rows. */
-export function displayPreview(tool: ToolCallView): string | null {
-  if (tool.preview === null || tool.preview === '') return null;
-  if (!isCommandTool(tool.name)) return tool.preview;
-  const body = commandOutputBody(tool.preview).join('\n');
-  return body === '' ? null : body;
-}
+export const isRuntimeNote = shared.isRuntimeNote;
+export const commandOutputBody = shared.commandOutputBody;
+export const failureReason = shared.failureLine;
+export const displayPreview = shared.displayPreview;
+export const isCommandTool = shared.isCommandTool;
 
 function roundStatus(tools: readonly ToolCallView[]): RoundStatus {
   if (tools.some((tool) => tool.status === 'run')) return 'running';

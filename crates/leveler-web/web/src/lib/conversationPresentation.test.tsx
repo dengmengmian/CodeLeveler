@@ -22,7 +22,7 @@ import {
 import { failureReason, groupExecutionRounds } from './executionRounds';
 import { ConfirmedDiffBlock } from '../components/ConfirmedDiffBlock';
 import { ExplorationReceiptRow } from '../components/ExplorationReceiptRow';
-import { ThoughtRow } from '../components/ThoughtRow';
+import { ThoughtRow, ThinkingRow } from '../components/ThoughtRow';
 
 import fixtureC1 from '../../../testdata/conversation_presentation/v1/C1.json?raw';
 import fixtureC2 from '../../../testdata/conversation_presentation/v1/C2.json?raw';
@@ -288,6 +288,14 @@ describe('conversation presentation rendering (Web)', () => {
     );
     expect(markup).toContain('思考 · 1.6s');
     expect(markup).not.toContain('先看解析器。');
+  });
+
+  it('paints the live Thinking row while the model is thinking', () => {
+    const markup = renderToStaticMarkup(<ThinkingRow text="先看入口。" />);
+    expect(markup).toContain('思考中');
+    expect(markup).toContain('先看入口。');
+    // A live segment is not a finished Thought: no duration is invented.
+    expect(markup).not.toContain('思考 ·');
   });
 
   it('paints an exploration receipt collapsed, and its members only when open', () => {

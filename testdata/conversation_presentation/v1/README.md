@@ -50,6 +50,8 @@ different tree is out of contract.
 | Web | `crates/leveler-web/web/src/lib/conversationPresentation.test.tsx` — the real reducer through the real bridge, plus the rendered components |
 | Desktop | `apps/leveler-desktop/test/conversationPresentation.test.mjs` |
 
-Deferred, and recorded rather than silently skipped: the Desktop client has no
-completed-Thought history (C3) and no exploration receipt (C2) yet, so its
-conformance test covers C1 and C4 only.
+The shared rules live once, in
+`packages/conversation-presentation/conversation.mjs`: the Web client and the
+Desktop renderer import the same projection, so a fold, a failure line or a
+Diff can no longer be decided twice. The terminal keeps its own renderer, which
+is the point — the contract is shared, the widgets are not.

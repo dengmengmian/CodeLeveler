@@ -5,18 +5,29 @@
 import { toolStatusFromOutcome, turnTerminalFromEvent } from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
-  const messages = structuredClone(snapshot.messages ?? []).map((message,index)=>({...message,seq:index}));
-  let state = {session:snapshot, messages, nextSeq:messages.length, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null};
-  let anchor=null;
-  for (const entry of history) {
-    if(entry.event.type==='user_message_added')anchor=entry.event.message.id;
-    if(entry.event.type==='assistant_message_started')anchor=entry.event.message_id;
-    state=applyToolEvent(state,{...entry.event,anchor});
+  let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null};
+  if (history.length > 0) {
+    // The durable log is the conversation; the snapshot's `messages` are the
+    // ACTIVE MODEL CONTEXT (`/compact` leaves one summary row there). Replaying
+    // the runtime's own normalized events through the SAME mapping the live
+    // stream uses is what keeps a reopened session's chronology whole.
+    let anchor=null;
+    for (const entry of history) {
+      const event=entry.event ?? entry;
+      if(event.type==='user_message_added')anchor=event.message.id;
+      if(event.type==='assistant_message_started')anchor=event.message_id;
+      if(event.type==='reasoning_started'||event.type==='reasoning_delta'||event.type==='reasoning_completed')state=applyEvent(state,event);
+      else state=applyEvent(state,{...event,anchor});
+    }
+  } else {
+    // No durable turn: the snapshot is all there is (a brand-new session).
+    state.messages = structuredClone(snapshot.messages ?? []).map((message,index)=>({...message,seq:index}));
+    state.nextSeq = state.messages.length;
   }
-  for (const tool of snapshot.active_tools ?? []) state = applyToolEvent(state,{type:'tool_call_started',...tool,id:tool.id ?? tool.call_id,name:tool.name,arguments:tool.arguments});
+  for (const tool of snapshot.active_tools ?? []) state = applyEvent(state,{type:'tool_call_started',...tool,id:tool.id ?? tool.call_id,name:tool.name,arguments:tool.arguments});
   // The durable history's turn terminal is the runtime's own fact: without it a
   // reopened turn could not tell an answer from interim narration (Contract §I9).
-  const terminal = [...history].reverse().find(entry=>terminalEvents.has(entry.event.type))?.event.type;
+  const terminal = [...history].reverse().find(entry=>terminalEvents.has((entry.event??entry).type))?.event?.type;
   if (terminal) state = {...state, lastTerminal: turnTerminalFromEvent(terminal, state.messages, state.tools)};
   state.approvals = (snapshot.pending_interactions ?? []).filter(i=>i.type==='approval').map(i=>i.request);
   state.clarifications = (snapshot.pending_interactions ?? []).filter(i=>i.type==='clarification').map(i=>i.request);
@@ -77,7 +88,28 @@ export function applyEvent(state,event) {
   if (event.type==='clarification_requested') next.clarifications=[...state.clarifications.filter(a=>a.id!==event.request.id),event.request];
   if (event.type==='clarification_resolved') next.clarifications=state.clarifications.filter(a=>a.id!==event.id);
   if (event.type==='agent_activity' || event.type==='command_progress') next.activity=event.label;
-  if (terminalEvents.has(event.type)) next.lastTerminal=turnTerminalFromEvent(event.type,next.messages,next.tools);
+  // Reasoning is never assistant prose. A running segment is the live Thinking
+  // row; `reasoning_completed` freezes it into a folded Thought with the
+  // runtime's own duration. Taking a tool action ends the segment, exactly as
+  // the reference does, and the next delta opens a new one.
+  next.thoughts=next.thoughts??[];
+  next.reasoning=next.reasoning??'';
+  if(event.type==='reasoning_delta'){
+    if(state.reasoningSuperseded){next.reasoning='';next.reasoningSuperseded=false;}
+    next.reasoning+=event.delta;
+  }
+  if(event.type==='reasoning_started'&&state.reasoningSuperseded){next.reasoning='';next.reasoningSuperseded=false;}
+  if(event.type==='reasoning_completed'){
+    const text=(next.reasoning||'').trim();
+    if(text!=='')next.thoughts=[...next.thoughts,{id:`th-${next.nextSeq++}`,text,elapsedMs:event.elapsed_ms,seq:next.nextSeq++}];
+    next.reasoning='';next.reasoningSuperseded=false;
+  }
+  if(event.type==='tool_call_started'||event.type==='assistant_message_started'){
+    // An action on the reasoning ends it; the next delta opens a new segment.
+    if((next.reasoning||'').trim()!=='')next.reasoningSuperseded=true;
+  }
+  if(event.type==='user_message_added'){next.thoughts=[];next.reasoning='';next.reasoningSuperseded=false;}
+  if (terminalEvents.has(event.type)) {next.lastTerminal=turnTerminalFromEvent(event.type,next.messages,next.tools);next.reasoning='';next.reasoningSuperseded=false;}
   return next;
 }
 export function commandEnvelope(sessionId,command) {

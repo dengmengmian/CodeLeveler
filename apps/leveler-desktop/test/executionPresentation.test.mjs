@@ -86,28 +86,11 @@ function runPath(steps) {
   return state;
 }
 
-/**
- * A path that rebuilds a turn from durable history ALONE is deferred: Desktop's
- * history load restores the tools and the terminal on top of the snapshot's
- * messages (see `loadHistory`), and it has no path that reads a transcript out
- * of history with no snapshot behind it. The gap is asserted below rather than
- * silently skipped.
- */
-function needsSnapshotBackedHistory(steps) {
-  const firstHistory = steps.findIndex((step) => step.history !== undefined);
-  return firstHistory >= 0 && !steps.slice(0, firstHistory).some((step) => step.snapshot);
-}
-
 test('execution presentation contract v1 (desktop)', () => {
   const failures = [];
   const compared = new Set();
-  const deferred = new Set();
   for (const fixture of fixtures()) {
     for (const [name, steps] of Object.entries(fixture.paths)) {
-      if (needsSnapshotBackedHistory(steps)) {
-        deferred.add(`${fixture.id}/${name}`);
-        continue;
-      }
       const state = runPath(steps);
       try {
         assert.deepEqual(project(state), fixture.expect);
@@ -119,14 +102,12 @@ test('execution presentation contract v1 (desktop)', () => {
   }
   assert.deepEqual(failures, []);
   assert.equal(compared.size >= 14, true, `every fixture compared: ${[...compared]}`);
-  // C14's replay path is the same pre-existing gap as C10's: with no snapshot
-  // behind it, a history-only load yields no messages (and no answer to keep).
-  assert.deepEqual([...deferred], ['C10/replay', 'C14/replay']);
 });
 
-test('desktop cannot rebuild a transcript from durable history alone', () => {
-  // The deferred C10/replay path: with no snapshot behind it, a history-only
-  // load yields no messages and no terminal. Stated, not hidden.
+test('a session reopened from durable history alone rebuilds its conversation', () => {
+  // The C10/replay shape: no snapshot carries the transcript, only the runtime's
+  // own projection of its durable log. Before this, a history-only load yielded
+  // no messages at all — a reopened session painted an empty conversation.
   const state = runPath([
     {
       history: [
@@ -135,13 +116,73 @@ test('desktop cannot rebuild a transcript from durable history alone', () => {
           turn_start: true,
           event: { type: 'user_message_added', message: { id: 'u1', role: 'user', text: 'q' } },
         },
-        { turn_elapsed_ms: 10, turn_start: false, event: { type: 'turn_completed' } },
+        {
+          turn_elapsed_ms: 100,
+          turn_start: false,
+          event: { type: 'assistant_message_started', message_id: 'm1' },
+        },
+        {
+          turn_elapsed_ms: 200,
+          turn_start: false,
+          event: { type: 'assistant_text_delta', message_id: 'm1', delta: 'a' },
+        },
+        {
+          turn_elapsed_ms: 300,
+          turn_start: false,
+          event: { type: 'assistant_message_completed', message_id: 'm1' },
+        },
+        { turn_elapsed_ms: 400, turn_start: false, event: { type: 'turn_answered' } },
       ],
     },
   ]);
-  // No messages are rebuilt, so the turn has no AssistantText and no answer.
-  assert.deepEqual(state.messages, []);
-  assert.equal(state.lastTerminal, 'no_final_answer');
+  assert.deepEqual(
+    state.messages.map((message) => [message.role, message.text]),
+    [
+      ['user', 'q'],
+      ['assistant', 'a'],
+    ],
+  );
+  assert.equal(state.lastTerminal, 'answered');
+});
+
+test('a compacted session replays the conversation, not the summary row', () => {
+  // `/compact` leaves the model context as one summary row. A reopen must paint
+  // the durable conversation, and the internal summary is never a user line.
+  const state = projectSnapshot(
+    {
+      id: 's1',
+      messages: [{ id: 'summary', role: 'user', text: '对话摘要（已压缩历史）：前面聊过解析器。' }],
+    },
+    [
+      {
+        turn_elapsed_ms: 0,
+        turn_start: true,
+        event: { type: 'user_message_added', message: { id: 'u1', role: 'user', text: '看下解析器' } },
+      },
+      { turn_elapsed_ms: 10, turn_start: false, event: { type: 'reasoning_started' } },
+      { turn_elapsed_ms: 20, turn_start: false, event: { type: 'reasoning_delta', delta: '先看入口。' } },
+      { turn_elapsed_ms: 1600, turn_start: false, event: { type: 'reasoning_completed', elapsed_ms: 1600 } },
+      { turn_elapsed_ms: 1700, turn_start: false, event: { type: 'assistant_message_started', message_id: 'm1' } },
+      { turn_elapsed_ms: 1800, turn_start: false, event: { type: 'assistant_text_delta', message_id: 'm1', delta: '解析器没问题。' } },
+      { turn_elapsed_ms: 1900, turn_start: false, event: { type: 'assistant_message_completed', message_id: 'm1' } },
+      { turn_elapsed_ms: 2000, turn_start: false, event: { type: 'turn_answered' } },
+    ],
+  );
+  assert.deepEqual(
+    state.messages.map((message) => message.text),
+    ['看下解析器', '解析器没问题。'],
+  );
+  assert.equal(
+    state.messages.some((message) => message.text.includes('对话摘要（已压缩历史）')),
+    false,
+    'the internal summary is a context artifact, not a conversation row',
+  );
+  assert.deepEqual(
+    state.thoughts.map((thought) => [thought.text, thought.elapsedMs]),
+    [['先看入口。', 1600]],
+    'the completed Thought comes back with the runtime duration',
+  );
+  assert.equal(state.lastTerminal, 'answered');
 });
 
 test('the corpus declares the frozen C-cases', () => {

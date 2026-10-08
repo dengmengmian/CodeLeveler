@@ -3,6 +3,8 @@
 export function modelLabel(model){return typeof model?.model==='string'?model.model:'';}
 /** @param {string|null|undefined} path @returns {string} */
 export function workspaceLabel(path){return path?path.split(/[\\/]/).filter(Boolean).at(-1)||path:'No Workspace';}
+import * as shared from '../../../packages/conversation-presentation/conversation.mjs';
+
 /** @typedef {{id?:string,name?:string,arguments?:string|Record<string,unknown>,preview?:string,status?:string}} ToolProjection */
 /** @type {Record<string,string>} */
 const toolNames={read_file:'查看文件',read:'查看文件',grep:'搜索内容',search:'搜索内容',glob:'查找文件',find_files:'查找文件',list_files:'查看目录',list_directory:'查看目录',bash:'运行命令',run_command:'运行命令',shell:'运行命令',shell_command:'运行命令',write_file:'写入文件',edit_file:'修改文件',apply_patch:'修改文件',web_search:'搜索网页',web_fetch:'读取网页',browser_navigate:'浏览网页',browser_click:'操作网页'};
@@ -54,25 +56,6 @@ export function messageKind(message){return message.kind==='runtime_notice'?'not
 export function messageRoleLabel(message){return message.kind==='runtime_notice'?'运行提示':message.role==='user'?'你':message.role==='assistant'?'CodeLeveler':message.role;}
 /** @template {{role:string,kind?:string}} T @param {T[]} messages @returns {T[]} */
 export function historyQuestions(messages){return messages.filter(message=>messageKind(message)==='user');}
-
-/** @typedef {{appliedDiff?:string|null,status?:string,name?:string}} DiffTool */
-
-/**
- * The runtime's CONFIRMED diff for an edit, or null.
- *
- * `applied_diff` is the applied result; the tool's arguments are the requested
- * patch. They are different facts, and a presentation that rebuilt the diff
- * from the arguments would show what was asked for, not what changed. A call
- * that did not confirm an edit has nothing to show.
- * @param {DiffTool} tool @returns {string|null}
- */
-export function confirmedDiff(tool){if(!tool)return null;if(!['ok','success','done'].includes(tool.status??''))return null;const patch=tool.appliedDiff;return typeof patch==='string'&&patch!==''?patch:null;}
-
-/** Changed lines of a patch: `[added, removed]`, header markers excluded. @param {string} patch */
-export function diffCounts(patch){const lines=patch.split('\n');return [lines.filter(line=>line.startsWith('+')&&!line.startsWith('+++')).length,lines.filter(line=>line.startsWith('-')&&!line.startsWith('---')).length];}
-
-/** Every line a confirmed diff must display. Full display is the contract, so this never truncates. @param {string} patch */
-export function diffLines(patch){return patch.split('\n');}
 
 /** @param {string} status */
 export function planStepLabel(status){const labels=/** @type {Record<string,string>} */({pending:'待执行',running:'进行中',done:'已完成',failed:'失败',skipped:'已跳过'});return labels[status]??`未知状态：${status}`;}
@@ -138,22 +121,28 @@ export function toolStatusFromOutcome(ok,stop){if(stop==='confirmed')return 'can
  * @param {ExecutionToolRow} tool */
 export function actsOnAnswer(tool){return (tool?.answerEffect??'work')==='work';}
 
-const RUNTIME_NOTE_TAGS=['[execution policy] ','[mutation rejected] ','[note] '];
-/** A runtime row about HOW a command ran, never why it failed. @param {string} line */
-export function isRuntimeNote(line){
- const trimmed=line.replace(/\s+$/,'');
- if(trimmed.startsWith('exit: '))return true;
- if(trimmed.startsWith('--- ')&&trimmed.endsWith(' ---'))return true;
- if(trimmed==='[timed out]')return true;
- if(trimmed.startsWith('[timed out after ')&&trimmed.endsWith(']'))return true;
- return RUNTIME_NOTE_TAGS.some(tag=>trimmed.startsWith(tag));
-}
-/** The command's own output, without the runtime's execution rows. @param {string} preview */
-export function commandOutputBody(preview){return preview.split('\n').map(line=>line.replace(/\s+$/,'')).filter(line=>line.trim()!==''&&!isRuntimeNote(line));}
-/** The reason a failed command states, never a runtime note. @param {string} preview */
-export function failureReason(preview){const lines=commandOutputBody(preview);return lines.find(line=>/^(error|fail|✗|panic)/i.test(line.trim()))??lines[0]??null;}
-/** The preview a row renders. @param {{name:string,preview?:string|null}} tool */
-export function displayPreview(tool){if(!tool.preview)return null;if(!['run_command','shell_command'].includes(tool.name))return tool.preview;const body=commandOutputBody(tool.preview).join('\n');return body===''?null:body;}
+/**
+ * Failure and output presentation rules live once, in
+ * `packages/conversation-presentation/conversation.mjs`, because the Web client
+ * and this renderer must name the same failure line. The reference
+ * implementation (the terminal's `shell_failure_line`) is the authority.
+ */
+export const isRuntimeNote = shared.isRuntimeNote;
+export const commandOutputBody = shared.commandOutputBody;
+export const failureReason = shared.failureLine;
+export const displayPreview = shared.displayPreview;
+export const isCommandTool = shared.isCommandTool;
+
+/** Conversation presentation rules, from the same shared module. */
+export const groupExploration = shared.groupExploration;
+export const explorationLabel = shared.explorationLabel;
+export const isExplorationTool = shared.isExplorationTool;
+export const foldedThoughts = shared.foldedThoughts;
+export const confirmedDiffs = shared.confirmedDiffs;
+export const confirmedDiffOf = shared.confirmedDiff;
+export const turnBlocks = shared.turnBlocks;
+export const diffCounts = shared.diffCounts;
+export const diffLines = shared.diffLines;
 
 /** Activity class for the legacy fallback only. @param {string} name */
 function activityClass(name){const n=name.toLowerCase();if(/apply_patch|edit|write|patch/.test(n))return 'edit';if(/read|cat|open|view/.test(n))return 'read';if(/search|grep|find|glob|list/.test(n))return 'search';if(/bash|shell|exec|command|run|terminal|cargo|npm|git_(?!diff)/.test(n))return 'command';return 'other';}
