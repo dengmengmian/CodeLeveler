@@ -969,9 +969,7 @@ async fn force_migrate_legacy_runtime(
         }
         // The same runtime is still serving. Re-prove that the pid is still the
         // process that was witnessed BEFORE sending anything at it.
-        if let Err(refusal) = revalidate(&target) {
-            return Err(refusal);
-        }
+        revalidate(&target)?;
         let elapsed = started.elapsed();
         match sent {
             None => {
