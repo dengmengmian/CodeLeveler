@@ -297,8 +297,7 @@ async fn a_submission_redelivered_after_a_runtime_restart_starts_no_second_turn_
         PermissionProfile::Assisted,
         false,
         false,
-    )
-    .with_durable_wire_ack();
+    );
     let mut events = client.subscribe_session(&session_id);
 
     client
@@ -569,16 +568,13 @@ fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable() {
 
 async fn concurrent_duplicates_of_a_live_dispatch_are_never_unresolvable_body() {
     let (_tmp, app, _client, _session) = build_client().await;
-    let client = Arc::new(
-        InProcessRuntimeClient::new_with_options(
-            app.clone(),
-            ModelRef::new("mock", "m"),
-            PermissionProfile::Assisted,
-            false,
-            false,
-        )
-        .with_durable_wire_ack(),
-    );
+    let client = Arc::new(InProcessRuntimeClient::new_with_options(
+        app.clone(),
+        ModelRef::new("mock", "m"),
+        PermissionProfile::Assisted,
+        false,
+        false,
+    ));
     for round in 0..5 {
         let session_id = app
             .create_session(&ModelRef::new("mock", "m"), "race")
@@ -1820,8 +1816,7 @@ async fn no_workspace_chat_uses_the_existing_runtime_and_restores_answer_and_ter
             ModelRef::new("mock", "m"),
             PermissionProfile::Assisted,
             false,
-        )
-        .with_durable_wire_ack();
+        );
         let id = app
             .create_session(&ModelRef::new("mock", "m"), "润色")
             .await

@@ -115,6 +115,13 @@ fn execution_decision(value: UiApprovalDecision) -> leveler_execution::ApprovalD
 /// A command ACK means the engine has committed the turn's write-ahead input
 /// record. The model loop may still be running, but a process death after this
 /// point can reconstruct the transcript from durable state.
+///
+/// This is the one ACK contract for every interactive client: an in-process
+/// (embedded) TUI, the daemon `serve` exposes, the `/web` UI over its own
+/// in-process runtime, and a connected WebUI all wait on the same acceptance.
+/// It is not a completion signal — only `leveler_engine::EngineEvent::TurnStarted`
+/// reaching this receiver, which the engine emits after `TurnStore::start_owned` has
+/// committed the turn row.
 async fn await_turn_acceptance(
     accepted: oneshot::Receiver<Result<(), ClientError>>,
 ) -> Result<(), ClientError> {
@@ -611,10 +618,6 @@ pub struct InProcessRuntimeClient {
     /// dropped client decrements it even after an abrupt disconnect. `None`
     /// for an in-process runtime, which has no transport to count.
     client_presence: Option<leveler_local_transport::LocalWaiters>,
-    /// A daemon must not emit its wire ACK until a fresh turn's write-ahead
-    /// input is durable. Embedded callers keep the historical dispatch-only
-    /// return so current-thread runtimes never wait on their own worker.
-    durable_wire_ack: bool,
     /// Commands this boot is handling. A command enters before its receipt is
     /// written and leaves only once the receipt is settled — or once the path
     /// handling it has ended without settling it — so a `dispatching` receipt
@@ -950,13 +953,6 @@ impl InProcessRuntimeClient {
         });
     }
 
-    /// Enable the daemon transport's durable ACK boundary. Set only by the
-    /// `serve` composition root; this is not a user-selectable policy.
-    pub fn with_durable_wire_ack(mut self) -> Self {
-        self.durable_wire_ack = true;
-        self
-    }
-
     /// Whether this process currently holds a main-turn or context-op lease
     /// for `session_id`.
     ///
@@ -1050,7 +1046,6 @@ impl InProcessRuntimeClient {
             retiring_reason: std::sync::Mutex::new(None),
             process_shutdown: None,
             client_presence: None,
-            durable_wire_ack: false,
             in_flight,
         }
     }
@@ -2326,12 +2321,7 @@ impl InProcessRuntimeClient {
         } else {
             self.spawn_turn(session_id, content, attachments, cancel, config)
         };
-        if self.durable_wire_ack {
-            await_turn_acceptance(accepted).await
-        } else {
-            drop(accepted);
-            Ok(())
-        }
+        await_turn_acceptance(accepted).await
     }
 
     /// Route a continuation intent (`继续`, `继续，但是先不要跑测试`, …).
@@ -2387,12 +2377,7 @@ impl InProcessRuntimeClient {
         let instruction = Message::user_input(content.clone());
         let cancel = self.stage_turn(&session_id, &content, false, 0).await?;
         let accepted = self.spawn_resume_turn(session_id, instruction, cancel);
-        if self.durable_wire_ack {
-            await_turn_acceptance(accepted).await
-        } else {
-            drop(accepted);
-            Ok(())
-        }
+        await_turn_acceptance(accepted).await
     }
 
     /// What a continuation intent (`继续`) means for this session.
@@ -3899,12 +3884,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
                 let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
-                if self.durable_wire_ack {
-                    await_turn_acceptance(accepted).await
-                } else {
-                    drop(accepted);
-                    Ok(())
-                }
+                await_turn_acceptance(accepted).await
             }
             ClientCommand::RunDevelop {
                 session_id,
@@ -3913,12 +3893,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 let config = self.runtime_config(&session_id).await?;
                 let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
                 let accepted = self.spawn_develop_turn(session_id, content, cancel, config);
-                if self.durable_wire_ack {
-                    await_turn_acceptance(accepted).await
-                } else {
-                    drop(accepted);
-                    Ok(())
-                }
+                await_turn_acceptance(accepted).await
             }
             ClientCommand::AddAttachment {
                 session_id,
@@ -4120,12 +4095,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 };
                 let cancel = self.stage_turn(&session_id, &goal, false, 0).await?;
                 let accepted = self.spawn_goal_turn(session_id, goal, cancel, config);
-                if self.durable_wire_ack {
-                    await_turn_acceptance(accepted).await
-                } else {
-                    drop(accepted);
-                    Ok(())
-                }
+                await_turn_acceptance(accepted).await
             }
             ClientCommand::ListMemory {
                 session_id,

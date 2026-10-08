@@ -131,8 +131,7 @@ async fn a_starting_sibling_does_not_interrupt_a_live_boots_running_turn() {
         PermissionProfile::Assisted,
         false,
         false,
-    )
-    .with_durable_wire_ack();
+    );
     client_a
         .send(ClientCommand::SubmitMessage {
             session_id: session.clone(),
@@ -187,7 +186,6 @@ async fn live_sibling() -> LiveSibling {
             false,
             false,
         )
-        .with_durable_wire_ack()
     };
     let app_a = Arc::new(Application::assemble(layout(tmp.path())).unwrap());
     let session = app_a.create_session(&model, "live work").await.unwrap();
@@ -434,8 +432,7 @@ async fn a_running_turn_without_a_boot_refuses_a_new_turn() {
         PermissionProfile::Assisted,
         false,
         false,
-    )
-    .with_durable_wire_ack();
+    );
 
     let rejected = client
         .send(ClientCommand::SubmitMessage {

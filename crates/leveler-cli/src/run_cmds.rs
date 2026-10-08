@@ -1303,8 +1303,7 @@ pub(crate) async fn cmd_serve(
             auto_approve,
         )
         .with_process_shutdown(shutdown.clone())
-        .with_client_presence(local_waiters.clone())
-        .with_durable_wire_ack(),
+        .with_client_presence(local_waiters.clone()),
     );
     // The host establishes exclusive ownership before recovery and publishes
     // readiness only after the application finishes its existing recovery.

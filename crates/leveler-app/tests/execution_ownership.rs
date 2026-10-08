@@ -460,8 +460,7 @@ async fn windows_with(profile: PermissionProfile) -> Windows {
             profile,
             false,
             false,
-        )
-        .with_durable_wire_ack(),
+        ),
         app,
     };
     let a = window(Arc::new(
