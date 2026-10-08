@@ -55,6 +55,9 @@ fn test_uploads_dir() -> std::path::PathBuf {
 /// drive session creation, commands, snapshots, and events deterministically.
 struct TestService {
     mock: MockRuntimeClient,
+    /// The last create request the host resolved, so a test can assert the axis
+    /// the Web host stated (and not the one a client would have defaulted to).
+    last_create: std::sync::Mutex<Option<CreateSessionRequest>>,
     /// Per-session streams, as a daemon-capable runtime provides. The mock's
     /// own stream is global; without these, a test cannot tell a correctly
     /// routed event from one that merely arrived.
@@ -66,6 +69,7 @@ impl TestService {
     fn new() -> Self {
         Self {
             mock: MockRuntimeClient::new(SessionId::new("s1")),
+            last_create: std::sync::Mutex::new(None),
             session_events: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -108,8 +112,9 @@ impl InteractiveRuntimeClient for TestService {
 impl LocalRuntimeService for TestService {
     async fn create_session(
         &self,
-        _request: CreateSessionRequest,
+        request: CreateSessionRequest,
     ) -> Result<SessionBootstrap, ClientError> {
+        *self.last_create.lock().unwrap() = Some(request);
         Ok(SessionBootstrap {
             session: self.mock.snapshot(&SessionId::new("s1")).await?,
             context_window: 4096,
@@ -267,6 +272,64 @@ async fn create_session_returns_the_bootstrap() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["session"]["id"], "s1");
     assert_eq!(body["context_window"], 4096);
+}
+
+/// WEB-SESSION-1 — an ordinary Web task is a CONVERSATION.
+///
+/// The browser is an interactive host. Before this, `POST /api/sessions` with
+/// no `collaboration` left the field to the transport's `Default` (the
+/// coding-session default, Goal), so a reader who typed a first message into a
+/// UI that said `chat` got a Goal session — `goal_unresolved`, two closeout
+/// nudges, and a transcript full of runtime rows they never asked for.
+#[tokio::test]
+async fn a_web_session_without_a_stated_axis_is_a_conversation() {
+    let server = TestServer::start().await;
+    let response = reqwest::Client::new()
+        .post(server.http(&format!("/api/sessions?token={TOKEN}")))
+        .json(&serde_json::json!({ "goal": "fix tests", "model": null, "mode": "assisted" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let resolved = server
+        .service
+        .last_create
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the host resolved a create request");
+    assert_eq!(
+        resolved.collaboration,
+        leveler_local_transport::CollaborationMode::interactive_session()
+    );
+    assert_eq!(resolved.collaboration.as_str(), "chat");
+}
+
+/// WEB-SESSION-2 — a stated axis is the client's request, not the host's
+/// default: a browser that asked for the goal lifecycle keeps it.
+#[tokio::test]
+async fn a_web_session_that_states_goal_keeps_goal() {
+    let server = TestServer::start().await;
+    for (sent, expected) in [
+        ("goal", leveler_local_transport::CollaborationMode::Goal),
+        ("plan", leveler_local_transport::CollaborationMode::Plan),
+        ("chat", leveler_local_transport::CollaborationMode::Chat),
+    ] {
+        let response = reqwest::Client::new()
+            .post(server.http(&format!("/api/sessions?token={TOKEN}")))
+            .json(&serde_json::json!({
+                "goal": "fix tests",
+                "model": null,
+                "mode": "assisted",
+                "collaboration": sent,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let resolved = server.service.last_create.lock().unwrap().clone().unwrap();
+        assert_eq!(resolved.collaboration, expected, "stated {sent}");
+    }
 }
 
 #[tokio::test]

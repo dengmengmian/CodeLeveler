@@ -259,13 +259,7 @@ impl Bridge {
                     .as_ref()
                     .and_then(|layout| layout.primary_workspace());
                 let request = CreateSessionRequest {
-                    collaboration: match params.get("collaboration") {
-                        Some(value) if !value.is_null() => serde_json::from_value(value.clone())?,
-                        // Desktop has no axis selector yet: a new session gets
-                        // the product default, the same one the daemon
-                        // resolves for a request that omits the field.
-                        _ => leveler_local_transport::CollaborationMode::default(),
-                    },
+                    collaboration: requested_collaboration(&params)?,
                     workspace: workspace.map_or(CreateWorkspaceSelection::None, |root| {
                         CreateWorkspaceSelection::Workspace {
                             path: root.display().to_string(),
@@ -413,6 +407,24 @@ fn workspace_param(params: &Value) -> anyhow::Result<Option<&str>> {
         _ => anyhow::bail!("workspace must be null or a nonempty string"),
     }
 }
+/// The axis a Desktop create request asks for.
+///
+/// The Desktop has no axis selector yet, and it is an INTERACTIVE host: a task
+/// that states no axis is a conversation — the ONE statement every interactive
+/// entry point consumes
+/// ([`leveler_local_transport::CollaborationMode::interactive_session`]).
+/// `CollaborationMode::default()` would have created a Goal session while the
+/// UI said `chat`, which is exactly the drift this names. A stated axis is
+/// honored as-is (a client that asked for the goal lifecycle gets it).
+fn requested_collaboration(
+    params: &serde_json::Value,
+) -> Result<leveler_local_transport::CollaborationMode, serde_json::Error> {
+    match params.get("collaboration") {
+        Some(value) if !value.is_null() => serde_json::from_value(value.clone()),
+        _ => Ok(leveler_local_transport::CollaborationMode::interactive_session()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +646,39 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    /// DESKTOP-SESSION-1: an ordinary Desktop task is a CONVERSATION.
+    ///
+    /// The bridge used to fill an omitted axis with `CollaborationMode::default()`
+    /// (the coding-session default, Goal), so a task the reader started from a
+    /// UI that said `chat` ran the goal lifecycle and ended
+    /// `goal_unresolved`.
+    #[test]
+    fn a_desktop_task_without_a_stated_axis_is_a_conversation() {
+        use leveler_local_transport::CollaborationMode;
+        assert_eq!(
+            requested_collaboration(&json!({"goal": "new task"})).unwrap(),
+            CollaborationMode::Chat
+        );
+        assert_eq!(
+            requested_collaboration(&json!({"goal": "new task", "collaboration": null})).unwrap(),
+            CollaborationMode::Chat
+        );
+        // A stated axis is the client's request, not this host's default.
+        assert_eq!(
+            requested_collaboration(&json!({"goal": "g", "collaboration": "goal"})).unwrap(),
+            CollaborationMode::Goal
+        );
+        assert_eq!(
+            requested_collaboration(&json!({"goal": "g", "collaboration": "plan"})).unwrap(),
+            CollaborationMode::Plan
+        );
+        // And it is NOT the coding-session default, so the two cannot drift.
+        assert_ne!(
+            CollaborationMode::interactive_session(),
+            CollaborationMode::default()
+        );
     }
 
     #[test]

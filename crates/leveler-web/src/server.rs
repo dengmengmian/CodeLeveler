@@ -256,6 +256,16 @@ struct WebCreateSessionRequest {
     inner: CreateSessionRequest,
     #[serde(default)]
     project: Option<String>,
+    /// The axis the browser stated, if it stated one.
+    ///
+    /// The browser is an INTERACTIVE host: a request that states no axis is an
+    /// ordinary conversation, resolved here to the same axis the terminal's
+    /// entry point states
+    /// ([`leveler_local_transport::CollaborationMode::interactive_session`]). A stated
+    /// axis (the reader picked Goal or Plan, or a client asked for the goal
+    /// lifecycle) is honored as-is.
+    #[serde(default)]
+    collaboration: Option<leveler_local_transport::CollaborationMode>,
 }
 
 async fn create_session(
@@ -268,6 +278,11 @@ async fn create_session(
     // interactive regardless of what the JSON body carried.
     let mut inner = request.inner;
     inner.approval_policy = leveler_client_protocol::ApprovalPolicy::Interactive;
+    // The axis, stated by the host that a person is sitting at — the same one
+    // statement every interactive entry point consumes.
+    inner.collaboration = request
+        .collaboration
+        .unwrap_or_else(leveler_local_transport::CollaborationMode::interactive_session);
     let bootstrap = match (&state.multi, &request.project) {
         (Some(multi), Some(project)) => {
             multi

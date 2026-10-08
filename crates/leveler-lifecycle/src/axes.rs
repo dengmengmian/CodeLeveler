@@ -33,6 +33,26 @@ pub enum CollaborationMode {
 }
 
 impl CollaborationMode {
+    /// The axis an ORDINARY interactive session is created with.
+    ///
+    /// A person sitting in an interactive client asked for a conversation;
+    /// the goal lifecycle is asked for explicitly (`/goal <task>`, the
+    /// `--collaboration goal` entry points, a wire request that states it) or
+    /// resumed from the session row. This is the ONE statement of that product
+    /// intent: the terminal, the Web host and the Desktop bridge all consume
+    /// it, so no two interactive clients can disagree about the axis of a new
+    /// session — which they did: the same product fact was restated per client,
+    /// and the Web and Desktop silently created **Goal** sessions while their
+    /// own UI said `chat`.
+    ///
+    /// [`CollaborationMode::default`] is deliberately NOT this value: it is the
+    /// product default for a coding session (a headless `leveler run`, or a wire
+    /// request that omits the field), and it stays `Goal` so an omission cannot
+    /// silently downgrade a goal run to a conversation.
+    pub const fn interactive_session() -> Self {
+        Self::Chat
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
