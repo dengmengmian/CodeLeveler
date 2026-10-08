@@ -1497,7 +1497,7 @@ fn command_progress_heartbeat_names_the_running_command_with_elapsed() {
 }
 
 #[test]
-fn ctrl_c_busy_cancels_then_force_cancels() {
+fn ctrl_c_busy_cancels_once_then_quits() {
     let mut s = state();
     reduce(
         &mut s,
@@ -1515,23 +1515,38 @@ fn ctrl_c_busy_cancels_then_force_cancels() {
         })]
     );
     assert!(s.cancel_armed);
-    assert!(!s.force_cancel_armed);
-
-    let second = reduce(&mut s, ctrl('c'));
+    assert!(!s.cancel_repeat_armed);
     assert_eq!(
-        second,
-        vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
-            session_id: SessionId::new("s1"),
-        })]
+        s.notification.as_ref().map(|n| n.message.as_str()),
+        Some("正在停止当前任务…")
     );
-    assert!(s.force_cancel_armed);
 
-    // Third press while still busy: force-cancel did not free the turn — quit.
+    // A second press must NOT invent a stronger cancel: the first
+    // `CancelCurrentTurn` is durable and idempotent, so there is no second
+    // command to send and no "force" capability to promise.
+    let second = reduce(&mut s, ctrl('c'));
+    assert!(
+        second.is_empty(),
+        "a repeat cancel must send nothing, got {second:?}"
+    );
+    assert!(s.cancel_repeat_armed);
+    let note = s
+        .notification
+        .as_ref()
+        .map(|n| n.message.clone())
+        .unwrap_or_default();
+    assert!(
+        !note.contains("强制"),
+        "the repeat press must not promise a force cancel: {note}"
+    );
+
+    // Third press while still busy: the turn is still stopping — leave the
+    // client (which does not stop the runtime).
     assert_eq!(reduce(&mut s, ctrl('c')), vec![Effect::Quit]);
 }
 
 #[test]
-fn turn_cancelled_clears_force_cancel_arm() {
+fn turn_cancelled_clears_cancel_arms() {
     let mut s = state();
     reduce(
         &mut s,
@@ -1541,10 +1556,10 @@ fn turn_cancelled_clears_force_cancel_arm() {
     );
     reduce(&mut s, ctrl('c'));
     reduce(&mut s, ctrl('c'));
-    assert!(s.force_cancel_armed);
+    assert!(s.cancel_repeat_armed);
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCancelled));
     assert!(
-        !s.force_cancel_armed && !s.cancel_armed,
+        !s.cancel_repeat_armed && !s.cancel_armed,
         "cancel arms must clear at turn end, else next busy turn escalates too fast"
     );
 }
@@ -6928,16 +6943,15 @@ fn esc_interrupts_the_running_turn() {
 }
 
 #[test]
-fn esc_escalates_to_force_cancel_but_never_quits() {
+fn esc_repeats_cancel_but_never_quits() {
     let mut s = busy_state();
     reduce(&mut s, key(KeyCode::Esc));
     let second = reduce(&mut s, key(KeyCode::Esc));
-    assert_eq!(
-        second,
-        vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
-            session_id: SessionId::new("s1"),
-        })]
+    assert!(
+        second.is_empty(),
+        "a repeat Esc must send no second command: {second:?}"
     );
+    assert!(s.cancel_repeat_armed);
     // Quitting is Ctrl+C's job alone — Esc must never drop the session.
     let third = reduce(&mut s, key(KeyCode::Esc));
     assert!(

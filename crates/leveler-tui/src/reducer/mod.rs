@@ -1654,30 +1654,30 @@ fn clear_quit_confirm_notification(state: &mut AppState) {
     }
 }
 
-/// Cancel the running turn, escalating cancel → force-cancel on repeat.
+/// Cancel the running turn; a repeat press only restates that the runtime is
+/// already stopping it.
 ///
-/// Shared by Esc and Ctrl+C. Force-cancel is needed because a tool stuck in
-/// process wait makes the runtime re-cancel the same token while the UI stays
-/// Busy forever; only Ctrl+C escalates past this into a quit.
+/// Shared by Esc and Ctrl+C. There is no second cancel command to send: the
+/// first `CancelCurrentTurn` is durable and idempotent, so a repeat press must
+/// not promise a stronger "force" stop that does not exist. Ctrl+C alone
+/// escalates into quitting the client; Esc never quits.
 fn request_cancel(state: &mut AppState) -> Vec<Effect> {
-    if state.force_cancel_armed {
-        // Already forced; re-sending the same cancel adds nothing.
+    if state.cancel_repeat_armed {
+        // Already asked once; nothing stronger exists to send.
         return Vec::new();
     }
     if state.cancel_armed {
-        state.force_cancel_armed = true;
+        state.cancel_repeat_armed = true;
         state.notification = Some(Notification {
             level: NotificationLevel::Warning,
-            message: "强制取消中…仍卡住再按 Ctrl+C 退出".to_string(),
+            message: "仍在停止当前任务…按 Ctrl+C 可退出客户端".to_string(),
         });
-        return vec![Effect::Send(ClientCommand::ForceCancelCurrentTurn {
-            session_id: state.session_id.clone(),
-        })];
+        return Vec::new();
     }
     state.cancel_armed = true;
     state.notification = Some(Notification {
         level: NotificationLevel::Warning,
-        message: "正在取消当前任务，再按一次强制取消".to_string(),
+        message: "正在停止当前任务…".to_string(),
     });
     vec![Effect::Send(ClientCommand::CancelCurrentTurn {
         session_id: state.session_id.clone(),
@@ -1795,9 +1795,9 @@ fn cycle_permission_profile(state: &mut AppState) -> Vec<Effect> {
 
 fn handle_ctrl_c(state: &mut AppState) -> Vec<Effect> {
     if state.is_busy() {
-        // Third press: force-cancel did not free the turn, so exit rather than
-        // trap the user in cancel-only key handling.
-        if state.force_cancel_armed {
+        // Third press: the runtime is still stopping the turn, so exit the
+        // client rather than trap the user in cancel-only key handling.
+        if state.cancel_repeat_armed {
             state.notification = None;
             return vec![Effect::Quit];
         }

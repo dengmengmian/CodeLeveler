@@ -447,7 +447,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.finalize_in_flight();
             state.team.mark_unreported_at_turn_end(state.elapsed_secs);
             state.cancel_armed = false;
-            state.force_cancel_armed = false;
+            state.cancel_repeat_armed = false;
             seal_analysis_segment(state);
             // A recoverable provider failure is a continuation point, not a
             // dead task. The runtime re-checks before it resumes; this only
@@ -511,7 +511,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.finalize_in_flight();
             state.team.mark_unreported_at_turn_end(state.elapsed_secs);
             state.cancel_armed = false;
-            state.force_cancel_armed = false;
+            state.cancel_repeat_armed = false;
             state.resumable_task = true;
             // An interrupted turn keeps its goal: the clock freezes and the
             // indicator waits for `继续` instead of disappearing.
@@ -543,7 +543,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.goal_mode_active = false;
             state.resumable_task = false;
             state.cancel_armed = false;
-            state.force_cancel_armed = false;
+            state.cancel_repeat_armed = false;
             state.active_goal = None;
             state.notification = Some(Notification {
                 level: NotificationLevel::Info,
@@ -1153,7 +1153,7 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         }
     }
     state.cancel_armed = false;
-    state.force_cancel_armed = false;
+    state.cancel_repeat_armed = false;
     // If the provider never reported usage, still drive the context gauge from
     // the visible transcript so it is not stuck at empty capacity forever.
     if state.context_tokens == 0 && state.token_input == 0 {

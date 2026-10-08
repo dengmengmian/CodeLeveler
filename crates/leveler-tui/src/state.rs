@@ -523,9 +523,11 @@ pub struct AppState {
 
     // Ctrl+C escalation state.
     pub cancel_armed: bool,
-    /// Set after ForceCancel was sent while still busy. A further Ctrl+C quits
-    /// so a hung turn cannot trap the user in cancel-only key handling.
-    pub force_cancel_armed: bool,
+    /// Set after the user pressed cancel a second time while the turn was still
+    /// running. A further Ctrl+C quits the client so a hung turn cannot trap
+    /// the user in cancel-only key handling. There is no stronger cancel to
+    /// send — the first request is already durable and idempotent.
+    pub cancel_repeat_armed: bool,
     /// The session's last turn ended in a state a continuation can re-enter
     /// (interrupted, or a recoverable provider failure). Purely presentational:
     /// the runtime re-checks before it resumes, and the client never decides
@@ -682,7 +684,7 @@ impl AppState {
             context_window_tokens: boot.context_window,
             editor_chord_armed: false,
             cancel_armed: false,
-            force_cancel_armed: false,
+            cancel_repeat_armed: false,
             resumable_task: false,
             quit_armed: false,
             tick: 0,
@@ -854,7 +856,7 @@ impl AppState {
     /// Clear any pending Ctrl+C escalation (any other activity resets it).
     pub fn disarm_ctrlc(&mut self) {
         self.cancel_armed = false;
-        self.force_cancel_armed = false;
+        self.cancel_repeat_armed = false;
         self.quit_armed = false;
     }
 }
