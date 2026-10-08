@@ -318,7 +318,7 @@ async fn remove_project(
     let Some(multi) = &state.multi else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match multi.manager.remove(&request.path) {
+    match multi.manager.remove(&request.path).await {
         // A JSON body (not 204) — the frontend helper parses every response.
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) => project_error(error),
@@ -360,11 +360,15 @@ async fn rename_project(
 }
 
 fn project_error(error: crate::projects::ProjectError) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": error.to_string() })),
-    )
-        .into_response()
+    // The lifecycle state is part of the body, not prose in the message: the
+    // browser branches on it ("wait for the running task" reads very differently
+    // from "exit the previous version"), and a message a human reads is not a
+    // contract a client can act on. Absent for ordinary validation failures.
+    let mut body = serde_json::json!({ "error": error.to_string() });
+    if let Some(state) = error.state_name() {
+        body["state"] = serde_json::Value::String(state.to_string());
+    }
+    (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
 async fn session_snapshot(
