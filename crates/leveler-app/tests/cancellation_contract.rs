@@ -349,6 +349,30 @@ async fn legacy_force_cancel_wire_payload_is_a_plain_cancel() {
     );
 }
 
+#[cfg(unix)]
+fn os_process_exists(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("query isolated test process liveness")
+        .success()
+}
+
+#[cfg(unix)]
+async fn assert_processes_gone(pids: &[u32]) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pids.iter().any(|pid| os_process_exists(*pid)) {
+            // Observe process cleanup; this polling does not create the
+            // cancellation window, which is established by output readiness.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("owned test processes still exist after cancellation: {pids:?}"));
+}
+
 /// CANCEL-02 — cancelling the turn stops the tool process tree it is inside,
 /// and says so with a confirmed stop rather than a hopeful one.
 ///
@@ -359,11 +383,16 @@ async fn legacy_force_cancel_wire_payload_is_a_plain_cancel() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_turn_kills_its_running_command_tree_and_confirms_it() {
+    let child = "import os, subprocess; open('child.pid', 'w').write(str(os.getpid())); leaf = subprocess.Popen(['sleep', '120']); open('grandchild.pid', 'w').write(str(leaf.pid)); print('tree-ready', flush=True); leaf.wait()";
+    let parent = format!(
+        "import os, subprocess, sys; open('parent.pid', 'w').write(str(os.getpid())); child = subprocess.Popen([sys.executable, '-c', {}]); child.wait()",
+        serde_json::to_string(child).unwrap()
+    );
     let f = fixture(vec![sse(vec![
         tool_call_frame(
             "c-sleep",
-            "shell_command",
-            serde_json::json!({ "cmd": "echo ready; sleep 30" }),
+            "run_command",
+            serde_json::json!({ "program": "python3", "args": ["-c", parent] }),
         ),
         finish_frame("tool_calls"),
     ])])
@@ -379,7 +408,11 @@ async fn cancelling_a_turn_kills_its_running_command_tree_and_confirms_it() {
         .unwrap();
 
     let produced = wait_for_event(&mut rx, |event| match event {
-        RuntimeEvent::ToolCallOutput { id, .. } if id.as_str() == "c-sleep" => Some(()),
+        RuntimeEvent::ToolCallOutput { id, chunk, .. }
+            if id.as_str() == "c-sleep" && chunk.contains("tree-ready") =>
+        {
+            Some(())
+        }
         _ => None,
     })
     .await;
@@ -387,6 +420,39 @@ async fn cancelling_a_turn_kills_its_running_command_tree_and_confirms_it() {
         produced.is_some(),
         "the command must actually be running before the cancel is meaningful"
     );
+
+    // The readiness output occurs only after all three PID files are written.
+    // Observe actual OS identities rather than trusting a stop status enum.
+    let pids: Vec<u32> = ["parent.pid", "child.pid", "grandchild.pid"]
+        .into_iter()
+        .map(|name| {
+            std::fs::read_to_string(f._tmp.path().join(name))
+                .expect("readiness must publish every PID")
+                .trim()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        pids.iter().all(|pid| os_process_exists(*pid)),
+        "the parent, child and grandchild must really exist before cancel: {pids:?}"
+    );
+    for pair in pids.windows(2) {
+        let observed = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pair[1].to_string()])
+            .output()
+            .expect("query controlled tree parent identity");
+        assert!(observed.status.success());
+        let parent: u32 = std::str::from_utf8(&observed.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            parent, pair[0],
+            "the observed PIDs must form three actual generations"
+        );
+    }
 
     f.client
         .send(ClientCommand::CancelCurrentTurn {
@@ -407,6 +473,7 @@ async fn cancelling_a_turn_kills_its_running_command_tree_and_confirms_it() {
         Some(Some(UiCommandStop::Confirmed)),
         "cancelling the turn must confirm the command's process tree is gone"
     );
+    assert_processes_gone(&pids).await;
     assert_eq!(
         last_outcome(&f.app.open_database().await.unwrap(), &f.session).await,
         "interrupted"
@@ -460,6 +527,19 @@ async fn cancelling_a_turn_leaves_an_independent_background_task_running() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
+    let pid = f
+        .app
+        .background_tasks()
+        .get(&background_id)
+        .await
+        .expect("the background task exists before cancel")
+        .pid
+        .expect("the task has an OS PID");
+    assert!(
+        os_process_exists(pid),
+        "the independent process must exist before cancel"
+    );
+
     // Now wait for the turn to be busy inside the second, blocking command.
     let blocking_started = wait_for_event(&mut rx, |event| match event {
         RuntimeEvent::ToolCallStarted { id, .. } if id.as_str() == "c-blocks" => Some(()),
@@ -489,17 +569,23 @@ async fn cancelling_a_turn_leaves_an_independent_background_task_running() {
         ),
         "cancelling the turn must leave an independent background task RUNNING: {snapshot:?}"
     );
+    assert_eq!(
+        snapshot.pid,
+        Some(pid),
+        "cancellation must preserve the same process identity"
+    );
     assert!(
-        snapshot.pid.is_some(),
-        "the background process must still have an OS identity"
+        os_process_exists(pid),
+        "the independent process must remain alive after cancel"
     );
 
     // Cleanup, through the same ownership-checked path a client uses.
-    let _ = f
-        .app
+    f.app
         .background_tasks()
         .kill_owned(&background_id, f.session.as_str())
-        .await;
+        .await
+        .expect("cleanup must stop the independently owned process");
+    assert_processes_gone(&[pid]).await;
 }
 
 /// CANCEL-09 — repeating a cancel is safe, and the task settles exactly once.
