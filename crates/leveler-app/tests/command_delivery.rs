@@ -4,6 +4,10 @@
 //! `command_id` (a duplicate never re-dispatches its action) and reject a
 //! command issued against a stale `expected_version` (optimistic concurrency).
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::sync::Arc;
 
 use leveler_app::runtime_boot::RuntimeBootLease;
@@ -145,6 +149,50 @@ async fn duplicate_command_id_dispatches_once_body() {
         "a duplicate command_id must not dispatch the action twice"
     );
     settle_background_turns(&app, &client, &[&session_id]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_title_changes_from_one_snapshot_have_only_one_winner() {
+    let (_tmp, app, client, session) = build_client().await;
+    let version = client
+        .snapshot(&session)
+        .await
+        .unwrap()
+        .last_sequence
+        .unwrap_or(0);
+    let rename = |id: &str, name: &str| CommandEnvelope {
+        command_id: CommandId::new(id),
+        session_id: session.clone(),
+        expected_version: Some(version),
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::RenameSession {
+            session_id: session.clone(),
+            name: name.into(),
+        },
+    };
+    let (left, right) = tokio::join!(
+        client.deliver(rename("rename-left", "left")),
+        client.deliver(rename("rename-right", "right"))
+    );
+    assert_eq!(
+        usize::from(left.is_ok()) + usize::from(right.is_ok()),
+        1,
+        "two clients editing the same snapshot must not silently overwrite: left={left:?}, right={right:?}"
+    );
+    let error = left.as_ref().err().or(right.as_ref().err()).unwrap();
+    assert!(error.to_string().contains("version conflict"));
+    let db = app.open_database().await.unwrap();
+    let row = leveler_storage::SessionRepository::new(&db)
+        .get(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.goal, if left.is_ok() { "left" } else { "right" });
+    let fresh = client.snapshot(&session).await.unwrap();
+    assert!(
+        fresh.last_sequence.unwrap_or(0) > version,
+        "successful mutation advances its authoritative version"
+    );
 }
 
 #[test]
@@ -474,7 +522,14 @@ async fn a_command_whose_dispatch_ended_in_this_boot_is_unresolvable_on_redelive
     let envelope = CommandEnvelope {
         command_id: CommandId::new("cmd-ended-here"),
         session_id: session_id.clone(),
-        expected_version: None,
+        expected_version: Some(
+            client
+                .snapshot(&session_id)
+                .await
+                .unwrap()
+                .last_sequence
+                .unwrap_or(0),
+        ),
         issued_at: "2026-09-15T00:00:00Z".to_string(),
         command: ClientCommand::SelectModel {
             session_id: session_id.clone(),
@@ -508,7 +563,7 @@ async fn selecting_a_model_does_not_rewrite_the_global_default_body() {
     std::fs::write(&path, original).unwrap();
 
     client
-        .send(ClientCommand::SelectModel {
+        .send_observed(ClientCommand::SelectModel {
             session_id,
             model: ModelRef::new("mock", "m"),
         })
@@ -956,7 +1011,7 @@ async fn daemon_event_subscriptions_are_isolated_per_session_body() {
     let mut second_events = client.subscribe_session(&second.session.id);
 
     client
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: first.session.id.clone(),
             mode: WirePermissionProfile::FullAccess,
         })
@@ -1020,7 +1075,7 @@ async fn socket_clients_receive_only_their_session_events_body() {
     let mut second_events = client.subscribe_session(&second.session.id);
 
     client
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: first.session.id,
             mode: WirePermissionProfile::FullAccess,
         })
@@ -1270,7 +1325,7 @@ async fn session_menu_rename_archive_fork_roundtrip_body() {
 
     // Rename.
     client
-        .send(ClientCommand::RenameSession {
+        .send_observed(ClientCommand::RenameSession {
             session_id: session_id.clone(),
             name: "  登录修复方案  ".to_string(),
         })
@@ -1349,7 +1404,7 @@ async fn internal_session_copies_inherit_an_explicit_chat_axis_body() {
 
     // Make the axis an explicit chat choice, not the product default.
     client
-        .send(ClientCommand::SetProductAxes {
+        .send_observed(ClientCommand::SetProductAxes {
             session_id: session_id.clone(),
             work_profile: "single".to_string(),
             collaboration: "chat".to_string(),
@@ -1953,4 +2008,152 @@ async fn no_workspace_global_query_does_not_create_an_empty_source_store() {
     assert!(index.tasks.is_empty());
     assert!(index.source_errors.is_empty());
     assert!(!database_path.exists());
+}
+
+#[tokio::test]
+async fn settings_require_observed_versions_and_completed_retries_remain_idempotent() {
+    let (_tmp, app, client, session_id) = build_client().await;
+    let command = ClientCommand::RenameSession {
+        session_id: session_id.clone(),
+        name: "accepted title".into(),
+    };
+    let original = client.snapshot(&session_id).await.unwrap();
+    let mut envelope = CommandEnvelope {
+        command_id: CommandId::generate(),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: command.clone(),
+    };
+    assert!(
+        client
+            .send(command)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot version required")
+    );
+    assert!(
+        client
+            .deliver(envelope.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot version required")
+    );
+    assert_eq!(
+        client.snapshot(&session_id).await.unwrap().goal,
+        original.goal
+    );
+    envelope.expected_version = Some(original.last_sequence.unwrap_or(0));
+    client.deliver(envelope.clone()).await.unwrap();
+    let accepted = client.snapshot(&session_id).await.unwrap();
+    assert_eq!(accepted.goal, "accepted title");
+    client.deliver(envelope.clone()).await.unwrap();
+    assert_eq!(
+        client.snapshot(&session_id).await.unwrap().last_sequence,
+        accepted.last_sequence
+    );
+    let stale = CommandEnvelope {
+        command_id: CommandId::generate(),
+        command: ClientCommand::SetThinkingLevel {
+            session_id: session_id.clone(),
+            level: Some(leveler_model::ThinkingLevel::High),
+        },
+        ..envelope
+    };
+    assert!(
+        client
+            .deliver(stale)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("version conflict")
+    );
+    let final_snapshot = client.snapshot(&session_id).await.unwrap();
+    assert_eq!(final_snapshot.last_sequence, accepted.last_sequence);
+    let db = app.open_database().await.unwrap();
+    assert_eq!(
+        leveler_storage::SessionRepository::new(&db)
+            .thinking(&session_id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_socket_clients_cannot_replace_settings_from_one_snapshot() {
+    let (tmp, app, runtime, session_id) = build_client().await;
+    let path = tmp.path().join("versioned-runtime.sock");
+    let server = LocalSocketServer::bind(&path, runtime).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+    let left = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+    let right = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+    let observed = left.snapshot(&session_id).await.unwrap();
+    let missing = CommandEnvelope {
+        command_id: CommandId::generate(),
+        session_id: session_id.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::RenameSession {
+            session_id: session_id.clone(),
+            name: "missing-version-must-not-apply".into(),
+        },
+    };
+    assert!(left.deliver(missing).await.is_err());
+    assert_eq!(
+        right.snapshot(&session_id).await.unwrap().goal,
+        observed.goal
+    );
+    let envelope = |name: &str| CommandEnvelope {
+        command_id: CommandId::generate(),
+        session_id: session_id.clone(),
+        expected_version: Some(observed.last_sequence.unwrap_or(0)),
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::RenameSession {
+            session_id: session_id.clone(),
+            name: name.into(),
+        },
+    };
+    let a = envelope("socket-left");
+    let b = envelope("socket-right");
+    let (a_result, b_result) = tokio::join!(left.deliver(a.clone()), right.deliver(b.clone()));
+    assert_eq!(
+        usize::from(a_result.is_ok()) + usize::from(b_result.is_ok()),
+        1
+    );
+    let (winner, loser) = if a_result.is_ok() {
+        (&a, b_result.unwrap_err())
+    } else {
+        (&b, a_result.unwrap_err())
+    };
+    assert!(loser.to_string().contains("version conflict"), "{loser:?}");
+    let fresh = right.snapshot(&session_id).await.unwrap();
+    let ClientCommand::RenameSession { name, .. } = &winner.command else {
+        unreachable!()
+    };
+    assert_eq!(&fresh.goal, name);
+    assert!(fresh.last_sequence.unwrap_or(0) > observed.last_sequence.unwrap_or(0));
+    left.deliver(winner.clone()).await.unwrap();
+    assert_eq!(
+        right.snapshot(&session_id).await.unwrap().last_sequence,
+        fresh.last_sequence
+    );
+    let db = app.open_database().await.unwrap();
+    assert_eq!(
+        leveler_storage::SessionRepository::new(&db)
+            .get(&session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .goal,
+        *name
+    );
+    drop(left);
+    drop(right);
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
 }

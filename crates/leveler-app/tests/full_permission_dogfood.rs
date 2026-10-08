@@ -52,6 +52,10 @@
 //! `is_mcp_tool` and the Full contract test; an honest UNMEASURED is not a
 //! pass. Wire a fixture server before claiming the gate covers MCP.
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -627,7 +631,7 @@ async fn run_case(path: Path, op: &Op, workroot: &std::path::Path) -> (Case, Vec
         };
         // Supersede by switching to Full.
         client
-            .send(ClientCommand::SetPermissionProfile {
+            .send_observed(ClientCommand::SetPermissionProfile {
                 session_id: session_id.clone(),
                 mode: WirePermission::FullAccess,
             })
@@ -967,7 +971,7 @@ async fn run_mode_persistence(workroot: &std::path::Path) -> (Vec<Case>, Vec<Vio
         .await
         .unwrap();
     daemon2
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: auto_id.clone(),
             mode: WirePermission::FullAccess,
         })
@@ -1096,7 +1100,7 @@ async fn run_live_profile_authority(workroot: &std::path::Path) -> (Vec<Case>, V
     .await;
     // The product switch: one write moves the durable row and the live cell.
     client
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: session_id.clone(),
             mode: WirePermission::FullAccess,
         })

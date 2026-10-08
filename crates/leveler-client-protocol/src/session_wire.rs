@@ -35,9 +35,52 @@ pub enum UpstreamMessage {
         command_id: String,
         session_id: String,
         command: ClientCommand,
+        /// Snapshot version observed by the caller for replacement commands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_version: Option<i64>,
+    },
+    /// Replace a setting under the caller's observed snapshot version. A
+    /// distinct verb prevents old peers from ignoring expected_version.
+    #[serde(rename = "deliver_versioned_setting")]
+    DeliverVersionedSettings {
+        command_id: String,
+        session_id: String,
+        command: ClientCommand,
+        /// Required by the delivery boundary; absent/null is explicitly refused.
+        #[serde(default)]
+        expected_version: Option<i64>,
     },
     /// Ask for a fresh session snapshot (initial render / resync).
     Snapshot { session_id: String },
+}
+
+impl UpstreamMessage {
+    /// Validate wire-operation choice against the single command policy.
+    /// Legacy frames cannot bypass the versioned setting boundary.
+    pub fn validate_setting_delivery(&self) -> Result<(), &'static str> {
+        let (command, version, versioned) = match self {
+            Self::Deliver {
+                command,
+                expected_version,
+                ..
+            } => (command, expected_version, false),
+            Self::DeliverVersionedSettings {
+                command,
+                expected_version,
+                ..
+            } => (command, expected_version, true),
+            Self::Snapshot { .. } => return Ok(()),
+        };
+        let protected = command
+            .requires_snapshot_version()
+            .map_err(|_| "invalid command version policy")?;
+        if protected != versioned || (versioned && version.is_none()) {
+            return Err(
+                "protected settings require the distinct versioned operation and an observed snapshot version",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// A message the server sends downstream over the WebSocket.
@@ -80,14 +123,79 @@ mod tests {
             command_id,
             session_id,
             command,
+            expected_version,
         } = message.clone()
         else {
             panic!("expected deliver, got {message:?}");
         };
+        assert_eq!(expected_version, None);
         assert_eq!(command_id, "cmd-1");
         assert_eq!(session_id, "s1");
         assert!(matches!(command, ClientCommand::SubmitMessage { .. }));
         assert_eq!(serde_json::to_string(&message).unwrap(), json);
+    }
+
+    #[test]
+    fn versioned_setting_wire_is_distinct_and_fail_closed_for_legacy_peer() {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyUpstream {
+            Deliver { command: ClientCommand },
+        }
+        let message = UpstreamMessage::DeliverVersionedSettings {
+            command_id: "versioned".into(),
+            session_id: "s1".into(),
+            expected_version: Some(7),
+            command: ClientCommand::RenameSession {
+                session_id: SessionId::new("s1"),
+                name: "must not run on old peer".into(),
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["type"],
+            "deliver_versioned_setting"
+        );
+        let mut effects = 0;
+        let legacy = serde_json::from_str::<LegacyUpstream>(&json);
+        assert!(
+            legacy.is_err(),
+            "legacy peer must refuse the unknown operation"
+        );
+        if let Ok(LegacyUpstream::Deliver { command }) = legacy
+            && matches!(command, ClientCommand::RenameSession { .. })
+        {
+            effects += 1;
+        }
+        assert_eq!(effects, 0);
+        assert!(message.validate_setting_delivery().is_ok());
+    }
+
+    #[test]
+    fn setting_delivery_requires_matching_wire_kind_and_observed_version() {
+        for (kind, version, command) in [
+            (
+                "deliver",
+                serde_json::json!(7),
+                serde_json::json!({"type":"rename_session", "session_id":"s1", "name":"bad"}),
+            ),
+            (
+                "deliver_versioned_setting",
+                serde_json::Value::Null,
+                serde_json::json!({"type":"rename_session", "session_id":"s1", "name":"bad"}),
+            ),
+            (
+                "deliver_versioned_setting",
+                serde_json::json!(7),
+                serde_json::json!({"type":"cancel_task", "session_id":"s1"}),
+            ),
+        ] {
+            let message: UpstreamMessage = serde_json::from_value(serde_json::json!({"type":kind, "command_id":"bad", "session_id":"s1", "expected_version":version, "command":command})).unwrap();
+            assert!(
+                message.validate_setting_delivery().is_err(),
+                "must refuse {kind}/{version}"
+            );
+        }
     }
 
     #[test]

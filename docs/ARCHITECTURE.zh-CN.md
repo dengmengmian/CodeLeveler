@@ -940,6 +940,12 @@ stdout/stderr 的实时通道和行缓冲都有容量上限。消费者变慢时
 
 未来一个智能体可能运行数小时、数天，甚至跨设备继续工作；持久化是这种形态的基础。
 
+### 会话设置的乐观并发边界
+
+替换会话标题、模型、默认模型、权限、Thinking 或 collaboration 的命令必须携带客户端实际观察的 snapshot `last_sequence`（空日志为 0）。Rust `SNAPSHOT_VERSIONED_COMMANDS` 是唯一命令分类，schema 导出同一 wire-tag 名单，Web/Desktop 消费生成版本，TUI 直接使用该分类。存储在同一 SQLite writer transaction 中比较日志版本、只替换目标字段并追加 `SessionMetadataChanged`；snapshot 的设置字段和版本来自同一 read transaction。冲突不修改字段或日志，客户端刷新并显示错误，不能自动改用新版本重试覆盖。已完成的相同 command identity 仍按 receipt 幂等返回。 LocalSocket/TCP 使用独立 `DeliverVersionedSettings`（wire tag `deliver_versioned_settings`），WebWS 使用 `deliver_versioned_setting`；旧 peer 不认识该操作时必须拒绝，客户端不退回 legacy deliver。新 peer 也拒绝通过 legacy deliver 修改受版本保护的设置，且新操作只接受名单中的命令与显式 observed version。
+
+Submit/Steer/Cancel 和 request-id waiter 回复保留各自的队列、取消或 identity 契约。RunGoal/ConfirmPlanToGoal 的内部轴切换只改 collaboration 并推进日志，不能把旧配置整行写回。SetDefaultModel 的 CAS 保护当前会话模型；全局默认模型文件仍由 GlobalConfig 负责，不提供跨会话 CAS。会话已切换但全局文件保存失败必须明确报告部分结果，并保留未知 dispatch receipt，禁止盲重放。
+
 ### 11.3 回合的持久接收边界
 
 一个新的用户回合或对话回合，只有在同一条 turn 记录已经携带版本化、可重放的 initiating user message 后，才可以持久地进入 `running`。这份预写载荷是崩溃恢复时的权威输入；`session_messages` 是供客户端展示和后续模型请求使用的有序 transcript 投影。

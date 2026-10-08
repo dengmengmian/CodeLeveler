@@ -128,3 +128,6 @@ pub use leveler_model::{ModelRef, ThinkingLevel};
 /// Prefix stamped on the message that replaces compacted history, so clients can
 /// render it as a distinct "history summary" block rather than a user message.
 pub const COMPACTION_SUMMARY_PREFIX: &str = "对话摘要（已压缩历史）";
+
+/// Authoritative wire-tag policy for snapshot versioned replacements.
+pub use command::SNAPSHOT_VERSIONED_COMMANDS;

@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { Action, AppState } from '../state/store';
 import { initialState, reducer } from '../state/store';
-import type { ClientCommand, RuntimeEvent, UpFrame } from '../types/protocol';
+import type { ClientCommand, RuntimeEvent, UpFrame, UiSessionSnapshot } from '../types/protocol';
 import { RuntimeBridge } from './controller';
 import { loadLastSession, saveLastSession } from './lastSession';
 
@@ -57,16 +57,14 @@ function harness(): Harness {
     };
   }).ws = {
     send: (frame: UpFrame) => {
-      if (frame.type === 'deliver') sent.push(frame.command);
+      if (frame.type === 'deliver' || frame.type === 'deliver_versioned_setting') sent.push(frame.command);
       return true;
     },
     setSession: (id: string | null) => {
       wsSession.id = id;
     },
   };
-  reducer(state, {
-    type: 'snapshot',
-    session: {
+  const observed: UiSessionSnapshot = {
       id: 's1',
       repository: '/repo',
       goal: 'g',
@@ -75,10 +73,12 @@ function harness(): Harness {
       branch: null,
       status: 'idle',
       messages: [],
-    },
-  });
+      last_sequence: 17,
+  };
+  reducer(state, { type: 'snapshot', session: observed });
   const apply = (ev: RuntimeEvent) =>
     (bridge as unknown as { applyEvent: (ev: RuntimeEvent) => void }).applyEvent(ev);
+  apply({ type: 'session_updated', session: observed });
   return { bridge, state, sent, apply, wsSession };
 }
 
@@ -131,7 +131,7 @@ function emptyHarness(): Harness {
     };
   }).ws = {
     send: (frame: UpFrame) => {
-      if (frame.type === 'deliver') sent.push(frame.command);
+      if (frame.type === 'deliver' || frame.type === 'deliver_versioned_setting') sent.push(frame.command);
       return true;
     },
     setSession: (id: string | null) => {
@@ -712,5 +712,28 @@ describe('logical creation identity', () => {
       expect(calls[1].body.request_id).toBe(calls[0].body.request_id);
       expect(calls[2].body.request_id).not.toBe(calls[0].body.request_id);
     } finally { globalThis.fetch = priorFetch; }
+  });
+});
+
+describe('snapshot concurrency', () => {
+  it('passes the version actually observed and refreshes a conflict without resending', () => {
+    const { bridge } = harness();
+    const frames: UpFrame[] = [];
+    (bridge as unknown as { ws: { send: (frame: UpFrame) => boolean } }).ws.send = (frame) => { frames.push(frame); return true; };
+    bridge.renameSession('s1', 'new title');
+    expect(frames[0]).toMatchObject({ type: 'deliver_versioned_setting', expected_version: 17,
+      command: { type: 'rename_session', name: 'new title' } });
+    (bridge as unknown as { handleFrame: (frame: unknown) => void }).handleFrame({ type: 'error', code: 'runtime_error', message: 'version conflict: resync required', command_id: 'failed' });
+    const count = frames.length;
+    expect(count).toBe(3); // rename and its sidebar refresh, followed by conflict snapshot
+    expect(frames[2]).toEqual({ type: 'snapshot', session_id: 's1' });
+  });
+  it('does not invent a version for a session never observed', () => {
+    const { bridge } = harness();
+    const frames: UpFrame[] = [];
+    (bridge as unknown as { ws: { send: (frame: UpFrame) => boolean } }).ws.send = (frame) => { frames.push(frame); return true; };
+    bridge.renameSession('unobserved', 'new title');
+    expect(frames.filter(frame => (frame.type === 'deliver' || frame.type === 'deliver_versioned_setting') && frame.command.type === 'rename_session')).toHaveLength(0);
+    expect(frames[0]).toEqual({ type: 'snapshot', session_id: 'unobserved' });
   });
 });

@@ -4,6 +4,10 @@
 //! asks for the context in between, and reads the exact bodies the provider
 //! received.
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -423,7 +427,7 @@ async fn thinking_session_override_reaches_wire_and_survives_reconnect_without_c
         (&session_b, Some(ThinkingLevel::Low), Some("low")),
     ] {
         client
-            .send(ClientCommand::SetThinkingLevel {
+            .send_observed(ClientCommand::SetThinkingLevel {
                 session_id: session.clone(),
                 level,
             })
@@ -524,7 +528,7 @@ async fn thinking_new_session_does_not_copy_the_requesting_sessions_override() {
         "compatibility: { drop_unsupported_fields: true }",
     ).await;
     client
-        .send(ClientCommand::SetThinkingLevel {
+        .send_observed(ClientCommand::SetThinkingLevel {
             session_id: session.clone(),
             level: Some(ThinkingLevel::Max),
         })
@@ -632,7 +636,7 @@ async fn thinking_reset_returns_to_the_models_configured_level_not_the_global_de
         (None, "low", ThinkingLevel::Low),
     ] {
         client
-            .send(ClientCommand::SetThinkingLevel {
+            .send_observed(ClientCommand::SetThinkingLevel {
                 session_id: session.clone(),
                 level,
             })
@@ -739,7 +743,7 @@ async fn thinking_btw_off_reaches_wire() {
         "compatibility: { drop_unsupported_fields: true }",
     ).await;
     client
-        .send(ClientCommand::SetThinkingLevel {
+        .send_observed(ClientCommand::SetThinkingLevel {
             session_id: session.clone(),
             level: Some(ThinkingLevel::Off),
         })
@@ -815,7 +819,7 @@ async fn thinking_model_switch_preserves_canonical_intent_and_reprojects_each_wi
     let db = app.open_database().await.unwrap();
     for level in [ThinkingLevel::Max, ThinkingLevel::Auto] {
         client
-            .send(ClientCommand::SetThinkingLevel {
+            .send_observed(ClientCommand::SetThinkingLevel {
                 session_id: session.clone(),
                 level: Some(level),
             })
@@ -829,7 +833,7 @@ async fn thinking_model_switch_preserves_canonical_intent_and_reprojects_each_wi
             ("m", Some("xhigh")),
         ] {
             client
-                .send(ClientCommand::SelectModel {
+                .send_observed(ClientCommand::SelectModel {
                     session_id: session.clone(),
                     model: ModelRef::new("mock", id),
                 })
@@ -887,7 +891,7 @@ async fn thinking_command_cannot_succeed_for_a_deleted_cached_session() {
         .await
         .unwrap();
     let result = client
-        .send(ClientCommand::SetThinkingLevel {
+        .send_observed(ClientCommand::SetThinkingLevel {
             session_id: session.clone(),
             level: Some(leveler_model::ThinkingLevel::Max),
         })
@@ -1185,7 +1189,7 @@ async fn btw_accounts_for_side_history_and_only_folds_with_an_accepted_summary()
             "compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }",
         ).await;
         client
-            .send(ClientCommand::SetThinkingLevel {
+            .send_observed(ClientCommand::SetThinkingLevel {
                 session_id: session.clone(),
                 level: Some(leveler_model::ThinkingLevel::Max),
             })

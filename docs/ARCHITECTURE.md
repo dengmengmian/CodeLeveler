@@ -951,6 +951,33 @@ auditability
 
 An agent may eventually work for hours or days and continue across devices. Persistence is the foundation of that shape.
 
+### Optimistic session settings
+
+Replacement commands for the session title, model, default model, permission,
+thinking level, and collaboration carry the snapshot `last_sequence` actually
+observed by the caller (0 for an empty log). Rust `SNAPSHOT_VERSIONED_COMMANDS`
+is the sole wire-tag policy; the schema exports it for generated Web/Desktop
+consumers, while TUI calls the Rust policy directly. One SQLite writer
+transaction compares the log version, replaces only the selected field, and
+appends `SessionMetadataChanged`. Metadata and its version are read in one
+snapshot transaction. A conflict changes neither metadata nor the log; clients
+refresh and show the error without automatically retrying an overwrite.
+Completed identical command identities retain receipt-based idempotency.
+LocalSocket/TCP use the distinct `DeliverVersionedSettings` operation (wire tag
+`deliver_versioned_settings`); WebWS
+uses `deliver_versioned_setting`. An old peer rejects the unknown operation,
+and clients never fall back to legacy delivery. A new peer refuses protected
+settings through legacy delivery, and the new operation only accepts classified
+replacement commands with an explicit observed version.
+
+Submit/Steer/Cancel and request-id waiter replies retain their own queue,
+cancellation, or identity contracts. Internal RunGoal/ConfirmPlanToGoal axis
+changes update only collaboration and advance the log. SetDefaultModel CAS
+protects the current session model; GlobalConfig owns the global default file
+and does not provide cross-session CAS. If that file write fails after the
+session change, report the partial result and retain the unresolved dispatch
+receipt rather than blindly replaying it.
+
 ### 11.3 Durable Turn Admission
 
 A fresh user or chat turn may become durably `running` only when the same turn

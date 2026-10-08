@@ -1,5 +1,6 @@
+import {SNAPSHOT_VERSIONED_COMMANDS} from '../src/command-policy.gen.mjs';
 import {test} from 'node:test';import assert from 'node:assert/strict';import security from '../src/security.cjs';
-const envelope=command=>({command_id:'id',session_id:'s1',expected_version:null,issued_at:new Date().toISOString(),command});
+const envelope=command=>({command_id:'id',session_id:'s1',expected_version:SNAPSHOT_VERSIONED_COMMANDS.includes(command.type)?7:null,issued_at:new Date().toISOString(),command});
 test('desktop IPC cannot shut down runtime or issue incomplete permission commands',()=>{
  for(const type of ['quit','shutdown_when_idle','force_retire','set_permission_profile','run_goal','add_attachment'])assert.throws(()=>security.validateEnvelope(envelope({type})));
 });
@@ -65,4 +66,11 @@ test('existing memory list is a strict selected-session correlated read, not a m
  const command={type:'list_memory',session_id:'s1',query_id:'q',include_archived:false};
  for(const fields of [{session_id:'other'},{query_id:null},{query_id:''},{include_archived:null},{include_archived:'true'},{include_archived:undefined},{path:'/private'},{forget:true}])assert.throws(()=>security.validateEnvelope(envelope({...command,...fields})));
  for(const type of ['accept_memory','reject_memory','forget_memory','remember_memory'])assert.throws(()=>security.validateEnvelope(envelope({...command,type})));
+});
+
+test('settings require a safe observed version while merge commands keep null',()=>{
+ const rename={type:'rename_session',session_id:'s1',name:'observed'};
+ for(const version of [null,undefined,-1,0.5,'7',Number.MAX_SAFE_INTEGER+1])assert.throws(()=>security.validateEnvelope({...envelope(rename),expected_version:version}));
+ for(const version of [0,7])assert.doesNotThrow(()=>security.validateEnvelope({...envelope(rename),expected_version:version}));
+ assert.throws(()=>security.validateEnvelope({...envelope({type:'submit_message',session_id:'s1',content:'hello'}),expected_version:7}));
 });

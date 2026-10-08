@@ -578,6 +578,8 @@ pub struct InProcessRuntimeClient {
     default_runtime: SessionRuntimeConfig,
     /// Model/mode/path selected independently by each live or restored session.
     session_runtime: Mutex<HashMap<SessionId, SessionRuntimeConfig>>,
+    // Serialize committed settings with their live permission projection.
+    settings_edits: tokio::sync::Mutex<()>,
     /// When true, skip the approval overlay (AutoApprove) so unattended TUI
     /// PTY drivers and CI dogfood can run interactive turns.
     auto_approve: bool,
@@ -873,6 +875,21 @@ struct SessionRuntimeConfig {
     thinking: Option<ThinkingLevel>,
 }
 
+// This cache owns only the transient approval policy. Hydration must never
+// overwrite an explicit attach that occurred while durable fields were read.
+fn install_persisted_config(
+    configs: &Mutex<HashMap<SessionId, SessionRuntimeConfig>>,
+    session_id: &SessionId,
+    mut config: SessionRuntimeConfig,
+) -> SessionRuntimeConfig {
+    let mut configs = configs.lock().unwrap();
+    if let Some(current) = configs.get(session_id) {
+        config.approval_policy = current.approval_policy;
+    }
+    configs.insert(session_id.clone(), config.clone());
+    config
+}
+
 impl InProcessRuntimeClient {
     /// Build a client that runs turns with the given model, mode, and sandbox
     /// setting.
@@ -1027,6 +1044,7 @@ impl InProcessRuntimeClient {
                 thinking: None,
             },
             session_runtime: Mutex::new(HashMap::new()),
+            settings_edits: tokio::sync::Mutex::new(()),
             auto_approve,
             media_root,
             events,
@@ -1113,15 +1131,9 @@ impl InProcessRuntimeClient {
         }
     }
 
-    /// The model a session runs on, or this runtime's default for a session it
-    /// has not opened.
-    fn session_model(&self, session_id: &SessionId) -> ModelRef {
-        self.session_runtime
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .map(|config| config.model.clone())
-            .unwrap_or_else(|| self.default_runtime.model.clone())
+    /// Session settings are read from the same durable authority as snapshots.
+    async fn session_model(&self, session_id: &SessionId) -> Result<ModelRef, ClientError> {
+        Ok(self.runtime_config(session_id).await?.model)
     }
 
     async fn save_agent(
@@ -1132,13 +1144,18 @@ impl InProcessRuntimeClient {
         query_id: Option<leveler_core::CommandId>,
         create: bool,
     ) {
-        let model = self.session_model(&session_id);
         let name = draft.name.trim().to_string();
-        let (ok, error, agent) = match self
-            .app
-            .save_agent(scope, &draft, create, Some(&model))
-            .await
-        {
+        let result = async {
+            let model = self
+                .session_model(&session_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.app
+                .save_agent(scope, &draft, create, Some(&model))
+                .await
+        }
+        .await;
+        let (ok, error, agent) = match result {
             Ok(entry) => (true, None, Some(entry)),
             Err(error) => (false, Some(error), None),
         };
@@ -1296,92 +1313,193 @@ impl InProcessRuntimeClient {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionRuntimeConfig, ClientError> {
-        if let Some(config) = self
-            .session_runtime
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
-        {
-            return Ok(config);
-        }
         let db = self
             .app
             .open_database()
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
-        let record = SessionRepository::new(&db)
-            .get(session_id)
+        let settings = SessionRepository::new(&db)
+            .settings_snapshot(session_id)
             .await
             .map_err(|error| ClientError::Runtime(error.to_string()))?
             .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        let config = self.config_from_settings(session_id, &settings)?;
+        Ok(install_persisted_config(
+            &self.session_runtime,
+            session_id,
+            config,
+        ))
+    }
+
+    fn config_from_settings(
+        &self,
+        session_id: &SessionId,
+        settings: &leveler_storage::SessionSettingsSnapshot,
+    ) -> Result<SessionRuntimeConfig, ClientError> {
+        let record = &settings.session;
         self.app
             .validate_session_workspace(record.repository.as_deref())
             .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        let approval_policy = self
+            .session_runtime
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|config| config.approval_policy)
+            .unwrap_or(ApprovalPolicy::Interactive);
+        Self::decode_settings(session_id, settings, approval_policy)
+    }
+
+    fn decode_settings(
+        session_id: &SessionId,
+        settings: &leveler_storage::SessionSettingsSnapshot,
+        approval_policy: ApprovalPolicy,
+    ) -> Result<SessionRuntimeConfig, ClientError> {
+        let record = &settings.session;
         let model = ModelRef::parse(&record.model).ok_or_else(|| {
             ClientError::Runtime(format!(
-                "session {} stores invalid model reference `{}`",
-                session_id.as_str(),
+                "session {session_id} stores invalid model reference `{}`",
                 record.model
             ))
         })?;
-        let (mode, sandbox, kind, _) = SessionRepository::new(&db)
-            .execution(session_id)
-            .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))?
-            .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
-        let mode = crate::session::mode_from_str(&mode).ok_or_else(|| {
+        let mode = crate::session::mode_from_str(&settings.mode).ok_or_else(|| {
             ClientError::Runtime(format!(
-                "session {} stores invalid execution mode `{mode}`",
-                session_id.as_str()
+                "session {session_id} stores invalid execution mode `{}`",
+                settings.mode
             ))
         })?;
-        // Interactive sessions always use the direct tool loop. Legacy rows
-        // stored as "orchestrate" are accepted but normalized to direct so a
-        // resume never re-enters the dual path.
-        match kind.as_str() {
-            "direct" | "orchestrate" | "orchestrated" => {}
-            other => {
-                return Err(ClientError::Runtime(format!(
-                    "session {} stores invalid execution kind `{other}`",
-                    session_id.as_str()
-                )));
-            }
+        if !matches!(
+            settings.kind.as_str(),
+            "direct" | "orchestrate" | "orchestrated"
+        ) {
+            return Err(ClientError::Runtime(format!(
+                "session {session_id} stores invalid execution kind `{}`",
+                settings.kind
+            )));
         }
-        // A session that chose a level keeps it across a resume; the level is
-        // canonical, so a model switch or upgrade re-resolves it rather than
-        // replaying a provider's old parameter.
-        let thinking = SessionRepository::new(&db)
-            .thinking(session_id)
-            .await
-            .map_err(|error| ClientError::Runtime(error.to_string()))?
-            .and_then(|raw| ThinkingLevel::parse(&raw));
-        let config = SessionRuntimeConfig {
+        let thinking = settings
+            .thinking
+            .as_deref()
+            .map(|raw| {
+                ThinkingLevel::parse(raw).ok_or_else(|| {
+                    ClientError::Runtime(format!(
+                        "session {session_id} stores invalid thinking level `{raw}`"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(SessionRuntimeConfig {
             model,
             mode,
-            sandbox,
-            // Retired column retained for old wire clients only.
+            sandbox: settings.sandbox,
             collaboration: record.collaboration.clone(),
-            // Not persisted in the session record; a restored session prompts
-            // unless the daemon-wide `auto_approve` fallback applies. A client
-            // that resumed with --auto-approve must re-assert it via
-            // attach_session_policy (R006 R6-P2) — warn so the downgrade is
-            // never silent again.
-            approval_policy: {
-                tracing::warn!(
-                    session = session_id.as_str(),
-                    "restored session hydrated with Interactive approval policy; \
-                     a resuming client must re-assert auto-approve explicitly"
-                );
-                ApprovalPolicy::Interactive
-            },
+            approval_policy,
             thinking,
+        })
+    }
+
+    /// Only the CAS transaction authorizes replacing a setting. Runtime views
+    /// read the committed row; they never persist a cached full-row replacement.
+    async fn edit_session_settings(
+        &self,
+        command: &ClientCommand,
+        expected: i64,
+    ) -> Result<bool, ClientError> {
+        use leveler_storage::{SessionEdit, SessionEditResult};
+        let _projection_guard = self.settings_edits.lock().await;
+        let session_id = command
+            .session_id()
+            .ok_or_else(|| ClientError::Runtime("setting command requires a session".into()))?;
+        let edit = match command {
+            ClientCommand::RenameSession { name, .. } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(ClientError::Runtime("名称不能为空".into()));
+                }
+                SessionEdit::Title(name.to_string())
+            }
+            ClientCommand::SelectModel { model, .. }
+            | ClientCommand::SetDefaultModel { model, .. } => {
+                if !self.app.model_refs().contains(model) {
+                    return Err(ClientError::Runtime(format!(
+                        "model `{model}` is not configured"
+                    )));
+                }
+                SessionEdit::Model(model.to_string())
+            }
+            ClientCommand::SetPermissionProfile { mode, .. } => {
+                SessionEdit::Permission(execution_mode(*mode).as_str().to_string())
+            }
+            ClientCommand::SetThinkingLevel { level, .. } => {
+                SessionEdit::Thinking(level.map(|level| level.as_str().to_string()))
+            }
+            ClientCommand::SetProductAxes { collaboration, .. } => {
+                if !matches!(collaboration.as_str(), "chat" | "plan" | "goal") {
+                    return Err(ClientError::Runtime(format!(
+                        "invalid collaboration `{collaboration}`"
+                    )));
+                }
+                SessionEdit::Collaboration(collaboration.clone())
+            }
+            _ => {
+                return Err(ClientError::Runtime(
+                    "version policy command has no setting implementation".into(),
+                ));
+            }
         };
-        self.session_runtime
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), config.clone());
-        Ok(config)
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        match SessionRepository::new(&db)
+            .edit_at_version(session_id, expected, &edit, leveler_core::now())
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+        {
+            SessionEditResult::Conflict(_) => return Ok(false),
+            SessionEditResult::Applied(_) => {}
+        }
+        if matches!(command, ClientCommand::SetPermissionProfile { .. }) {
+            let config = self.runtime_config(session_id).await?;
+            self.app
+                .set_live_permission_profile(session_id.as_str(), config.mode);
+            supersede_pending_approvals(&self.pending, session_id);
+        }
+        if let ClientCommand::SetDefaultModel { model, .. } = command {
+            crate::global_config::GlobalConfig::save_default_model(model).map_err(|error| {
+                ClientError::Runtime(format!(
+                    "已切换到 {model}，但默认模型保存失败：{error}；下次启动可能恢复原模型"
+                ))
+            })?;
+        }
+        let session = self.snapshot(session_id).await?;
+        let _ = self
+            .events_for(session_id)
+            .send(RuntimeEvent::SessionUpdated { session });
+        if matches!(command, ClientCommand::RenameSession { .. }) {
+            let _ = self.events.send(RuntimeEvent::SessionList {
+                sessions: self.list_sessions().await?,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn persist_turn_collaboration(
+        &self,
+        session_id: &SessionId,
+        collaboration: &str,
+    ) -> Result<(), ClientError> {
+        let _projection_guard = self.settings_edits.lock().await;
+        let db = self
+            .app
+            .open_database()
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        SessionRepository::new(&db)
+            .set_turn_collaboration(session_id, collaboration, leveler_core::now())
+            .await
+            .map_err(|error| ClientError::Runtime(error.to_string()))
     }
 
     async fn persist_runtime_config(
@@ -1444,27 +1562,6 @@ impl InProcessRuntimeClient {
             .lock()
             .unwrap()
             .insert(session_id.clone(), config);
-        Ok(())
-    }
-
-    /// Apply a model change to the active session: in-memory truth and the
-    /// durable session record, then the client-visible snapshot. Shared by
-    /// [`ClientCommand::SelectModel`] (session-scoped) and
-    /// [`ClientCommand::SetDefaultModel`] (the user's explicit default), which
-    /// differ only in whether configuration is rewritten afterwards.
-    async fn switch_session_model(
-        &self,
-        session_id: &SessionId,
-        model: &ModelRef,
-    ) -> Result<(), ClientError> {
-        let mut config = self.runtime_config(session_id).await?;
-        config.model = model.clone();
-        self.persist_runtime_config(session_id, config).await?;
-        if let Ok(session) = self.snapshot(session_id).await {
-            let _ = self
-                .events_for(session_id)
-                .send(RuntimeEvent::SessionUpdated { session });
-        }
         Ok(())
     }
 
@@ -3619,23 +3716,15 @@ impl InProcessRuntimeClient {
             }
         };
         let model = config.model;
-        let mode = config.mode;
         let active = self.active.clone();
         let checkpoints = self.checkpoints.clone();
         let live_views = self.live_views.clone();
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
-                let rewrote = compact_conversation(
-                    &app,
-                    &events,
-                    &live_views,
-                    &model,
-                    mode,
-                    &session_id,
-                    cancel,
-                )
-                .await;
+                let rewrote =
+                    compact_conversation(&app, &events, &live_views, &model, &session_id, cancel)
+                        .await;
                 // Only wipe checkpoints when the transcript was actually
                 // replaced — a short/no-op compact must keep them.
                 if rewrote {
@@ -3737,6 +3826,12 @@ impl InProcessRuntimeClient {
 #[async_trait]
 impl InteractiveRuntimeClient for InProcessRuntimeClient {
     async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
+        if command
+            .requires_snapshot_version()
+            .map_err(|error| ClientError::Runtime(error.to_string()))?
+        {
+            return Err(ClientError::Runtime("snapshot version required: deliver this setting with its observed expected_version".into()));
+        }
         match command {
             ClientCommand::QueryGlobalTasks {
                 requester_session_id,
@@ -3833,7 +3928,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     self.active.clone(),
                     self.auxiliary_assists.clone(),
                     session_id.clone(),
-                    self.session_model(&session_id),
+                    self.session_model(&session_id).await?,
                     self.events_for(&session_id),
                     AssistKind::PromptSuggestion,
                 );
@@ -3845,7 +3940,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     self.active.clone(),
                     self.auxiliary_assists.clone(),
                     session_id.clone(),
-                    self.session_model(&session_id),
+                    self.session_model(&session_id).await?,
                     self.events_for(&session_id),
                     AssistKind::AwaySummary,
                 );
@@ -3879,7 +3974,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     config.collaboration = leveler_lifecycle::CollaborationMode::Goal
                         .as_str()
                         .to_string();
-                    self.persist_runtime_config(&session_id, config.clone())
+                    self.persist_turn_collaboration(&session_id, &config.collaboration)
                         .await?;
                     if let Ok(session) = self.snapshot(&session_id).await {
                         let _ = self
@@ -3887,6 +3982,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                             .send(RuntimeEvent::SessionUpdated { session });
                     }
                 }
+                let config = self.runtime_config(&session_id).await?;
                 let cancel = self.stage_turn(&session_id, &content, true, 0).await?;
                 let accepted = self.spawn_goal_turn(session_id, content, cancel, config);
                 await_turn_acceptance(accepted).await
@@ -3992,98 +4088,13 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             ClientCommand::AnswerClarification { request_id, answer } => {
                 resolve_clarification(&self.pending_clarify, &request_id, answer)
             }
-            ClientCommand::SelectModel { session_id, model } => {
-                if !self.app.model_refs().contains(&model) {
-                    return Err(ClientError::Runtime(format!(
-                        "model `{model}` is not configured"
-                    )));
-                }
-                self.switch_session_model(&session_id, &model).await
-            }
-            ClientCommand::SetDefaultModel { session_id, model } => {
-                if !self.app.model_refs().contains(&model) {
-                    return Err(ClientError::Runtime(format!(
-                        "model `{model}` is not configured"
-                    )));
-                }
-                // The active session switches first, because the user's
-                // immediate effect must not be lost to a config write. If the
-                // default cannot be persisted the switch still stands, but the
-                // result says so plainly — runtime success is not persistence
-                // success, and the caller must never be told otherwise.
-                self.switch_session_model(&session_id, &model).await?;
-                crate::global_config::GlobalConfig::save_default_model(&model).map_err(|error| {
-                    ClientError::Runtime(format!(
-                        "已切换到 {model}，但默认模型保存失败：{error}；下次启动可能恢复原模型"
-                    ))
-                })
-            }
-            ClientCommand::SetPermissionProfile { session_id, mode } => {
-                let mut config = self.runtime_config(&session_id).await?;
-                let next_mode = execution_mode(mode);
-                let changed = config.mode != next_mode;
-                config.mode = next_mode;
-                self.persist_runtime_config(&session_id, config).await?;
-                // A profile change voids every permission question already
-                // waiting for this session: its premise (the old profile) is
-                // gone. Superseding BEFORE the snapshot is what keeps the
-                // snapshot — and every client that renders it — free of a
-                // stale approval, and lets the blocked call re-resolve under
-                // the profile now in force (Full => Allow). Clarifications are
-                // untouched: they are not permission approvals.
-                if changed {
-                    let superseded = supersede_pending_approvals(&self.pending, &session_id);
-                    if superseded > 0 {
-                        tracing::info!(
-                            session = session_id.as_str(),
-                            superseded,
-                            "permission profile changed; superseded pending approvals"
-                        );
-                    }
-                }
-                if let Ok(session) = self.snapshot(&session_id).await {
-                    let _ = self
-                        .events_for(&session_id)
-                        .send(RuntimeEvent::SessionUpdated { session });
-                }
-                Ok(())
-            }
-
-            ClientCommand::SetThinkingLevel { session_id, level } => {
-                // `/thinking <level>` sets this session's override; `/thinking
-                // reset` clears it, which is a different request from setting
-                // `auto` (`level` is `Some(Auto)` then, not `None`).
-                let mut config = self.runtime_config(&session_id).await?;
-                config.thinking = level;
-                self.persist_runtime_config(&session_id, config).await?;
-                if let Ok(session) = self.snapshot(&session_id).await {
-                    let _ = self
-                        .events_for(&session_id)
-                        .send(RuntimeEvent::SessionUpdated { session });
-                }
-                Ok(())
-            }
-            ClientCommand::SetProductAxes {
-                session_id,
-                work_profile,
-                collaboration,
-            } => {
-                // Idle-only is enforced by the TUI; runtime still accepts while idle.
-                let mut config = self.runtime_config(&session_id).await?;
-                // Old clients may still send this field; it has no runtime effect.
-                if work_profile != "single" {
-                    tracing::warn!(legacy_work_profile = %work_profile, "work_profile is deprecated and ignored; capability loading is model-driven");
-                }
-                config.collaboration = collaboration.clone();
-                // Collaboration::Plan forces Safe-only tools via ToolContext.read_only
-                // (orthogonal to the permission profile).
-                self.persist_runtime_config(&session_id, config).await?;
-                if let Ok(session) = self.snapshot(&session_id).await {
-                    let _ = self
-                        .events_for(&session_id)
-                        .send(RuntimeEvent::SessionUpdated { session });
-                }
-                Ok(())
+            ClientCommand::SelectModel { .. }
+            | ClientCommand::SetDefaultModel { .. }
+            | ClientCommand::SetPermissionProfile { .. }
+            | ClientCommand::SetThinkingLevel { .. }
+            | ClientCommand::SetProductAxes { .. }
+            | ClientCommand::RenameSession { .. } => {
+                Err(ClientError::Runtime("snapshot version required".into()))
             }
             ClientCommand::ConfirmPlanToGoal {
                 session_id,
@@ -4091,13 +4102,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             } => {
                 let mut config = self.runtime_config(&session_id).await?;
                 config.collaboration = "goal".into();
-                self.persist_runtime_config(&session_id, config.clone())
+                self.persist_turn_collaboration(&session_id, &config.collaboration)
                     .await?;
                 let goal = if content.trim().is_empty() {
                     "Execute the confirmed plan".to_string()
                 } else {
                     content
                 };
+                let config = self.runtime_config(&session_id).await?;
                 let cancel = self.stage_turn(&session_id, &goal, false, 0).await?;
                 let accepted = self.spawn_goal_turn(session_id, goal, cancel, config);
                 await_turn_acceptance(accepted).await
@@ -4442,28 +4454,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                     .send(RuntimeEvent::SessionList {
                         sessions: self.list_sessions().await?,
                     });
-                Ok(())
-            }
-            ClientCommand::RenameSession { session_id, name } => {
-                let name = name.trim().to_string();
-                let renamed: Result<(), anyhow::Error> = async {
-                    if name.is_empty() {
-                        anyhow::bail!("名称不能为空");
-                    }
-                    let db = self.app.open_database().await?;
-                    SessionRepository::new(&db)
-                        .update_goal(&session_id, &name)
-                        .await?;
-                    Ok(())
-                }
-                .await;
-                if let Err(error) = renamed {
-                    self.notify_error(&session_id, format!("重命名会话失败: {error}"));
-                    return Ok(());
-                }
-                let _ = self.events.send(RuntimeEvent::SessionList {
-                    sessions: self.list_sessions().await?,
-                });
                 Ok(())
             }
             ClientCommand::ArchiveSession { session_id } => {
@@ -4820,7 +4810,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 session_id,
                 query_id,
             } => {
-                let model = self.session_model(&session_id);
+                let model = self.session_model(&session_id).await?;
                 let (agents, problems) = self.app.list_agents(Some(&model)).await;
                 let _ = self
                     .events_for(&session_id)
@@ -4836,7 +4826,7 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 name,
                 query_id,
             } => {
-                let model = self.session_model(&session_id);
+                let model = self.session_model(&session_id).await?;
                 let (agent, error) = match self.app.get_agent(&name, Some(&model)).await {
                     Ok(detail) => (Some(detail), None),
                     Err(error) => (None, Some(error)),
@@ -5045,10 +5035,21 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             validate_pending_session(&envelope.session_id, pending_session)?;
         }
 
+        let versioned = envelope
+            .command
+            .requires_snapshot_version()
+            .map_err(|error| ClientError::Runtime(error.to_string()))?;
+        if versioned && envelope.expected_version.is_none() {
+            return Err(ClientError::Runtime(
+                "snapshot version required: expected_version must come from the observed snapshot"
+                    .into(),
+            ));
+        }
+
         // Optimistic concurrency: reject a command issued against a stale view
         // *before* consuming its id, so the client can resync and reissue with a
         // fresh id rather than have this one silently swallowed as a duplicate.
-        if let Some(expected) = envelope.expected_version {
+        if !versioned && let Some(expected) = envelope.expected_version {
             let latest = leveler_storage::EventRepository::new(&db)
                 .latest_sequence(&envelope.session_id)
                 .await
@@ -5106,15 +5107,42 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         }
 
         let command_id = envelope.command_id.clone();
-        let dispatched = match envelope.command {
-            ClientCommand::AddAttachmentData {
-                session_id,
-                name,
-                data_base64,
-            } => {
-                self.import_attachment_data(session_id, name, data_base64, Some(command_id.clone()))
+        let dispatched = if versioned {
+            match self
+                .edit_session_settings(
+                    &envelope.command,
+                    envelope.expected_version.expect("validated version"),
+                )
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    // The atomic compare guarantees no mutation, so this id can
+                    // be retried after an explicit caller resync.
+                    receipts
+                        .mark_failed(&command_id)
+                        .await
+                        .map_err(|error| ClientError::Runtime(error.to_string()))?;
+                    return Err(ClientError::Runtime(
+                        "version conflict: resync required".into(),
+                    ));
+                }
+                Err(error) => Err(error),
             }
-            command => self.send(command).await,
+        } else {
+            match envelope.command {
+                ClientCommand::AddAttachmentData {
+                    session_id,
+                    name,
+                    data_base64,
+                } => self.import_attachment_data(
+                    session_id,
+                    name,
+                    data_base64,
+                    Some(command_id.clone()),
+                ),
+                command => self.send(command).await,
+            }
         };
         match dispatched {
             Ok(()) => {
@@ -5153,11 +5181,14 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .open_database()
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        let record = SessionRepository::new(&db)
-            .get(session_id)
+        let settings = SessionRepository::new(&db)
+            .settings_snapshot(session_id)
             .await
             .map_err(|e| ClientError::Runtime(e.to_string()))?
             .ok_or_else(|| ClientError::SessionNotFound(session_id.clone()))?;
+        let config = self.config_from_settings(session_id, &settings)?;
+        let last_sequence = settings.sequence;
+        let record = settings.session;
 
         let payloads = MessageRepository::new(&db)
             .load(session_id)
@@ -5172,7 +5203,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
         let mut available_models = self.app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
 
-        let config = self.runtime_config(session_id).await?;
         let model = config.model.clone();
         let profile = self.app.registry.profile(&model).await.ok();
         // Whether the current model accepts images (spec §42).
@@ -5181,11 +5211,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
             .map(|p| p.capabilities.vision)
             .unwrap_or(false);
         let thinking = ui_thinking_state(profile.as_ref(), config.thinking);
-
-        let last_sequence = leveler_storage::EventRepository::new(&db)
-            .latest_sequence(session_id)
-            .await
-            .map_err(|e| ClientError::Runtime(e.to_string()))?;
 
         let mut pending_interactions = Vec::new();
         pending_interactions.extend(
@@ -5843,7 +5868,6 @@ async fn compact_conversation(
     events: &broadcast::Sender<RuntimeEvent>,
     live_views: &crate::live_view::LiveViews,
     model: &ModelRef,
-    mode: PermissionProfile,
     session_id: &SessionId,
     cancellation: CancellationToken,
 ) -> bool {
@@ -6040,7 +6064,37 @@ async fn compact_conversation(
         return false;
     }
 
-    if let Ok(Some(record)) = SessionRepository::new(&db).get(session_id).await {
+    let settings = match SessionRepository::new(&db)
+        .settings_snapshot(session_id)
+        .await
+    {
+        Ok(Some(settings)) => settings,
+        Ok(None) => {
+            fail("压缩已提交，但会话不存在；请重新连接".into());
+            return false;
+        }
+        Err(error) => {
+            fail(format!("压缩已提交，但无法读取一致快照：{error}"));
+            return false;
+        }
+    };
+    let config = match InProcessRuntimeClient::decode_settings(
+        session_id,
+        &settings,
+        ApprovalPolicy::Interactive,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            fail(format!("压缩已提交，但无法解码会话设置：{error}"));
+            return false;
+        }
+    };
+    let model = config.model;
+    let mode = config.mode;
+    let thinking_level = config.thinking;
+    let last_sequence = settings.sequence;
+    let record = settings.session;
+    {
         let messages = repo
             .load(session_id)
             .await
@@ -6050,25 +6104,12 @@ async fn compact_conversation(
             .collect();
         let mut available_models = app.model_refs();
         available_models.sort_by_key(|m| m.to_string());
-        let profile = app.registry.profile(model).await.ok();
+        let profile = app.registry.profile(&model).await.ok();
         let vision = profile
             .as_ref()
             .map(|p| p.capabilities.vision)
             .unwrap_or(false);
-        let thinking = ui_thinking_state(
-            profile.as_ref(),
-            SessionRepository::new(&db)
-                .thinking(session_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|raw| ThinkingLevel::parse(&raw)),
-        );
-        let last_sequence = leveler_storage::EventRepository::new(&db)
-            .latest_sequence(session_id)
-            .await
-            .ok()
-            .flatten();
+        let thinking = ui_thinking_state(profile.as_ref(), thinking_level);
         let live = live_views.view(session_id);
         let active_background_tasks = background_snapshots
             .into_iter()
@@ -6530,6 +6571,56 @@ mod title_tests {
 
 #[cfg(test)]
 mod approval_policy_tests {
+    use super::{
+        Arc, HashMap, ModelRef, Mutex, PermissionProfile, SessionId, SessionRuntimeConfig,
+        install_persisted_config,
+    };
+    #[test]
+    fn an_explicit_attach_during_hydration_is_not_overwritten() {
+        use std::sync::Barrier;
+        let session_id = SessionId::new("concurrent-policy");
+        let initial = SessionRuntimeConfig {
+            model: ModelRef::new("mock", "m"),
+            mode: PermissionProfile::Assisted,
+            sandbox: false,
+            collaboration: "chat".into(),
+            approval_policy: ApprovalPolicy::Interactive,
+            thinking: None,
+        };
+        let configs = Arc::new(Mutex::new(HashMap::from([(session_id.clone(), initial)])));
+        let durable_read = Arc::new(Barrier::new(2));
+        let attached = Arc::new(Barrier::new(2));
+        let worker = {
+            let configs = configs.clone();
+            let session_id = session_id.clone();
+            let durable_read = durable_read.clone();
+            let attached = attached.clone();
+            std::thread::spawn(move || {
+                let mut hydrated = configs.lock().unwrap()[&session_id].clone();
+                hydrated.model = ModelRef::new("mock", "selected");
+                durable_read.wait();
+                attached.wait();
+                install_persisted_config(&configs, &session_id, hydrated)
+            })
+        };
+        durable_read.wait();
+        configs
+            .lock()
+            .unwrap()
+            .get_mut(&session_id)
+            .unwrap()
+            .approval_policy = ApprovalPolicy::AutoApprove;
+        attached.wait();
+        let hydrated = worker.join().unwrap();
+        assert_eq!(hydrated.approval_policy, ApprovalPolicy::AutoApprove);
+        let stored = configs.lock().unwrap();
+        assert_eq!(
+            stored[&session_id].approval_policy,
+            ApprovalPolicy::AutoApprove
+        );
+        assert_eq!(stored[&session_id].model, ModelRef::new("mock", "selected"));
+    }
+
     use super::should_auto_approve;
     use leveler_client_protocol::ApprovalPolicy;
 

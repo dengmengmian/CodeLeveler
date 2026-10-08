@@ -10,6 +10,10 @@
 //! * a normal main task under Full access keeps its full surface — the fix
 //!   narrows the side question, not the session.
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,7 +138,7 @@ compatibility: { synthesize_tool_call_ids: true, drop_unsupported_fields: true }
     // The session's own execution config is what a turn and a side question
     // actually resolve, so the profile under test must be the SESSION's.
     client
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: session.clone(),
             mode: match profile {
                 PermissionProfile::RequestApproval => WirePermissionProfile::RequestApproval,

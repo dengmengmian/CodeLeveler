@@ -1238,3 +1238,55 @@ async fn ws_does_not_forward_local_global_task_answers() {
     );
     assert_eq!(frame["event"]["message"], "safe-marker");
 }
+
+#[tokio::test]
+async fn ws_versioned_settings_refuse_legacy_missing_version_and_wrong_command_without_effect() {
+    let server = TestServer::start().await;
+    let (mut socket, _) = connect_async(format!("ws://{}/ws?token={TOKEN}", server.addr))
+        .await
+        .unwrap();
+    for (index, (kind, version, command)) in [
+        (
+            "deliver",
+            serde_json::json!(0),
+            serde_json::json!({"type":"rename_session", "session_id":"s1", "name":"must-not-run"}),
+        ),
+        (
+            "deliver_versioned_setting",
+            serde_json::Value::Null,
+            serde_json::json!({"type":"rename_session", "session_id":"s1", "name":"must-not-run"}),
+        ),
+        (
+            "deliver_versioned_setting",
+            serde_json::json!(0),
+            serde_json::json!({"type":"cancel_task", "session_id":"s1"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("refused-{index}");
+        let frame = serde_json::json!({"type":kind, "command_id":id, "session_id":"s1", "expected_version":version, "command":command});
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+        let reply = next_json(&mut socket).await;
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["command_id"], id);
+        assert_eq!(
+            server.service.mock.commands().len(),
+            0,
+            "refused setting must perform no runtime effect"
+        );
+    }
+    let valid = serde_json::json!({"type":"deliver_versioned_setting", "command_id":"allowed-versioned", "session_id":"s1", "expected_version":0, "command":{"type":"rename_session", "session_id":"s1", "name":"allowed"}});
+    socket
+        .send(Message::Text(valid.to_string().into()))
+        .await
+        .unwrap();
+    let reply = next_json(&mut socket).await;
+    assert_eq!(reply["type"], "ack");
+    assert_eq!(reply["command_id"], "allowed-versioned");
+    assert_eq!(server.service.mock.commands().len(), 1);
+}

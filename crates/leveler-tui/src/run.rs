@@ -39,6 +39,7 @@ enum DeliveryJob {
     Command {
         session_id: SessionId,
         command: ClientCommand,
+        expected_version: Option<i64>,
     },
     Submission {
         envelope: CommandEnvelope,
@@ -50,6 +51,22 @@ enum DeliveryJob {
         command_id: CommandId,
         key: String,
     },
+}
+
+fn observed_command_version(
+    command: &ClientCommand,
+    snapshot_version: Option<i64>,
+) -> Result<Option<i64>, String> {
+    if command
+        .requires_snapshot_version()
+        .map_err(|error| error.to_string())?
+    {
+        snapshot_version.map(Some).ok_or_else(|| {
+            "snapshot version required; refresh session before changing settings".into()
+        })
+    } else {
+        Ok(None)
+    }
 }
 
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -157,12 +174,17 @@ pub async fn run(
                 DeliveryJob::Command {
                     session_id,
                     command,
+                    expected_version,
                 } => {
                     let client = Arc::clone(&delivery_client);
-                    let issuer = session_id.clone();
-                    let issued = command.clone();
-                    let mut attempt =
-                        tokio::spawn(async move { client.issue(issuer, issued).await });
+                    let envelope = CommandEnvelope {
+                        command_id: leveler_client_protocol::CommandId::generate(),
+                        session_id: session_id.clone(),
+                        expected_version,
+                        issued_at: chrono::Utc::now().to_rfc3339(),
+                        command: command.clone(),
+                    };
+                    let mut attempt = tokio::spawn(async move { client.deliver(envelope).await });
                     let answer = match tokio::time::timeout(DELIVERY_TIMEOUT, &mut attempt).await {
                         Ok(joined) => delivery_answer(joined),
                         Err(_) => DeliveryAnswer::None,
@@ -741,10 +763,22 @@ fn dispatch_effects(
                     });
                     continue;
                 }
+                let expected_version =
+                    match observed_command_version(&command, state.snapshot_version) {
+                        Ok(version) => version,
+                        Err(message) => {
+                            state.notification = Some(Notification {
+                                level: NotificationLevel::Error,
+                                message,
+                            });
+                            continue;
+                        }
+                    };
                 let session_id = state.session_id.clone();
                 let _ = delivery_tx.send(DeliveryJob::Command {
                     session_id,
                     command,
+                    expected_version,
                 });
             }
             // The reducer only emits this while the runtime is connected, and
@@ -1170,6 +1204,30 @@ fn run_remote(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_use_the_observed_snapshot_while_cancellation_keeps_its_identity_contract() {
+        let rename = leveler_client_protocol::ClientCommand::RenameSession {
+            session_id: leveler_client_protocol::SessionId::new("s1"),
+            name: "new".into(),
+        };
+        assert_eq!(
+            super::observed_command_version(&rename, Some(17)).unwrap(),
+            Some(17)
+        );
+        assert!(
+            super::observed_command_version(&rename, None)
+                .unwrap_err()
+                .contains("snapshot version required")
+        );
+        let cancel = leveler_client_protocol::ClientCommand::CancelTask {
+            session_id: leveler_client_protocol::SessionId::new("s1"),
+        };
+        assert_eq!(
+            super::observed_command_version(&cancel, Some(17)).unwrap(),
+            None
+        );
+    }
+
     use super::*;
 
     fn state() -> AppState {

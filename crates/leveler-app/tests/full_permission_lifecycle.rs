@@ -190,13 +190,45 @@ async fn switch(
     session_id: &SessionId,
     mode: WirePermission,
 ) {
-    client
-        .send(ClientCommand::SetPermissionProfile {
+    // ApprovalRequested is a live waiter handshake. Canonical execution facts
+    // can still advance after it; the operator must observe and resubmit a new
+    // intent after a refused CAS rather than retry the stale envelope.
+    for attempt in 0..8 {
+        let observed = client.snapshot(session_id).await.unwrap();
+        let expected = observed.last_sequence.unwrap_or(0);
+        let envelope = leveler_client_protocol::CommandEnvelope {
+            command_id: leveler_core::CommandId::generate(),
             session_id: session_id.clone(),
-            mode,
-        })
-        .await
-        .unwrap();
+            expected_version: Some(expected),
+            issued_at: leveler_core::now().to_rfc3339(),
+            command: ClientCommand::SetPermissionProfile {
+                session_id: session_id.clone(),
+                mode,
+            },
+        };
+        match client.deliver(envelope).await {
+            Ok(()) => return,
+            Err(leveler_client_protocol::ClientError::Runtime(message))
+                if message.starts_with("version conflict:") =>
+            {
+                let current = client.snapshot(session_id).await.unwrap();
+                assert_eq!(
+                    current.mode, observed.mode,
+                    "refused version must not mutate permission"
+                );
+                let actual = current.last_sequence.unwrap_or(0);
+                assert!(
+                    actual > expected,
+                    "conflict requires observed canonical advancement: expected={expected} actual={actual}"
+                );
+                eprintln!(
+                    "live permission fixture resync attempt={attempt} expected={expected} actual={actual}"
+                );
+            }
+            Err(error) => panic!("permission intent failed: {error:?}"),
+        }
+    }
+    panic!("canonical execution never stabilized for a fresh permission intent");
 }
 
 /// The lifecycle invariant itself, asserted against the runtime snapshot.

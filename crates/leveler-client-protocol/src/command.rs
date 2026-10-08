@@ -485,7 +485,30 @@ pub enum ClientCommand {
     Quit,
 }
 
+/// Commands replacing a user-selected setting require an observed snapshot version.
+/// Other commands retain their own queue, merge, or request-identity semantics.
+pub const SNAPSHOT_VERSIONED_COMMANDS: &[&str] = &[
+    "rename_session",
+    "select_model",
+    "set_default_model",
+    "set_permission_profile",
+    "set_thinking_level",
+    "set_product_axes",
+];
+
 impl ClientCommand {
+    /// Use the serialized wire tag as the single classification key.
+    pub fn requires_snapshot_version(&self) -> Result<bool, serde_json::Error> {
+        let value = serde_json::to_value(self)?;
+        let tag = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                <serde_json::Error as serde::ser::Error>::custom("command has no wire type")
+            })?;
+        Ok(SNAPSHOT_VERSIONED_COMMANDS.contains(&tag))
+    }
+
     /// The session this command targets, if any. Session-less commands
     /// (`ApprovalDecision`/`AnswerClarification` key off a request id;
     /// `RequestSessionList`/`Quit` are global) return `None`.

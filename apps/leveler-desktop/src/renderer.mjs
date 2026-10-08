@@ -140,9 +140,9 @@ function renderHeader(){
   renderWorkbench();
   controls();
 }
-async function deliver(command,envelope=commandEnvelope(current.session.id,command)){
+async function deliver(command,envelope=commandEnvelope(current.session.id,command,current.session.last_sequence??0)){
   const result=await api.deliver(envelope);
-  if(!result.ok){if(['outcome_unknown','transport'].includes(result.error.kind)){uncertain=envelope;renderInteractions();}throw new Error(result.error.message);}
+  if(!result.ok){if(result.error.message.includes('version conflict'))await refreshMetadata();if(['outcome_unknown','transport'].includes(result.error.kind)){uncertain=envelope;renderInteractions();}throw new Error(result.error.message);}
   if(uncertain?.command_id===envelope.command_id)uncertain=null;
   if(command.type==='submit_message'&&command.session_id===current?.session.id){if($('message').value.trim()===command.content)$('message').value='';const sent=new Set((command.attachments??[]).map(ref=>ref.id));attachmentDrafts.set(draftKey(),attachments().filter(item=>!sent.has(item.attachment?.id)));renderAttachments();}
   renderInteractions();return result;

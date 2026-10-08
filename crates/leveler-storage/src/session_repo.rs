@@ -11,6 +11,46 @@ use leveler_lifecycle::{AgentState, SessionStatus, TaskOutcome, UnknownVariant};
 
 use crate::database::{Database, StorageError};
 
+/// A replacement of one user-selected field, never a stale full-row rewrite.
+#[derive(Debug, Clone)]
+pub enum SessionEdit {
+    /// Session display title.
+    Title(String),
+    /// Configured provider/model reference.
+    Model(String),
+    /// Permission profile wire value.
+    Permission(String),
+    /// Thinking override; None restores inheritance.
+    Thinking(Option<String>),
+    /// Collaboration mode wire value.
+    Collaboration(String),
+}
+
+/// Atomic metadata replacement outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEditResult {
+    /// Mutation committed at this sequence.
+    Applied(i64),
+    /// No mutation; current authoritative sequence.
+    Conflict(i64),
+}
+
+/// Settings and their event-log version observed in one SQLite read snapshot.
+pub struct SessionSettingsSnapshot {
+    /// Persisted session metadata.
+    pub session: SessionRecord,
+    /// Permission profile wire value.
+    pub mode: String,
+    /// Persisted sandbox setting.
+    pub sandbox: bool,
+    /// Legacy execution kind.
+    pub kind: String,
+    /// Persisted thinking override.
+    pub thinking: Option<String>,
+    /// Latest event sequence in the same read transaction.
+    pub sequence: Option<i64>,
+}
+
 impl From<UnknownVariant> for StorageError {
     fn from(err: UnknownVariant) -> Self {
         StorageError::InvalidData(err.to_string())
@@ -175,6 +215,134 @@ impl<'a> SessionRepository<'a> {
         .fetch_optional(self.db.pool())
         .await?;
         row.map(SessionRow::decode).transpose()
+    }
+
+    /// Compare, replace the selected field, and advance the existing log in
+    /// one writer transaction. A conflict changes neither the row nor the log.
+    pub async fn edit_at_version(
+        &self,
+        id: &SessionId,
+        expected: i64,
+        edit: &SessionEdit,
+        now: Timestamp,
+    ) -> Result<SessionEditResult, StorageError> {
+        self.edit_metadata(id, Some(expected), edit, now).await
+    }
+
+    /// A goal/plan submission changes only its collaboration axis, preserving
+    /// independently selected model, permission, and thinking fields.
+    pub async fn set_turn_collaboration(
+        &self,
+        id: &SessionId,
+        collaboration: &str,
+        now: Timestamp,
+    ) -> Result<(), StorageError> {
+        self.edit_metadata(
+            id,
+            None,
+            &SessionEdit::Collaboration(collaboration.into()),
+            now,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn edit_metadata(
+        &self,
+        id: &SessionId,
+        expected: Option<i64>,
+        edit: &SessionEdit,
+        now: Timestamp,
+    ) -> Result<SessionEditResult, StorageError> {
+        let mut tx = self.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = ?1",
+        )
+        .bind(id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if expected.is_some_and(|expected| sequence != expected) {
+            tx.rollback().await?;
+            return Ok(SessionEditResult::Conflict(sequence));
+        }
+        let (sql, value, field) = match edit {
+            SessionEdit::Title(value) => (
+                "UPDATE sessions SET goal = ?2, updated_at = ?3 WHERE id = ?1",
+                Some(value.as_str()),
+                "goal",
+            ),
+            SessionEdit::Model(value) => (
+                "UPDATE sessions SET model = ?2, updated_at = ?3 WHERE id = ?1",
+                Some(value.as_str()),
+                "model",
+            ),
+            SessionEdit::Permission(value) => (
+                "UPDATE sessions SET mode = ?2, updated_at = ?3 WHERE id = ?1",
+                Some(value.as_str()),
+                "mode",
+            ),
+            SessionEdit::Thinking(value) => (
+                "UPDATE sessions SET thinking = ?2, updated_at = ?3 WHERE id = ?1",
+                value.as_deref(),
+                "thinking",
+            ),
+            SessionEdit::Collaboration(value) => (
+                "UPDATE sessions SET collaboration = ?2, updated_at = ?3 WHERE id = ?1",
+                Some(value.as_str()),
+                "collaboration",
+            ),
+        };
+        let changed = sqlx::query(sql)
+            .bind(id.as_str())
+            .bind(value)
+            .bind(now.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        if changed.rows_affected() != 1 {
+            return Err(StorageError::InvalidData(format!(
+                "session {id} not found for metadata edit"
+            )));
+        }
+        let payload =
+            serde_json::json!({"type": "session_metadata_changed", "payload": {"field": field}})
+                .to_string();
+        sqlx::query("INSERT INTO events (id, session_id, sequence, type, payload, created_at, schema_version) VALUES (?1, ?2, ?3, 'session_metadata_changed', ?4, ?5, ?6)")
+            .bind(leveler_core::EventId::generate().as_str()).bind(id.as_str()).bind(sequence + 1)
+            .bind(payload).bind(now.to_rfc3339()).bind(crate::event_repo::EVENT_SCHEMA_VERSION)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(SessionEditResult::Applied(sequence + 1))
+    }
+
+    /// Read metadata and its log version from one SQLite snapshot.
+    pub async fn settings_snapshot(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionSettingsSnapshot>, StorageError> {
+        let mut tx = self.db.pool().begin().await?;
+        let row: Option<SessionRow> = sqlx::query_as("SELECT id, repository, goal, status, model, state, created_at, updated_at, collaboration, work_profile FROM sessions WHERE id = ?1")
+            .bind(id.as_str()).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let (mode, sandbox, kind, thinking): (String, bool, String, Option<String>) =
+            sqlx::query_as("SELECT mode, sandbox, kind, thinking FROM sessions WHERE id = ?1")
+                .bind(id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+        let sequence = sqlx::query_scalar("SELECT MAX(sequence) FROM events WHERE session_id = ?1")
+            .bind(id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(SessionSettingsSnapshot {
+            session: row.decode()?,
+            mode,
+            sandbox,
+            kind,
+            thinking,
+            sequence,
+        }))
     }
 
     /// Persist product axes (collaboration × work profile).
@@ -408,6 +576,133 @@ impl SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_replacements_compare_and_advance_the_log_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect(&tmp.path().join("cas.db")).await.unwrap();
+        let record = SessionRecord::without_workspace("original", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        let repo = SessionRepository::new(&db);
+        repo.create(&record).await.unwrap();
+        let left = SessionEdit::Title("left".into());
+        let right = SessionEdit::Title("right".into());
+        let (left, right) = tokio::join!(
+            repo.edit_at_version(&id, 0, &left, leveler_core::now()),
+            repo.edit_at_version(&id, 0, &right, leveler_core::now())
+        );
+        let results = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == SessionEditResult::Applied(1))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == SessionEditResult::Conflict(1))
+                .count(),
+            1
+        );
+        let snapshot = repo.settings_snapshot(&id).await.unwrap().unwrap();
+        assert_eq!(snapshot.sequence, Some(1));
+        assert_eq!(
+            snapshot.session.goal,
+            if results[0] == SessionEditResult::Applied(1) {
+                "left"
+            } else {
+                "right"
+            }
+        );
+        // The loser cannot change another field or append a phantom version.
+        assert_eq!(
+            repo.edit_at_version(
+                &id,
+                0,
+                &SessionEdit::Model("other".into()),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
+            SessionEditResult::Conflict(1)
+        );
+        let snapshot = repo.settings_snapshot(&id).await.unwrap().unwrap();
+        assert_eq!(snapshot.sequence, Some(1));
+        assert_eq!(snapshot.session.model, "m");
+        assert_eq!(
+            repo.edit_at_version(
+                &id,
+                1,
+                &SessionEdit::Model("selected".into()),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
+            SessionEditResult::Applied(2)
+        );
+        assert_eq!(
+            repo.edit_at_version(
+                &id,
+                2,
+                &SessionEdit::Permission("full_access".into()),
+                leveler_core::now()
+            )
+            .await
+            .unwrap(),
+            SessionEditResult::Applied(3)
+        );
+        repo.set_turn_collaboration(&id, "goal", leveler_core::now())
+            .await
+            .unwrap();
+        let merged = repo.settings_snapshot(&id).await.unwrap().unwrap();
+        assert_eq!(merged.session.model, "selected");
+        assert_eq!(merged.mode, "full_access");
+        assert_eq!(merged.session.collaboration, "goal");
+        assert_eq!(merged.sequence, Some(4));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settings_and_log_version_share_one_read_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect(&tmp.path().join("snapshot.db"))
+            .await
+            .unwrap();
+        let record = SessionRecord::without_workspace("title-0", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        let repo = SessionRepository::new(&db);
+        repo.create(&record).await.unwrap();
+        let writer = async {
+            for version in 0..40 {
+                assert_eq!(
+                    repo.edit_at_version(
+                        &id,
+                        version,
+                        &SessionEdit::Title(format!("title-{}", version + 1)),
+                        leveler_core::now()
+                    )
+                    .await
+                    .unwrap(),
+                    SessionEditResult::Applied(version + 1)
+                );
+            }
+        };
+        let reader = async {
+            for _ in 0..80 {
+                let snapshot = repo.settings_snapshot(&id).await.unwrap().unwrap();
+                assert_eq!(
+                    snapshot.session.goal,
+                    format!("title-{}", snapshot.sequence.unwrap_or(0))
+                );
+            }
+        };
+        tokio::join!(writer, reader);
+        assert_eq!(
+            repo.settings_snapshot(&id).await.unwrap().unwrap().sequence,
+            Some(40)
+        );
+    }
 
     #[tokio::test]
     async fn no_workspace_roundtrips_and_deletes_without_becoming_a_path() {

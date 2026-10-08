@@ -537,11 +537,24 @@ impl AgentBridge {
             device_id: device_id.clone(),
         };
 
+        message
+            .validate_setting_delivery()
+            .map_err(|reason| AdmissionError::Refused {
+                code: "versioned_setting_required",
+                reason,
+            })?;
         match message {
             UpstreamMessage::Deliver {
                 command_id,
                 session_id,
                 command,
+                expected_version,
+            }
+            | UpstreamMessage::DeliverVersionedSettings {
+                command_id,
+                session_id,
+                command,
+                expected_version,
             } => {
                 let kind = command_kind(&command);
                 if let RemoteVerdict::Deny { code, reason } = policy.evaluate(&command) {
@@ -556,8 +569,14 @@ impl AgentBridge {
                     });
                     return Err(AdmissionError::Refused { code, reason });
                 }
-                self.deliver(project_id, &command_id, &session_id, command)
-                    .await?;
+                self.deliver(
+                    project_id,
+                    &command_id,
+                    &session_id,
+                    command,
+                    expected_version,
+                )
+                .await?;
                 self.audit(AuditEvent::Delivered {
                     device: hashed(&device_id),
                     project: project_id.to_string(),
@@ -579,11 +598,12 @@ impl AgentBridge {
         command_id: &str,
         session_id: &str,
         command: ClientCommand,
+        expected_version: Option<i64>,
     ) -> Result<(), AdmissionError> {
         let envelope = CommandEnvelope {
             command_id: CommandId::new(command_id),
             session_id: SessionId::new(session_id),
-            expected_version: None,
+            expected_version,
             issued_at: chrono::Utc::now().to_rfc3339(),
             command,
         };

@@ -247,3 +247,10 @@ test('settings reads register before ACK and accept only owned typed results, re
  const partial={session_id:'s1',event:'runtime',data:{type:'agents_loaded',query_id:'q2',agents:[],problems:[{error:'broken definition'}]}};
  assert.equal(applyReadResult(read,partial).data.problems.length,1);
 });
+
+test('settings envelope carries the displayed version and refuses an unobserved version',()=>{
+ const rename={type:'rename_session',session_id:'s1',name:'new title'};
+ assert.throws(()=>commandEnvelope('s1',rename),/snapshot version required/);
+ assert.equal(commandEnvelope('s1',rename,17).expected_version,17);
+ assert.equal(commandEnvelope('s1',{type:'cancel_current_turn',session_id:'s1'},17).expected_version,null);
+});

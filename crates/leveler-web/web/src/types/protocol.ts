@@ -32,7 +32,7 @@ export const TURN_TERMINAL_TYPES: ReadonlySet<RuntimeEvent['type']> = new Set([
 // ── WS 帧（与 leveler-web 网关的契约，见 crates/leveler-web/src/ws.rs）──
 /** 上行：浏览器 → 服务端。 */
 export type UpFrame =
-  | { type: 'deliver'; command_id: CommandId; session_id: SessionId; command: ClientCommand }
+  | { type: 'deliver' | 'deliver_versioned_setting'; command_id: CommandId; session_id: SessionId; command: ClientCommand; expected_version?: number | null }
   | { type: 'snapshot'; session_id: SessionId };
 
 /** 下行：服务端 → 浏览器。 */

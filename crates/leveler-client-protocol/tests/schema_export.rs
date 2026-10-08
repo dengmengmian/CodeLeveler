@@ -63,10 +63,12 @@ fn check(file_name: &str, generated: String) {
 
 #[test]
 fn client_command_schema_is_current() {
-    check(
-        "client_command.schema.json",
-        render(&schema_for!(ClientCommand)),
+    let mut schema = schema_for!(ClientCommand);
+    schema.schema.extensions.insert(
+        "x-snapshot-versioned-commands".into(),
+        serde_json::json!(leveler_client_protocol::SNAPSHOT_VERSIONED_COMMANDS),
     );
+    check("client_command.schema.json", render(&schema));
 }
 
 #[test]

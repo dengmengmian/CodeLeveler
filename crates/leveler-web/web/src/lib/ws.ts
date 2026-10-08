@@ -2,6 +2,7 @@
 // 断线指数退避重连（200ms 起步、封顶 5s）；重连成功后自动发 snapshot 帧整量重同步；
 // 收到 resync_required 立即重连；未知帧/未知事件类型忽略不崩。
 
+import { SNAPSHOT_VERSIONED_COMMANDS } from '../types/protocol.gen';
 import type { ClientCommand, CommandId, DownFrame, SessionId, UpFrame } from '../types/protocol';
 
 export type WsStatus = 'online' | 'connecting';
@@ -144,11 +145,13 @@ export function deliverFrame(
   sessionId: SessionId,
   command: ClientCommand,
   commandId?: CommandId,
+  expectedVersion?: number | null,
 ): UpFrame {
   return {
-    type: 'deliver',
+    type: SNAPSHOT_VERSIONED_COMMANDS.includes(command.type) ? 'deliver_versioned_setting' : 'deliver',
     command_id: commandId ?? crypto.randomUUID(),
     session_id: sessionId,
     command,
+    ...(expectedVersion === undefined ? {} : { expected_version: expectedVersion }),
   };
 }

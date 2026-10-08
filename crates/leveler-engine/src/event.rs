@@ -130,6 +130,11 @@ pub enum EngineEvent {
         #[serde(default)]
         task_id: Option<leveler_core::TaskId>,
     },
+    /// A session setting replacement committed together with this log version.
+    /// Values remain authoritative in the session row.
+    SessionMetadataChanged {
+        field: String,
+    },
     /// Durable acceptance of logical cancellation; never a task terminal.
     TaskCancelRequested {
         task_id: leveler_core::TaskId,
@@ -830,7 +835,8 @@ impl EngineEvent {
             | EngineEvent::UserShellFinished { .. }
             // Raw command output — local-sensitive like the user shell's.
             | EngineEvent::ToolCallOutput { .. }
-            | EngineEvent::TaskCancelRequested { .. } => LocalOnly,
+            | EngineEvent::TaskCancelRequested { .. }
+            | EngineEvent::SessionMetadataChanged { .. } => LocalOnly,
         }
     }
 
@@ -949,7 +955,8 @@ impl EngineEvent {
                 blocking: *blocking,
             },
 
-            EngineEvent::TaskCancelRequested { .. }
+            EngineEvent::SessionMetadataChanged { .. }
+            | EngineEvent::TaskCancelRequested { .. }
             | EngineEvent::StreamAttemptStarted
             | EngineEvent::AssistantDelta { .. }
             | EngineEvent::ReasoningStarted

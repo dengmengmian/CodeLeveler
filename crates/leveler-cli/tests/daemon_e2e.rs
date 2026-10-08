@@ -14,6 +14,10 @@
 
 #![cfg(unix)]
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -2564,7 +2568,7 @@ async fn collaboration_entry_smoke_body() {
 
     // 3) Explicit Chat: the next ordinary question ends on its answer.
     client
-        .send(ClientCommand::SetProductAxes {
+        .send_observed(ClientCommand::SetProductAxes {
             session_id: session.clone(),
             work_profile: "single".to_string(),
             collaboration: "chat".to_string(),
@@ -2601,7 +2605,7 @@ async fn collaboration_entry_smoke_body() {
 
     // 4) Back to Goal, durable across a reconnect.
     client
-        .send(ClientCommand::SetProductAxes {
+        .send_observed(ClientCommand::SetProductAxes {
             session_id: session.clone(),
             work_profile: "single".to_string(),
             collaboration: "goal".to_string(),

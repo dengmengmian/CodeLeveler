@@ -7,6 +7,10 @@
 //! when it started. These pin both directions of the change, and that one
 //! session's change never reaches another.
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use leveler_app::{Application, InProcessRuntimeClient};
 use leveler_client_protocol::{
     ClientCommand, InteractiveRuntimeClient, PermissionProfile as WirePermissionProfile,
@@ -200,7 +204,7 @@ async fn set_permission_profile_reaches_a_running_engine_before_session_updated(
         InProcessRuntimeClient::new(app.clone(), model, PermissionProfile::Assisted, false);
     let mut events = client.subscribe_session(&session_id);
     client
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: session_id.clone(),
             mode: WirePermissionProfile::FullAccess,
         })
@@ -266,7 +270,14 @@ async fn delivered_permission_selection_persists_only_the_target_session_and_lea
         let envelope = CommandEnvelope {
             command_id: CommandId::new(format!("desktop-mode-{index}")),
             session_id: session_id.clone(),
-            expected_version: None,
+            expected_version: Some(
+                client
+                    .snapshot(&session_id)
+                    .await
+                    .unwrap()
+                    .last_sequence
+                    .unwrap_or(0),
+            ),
             issued_at: leveler_core::now().to_rfc3339(),
             command: ClientCommand::SetPermissionProfile {
                 session_id: session_id.clone(),

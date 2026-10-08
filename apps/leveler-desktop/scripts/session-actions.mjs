@@ -1,3 +1,4 @@
+import {SNAPSHOT_VERSIONED_COMMANDS} from '../src/command-policy.gen.mjs';
 // Real Electron Main/preload -> Rust bridge -> isolated Runtime acceptance.
 // A test-only provider is configured, but no inference or tools are invoked.
 import {_electron as electron} from 'playwright';
@@ -15,16 +16,16 @@ await writeFile(path.join(home,'config.toml'),config,{mode:0o600});
 let application,page,runtime;
 const errors=[];
 async function launch(){
- application=await electron.launch({args:[root,`--user-data-dir=${path.join(temporary,'electron-profile')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_BINARY:path.resolve(root,'../../target/debug/leveler'),LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});
+ application=await electron.launch({args:[root,`--user-data-dir=${path.join(temporary,'electron-profile')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_BINARY:process.env.LEVELER_BINARY??path.resolve(root,'../../target/debug/leveler'),LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});
  page=await application.firstWindow();page.setDefaultTimeout(15000);page.on('pageerror',error=>errors.push(error.message));
  await page.waitForFunction(()=>window.desktop&&document.querySelector('#refresh')?.disabled===false);
 }
-async function command(sessionId,command){return page.evaluate(({sessionId,command})=>window.desktop.deliver({command_id:crypto.randomUUID(),session_id:sessionId,expected_version:null,issued_at:new Date().toISOString(),command}),{sessionId,command});}
+async function command(sessionId,command){const observed=SNAPSHOT_VERSIONED_COMMANDS.includes(command.type)?await snapshot(sessionId):null;const expected_version=observed?observed.last_sequence??0:null;return page.evaluate(({sessionId,command,expected_version})=>window.desktop.deliver({command_id:crypto.randomUUID(),session_id:sessionId,expected_version,issued_at:new Date().toISOString(),command}),{sessionId,command,expected_version});}
 const snapshot=id=>page.evaluate(id=>window.desktop.snapshot(id),id);
 const index=()=>page.evaluate(()=>window.desktop.listTasks());
 async function close(){await application.close();application=null;}
 try{
- await launch();const created=await page.evaluate(()=>window.desktop.createTask(null));const id=created.session.id;runtime=await page.evaluate(()=>window.desktop.runtimeInfo());
+ await launch();const created=await page.evaluate(()=>window.desktop.createTask(null,crypto.randomUUID()));const id=created.session.id;runtime=await page.evaluate(()=>window.desktop.runtimeInfo());
  const original=await snapshot(id);assert.equal(original.repository,null);assert.equal(original.available_models.length,2);assert.deepEqual(original.model,{provider:'fixture',model:'first'});
  const rename=await command(id,{type:'rename_session',session_id:id,name:'Isolated renamed acceptance task'});assert.equal(rename.ok,true);
  const renamed=await snapshot(id);assert.equal(renamed.goal,'Isolated renamed acceptance task');const task=(await index()).tasks.find(t=>t.id===id);assert.equal(task.title,renamed.goal);

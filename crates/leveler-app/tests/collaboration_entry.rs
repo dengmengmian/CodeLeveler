@@ -9,6 +9,10 @@
 //! receives: `update_goal` exists in the request exactly when
 //! `executor.goal_mode` is on (Goal), and never in a Chat request.
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -333,7 +337,7 @@ async fn run_goal_is_durable_and_explicit_chat_restores_chat() {
 
     // `/goal clear` / `/collab chat` is the explicit way back.
     client
-        .send(ClientCommand::SetProductAxes {
+        .send_observed(ClientCommand::SetProductAxes {
             session_id: session.clone(),
             work_profile: "single".to_string(),
             collaboration: "chat".to_string(),

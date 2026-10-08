@@ -1,3 +1,4 @@
+import {SNAPSHOT_VERSIONED_COMMANDS} from './command-policy.gen.mjs';
 // Presentation only: snapshots and events come from the Rust client protocol.
 //
 // Execution semantics live in `presentation.mjs` (Contract v1); this module
@@ -144,8 +145,10 @@ export function applyEvent(state,event) {
   }
   return next;
 }
-export function commandEnvelope(sessionId,command) {
-  return {command_id:crypto.randomUUID(),session_id:sessionId,expected_version:null,issued_at:new Date().toISOString(),command};
+export function commandEnvelope(sessionId,command,observedVersion) {
+  const versioned=SNAPSHOT_VERSIONED_COMMANDS.includes(command.type);
+  if(versioned&&(!Number.isSafeInteger(observedVersion)||observedVersion<0))throw new Error('snapshot version required');
+  return {command_id:crypto.randomUUID(),session_id:sessionId,expected_version:versioned?observedVersion:null,issued_at:new Date().toISOString(),command};
 }
 export const terminalEvents = new Set(['turn_completed','turn_completed_with_warnings','turn_answered','turn_failed','turn_cancelled','task_cancelled','turn_truncated','turn_incomplete']);
 export function approvalDecisions(request){return request.requires_human_consent?['approve_once','deny']:['approve_once','approve_session',...(request.always_persists?['approve_always']:[]),'deny'];}

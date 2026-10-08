@@ -1,3 +1,4 @@
+const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
 const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','approval_decision','answer_clarification','query_session_history','request_diff','list_memory','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
@@ -5,9 +6,10 @@ function string(value,max=256){return typeof value==='string'&&value.length>0&&v
 function exactKeys(value,keys){return !!value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===keys.length&&keys.every(key=>Object.hasOwn(value,key));}
 function nonblank(value){return string(value)&&value.trim().length>0;}
 function validateEnvelope(envelope,authorizeAttachment){
-  if(!envelope||!string(envelope.command_id)||!string(envelope.session_id)||typeof envelope.issued_at!=='string'||!Number.isFinite(Date.parse(envelope.issued_at))||envelope.expected_version!==null)throw new Error('Invalid command envelope');
+  if(!envelope||!string(envelope.command_id)||!string(envelope.session_id)||typeof envelope.issued_at!=='string'||!Number.isFinite(Date.parse(envelope.issued_at)))throw new Error('Invalid command envelope');
   const command=envelope.command;
   if(!command||!allowed.has(command.type))throw new Error('Unsupported Desktop command');
+  if(SNAPSHOT_VERSIONED_COMMANDS.includes(command.type)?(!Number.isSafeInteger(envelope.expected_version)||envelope.expected_version<0):envelope.expected_version!==null)throw new Error('Invalid snapshot version');
   if(command.session_id && command.session_id!==envelope.session_id)throw new Error('Session mismatch');
   if(['submit_message','steer_current_turn'].includes(command.type)&&((!string(command.content,100000)&&!(command.type==='submit_message'&&command.content===''&&Array.isArray(command.attachments)&&command.attachments.length>0))||command.session_id!==envelope.session_id))throw new Error('Invalid message');
   if(command.type==='submit_message'&&Object.keys(command).some(key=>!['type','session_id','content','attachments'].includes(key)))throw new Error('Invalid message fields');

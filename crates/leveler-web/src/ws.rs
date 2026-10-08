@@ -274,11 +274,33 @@ async fn handle_upstream(
             return;
         }
     };
+    if let Err(reason) = message.validate_setting_delivery() {
+        let command_id = match &message {
+            UpstreamMessage::Deliver { command_id, .. }
+            | UpstreamMessage::DeliverVersionedSettings { command_id, .. } => {
+                Some(command_id.clone())
+            }
+            UpstreamMessage::Snapshot { .. } => None,
+        };
+        send_or_ignore(
+            outgoing,
+            error_frame(&ClientError::Runtime(reason.into()), command_id),
+        )
+        .await;
+        return;
+    }
     match message {
         UpstreamMessage::Deliver {
             command_id,
             session_id,
             command,
+            expected_version,
+        }
+        | UpstreamMessage::DeliverVersionedSettings {
+            command_id,
+            session_id,
+            command,
+            expected_version,
         } => {
             if matches!(&command, ClientCommand::QueryGlobalTasks { .. }) {
                 send_or_ignore(outgoing, error_frame(&ClientError::Runtime("global task discovery is only available through the trusted local runtime transport".into()), Some(command_id))).await;
@@ -288,7 +310,7 @@ async fn handle_upstream(
             let envelope = CommandEnvelope {
                 command_id: CommandId::new(command_id.clone()),
                 session_id: SessionId::new(session_id),
-                expected_version: None,
+                expected_version,
                 issued_at: leveler_core::now().to_rfc3339(),
                 command,
             };

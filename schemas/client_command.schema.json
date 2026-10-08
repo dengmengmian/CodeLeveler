@@ -1504,6 +1504,14 @@
       }
     }
   ],
+  "x-snapshot-versioned-commands": [
+    "rename_session",
+    "select_model",
+    "set_default_model",
+    "set_permission_profile",
+    "set_thinking_level",
+    "set_product_axes"
+  ],
   "definitions": {
     "ApprovalDecision": {
       "type": "string",

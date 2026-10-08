@@ -145,6 +145,12 @@ function collectDefinitions(schema, file) {
   }
 }
 
+const policySchema = JSON.parse(readFileSync(join(schemasDir, SCHEMAS[0]), 'utf8'));
+const versionedCommands = policySchema['x-snapshot-versioned-commands'];
+if (!Array.isArray(versionedCommands) || !versionedCommands.every((tag) => typeof tag === 'string')) {
+  fail('client command schema lacks snapshot version policy');
+}
+const policyLiteral = JSON.stringify(versionedCommands);
 const sections = [];
 for (const file of SCHEMAS) {
   const schema = JSON.parse(readFileSync(join(schemasDir, file), 'utf8'));
@@ -166,7 +172,16 @@ const banner = `// 自动生成，禁止手改 —— npm run gen:protocol 重�
 
 `;
 
-const output = banner + [...defDecls, ...sections].join('\n');
+const output = banner + `export const SNAPSHOT_VERSIONED_COMMANDS: readonly string[] = ${policyLiteral};\n\n` + [...defDecls, ...sections].join('\n');
+const policyFiles = [
+  [join(repoRoot, 'apps/leveler-desktop/src/command-policy.gen.mjs'), `// Generated from Rust command schema; run npm run gen:protocol in leveler-web/web.\nexport const SNAPSHOT_VERSIONED_COMMANDS = ${policyLiteral};\n`],
+  [join(repoRoot, 'apps/leveler-desktop/src/command-policy.gen.cjs'), `// Generated from Rust command schema; run npm run gen:protocol in leveler-web/web.\nmodule.exports.SNAPSHOT_VERSIONED_COMMANDS = ${policyLiteral};\n`],
+];
+for (const [path, content] of policyFiles) {
+  if (process.argv.includes('--check')) {
+    if (readFileSync(path, 'utf8') !== content) fail(`${path} is stale`);
+  } else writeFileSync(path, content);
+}
 
 if (process.argv.includes('--check')) {
   let committed = '';

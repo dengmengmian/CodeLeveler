@@ -6,6 +6,10 @@
 //! alone; `ClientCommand::SetDefaultModel` (the TUI picker's explicit action)
 //! must update both the active session and the persisted default.
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::sync::Arc;
 
 use leveler_app::{Application, GlobalConfig, InProcessRuntimeClient};
@@ -170,7 +174,7 @@ async fn explicit_selection_switches_the_session_and_persists_the_default() {
     let (_app, client, session_id) = build(&tmp).await;
 
     client
-        .send(ClientCommand::SetDefaultModel {
+        .send_observed(ClientCommand::SetDefaultModel {
             session_id: session_id.clone(),
             model: ModelRef::new("mock", "m"),
         })
@@ -197,7 +201,7 @@ async fn persisted_default_survives_a_reload() {
     let (_app, client, session_id) = build(&tmp).await;
 
     client
-        .send(ClientCommand::SetDefaultModel {
+        .send_observed(ClientCommand::SetDefaultModel {
             session_id,
             model: ModelRef::new("mock", "m"),
         })
@@ -225,7 +229,7 @@ async fn a_new_session_starts_on_the_persisted_default() {
     let (app, client, session_id) = build(&tmp).await;
 
     client
-        .send(ClientCommand::SetDefaultModel {
+        .send_observed(ClientCommand::SetDefaultModel {
             session_id,
             model: ModelRef::new("mock", "m"),
         })
@@ -266,7 +270,7 @@ async fn a_session_scoped_switch_leaves_the_default_alone() {
     let (_app, client, session_id) = build(&tmp).await;
 
     client
-        .send(ClientCommand::SelectModel {
+        .send_observed(ClientCommand::SelectModel {
             session_id: session_id.clone(),
             model: ModelRef::new("mock", "m"),
         })
@@ -300,7 +304,7 @@ async fn a_config_write_failure_is_reported_as_a_partial_failure() {
     std::fs::create_dir(&path).unwrap();
 
     let error = client
-        .send(ClientCommand::SetDefaultModel {
+        .send_observed(ClientCommand::SetDefaultModel {
             session_id: session_id.clone(),
             model: ModelRef::new("mock", "m"),
         })

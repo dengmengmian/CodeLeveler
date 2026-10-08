@@ -24,6 +24,10 @@
 //!
 //! A break is `FULL_PERMISSION_MODE_DRIFT`.
 
+#[path = "support/observed_command.rs"]
+mod observed_command;
+use observed_command::ObservedSettings;
+
 use std::sync::Arc;
 
 use leveler_app::{Application, InProcessRuntimeClient};
@@ -239,7 +243,7 @@ async fn explicit_full_override_on_a_persisted_auto_session_is_effective_and_per
     // `--permission full` drives.
     let runtime = client(&app, PermissionProfile::Assisted);
     runtime
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: id.clone(),
             mode: WirePermission::FullAccess,
         })
@@ -311,7 +315,7 @@ async fn explicit_assisted_override_downgrades_a_persisted_full_session() {
         .unwrap();
     let runtime = client(&app, PermissionProfile::FullAccess);
     runtime
-        .send(ClientCommand::SetPermissionProfile {
+        .send_observed(ClientCommand::SetPermissionProfile {
             session_id: id.clone(),
             mode: WirePermission::Assisted,
         })

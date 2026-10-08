@@ -56,7 +56,9 @@ pub use ownership_store::{
     MemoryOwnershipState, MemoryOwnershipStore, OwnershipError, OwnershipStore, TaskOwner,
 };
 pub use session_facts::SessionFacts;
-pub use session_repo::{SessionRecord, SessionRepository};
+pub use session_repo::{
+    SessionEdit, SessionEditResult, SessionRecord, SessionRepository, SessionSettingsSnapshot,
+};
 pub use session_store::{MemorySessionStore, SessionStore};
 pub use task_creation_store::TaskCreationStore;
 pub use task_store::{MemoryTaskStore, TaskStore};

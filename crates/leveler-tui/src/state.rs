@@ -239,6 +239,8 @@ pub struct AppState {
     /// False once the event subscription closes. Commands stay disabled until
     /// the user exits and reconnects, avoiding a write-only UI.
     pub runtime_connected: bool,
+    /// Version of metadata actually rendered from a runtime snapshot.
+    pub snapshot_version: Option<i64>,
     pub session_id: SessionId,
     pub transcript: TranscriptState,
     /// Which conversation surface owns the viewport and the composer. One
@@ -577,6 +579,7 @@ impl AppState {
         let mut state = Self {
             running: true,
             runtime_connected: true,
+            snapshot_version: None,
             session_id: boot.session_id.clone(),
             transcript: TranscriptState::new(),
             surface: crate::btw::SurfaceFocus::Main,

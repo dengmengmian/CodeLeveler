@@ -16,6 +16,7 @@ import {
   turnProgressLabel,
 } from './turn';
 import { deliverFrame, WsClient } from './ws';
+import { SNAPSHOT_VERSIONED_COMMANDS } from '../types/protocol.gen';
 import {
   initialState,
   reducer,
@@ -46,6 +47,7 @@ type GetState = () => AppState;
 
 export class RuntimeBridge {
   private readonly ws: WsClient;
+  private readonly snapshotVersions = new Map<SessionId, number>();
   private readonly dispatch: Dispatch<Action>;
   private readonly getState: GetState;
   /** Where actions currently go. A durable-history replay swaps this for a
@@ -116,6 +118,10 @@ export class RuntimeBridge {
         }
         return;
       case 'error':
+        if (frame.message.includes('version conflict')) {
+          const id = this.getState().current?.id;
+          if (id) this.ws.send({ type: 'snapshot', session_id: id });
+        }
         this.sink({ type: 'notice', message: `服务端错误 ${frame.code}: ${frame.message}` });
         return;
       default:
@@ -243,6 +249,7 @@ export class RuntimeBridge {
       return;
     }
     this.pendingSessionId = null;
+    this.snapshotVersions.set(snap.id, snap.last_sequence ?? 0);
     this.sink({ type: 'snapshot', session: snap, contextWindow });
     saveLastSession(snap.id);
     if (reopen) {
@@ -260,6 +267,7 @@ export class RuntimeBridge {
   private applySessionMeta(snap: UiSessionSnapshot): void {
     const { current } = this.getState();
     if (!current || current.id !== snap.id) return;
+    this.snapshotVersions.set(snap.id, snap.last_sequence ?? 0);
     this.sink({ type: 'session_meta', session: snap });
   }
 
@@ -609,7 +617,14 @@ export class RuntimeBridge {
         : ((command as { session_id?: SessionId }).session_id ??
           this.getState().current?.id ??
           '');
-    this.ws.send(deliverFrame(sessionId, command, commandId));
+    const versioned = SNAPSHOT_VERSIONED_COMMANDS.includes(command.type);
+    const expectedVersion = versioned ? this.snapshotVersions.get(sessionId) : undefined;
+    if (versioned && expectedVersion === undefined) {
+      this.ws.send({ type: 'snapshot', session_id: sessionId });
+      this.sink({ type: 'notice', message: '请先刷新会话，再重新修改设置。' });
+      return;
+    }
+    this.ws.send(deliverFrame(sessionId, command, commandId, expectedVersion));
   }
 
   requestSessionList(): void {

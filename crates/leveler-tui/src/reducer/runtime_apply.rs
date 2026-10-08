@@ -1583,6 +1583,7 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
         state.skill_catalog.clear();
         state.skill_catalog_root = None;
     }
+    state.snapshot_version = Some(session.last_sequence.unwrap_or(0));
     state.session_id = session.id.clone();
     state.repository = session.repository.clone();
     state.branch = session.branch.clone();

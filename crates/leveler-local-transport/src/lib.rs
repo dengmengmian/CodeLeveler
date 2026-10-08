@@ -281,6 +281,7 @@ enum WireRequest {
     Ping,
     Send(ClientCommand),
     Deliver(ProtocolEnvelope<CommandEnvelope>),
+    DeliverVersionedSettings(ProtocolEnvelope<CommandEnvelope>),
     Snapshot {
         session_id: SessionId,
     },
@@ -371,7 +372,8 @@ impl WireRequest {
             // Idempotent per-session policy assertion — replaying it after a
             // transport failure converges to the same state.
             | WireRequest::AttachSessionPolicy { .. }
-            | WireRequest::Deliver(_) => true,
+            | WireRequest::Deliver(_)
+            | WireRequest::DeliverVersionedSettings(_) => true,
             WireRequest::CreateSessionIdentified { request, .. } => request.request_id.as_ref().is_some_and(|id| !id.as_str().is_empty()),
             WireRequest::Send(_)
             | WireRequest::CreateSession { .. }
@@ -391,6 +393,7 @@ impl WireRequest {
             WireRequest::Ping => "ping",
             WireRequest::Send(_) => "send",
             WireRequest::Deliver(_) => "deliver",
+            WireRequest::DeliverVersionedSettings(_) => "deliver_versioned_settings",
             WireRequest::Snapshot { .. } => "snapshot",
             WireRequest::CreateSession { .. }
             | WireRequest::CreateSessionSelected { .. }
@@ -643,6 +646,7 @@ mod transport {
             )
             .await;
         }
+        let versioned_setting = matches!(&request, WireRequest::DeliverVersionedSettings(_));
         match request {
             WireRequest::Ping => send_response(&mut stream, WireResponse::Ack).await,
             WireRequest::Send(command) => {
@@ -671,7 +675,22 @@ mod transport {
                 )
                 .await
             }
-            WireRequest::Deliver(envelope) => {
+            WireRequest::Deliver(envelope) | WireRequest::DeliverVersionedSettings(envelope) => {
+                let protected = match envelope.body.command.requires_snapshot_version() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return send_result(
+                            &mut stream,
+                            Err(ClientError::Runtime(error.to_string())),
+                        )
+                        .await;
+                    }
+                };
+                if protected != versioned_setting
+                    || (versioned_setting && envelope.body.expected_version.is_none())
+                {
+                    return send_result(&mut stream, Err(ClientError::Runtime("protected settings require the distinct versioned operation and an observed snapshot version".into()))).await;
+                }
                 if !transport_trusted
                     && matches!(
                         &envelope.body.command,
@@ -1431,8 +1450,17 @@ mod transport {
             {
                 return Err(ClientError::Runtime("global tasks are local-only".into()));
             }
+            let protected = envelope
+                .command
+                .requires_snapshot_version()
+                .map_err(|e| ClientError::Runtime(e.to_string()))?;
+            let request = if protected {
+                WireRequest::DeliverVersionedSettings(ProtocolEnvelope::wrap(envelope))
+            } else {
+                WireRequest::Deliver(ProtocolEnvelope::wrap(envelope))
+            };
             match self
-                .request(WireRequest::Deliver(ProtocolEnvelope::wrap(envelope)))
+                .request(request)
                 .await
                 .map_err(transport_client_error)?
             {
@@ -2487,6 +2515,177 @@ mod tests {
         assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 0);
         shutdown.cancel();
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn versioned_setting_is_refused_by_legacy_daemon_without_effect_or_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let renames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = renames.clone();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server = tokio::spawn(async move {
+            let mut subscriptions = Vec::new();
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = stop.cancelled() => return,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let length = stream.read_u32().await.unwrap() as usize;
+                let mut bytes = vec![0; length];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let kind = request["body"]["type"].as_str().unwrap();
+                // The old peer accepts legacy Deliver and ignores its optional
+                // version field. Unknown operation names are refused.
+                let response = match kind {
+                    "subscribe" => serde_json::json!({"type":"ack"}),
+                    "deliver" => {
+                        assert_eq!(
+                            request["body"]["body"]["body"]["command"]["type"],
+                            "rename_session"
+                        );
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        serde_json::json!({"type":"ack"})
+                    }
+                    _ => {
+                        serde_json::json!({"type":"error","body":{"message":"unsupported legacy request","session_id":null}})
+                    }
+                };
+                let reply = serde_json::to_vec(
+                    &serde_json::json!({"protocol":{"major":1,"minor":12},"body":response}),
+                )
+                .unwrap();
+                stream.write_u32(reply.len() as u32).await.unwrap();
+                stream.write_all(&reply).await.unwrap();
+                if kind == "subscribe" {
+                    subscriptions.push(stream);
+                }
+            }
+        });
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        let result = client
+            .deliver(CommandEnvelope {
+                command_id: leveler_client_protocol::CommandId::new("versioned-old-peer"),
+                session_id: SessionId::new("s1"),
+                expected_version: Some(0),
+                issued_at: "2026-10-09T00:00:00Z".into(),
+                command: ClientCommand::RenameSession {
+                    session_id: SessionId::new("s1"),
+                    name: "must-not-run".into(),
+                },
+            })
+            .await;
+        let effects = renames.load(std::sync::atomic::Ordering::SeqCst);
+        shutdown.cancel();
+        server.await.unwrap();
+        assert!(
+            result.is_err(),
+            "old peer must explicitly refuse versioned settings; observed legacy effects={effects}"
+        );
+        assert_eq!(effects, 0, "old daemon must perform no rename");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn versioned_setting_boundary_rejects_legacy_missing_version_and_wrong_command() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("versioned.sock");
+        let runtime = Arc::new(TestRuntime::new());
+        let server = LocalSocketServer::bind(&path, runtime.clone())
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(server.serve(shutdown.clone()));
+        let rename = ClientCommand::RenameSession {
+            session_id: SessionId::new("s1"),
+            name: "new title".into(),
+        };
+        for (index, (verb, version, command)) in [
+            ("deliver", Some(0), rename.clone()),
+            ("deliver_versioned_settings", None, rename.clone()),
+            (
+                "deliver_versioned_settings",
+                Some(0),
+                ClientCommand::CancelTask {
+                    session_id: SessionId::new("s1"),
+                },
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let envelope = ProtocolEnvelope::wrap(CommandEnvelope {
+                command_id: leveler_client_protocol::CommandId::new(format!("invalid-{index}")),
+                session_id: SessionId::new("s1"),
+                expected_version: version,
+                issued_at: "2026-10-09T00:00:00Z".into(),
+                command,
+            });
+            let request =
+                ProtocolEnvelope::wrap(serde_json::json!({ "type": verb, "body": envelope }));
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+            stream.write_u32(bytes.len() as u32).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            let len = stream.read_u32().await.unwrap();
+            let mut reply = vec![0; len as usize];
+            stream.read_exact(&mut reply).await.unwrap();
+            let response: ProtocolEnvelope<WireResponse> = serde_json::from_slice(&reply).unwrap();
+            assert!(
+                matches!(response.into_body().unwrap(), WireResponse::Error(_)),
+                "boundary must refuse {verb}/{version:?}"
+            );
+            assert_eq!(
+                runtime.deliveries.lock().unwrap().len(),
+                0,
+                "refused delivery must never reach runtime"
+            );
+        }
+        let client = LocalSocketRuntimeClient::connect(&path).await.unwrap();
+        client
+            .deliver(CommandEnvelope {
+                command_id: leveler_client_protocol::CommandId::new("valid-versioned"),
+                session_id: SessionId::new("s1"),
+                expected_version: Some(0),
+                issued_at: "2026-10-09T00:00:00Z".into(),
+                command: rename,
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime.deliveries.lock().unwrap().len(), 1);
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_versioned_setting_requires_observed_version_and_preserves_receipt_identity() {
+        let (addr, runtime, shutdown) = tcp_server("versioned-token").await;
+        let client = LocalSocketRuntimeClient::connect_tcp(addr, "versioned-token")
+            .await
+            .unwrap();
+        let mut envelope = CommandEnvelope {
+            command_id: leveler_client_protocol::CommandId::new("tcp-versioned"),
+            session_id: SessionId::new("s1"),
+            expected_version: None,
+            issued_at: "2026-10-09T00:00:00Z".into(),
+            command: ClientCommand::RenameSession {
+                session_id: SessionId::new("s1"),
+                name: "observed title".into(),
+            },
+        };
+        assert!(client.deliver(envelope.clone()).await.is_err());
+        assert_eq!(runtime.deliveries.lock().unwrap().len(), 0);
+        envelope.expected_version = Some(0);
+        client.deliver(envelope.clone()).await.unwrap();
+        client.deliver(envelope).await.unwrap();
+        assert_eq!(runtime.deliveries.lock().unwrap().len(), 1);
+        shutdown.cancel();
     }
 
     #[cfg(unix)]
