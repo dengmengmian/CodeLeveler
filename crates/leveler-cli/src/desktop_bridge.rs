@@ -72,6 +72,8 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
             if query_id
                 .as_ref()
                 .is_none_or(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256) => {}
+        ClientCommand::ResumeTask { content, .. }
+            if !content.is_empty() && content.chars().count() <= 100_000 => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
@@ -439,6 +441,45 @@ fn requested_collaboration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_existing_task_commands_validate_scope_and_resume_content() {
+        let session = SessionId::new("desktop-session");
+        for command in [
+            ClientCommand::CancelTask {
+                session_id: session.clone(),
+            },
+            ClientCommand::ResumeTask {
+                session_id: session.clone(),
+                content: "继续".into(),
+            },
+        ] {
+            assert!(validate_command(&session, &command).is_ok());
+            assert!(validate_command(&SessionId::new("other-session"), &command).is_err());
+        }
+        for content in [String::new(), "a".repeat(100_001)] {
+            assert!(
+                validate_command(
+                    &session,
+                    &ClientCommand::ResumeTask {
+                        session_id: session.clone(),
+                        content
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_command(
+                &session,
+                &ClientCommand::ResumeTask {
+                    session_id: session.clone(),
+                    content: "a".repeat(100_000)
+                }
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn uncertain_delivery_retains_error_semantics_and_invalid_workspace_fails() {

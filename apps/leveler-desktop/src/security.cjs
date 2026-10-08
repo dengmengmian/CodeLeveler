@@ -1,5 +1,5 @@
 const {SNAPSHOT_VERSIONED_COMMANDS}=require('./command-policy.gen.cjs');
-const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','approval_decision','answer_clarification','query_session_history','request_diff','list_memory','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session']);
+const allowed=new Set(['submit_message','steer_current_turn','cancel_current_turn','cancel_task','resume_task','approval_decision','answer_clarification','query_session_history','request_diff','list_memory','list_agents','get_agent','query_context','query_observability','select_model','set_permission_profile','rename_session','archive_session']);
 const decisions=new Set(['approve_once','approve_session','approve_always','deny']);
 const {validRef}=require('./attachment-ingress.cjs');
 function string(value,max=256){return typeof value==='string'&&value.length>0&&value.length<=max;}
@@ -17,6 +17,11 @@ function validateEnvelope(envelope,authorizeAttachment){
     if(Array.isArray(command.attachments)&&command.attachments.some(ref=>ref?.kind!=='image'))throw new Error('普通文件已上传，但当前 Runtime 不支持将其内容发送给模型；请移除附件后发送文字');
     if(!Array.isArray(command.attachments)||command.attachments.length>16||command.attachments.some(ref=>!validRef(ref)||!authorizeAttachment?.(envelope.session_id,ref)))throw new Error('Invalid or unregistered attachment');
     if(new Set(command.attachments.map(ref=>ref.id)).size!==command.attachments.length)throw new Error('Duplicate attachment');
+  }
+  if(['cancel_task','resume_task'].includes(command.type)){
+    const keys=command.type==='resume_task'?['type','session_id','content']:['type','session_id'];
+    if(!exactKeys(command,keys)||!nonblank(command.session_id)||command.session_id!==envelope.session_id)throw new Error('Invalid task command');
+    if(command.type==='resume_task'&&!string(command.content,100000))throw new Error('Invalid continuation');
   }
   if(command.type==='cancel_current_turn'&&command.session_id!==envelope.session_id)throw new Error('Invalid cancellation');
   if(command.type==='approval_decision'&&(!string(command.request_id)||!decisions.has(command.decision)))throw new Error('Invalid approval decision');

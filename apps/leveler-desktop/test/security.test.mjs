@@ -74,3 +74,13 @@ test('settings require a safe observed version while merge commands keep null',(
  for(const version of [0,7])assert.doesNotThrow(()=>security.validateEnvelope({...envelope(rename),expected_version:version}));
  assert.throws(()=>security.validateEnvelope({...envelope({type:'submit_message',session_id:'s1',content:'hello'}),expected_version:7}));
 });
+
+test('existing task cancellation and continuation stay bounded to the selected session',()=>{
+ const commands=[{type:'cancel_task',session_id:'s1'},{type:'resume_task',session_id:'s1',content:'继续'}];
+ for(const command of commands){
+  assert.doesNotThrow(()=>security.validateEnvelope(envelope(command)));
+  for(const fields of [{session_id:'s2'},{session_id:''},{session_id:null},{permission:'full'}])assert.throws(()=>security.validateEnvelope(envelope({...command,...fields})));
+ }
+ for(const content of ['',null,42,'a'.repeat(100001)])assert.throws(()=>security.validateEnvelope(envelope({type:'resume_task',session_id:'s1',content})));
+ assert.doesNotThrow(()=>security.validateEnvelope(envelope({type:'resume_task',session_id:'s1',content:'a'.repeat(100000)})));
+});

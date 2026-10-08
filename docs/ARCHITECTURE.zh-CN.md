@@ -1217,7 +1217,7 @@ Phase 3C 的 Electron 骨架位于 `apps/leveler-desktop`。Renderer 通过受�
 连接 Main；Main 只启动 `leveler desktop-bridge` 薄 Rust 适配入口。bridge 复用上述
 Runtime Host 的 detached 接入、跨来源连接和 revive，以及现有客户端协议；不复制
 进程编排或业务状态。关窗只断开 bridge，不取消回合或关闭 Runtime；Runtime 保留
-既有空闲回收策略。
+既有空闲回收策略。Desktop Main 与 Rust bridge 接受现有 `CancelTask` / `ResumeTask` 命令并绑定当前会话；续写内容有界，取消与恢复的生命周期判定仍由 App / Harness owner 负责。
 
 ### 13.2.1 Optional Workspace 与全局历史契约
 

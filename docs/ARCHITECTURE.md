@@ -1318,7 +1318,7 @@ reaches Main through restricted preload IPC; Main starts only the thin Rust
 attachment, cross-source connection and revival, and the existing client
 protocol, without duplicating process orchestration or business state.
 Closing Desktop disconnects the bridge without cancelling turns or stopping
-Runtime; Runtime retains its existing idle reclamation policy.
+Runtime; Runtime retains its existing idle reclamation policy. Desktop Main and the Rust bridge accept the existing `CancelTask` / `ResumeTask` commands bound to the selected session, with bounded continuation content. App / Harness owners retain cancellation and recovery lifecycle authority.
 
 ### 13.2.1 Optional Workspace and Global History Contracts
 
