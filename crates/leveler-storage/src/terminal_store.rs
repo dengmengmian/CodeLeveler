@@ -632,19 +632,19 @@ impl TerminalStore for MemoryTerminalStore {
                     .filter(|turn| turn.session_id == session_id.as_str())
                     .max_by_key(|turn| turn.ordinal)
                     .is_some_and(|turn| turn.id == turn_id.as_str());
-                if outcome == TurnOutcome::Interrupted && latest {
-                    if let Some(session) = self
+                if outcome == TurnOutcome::Interrupted
+                    && latest
+                    && let Some(session) = self
                         .sessions
                         .rows
                         .lock()
                         .unwrap()
                         .get_mut(session_id.as_str())
-                    {
-                        if session.status == SessionStatus::Running && session.outcome.is_none() {
-                            session.status = SessionStatus::Interrupted;
-                            session.state = AgentState::Execute;
-                        }
-                    }
+                    && session.status == SessionStatus::Running
+                    && session.outcome.is_none()
+                {
+                    session.status = SessionStatus::Interrupted;
+                    session.state = AgentState::Execute;
                 }
                 Ok(event)
             })?
