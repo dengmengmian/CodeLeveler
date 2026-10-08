@@ -962,6 +962,8 @@ daemon 只有在这个边界提交后才发送 wire ACK。如果进程在正常 
 
 无附件的 `SubmitMessage` 若被既有 `parse_continuation` 识别为“继续”，由 App 命令入口统一进入已有 `ResumeTask` handler：沿原任务、Goal 和计划继续，并把补充要求追加到原目标。是否可恢复、显式取消拒绝和无可恢复任务时的普通消息语义，仍由原 Runtime owner 判定；带附件的提交保留内容与图像校验路径。客户端不各自新增“继续”解析器。
 
+Web 重开会话时，持久保存的最后选择与本次收到的 `SessionList` 决定恢复对象；不能读取尚未由 React 提交的旧列表。恢复继续遵守 current / pending selection guard，避免覆盖用户已开始的会话选择。
+
 #### 取消 ACK：请求 ≠ 送达 ≠ 已终止
 
 命令 ACK 回答的是“送达”，不是“执行完成”。取消让这条区分变得关键，其语义阶段可以拆开表达：

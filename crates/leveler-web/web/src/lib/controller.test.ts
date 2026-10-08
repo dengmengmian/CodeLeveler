@@ -199,6 +199,38 @@ describe('reopen last conversation on refresh', () => {
     expect(sent.some((c) => c.type === 'open_session' && c.session_id === 'sess-keep')).toBe(true);
   });
 
+  it('restores from the received session list before React commits queued actions', () => {
+    saveLastSession('sess-keep');
+    const state: AppState = structuredClone(initialState);
+    const queued: Action[] = [];
+    const bridge = new RuntimeBridge((action) => queued.push(action), () => state);
+    const sent: ClientCommand[] = [];
+    (bridge as unknown as { ws: { send: (frame: UpFrame) => boolean; setSession: (id: string | null) => void } }).ws = {
+      send: (frame) => {
+        if (frame.type === 'deliver' || frame.type === 'deliver_versioned_setting') sent.push(frame.command);
+        return true;
+      },
+      setSession: () => {},
+    };
+    (bridge as unknown as { applyEvent: (event: RuntimeEvent) => void }).applyEvent({
+      type: 'session_list', sessions: [summary('sess-keep')],
+    });
+    expect(state.sessions).toEqual([]);
+    expect(sent).toContainEqual({ type: 'open_session', session_id: 'sess-keep' });
+    for (const action of queued) reducer(state, action);
+    expect(state.draft).toBe(false);
+  });
+
+  it('does not restore over a conversation the user is already opening', () => {
+    const { bridge, sent, apply } = emptyHarness();
+    bridge.selectSession('human-selection');
+    saveLastSession('previous-selection');
+    apply({ type: 'session_list', sessions: [summary('previous-selection'), summary('human-selection')] });
+    expect(sent.filter((command) => command.type === 'open_session')).toEqual([
+      { type: 'open_session', session_id: 'human-selection' },
+    ]);
+  });
+
   it('does not invent a conversation when nothing was open', () => {
     const { state, sent, apply } = emptyHarness();
     apply({ type: 'session_list', sessions: [summary('sess-keep')] });

@@ -1012,6 +1012,8 @@ an unknown outcome never authorizes an automatic rerun.
 
 For an attachment-free `SubmitMessage`, the App command entry recognizes continuation with the existing `parse_continuation` and invokes the existing `ResumeTask` handler. It preserves the original task, Goal and plan, treating amendments as additions to the original objective. The existing Runtime owner still decides resumability, rejects explicitly cancelled tasks, and treats continuation without resumable work as an ordinary message. Submissions with attachments retain the content and image validation path; clients do not add separate continuation parsers.
 
+Web restores a saved conversation using the newly received `SessionList`, rather than a React state list whose dispatch may not yet have committed. Existing current / pending selection guards prevent restoration from overriding a conversation the user is already opening.
+
 #### Cancellation ACK: requested ≠ delivered ≠ terminated
 
 A command ACK answers delivery, not execution. Cancellation makes that a

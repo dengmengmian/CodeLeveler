@@ -276,7 +276,7 @@ export class RuntimeBridge {
     switch (ev.type) {
       case 'session_list':
         this.sink({ type: 'session_list', sessions: ev.sessions });
-        this.maybeRestoreLastSession();
+        this.maybeRestoreLastSession(ev.sessions);
         return;
       case 'session_opened':
         this.applySnapshot(ev.session);
@@ -653,12 +653,14 @@ export class RuntimeBridge {
   }
 
   /** Refresh should reopen the conversation that was on screen, not the hero. */
-  private maybeRestoreLastSession(): void {
+  private maybeRestoreLastSession(sessions: ReadonlyArray<{ id: SessionId }>): void {
     const state = this.getState();
     if (!state.draft || state.current || this.pendingSessionId) return;
     const last = loadLastSession();
     if (!last) return;
-    if (!state.sessions.some((s) => s.id === last)) return;
+    // React may not have committed the session_list action yet. The received
+    // list is authoritative for this restore; current/pending selection stays guarded.
+    if (!sessions.some((s) => s.id === last)) return;
     this.selectSession(last);
   }
 
