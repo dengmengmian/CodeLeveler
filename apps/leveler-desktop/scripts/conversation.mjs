@@ -3,7 +3,9 @@
 import {_electron as electron} from 'playwright';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
-import {mkdtemp,mkdir,writeFile} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile} from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 const root=fileURLToPath(new URL('..',import.meta.url));
@@ -29,16 +31,28 @@ const server=createServer(async(request,response)=>{
 const baseURL=`http://127.0.0.1:${server.address().port}`;
 rich=`# Rich conversation acceptance\n\nThis is **rendered bold** and *rendered emphasis*, with \`inline code\`.\n\n- First bullet\n- Second bullet\n\n1. First ordered\n2. Second ordered\n\n> A visible quoted result.\n\n\`\`\`js\n${literalCode}\n\`\`\`\n\n| Name | Count | Alpha | Beta | Gamma | Delta | Epsilon | Zeta |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| Files | 3 | one | two | three | four | five | six |\n\n[Safe documentation](${baseURL}/docs)\n\n<script>window.__markdownExecuted = true</script>\n\n<img src="${baseURL}/track.png" onerror="window.__markdownExecuted = true">\n\n[Dangerous link](javascript:alert%281%29)\n\n![External tracking image](${baseURL}/track.png)\n\nRICH_STREAM_COMPLETE`;
 await writeFile(path.join(home,'config.toml'),`default_model = "fixture/m"\n[providers.fixture]\nprotocol = "openai_chat"\nbase_url = "${baseURL}"\napi_key = "test-only-fixture"\n[models.m]\nprovider = "fixture"\nmodel_id = "fixture-model"\ncontext_window = 131072\n`,{mode:0o600});
-let application,page,clipboardCaptured=false;const pageErrors=[],evidence={scope:'real Desktop / Runtime streaming test-only provider, isolated home',temporary_home:home};
+const binary=process.env.LEVELER_BINARY??path.resolve(root,'../../target/debug/leveler');
+const producer={source_sha:execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim(),source_changes:execFileSync('git',['status','--porcelain'],{cwd:root,encoding:'utf8'}).trim(),binary_path:binary,binary_version:execFileSync(binary,['--version'],{encoding:'utf8'}).trim(),binary_sha256:createHash('sha256').update(await readFile(binary)).digest('hex'),script_sha256:createHash('sha256').update(await readFile(fileURLToPath(import.meta.url))).digest('hex')};
+await writeFile(path.join(output,'producer-evidence.json'),JSON.stringify(producer,null,2)+'\n');
+let application,page,clipboardCaptured=false,runtime,primaryError;const pageErrors=[],evidence={scope:'real Desktop / Runtime streaming test-only provider, isolated home',temporary_home:home,producer};
+async function cleanupRuntime(){
+ if(!runtime){await writeFile(path.join(output,'cleanup-evidence.json'),JSON.stringify({runtime_observed:false,signaled:false})+'\n');return;}
+ const deadline=Date.now()+45000;let gone=false;
+ while(Date.now()<deadline){try{process.kill(runtime.pid,0);}catch(error){if(error.code==='ESRCH'){gone=true;break;}throw error;}await new Promise(resolve=>setTimeout(resolve,100));}
+ const cleanup={runtime_pid:runtime.pid,runtime_id:runtime.runtime_id,normal_idle_exit_observed:gone,signaled:false};
+ await writeFile(path.join(output,'cleanup-evidence.json'),JSON.stringify(cleanup,null,2)+'\n');
+ if(!gone&&!primaryError)throw new Error('Isolated Runtime did not exit normally; no signal sent');
+}
 async function capture(name){await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));await page.screenshot();const image=await application.evaluate(async({BrowserWindow})=>(await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));await writeFile(path.join(output,name+'.png'),Buffer.from(image,'base64'));}
 async function settled(marker){await page.waitForFunction(marker=>document.querySelector('.message.assistant:last-of-type .body')?.textContent.includes(marker)&&['已回答','已完成'].includes(document.querySelector('#status').textContent),marker,{timeout:60000});}
 try{
- application=await electron.launch({args:[root,`--user-data-dir=${path.join(temporary,'electron-profile')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_BINARY:path.resolve(root,'../../target/debug/leveler'),LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await application.firstWindow();page.setDefaultTimeout(15000);page.on('pageerror',error=>pageErrors.push(error.message));await page.waitForFunction(()=>window.desktop&&document.querySelector('#refresh')?.disabled===false);
- await page.locator('#message').fill('conversation-rich: render the structured answer');await page.locator('#send').click();await settled('RICH_STREAM_COMPLETE');
+ application=await electron.launch({args:[root,`--user-data-dir=${path.join(temporary,'electron-profile')}`],env:{...process.env,ELECTRON_RUN_AS_NODE:undefined,LEVELER_HOME:home,LEVELER_CONFIG_DIR:undefined,LEVELER_BINARY:binary,LEVELER_DAEMON_IDLE_TIMEOUT_SECS:'10'}});page=await application.firstWindow();page.setDefaultTimeout(15000);page.on('pageerror',error=>pageErrors.push(error.message));await page.waitForFunction(()=>window.desktop&&document.querySelector('#refresh')?.disabled===false);
+ await page.locator('#message').fill('conversation-rich: render the structured answer');await page.locator('#send').click();await settled('RICH_STREAM_COMPLETE');runtime=await page.evaluate(()=>window.desktop.runtimeInfo());assert.ok(Number.isInteger(runtime.pid)&&runtime.pid>0,'own Runtime PID must be observed');evidence.runtime=runtime;
  const body=page.locator('.message.assistant .body').last();
  for(const tag of ['h1','strong','em','ul','ol','blockquote','pre code','table th','table td'])assert.ok(await body.locator(tag).count(),`${tag} missing from real assistant response`);
  assert.equal(await body.locator('strong').first().textContent(),'rendered bold');assert.equal(await body.locator('pre code').textContent(),literalCode);
- assert.equal(await body.locator('script,img,svg,iframe,object').count(),0);
+ // The copy control owns an SVG icon; it is not model-authored Markdown.
+ assert.equal(await body.locator('script,img,svg,iframe,object').evaluateAll(nodes=>nodes.filter(node=>!(node.tagName.toLowerCase()==='svg'&&node.closest('button[data-copy-code]'))).length),0);
  assert.equal(await page.evaluate(()=>typeof window.__markdownExecuted),'undefined');assert.equal(imageRequests,0);
  const badLinks=await body.locator('a[href]').evaluateAll(nodes=>nodes.map(n=>n.getAttribute('href')).filter(href=>!/^https?:\/\//i.test(href)));assert.deepEqual(badLinks,[]);
  await capture('conversation-rich-markdown');
@@ -61,8 +75,8 @@ try{
  assert.ok(await page.locator('.message.assistant').last().locator('strong').count()>=180);assert.ok(await page.locator('#conversation').evaluate(n=>n.scrollHeight>n.clientHeight));
  assert.equal(imageRequests,0);assert.deepEqual(providerErrors,[]);assert.deepEqual(pageErrors,[]);
  Object.assign(evidence,{semantic_markdown:true,code_literal_preserved:true,message_clipboard_exact:true,code_clipboard_exact:true,rendered_text_search:true,raw_html_and_script_inert:true,image_nodes:0,image_requests:imageRequests,provider_calls:providerCalls,stream_writes:streamWrites,long_paragraphs:180,draft_preserved:true,page_errors:pageErrors,provider_errors:providerErrors,passed:true});await writeFile(path.join(output,'conversation-evidence.json'),JSON.stringify(evidence,null,2)+'\n');console.log(JSON.stringify(evidence,null,2));
-}catch(error){Object.assign(evidence,{passed:false,error:error.message,page_errors:pageErrors,provider_errors:providerErrors});await writeFile(path.join(output,'conversation-evidence.json'),JSON.stringify(evidence,null,2)+'\n');if(page&&!page.isClosed())await capture('conversation-failure').catch(()=>{});throw error;}
+}catch(error){primaryError=error;const observed=page&&!page.isClosed()?await page.evaluate(()=>({forbidden_nodes:[...document.querySelectorAll('.message.assistant .body script,.message.assistant .body img,.message.assistant .body svg,.message.assistant .body iframe,.message.assistant .body object')].map(node=>node.outerHTML),markdown_executed:typeof window.__markdownExecuted})).catch(()=>null):null;Object.assign(evidence,{passed:false,error:error.message,page_errors:pageErrors,provider_errors:providerErrors,image_requests:imageRequests,provider_calls:providerCalls,observed});await writeFile(path.join(output,'conversation-evidence.json'),JSON.stringify(evidence,null,2)+'\n');if(page&&!page.isClosed())await capture('conversation-failure').catch(()=>{});throw error;}
 finally{
  try{if(application&&clipboardCaptured)await application.evaluate(async({clipboard})=>{const original=globalThis.__conversationClipboard;if(original.length)await clipboard.write(original);else clipboard.clear();delete globalThis.__conversationClipboard;});}
- finally{if(application)await application.close();await new Promise(resolve=>server.close(resolve));}
+ finally{if(application)await application.close();await new Promise(resolve=>server.close(resolve));await cleanupRuntime();}
 }
