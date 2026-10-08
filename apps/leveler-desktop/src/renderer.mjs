@@ -57,25 +57,29 @@ function renderConversation(){
  if(!current){list.replaceChildren();return;}
  const existing=new Map([...list.children].filter(n=>n.dataset.key).map(n=>[n.dataset.key,n]));const nodes=[];
  for(const message of current.messages){const key='message:'+message.id;let row=existing.get(key);if(!row){row=el('article',undefined,`message ${message.role} ${message.kind??''}`);row.dataset.key=key;row.dataset.messageId=message.id;row.append(el('div',messageRoleLabel(message),'role'),el('div','','body'));}row.className=`message ${message.role} ${message.kind??''} presentation-${messageKind(message)}`;const body=row.querySelector('.body');if(renderedSources.get(body)!==message.text){renderedSources.set(body,message.text);if(messageKind(message)==='assistant'){renderMarkdown(body,message.text,{onLink:url=>openMessageLink(url)});addCodeActions(body);}else body.textContent=message.text;}decorateMessage(row,message);nodes.push(row);}
- if(current.tools.length||(current.thoughts??[]).length||(current.reasoning??'').trim()!==''){let progress=existing.get('progress');if(!progress){progress=el('div','执行过程','progress-label');progress.dataset.key='progress';}const finalIndex=nodes.findLastIndex(n=>n.classList.contains('assistant'));const insert=finalIndex>=0?finalIndex:nodes.length;const rounds=groupExecutionRounds(current.tools);const blocks=turnBlocks(foldedThoughts(current.thoughts??[]),rounds);const placed=[];
+ if(current.tools.length||(current.thoughts??[]).length||(current.reasoning??'').trim()!==''){const rounds=groupExecutionRounds(current.tools);const blocks=turnBlocks(foldedThoughts(current.thoughts??[]),rounds);const placed=[];
  // ONE ordered process stream per turn: Thoughts, exploration receipts and the
- // rounds that ran between them, in arrival order. This is the same semantic
- // tree the terminal and the Web client project — the Desktop no longer derives
- // its own rounds from anything but the runtime's facts.
- const children=[];
+ // rounds that ran between them, in arrival order — the same semantic tree the
+ // terminal and the Web client project. One group PER TURN, placed by the
+ // anchor its rows carry, so a reopened conversation keeps every turn's
+ // Thoughts and rounds where that turn ran.
+ const groups=new Map();
+ const groupFor=(anchor)=>{const key=anchor??'(tail)';if(!groups.has(key))groups.set(key,{anchor,nodes:[]});return groups.get(key);};
  for(const block of blocks){
-  if(block.kind==='thought'){children.push(thoughtNode(existing,block.thought));continue;}
-  if(block.kind==='receipt'){children.push(receiptNode(existing,block.receipt,block.thoughts));continue;}
-  children.push(roundNode(existing,block.round));
+  if(block.kind==='thought'){groupFor(block.thought.anchor).nodes.push(thoughtNode(existing,block.thought));continue;}
+  if(block.kind==='receipt'){groupFor(block.receipt.anchor??(block.receipt.seq!=null?undefined:undefined)).nodes.push(receiptNode(existing,block.receipt,block.thoughts));continue;}
+  groupFor(block.round.tools[0].anchor).nodes.push(roundNode(existing,block.round));
  }
- // The live Thinking row is the running segment, never a finished Thought.
- if((current.reasoning??'').trim()!==''){let live=existing.get('thought:live');if(!live){live=el('div',undefined,'thought live');live.dataset.key='thought:live';live.append(el('div',undefined,'thought-head'),el('div',undefined,'thought-body'));}live.querySelector('.thought-head').textContent='\u25c6 思考中\u2026';live.querySelector('.thought-body').textContent=current.reasoning;children.push(live);}
- while(progress.firstChild)progress.firstChild.remove();
- for(const child of children)progress.append(child);
- placed.push({host:progress,anchor:rounds.length?rounds[0].tools[0].anchor:undefined});
-nodes.splice(insert,0,progress);
- const anchors=new Map();for(const {host,anchor} of placed){const anchorNode=anchors.get(anchor)??nodes.find(n=>n.dataset.messageId===anchor);const position=anchorNode?nodes.indexOf(anchorNode)+1:nodes.indexOf(progress)+1;nodes.splice(position,0,host);anchors.set(anchor,host);}
- nodes.splice(nodes.indexOf(progress),1);nodes.splice(nodes.indexOf(placed[0].host),0,progress);}
+ const liveText=(current.reasoning??'').trim();
+ if(liveText!==''){let live=existing.get('thought:live');if(!live){live=el('div',undefined,'thought live');live.dataset.key='thought:live';live.append(el('div',undefined,'thought-head'),el('div',undefined,'thought-body'));}live.querySelector('.thought-head').textContent='\u25c6 思考中\u2026';live.querySelector('.thought-body').textContent=current.reasoning;groupFor(null).nodes.push(live);}
+ for(const group of groups.values()){
+  let host=existing.get('process:'+(group.anchor??'(tail)'));if(!host){host=el('div','执行过程','progress-label');host.dataset.key='process:'+(group.anchor??'(tail)');}
+  const stale=[...host.children].filter(child=>!group.nodes.includes(child));for(const child of stale)child.remove();
+  for(const child of group.nodes){if(child.parentNode!==host)host.append(child);}
+  placed.push({host,anchor:group.anchor??undefined});
+ }
+ const anchors=new Map();
+ for(const {host,anchor} of placed){const anchorNode=anchors.get(anchor)??nodes.find(n=>n.dataset.messageId===anchor);const position=anchorNode?nodes.indexOf(anchorNode)+1:nodes.length;nodes.splice(position,0,host);anchors.set(anchor,host);}}
  const keep=new Set(nodes);for(const child of [...list.children])if(!keep.has(child))child.remove();for(let i=0;i<nodes.length;i++)if(list.children[i]!==nodes[i])list.insertBefore(nodes[i],list.children[i]??null);
  if(nearBottom)list.scrollTop=list.scrollHeight;if(!$('conversation-search-bar').hidden)updateConversationSearch();
 }

@@ -57,6 +57,9 @@ export function messageRoleLabel(message){return message.kind==='runtime_notice'
 /** @template {{role:string,kind?:string}} T @param {T[]} messages @returns {T[]} */
 export function historyQuestions(messages){return messages.filter(message=>messageKind(message)==='user');}
 
+/** The round's status in the contract vocabulary. @param {{tools:Array<{status:string}>}} round */
+export function contractRoundStatus(round){const statuses=round.tools.map(tool=>contractToolStatus(tool.status));if(statuses.includes('running'))return 'running';if(round.tools.length>0&&statuses.every(status=>status==='ok'))return 'ok';if(statuses.includes('failed'))return 'failed';if(statuses.includes('cancelled'))return 'cancelled';return 'unknown';}
+
 /** @param {string} status */
 export function planStepLabel(status){const labels=/** @type {Record<string,string>} */({pending:'待执行',running:'进行中',done:'已完成',failed:'失败',skipped:'已跳过'});return labels[status]??`未知状态：${status}`;}
 /** @param {{plan?:{steps:unknown[]}|null,diff?:unknown,diffError?:string|null,hasWorkspace?:boolean}} state */

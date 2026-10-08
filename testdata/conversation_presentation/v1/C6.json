@@ -1,0 +1,40 @@
+{
+  "id": "C6",
+  "title": "narration is progress, the last answer is the Final",
+  "invariant": "assistant text that is followed by more work is Narration, not a Thought and not a RuntimeNotice; the message the turn ends on is the FinalAnswer, and it never joins a fold",
+  "paths": {
+    "live": [
+      { "event": { "type": "user_message_added", "message": { "id": "u1", "role": "user", "text": "看看解析器的状态" } } },
+      { "event": { "type": "tool_call_started", "id": "t1", "name": "read_file", "arguments": "{\"path\":\"src/parser.rs\"}", "parallel": false, "model_step": 1 } },
+      { "event": { "type": "tool_call_completed", "id": "t1", "ok": true, "duration_ms": 8, "preview": "fn parse() {}" } },
+      { "event": { "type": "assistant_message_started", "message_id": "m1" } },
+      { "event": { "type": "assistant_text_delta", "message_id": "m1", "delta": "解析器本身没问题，我跑一下它的测试。" } },
+      { "event": { "type": "assistant_message_completed", "message_id": "m1" } },
+      { "event": { "type": "tool_call_started", "id": "t2", "name": "run_command", "arguments": "{\"program\":\"cargo\",\"args\":[\"test\",\"parse\"]}", "parallel": false, "model_step": 2 } },
+      { "event": { "type": "tool_call_completed", "id": "t2", "ok": true, "exit_code": 0, "duration_ms": 420, "preview": "tests-passed\n" } },
+      { "event": { "type": "assistant_message_started", "message_id": "m2" } },
+      { "event": { "type": "assistant_text_delta", "message_id": "m2", "delta": "解析器测试通过，不需要改动。" } },
+      { "event": { "type": "assistant_message_completed", "message_id": "m2" } },
+      { "event": { "type": "turn_answered" } }
+    ]
+  },
+  "expect": {
+    "items": [
+      { "kind": "user", "text": "看看解析器的状态" },
+      { "kind": "exploration_row", "name": "read_file", "target": "src/parser.rs", "status": "ok" },
+      { "kind": "assistant_text", "text": "解析器本身没问题，我跑一下它的测试。" },
+      {
+        "kind": "run_receipt",
+        "model_step": 2,
+        "status": "ok",
+        "folded": true,
+        "command_visible": true,
+        "output_visible": false,
+        "output_available": true,
+        "rows": [{ "id": "t2", "name": "run_command", "status": "ok" }]
+      },
+      { "kind": "final_answer", "text": "解析器测试通过，不需要改动。" },
+      { "kind": "turn_end", "status": "answered" }
+    ]
+  }
+}

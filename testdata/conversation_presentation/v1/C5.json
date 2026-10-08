@@ -1,0 +1,33 @@
+{
+  "id": "C5",
+  "title": "a successful Run is collapsed and states what it was",
+  "invariant": "a settled Run is collapsed by default, names the command it ran and states that it succeeded; its stdout is NOT painted until the reader opens it, and the rows keep their chronology",
+  "paths": {
+    "live": [
+      { "event": { "type": "user_message_added", "message": { "id": "u1", "role": "user", "text": "跑一下映射测试" } } },
+      { "event": { "type": "tool_call_started", "id": "t1", "name": "run_command", "arguments": "{\"program\":\"cargo\",\"args\":[\"test\",\"mapping\"]}", "parallel": false, "model_step": 1 } },
+      { "event": { "type": "tool_call_completed", "id": "t1", "ok": true, "exit_code": 0, "duration_ms": 900, "preview": "running 2 tests\ntest mapping::recommended ... ok\ntests-passed\n" } },
+      { "event": { "type": "assistant_message_started", "message_id": "m1" } },
+      { "event": { "type": "assistant_text_delta", "message_id": "m1", "delta": "映射测试全部通过。" } },
+      { "event": { "type": "assistant_message_completed", "message_id": "m1" } },
+      { "event": { "type": "turn_answered" } }
+    ]
+  },
+  "expect": {
+    "items": [
+      { "kind": "user", "text": "跑一下映射测试" },
+      {
+        "kind": "run_receipt",
+        "model_step": 1,
+        "status": "ok",
+        "folded": true,
+        "command_visible": true,
+        "output_visible": false,
+        "output_available": true,
+        "rows": [{ "id": "t1", "name": "run_command", "status": "ok" }]
+      },
+      { "kind": "final_answer", "text": "映射测试全部通过。" },
+      { "kind": "turn_end", "status": "answered" }
+    ]
+  }
+}

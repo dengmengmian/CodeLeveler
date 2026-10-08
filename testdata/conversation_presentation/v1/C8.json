@@ -1,0 +1,173 @@
+{
+  "id": "C8",
+  "title": "a cancelled turn keeps what it saw and claims nothing",
+  "invariant": "cancelling a turn keeps the partial content that arrived, never presents it as a completed answer, leaves no live Thinking block and no duplicated tool row, states the cancellation as a runtime fact, and the next turn runs normally",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "type": "user_message_added",
+          "message": {
+            "id": "u1",
+            "role": "user",
+            "text": "跑一个长命令"
+          }
+        }
+      },
+      {
+        "event": {
+          "type": "reasoning_started"
+        }
+      },
+      {
+        "event": {
+          "type": "reasoning_delta",
+          "delta": "先跑命令。"
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_started",
+          "id": "t1",
+          "name": "run_command",
+          "arguments": "{\"program\":\"sleep\",\"args\":[\"600\"]}",
+          "parallel": false,
+          "model_step": 1
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t1",
+          "ok": false,
+          "exit_code": null,
+          "duration_ms": 1200,
+          "preview": "exit: 130\n",
+          "stop": "confirmed"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_cancelled"
+        }
+      },
+      {
+        "event": {
+          "type": "user_message_added",
+          "message": {
+            "id": "u2",
+            "role": "user",
+            "text": "换一个短命令"
+          }
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_started",
+          "id": "t2",
+          "name": "run_command",
+          "arguments": "{\"program\":\"echo\",\"args\":[\"ok\"]}",
+          "parallel": false,
+          "model_step": 2
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t2",
+          "ok": true,
+          "exit_code": 0,
+          "duration_ms": 30,
+          "preview": "ok\n"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_message_started",
+          "message_id": "m1"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_text_delta",
+          "message_id": "m1",
+          "delta": "短命令完成。"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_message_completed",
+          "message_id": "m1"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_answered"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "items": [
+      {
+        "kind": "user",
+        "text": "跑一个长命令"
+      },
+      {
+        "kind": "thought",
+        "state": "interrupted",
+        "folded": true,
+        "body_visible": false,
+        "body": "先跑命令。"
+      },
+      {
+        "kind": "run_receipt",
+        "model_step": 1,
+        "status": "cancelled",
+        "folded": true,
+        "command_visible": true,
+        "output_visible": false,
+        "output_available": true,
+        "rows": [
+          {
+            "id": "t1",
+            "name": "run_command",
+            "status": "cancelled"
+          }
+        ]
+      },
+      {
+        "kind": "turn_end",
+        "status": "cancelled"
+      },
+      {
+        "kind": "user",
+        "text": "换一个短命令"
+      },
+      {
+        "kind": "run_receipt",
+        "model_step": 2,
+        "status": "ok",
+        "folded": true,
+        "command_visible": true,
+        "output_visible": false,
+        "output_available": true,
+        "rows": [
+          {
+            "id": "t2",
+            "name": "run_command",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "final_answer",
+        "text": "短命令完成。"
+      },
+      {
+        "kind": "turn_end",
+        "status": "answered"
+      }
+    ]
+  }
+}

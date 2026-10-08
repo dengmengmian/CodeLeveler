@@ -2,7 +2,11 @@
 //
 // Execution semantics live in `presentation.mjs` (Contract v1); this module
 // only carries the runtime facts the renderer and the conformance test project.
-import { toolStatusFromOutcome, turnTerminalFromEvent } from './presentation.mjs';
+import {
+  committedFinalAnswer,
+  toolStatusFromOutcome,
+  turnTerminalFromEvent,
+} from './presentation.mjs';
 
 export function projectSnapshot(snapshot, history = []) {
   let state = {session:snapshot, messages:[], nextSeq:0, status:snapshot.task_status ?? snapshot.status ?? 'unknown', tools:[], thoughts:[], reasoning:'', reasoningSuperseded:false, approvals:[], clarifications:[], activity:'',plan:snapshot.plan??null,diff:snapshot.diff??null,diffError:null,streamingMessageId:null,lastTerminal:null};
@@ -12,11 +16,12 @@ export function projectSnapshot(snapshot, history = []) {
     // the runtime's own normalized events through the SAME mapping the live
     // stream uses is what keeps a reopened session's chronology whole.
     let anchor=null;
-    for (const entry of history) {
-      const event=entry.event ?? entry;
-      if(event.type==='user_message_added')anchor=event.message.id;
-      if(event.type==='assistant_message_started')anchor=event.message_id;
-      if(event.type==='reasoning_started'||event.type==='reasoning_delta'||event.type==='reasoning_completed')state=applyEvent(state,event);
+    for (const [index, entry] of history.entries()) {
+      const raw=entry.event ?? entry;
+      if(raw.type==='user_message_added')anchor=raw.message.id;
+      if(raw.type==='assistant_message_started')anchor=raw.message_id;
+      const event={...raw,seq:index};
+      if(raw.type==='reasoning_started'||raw.type==='reasoning_delta'||raw.type==='reasoning_completed')state=applyEvent(state,event);
       else state=applyEvent(state,{...event,anchor});
     }
   } else {
@@ -33,6 +38,9 @@ export function projectSnapshot(snapshot, history = []) {
   state.clarifications = (snapshot.pending_interactions ?? []).filter(i=>i.type==='clarification').map(i=>i.request);
   return state;
 }
+/** The message a process row belongs to: the newest one when the row began. */
+function lastMessageId(messages){return messages&&messages.length?messages[messages.length-1].id:null;}
+
 function applyToolEvent(state, event) {
   const tools = state.tools.map(t=>({...t}));
   let nextSeq = state.nextSeq ?? 0;
@@ -54,7 +62,7 @@ function applyToolEvent(state, event) {
         // The runtime's answer classification. `?? 'work'` is the conservative
         // read of a peer that did not state it (AnswerEffect::unstated), never
         // a local decision about the tool name.
-        answerEffect:event.answer_effect??'work',appliedDiff:null,batch,seq:'anchor' in event?undefined:nextSeq++});
+        answerEffect:event.answer_effect??'work',appliedDiff:null,batch,seq:event.seq??nextSeq++});
     }
   } else if (event.type === 'tool_call_completed' || event.type === 'tool_call_output') {
     if (!tool) {tool={id:event.id,name:'工具',arguments:'',status:'unknown',preview:'',appliedDiff:null,parallel:false,modelStep:null,answerEffect:'work',batch:null}; tools.push(tool);}
@@ -69,17 +77,23 @@ export function applyEvent(state,event) {
   next.messages=state.messages.map(m=>({...m}));
   // Arrival order is the fact the Execution Presentation Contract groups by, so
   // every message and tool carries the same monotonic stamp.
-  if (event.type==='user_message_added' && !next.messages.some(m=>m.id===event.message.id)) next.messages.push({...event.message,seq:next.nextSeq++});
-  if (event.type==='assistant_message_started' && !next.messages.some(m=>m.id===event.message_id)) next.messages.push({id:event.message_id,role:'assistant',text:'',seq:next.nextSeq++});
+  if (event.type==='user_message_added' && !next.messages.some(m=>m.id===event.message.id)) next.messages.push({...event.message,seq:event.seq??next.nextSeq++});
+  if (event.type==='assistant_message_started' && !next.messages.some(m=>m.id===event.message_id)) next.messages.push({id:event.message_id,role:'assistant',text:'',seq:event.seq??next.nextSeq++});
   if (event.type==='assistant_text_delta') {
     let message=next.messages.find(m=>m.id===event.message_id);
-    if (!message) {message={id:event.message_id,role:'assistant',text:'',seq:next.nextSeq++};next.messages.push(message);}
+    if (!message) {message={id:event.message_id,role:'assistant',text:'',seq:event.seq??next.nextSeq++};next.messages.push(message);}
     message.text+=event.delta;
   }
   if(event.type==='assistant_message_started'||event.type==='assistant_text_delta')next.streamingMessageId=event.message_id;
   if(event.type==='assistant_message_completed'&&state.streamingMessageId===event.message_id)next.streamingMessageId=null;
   if(terminalEvents.has(event.type)||event.type==='assistant_attempt_reset')next.streamingMessageId=null;
   if(event.type==='plan_updated') next.plan=event.plan;
+  if(event.type==='context_compacted'){
+    // The compaction is a durable conversation fact, not only a toast: a
+    // reopened session must still say where the context was re-based. The row
+    // is runtime-authored, never something the person typed.
+    next.messages=next.messages.some(m=>m.id===`compact-${event.from}-${event.to}`)?next.messages:[...next.messages,{id:`compact-${event.from}-${event.to}`,role:'user',kind:'runtime_notice',text:`上下文已压缩 ${event.from} → ${event.to} 条`,seq:event.seq??next.nextSeq++}];
+  }
   if(event.type==='diff_updated'){next.diff=event.diff;next.diffError=null;if(event.query_id)next.diffQuery={id:event.query_id,status:'confirmed',error:null};}
   if(event.type==='diff_failed'){next.diff=null;next.diffError=event.message;if(event.query_id)next.diffQuery={id:event.query_id,status:'failed',error:event.message};}
   if(event.type==='assistant_attempt_reset') next.messages=next.messages.filter(m=>m.id!==event.message_id);
@@ -95,21 +109,39 @@ export function applyEvent(state,event) {
   next.thoughts=next.thoughts??[];
   next.reasoning=next.reasoning??'';
   if(event.type==='reasoning_delta'){
-    if(state.reasoningSuperseded){next.reasoning='';next.reasoningSuperseded=false;}
+    if(state.reasoningSuperseded||(next.reasoning||'')===''){next.reasoning='';next.reasoningSuperseded=false;next.reasoningSeq=event.seq??next.nextSeq++;}
     next.reasoning+=event.delta;
   }
-  if(event.type==='reasoning_started'&&state.reasoningSuperseded){next.reasoning='';next.reasoningSuperseded=false;}
+  if(event.type==='reasoning_started'){if(state.reasoningSuperseded){next.reasoning='';next.reasoningSuperseded=false;}next.reasoningSeq=event.seq??next.nextSeq++;}
   if(event.type==='reasoning_completed'){
     const text=(next.reasoning||'').trim();
-    if(text!=='')next.thoughts=[...next.thoughts,{id:`th-${next.nextSeq++}`,text,elapsedMs:event.elapsed_ms,seq:next.nextSeq++}];
+    if(text!=='')next.thoughts=[...next.thoughts,{id:`th-${next.nextSeq++}`,text,elapsedMs:event.elapsed_ms,anchor:lastMessageId(next.messages),seq:next.reasoningSeq??next.nextSeq}];
+    next.reasoningSeq=null;
     next.reasoning='';next.reasoningSuperseded=false;
   }
   if(event.type==='tool_call_started'||event.type==='assistant_message_started'){
-    // An action on the reasoning ends it; the next delta opens a new segment.
-    if((next.reasoning||'').trim()!=='')next.reasoningSuperseded=true;
+    // An action ends the reasoning segment. A segment the runtime never
+    // completed is INTERRUPTED — kept and folded, never presented as finished —
+    // instead of being thrown away with the live buffer.
+    const partial=(next.reasoning||'').trim();
+    if(partial!==''){
+      next.thoughts=[...next.thoughts,{id:`th-${next.nextSeq++}`,text:partial,elapsedMs:0,interrupted:true,anchor:lastMessageId(next.messages),seq:next.reasoningSeq??next.nextSeq}];
+      next.reasoningSeq=null;
+      next.reasoning='';
+    }
+    next.reasoningSuperseded=true;
   }
-  if(event.type==='user_message_added'){next.thoughts=[];next.reasoning='';next.reasoningSuperseded=false;}
-  if (terminalEvents.has(event.type)) {next.lastTerminal=turnTerminalFromEvent(event.type,next.messages,next.tools);next.reasoning='';next.reasoningSuperseded=false;}
+  if(event.type==='user_message_added'){next.reasoning='';next.reasoningSuperseded=false;}
+  if (terminalEvents.has(event.type)) {
+    // The turn's committed answer, recorded on its own message: a frozen turn
+    // must not look like it never answered.
+    const answer=committedFinalAnswer(next.messages,next.tools);
+    if(answer!==null)for(let i=next.messages.length-1;i>=0;i-=1){const message=next.messages[i];if(message.role==='assistant'&&message.text===answer){message.final=true;break;}}
+    const status=turnTerminalFromEvent(event.type,next.messages,next.tools);
+    next.lastTerminal=status;
+    next.turnTerminals=[...(next.turnTerminals??[]),{seq:(next.nextSeq??0)-0.5,status}];
+    next.reasoning='';next.reasoningSuperseded=false;next.reasoningSeq=null;
+  }
   return next;
 }
 export function commandEnvelope(sessionId,command) {

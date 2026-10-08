@@ -1,0 +1,475 @@
+{
+  "id": "C10",
+  "title": "a compacted session reopens with its whole conversation",
+  "invariant": "`/compact` re-bases the ACTIVE MODEL CONTEXT on one summary row; the conversation is not the context. A session reopened after a compaction still shows both user turns, the Thoughts, the exploration receipt, the confirmed Diff and the Final, in order, exactly once — and never the internal summary",
+  "paths": {
+    "live": [
+      {
+        "event": {
+          "type": "user_message_added",
+          "message": {
+            "id": "u1",
+            "role": "user",
+            "text": "先看解析器"
+          }
+        }
+      },
+      {
+        "event": {
+          "type": "reasoning_started"
+        }
+      },
+      {
+        "event": {
+          "type": "reasoning_delta",
+          "delta": "先看入口。"
+        }
+      },
+      {
+        "event": {
+          "type": "reasoning_completed",
+          "elapsed_ms": 1600
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_started",
+          "id": "t1",
+          "name": "read_file",
+          "arguments": "{\"path\":\"src/parser.rs\"}",
+          "parallel": false,
+          "model_step": 1
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t1",
+          "ok": true,
+          "duration_ms": 6,
+          "preview": "fn parse() {}"
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_started",
+          "id": "t2",
+          "name": "grep",
+          "arguments": "{\"pattern\":\"parse\"}",
+          "parallel": false,
+          "model_step": 1
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t2",
+          "ok": true,
+          "duration_ms": 6,
+          "preview": "src/parser.rs:1"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_message_started",
+          "message_id": "m1"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_text_delta",
+          "message_id": "m1",
+          "delta": "解析器在 parser.rs。"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_message_completed",
+          "message_id": "m1"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_answered"
+        }
+      },
+      {
+        "event": {
+          "type": "context_compacted",
+          "from": 6,
+          "to": 1
+        }
+      },
+      {
+        "event": {
+          "type": "user_message_added",
+          "message": {
+            "id": "u2",
+            "role": "user",
+            "text": "把 parse 修好"
+          }
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_started",
+          "id": "t3",
+          "name": "apply_patch",
+          "arguments": "{\"patch\":\"*** Begin Patch\\n*** Update File: src/parser.rs\\n@@\\n-fn parse() {}\\n+fn parse() { ok() }\\n*** End Patch\"}",
+          "parallel": false,
+          "model_step": 2
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t3",
+          "ok": true,
+          "duration_ms": 20,
+          "preview": "applied 1 file",
+          "applied_diff": "--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -1,1 +1,1 @@\n-fn parse() {}\n+fn parse() { ok() }\n"
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_started",
+          "id": "t4",
+          "name": "run_command",
+          "arguments": "{\"program\":\"cargo\",\"args\":[\"test\",\"parse\"]}",
+          "parallel": false,
+          "model_step": 3
+        }
+      },
+      {
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t4",
+          "ok": true,
+          "exit_code": 0,
+          "duration_ms": 300,
+          "preview": "tests-passed\n"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_message_started",
+          "message_id": "m2"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_text_delta",
+          "message_id": "m2",
+          "delta": "parse 已修好，测试通过。"
+        }
+      },
+      {
+        "event": {
+          "type": "assistant_message_completed",
+          "message_id": "m2"
+        }
+      },
+      {
+        "event": {
+          "type": "turn_answered"
+        }
+      }
+    ],
+    "replay": [
+      {
+        "turn_start": true,
+        "turn_elapsed_ms": 0,
+        "event": {
+          "type": "user_message_added",
+          "message": {
+            "id": "u1",
+            "role": "user",
+            "text": "先看解析器"
+          }
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 1,
+        "event": {
+          "type": "reasoning_started"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 2,
+        "event": {
+          "type": "reasoning_delta",
+          "delta": "先看入口。"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 1600,
+        "event": {
+          "type": "reasoning_completed",
+          "elapsed_ms": 1600
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 1700,
+        "event": {
+          "type": "tool_call_started",
+          "id": "t1",
+          "name": "read_file",
+          "arguments": "{\"path\":\"src/parser.rs\"}",
+          "parallel": false,
+          "model_step": 1
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 1800,
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t1",
+          "ok": true,
+          "duration_ms": 6,
+          "preview": "fn parse() {}"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 1900,
+        "event": {
+          "type": "tool_call_started",
+          "id": "t2",
+          "name": "grep",
+          "arguments": "{\"pattern\":\"parse\"}",
+          "parallel": false,
+          "model_step": 1
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 2000,
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t2",
+          "ok": true,
+          "duration_ms": 6,
+          "preview": "src/parser.rs:1"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 2100,
+        "event": {
+          "type": "assistant_message_started",
+          "message_id": "m1"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 2200,
+        "event": {
+          "type": "assistant_text_delta",
+          "message_id": "m1",
+          "delta": "解析器在 parser.rs。"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 2300,
+        "event": {
+          "type": "assistant_message_completed",
+          "message_id": "m1"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 2400,
+        "event": {
+          "type": "turn_answered"
+        }
+      },
+      {
+        "turn_start": true,
+        "turn_elapsed_ms": 0,
+        "event": {
+          "type": "context_compacted",
+          "from": 6,
+          "to": 1
+        }
+      },
+      {
+        "turn_start": true,
+        "turn_elapsed_ms": 0,
+        "event": {
+          "type": "user_message_added",
+          "message": {
+            "id": "u2",
+            "role": "user",
+            "text": "把 parse 修好"
+          }
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 100,
+        "event": {
+          "type": "tool_call_started",
+          "id": "t3",
+          "name": "apply_patch",
+          "arguments": "{\"patch\":\"*** Begin Patch\\n*** Update File: src/parser.rs\\n@@\\n-fn parse() {}\\n+fn parse() { ok() }\\n*** End Patch\"}",
+          "parallel": false,
+          "model_step": 2
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 200,
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t3",
+          "ok": true,
+          "duration_ms": 20,
+          "preview": "applied 1 file",
+          "applied_diff": "--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -1,1 +1,1 @@\n-fn parse() {}\n+fn parse() { ok() }\n"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 300,
+        "event": {
+          "type": "tool_call_started",
+          "id": "t4",
+          "name": "run_command",
+          "arguments": "{\"program\":\"cargo\",\"args\":[\"test\",\"parse\"]}",
+          "parallel": false,
+          "model_step": 3
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 600,
+        "event": {
+          "type": "tool_call_completed",
+          "id": "t4",
+          "ok": true,
+          "exit_code": 0,
+          "duration_ms": 300,
+          "preview": "tests-passed\n"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 700,
+        "event": {
+          "type": "assistant_message_started",
+          "message_id": "m2"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 800,
+        "event": {
+          "type": "assistant_text_delta",
+          "message_id": "m2",
+          "delta": "parse 已修好，测试通过。"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 900,
+        "event": {
+          "type": "assistant_message_completed",
+          "message_id": "m2"
+        }
+      },
+      {
+        "turn_start": false,
+        "turn_elapsed_ms": 1000,
+        "event": {
+          "type": "turn_answered"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "items": [
+      {
+        "kind": "user",
+        "text": "先看解析器"
+      },
+      {
+        "kind": "thought",
+        "state": "completed",
+        "elapsed_ms": 1600,
+        "folded": true,
+        "body_visible": false,
+        "body": "先看入口。"
+      },
+      {
+        "kind": "exploration_receipt",
+        "reads": 1,
+        "searches": 1,
+        "folded": true,
+        "members_visible": false,
+        "reversible": true,
+        "members": [
+          "read_file:src/parser.rs",
+          "grep:parse"
+        ]
+      },
+      {
+        "kind": "final_answer",
+        "text": "解析器在 parser.rs。"
+      },
+      {
+        "kind": "turn_end",
+        "status": "answered"
+      },
+      {
+        "kind": "runtime_notice"
+      },
+      {
+        "kind": "user",
+        "text": "把 parse 修好"
+      },
+      {
+        "kind": "edit_diff",
+        "paths": [
+          "src/parser.rs"
+        ],
+        "added": 1,
+        "removed": 1,
+        "rendered_in_full": true,
+        "needs_click": false
+      },
+      {
+        "kind": "run_receipt",
+        "model_step": 3,
+        "status": "ok",
+        "folded": true,
+        "command_visible": true,
+        "output_visible": false,
+        "output_available": true,
+        "rows": [
+          {
+            "id": "t4",
+            "name": "run_command",
+            "status": "ok"
+          }
+        ]
+      },
+      {
+        "kind": "final_answer",
+        "text": "parse 已修好，测试通过。"
+      },
+      {
+        "kind": "turn_end",
+        "status": "answered"
+      }
+    ],
+    "forbidden_text": [
+      "对话摘要（已压缩历史）"
+    ]
+  }
+}

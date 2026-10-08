@@ -24,11 +24,16 @@ import test from 'node:test';
 import { applyEvent, projectSnapshot } from '../src/state.mjs';
 import {
   confirmedDiffOf,
+  confirmedDiffs,
+  contractRoundStatus,
+  contractToolStatus,
   diffCounts,
   diffLines,
   failureReason,
   foldedThoughts,
+  groupExecutionRounds,
   groupExploration,
+  isExplorationTool,
   turnBlocks,
 } from '../src/presentation.mjs';
 
@@ -173,4 +178,248 @@ test('C3: a completed Thought is folded, with the runtime duration', () => {
   assert.equal(folded[0].body, '先看入口。再看调用方。', 'the body is the durable segment');
   // Reasoning never becomes assistant prose.
   assert.equal(state.messages.some((message) => message.text.includes('先看入口。')), false);
+});
+
+
+// ── The shared conversation corpus, all ten fixtures ────────────────────────
+//
+// The SAME JSON the terminal (reference) and the Web client are checked
+// against. The comparison is structural: item kinds, their order, fold state,
+// visibility, roles and the facts a collapsed row must still show.
+
+const CORPUS_IDS = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10'];
+
+/** The conversation as the corpus names it: this renderer's projection, in order. */
+function conversationTree(state) {
+  const items = [];
+  const tools = [...state.tools].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  const receipts = groupExploration(tools);
+  const receiptIds = new Set(receipts.flatMap((receipt) => receipt.members.map((member) => member.id)));
+  const confirmed = confirmedDiffs(tools);
+  const rounds = groupExecutionRounds(tools);
+
+  for (const message of state.messages) {
+    if (message.kind === 'runtime_notice') {
+      items.push({ seq: message.seq, item: { kind: 'runtime_notice', text: message.text } });
+      continue;
+    }
+    if (message.role !== 'user' && message.role !== 'assistant') continue;
+    if (!(message.text ?? '').trim()) continue;
+    items.push({
+      seq: message.seq,
+      item: {
+        kind:
+          message.role === 'user'
+            ? 'user'
+            : message.final === true
+              ? 'final_answer'
+              : 'assistant_text',
+        text: message.text,
+      },
+    });
+  }
+
+  for (const round of rounds) {
+    const members = round.tools.filter((tool) => !receiptIds.has(tool.id));
+    if (members.length === 0) continue;
+    const first = members[0];
+    if (members.length === 1 && !receipts.length && !isSingleRowGroup(members)) {
+      // fall through to the round rendering below
+    }
+    if (members.length === 1 && isExplorationTool(members[0].name) && members[0].status !== 'failed') {
+      items.push({
+        seq: first.seq,
+        item: {
+          kind: 'exploration_row',
+          name: members[0].name,
+          target: memberTargetOf(members[0]),
+          status: contractToolStatus(members[0].status ?? 'unknown'),
+        },
+      });
+      continue;
+    }
+    const edits = confirmed.filter((diff) => members.some((tool) => tool.id === diff.toolId));
+    if (edits.length === members.length && edits.length > 0) {
+      const paths = new Set();
+      for (const diff of edits) {
+        for (const line of diff.lines) {
+          const match = /^\+\+\+ (?:b\/)?(.+)$/.exec(line);
+          if (match) paths.add(match[1]);
+        }
+      }
+      items.push({
+        seq: first.seq,
+        item: {
+          kind: 'edit_diff',
+          paths: [...paths].sort(),
+          added: edits.reduce((total, diff) => total + diff.added, 0),
+          removed: edits.reduce((total, diff) => total + diff.removed, 0),
+          rendered_in_full: true,
+          needs_click: false,
+        },
+      });
+      continue;
+    }
+    const status = contractRoundStatus(round);
+    const failed = members.find((tool) => tool.status === 'failed' || tool.status === 'fail');
+    const item = {
+      kind: 'run_receipt',
+      model_step: round.modelStep,
+      status,
+      folded: true,
+      command_visible: true,
+      output_visible: false,
+      output_available: true,
+      rows: members.map((tool) => ({
+        id: tool.id,
+        name: tool.name,
+        status: contractToolStatus(tool.status ?? 'unknown'),
+      })),
+    };
+    if (failed) {
+      item.failure_visible = true;
+      item.failure_line = failureReason(failed.preview ?? '');
+      if (failed.exit_code !== undefined && failed.exit_code !== null) {
+        item.exit_code = failed.exit_code;
+      }
+    }
+    items.push({ seq: first.seq, item });
+  }
+
+  for (const receipt of receipts) {
+    items.push({
+      seq: receipt.seq,
+      item: {
+        kind: 'exploration_receipt',
+        reads: receipt.reads,
+        searches: receipt.searches,
+        folded: receipt.folded,
+        members_visible: false,
+        reversible: true,
+        members: receipt.members.map((member) => `${member.name}:${member.target}`),
+      },
+    });
+  }
+
+  for (const thought of foldedThoughts(state.thoughts ?? [])) {
+    const source = (state.thoughts ?? []).find((candidate) => candidate.id === thought.id);
+    items.push({
+      seq: thought.seq,
+      item: {
+        kind: 'thought',
+        state: source?.interrupted ? 'interrupted' : 'completed',
+        ...(source?.interrupted ? {} : { elapsed_ms: thought.elapsedMs }),
+        folded: thought.folded,
+        body_visible: false,
+        body: thought.body,
+      },
+    });
+  }
+  if ((state.reasoning ?? '').trim() !== '') {
+    items.push({
+      seq: Number.MAX_SAFE_INTEGER - 2,
+      item: {
+        kind: 'thought',
+        state: 'running',
+        folded: false,
+        body_visible: true,
+        body: state.reasoning,
+      },
+    });
+  }
+
+  // Each turn keeps its own terminal, where the turn's own work ended.
+  for (const terminal of state.turnTerminals ?? []) {
+    items.push({ seq: terminal.seq, item: { kind: 'turn_end', status: terminal.status } });
+  }
+  items.sort((a, b) => a.seq - b.seq);
+  const ordered = items.map((entry) => entry.item);
+  const terminals = ordered.filter((item) => item.kind === 'turn_end').length;
+  if (state.lastTerminal && terminals === 0) {
+    ordered.push({ kind: 'turn_end', status: state.lastTerminal });
+  }
+  return ordered;
+}
+
+function isSingleRowGroup(tools) {
+  return tools.length === 1 && !isExplorationTool(tools[0].name);
+}
+
+function memberTargetOf(tool) {
+  try {
+    const args = JSON.parse(tool.arguments);
+    for (const key of ['path', 'pattern', 'query', 'glob', 'file']) {
+      if (typeof args[key] === 'string') return args[key];
+    }
+  } catch {
+    // A malformed argument blob names no target.
+  }
+  return '';
+}
+
+function expectItems(id, expected, actual) {
+  let cursor = 0;
+  expected.forEach((want, index) => {
+    const optional = want.optional === true;
+    const fields = Object.entries(want).filter(([key]) => key !== 'optional');
+    if (optional) {
+      const candidate = actual[cursor];
+      const matches =
+        candidate !== undefined &&
+        fields.every(([key, value]) => JSON.stringify(candidate[key]) === JSON.stringify(value));
+      if (!matches) return;
+    }
+    const got = actual[cursor];
+    for (const [key, value] of fields) {
+      assert.deepEqual(
+        got?.[key],
+        value,
+        `${id}: item ${index} field ${key}: ${JSON.stringify(got)}\n${JSON.stringify(actual, null, 1)}`,
+      );
+    }
+    cursor += 1;
+  });
+  assert.equal(
+    cursor,
+    actual.length,
+    `${id}: unclaimed items\n${JSON.stringify(actual.slice(cursor), null, 1)}`,
+  );
+}
+
+test('the conversation corpus C1..C10 projects the frozen tree (desktop)', async () => {
+  const failures = [];
+  let compared = 0;
+  for (const id of CORPUS_IDS) {
+    const doc = await fixture(id);
+    for (const [name, steps] of Object.entries(doc.paths)) {
+      let state = projectSnapshot(
+        {
+          id: 's1',
+          collaboration: doc.session?.collaboration ?? 'chat',
+          goal: doc.session?.goal,
+          messages: [],
+        },
+        [],
+      );
+      for (const step of steps) {
+        if (step.history !== undefined) {
+          state = projectSnapshot(state.session, step.history);
+          continue;
+        }
+        const payload = step.event ?? step.snapshot;
+        if (payload) state = applyEvent(state, payload);
+      }
+      try {
+        expectItems(`${id}/${name}`, doc.expect.items, conversationTree(state));
+        if (doc.expect.collaboration !== undefined) {
+          assert.equal(state.session?.collaboration, doc.expect.collaboration, `${id}/${name}: axis`);
+        }
+        compared += 1;
+      } catch (error) {
+        failures.push(`${id}/${name}: ${error.message}`);
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
+  assert.equal(compared >= 11, true, `paths compared: ${compared}`);
 });

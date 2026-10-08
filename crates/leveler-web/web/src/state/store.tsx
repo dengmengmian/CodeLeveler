@@ -5,6 +5,7 @@
 // 保持同构：同一事件在两个 UI 里表达同一产品事实。
 
 import { createContext, useContext, type Dispatch, type ReactNode } from 'react';
+import { committedFinalAnswer } from '../lib/executionRounds';
 import { isCompactionSummaryText, isTurnUser } from '../lib/presentationKind';
 import { finalizationStageLabel, type TurnOutcome } from '../lib/turn';
 import { useImmerReducer } from '../lib/useImmerReducer';
@@ -85,6 +86,9 @@ export interface ToolCallView {
    *  `'work'` when an older peer did not state it — the conservative read. A
    *  surface never classifies the tool name itself. */
   answerEffect: AnswerEffect;
+  /** The command's own exit code, when the runtime reported one. A failed Run
+   *  states it on the collapsed row. */
+  exitCode: number | null;
   /** The runtime's CONFIRMED diff for an edit (the canonical Diff). `null`
    *  when the call was not an edit, or the runtime reported none. The UI never
    *  reconstructs a diff from the tool's arguments: the requested patch and the
@@ -104,6 +108,9 @@ export interface ThoughtView {
   text: string;
   /** The runtime's own measurement (`RuntimeEvent::ReasoningCompleted`). */
   elapsedMs: number;
+  /** The segment never received the runtime's completion (a cancel, a timeout,
+   *  a stream break). It is presented as interrupted, never as finished. */
+  interrupted?: boolean;
   /** 时间线排序戳（越小越早） */
   seq: number;
 }
@@ -128,6 +135,10 @@ export interface TurnTrace {
   /** The turn's completed Thoughts, frozen with its tools: they are the same
    *  process record, and a reopened view must not lose the reasoning it saw. */
   thoughts: ThoughtView[];
+  /** The message this turn committed as its Final, or `null` when it committed
+   *  none. Recorded at freeze time from the runtime's own answer decision — a
+   *  frozen turn must not look like it never answered. */
+  answerId: string | null;
   backgroundTasks: BackgroundTaskView[];
   lastTurn: LastTurn;
 }
@@ -360,7 +371,15 @@ export type Action =
   | { type: 'set_inspector_more'; open: boolean }
   | { type: 'observation_loading'; queryId: string }
   | { type: 'observation_loaded'; observation: UiObservabilityLoaded; queryId: string | null }
-  | { type: 'user_message'; id: string; text: string; time: string }
+  | {
+      type: 'user_message';
+      id: string;
+      text: string;
+      time: string;
+      /** The runtime's own message kind. A runtime notice is model context the
+       *  runtime wrote, never something the person typed. */
+      kind?: 'runtime_notice';
+    }
   | { type: 'assistant_started'; id: string; time: string }
   | { type: 'assistant_reset'; id: string | null }
   | { type: 'assistant_delta'; id: string; delta: string }
@@ -400,6 +419,7 @@ export type Action =
       type: 'tool_completed';
       id: ToolCallId;
       ok: boolean;
+      exitCode?: number | null;
       appliedDiff?: string | null;
       preview: string;
       durationMs: number;
@@ -493,9 +513,10 @@ function viewFromSnapshot(
     arguments: t.arguments,
     status: 'run',
     preview: null,
-    // A snapshot lists IN-FLIGHT calls only; a confirmed diff can only exist
-    // for a call that already finished, so there is nothing to read here.
+    // A snapshot lists IN-FLIGHT calls only; a confirmed diff or an exit code
+    // can only exist for a call that already finished.
     appliedDiff: null,
+    exitCode: null,
     durationMs: null,
     parallel: false,
     modelStep: t.model_step ?? null,
@@ -666,6 +687,15 @@ function snapshotTurnTrace(current: SessionView): void {
     userSeq,
     tools: current.tools.slice(),
     thoughts: (current.thoughts ?? []).slice(),
+    answerId: (() => {
+      const answer = committedFinalAnswer(current.messages, current.tools);
+      if (answer === null) return null;
+      for (let i = current.messages.length - 1; i >= 0; i -= 1) {
+        const message = current.messages[i];
+        if (message.role === 'assistant' && message.text === answer) return message.id;
+      }
+      return null;
+    })(),
     backgroundTasks: current.backgroundTasks.slice(),
     lastTurn: current.lastTurn,
   };
@@ -777,6 +807,21 @@ export function reducer(state: AppState, action: Action): void {
     case 'user_message': {
       if (!state.current) return;
       if (state.current.messages.some((m) => m.id === action.id)) return;
+      const notice = action.kind === 'runtime_notice';
+      if (notice) {
+        // A runtime-authored row is model context, not something the person
+        // typed: it never opens a turn and never clears the running process.
+        state.current.messages.push({
+          id: action.id,
+          role: 'user',
+          text: action.text,
+          streaming: false,
+          time: action.time,
+          seq: nextSeq(),
+          kind: 'runtime_notice',
+        });
+        return;
+      }
       state.current.messages.push({
         id: action.id,
         role: 'user',
@@ -784,6 +829,7 @@ export function reducer(state: AppState, action: Action): void {
         streaming: false,
         time: action.time,
         seq: nextSeq(),
+        kind: action.kind,
       });
       // 新回合开始：清掉上一回合的执行轨（工具/后台任务）与终态。子 agent 只清
       // 已结束的：一个仍未结束（例如已中断、将被本回合续跑）的子 agent 不属于
@@ -916,7 +962,20 @@ export function reducer(state: AppState, action: Action): void {
     case 'tool_started': {
       if (!state.current) return;
       markBusy(state.current);
-      // 对思考采取行动 = 思考结束；下一条 reasoning delta 会替换它。
+      // An action ends the reasoning segment. A segment the runtime never
+      // completed is INTERRUPTED — kept, folded, and never presented as a
+      // finished Thought — instead of being thrown away with the live buffer.
+      const partial = state.current.reasoning.trim();
+      if (partial !== '') {
+        state.current.thoughts.push({
+          id: `th-${nextSeq()}`,
+          text: partial,
+          elapsedMs: 0,
+          interrupted: true,
+          seq: nextSeq(),
+        });
+        state.current.reasoning = '';
+      }
       state.current.reasoningSuperseded = true;
       if (state.current.tools.some((t) => t.id === action.id)) return;
       // A batch is OBSERVED here, never inferred later: this call starts while
@@ -941,6 +1000,7 @@ export function reducer(state: AppState, action: Action): void {
         modelStep: action.modelStep,
         answerEffect: action.answerEffect,
         appliedDiff: null,
+        exitCode: null,
         batch,
         seq: nextSeq(),
       });
@@ -962,6 +1022,7 @@ export function reducer(state: AppState, action: Action): void {
         tool.preview = action.preview || null;
         tool.durationMs = action.durationMs;
         tool.appliedDiff = action.appliedDiff || null;
+        tool.exitCode = action.exitCode ?? null;
       }
       // 工具结束后把它的 activity 标签留着会像挂死；退回思考态（TUI 同款）。
       if (state.current) {
@@ -1157,6 +1218,19 @@ export function reducer(state: AppState, action: Action): void {
       return;
     case 'turn_terminal':
       if (state.current) {
+        // The segment that was live when the turn ended never received a clean
+        // completion: it is kept as an INTERRUPTED Thought (the reference does
+        // the same) instead of being thrown away with the live buffer.
+        const live = state.current.reasoning.trim();
+        if (live !== '' && action.outcome !== 'answered' && action.outcome !== 'completed') {
+          state.current.thoughts.push({
+            id: `th-${nextSeq()}`,
+            text: live,
+            elapsedMs: 0,
+            interrupted: true,
+            seq: nextSeq(),
+          });
+        }
         const ms = state.current.turnStartedAt
           ? Math.max(0, Date.now() - state.current.turnStartedAt)
           : 0;

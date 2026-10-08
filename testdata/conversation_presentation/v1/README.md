@@ -37,6 +37,28 @@ it may not reorder, rewrite or invent.
 | C2 | consecutive exploration is one collapsed, reversible receipt |
 | C3 | a completed Thought is folded, with the runtime's own duration |
 | C4 | a failed Run shows its failure without expanding anything |
+| C5 | a successful Run is collapsed, names its command and hides its stdout |
+| C6 | narration is progress and the turn's last answer is the Final |
+| C7 | a runtime-authored row is never the user speaking |
+| C8 | a cancelled turn keeps what it saw and claims nothing |
+| C9 | a Goal turns its own plan and closes out as a runtime fact |
+| C10 | a compacted session reopens with its whole conversation |
+
+Item kinds: `user`, `thought`, `exploration_receipt`, `exploration_row`,
+`edit_diff`, `run_receipt`, `assistant_text`, `final_answer`, `runtime_notice`,
+`turn_end`. A fixture may also declare `session` (the axis and objective, which
+arrive on the session snapshot rather than in the event stream), `plan` (the
+plan panel is not part of the transcript), and `forbidden_text`.
+
+An item marked `"optional": true` is a fact a client may express in another
+place: the terminal paints a dedicated failure block where the Web and Desktop
+state the same failure in their run row and turn terminal. It is asserted where
+it exists and never forces the other clients to invent a row.
+
+Every path a fixture declares is compared — `live`, `reconnect` (a snapshot with
+the ACTIVE context, then the durable history) and `replay` (durable history
+alone). A path that a client cannot serve yet must be recorded as a deferral in
+that client's test, never silently skipped.
 
 Each fixture carries `paths.live` (the wire events a client receives) and
 `expect.items` (the semantic tree). A client that projects these fixtures to a
@@ -47,7 +69,7 @@ different tree is out of contract.
 | Surface | Where |
 |---|---|
 | terminal (reference) | `crates/leveler-tui/tests/transcript_fold.rs` — the same wire events through the real reducer, asserted against the same JSON, plus the reference behaviour suite for folds, receipts and the always-full diff |
-| Web | `crates/leveler-web/web/src/lib/conversationPresentation.test.tsx` — the real reducer through the real bridge, plus the rendered components |
+| Web | `crates/leveler-web/web/src/lib/conversationPresentation.test.tsx` — the real reducer through the real bridge (live, reconnect and replay paths), plus the rendered components |
 | Desktop | `apps/leveler-desktop/test/conversationPresentation.test.mjs` |
 
 The shared rules live once, in

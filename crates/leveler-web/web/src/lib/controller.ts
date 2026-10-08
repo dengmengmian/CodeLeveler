@@ -299,6 +299,9 @@ export class RuntimeBridge {
           id: ev.message.id,
           text: ev.message.text,
           time: formatClock(),
+          // Provenance travels with the row: a runtime-authored notice is never
+          // painted as something the person typed.
+          kind: ev.message.kind === 'runtime_notice' ? 'runtime_notice' : undefined,
         });
         break;
       case 'assistant_message_started':
@@ -332,6 +335,7 @@ export class RuntimeBridge {
           preview: ev.preview,
           durationMs: ev.duration_ms,
           stop: ev.stop ?? null,
+          exitCode: ev.exit_code ?? null,
           // The runtime's CONFIRMED diff. Presentation never rebuilds one from
           // the tool's arguments: the requested patch is not the applied result.
           appliedDiff: ev.applied_diff ?? null,
@@ -533,6 +537,17 @@ export class RuntimeBridge {
         this.sink({ type: 'context_estimate', tokens: ev.estimated_tokens });
         break;
       case 'context_compacted':
+        // The compaction is a durable conversation fact, not only a fading
+        // toast: everything above this point is a summary to the model now, and
+        // a reopened session must still say where that happened. The row is
+        // runtime-authored — never something the person typed.
+        this.sink({
+          type: 'user_message',
+          id: `compact-${ev.from}-${ev.to}-${current.messages.length}`,
+          text: `上下文已压缩 ${ev.from} → ${ev.to} 条`,
+          time: formatClock(),
+          kind: 'runtime_notice',
+        });
         this.sink({ type: 'notice', message: `上下文已压缩 ${ev.from} → ${ev.to} 条` });
         break;
       case 'context_expanded':

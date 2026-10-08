@@ -25,11 +25,14 @@ use leveler_tui::fold::DisplayMode;
 use leveler_tui::reducer::reduce;
 use leveler_tui::state::{AppState, Boot};
 use leveler_tui::theme::Theme;
-use leveler_tui::transcript::{ThoughtBlock, TranscriptItem};
+use leveler_tui::transcript::{
+    AssistantKind, ThoughtBlock, ToolStatus, TranscriptItem, TurnEndStatus,
+};
+use serde_json::{Value, json};
 
 const W: usize = 100;
 
-fn opened() -> AppState {
+fn opened_bare() -> AppState {
     let mut s = AppState::new(
         Theme::no_color(),
         Boot {
@@ -80,8 +83,15 @@ fn opened() -> AppState {
         &mut s,
         Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
     );
-    // A prompt precedes every real turn; without one the welcome splash owns
-    // the viewport and the conversation builder paints the logo instead.
+    s
+}
+
+/// The painted checks need a prompt: without one the welcome splash owns the
+/// viewport and the conversation builder paints the logo instead. The corpus
+/// tree, by contrast, is the transcript itself — an extra synthetic line would
+/// be an item the fixture never declared.
+fn opened() -> AppState {
+    let mut s = opened_bare();
     s.transcript.push_user("看下当前项目有什么 bug".into());
     s
 }
@@ -1047,15 +1057,50 @@ fn corpus(id: &str) -> serde_json::Value {
 }
 
 /// Drive one fixture's live path through the real reducer.
-fn drive_corpus(id: &str) -> (AppState, serde_json::Value) {
+///
+/// `painted` keeps the synthetic prompt the rendered checks need; the corpus
+/// tree is compared without it. The returned plan is the one the LAST
+/// `plan_updated` left: a settled turn's plan panel is restored from the durable
+/// goal facts, so that is where the plan's own chronology lives.
+fn drive_corpus_painted(id: &str, painted: bool) -> (AppState, serde_json::Value) {
     let doc = corpus(id);
-    let mut s = opened();
+    let mut s = if painted { opened() } else { opened_bare() };
+    // A fixture may declare session facts (the axis, the goal): they arrive on
+    // the session snapshot, not in the event stream, exactly as they do in the
+    // product.
+    let mut last_plan: Option<leveler_client_protocol::UiPlan> = None;
+    s.plan = None;
+    if let Some(collaboration) = doc["session"]["collaboration"].as_str() {
+        s.collaboration = collaboration.to_string();
+    }
+    if let Some(goal) = doc["session"]["goal"].as_str() {
+        s.goal = goal.to_string();
+    }
+    if let Some(session) = doc["session"].as_object() {
+        let _ = session;
+    }
     for entry in doc["paths"]["live"].as_array().expect("live path") {
         let event: RuntimeEvent =
             serde_json::from_value(entry["event"].clone()).expect("wire event");
+        let is_plan = matches!(event, RuntimeEvent::PlanUpdated { .. });
         reduce(&mut s, Action::Runtime(event));
+        if is_plan {
+            last_plan = s.plan.clone();
+        }
     }
+    PLAN_CAPTURE.with(|slot| *slot.borrow_mut() = last_plan);
     (s, doc)
+}
+
+thread_local! {
+    /// The plan the LAST `plan_updated` installed, for the corpus assertion.
+    static PLAN_CAPTURE: std::cell::RefCell<Option<leveler_client_protocol::UiPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Drive one fixture for the PAINTED assertions.
+fn drive_corpus(id: &str) -> (AppState, serde_json::Value) {
+    drive_corpus_painted(id, true)
 }
 
 /// Every `expect.items` entry of the fixture with the given `kind`.
@@ -1164,4 +1209,407 @@ fn conversation_c4_a_failed_run_shows_its_failure_collapsed() {
         painted.contains("✗") || painted.contains("失败"),
         "the row states it failed: {painted}"
     );
+}
+
+// ── The shared conversation-presentation corpus: the full tree ──────────────
+//
+// Every fixture in `testdata/conversation_presentation/v1/` declares the
+// semantic tree the conversation must project to. This is the reference
+// projection: the terminal's own transcript, walked in order, reduced to the
+// items the corpus names — kinds, order, fold state, visibility, roles. The Web
+// client and the Desktop renderer project the SAME files.
+
+/// The exploration kind of a call, from the reference's own taxonomy.
+fn exploration_kind(name: &str) -> Option<&'static str> {
+    use leveler_tui::tool_taxonomy::ToolKind;
+    match leveler_tui::tool_taxonomy::lookup(name)?.kind {
+        ToolKind::Read => Some("read"),
+        ToolKind::ListDir => Some("list"),
+        ToolKind::Search => Some("search"),
+        _ => None,
+    }
+}
+
+/// The target a row names, read from the call's own arguments.
+fn call_target(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return String::new();
+    };
+    for key in ["path", "pattern", "query", "glob", "file"] {
+        if let Some(found) = value.get(key).and_then(|v| v.as_str()) {
+            return found.to_string();
+        }
+    }
+    String::new()
+}
+
+fn turn_end_status(status: TurnEndStatus) -> &'static str {
+    match status {
+        TurnEndStatus::Completed => "completed",
+        TurnEndStatus::CompletedWithWarnings => "completed_with_warnings",
+        TurnEndStatus::Answered => "answered",
+        TurnEndStatus::Truncated => "truncated",
+        TurnEndStatus::Incomplete => "incomplete",
+        TurnEndStatus::NoFinalAnswer => "no_final_answer",
+        TurnEndStatus::Failed => "failed",
+        TurnEndStatus::Cancelled => "cancelled",
+    }
+}
+
+fn tool_status_name(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Running => "running",
+        ToolStatus::Ok => "ok",
+        ToolStatus::Failed => "failed",
+        ToolStatus::Cancelled => "cancelled",
+        ToolStatus::Unknown => "unknown",
+    }
+}
+
+/// An edit's confirmed diff, as the corpus names it: the change itself, whole.
+///
+/// A group whose visible calls are all confirmed edits IS its diff — the row
+/// header is the diff's own header, and no diffstat-only summary may take its
+/// place (`rendered_in_full` is what the client must be able to paint).
+fn edit_diff_item(calls: &[&leveler_tui::transcript::ToolCallBlock]) -> Option<Value> {
+    let mut patches = Vec::new();
+    for call in calls {
+        let patch = call.applied_diff.as_deref()?;
+        if patch.trim().is_empty() {
+            return None;
+        }
+        patches.push(patch);
+    }
+    if patches.is_empty() {
+        return None;
+    }
+    let mut paths: Vec<String> = Vec::new();
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for patch in &patches {
+        for line in patch.lines() {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                let path = rest
+                    .trim()
+                    .trim_start_matches("b/")
+                    .trim_start_matches("a/")
+                    .to_string();
+                if !path.is_empty() && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                added += 1;
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                removed += 1;
+            }
+        }
+    }
+    paths.sort();
+    Some(json!({
+        "kind": "edit_diff",
+        "paths": paths,
+        "added": added,
+        "removed": removed,
+        "rendered_in_full": true,
+        "needs_click": false,
+    }))
+}
+
+/// One tool group as the corpus names it: a confirmed edit's diff, a merged
+/// exploration receipt, lone exploration rows, or a Run receipt. The fold state
+/// is the group's own `display`.
+fn group_item(group: &leveler_tui::transcript::ToolGroupBlock) -> Value {
+    let visible: Vec<&leveler_tui::transcript::ToolCallBlock> = group.calls.iter().collect();
+    if !visible.is_empty()
+        && visible
+            .iter()
+            .all(|call| matches!(&call.name[..], "apply_patch" | "write_file" | "edit_file"))
+        && let Some(diff) = edit_diff_item(&visible)
+    {
+        return diff;
+    }
+    let kinds: Vec<Option<&'static str>> = visible
+        .iter()
+        .map(|call| exploration_kind(&call.name))
+        .collect();
+    let all_exploration = !visible.is_empty() && kinds.iter().all(Option::is_some);
+    let none_failed = visible.iter().all(|call| call.status != ToolStatus::Failed);
+    let folded = group.display.is_collapsed();
+    if all_exploration && visible.len() >= 2 && none_failed {
+        let reads = kinds.iter().filter(|kind| **kind == Some("read")).count();
+        let searches = kinds.iter().filter(|kind| **kind == Some("search")).count();
+        // Arrival order, never sorted: the fold restores the chronology it
+        // hid, so the order the calls happened in IS part of the item.
+        let members: Vec<String> = visible
+            .iter()
+            .map(|call| format!("{}:{}", call.name, call_target(&call.arguments)))
+            .collect();
+        return json!({
+            "kind": "exploration_receipt",
+            "reads": reads,
+            "searches": searches,
+            "folded": folded,
+            "members_visible": !folded,
+            "reversible": true,
+            "members": members,
+        });
+    }
+    if all_exploration && visible.len() == 1 {
+        let call = visible[0];
+        return json!({
+            "kind": "exploration_row",
+            "name": call.name,
+            "target": call_target(&call.arguments),
+            "status": tool_status_name(call.status),
+        });
+    }
+    let rows: Vec<Value> = visible
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id.to_string(),
+                "name": call.name,
+                "status": tool_status_name(call.status),
+            })
+        })
+        .collect();
+    let status = match group.calls.iter().map(|call| call.status).find(|status| {
+        matches!(
+            status,
+            ToolStatus::Running | ToolStatus::Failed | ToolStatus::Cancelled | ToolStatus::Unknown
+        )
+    }) {
+        Some(ToolStatus::Running) => "running",
+        Some(ToolStatus::Failed) => "failed",
+        Some(ToolStatus::Cancelled) => "cancelled",
+        Some(ToolStatus::Unknown) => "unknown",
+        _ => "ok",
+    };
+    let mut item = json!({
+        "kind": "run_receipt",
+        "model_step": group.round,
+        "status": status,
+        "folded": folded,
+        "command_visible": true,
+        "output_visible": !folded,
+        "output_available": true,
+        "rows": rows,
+    });
+    if status == "failed" {
+        // The contract's failure facts: the status is above, the exit code and
+        // the command's own failure line follow it.
+        item["failure_visible"] = json!(true);
+        let exit_code = group
+            .calls
+            .iter()
+            .filter(|call| call.status == ToolStatus::Failed)
+            .find_map(|call| call.exit_code);
+        if let Some(code) = exit_code {
+            item["exit_code"] = json!(code);
+        }
+        item["failure_line"] = json!(
+            group
+                .calls
+                .iter()
+                .filter(|call| call.status == ToolStatus::Failed)
+                .find_map(|call| call.preview.as_deref())
+                .map(|preview| {
+                    preview
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| {
+                            let lower = line.to_lowercase();
+                            lower.starts_with("error")
+                                || lower.contains("panic")
+                                || line.contains('\u{2717}')
+                                || lower.contains("failed")
+                                || lower.contains("fail")
+                        })
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .unwrap_or_default()
+        );
+    }
+    item
+}
+
+/// The conversation as the corpus names it: the reference's own transcript, in
+/// order, reduced to the contract's items.
+fn conversation_tree(s: &AppState) -> Vec<Value> {
+    let mut items = Vec::new();
+    for item in s.transcript.items() {
+        match item {
+            TranscriptItem::User(text) => items.push(json!({"kind": "user", "text": text})),
+            TranscriptItem::Assistant(block) => {
+                let text = block.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let kind = if block.kind == AssistantKind::Final {
+                    "final_answer"
+                } else {
+                    "assistant_text"
+                };
+                items.push(json!({"kind": kind, "text": text}));
+            }
+            TranscriptItem::Thought(block) => {
+                let state = if !block.done {
+                    "running"
+                } else if block.interrupted {
+                    "interrupted"
+                } else {
+                    "completed"
+                };
+                items.push(json!({
+                    "kind": "thought",
+                    "state": state,
+                    "elapsed_ms": block.duration_ms,
+                    "folded": block.display.is_collapsed(),
+                    "body_visible": block.display.is_expanded(),
+                    "body": block.text,
+                }));
+            }
+            TranscriptItem::ToolGroup(group) => items.push(group_item(group)),
+            TranscriptItem::TurnEnd(end) => items.push(json!({
+                "kind": "turn_end",
+                "status": turn_end_status(end.status),
+            })),
+            // A row the runtime authored (a notice, a checkpoint line, the
+            // compaction marker) is never user speech and never a Thought.
+            TranscriptItem::Note(text) => {
+                items.push(json!({"kind": "runtime_notice", "text": text}))
+            }
+            TranscriptItem::Failure(failure) => items.push(json!({
+                "kind": "failure",
+                "title": failure.title,
+                "summary": failure.summary,
+            })),
+            _ => {}
+        }
+    }
+    items
+}
+
+/// The fields of `expect.items` must appear in the same position in the tree.
+///
+/// An item marked `optional` is a fact a client may express in another place
+/// (the terminal paints a dedicated failure block; the Web and Desktop state the
+/// same failure in their run row and turn terminal). It is asserted when it is
+/// present and never forces the other clients to invent a row.
+fn assert_corpus_items(id: &str, expect: &[Value], actual: &[Value]) {
+    let mut cursor = 0usize;
+    for (index, expected) in expect.iter().enumerate() {
+        let object = expected.as_object().expect("expected item");
+        let fields: Vec<(&String, &Value)> = object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "optional")
+            .collect();
+        if object.get("optional").and_then(Value::as_bool) == Some(true) {
+            let matches = actual.get(cursor).is_some_and(|candidate| {
+                fields
+                    .iter()
+                    .all(|(key, value)| candidate.get(*key) == Some(*value))
+            });
+            if !matches {
+                continue;
+            }
+        }
+        let actual_item = actual
+            .get(cursor)
+            .unwrap_or_else(|| panic!("{id}: missing item {index}: {expected}\n{actual:#?}"));
+        for (key, value) in fields {
+            assert_eq!(
+                actual_item.get(key),
+                Some(value),
+                "{id}: item {index} field {key:?}\nexpected {expected}\nactual {actual_item:#?}"
+            );
+        }
+        cursor += 1;
+    }
+    assert_eq!(
+        cursor,
+        actual.len(),
+        "{id}: the tree has unclaimed items\n{:#?}",
+        &actual[cursor.min(actual.len())..]
+    );
+}
+
+fn all_conversation_fixtures() -> Vec<serde_json::Value> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/conversation_presentation/v1");
+    let mut ids: Vec<u32> = (1..=10).collect();
+    ids.sort();
+    ids.into_iter()
+        .map(|id| {
+            let path = dir.join(format!("C{id}.json"));
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            serde_json::from_str(&raw).expect("fixture json")
+        })
+        .collect()
+}
+
+#[test]
+fn conversation_corpus_projects_the_frozen_tree() {
+    for doc in all_conversation_fixtures() {
+        let id = doc["id"].as_str().expect("id");
+        let (s, _) = drive_corpus_painted(id, false);
+        let expect = doc["expect"]["items"].as_array().expect("items").clone();
+        let actual = conversation_tree(&s);
+        assert_corpus_items(id, &expect, &actual);
+        if let Some(collaboration) = doc["expect"]["collaboration"].as_str() {
+            assert_eq!(
+                s.collaboration, collaboration,
+                "{id}: the session axis is a runtime fact, not a transcript item"
+            );
+        }
+        if let Some(plan) = doc["expect"].get("plan") {
+            let captured = PLAN_CAPTURE.with(|slot| slot.borrow().clone());
+            let steps: Vec<Value> = captured
+                .as_ref()
+                .map(|plan| {
+                    plan.steps
+                        .iter()
+                        .map(|step| {
+                            json!({
+                                "description": step.description,
+                                "status": match step.status {
+                                    leveler_client_protocol::PlanStepStatus::Pending => "pending",
+                                    leveler_client_protocol::PlanStepStatus::Running => "running",
+                                    leveler_client_protocol::PlanStepStatus::Done => "done",
+                                    leveler_client_protocol::PlanStepStatus::Failed => "failed",
+                                    leveler_client_protocol::PlanStepStatus::Skipped => "skipped",
+                                },
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                plan["steps"].as_array().map(|steps| steps.len()),
+                Some(steps.len()),
+                "{id}: plan steps\n{steps:#?}"
+            );
+            for (index, expected) in plan["steps"].as_array().expect("steps").iter().enumerate() {
+                for (key, value) in expected.as_object().expect("step") {
+                    assert_eq!(
+                        steps[index].get(key),
+                        Some(value),
+                        "{id}: plan step {index} field {key:?}\n{steps:#?}"
+                    );
+                }
+            }
+        }
+        if let Some(forbidden) = doc["expect"]["forbidden_text"].as_array() {
+            let tree = serde_json::to_string(&actual).expect("tree");
+            for needle in forbidden {
+                let needle = needle.as_str().unwrap_or_default();
+                assert!(
+                    !tree.contains(needle),
+                    "{id}: forbidden text in the conversation tree: {needle}\n{tree}"
+                );
+            }
+        }
+    }
 }

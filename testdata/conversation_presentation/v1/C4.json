@@ -57,6 +57,10 @@
         "failure_line": "test mapping::recommended ... FAILED"
       },
       {
+        "kind": "failure",
+        "optional": true
+      },
+      {
         "kind": "turn_end",
         "status": "failed"
       }
