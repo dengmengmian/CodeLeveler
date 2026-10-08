@@ -538,6 +538,12 @@ mod tests {
         }
     }
 
+    /// A bound Unix socket at a chosen path.
+    ///
+    /// Unix-only, and so is every test that needs one: on a platform without a
+    /// verified process witness there is no termination target to examine —
+    /// [`verify_target`] refuses before it looks at the socket at all.
+    #[cfg(unix)]
     fn socket_at(
         dir: &tempfile::TempDir,
     ) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
@@ -549,6 +555,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_runtime_that_reports_the_current_build_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (socket, _listener) = socket_at(&dir);
@@ -558,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_non_socket_path_is_never_a_termination_target() {
         let dir = tempfile::tempdir().unwrap();
         let not_a_socket = dir.path().join("plain.txt");
@@ -578,6 +586,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_unreported_identity_is_never_a_termination_target() {
         let dir = tempfile::tempdir().unwrap();
         let (socket, _listener) = socket_at(&dir);
@@ -597,6 +606,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn this_client_is_never_its_own_termination_target() {
         let dir = tempfile::tempdir().unwrap();
         let (socket, _listener) = socket_at(&dir);
@@ -613,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_dead_pid_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (socket, _listener) = socket_at(&dir);
