@@ -131,13 +131,6 @@ fn every_variant() -> Vec<(&'static str, ClientCommand, bool)> {
             true,
         ),
         (
-            "force_cancel_current_turn",
-            ClientCommand::ForceCancelCurrentTurn {
-                session_id: session(),
-            },
-            true,
-        ),
-        (
             // A strictly stronger stop than cancelling the turn.
             "cancel_task",
             ClientCommand::CancelTask {

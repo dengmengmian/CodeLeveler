@@ -4569,12 +4569,6 @@ impl InteractiveRuntimeClient for InProcessRuntimeClient {
                 }
                 Ok(())
             }
-            ClientCommand::ForceCancelCurrentTurn { session_id } => {
-                if !self.cancel_active(&session_id) {
-                    self.cancel_orphaned(&session_id).await?;
-                }
-                Ok(())
-            }
             ClientCommand::CancelTask { session_id } => {
                 // A running turn carries the flag to its terminal, so the
                 // engine records `cancelled` (not resumable `interrupted`).

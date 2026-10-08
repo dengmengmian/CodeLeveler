@@ -1,8 +1,8 @@
 //! [`ClientCommand`] — intents a client sends into the runtime.
 //!
-//! Commands submit messages and cancel (or force-cancel) running
-//! turn, quit. Later phases add plan approval, clarifications, permission
-//! decisions, model/mode switches, attachments, checkpoints — as new variants.
+//! Commands submit messages, cancel a running turn or the logical task, and
+//! quit. Later phases add plan approval, clarifications, permission decisions,
+//! model/mode switches, attachments, checkpoints — as new variants.
 
 use serde::{Deserialize, Serialize};
 
@@ -151,9 +151,16 @@ pub enum ClientCommand {
     /// runtime keeps waiting for them if any remain.
     ForceRetire { reason: RestartReason },
     /// Cooperatively cancel the running turn (graceful; resumable).
+    ///
+    /// This is the only turn cancel the protocol offers: it asks the runtime
+    /// to stop the current work window and settle the turn as resumable
+    /// `interrupted`. Older 1.x clients may still put
+    /// `force_cancel_current_turn` on the wire; that payload is accepted as
+    /// this same command and produces the same terminal. There is no separate
+    /// force-cancel capability to escalate to, so the protocol must not imply
+    /// one.
+    #[serde(alias = "force_cancel_current_turn")]
     CancelCurrentTurn { session_id: SessionId },
-    /// Escalate a cancel the user has already requested once.
-    ForceCancelCurrentTurn { session_id: SessionId },
     /// Cancel the logical task, not just the running turn.
     ///
     /// Distinct from [`Self::CancelCurrentTurn`]: that interrupts the current
@@ -495,7 +502,6 @@ impl ClientCommand {
             | ClientCommand::AddAttachmentData { session_id, .. }
             | ClientCommand::AddClipboardImage { session_id }
             | ClientCommand::CancelCurrentTurn { session_id }
-            | ClientCommand::ForceCancelCurrentTurn { session_id }
             | ClientCommand::CancelTask { session_id }
             | ClientCommand::CancelChild { session_id, .. }
             | ClientCommand::CancelToolCall { session_id, .. }
@@ -733,13 +739,32 @@ mod tests {
         );
     }
 
+    /// A 1.x client that still sends `force_cancel_current_turn` must be
+    /// accepted, and must arrive as the ONE cancel the runtime has. The real
+    /// wire payload is used, not a Rust value: the compatibility promise is
+    /// about bytes on the socket.
     #[test]
-    fn force_cancel_current_turn_roundtrips() {
-        roundtrip(
-            ClientCommand::ForceCancelCurrentTurn {
+    fn legacy_force_cancel_wire_payload_is_a_plain_cancel() {
+        let legacy = r#"{"type":"force_cancel_current_turn","session_id":"s1"}"#;
+        let parsed: ClientCommand = serde_json::from_str(legacy)
+            .expect("a legacy force-cancel payload must deserialize, not be rejected");
+        assert_eq!(
+            parsed,
+            ClientCommand::CancelCurrentTurn {
                 session_id: SessionId::new("s1"),
             },
-            "force_cancel_current_turn",
+            "the legacy payload must resolve to the one turn cancel"
+        );
+
+        // And the runtime never emits the legacy tag: one canonical spelling.
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            json.contains("\"type\":\"cancel_current_turn\""),
+            "a cancel must serialize canonically: {json}"
+        );
+        assert!(
+            !json.contains("force_cancel"),
+            "no force-cancel semantics may be re-emitted: {json}"
         );
     }
 

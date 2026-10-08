@@ -308,7 +308,9 @@ export type RestartReason =
   /** The connecting client sees a different effective configuration source generation than the running daemon loaded at boot. */
   | 'config_changed'
   /** A newer artifact is installed and waiting to take over. Reserved for the updater; nothing sends it yet. */
-  | 'update_ready';
+  | 'update_ready'
+  /** An operator asked this project's runtime to restart (the Web project action, or any client acting on a person's explicit request). Distinct from the generation reasons on purpose: `BuildMismatch` and `ConfigChanged` describe WHY a new generation is wanted, and reporting either for a plain operator restart would be a lie in the health a waiting client reads. */
+  | 'restart_requested';
 
 /** An event flowing from the runtime to clients. */
 export type RuntimeEvent =
@@ -1239,10 +1241,8 @@ export type ClientCommand =
   | { type: 'shutdown_when_idle'; reason: RestartReason }
   /** End this runtime NOW for a generation handover, cancelling the main turns it still owns instead of waiting for them to reach a terminal. The explicit, user-chosen escape from a handover whose drain cannot finish — a turn that will never terminate on its own. Distinct from `Quit`: this is a version handover, not a user shutdown, so it never kills background work. The caller must have settled those first; the runtime keeps waiting for them if any remain. */
   | { type: 'force_retire'; reason: RestartReason }
-  /** Cooperatively cancel the running turn (graceful; resumable). */
+  /** Cooperatively cancel the running turn (graceful; resumable). This is the only turn cancel the protocol offers: it asks the runtime to stop the current work window and settle the turn as resumable `interrupted`. Older 1.x clients may still put `force_cancel_current_turn` on the wire; that payload is accepted as this same command and produces the same terminal. There is no separate force-cancel capability to escalate to, so the protocol must not imply one. */
   | { type: 'cancel_current_turn'; session_id: SessionId }
-  /** Escalate a cancel the user has already requested once. */
-  | { type: 'force_cancel_current_turn'; session_id: SessionId }
   /** Cancel the logical task, not just the running turn. Distinct from [`Self::CancelCurrentTurn`]: that interrupts the current work window and leaves the task resumable, while this is the user saying the task itself is over. The runtime commits a terminal `cancelled` outcome, settles the goal, and refuses a later continuation — a `继续` must not silently reopen it. */
   | { type: 'cancel_task'; session_id: SessionId }
   /** Cancel ONE running delegated child of the session's turn. The child settles as cancelled; its parent turn keeps running. */

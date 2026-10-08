@@ -168,7 +168,6 @@ impl RemotePolicy {
             // The extra reading stages narrow nothing and widen nothing.
             | ClientCommand::RunDevelop { .. }
             | ClientCommand::CancelCurrentTurn { .. }
-            | ClientCommand::ForceCancelCurrentTurn { .. }
             // Cancelling the logical task is a strictly stronger stop than
             // cancelling its turn, which is already allowed.
             | ClientCommand::CancelTask { .. }

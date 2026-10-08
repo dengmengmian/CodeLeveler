@@ -478,8 +478,6 @@ async function handleDeliver(ws, frame) {
       if (runner) runner.cancelled = true;
       return;
     }
-    case 'force_cancel_current_turn':
-      return;
     case 'approval_decision': {
       for (const runner of runners.values()) {
         if (runner.pendingApproval?.requestId === command.request_id) {

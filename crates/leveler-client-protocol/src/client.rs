@@ -42,6 +42,24 @@ pub enum ClientError {
 
 /// The seam between UI clients and the CodeLeveler runtime.
 ///
+/// # Delivery ACK vs. execution terminal
+///
+/// A successful [`Self::send`] / [`Self::deliver`] is a *delivery* answer: the
+/// command was admitted and its dispatch returned `Ok`. It is never a claim
+/// that the command's effect has completed. For cancellation this matters:
+///
+/// - `CancelCurrentTurn` returning `Ok` means the request reached the runtime
+///   that owns the turn. The turn ends later, at its durable terminal (the
+///   persisted `interrupted` outcome and the matching `RuntimeEvent`). A
+///   client must render "stopping", not "stopped", until that terminal.
+/// - `CancelTask` returning `Ok` currently means only that this boot recorded
+///   the logical-cancel intent in memory and stopped the running turn. That
+///   intent is **not** durable across a crash: a boot that dies before the
+///   `cancelled` terminal commits loses it, and recovery then settles the
+///   orphan turn as the resumable `interrupted`. This is a known, unfixed
+///   durability gap — a `CancelTask` ACK must never be presented as execution
+///   terminated.
+///
 /// Implementations bridge the runtime's internal mechanics (synchronous
 /// observer callbacks, cancellation tokens, approvers) into this async,
 /// broadcast-shaped contract. Implementations may run in-process or bridge a

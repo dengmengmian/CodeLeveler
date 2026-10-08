@@ -611,7 +611,6 @@ fn command_kind(command: &ClientCommand) -> &'static str {
         ClientCommand::AddAttachmentData { .. } => "add_attachment_data",
         ClientCommand::AddClipboardImage { .. } => "add_clipboard_image",
         ClientCommand::CancelCurrentTurn { .. } => "cancel_current_turn",
-        ClientCommand::ForceCancelCurrentTurn { .. } => "force_cancel_current_turn",
         ClientCommand::CancelTask { .. } => "cancel_task",
         ClientCommand::ApprovalDecision { .. } => "approval_decision",
         ClientCommand::AnswerClarification { .. } => "answer_clarification",

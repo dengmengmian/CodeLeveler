@@ -74,7 +74,6 @@ fn validate_command(session: &SessionId, command: &ClientCommand) -> anyhow::Res
                 .is_none_or(|id| !id.as_str().trim().is_empty() && id.as_str().len() <= 256) => {}
         ClientCommand::SteerCurrentTurn { .. }
         | ClientCommand::CancelCurrentTurn { .. }
-        | ClientCommand::ForceCancelCurrentTurn { .. }
         | ClientCommand::CancelTask { .. }
         | ClientCommand::QuerySessionHistory { .. }
         | ClientCommand::SelectModel { .. }
