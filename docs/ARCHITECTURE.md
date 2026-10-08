@@ -983,6 +983,30 @@ error, never a success ACK. No response or a dropped connection cannot be read
 as "the command did not run": receipts keep their existing dedup semantics and
 an unknown outcome never authorizes an automatic rerun.
 
+#### Cancellation ACK: requested ≠ delivered ≠ terminated
+
+A command ACK answers delivery, not execution. Cancellation makes that a
+load-bearing distinction, with separable stages:
+
+```text
+CancelRequested → CancelDelivered → ExecutionTerminated → TerminalPersisted
+```
+
+These are semantic stages, not wire types. A successful `CancelCurrentTurn`
+ACK means the request reached the runtime that owns the turn; the turn stays
+`running` until its terminal commits. Clients learn the real end from the
+durable terminal (`TaskFinished` plus the matching `RuntimeEvent`), never from
+the ACK, and render "stopping" rather than "stopped" while the turn is live.
+
+`CancelTask` differs in intent, not in ACK strength: it asks for a terminal
+`cancelled` outcome that settles the goal and refuses a later continuation,
+whereas `CancelCurrentTurn` leaves a resumable `interrupted`. Today the running
+path carries that intent only in memory (the turn lease's cancel flag). If the
+boot dies after the `CancelTask` ACK but before the `cancelled` terminal
+commits, the intent is lost and recovery settles the orphan turn as resumable
+`interrupted`. This is a known, unfixed durability gap: an ACK must not be
+presented as execution terminated.
+
 ---
 
 ## 12. Model Providers and Capability Negotiation

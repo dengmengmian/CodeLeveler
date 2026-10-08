@@ -954,6 +954,18 @@ daemon 只有在这个边界提交后才发送 wire ACK。如果进程在正常 
 
 对每个交互客户端来说，ACK 契约是同一个：启动或继续 Turn 的命令，只有在对应的持久化接收边界提交后才返回成功。进程内 TUI、`leveler serve` 暴露的 daemon、该进程服务的 `/web` UI，以及连接的 WebUI 都遵守这一条；Embedded 与 Daemon 之间不再存在不同的 Turn ACK 契约。成功 ACK 只表示执行输入已被持久接收（`EngineEvent::TurnStarted` 在 `TurnStore::start_owned` 提交后发出），不表示 Turn 已完成，也不表示工具副作用 exactly-once。被拒绝的 Turn 必须返回明确错误，而不是成功 ACK。无响应或断线不能推导命令未执行：凭证仍按原语义去重，未知结果不授权自动重跑。
 
+#### 取消 ACK：请求 ≠ 送达 ≠ 已终止
+
+命令 ACK 回答的是“送达”，不是“执行完成”。取消让这条区分变得关键，其语义阶段可以拆开表达：
+
+```text
+CancelRequested → CancelDelivered → ExecutionTerminated → TerminalPersisted
+```
+
+这些是语义阶段，不是新的 wire 类型。`CancelCurrentTurn` 返回成功只表示请求已经到达拥有该 Turn 的 Runtime；Turn 在终态提交前始终是 `running`。客户端从持久终态（`TaskFinished` 及对应 `RuntimeEvent`）得知真正的结束，而不是从 ACK 推断，并且在 Turn 仍存活时显示“正在停止”，而不是“已停止”。
+
+`CancelTask` 的差别在意图，不在 ACK 强度：它要求提交终态 `cancelled`、结清 Goal 并拒绝之后的继续；而 `CancelCurrentTurn` 留下可恢复的 `interrupted`。目前运行中的路径只在内存中携带该意图（turn lease 的 cancel flag）。如果 boot 在 `CancelTask` ACK 之后、`cancelled` 终态提交之前死亡，该意图就会丢失，恢复会把孤儿 Turn 结算为可恢复的 `interrupted`。这是一个已知且尚未修复的持久化缺口：任何 ACK 都不能被表述成“执行已经终止”。
+
 ---
 
 ## 12. 模型接入与能力协商
