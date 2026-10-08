@@ -316,25 +316,6 @@ impl LocalRuntimeService for OldBuildRuntime {
     }
 }
 
-struct RetireOldBuildUi {
-    commands: Arc<Mutex<Vec<RestartReason>>>,
-    shutdown: CancellationToken,
-}
-
-impl HandoffUi for RetireOldBuildUi {
-    fn emit(&self, event: HandoffEvent) {
-        // A Status event proves that ShutdownWhenIdle was ACKed and the Host
-        // observed the old runtime's drain state. Only then release its socket.
-        if matches!(event, HandoffEvent::Status(_)) && !self.commands.lock().unwrap().is_empty() {
-            self.shutdown.cancel();
-        }
-    }
-
-    fn input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<HandoffAction>> {
-        None
-    }
-}
-
 /// The Host starts a detached daemon, so the test records its PID before
 /// `exec` and reclaims it even when a later assertion fails.
 struct HostDaemonGuard {
@@ -466,11 +447,13 @@ async fn owned_host_starts_then_adopts_a_real_daemon_body() {
 
     let started = ensure_owned_runtime(
         &env.repo,
+        &layout,
         &socket,
         Some(OwnedRuntimeLaunch {
             executable: &launch.executable,
             ready_path: &ready_path,
         }),
+        leveler_runtime_host::NonInteractiveHandoffUi::new(),
     )
     .await
     .expect("owned Host starts and connects to a real daemon");
@@ -498,11 +481,13 @@ async fn owned_host_starts_then_adopts_a_real_daemon_body() {
     let missing_executable = env.home.join("nonexistent-leveler");
     let adopted = ensure_owned_runtime(
         &env.repo,
+        &layout,
         &socket,
         Some(OwnedRuntimeLaunch {
             executable: &missing_executable,
             ready_path: &env.home.join("must-not-be-written.json"),
         }),
+        leveler_runtime_host::NonInteractiveHandoffUi::new(),
     )
     .await
     .expect("owned Host adopts the existing daemon");
@@ -524,21 +509,29 @@ async fn owned_host_starts_then_adopts_a_real_daemon_body() {
     std::fs::remove_file(&guard.pid_file).unwrap();
 }
 
-/// A different reported build must receive ShutdownWhenIdle before a new
-/// daemon can take the same repository socket and answer with the current build.
+/// A runtime of a DIFFERENT generation whose process identity cannot be proven
+/// must be REFUSED, not killed and not commanded.
+///
+/// This in-process stub reports this test process's own pid, which is exactly
+/// the adversarial case: a runtime naming a pid the client may not safely signal
+/// has to end in a refusal. The positive case — a REAL second process being
+/// verified and terminated — is
+/// `runtime_host_handover::a_legacy_runtime_is_verified_and_terminated_before_replacement`,
+/// and the end-to-end case against a real older binary is the Dogfood
+/// `DF-L01`/`DF-L02` scenarios.
 #[test]
-fn host_retires_an_old_build_before_starting_a_replacement() {
+fn host_refuses_to_replace_an_old_build_it_cannot_verify() {
     leveler_test_support::bounded_test(
-        "host_retires_an_old_build_before_starting_a_replacement",
+        "host_refuses_to_replace_an_old_build_it_cannot_verify",
         leveler_test_support::DEFAULT_TEST_TIMEOUT,
-        host_retires_an_old_build_before_starting_a_replacement_body,
+        host_refuses_to_replace_an_old_build_it_cannot_verify_body,
     );
 }
 
-async fn host_retires_an_old_build_before_starting_a_replacement_body() {
+async fn host_refuses_to_replace_an_old_build_it_cannot_verify_body() {
     let env = test_env("http://127.0.0.1:9");
     let layout = Layout::ephemeral(env.repo.clone(), Some(env.config_dir.clone()), &env.home);
-    let (launch, guard) = detached_host_launch(&env);
+    let (launch, _guard) = detached_host_launch(&env);
     let mut old_build = BuildIdentity::current();
     old_build.fingerprint.push_str("-previous-build");
     let commands = Arc::new(Mutex::new(Vec::new()));
@@ -554,37 +547,44 @@ async fn host_retires_an_old_build_before_starting_a_replacement_body() {
         .await
         .expect("old build owns the repository socket");
     let old_server = tokio::spawn(server.serve(shutdown.clone()));
-    let ui: Arc<dyn HandoffUi> = Arc::new(RetireOldBuildUi {
-        commands: commands.clone(),
-        shutdown,
-    });
+    let ui: Arc<dyn HandoffUi> = Arc::new(SilentHandoffUi);
 
-    let client = tokio::time::timeout(
+    let outcome = tokio::time::timeout(
         Duration::from_secs(20),
         ensure_default_runtime(&layout, &launch, ui),
     )
     .await
-    .expect("Host handoff completes")
-    .expect("Host connects to replacement daemon");
-    let old_server_result = old_server.await.expect("old server task joins");
-    old_server_result.expect("old server retired cleanly");
-    assert_eq!(
-        *commands.lock().unwrap(),
-        vec![RestartReason::BuildMismatch],
-        "Host must retire the old build for the correct reason"
-    );
-    let replacement = LocalRuntimeService::runtime_info(&client).await.unwrap();
-    assert_eq!(
-        replacement.pid,
-        guard.pid(),
-        "replacement is a real child process"
-    );
-    assert_ne!(replacement.pid, std::process::id());
+    .expect("the refusal is prompt, not a hang");
+    let error = match outcome {
+        Ok(_) => panic!("an unprovable old build must not be replaced"),
+        Err(error) => error,
+    };
+    let host = error
+        .downcast_ref::<leveler_runtime_host::EnsureError>()
+        .expect("the failure names the handover contract");
     assert!(
-        replacement.build.matches(&BuildIdentity::current()),
-        "replacement must report the current build"
+        matches!(
+            host,
+            leveler_runtime_host::EnsureError::LegacyMigrationRefused { .. }
+        ),
+        "the refusal must be a named migration failure: {host}"
     );
-    assert_ne!(replacement.build, old_build);
+
+    // Nothing was commanded and nothing was signalled: the old build is intact
+    // and still owns the endpoint.
+    assert!(
+        commands.lock().unwrap().is_empty(),
+        "an unverifiable runtime must never receive a retire command"
+    );
+    let still_there = LocalSocketRuntimeClient::connect(&layout.socket_path())
+        .await
+        .expect("the old build is still serving");
+    let info = LocalRuntimeService::runtime_info(&still_there).await.unwrap();
+    assert_eq!(info.build, old_build);
+    assert_eq!(info.pid, std::process::id());
+
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), old_server).await;
 }
 
 async fn host_starts_adopts_and_revives_a_real_daemon_body() {

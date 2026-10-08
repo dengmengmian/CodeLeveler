@@ -4,18 +4,27 @@
 #![forbid(unsafe_code)]
 
 mod client;
+mod legacy;
+mod lifecycle_state;
 mod server;
 #[cfg(any(unix, windows))]
 pub use client::{
-    DaemonReviver, DetachedRuntimeLaunch, connect_global_task_runtime, ensure_default_runtime,
-    observe_retiring_runtime,
+    DaemonReviver, DetachedRuntimeLaunch, DrainOutcome, NonInteractiveHandoffUi, StartupObservation,
+    connect_global_task_runtime, ensure_default_runtime, observe_retiring_runtime,
+    reconcile_runtime_generation,
 };
 pub use client::{
     EnsureError, HandoffAction, HandoffEvent, HandoffUi, RuntimeConsistency, classify_runtime,
-    classify_runtime_generation, force_handover_allowed, handoff_key, probe_default_runtime,
-    stalled_turn_sessions, verify_replacement,
+    classify_runtime_generation, expected_config_fingerprint, force_handover_allowed, handoff_key,
+    probe_default_runtime, stalled_turn_sessions, verify_replacement,
 };
+pub use lifecycle_state::{LifecycleAction, RuntimeLifecycleState};
 mod owned;
+pub use legacy::{
+    LegacyRuntimeTarget, MigrationRefusal, OwnershipEvidence, ProcessWitness, SocketObject,
+    TerminationSignal, platform_supports_forced_migration, process_alive, process_uid,
+    process_witness, revalidate, signal_process, socket_object, socket_ownership, verify_target,
+};
 pub use owned::{
     EnsureOwnedError, OwnedRuntime, OwnedRuntimeError, OwnedRuntimeLaunch,
     connect_existing_runtime, ensure_owned_runtime,

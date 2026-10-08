@@ -1,0 +1,575 @@
+//! Forced migration of a runtime too old to answer the atomic retirement
+//! question.
+//!
+//! # Why this is not "just kill the daemon"
+//!
+//! A runtime that answers `RetireDecision::Unsupported` has stated that it
+//! cannot retire atomically. CodeLeveler has no released users, so that
+//! generation may be replaced without an uninterrupted-upgrade guarantee — but
+//! *may be replaced* is not *may be killed*. The only thing this module is
+//! allowed to terminate is a process it can prove is the very runtime serving
+//! this socket, right now.
+//!
+//! Three facts have to hold together, and each is re-checked at the moment of
+//! the signal rather than trusted from an earlier snapshot:
+//!
+//! 1. **Protocol capability.** The endpoint answered `Unsupported`. A
+//!    connection failure, a timeout, a truncated reply or a permission failure
+//!    is *not* capability evidence and never reaches this module — the
+//!    transport keeps those apart ([`leveler_local_transport::TransportError::PeerClosed`]
+//!    is the only transport-level fact read as `Unsupported`).
+//! 2. **Generation.** The runtime's build identity is known and differs from
+//!    ours. Version numbers are never used to guess capability.
+//! 3. **Process ownership.** The runtime reports a PID; that PID is witnessed
+//!    with its *start time*, so a PID reused by an unrelated process cannot
+//!    inherit the signal. The witness is captured, re-read immediately before
+//!    the signal, and re-read again while waiting.
+//!
+//! # Signals are never sent to a group
+//!
+//! Only the one witnessed PID is signalled. The runtime's process group can
+//! contain — or later contain — the user's own background services, which are
+//! held by the independent execution host and are not this migration's to
+//! destroy.
+//!
+//! # Windows
+//!
+//! There is no verified Windows process-identity witness here, so `windows`
+//! refuses forced migration ([`MigrationRefusal::PlatformUnsupported`]) and the
+//! caller reports it. A refusal is a supported outcome; a wrong kill is not.
+
+use std::path::Path;
+
+use leveler_client_protocol::BuildIdentity;
+
+/// Why a forced migration did not happen.
+///
+/// Every variant is a REFUSAL, never a partial action: the caller must be able
+/// to state that nothing was signalled.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MigrationRefusal {
+    /// The endpoint did not report a usable identity (no build, no pid, or the
+    /// pid is this process). Nothing is known well enough to terminate.
+    #[error("the previous runtime did not report a usable identity: {0}")]
+    IdentityUnknown(String),
+    /// The identity was usable but the process could not be witnessed, so a
+    /// signal could land on a reused PID.
+    #[error("the previous runtime's process could not be verified: {0}")]
+    ProcessUnverifiable(String),
+    /// Reaching this point requires a process-identity witness and a
+    /// single-process signal, and this platform has not been verified to
+    /// provide them.
+    #[error("forced migration is not supported on this platform: {0}")]
+    PlatformUnsupported(String),
+    /// The process behind the captured PID is no longer the one that was
+    /// captured — the PID was reused. Nothing further is signalled.
+    #[error("pid {pid} was reused by a different process during migration")]
+    TargetReused { pid: u32 },
+    /// The runtime serving the socket is not the one this migration was
+    /// planned against — it was replaced, or the socket was taken over.
+    #[error("the runtime serving {socket} changed during migration")]
+    TargetChanged { socket: String },
+    /// The process was signalled and still serves after the grace period, with
+    /// an identity that still matches. The migration stops here rather than
+    /// escalating forever.
+    #[error("the previous runtime (pid {pid}) did not exit within {waited_secs}s")]
+    DidNotExit { pid: u32, waited_secs: u64 },
+}
+
+/// A PID plus the start time that makes it a *specific* process.
+///
+/// A bare PID is a snapshot that can be reused; `(pid, start)` is an identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessWitness {
+    pub pid: u32,
+    /// An opaque, comparable start marker. Equal markers for the same PID mean
+    /// the same process; a different marker means the PID was reused.
+    pub started: String,
+}
+
+/// What the socket path itself is, so "the same endpoint" is checkable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketObject {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Everything this client can PROVE about the runtime it intends to replace.
+#[derive(Debug, Clone)]
+pub struct LegacyRuntimeTarget {
+    pub pid: u32,
+    pub runtime_id: String,
+    pub build: BuildIdentity,
+    pub socket: SocketObject,
+    pub witness: ProcessWitness,
+    pub ownership: OwnershipEvidence,
+}
+
+/// The socket path's file object identity, or `None` when it is not a socket.
+pub fn socket_object(path: &Path) -> Option<SocketObject> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_socket() {
+            return None;
+        }
+        Some(SocketObject {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The identity of the process behind `pid`, or `None` when it is gone — or
+/// when this platform has no witness to offer.
+///
+/// Deliberately free of `unsafe`: the start marker is read from `/proc` where
+/// the kernel publishes it, and from `ps` otherwise. A platform where neither
+/// works reports `None`, which makes migration refuse rather than guess.
+pub fn process_witness(pid: u32) -> Option<ProcessWitness> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Field 22 of `/proc/<pid>/stat` is the start time in clock ticks since
+        // boot. `comm` (field 2) may contain spaces and parentheses, so parsing
+        // resumes after the LAST ')'.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.rsplit_once(')')?.1;
+        let start = rest.split_whitespace().nth(19)?;
+        start.parse::<u64>().ok()?;
+        Some(ProcessWitness {
+            pid,
+            started: start.to_string(),
+        })
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let output = std::process::Command::new("ps")
+            .env("LC_ALL", "C")
+            .arg("-o")
+            .arg("lstart=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let started = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        if started.is_empty() {
+            return None;
+        }
+        Some(ProcessWitness { pid, started })
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The user that owns `pid`, as the kernel reports it.
+pub fn process_uid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        // `/proc/<pid>/status` carries `Uid:\t<real>\t<effective>\t...`; the
+        // real uid is the first field.
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let line = status.lines().find(|line| line.starts_with("Uid:"))?;
+        line.split_whitespace().nth(1)?.parse().ok()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let output = std::process::Command::new("ps")
+            .env("LC_ALL", "C")
+            .arg("-o")
+            .arg("uid=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// This process's real user id.
+fn current_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(nix::unistd::Uid::current().as_raw())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// How strongly the *endpoint* — not the runtime's own claim — is tied to the
+/// process this migration is about to signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnershipEvidence {
+    /// The process holds the very socket object this endpoint is, proven from
+    /// the kernel's own file-descriptor table.
+    HoldsEndpointSocket,
+    /// The process could not be tied to the socket object directly, but it is
+    /// this user's process, it is alive, its start time is witnessed, and the
+    /// endpoint answers as the same runtime throughout.
+    SameUserWitnessOnly,
+}
+
+/// Prove the process holds the endpoint socket, where the kernel publishes
+/// enough to do so.
+///
+/// Linux: scanning the target's file-descriptor table for
+/// `socket:[<inode>]` matching the socket path decides it outright. Other
+/// platforms have no equivalent without an unverified platform shim, so they
+/// report the weaker [`OwnershipEvidence`] honestly instead of pretending.
+pub fn socket_ownership(pid: u32, socket: SocketObject) -> OwnershipEvidence {
+    #[cfg(target_os = "linux")]
+    {
+        let wanted = format!("socket:[{}]", socket.inode);
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            return OwnershipEvidence::SameUserWitnessOnly;
+        };
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path()).is_ok_and(|link| link.to_string_lossy() == wanted) {
+                return OwnershipEvidence::HoldsEndpointSocket;
+            }
+        }
+        OwnershipEvidence::SameUserWitnessOnly
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, socket);
+        OwnershipEvidence::SameUserWitnessOnly
+    }
+}
+
+/// Whether `pid` still exists.
+///
+/// `kill(pid, 0)` performs the existence and permission check without delivering
+/// anything. EPERM still proves the process exists (it is owned by another
+/// user); only ESRCH means it is gone.
+pub fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        match kill(Pid::from_raw(pid as i32), None) {
+            Ok(()) => true,
+            Err(Errno::EPERM) => true,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// The signals this migration may send. Named so the two-step escalation is a
+/// value a test can assert on rather than a raw integer at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationSignal {
+    /// The graceful request. A runtime that can exit cleanly should.
+    Term,
+    /// The last resort, sent only after `Term` was ignored.
+    Kill,
+}
+
+/// Send one signal to exactly one process — never to a group.
+pub fn signal_process(pid: u32, signal: TerminationSignal) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let signal = match signal {
+            TerminationSignal::Term => Signal::SIGTERM,
+            TerminationSignal::Kill => Signal::SIGKILL,
+        };
+        kill(Pid::from_raw(pid as i32), Some(signal)).map_err(std::io::Error::from)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, signal);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no single-process signalling on this platform",
+        ))
+    }
+}
+
+/// Whether this platform can prove process identity and signal one process
+/// well enough to force a migration at all.
+pub fn platform_supports_forced_migration() -> bool {
+    process_witness(std::process::id()).is_some()
+}
+
+/// Classify the observed runtime, and refuse when it is not a target this
+/// migration may act on.
+///
+/// Split out from the signal loop because this is where all the policy lives,
+/// and it must be testable without terminating anything.
+pub fn verify_target(
+    socket_path: &Path,
+    reported_pid: u32,
+    reported_runtime_id: &str,
+    reported_build: &BuildIdentity,
+    expected_build: &BuildIdentity,
+) -> Result<LegacyRuntimeTarget, MigrationRefusal> {
+    if reported_pid == 0 || reported_runtime_id.is_empty() || !reported_build.is_known() {
+        return Err(MigrationRefusal::IdentityUnknown(format!(
+            "pid={reported_pid}, runtime_id={reported_runtime_id:?}, build_known={}",
+            reported_build.is_known()
+        )));
+    }
+    if reported_pid == std::process::id() {
+        return Err(MigrationRefusal::IdentityUnknown(
+            "the runtime reported this client's own pid".to_string(),
+        ));
+    }
+    if !expected_build.is_known() {
+        return Err(MigrationRefusal::IdentityUnknown(
+            "this client cannot state which build it expected".to_string(),
+        ));
+    }
+    if expected_build == reported_build {
+        return Err(MigrationRefusal::IdentityUnknown(
+            "the runtime already reports the current build".to_string(),
+        ));
+    }
+    let socket = socket_object(socket_path).ok_or_else(|| {
+        MigrationRefusal::ProcessUnverifiable(format!(
+            "{} is not a socket owned by a runtime",
+            socket_path.display()
+        ))
+    })?;
+    if !platform_supports_forced_migration() {
+        return Err(MigrationRefusal::PlatformUnsupported(
+            std::env::consts::OS.to_string(),
+        ));
+    }
+    let witness = process_witness(reported_pid).ok_or_else(|| {
+        MigrationRefusal::ProcessUnverifiable(format!(
+            "no process identity is available for pid {reported_pid}"
+        ))
+    })?;
+    if !process_alive(reported_pid) {
+        return Err(MigrationRefusal::ProcessUnverifiable(format!(
+            "pid {reported_pid} is already gone"
+        )));
+    }
+    // Ownership: only a runtime owned by this user may be terminated. Without
+    // this a broken runtime that names, say, pid 1 would be obeyed.
+    match (process_uid(reported_pid), current_uid()) {
+        (Some(owner), Some(current)) if owner == current => {}
+        (Some(owner), Some(current)) => {
+            return Err(MigrationRefusal::ProcessUnverifiable(format!(
+                "pid {reported_pid} is owned by uid {owner}, not this user (uid {current})"
+            )));
+        }
+        _ => {
+            return Err(MigrationRefusal::ProcessUnverifiable(format!(
+                "the owner of pid {reported_pid} could not be read"
+            )));
+        }
+    }
+    Ok(LegacyRuntimeTarget {
+        pid: reported_pid,
+        runtime_id: reported_runtime_id.to_string(),
+        build: reported_build.clone(),
+        socket,
+        witness,
+        ownership: socket_ownership(reported_pid, socket),
+    })
+}
+
+/// Re-verify a captured target immediately before signalling it.
+///
+/// Two independent facts, both required: the PID is still the same *process*
+/// (start marker unchanged) and it is still alive. Either failing means the
+/// signal would not reach the runtime this migration examined.
+pub fn revalidate(target: &LegacyRuntimeTarget) -> Result<(), MigrationRefusal> {
+    match process_witness(target.pid) {
+        Some(witness) if witness == target.witness => {
+            if process_alive(target.pid) {
+                Ok(())
+            } else {
+                Err(MigrationRefusal::ProcessUnverifiable(format!(
+                    "pid {} disappeared between the identity read and the signal",
+                    target.pid
+                )))
+            }
+        }
+        Some(_) => Err(MigrationRefusal::TargetReused { pid: target.pid }),
+        None => Err(MigrationRefusal::ProcessUnverifiable(format!(
+            "pid {} is gone",
+            target.pid
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build(tag: &str) -> BuildIdentity {
+        BuildIdentity {
+            version: "1.0.12".into(),
+            revision: "rev".into(),
+            dirty: false,
+            fingerprint: tag.into(),
+        }
+    }
+
+    fn socket_at(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
+        let socket = dir.path().join("x.sock");
+        // Kept alive by the caller: the path stays a socket object for the
+        // whole test, and the listener is closed when the test ends.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        (socket, listener)
+    }
+
+    #[test]
+    fn a_runtime_that_reports_the_current_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _listener) = socket_at(&dir);
+        let current = build("same");
+        let refusal = verify_target(&socket, 42, "rt-1", &current, &current).unwrap_err();
+        assert!(matches!(refusal, MigrationRefusal::IdentityUnknown(_)));
+    }
+
+    #[test]
+    fn a_non_socket_path_is_never_a_termination_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_socket = dir.path().join("plain.txt");
+        std::fs::write(&not_a_socket, b"hello").unwrap();
+        let refusal =
+            verify_target(&not_a_socket, 42, "rt-1", &build("old"), &build("new")).unwrap_err();
+        assert!(
+            matches!(refusal, MigrationRefusal::ProcessUnverifiable(_)),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreported_identity_is_never_a_termination_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _listener) = socket_at(&dir);
+        let candidates = [
+            (0u32, "rt-1", build("old")),
+            (42, "", build("old")),
+            (42, "rt-1", BuildIdentity::default()),
+        ];
+        for (pid, runtime_id, reported) in candidates {
+            let refusal =
+                verify_target(&socket, pid, runtime_id, &reported, &build("new")).unwrap_err();
+            assert!(
+                matches!(refusal, MigrationRefusal::IdentityUnknown(_)),
+                "{refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn this_client_is_never_its_own_termination_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _listener) = socket_at(&dir);
+        let refusal = verify_target(
+            &socket,
+            std::process::id(),
+            "rt-1",
+            &build("old"),
+            &build("new"),
+        )
+        .unwrap_err();
+        assert!(matches!(refusal, MigrationRefusal::IdentityUnknown(_)));
+    }
+
+    #[test]
+    fn a_dead_pid_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _listener) = socket_at(&dir);
+        // A pid this large is not allocated on any supported platform.
+        let pid = 0x7fff_fffe;
+        if process_alive(pid) {
+            return;
+        }
+        let refusal =
+            verify_target(&socket, pid, "rt-1", &build("old"), &build("new")).unwrap_err();
+        assert!(
+            matches!(refusal, MigrationRefusal::ProcessUnverifiable(_)),
+            "{refusal:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_process_is_witnessable_and_stable() {
+        let pid = std::process::id();
+        let witness = process_witness(pid).expect("own process must be witnessable");
+        assert_eq!(witness.pid, pid);
+        assert!(
+            !witness.started.is_empty(),
+            "a witness without a start marker proves nothing"
+        );
+        assert_eq!(process_witness(pid).unwrap(), witness);
+        assert!(process_alive(pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_pid_is_detected_before_it_is_signalled() {
+        // A witness for a DIFFERENT identity must not validate: this is the
+        // check that stops a signal from landing on an unrelated process.
+        let pid = std::process::id();
+        let mut target = LegacyRuntimeTarget {
+            pid,
+            runtime_id: "rt-1".into(),
+            build: build("old"),
+            socket: SocketObject {
+                device: 1,
+                inode: 1,
+            },
+            witness: process_witness(pid).unwrap(),
+            ownership: OwnershipEvidence::SameUserWitnessOnly,
+        };
+        assert!(revalidate(&target).is_ok());
+        target.witness.started.push_str("-stale");
+        assert!(
+            matches!(revalidate(&target), Err(MigrationRefusal::TargetReused { .. })),
+            "a changed start marker must read as a reused pid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_is_identified_by_its_file_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _listener) = socket_at(&dir);
+        let first = socket_object(&socket).expect("a bound socket has an object identity");
+        let second = socket_object(&socket).unwrap();
+        assert_eq!(first, second);
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        assert!(socket_object(&plain).is_none());
+    }
+}

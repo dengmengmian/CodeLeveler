@@ -2,10 +2,15 @@
 //! the child monitor, kill signal, registry and project status.
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use leveler_local_transport::{LocalSocketRuntimeClient, TransportError};
+use leveler_project::Layout;
 use tokio::process::{Child, Command};
+
+use crate::client::{HandoffUi, reconcile_runtime_generation};
+use crate::lifecycle_state::RuntimeLifecycleState;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OwnedRuntimeError {
@@ -41,28 +46,80 @@ pub enum EnsureOwnedError {
     Ready(OwnedRuntimeError),
     #[error("daemon became ready but could not be connected: {0}")]
     Connect(TransportError),
+    /// A runtime IS serving the endpoint, but not this generation — and it
+    /// could not be reconciled with it. This is the variant that stops a Web
+    /// server from silently attaching to a runtime it does not match.
+    #[error("{state_name}: {reason}")]
+    Generation {
+        state: RuntimeLifecycleState,
+        state_name: &'static str,
+        reason: String,
+    },
 }
 
-/// Web's attach-or-start path. The direct probe and retry timing are kept
-/// separate from the TUI's short default-daemon probe. On success the caller
-/// receives the child only when this call started it, so it can retain its
-/// existing monitor, removal and shutdown policy.
+/// The lifecycle state a failure to obtain an owned runtime represents.
+impl EnsureOwnedError {
+    /// The shared vocabulary name for this failure. A launch failure (no
+    /// executable, spawn error, readiness timeout) is `Unresponsive`: something
+    /// was supposed to answer and did not.
+    pub fn lifecycle_state(&self) -> RuntimeLifecycleState {
+        match self {
+            Self::Generation { state, .. } => *state,
+            Self::NoLauncher { .. }
+            | Self::Spawn(_)
+            | Self::Ready(_)
+            | Self::Connect(_) => RuntimeLifecycleState::Unresponsive,
+        }
+    }
+}
+
+/// Web's attach-or-start path, generation-aware.
+///
+/// The compatibility decision is NOT made here. This calls
+/// [`reconcile_runtime_generation`], the same function the terminal and the
+/// Desktop bridge use, so the Web cannot reach a different verdict about the
+/// same runtime than they do. What is Web-specific is only what happens when the
+/// answer is "start one": this path keeps the child handle, because an owned
+/// child has to be reaped, monitored and asked before it is stopped.
+///
+/// `layout` is the generation this project expects (its build, its
+/// configuration sources, its endpoint). `repo` is the workspace the spawned
+/// daemon should serve, kept explicit because a workspace-free layout has none.
+/// `socket` is the endpoint to use, kept separate so a caller may point at an
+/// equivalent path.
 pub async fn ensure_owned_runtime(
     repo: &Path,
+    layout: &Layout,
     socket: &Path,
     launcher: Option<OwnedRuntimeLaunch<'_>>,
+    ui: Arc<dyn HandoffUi>,
 ) -> Result<OwnedRuntime, EnsureOwnedError> {
-    if let Ok(client) = connect_existing_runtime(socket).await {
-        return Ok(OwnedRuntime {
-            client,
-            child: None,
-        });
+    match reconcile_runtime_generation(socket, layout, ui.as_ref()).await {
+        Ok(Some(client)) => {
+            return Ok(OwnedRuntime {
+                client,
+                child: None,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let state = error
+                .downcast_ref::<crate::EnsureError>()
+                .map(RuntimeLifecycleState::from_ensure_error)
+                .unwrap_or(RuntimeLifecycleState::Unresponsive);
+            return Err(EnsureOwnedError::Generation {
+                state,
+                state_name: state.as_str(),
+                reason: error.to_string(),
+            });
+        }
     }
     let Some(launcher) = launcher else {
         return Err(EnsureOwnedError::NoLauncher {
             socket: socket.to_path_buf(),
         });
     };
+    let repo = layout.require_workspace().unwrap_or(repo);
     let _ = std::fs::remove_file(launcher.ready_path);
     let mut child = spawn_owned_runtime(launcher.executable, repo, launcher.ready_path)
         .map_err(EnsureOwnedError::Spawn)?;
@@ -103,7 +160,14 @@ pub fn spawn_owned_runtime(exe: &Path, repo: &Path, ready_path: &Path) -> std::i
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        // Deliberately NOT `kill_on_drop`. The child handle this manager holds
+        // is a handle to a PROCESS, not to the work the runtime owns: dropping
+        // it used to SIGKILL the daemon, so closing the Web UI destroyed a
+        // turn that happened to be running. A daemon is a long-lived owner
+        // with its own idle eviction, exactly like one started by the terminal,
+        // so an exiting shell releases its handle and leaves the runtime alone.
+        // Stopping a runtime goes through the runtime's own decision
+        // (`ProjectManager::retire_owned`), never through this drop.
         .spawn()
 }
 
@@ -168,7 +232,15 @@ mod tests {
     async fn no_runtime_and_no_launcher_reports_the_socket() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("missing.sock");
-        let result = ensure_owned_runtime(dir.path(), &socket, None).await;
+        let layout = leveler_project::Layout::ephemeral(dir.path().to_path_buf(), None, dir.path());
+        let result = ensure_owned_runtime(
+            dir.path(),
+            &layout,
+            &socket,
+            None,
+            crate::NonInteractiveHandoffUi::new(),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(EnsureOwnedError::NoLauncher { socket: missing }) if missing == socket

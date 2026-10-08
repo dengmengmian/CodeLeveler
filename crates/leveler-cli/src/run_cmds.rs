@@ -488,6 +488,57 @@ impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
                     "The interrupt request could not reach the previous version.",
                 )
             ),
+            HandoffEvent::StillWaiting {
+                waited_secs,
+                active_turns,
+                active_background_tasks,
+                can_force,
+            } => {
+                let hint = if can_force {
+                    lang.pick(
+                        "输入 i 尝试中断，或输入 f 强制切换。",
+                        "Type i to interrupt it, or f to force the switch.",
+                    )
+                } else {
+                    lang.pick(
+                        "后台任务不能被强制切换终止；请按上面的提示停止它们，或继续等待。",
+                        "Background tasks cannot be force-ended; stop them as shown above, or keep waiting.",
+                    )
+                };
+                eprintln!(
+                    "{}\n  {}\n  {hint}",
+                    lang.pick("版本更新等待中", "Version update pending"),
+                    lang.pick(
+                        "旧版本仍在执行任务，本次等待已持续",
+                        "The previous version is still working; this wait has lasted",
+                    )
+                    .to_string()
+                        + &format!(
+                            " {} ({} {} · {} {})",
+                            format_task_age(waited_secs * 1_000),
+                            lang.pick("当前轮次", "turns"),
+                            active_turns,
+                            lang.pick("后台任务", "background tasks"),
+                            active_background_tasks,
+                        ),
+                );
+            }
+            HandoffEvent::UpgradeDeferred {
+                active_turns,
+                active_background_tasks,
+            } => eprintln!(
+                "{}\n  {}\n  {} ({} {} · {} {})",
+                lang.pick("版本更新推迟", "Version update deferred"),
+                lang.pick(
+                    "旧版本仍在执行任务，因此本次升级没有让它停止接受新工作；旧运行时继续正常服务。",
+                    "The previous version is still working, so this upgrade did not stop it from accepting new work; it keeps serving normally.",
+                ),
+                lang.pick("当前欠工作：", "work still owed:"),
+                lang.pick("当前轮次", "turns"),
+                active_turns,
+                lang.pick("后台任务", "background tasks"),
+                active_background_tasks,
+            ),
             HandoffEvent::ForceBlocked => eprintln!(
                 "  {}",
                 lang.pick(
@@ -506,6 +557,43 @@ impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
                 "  {}{error}",
                 lang.pick("强制切换失败：", "Force handover failed: ")
             ),
+            HandoffEvent::MigrationStarted { pid, version } => eprintln!(
+                "{}\n  {} (pid {pid}, {version})",
+                lang.pick("正在替换无原子退役能力的旧版本", "Replacing a previous version with no atomic retirement"),
+                lang.pick(
+                    "已核实该进程就是当前端点的运行时，将先请求其正常退出。",
+                    "The process was verified as this endpoint's runtime; it will be asked to exit first.",
+                ),
+            ),
+            HandoffEvent::MigrationTerminating { pid, force } => {
+                let detail = if force {
+                    lang.pick(
+                        "正常退出请求未被响应，已发送强制结束信号。",
+                        "The graceful exit request went unanswered; the forced signal was sent.",
+                    )
+                } else {
+                    lang.pick("已发送正常退出请求。", "Sent the graceful exit request.")
+                };
+                eprintln!("  {detail} (pid {pid})");
+            }
+            HandoffEvent::MigrationTerminated { pid } => eprintln!(
+                "  {} (pid {pid})",
+                lang.pick(
+                    "旧版本已退出并释放端点，开始启动当前版本。",
+                    "The previous version exited and released the endpoint; starting the current version.",
+                )
+            ),
+            HandoffEvent::MigrationFailed { reason } => eprintln!(
+                "{}\n  {reason}\n  {}",
+                lang.pick(
+                    "无法安全替换旧版本，已放弃自动升级（未终止任何进程）",
+                    "The previous version cannot be safely replaced; automatic upgrade abandoned (nothing was terminated)",
+                ),
+                lang.pick(
+                    "请手动退出旧版本 CodeLeveler 后重新启动；不会盲目终止进程。",
+                    "Exit the previous CodeLeveler version manually and start again; no process is terminated on a guess.",
+                ),
+            ),
         }
     }
 
@@ -513,6 +601,14 @@ impl leveler_runtime_host::HandoffUi for TuiHandoffUi {
         &self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<leveler_runtime_host::HandoffAction>> {
         spawn_handover_input()
+    }
+
+    /// A human at this terminal can answer `i` / `f`. Reports the same fact
+    /// `input` would act on, without acquiring stdin: the reader thread must
+    /// only start when the host is actually waiting on a stalled turn.
+    fn interactive(&self) -> bool {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal()
     }
 
     fn render_ensure_error(&self, error: &leveler_runtime_host::EnsureError) -> String {
@@ -547,11 +643,71 @@ fn format_ensure_error(host: &leveler_runtime_host::EnsureError) -> String {
                     ),
                 )
         }
-        EnsureError::ReadyTimeout { seconds, log_path } => format!(
-            "the local runtime did not become ready within {}s; inspect {} or run `leveler tui --in-process` as a fallback",
+        EnsureError::RetireBlocked {
+            waited_secs,
+            active_turns,
+            active_background_tasks,
+        } => {
+            let lang = HandoffLang::current();
+            let waited = format_task_age(waited_secs.saturating_mul(1_000));
+            format!(
+                "{}\n  {} {waited} ({} {active_turns} · {} {active_background_tasks})\n  {}\n  {}",
+                lang.pick(
+                    "旧版本 CodeLeveler 仍在执行任务，本次启动无法自动接管运行时。",
+                    "The previous CodeLeveler version is still working, so this launch cannot take over the runtime.",
+                ),
+                lang.pick("已等待", "waited"),
+                lang.pick("当前轮次", "turns"),
+                lang.pick("后台任务", "background tasks"),
+                lang.pick(
+                    "旧版本未被打断、未被终止，任务不会丢失；上面的状态里列了每个阻塞任务和停止命令。",
+                    "The previous version was neither interrupted nor terminated, so no work is lost; the status above names each blocking task and its stop command.",
+                ),
+                lang.pick(
+                    "处理完后重新启动 CodeLeveler 即可切换到当前版本；如需一直等待，设置 LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS=0。",
+                    "Start CodeLeveler again afterwards to switch to this version; set LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS=0 to wait forever instead.",
+                ),
+            )
+        }
+        EnsureError::LegacyMigrationRefused { reason, .. } => {
+            let lang = HandoffLang::current();
+            format!(
+                "{}\n  {reason}\n  {}",
+                lang.pick(
+                    "旧版本无法自动替换，且不能安全强制迁移。",
+                    "The previous version cannot be replaced automatically, and cannot be force-migrated safely.",
+                ),
+                lang.pick(
+                    "未终止任何进程，也未取消任何任务；请手动退出旧版本后重新启动。",
+                    "No process was terminated and no work was cancelled; exit the previous version manually and start again.",
+                ),
+            )
+        }
+        EnsureError::ReadyTimeout {
             seconds,
-            log_path.display()
-        ),
+            log_path,
+            observation,
+        } => {
+            let lang = HandoffLang::current();
+            let state = match observation {
+                leveler_runtime_host::StartupObservation::Starting => lang.pick(
+                    "旧进程还没完成启动（未公布就绪，进程仍在运行，本客户端不会把它杀掉）。",
+                    "The previous process has not finished starting (no readiness published; it is still running and this client will not kill it).",
+                ),
+                leveler_runtime_host::StartupObservation::Unresponsive => lang.pick(
+                    "旧进程已公布就绪但对连接无响应；这不能证明它已经退出。",
+                    "The previous process published readiness but does not answer; that is not proof it has exited.",
+                ),
+                leveler_runtime_host::StartupObservation::ChildExited => lang.pick(
+                    "启动的进程已退出且未公布就绪。",
+                    "The process that was launched exited without publishing readiness.",
+                ),
+            };
+            format!(
+                "the local runtime did not become ready within {seconds}s\n  {state}\n  log: {}\n  retry, read the log, or run `leveler tui --in-process` as a fallback",
+                log_path.display()
+            )
+        }
         EnsureError::StartupFailed { log_path, tail } => format!(
             "the local runtime failed to start (log: {}):\n{}\nrun `leveler tui --in-process` as a fallback",
             log_path.display(),
@@ -614,7 +770,7 @@ async fn observe_retiring_runtime(
     _reason: leveler_client_protocol::RestartReason,
     observed_pid: Option<u32>,
     interval: Duration,
-) {
+) -> leveler_runtime_host::DrainOutcome {
     leveler_runtime_host::observe_retiring_runtime(
         client,
         socket_path,
@@ -622,7 +778,7 @@ async fn observe_retiring_runtime(
         interval,
         &TuiHandoffUi,
     )
-    .await;
+    .await
 }
 
 /// Bind the TUI-embedded Web UI against an existing local runtime service.
@@ -693,15 +849,16 @@ fn make_url_opener() -> leveler_tui::UrlOpener {
 /// The collaboration axis every NEW interactive TUI session opens on.
 ///
 /// An interactive terminal session is a conversation, and `/goal <task>` is the
-/// durable way to ask for the goal lifecycle. This is the ONE statement of that
-/// product intent: the daemon request and the in-process create both consume it,
-/// so the transport can never change the axis. Reading
-/// `CollaborationMode::default()` instead would hand the axis to the product's
-/// coding-session default, and the two transports would silently disagree the
-/// moment that default moved. Resuming a session takes its persisted axis and
-/// never passes through here.
+/// durable way to ask for the goal lifecycle. The statement lives ONCE, on the
+/// axis vocabulary itself
+/// ([`leveler_lifecycle::CollaborationMode::interactive_session`]), because
+/// every interactive host states it — the terminal, the Web host and the
+/// Desktop bridge. Reading `CollaborationMode::default()` instead would hand the
+/// axis to the product's coding-session default, and interactive clients would
+/// silently disagree the moment that default moved. Resuming a session takes its
+/// persisted axis and never passes through here.
 fn interactive_session_collaboration() -> leveler_local_transport::CollaborationMode {
-    leveler_local_transport::CollaborationMode::Chat
+    leveler_local_transport::CollaborationMode::interactive_session()
 }
 
 /// The session-open request a bare `leveler` / `leveler tui` issues.

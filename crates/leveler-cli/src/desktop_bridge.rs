@@ -29,9 +29,13 @@ struct Request {
 struct DesktopHandoff(mpsc::Sender<Value>);
 impl HandoffUi for DesktopHandoff {
     fn emit(&self, event: HandoffEvent) {
+        // The typed event travels as itself. The Desktop is a shell that cannot
+        // ask a human here, so the only thing it can do with a handover is show
+        // it — and a `Debug` rendering is prose that silently drifts the moment
+        // a variant is renamed. A client branches on `kind`.
         let _ = self
             .0
-            .try_send(json!({"event":"handoff", "data":format!("{event:?}")}));
+            .try_send(json!({"event": "handoff", "data": event}));
     }
     fn input(&self) -> Option<mpsc::UnboundedReceiver<HandoffAction>> {
         None
@@ -348,9 +352,7 @@ pub(crate) async fn run(config_dir: Option<PathBuf>) -> anyhow::Result<std::proc
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => match bridge.handle(&request.method, request.params).await {
                 Ok(result) => json!({"id":request.id,"ok":true,"result":result}),
-                Err(error) => {
-                    json!({"id":request.id,"ok":false,"error":{"message":error.to_string(),"kind":error_kind(&error)}})
-                }
+                Err(error) => json!({"id":request.id,"ok":false,"error":error_payload(&error)}),
             },
             Err(error) => {
                 json!({"id":null,"ok":false,"error":{"message":error.to_string(),"kind":"invalid_request"}})
@@ -366,6 +368,31 @@ pub(crate) async fn run(config_dir: Option<PathBuf>) -> anyhow::Result<std::proc
     writer.await??;
     Ok(std::process::ExitCode::SUCCESS)
 }
+/// The typed lifecycle state of a failed request, when the failure is a runtime
+/// lifecycle fact rather than a protocol error.
+fn lifecycle_state(
+    error: &anyhow::Error,
+) -> Option<leveler_runtime_host::RuntimeLifecycleState> {
+    error
+        .downcast_ref::<leveler_runtime_host::EnsureError>()
+        .map(leveler_runtime_host::RuntimeLifecycleState::from_ensure_error)
+}
+
+/// The structured error a Desktop client receives.
+///
+/// `kind` is the protocol error class; `state` and `next_step` are present only
+/// for a lifecycle failure, and they come from the SAME vocabulary the terminal
+/// and the Web use — so a Desktop client can offer the actionable next step
+/// instead of a generic "connect failed".
+fn error_payload(error: &anyhow::Error) -> Value {
+    let mut payload = json!({"message": error.to_string(), "kind": error_kind(error)});
+    if let Some(state) = lifecycle_state(error) {
+        payload["state"] = json!(state.as_str());
+        payload["next_step"] = json!(state.next_step().as_str());
+    }
+    payload
+}
+
 fn error_kind(error: &anyhow::Error) -> &'static str {
     use leveler_client_protocol::ClientError;
     match error.downcast_ref::<ClientError>() {
