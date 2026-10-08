@@ -1,14 +1,17 @@
 // 工具调用行：紧凑无边框列表行（时间序执行明细）。
 // 默认弱视觉权重：成功项不高亮；仅当前执行 / 失败项增强。
-// 文件编辑（apply_patch）与 git_diff 显示「M path +N −M」轻量摘要，完整 Diff 点击后展开；
-// 其余工具有输出时 hover 出现「输出」入口；失败命令默认展开末尾 30 行输出。
+// 已确认的编辑改动走 ConfirmedDiffBlock：runtime 的 applied_diff 完整直接展示，
+// 不折叠、不截断、不由参数重建。git_diff 的输出仍按工具输出处理（点击展开）；
+// 失败命令默认展开末尾 30 行输出。
 
 import { useState } from 'react';
 import { useAppDispatch, type ToolCallView } from '../state/store';
 import { formatDuration, toolSummary } from '../lib/format';
 import { displayPreview, failureReason } from '../lib/executionRounds';
+import { confirmedDiffs } from '../lib/conversationPresentation';
 import { tailLines } from '../lib/toolstats';
-import { DiffBlock, parseDiff, patchFromArguments } from './DiffBlock';
+import { DiffBlock, parseDiff } from './DiffBlock';
+import { ConfirmedDiffBlock } from './ConfirmedDiffBlock';
 
 const GLYPH: Record<ToolCallView['status'], string> = {
   done: '✓',
@@ -27,16 +30,19 @@ export function ToolCallRow({ tool }: { tool: ToolCallView }) {
   const [open, setOpen] = useState(failed);
   const { verb, main } = toolSummary(tool.name, tool.arguments);
 
-  // 原始 diff → 轻量统计摘要；完整 DiffBlock 按需展开（事实由原始 diff 负责）。
-  const editDiff =
-    tool.name === 'apply_patch' && tool.status !== 'fail' ? patchFromArguments(tool.arguments) : null;
-  const gitDiff =
-    tool.name === 'git_diff' && tool.preview && tool.preview.trim() !== '' ? tool.preview : null;
-  const diffSource = editDiff ?? gitDiff;
-  const diff = diffSource ? parseDiff(diffSource) : null;
+  // The runtime's CONFIRMED diff, when this call confirmed an edit. It is
+  // displayed whole, here, with no gate — see ConfirmedDiffBlock.
+  const [confirmed] = confirmedDiffs([tool]);
+  // A read-only `git_diff` call reports a diff-shaped OUTPUT: that is output,
+  // not a confirmed change, and it keeps the ordinary output affordance.
+  const outputDiff =
+    !confirmed && tool.name === 'git_diff' && tool.preview && tool.preview.trim() !== ''
+      ? tool.preview
+      : null;
+  const diff = outputDiff ? parseDiff(outputDiff) : null;
 
   const preview = displayPreview(tool);
-  const expandable = diffSource !== null || preview !== null;
+  const expandable = outputDiff !== null || preview !== null;
 
   return (
     <>
@@ -75,13 +81,14 @@ export function ToolCallRow({ tool }: { tool: ToolCallView }) {
         )}
         {tool.durationMs !== null && <span className="dur">{formatDuration(tool.durationMs)}</span>}
         {expandable && (
-          <span className="tool-acts">{open ? '收起' : failed ? '查看错误输出' : diff ? '查看改动' : '输出'}</span>
+          <span className="tool-acts">{open ? '收起' : failed ? '查看错误输出' : '输出'}</span>
         )}
       </button>
-      {open && diffSource && (
-        <DiffBlock source={diffSource} title={tool.name === 'git_diff' ? main : undefined} />
+      {confirmed && <ConfirmedDiffBlock diff={confirmed} />}
+      {open && outputDiff && (
+        <DiffBlock source={outputDiff} title={tool.name === 'git_diff' ? main : undefined} />
       )}
-      {open && !diffSource && preview && (
+      {open && !outputDiff && !confirmed && preview && (
         <div className="tool-preview">{failed ? tailLines(preview, FAIL_TAIL) : preview}</div>
       )}
     </>

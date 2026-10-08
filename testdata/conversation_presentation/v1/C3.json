@@ -1,0 +1,26 @@
+{
+  "id": "C3",
+  "title": "a completed Thought folds; a live one stays visible",
+  "invariant": "provider reasoning is never assistant prose: a running Thought is visible as the live reasoning row, and a completed Thought is one folded '思考 · Ns' block whose body comes back on demand",
+  "paths": {
+    "live": [
+      { "event": { "type": "user_message_added", "message": { "id": "u1", "role": "user", "text": "解释一下解析器" } } },
+      { "event": { "type": "reasoning_started" } },
+      { "event": { "type": "reasoning_delta", "delta": "先看解析器的入口。" } },
+      { "event": { "type": "reasoning_delta", "delta": "再看它的调用方。" } },
+      { "event": { "type": "reasoning_completed", "elapsed_ms": 1600 } },
+      { "event": { "type": "assistant_message_started", "message_id": "m1" } },
+      { "event": { "type": "assistant_text_delta", "message_id": "m1", "delta": "解析器从 parse() 进入。" } },
+      { "event": { "type": "assistant_message_completed", "message_id": "m1" } },
+      { "event": { "type": "turn_answered" } }
+    ]
+  },
+  "expect": {
+    "items": [
+      { "kind": "user", "text": "解释一下解析器" },
+      { "kind": "thought", "state": "completed", "elapsed_ms": 1600, "folded": true, "body_visible": false, "body": "先看解析器的入口。再看它的调用方。" },
+      { "kind": "final_answer", "text": "解析器从 parse() 进入。" },
+      { "kind": "turn_end", "status": "answered" }
+    ]
+  }
+}

@@ -19,6 +19,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     status: 'idle',
     messages: [],
     tools: [],
+    thoughts: [],
     traces: [],
     agents: [],
     backgroundTasks: [],

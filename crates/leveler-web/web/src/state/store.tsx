@@ -85,6 +85,25 @@ export interface ToolCallView {
    *  `'work'` when an older peer did not state it — the conservative read. A
    *  surface never classifies the tool name itself. */
   answerEffect: AnswerEffect;
+  /** The runtime's CONFIRMED diff for an edit (the canonical Diff). `null`
+   *  when the call was not an edit, or the runtime reported none. The UI never
+   *  reconstructs a diff from the tool's arguments: the requested patch and the
+   *  applied result are different facts. */
+  appliedDiff: string | null;
+  /** 时间线排序戳（越小越早） */
+  seq: number;
+}
+
+/** One reasoning segment the runtime reported as finished.
+ *
+ *  Reasoning is not assistant prose: the running one is the live Thinking row,
+ *  and a completed one is a folded `思考 · Ns` block whose body is the durable
+ *  segment the runtime measured. */
+export interface ThoughtView {
+  id: string;
+  text: string;
+  /** The runtime's own measurement (`RuntimeEvent::ReasoningCompleted`). */
+  elapsedMs: number;
   /** 时间线排序戳（越小越早） */
   seq: number;
 }
@@ -106,6 +125,9 @@ export interface LastTurn {
 export interface TurnTrace {
   userSeq: number;
   tools: ToolCallView[];
+  /** The turn's completed Thoughts, frozen with its tools: they are the same
+   *  process record, and a reopened view must not lose the reasoning it saw. */
+  thoughts: ThoughtView[];
   backgroundTasks: BackgroundTaskView[];
   lastTurn: LastTurn;
 }
@@ -201,6 +223,9 @@ export interface SessionView {
   /** 模型推理流（reasoning_delta）；工具调用后被下一条 delta 替换（TUI 同款） */
   reasoning: string;
   reasoningSuperseded: boolean;
+  /** 本回合已完成的推理段（reasoning_completed）：折叠的 Thought 历史。
+   *  以事件到达顺序排列，和工具行一样属于本轮的过程。 */
+  thoughts: ThoughtView[];
   /** 当前回合开始时间（epoch ms）；空闲时为 null，用于运行计时 */
   turnStartedAt: number | null;
   /** 上一回合终态（7 值保真）；新回合开始时清空 */
@@ -327,6 +352,13 @@ export type Action =
   | { type: 'assistant_delta'; id: string; delta: string }
   | { type: 'assistant_completed'; id: string }
   | { type: 'reasoning_delta'; delta: string }
+  | {
+      /** A completed reasoning segment: the runtime's own elapsed and the text
+       *  it accumulated. Never inferred by the UI. */
+      type: 'reasoning_completed';
+      elapsedMs: number;
+      text: string;
+    }
   | { type: 'btw_started'; question: string; time: string }
   | { type: 'btw_delta'; delta: string }
   | { type: 'btw_done' }
@@ -343,6 +375,7 @@ export type Action =
       type: 'tool_completed';
       id: ToolCallId;
       ok: boolean;
+      appliedDiff?: string | null;
       preview: string;
       durationMs: number;
       stop: 'confirmed' | 'unconfirmed' | null;
@@ -435,6 +468,9 @@ function viewFromSnapshot(
     arguments: t.arguments,
     status: 'run',
     preview: null,
+    // A snapshot lists IN-FLIGHT calls only; a confirmed diff can only exist
+    // for a call that already finished, so there is nothing to read here.
+    appliedDiff: null,
     durationMs: null,
     parallel: false,
     modelStep: t.model_step ?? null,
@@ -478,6 +514,7 @@ function viewFromSnapshot(
           : null,
     reasoning: sameSession ? prev.reasoning : '',
     reasoningSuperseded: sameSession ? prev.reasoningSuperseded : false,
+    thoughts: sameSession ? prev.thoughts : [],
     turnStartedAt: sameSession ? prev.turnStartedAt : turnActive ? Date.now() : null,
     lastTurn: sameSession ? prev.lastTurn : null,
     model: snap.model ?? null,
@@ -602,6 +639,7 @@ function snapshotTurnTrace(current: SessionView): void {
   const trace: TurnTrace = {
     userSeq,
     tools: current.tools.slice(),
+    thoughts: (current.thoughts ?? []).slice(),
     backgroundTasks: current.backgroundTasks.slice(),
     lastTurn: current.lastTurn,
   };
@@ -725,6 +763,9 @@ export function reducer(state: AppState, action: Action): void {
       // 已结束的：一个仍未结束（例如已中断、将被本回合续跑）的子 agent 不属于
       // 上一回合，清掉它会让续跑事件找不到对象。
       state.current.tools = [];
+      // The turn's completed Thoughts belong to that turn's process, exactly
+      // like its tool rows, and clear with them.
+      state.current.thoughts = [];
       state.current.agents = state.current.agents.filter((a) => a.state !== 'settled');
       state.current.backgroundTasks = [];
       state.current.turnActive = true;
@@ -785,6 +826,23 @@ export function reducer(state: AppState, action: Action): void {
       state.current.reasoning += action.delta;
       return;
     }
+    case 'reasoning_completed': {
+      // The runtime states the segment is over and how long it took. Freezing
+      // it here is what turns live Thinking into a folded Thought; without it
+      // the Web had no completed-Thought history at all.
+      if (!state.current) return;
+      const text = action.text.trim();
+      if (text !== '') {
+        state.current.thoughts.push({
+          id: `th-${nextSeq()}`,
+          text,
+          elapsedMs: action.elapsedMs,
+          seq: nextSeq(),
+        });
+      }
+      resetReasoning(state.current);
+      return;
+    }
     case 'btw_started': {
       if (!state.current) return;
       state.current.messages.push({
@@ -838,6 +896,7 @@ export function reducer(state: AppState, action: Action): void {
         parallel: action.parallel,
         modelStep: action.modelStep,
         answerEffect: action.answerEffect,
+        appliedDiff: null,
         batch,
         seq: nextSeq(),
       });
@@ -858,6 +917,7 @@ export function reducer(state: AppState, action: Action): void {
                 : 'fail';
         tool.preview = action.preview || null;
         tool.durationMs = action.durationMs;
+        tool.appliedDiff = action.appliedDiff || null;
       }
       // 工具结束后把它的 activity 标签留着会像挂死；退回思考态（TUI 同款）。
       if (state.current) {

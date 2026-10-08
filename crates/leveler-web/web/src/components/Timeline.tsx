@@ -11,6 +11,7 @@ import {
   type TimelineSlot,
 } from '../lib/timelineLayout';
 import { committedFinalAnswer } from '../lib/executionRounds';
+import { foldedThoughts } from '../lib/conversationPresentation';
 import { isTurnUser } from '../lib/presentationKind';
 import { useAppState, type ChatMessage, type LastTurn, type TurnTrace } from '../state/store';
 import { AgentRunBlock } from './AgentRunBlock';
@@ -72,14 +73,14 @@ function renderSlot(
   if (slot.live && turnActive) {
     return <AgentRunBlock key={`live-${slot.userSeq}`} variant="live" />;
   }
-  const tools = slot.live ? undefined : traces.get(slot.userSeq)?.tools;
-  const backgroundTasks = slot.live ? undefined : traces.get(slot.userSeq)?.backgroundTasks;
+  const trace = slot.live ? undefined : traces.get(slot.userSeq);
   return (
     <AgentRunBlock
       key={`process-${slot.userSeq}-${index}`}
       variant="process"
-      tools={tools}
-      backgroundTasks={backgroundTasks}
+      tools={trace?.tools}
+      thoughts={foldedThoughts(trace?.thoughts ?? [])}
+      backgroundTasks={trace?.backgroundTasks}
     />
   );
 }

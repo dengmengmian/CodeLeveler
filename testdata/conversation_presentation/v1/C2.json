@@ -1,0 +1,28 @@
+{
+  "id": "C2",
+  "title": "consecutive exploration collapses into one reversible receipt",
+  "invariant": "consecutive read-only exploration (read/search/list/grep/glob) is ONE collapsed receipt '读取 N 个文件 · 搜索 M 次'; its members are not a waterfall, and opening it restores the real member chronology",
+  "paths": {
+    "live": [
+      { "event": { "type": "user_message_added", "message": { "id": "u1", "role": "user", "text": "找一下推荐模型在哪" } } },
+      { "event": { "type": "tool_call_started", "id": "t1", "name": "read_file", "arguments": "{\"path\":\"src/models.rs\"}", "parallel": false, "model_step": 1 } },
+      { "event": { "type": "tool_call_completed", "id": "t1", "ok": true, "duration_ms": 5, "preview": "const RECOMMENDED: &[&str] = &[\"gpt-6\"];" } },
+      { "event": { "type": "tool_call_started", "id": "t2", "name": "read_file", "arguments": "{\"path\":\"src/config.rs\"}", "parallel": false, "model_step": 1 } },
+      { "event": { "type": "tool_call_completed", "id": "t2", "ok": true, "duration_ms": 5, "preview": "const MODELS: &str = \"recommended\";" } },
+      { "event": { "type": "tool_call_started", "id": "t3", "name": "grep", "arguments": "{\"pattern\":\"recommended\"}", "parallel": false, "model_step": 1 } },
+      { "event": { "type": "tool_call_completed", "id": "t3", "ok": true, "duration_ms": 5, "preview": "src/config.rs:1" } },
+      { "event": { "type": "assistant_message_started", "message_id": "m1" } },
+      { "event": { "type": "assistant_text_delta", "message_id": "m1", "delta": "在 config.rs 的推荐映射里。" } },
+      { "event": { "type": "assistant_message_completed", "message_id": "m1" } },
+      { "event": { "type": "turn_answered" } }
+    ]
+  },
+  "expect": {
+    "items": [
+      { "kind": "user", "text": "找一下推荐模型在哪" },
+      { "kind": "exploration_receipt", "reads": 2, "searches": 1, "folded": true, "members_visible": false, "reversible": true, "members": ["read_file:src/models.rs", "read_file:src/config.rs", "grep:recommended"] },
+      { "kind": "final_answer", "text": "在 config.rs 的推荐映射里。" },
+      { "kind": "turn_end", "status": "answered" }
+    ]
+  }
+}

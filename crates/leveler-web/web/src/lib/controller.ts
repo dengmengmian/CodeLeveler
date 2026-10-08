@@ -212,6 +212,9 @@ export class RuntimeBridge {
           preview: ev.preview,
           durationMs: ev.duration_ms,
           stop: ev.stop ?? null,
+          // The runtime's CONFIRMED diff. Presentation never rebuilds one from
+          // the tool's arguments: the requested patch is not the applied result.
+          appliedDiff: ev.applied_diff ?? null,
         });
         break;
       case 'approval_requested':
@@ -277,6 +280,15 @@ export class RuntimeBridge {
         break;
       case 'reasoning_delta':
         this.dispatch({ type: 'reasoning_delta', delta: ev.delta });
+        break;
+      case 'reasoning_completed':
+        this.dispatch({
+          type: 'reasoning_completed',
+          elapsedMs: ev.elapsed_ms,
+          // The segment's text is what the live row accumulated; the runtime
+          // measured the duration, the UI never invents one.
+          text: current.reasoning,
+        });
         break;
       case 'command_progress':
         this.dispatch({

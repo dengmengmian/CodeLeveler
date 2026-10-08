@@ -116,13 +116,29 @@ function marker(type: DiffLineType): string {
 
 const COLLAPSED_ROWS = 20;
 
-export function DiffBlock({ source, title }: { source: string; title?: string }) {
+/**
+ * `full` renders the WHOLE patch with no row cap and no expand gate.
+ *
+ * A confirmed Diff is the product's strongest presentation contract: every
+ * file, hunk and changed line is on screen directly. The conversation passes
+ * `full`; the workspace diff browser keeps the bounded default because it is a
+ * browsing surface, not the record of one confirmed change.
+ */
+export function DiffBlock({
+  source,
+  title,
+  full = false,
+}: {
+  source: string;
+  title?: string;
+  full?: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
   const { lines, additions, deletions, files } = parseDiff(source);
   if (lines.length === 0) return null;
 
   const headerPath = title ?? (files.length === 1 ? files[0] : files.length > 1 ? `${files.length} 个文件` : 'diff');
-  const clipped = !expanded && lines.length > COLLAPSED_ROWS;
+  const clipped = !full && !expanded && lines.length > COLLAPSED_ROWS;
   const shown = clipped ? lines.slice(0, COLLAPSED_ROWS) : lines;
 
   return (
@@ -151,7 +167,7 @@ export function DiffBlock({ source, title }: { source: string; title?: string })
           ),
         )}
       </div>
-      {lines.length > COLLAPSED_ROWS && (
+      {!full && lines.length > COLLAPSED_ROWS && (
         <button className="diffv-toggle" onClick={() => setExpanded((v) => !v)}>
           {expanded ? '收起' : `··· 展开剩余 ${lines.length - COLLAPSED_ROWS} 行 ···`}
         </button>

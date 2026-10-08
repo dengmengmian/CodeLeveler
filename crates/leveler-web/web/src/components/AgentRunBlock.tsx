@@ -14,7 +14,15 @@ import {
 } from '../state/store';
 import { useBridge } from '../state/bridge';
 import { completionTruth } from '../lib/completionTruth';
+import {
+  foldedThoughts,
+  turnBlocks,
+  type FoldedThought,
+  type TurnBlock,
+} from '../lib/conversationPresentation';
 import { groupExecutionRounds, roundGlyph, roundHeadline, type ExecutionRoundView } from '../lib/executionRounds';
+import { ExplorationReceiptRow } from './ExplorationReceiptRow';
+import { ThoughtRow, ThinkingRow } from './ThoughtRow';
 import { deriveRunState, type AgentRunState } from '../lib/runstate';
 import { formatSeconds, statsLine, summarizeTools } from '../lib/toolstats';
 import { presentTurnEnd, turnFooterPrimary } from '../lib/turn';
@@ -79,6 +87,41 @@ function ExecutionRoundBlock({
   );
 }
 
+/**
+ * The turn's process blocks: completed Thoughts, exploration receipts and
+ * rounds, in the order they happened. A read-only run is ONE reversible
+ * receipt (the Thoughts it hides come back when it opens); a round keeps its
+ * truthful head and its own rows.
+ */
+function ProcessBlocks({
+  thoughts,
+  rounds,
+  showRows,
+}: {
+  thoughts: FoldedThought[];
+  rounds: ExecutionRoundView[];
+  showRows: boolean;
+}) {
+  const blocks: TurnBlock[] = turnBlocks(thoughts, rounds);
+  return (
+    <>
+      {blocks.map((block, i) => {
+        if (block.kind === 'thought') return <ThoughtRow key={block.thought.id} thought={block.thought} />;
+        if (block.kind === 'receipt') {
+          return (
+            <ExplorationReceiptRow
+              key={`receipt-${i}`}
+              receipt={block.receipt}
+              hiddenThoughts={block.thoughts}
+            />
+          );
+        }
+        return <ExecutionRoundBlock key={`round-${block.seq}-${i}`} round={block.round} showRows={showRows} />;
+      })}
+    </>
+  );
+}
+
 function BackgroundTaskRow({ task }: { task: BackgroundTaskView }) {
   const running = task.status === 'run';
   const elapsed = useElapsedSeconds(task.startedAt, running);
@@ -105,6 +148,7 @@ export function AgentRunBlock({
   variant = 'live',
   tools: toolsProp,
   backgroundTasks: bgProp,
+  thoughts: thoughtsProp,
   lastTurn: lastTurnProp,
   copyText = null,
   live: liveFooter = false,
@@ -112,6 +156,8 @@ export function AgentRunBlock({
   variant?: 'live' | 'process' | 'footer';
   tools?: ToolCallView[];
   backgroundTasks?: BackgroundTaskView[];
+  /** A frozen turn's completed Thoughts (its `TurnTrace`). */
+  thoughts?: FoldedThought[];
   lastTurn?: LastTurn | null;
   copyText?: string | null;
   live?: boolean;
@@ -130,6 +176,7 @@ export function AgentRunBlock({
     if (tools.length === 0 && backgroundTasks.length === 0) return null;
     const stats = summarizeTools(tools);
     const rounds = groupExecutionRounds(tools);
+    const thoughts = thoughtsProp ?? [];
     return (
       <div className="run-summary r-process tone-muted">
         {tools.length > 0 && <div className="rs-sub">{statsLine(stats)}</div>}
@@ -141,9 +188,7 @@ export function AgentRunBlock({
             {expanded ? '收起执行过程' : `查看执行过程 · ${tools.length}`}
           </button>
         )}
-        {rounds.map((round, i) => (
-          <ExecutionRoundBlock key={`${round.modelStep ?? 'legacy'}-${i}`} round={round} showRows={expanded} />
-        ))}
+        <ProcessBlocks thoughts={thoughts} rounds={rounds} showRows={expanded} />
       </div>
     );
   }
@@ -212,9 +257,12 @@ export function AgentRunBlock({
         <BackgroundTaskRow key={t.id} task={t} />
       ))}
 
-      {rounds.map((round, i) => (
-        <ExecutionRoundBlock key={`${round.modelStep ?? 'legacy'}-${i}`} round={round} showRows={expanded} />
-      ))}
+      <ProcessBlocks
+        thoughts={foldedThoughts(current.thoughts ?? [])}
+        rounds={rounds}
+        showRows={expanded}
+      />
+      {current.reasoning.trim() !== '' && <ThinkingRow text={current.reasoning} />}
     </div>
   );
 }

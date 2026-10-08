@@ -341,6 +341,10 @@ export type RuntimeEvent =
   | { type: 'assistant_text_delta'; delta: string; message_id: MessageId }
   /** A chunk of model reasoning/summary, rendered separately from the answer. */
   | { type: 'reasoning_delta'; delta: string }
+  /** A model reasoning segment began. Presentation opens ONE mutable reasoning block on this; it must not append a new transcript item. */
+  | { type: 'reasoning_started' }
+  /** The current reasoning segment ended cleanly. `elapsed_ms` is the runtime's own measurement of the segment. Presentation freezes its mutable block into an immutable history item on this. A segment that never receives this was interrupted, not completed. */
+  | { type: 'reasoning_completed'; elapsed_ms: number }
   /** The assistant message is complete. */
   | { type: 'assistant_message_completed'; message_id: MessageId }
   /** The assistant has produced its final response, while the runtime is still settling the task before its one authoritative terminal event. */
