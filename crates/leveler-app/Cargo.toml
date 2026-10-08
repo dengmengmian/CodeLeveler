@@ -10,7 +10,7 @@ description = "Composition root: config loading, registry assembly, database, do
 
 [features]
 default = []
-test-crash-barrier = []
+test-crash-barrier = ["leveler-agent/test-crash-barrier"]
 
 [dependencies]
 leveler-core = { workspace = true }

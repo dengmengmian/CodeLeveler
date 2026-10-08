@@ -8,6 +8,12 @@ authors.workspace = true
 repository.workspace = true
 description = "The CodeLeveler coding harness: prompt, repository context, memory, skills, ToolHost admission, write ownership and sub-agents, driven by the leveler-agent-core kernel."
 
+[features]
+default = []
+# Test-only: adds a deterministic crash barrier before a cancelled turn's
+# terminal commit. Inert in every default build.
+test-crash-barrier = []
+
 [dependencies]
 leveler-core = { workspace = true }
 leveler-lifecycle = { workspace = true }

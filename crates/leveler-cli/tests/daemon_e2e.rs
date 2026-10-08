@@ -1466,6 +1466,454 @@ async fn sigkill_before_the_receipt_settles_is_unresolvable_after_restart_body()
     stop_daemon(&mut daemon);
 }
 
+/// Spawn a daemon whose cancelled-turn terminal commit is held behind the
+/// test-only crash barrier. The barrier fires after the cancel is observed and
+/// before the terminal is durable, so a SIGKILL there reproduces the exact
+/// window the cancel-intent durability gap lives in.
+#[cfg(feature = "test-crash-barrier")]
+fn spawn_serve_with_cancel_terminal_barrier(
+    env: &TestEnv,
+    ready: &Path,
+    barrier: &Path,
+) -> ManagedChild {
+    spawn_serve_with_barrier(
+        env,
+        ready,
+        "LEVELER_TEST_BEFORE_CANCEL_TERMINAL_BARRIER",
+        barrier,
+    )
+}
+
+#[cfg(feature = "test-crash-barrier")]
+fn wait_for_cancel_terminal_barrier(barrier: &Path, daemon: &mut ManagedChild, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !barrier.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "daemon never reached the pre-terminal cancel barrier"
+        );
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon exited before the cancel barrier"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The durable task terminal(s) for a session: the last outcome and the count.
+/// Read straight from the shared database, never inferred from source.
+async fn task_terminal_state(
+    db: &leveler_storage::Database,
+    session: &leveler_core::SessionId,
+) -> (Option<String>, usize) {
+    let stores = leveler_storage::EngineStores::from_database(db);
+    let rows = stores
+        .events
+        .load_by_types(session, &["task_finished"])
+        .await
+        .unwrap();
+    let count = rows.len();
+    let outcome =
+        rows.iter().rev().find_map(|row| {
+            match leveler_engine::EngineEvent::from_payload(&row.payload) {
+                Ok(leveler_engine::EngineEvent::TaskFinished { outcome, .. }) => {
+                    Some(outcome.as_str().to_string())
+                }
+                _ => None,
+            }
+        });
+    (outcome, count)
+}
+
+/// Wait until a session's task terminal reaches `want`.
+async fn wait_for_task_outcome(db_path: &Path, session: &leveler_core::SessionId, want: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let db = leveler_storage::Database::connect(db_path).await.unwrap();
+        let (outcome, _) = task_terminal_state(&db, session).await;
+        if outcome.as_deref() == Some(want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal `{want}` was never committed; last was {outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A committed `cancelled` terminal survives a crash untouched: the reaper has
+/// no running turn to settle, so the logical-task outcome is not rewritten.
+#[test]
+fn committed_cancelled_terminal_survives_a_crash() {
+    leveler_test_support::bounded_test(
+        "committed_cancelled_terminal_survives_a_crash",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        committed_cancelled_terminal_survives_a_crash_body,
+    );
+}
+
+async fn committed_cancelled_terminal_survives_a_crash_body() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready1 = env.home.join("ready-cancel-committed-1.json");
+    let mut daemon = spawn_serve(&env, &ready1);
+    wait_ready(&ready1, &mut daemon, Duration::from_secs(30));
+
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "committed cancel crash".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "COMMITTED_CANCEL_MARKER".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    client
+        .send(ClientCommand::CancelTask {
+            session_id: session.clone(),
+        })
+        .await
+        .expect("CancelTask must ACK");
+
+    let db_path = find_state_dir(&env).join("sessions.db");
+    wait_for_task_outcome(&db_path, &session, "cancelled").await;
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    // The task terminal is durable. The turn ROW records the work-window stop
+    // (`interrupted`) while the TASK outcome is `cancelled` — those are two
+    // different authorities, not a contradiction.
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert!(
+        turns.iter().all(|turn| turn.status != "running"),
+        "the turn must already be settled: {turns:?}"
+    );
+    drop(db);
+    drop(client);
+
+    daemon
+        .kill()
+        .expect("SIGKILL after the cancelled terminal committed");
+    let _ = daemon.wait();
+
+    let ready2 = env.home.join("ready-cancel-committed-2.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let (outcome, count) = task_terminal_state(&db, &session).await;
+    assert_eq!(count, 1, "a committed terminal must not be duplicated");
+    assert_eq!(
+        outcome.as_deref(),
+        Some("cancelled"),
+        "a crash after commit must not rewrite the cancelled terminal"
+    );
+    drop(db);
+    stop_daemon(&mut daemon);
+}
+
+/// Control A — a plain `CancelCurrentTurn` acknowledged before the crash is
+/// resumable after recovery. The same crash window that loses a `CancelTask`
+/// intent must NOT change the ordinary interrupt contract.
+#[cfg(feature = "test-crash-barrier")]
+#[test]
+fn sigkill_after_cancel_current_turn_ack_stays_resumable() {
+    leveler_test_support::bounded_test(
+        "sigkill_after_cancel_current_turn_ack_stays_resumable",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        sigkill_after_cancel_current_turn_ack_stays_resumable_body,
+    );
+}
+
+#[cfg(feature = "test-crash-barrier")]
+async fn sigkill_after_cancel_current_turn_ack_stays_resumable_body() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready1 = env.home.join("ready-cancel-turn-1.json");
+    let barrier = env.home.join(format!(
+        ".test-crash-barrier-{}",
+        leveler_core::new_uuid_string()
+    ));
+    let mut daemon = spawn_serve_with_cancel_terminal_barrier(&env, &ready1, &barrier);
+    wait_ready(&ready1, &mut daemon, Duration::from_secs(30));
+
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "plain cancel crash".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "PLAIN_CANCEL_MARKER".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    client
+        .send(ClientCommand::CancelCurrentTurn {
+            session_id: session.clone(),
+        })
+        .await
+        .expect("CancelCurrentTurn must ACK");
+
+    wait_for_cancel_terminal_barrier(&barrier, &mut daemon, Duration::from_secs(15));
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let (outcome, count) = task_terminal_state(&db, &session).await;
+    assert!(
+        outcome.is_none() && count == 0,
+        "the barrier must sit before the terminal commit: {outcome:?} x{count}"
+    );
+    drop(db);
+
+    daemon.kill().expect("SIGKILL at the plain-cancel barrier");
+    let _ = daemon.wait();
+    drop(client);
+
+    let ready2 = env.home.join("ready-cancel-turn-2.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let (outcome, count) = task_terminal_state(&db, &session).await;
+    let turn_statuses: Vec<String> = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|turn| turn.status)
+        .collect();
+    let session_status = leveler_storage::SessionRepository::new(&db)
+        .get(&session)
+        .await
+        .unwrap()
+        .map(|record| format!("{:?}", record.status))
+        .unwrap_or_else(|| "<missing>".to_string());
+    assert_eq!(count, 0, "a cancelled turn commits no task terminal here");
+    assert_ne!(
+        outcome.as_deref(),
+        Some("cancelled"),
+        "a plain cancel must never be recovered as a logical-task cancel"
+    );
+    assert!(
+        turn_statuses.iter().all(|status| status == "interrupted"),
+        "a plain cancel keeps the turn resumable `interrupted`; got turns \
+         {turn_statuses:?}, session {session_status}, task terminal {outcome:?}"
+    );
+    drop(db);
+    stop_daemon(&mut daemon);
+}
+
+/// Gate 5 RED — an acknowledged `CancelTask` must survive a crash as a terminal
+/// `cancelled` task. Today the intent lives only in memory, so a boot that dies
+/// between the ACK and the terminal commit loses it, and recovery settles the
+/// orphan turn as resumable `interrupted`.
+///
+/// The crash window is exact: `LEVELER_TEST_BEFORE_CANCEL_TERMINAL_BARRIER`
+/// parks the run task after the cancel is observed and before `finish_task`.
+/// No sleep is used to guess a race.
+///
+/// Ignored so the RED stays reproducible evidence rather than a red release
+/// gate. Run it explicitly:
+/// `cargo test -p leveler-cli --features test-crash-barrier --test daemon_e2e \
+///   sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent -- --ignored`
+#[cfg(feature = "test-crash-barrier")]
+#[ignore = "Phase 2C: an acknowledged CancelTask intent is lost across a crash"]
+#[test]
+fn sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent() {
+    leveler_test_support::bounded_test(
+        "sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent",
+        leveler_test_support::DEFAULT_TEST_TIMEOUT,
+        sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent_body,
+    );
+}
+
+#[cfg(feature = "test-crash-barrier")]
+async fn sigkill_after_cancel_task_ack_loses_the_logical_cancel_intent_body() {
+    let (base_url, _model) = hold_open_model_endpoint().await;
+    let env = test_env(&base_url);
+    let ready1 = env.home.join("ready-cancel-task-1.json");
+    let barrier = env.home.join(format!(
+        ".test-crash-barrier-{}",
+        leveler_core::new_uuid_string()
+    ));
+    let mut daemon = spawn_serve_with_cancel_terminal_barrier(&env, &ready1, &barrier);
+    wait_ready(&ready1, &mut daemon, Duration::from_secs(30));
+
+    let client = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(CreateSessionRequest {
+            collaboration: leveler_local_transport::CollaborationMode::Chat,
+            workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+            approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+            goal: "logical cancel crash".to_string(),
+            model: None,
+            mode: leveler_client_protocol::PermissionProfile::Assisted,
+        })
+        .await
+        .unwrap()
+        .session
+        .id;
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "CANCEL_TASK_CRASH_MARKER".to_string(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+
+    let db_path = find_state_dir(&env).join("sessions.db");
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let running = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert!(
+        running.iter().any(|turn| turn.status == "running"),
+        "the turn must be running before CancelTask: {running:?}"
+    );
+    drop(db);
+
+    // A. The acknowledged command: use an explicit CommandId so the post-crash
+    //    retry can reuse it and prove the retry masks nothing.
+    let cancel_id = leveler_client_protocol::CommandId::new("cmd-cancel-task-crash");
+    let cancel_envelope = leveler_client_protocol::CommandEnvelope {
+        command_id: cancel_id.clone(),
+        session_id: session.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command: ClientCommand::CancelTask {
+            session_id: session.clone(),
+        },
+    };
+    client
+        .deliver(cancel_envelope.clone())
+        .await
+        .expect("CancelTask must ACK");
+
+    // B. The ACK is out and the terminal is not durable yet.
+    wait_for_cancel_terminal_barrier(&barrier, &mut daemon, Duration::from_secs(15));
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let (outcome, count) = task_terminal_state(&db, &session).await;
+    assert!(
+        outcome.is_none() && count == 0,
+        "no terminal may be durable at the barrier: {outcome:?} x{count}"
+    );
+    let turns = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap();
+    assert!(
+        turns.iter().all(|turn| turn.status != "cancelled"),
+        "no turn may be durably cancelled before the task terminal commits: {turns:?}"
+    );
+    drop(db);
+
+    // C. SIGKILL the boot that acknowledged the cancel.
+    daemon.kill().expect("SIGKILL at the CancelTask barrier");
+    let _ = daemon.wait();
+    assert!(
+        daemon.try_wait().unwrap().is_some(),
+        "the old boot must be dead before recovery"
+    );
+    drop(client);
+
+    // D. A new boot recovers.
+    let ready2 = env.home.join("ready-cancel-task-2.json");
+    let mut daemon = spawn_serve(&env, &ready2);
+    wait_ready(&ready2, &mut daemon, Duration::from_secs(30));
+
+    // H. The durable facts are observable.
+    let db = leveler_storage::Database::connect(&db_path).await.unwrap();
+    let messages = leveler_storage::MessageRepository::new(&db)
+        .load(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|payload| payload.contains("CANCEL_TASK_CRASH_MARKER"))
+            .count(),
+        1,
+        "recovery must not duplicate the initiating input"
+    );
+
+    // I. A same-CommandId retry is answered as a completed duplicate and
+    //    dispatches nothing, so it cannot repair a lost intent.
+    let retry = LocalSocketRuntimeClient::connect(&find_socket(&env))
+        .await
+        .unwrap()
+        .deliver(cancel_envelope)
+        .await;
+    assert!(
+        retry.is_ok(),
+        "a completed receipt must answer the retry instead of re-dispatching: {retry:?}"
+    );
+
+    // E/F/G. The logical cancel must be terminal and non-resumable, not the
+    // resumable `interrupted` and never a forged `completed`.
+    let (outcome, count) = task_terminal_state(&db, &session).await;
+    let turn_statuses: Vec<String> = leveler_storage::TurnRepository::new(&db)
+        .list(&session)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|turn| turn.status)
+        .collect();
+    let session_status = leveler_storage::SessionRepository::new(&db)
+        .get(&session)
+        .await
+        .unwrap()
+        .map(|record| format!("{:?}", record.status))
+        .unwrap_or_else(|| "<missing>".to_string());
+    assert_ne!(
+        outcome.as_deref(),
+        Some("completed"),
+        "recovery must never forge a completed task"
+    );
+    assert_eq!(
+        outcome.as_deref(),
+        Some("cancelled"),
+        "DEFECT: after an acknowledged CancelTask the recovered task must be a terminal \
+         `cancelled`; recovery settled task terminal {outcome:?} (count {count}), \
+         turns {turn_statuses:?}, session {session_status}"
+    );
+    drop(db);
+    stop_daemon(&mut daemon);
+}
+
 /// Gate Scenario A: a running daemon reports identity + admission health
 /// over the socket, and the numbers reflect reality (no active work yet).
 #[test]

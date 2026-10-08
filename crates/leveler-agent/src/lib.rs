@@ -23,6 +23,7 @@ mod nudges;
 pub mod ownership;
 mod prompt;
 mod sub_agent;
+mod test_barrier;
 mod update_plan;
 
 // The kernel owns these: one definition of what a spent budget is, shared by

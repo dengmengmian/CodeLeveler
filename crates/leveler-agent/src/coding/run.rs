@@ -1390,6 +1390,12 @@ impl CodingRuntime {
             // only a detached target set and has performed no side effect yet.
             cleanup_ticket = None;
         }
+        // Test-only exact crash window: a cancel has been observed and the
+        // terminal is decided, but nothing is durable yet. The default build
+        // compiles the barrier body away; the call itself is a no-op.
+        if interrupted {
+            crate::test_barrier::hit_before_cancel_terminal_persist();
+        }
         let settled = self
             .engine
             .finish_task(token, session_id, terminal, observer)
