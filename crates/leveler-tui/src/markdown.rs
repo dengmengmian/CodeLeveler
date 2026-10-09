@@ -1,9 +1,9 @@
 //! Markdown rendering for the transcript (spec §62).
 //!
-//! Parsing (pulldown-cmark) and syntax highlighting (syntect) happen once, when
-//! a message completes, producing a width-agnostic [`MdDoc`]. Each frame that
-//! doc is laid out to the current width — cheap word-wrapping, no re-parsing —
-//! honoring the "don't re-parse Markdown every frame" performance rule.
+//! Completed messages reuse a width-agnostic [`MdDoc`]. Streaming updates still
+//! parse the whole Markdown document to preserve nonlocal syntax; append-only
+//! code blocks reuse completed-line highlighting and recompute their partial tail.
+//! Width changes lay out the existing document without parsing or highlighting.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -1183,7 +1183,7 @@ type HighlightedLines = Vec<HighlightedLine>;
 /// final color mapping happens later at render time, so entries never go stale
 /// with a theme change. Bounds are on both entry count and retained source
 /// bytes, so a session that pastes many large blocks cannot grow without limit.
-const HIGHLIGHT_CACHE_MAX_ENTRIES: usize = 512;
+const HIGHLIGHT_CACHE_MAX_ENTRIES: usize = 640;
 const HIGHLIGHT_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 struct HighlightEntry {
@@ -1611,6 +1611,100 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::theme::ThemeId;
+
+    #[test]
+    fn measured_hot_set_reentry_preserves_rows_without_syntect_work() {
+        let memo = Mutex::new(HighlightCache::default());
+        let mut sources: Vec<String> = (0..574)
+            .map(|i| format!("small code block {i}\n"))
+            .collect();
+        sources.push("large history code line\n".repeat(40_000));
+        assert!(sources.iter().map(String::len).sum::<usize>() < HIGHLIGHT_CACHE_MAX_BYTES);
+        let original: Vec<_> = sources
+            .iter()
+            .map(|s| highlight_code_with_cache(s, None, &memo))
+            .collect();
+        let mut held = MdDoc::default();
+        for lines in &original {
+            held.blocks.push(MdBlock::Code {
+                lang: None,
+                title: None,
+                lines: lines.clone(),
+            });
+        }
+        let before = highlight_cache_snapshot_inner(&memo.lock().unwrap(), &[&held]);
+        HIGHLIGHT_TEST_WORK.with(|work| work.set((0, 0)));
+        let replay: Vec<_> = sources
+            .iter()
+            .map(|s| highlight_code_with_cache(s, None, &memo))
+            .collect();
+        let actual_work = HIGHLIGHT_TEST_WORK.with(|work| work.get());
+        assert_eq!(
+            actual_work,
+            (0, 0),
+            "the measured 575-block hot set fits the source budget and must replay without highlighting"
+        );
+        assert!(
+            original
+                .iter()
+                .zip(&replay)
+                .all(|(old, new)| Arc::ptr_eq(old, new))
+        );
+        let after = highlight_cache_snapshot_inner(&memo.lock().unwrap(), &[&held]);
+        assert_eq!(before["cache_and_active"], after["cache_and_active"]);
+        assert_eq!(
+            after["cache_and_active"],
+            after["union_with_held_documents"]
+        );
+    }
+
+    #[test]
+    fn highlight_cache_evicts_lru_beyond_capacity_and_preserves_values() {
+        let mut cache = HighlightCache::default();
+        let lines = Arc::new(Vec::new());
+        for key in 0..HIGHLIGHT_CACHE_MAX_ENTRIES as u64 {
+            cache.put(key, None, Arc::from(format!("block {key}")), lines.clone());
+        }
+        assert!(cache.get(0, None, "block 0").is_some());
+        let key = HIGHLIGHT_CACHE_MAX_ENTRIES as u64;
+        cache.put(key, None, Arc::from(format!("block {key}")), lines.clone());
+        assert_eq!(cache.entries.len(), HIGHLIGHT_CACHE_MAX_ENTRIES);
+        assert!(
+            cache.get(1, None, "block 1").is_none(),
+            "least recent entry is evicted"
+        );
+        assert!(Arc::ptr_eq(&cache.get(0, None, "block 0").unwrap(), &lines));
+        assert!(cache.get(key, None, "incorrect source").is_none());
+        assert!(
+            cache
+                .get(key, Some("rust"), &format!("block {key}"))
+                .is_none()
+        );
+        assert_eq!(
+            cache.total_bytes,
+            cache.entries.values().map(|e| e.code.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn highlight_cache_retains_source_budget_and_single_oversized_exception() {
+        let mut cache = HighlightCache::default();
+        let lines = Arc::new(Vec::new());
+        let half = "x".repeat(HIGHLIGHT_CACHE_MAX_BYTES / 2 + 1);
+        cache.put(1, None, Arc::from(half.as_str()), lines.clone());
+        cache.put(2, None, Arc::from(half.as_str()), lines.clone());
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.total_bytes <= HIGHLIGHT_CACHE_MAX_BYTES);
+        assert!(cache.get(1, None, &half).is_none());
+        let oversized = "y".repeat(HIGHLIGHT_CACHE_MAX_BYTES + 1);
+        cache.put(3, None, Arc::from(oversized.as_str()), lines);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.total_bytes, oversized.len());
+        assert!(cache.get(3, None, &oversized).is_some());
+        cache.clear();
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.active.is_none());
+    }
 
     #[test]
     fn owned_snapshot_deduplicates_shared_rows_and_observes_document_retention() {
