@@ -113,7 +113,7 @@
   "title": "prose-free multi-round",
   "rendered": {
     "contains": [
-      "▸ 读取 2 个文件 · 搜索 1 次"
+      "▸ 读取 2 次 · 搜索 1 次"
     ],
     "excludes": [
       "读取 src/a.rs",

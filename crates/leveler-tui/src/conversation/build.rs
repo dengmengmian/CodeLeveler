@@ -1125,7 +1125,7 @@ mod exploration_fold_tests {
         assert_eq!(found.len(), 1, "one aggregate receipt: {lines:#?}");
         assert_eq!(
             found[0].trim_end(),
-            "\u{25b8} 读取 2 个文件 \u{b7} 搜索 1 次"
+            "\u{25b8} 读取 2 次 \u{b7} 搜索 1 次"
         );
         assert!(
             !lines.iter().any(|l| l.contains("思考 ·")),
@@ -1153,7 +1153,7 @@ mod exploration_fold_tests {
         seal(&mut s);
 
         let collapsed = render(&s);
-        assert!(collapsed.iter().any(|l| l.contains("读取 2 个文件")));
+        assert!(collapsed.iter().any(|l| l.contains("读取 2 次")));
 
         let anchor = first_group_index(&s);
         crate::conversation::interaction::toggle_fold(&mut s, anchor);

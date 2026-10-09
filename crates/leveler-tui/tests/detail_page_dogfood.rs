@@ -436,7 +436,7 @@ fn dogfood_sub_agent_detail_page() {
     println!("--- SUB-AGENT (running) ---\n{running}");
     assert!(running.contains("  Euclid"), "{running}");
     assert!(running.contains("● 运行中"), "{running}");
-    assert!(running.contains("读取 6 个文件"), "{running}");
+    assert!(running.contains("读取 6 次"), "{running}");
     assert!(running.contains("执行了 9 个命令"), "{running}");
     assert!(
         running.contains("● 搜索代码"),

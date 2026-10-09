@@ -228,7 +228,7 @@ fn a_homogeneous_shell_round_names_the_tool() {
     );
 }
 
-/// B — three reads in one round read as ONE compact receipt (`读取 3 个文件`),
+/// B — three reads in one round read as ONE compact receipt (`读取 3 次`),
 /// not a row per file and not a per-tool count line.
 #[test]
 fn a_homogeneous_read_round_reads_as_one_receipt() {
@@ -241,7 +241,7 @@ fn a_homogeneous_read_round_reads_as_one_receipt() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("读取") && l.contains("3 个文件"))
+        .find(|l| l.contains("读取") && l.contains("3 次"))
         .unwrap_or_else(|| panic!("the read round is a receipt: {t:?}"));
     assert!(
         !head.contains("完成 3 项"),
