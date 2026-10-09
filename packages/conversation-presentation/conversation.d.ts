@@ -15,9 +15,12 @@ export interface ToolView {
   appliedDiff?: string | null;
   durationMs?: number | null;
   seq: number;
+  anchor?: string;
+  task_id?: string;
 }
 
 export interface ThoughtView {
+  anchor?: string;
   id: string;
   text: string;
   elapsedMs: number;
@@ -33,6 +36,7 @@ export interface RoundView {
 }
 
 export interface ExplorationMember {
+  seq?: number;
   id: string;
   name: string;
   target: string;
@@ -40,6 +44,7 @@ export interface ExplorationMember {
 }
 
 export interface ExplorationReceipt {
+  anchor?: string;
   kind: 'exploration_receipt';
   reads: number;
   searches: number;
@@ -66,6 +71,7 @@ export interface ConfirmedDiff {
 }
 
 export interface FoldedThought {
+  anchor?: string;
   kind: 'thought';
   id: string;
   elapsedMs: number;
@@ -102,3 +108,5 @@ export function commandOutputBody(preview: string): string[];
 export function failureLine(preview: string): string | null;
 export function isCommandTool(name: string): boolean;
 export function displayPreview(tool: ToolView): string | null;
+
+export function explorationEntries(receipt: ExplorationReceipt, thoughts: readonly FoldedThought[]): ({kind: 'member'; member: ExplorationMember; seq: number} | {kind: 'thought'; thought: FoldedThought; seq: number})[];

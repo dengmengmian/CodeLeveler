@@ -292,3 +292,5 @@ export function turnTerminalFromEvent(type,messages,tools){
  if(type==='turn_cancelled')return 'cancelled';
  return null;
 }
+
+export { explorationEntries } from '../../../packages/conversation-presentation/conversation.mjs';

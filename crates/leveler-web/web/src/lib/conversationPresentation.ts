@@ -15,6 +15,7 @@ import type { ThoughtView, ToolCallView } from '../state/store';
 import type { ExecutionRoundView } from './executionRounds';
 
 export interface ExplorationMember {
+  seq?: number;
   id: string;
   name: string;
   target: string;
@@ -55,6 +56,7 @@ export interface ConfirmedDiff {
 
 /** A completed Thought as the conversation presents it: folded, openable. */
 export interface FoldedThought {
+  anchor?: string;
   kind: 'thought';
   id: string;
   elapsedMs: number;
@@ -116,4 +118,11 @@ export function turnBlocks(
   rounds: readonly ExecutionRoundView[],
 ): TurnBlock[] {
   return shared.turnBlocks(thoughts as never, rounds as never) as TurnBlock[];
+}
+
+export function explorationEntries(receipt: ExplorationReceipt, thoughts: readonly FoldedThought[]) {
+  return shared.explorationEntries(receipt as never, thoughts as never) as (
+    | { kind: 'member'; member: ExplorationMember; seq: number }
+    | { kind: 'thought'; thought: FoldedThought; seq: number }
+  )[];
 }

@@ -4,6 +4,8 @@ import { initialState, reducer, type AppState, type Action } from '../state/stor
 import { RuntimeBridge } from './controller';
 import { Timeline } from '../components/Timeline';
 import { AgentRunBlock } from '../components/AgentRunBlock';
+import { foldedThoughts, turnBlocks } from './conversationPresentation';
+import { groupExecutionRounds } from './executionRounds';
 import traceSource from '../../../testdata/conversation_presentation/wire-v1/full-execution.json?raw';
 
 let state: AppState;
@@ -34,7 +36,12 @@ it('actual completed wire thoughts remain in the latest Timeline process slot', 
   expect(state.current?.thoughts).toHaveLength(4);
   expect(state.current?.thoughts.map(t => t.elapsedMs)).toEqual([0, 0, 0, 0]);
   const html = renderToStaticMarkup(<Timeline />);
-  expect((html.match(/data-thought-id=/g) ?? []).length).toBe(4);
+  const blocks = turnBlocks(foldedThoughts(state.current!.thoughts), groupExecutionRounds(state.current!.tools));
+  const outside = blocks.filter(block => block.kind === 'thought');
+  const retained = blocks.flatMap(block => block.kind === 'thought' ? [block.thought] : block.kind === 'receipt' ? block.thoughts : []);
+  expect(retained.map(thought => thought.id)).toEqual(state.current!.thoughts.map(thought => thought.id));
+  expect((html.match(/data-thought-id=/g) ?? []).length).toBe(outside.length);
+  for (const block of outside) if (block.kind === 'thought') expect(html).toContain(`data-thought-id="${block.thought.id}"`);
 });
 
 it('actual confirmed filesystem diff is full and inline while its execution round is collapsed', () => {

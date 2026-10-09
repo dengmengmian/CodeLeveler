@@ -32,12 +32,15 @@
  * @property {string|null} [appliedDiff]
  * @property {number|null} [durationMs]
  * @property {number} seq
+ * @property {string} [anchor]
+ * @property {string} [task_id]
  *
  * @typedef {object} ThoughtView
  * @property {string} id
  * @property {string} text
  * @property {number} elapsedMs
  * @property {number} seq
+ * @property {string} [anchor]
  *
  * @typedef {object} RoundView
  * @property {number|null} modelStep
@@ -153,8 +156,10 @@ export function groupExploration(tools) {
         name: tool.name,
         target: memberTarget(tool),
         status: tool.status,
+        seq: tool.seq,
       })),
       seq: run[0].seq,
+      ...(run[0].anchor !== undefined ? { anchor: run[0].anchor } : {}),
     });
     run = [];
   };
@@ -262,6 +267,7 @@ export function foldedThoughts(thoughts) {
       folded: true,
       body: thought.text,
       seq: thought.seq,
+      ...(thought.anchor !== undefined ? { anchor: thought.anchor } : {}),
     }));
 }
 
@@ -270,7 +276,7 @@ export function foldedThoughts(thoughts) {
  * @param {readonly ToolView[]} tools @returns {boolean}
  */
 function isReceiptRun(tools) {
-  if (tools.length < 2) return false;
+  if (tools.length < 2 || tools.some(tool => tool.anchor !== tools[0].anchor || tool.task_id !== tools[0].task_id)) return false;
   const receipts = groupExploration(tools);
   return receipts.length === 1 && receipts[0].members.length === tools.length;
 }
@@ -289,19 +295,46 @@ function isReceiptRun(tools) {
 export function turnBlocks(thoughts, rounds) {
   const blocks = [];
   const folds = [];
-  for (const round of rounds) {
+  // Model steps delimit execution rounds, not read-only presentation runs.
+  // Only confirmed successful exploration may bridge that boundary; an error,
+  // pending result, mutation or a different message/task anchor ends the run.
+  let pending = [];
+  const addRound = (round) => {
     const tools = round.tools || [];
     if (isReceiptRun(tools)) {
       const receipt = groupExploration(tools)[0];
       const block = { kind: 'receipt', receipt, thoughts: [], seq: receipt.seq };
       folds.push({ first: receipt.seq, last: tools[tools.length - 1].seq, block });
       blocks.push(block);
-      continue;
+    } else {
+      blocks.push({ kind: 'round', round, seq: (tools[0] && tools[0].seq) || 0 });
     }
-    blocks.push({ kind: 'round', round, seq: (tools[0] && tools[0].seq) || 0 });
+  };
+  const flush = () => {
+    if (pending.length === 0) return;
+    const tools = pending.flatMap(round => round.tools);
+    if (tools.length >= 2) addRound({ ...pending[0], tools });
+    else addRound(pending[0]);
+    pending = [];
+  };
+  for (const round of rounds) {
+    const tools = round.tools || [];
+    const eligible = tools.length > 0 && tools.every(tool =>
+      isExplorationTool(tool.name) && SETTLED_OK.includes(tool.status) &&
+      tool.anchor === tools[0].anchor && tool.task_id === tools[0].task_id);
+    const last = pending.length > 0 ? pending[pending.length - 1].tools.at(-1) : undefined;
+    const first = tools[0];
+    if (!eligible || (last && (last.anchor !== first.anchor || last.task_id !== first.task_id))) flush();
+    if (eligible) pending.push(round);
+    else addRound(round);
   }
+  flush();
+  const seenThoughtIds = new Set();
   for (const thought of thoughts) {
-    const fold = folds.find((candidate) => thought.seq > candidate.first && thought.seq < candidate.last);
+    if (seenThoughtIds.has(thought.id)) continue;
+    seenThoughtIds.add(thought.id);
+    const fold = folds.find((candidate) => thought.seq > candidate.first && thought.seq < candidate.last &&
+      thought.anchor === candidate.block.receipt.anchor);
     if (fold) {
       fold.block.thoughts.push(thought);
       continue;
@@ -310,6 +343,17 @@ export function turnBlocks(thoughts, rounds) {
   }
   blocks.sort((a, b) => a.seq - b.seq);
   return blocks;
+}
+
+/** A reversible receipt restores members and Thoughts in their original order.
+ * @param {{seq:number,members:readonly {id:string,seq?:number}[]}} receipt
+ * @param {readonly {id:string,seq:number}[]} thoughts
+ */
+export function explorationEntries(receipt, thoughts) {
+  return [
+    ...receipt.members.map(member => ({ kind: 'member', member, seq: member.seq ?? receipt.seq })),
+    ...thoughts.map(thought => ({ kind: 'thought', thought, seq: thought.seq })),
+  ].sort((a, b) => a.seq - b.seq);
 }
 
 /** Runtime execution rows: they say HOW a command ran, never why it failed.

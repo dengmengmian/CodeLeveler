@@ -7,7 +7,7 @@
 // fold hides, it never destroys.
 
 import { useState } from 'react';
-import type { ExplorationReceipt, FoldedThought } from '../lib/conversationPresentation';
+import { explorationEntries, type ExplorationReceipt, type FoldedThought } from '../lib/conversationPresentation';
 import { ThoughtRow } from './ThoughtRow';
 
 const STATUS_GLYPH: Record<string, string> = {
@@ -45,7 +45,10 @@ export function ExplorationReceiptRow({
       </button>
       {open && (
         <div className="exploration-members">
-          {receipt.members.map((member) => (
+          {explorationEntries(receipt, hiddenThoughts).map(entry => {
+            if (entry.kind === 'thought') return <ThoughtRow key={entry.thought.id} thought={entry.thought} />;
+            const member = entry.member;
+            return (
             <div key={member.id} className={`exploration-member ${member.status}`}>
               <span className="exploration-member-glyph" aria-hidden="true">
                 {STATUS_GLYPH[member.status] ?? '◇'}
@@ -53,10 +56,8 @@ export function ExplorationReceiptRow({
               <span className="exploration-member-name">{member.name}</span>
               {member.target !== '' && <span className="exploration-member-target">{member.target}</span>}
             </div>
-          ))}
-          {hiddenThoughts.map((thought) => (
-            <ThoughtRow key={thought.id} thought={thought} />
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
