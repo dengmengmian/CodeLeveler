@@ -68,6 +68,22 @@ impl LiveViews {
     pub fn clear(&self, session_id: &SessionId) {
         self.views.lock().unwrap().remove(session_id);
     }
+
+    /// Forget only the last context accounting for a session, keeping the rest
+    /// of its live view.
+    ///
+    /// The accounting describes ONE assembled request against the policy in
+    /// force when it was published. When that stops being the request the
+    /// runtime would send next — the model changed, so the resolved policy
+    /// (window, reservation, soft threshold) changed, or the active context was
+    /// replaced by a compaction — the old numbers must not be served as
+    /// current. The next assembled request republishes them; meanwhile a client
+    /// shows nothing rather than a denominator measured for a different policy.
+    pub fn clear_context(&self, session_id: &SessionId) {
+        if let Some(view) = self.views.lock().unwrap().get_mut(session_id) {
+            view.context_usage = None;
+        }
+    }
 }
 
 /// The pure reducer: what each client-visible event means for the live view.
@@ -381,5 +397,46 @@ mod task_cancel_cleanup_tests {
         assert!(restored.active_tools.is_empty());
         assert!(restored.plan.is_none());
         assert!(restored.finalization_stage.is_none());
+    }
+
+    /// Dropping the context accounting is surgical: the rest of the live view
+    /// (a running tool, the plan) survives, because only the numbers measured
+    /// for a policy that no longer applies are invalid.
+    #[test]
+    fn clear_context_keeps_the_rest_of_the_live_view() {
+        let session_id = SessionId::new("s1");
+        let views = LiveViews::default();
+        let projection = leveler_model::RequestProjection::project(
+            &[],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::default(),
+        );
+        let accounting = leveler_model::ContextAccounting::compute(
+            leveler_model::ModelRef::new("mock", "m"),
+            &projection,
+            None,
+            None,
+            None,
+        );
+        views.apply(
+            &session_id,
+            &RuntimeEvent::PlanUpdated {
+                plan: UiPlan { steps: Vec::new() },
+            },
+        );
+        views.apply(&session_id, &RuntimeEvent::ContextUsage { accounting });
+        assert!(views.view(&session_id).context_usage.is_some());
+
+        views.clear_context(&session_id);
+        let view = views.view(&session_id);
+        assert!(view.context_usage.is_none());
+        assert!(
+            view.plan.is_some(),
+            "the plan is not the context's to clear"
+        );
+
+        // Clearing a session with no live view is a no-op, not a panic.
+        views.clear_context(&SessionId::new("never-seen"));
     }
 }

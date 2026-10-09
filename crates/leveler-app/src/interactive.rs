@@ -1460,6 +1460,17 @@ impl InProcessRuntimeClient {
             SessionEditResult::Conflict(_) => return Ok(false),
             SessionEditResult::Applied(_) => {}
         }
+        if matches!(
+            command,
+            ClientCommand::SelectModel { .. } | ClientCommand::SetDefaultModel { .. }
+        ) {
+            // The resolved context policy is per-model: the published accounting
+            // names the previous model's window, reservation and soft threshold.
+            // Keeping it would show a denominator the next request never uses,
+            // so drop it. The next assembled request republishes it under the
+            // new policy; until then the client shows nothing.
+            self.live_views.clear_context(session_id);
+        }
         if matches!(command, ClientCommand::SetPermissionProfile { .. }) {
             let config = self.runtime_config(session_id).await?;
             self.app
@@ -6178,6 +6189,10 @@ async fn compact_conversation(
         fail(format!("压缩失败：{e}（原历史与任务状态未改动）"));
         return false;
     }
+    // The transcript the previous accounting measured is gone: keeping it would
+    // report the pre-compaction size against the post-compaction history. The
+    // next turn republishes the folded request's accounting.
+    live_views.clear_context(session_id);
 
     let settings = match SessionRepository::new(&db)
         .settings_snapshot(session_id)

@@ -854,6 +854,14 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             );
         }
         RuntimeEvent::ContextCompacted { from, to } => {
+            // The measured transcript was replaced. The runtime drops its own
+            // accounting; the client must drop the snapshot AND the token
+            // fallback so no pre-compaction figure survives the fold.
+            state.context.loaded = None;
+            state.context_tokens = 0;
+            state.token_input = 0;
+            state.token_output = 0;
+            state.token_cached = 0;
             // Compaction is not a passing event: everything above this point is
             // a summary to the model now. A toast that fades leaves the reader
             // scrolling through detail the model no longer holds, so the
@@ -1589,11 +1597,24 @@ fn apply_meta(state: &mut AppState, session: &UiSessionSnapshot) {
     state.repository = session.repository.clone();
     state.branch = session.branch.clone();
     state.goal = session.goal.clone();
-    state.model_label = session
+    let model_label = session
         .model
         .as_ref()
         .map(|m| m.to_string())
         .unwrap_or_else(|| "Auto".to_string());
+    if state.model_label != model_label {
+        // The context accounting was measured against the previous model's
+        // resolved policy. A different model makes every one of its figures a
+        // denominator the next request never uses, so drop it with the token
+        // fallback; the refreshed query answers with the new policy's numbers
+        // (or nothing, until an assembled request exists).
+        state.context.loaded = None;
+        state.context_tokens = 0;
+        state.token_input = 0;
+        state.token_output = 0;
+        state.token_cached = 0;
+    }
+    state.model_label = model_label;
     state.mode = session.mode;
     state.mode_label = mode_label(session.mode).to_string();
     state.available_models = session.available_models.clone();
@@ -1731,6 +1752,7 @@ fn apply_session_with(
         state.diff_query = None;
         state.diff_pending = false;
         state.context.pending_query_id = None;
+        state.context.loaded = None;
         state.trace.pending_query_id = None;
         state.context_files.clear();
         state.context_tokens = 0;
