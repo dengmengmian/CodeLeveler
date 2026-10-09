@@ -364,6 +364,12 @@ pub struct UiText {
     pub activity_focus_hint: &'static str,
     /// Expanded output that dropped its head: "前 {} 行未显示".
     pub command_output_hidden: &'static str,
+    /// Expanded output whose MIDDLE was omitted (head and tail both shown):
+    /// "… 其余 {} 行未显示".
+    pub command_output_omitted: &'static str,
+    /// Expanded output whose client-side copy lost its head to the tail cap, so
+    /// the count is unknowable: "… 更早的输出未保留".
+    pub command_output_head_dropped: &'static str,
     /// 待发送 area: "待发送 · {}", actions, per-item delivery labels, overflow.
     pub pending_inputs_title: &'static str,
     pub pending_input_send: &'static str,
@@ -1357,6 +1363,8 @@ static ZH: UiText = UiText {
     command_focus_hint: "Enter 展开 · x 停止",
     activity_focus_hint: "Enter 查看",
     command_output_hidden: "前 {} 行未显示",
+    command_output_omitted: "… 其余 {} 行未显示",
+    command_output_head_dropped: "… 更早的输出未保留",
     pending_inputs_title: "待发送 · {}",
     pending_input_send: "发送",
     pending_input_delete: "删除",
@@ -2139,6 +2147,8 @@ static EN: UiText = UiText {
     command_focus_hint: "Enter expand · x stop",
     activity_focus_hint: "Enter open",
     command_output_hidden: "{} earlier lines hidden",
+    command_output_omitted: "… {} more lines hidden",
+    command_output_head_dropped: "… earlier output was not retained",
     pending_inputs_title: "Not sent · {}",
     pending_input_send: "send",
     pending_input_delete: "delete",

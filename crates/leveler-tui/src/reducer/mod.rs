@@ -1569,16 +1569,22 @@ fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
     })]
 }
 
-/// Ctrl+O (undocumented fallback): toggle the latest collapsible block —
-/// a tool group or a sub-agent.
+/// Ctrl+O (keyboard fold): toggle the LATEST TOOL GROUP.
 ///
-/// The primary product interaction is still clicking the ▸ row; this only
-/// reaches whatever is latest.
+/// The product's help names this binding "展开/收起最新工具组", so its target
+/// is the newest execution group — never "whatever entry folded last". A live
+/// Thought always sits after the tool group of the round it belongs to, so a
+/// latest-foldable target sent every Ctrl+O to the Thought and left the tool
+/// body reachable only by mouse. A transcript with no tool group at all still
+/// falls back to the newest foldable, so the key is never dead.
+///
+/// The mouse path is unchanged: a click targets exactly the row it lands on.
 fn toggle_current_expand(state: &mut AppState) {
-    // Ctrl+O reaches whatever the transcript most recently folded — including
-    // the Thought that just finished. The anchor path is shared with the mouse
-    // so a keyboard fold never jumps the viewport either.
-    let Some(index) = state.transcript.last_foldable_index() else {
+    let Some(index) = state
+        .transcript
+        .last_tool_group_index()
+        .or_else(|| state.transcript.last_foldable_index())
+    else {
         return;
     };
     if let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index) {
