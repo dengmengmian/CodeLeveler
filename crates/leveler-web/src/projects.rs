@@ -12,8 +12,9 @@
 //! Two facts are kept apart on purpose. This manager owns the CHILD HANDLE of
 //! a daemon it launched; it does not own the runtime's work. So a stop always
 //! goes through [`ProjectManager::retire_owned`], which asks the runtime
-//! (`try_retire_if_idle`, or its own health for a runtime older than that
-//! request) and only releases a child the runtime agreed owed nothing.
+//! (`try_retire_if_idle`) and only releases a child after admission is closed.
+//! Unsupported or unanswered retirement leaves the child with its original
+//! owner; a health snapshot cannot authorize replacement.
 //!
 //! Consequences, all deliberate:
 //!
@@ -34,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
 
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, ProjectStatus};
+use leveler_client_protocol::ProjectStatus;
 use leveler_local_transport::LocalRuntimeService;
 use leveler_project::Layout;
 use leveler_runtime_host::{
@@ -701,9 +702,21 @@ async fn monitor_child(
             tracing::warn!(repo = %repo.display(), ?status, "project daemon exited");
             state.set_status(&repo, ProjectStatus::Offline);
         }
-        _ = kill => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        command = kill => {
+            match command {
+                Ok(()) => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+                Err(_) => {
+                    // Unregistering a project or closing the manager drops
+                    // this sender. Channel closure grants no retirement
+                    // authority; retain supervision until the owner exits.
+                    let status = child.wait().await;
+                    tracing::warn!(repo = %repo.display(), ?status, "project daemon exited");
+                    state.set_status(&repo, ProjectStatus::Offline);
+                }
+            }
         }
     }
 }
@@ -778,9 +791,9 @@ impl ProjectManager {
     /// - `Busy` — reported, never enforced;
     /// - `GenerationChanged` — another client is already replacing it, so this
     ///   manager steps aside instead of racing;
-    /// - `Unsupported` (a runtime older than the atomic request) — falls back to
-    ///   that runtime's OWN fresh health report: idle may be stopped, anything
-    ///   else may not.
+    /// - `Unsupported` or an unanswered request — a fresh busy report explains
+    ///   a deferral; apparent idleness still cannot authorize stopping. The
+    ///   runtime's original owner must exit normally.
     ///
     /// A daemon this manager only attached to is never signalled at all: there
     /// is no child handle for it, and it is not ours to end.
@@ -827,35 +840,29 @@ impl ProjectManager {
                     reason: "运行时已被另一客户端替换".to_string(),
                 }
             }
-            Ok(leveler_client_protocol::RetireDecision::Unsupported) | Err(_) => {
-                // No atomic answer. The only authority left is the runtime's own
-                // health, read FRESH — never the snapshot from before the
-                // failure, which could already be stale.
-                match service.runtime_info().await {
-                    Ok(fresh) if fresh.health.quiescent() => {
-                        if let Err(error) = InteractiveRuntimeClient::send(
-                            service.as_ref(),
-                            ClientCommand::ShutdownWhenIdle {
-                                reason: leveler_client_protocol::RestartReason::RestartRequested,
-                            },
-                        )
-                        .await
-                        {
-                            return OwnedRetirement::Unavailable {
-                                reason: error.to_string(),
-                            };
-                        }
-                        if let Some(kill) = entry.kill.take() {
-                            let _ = kill.send(());
-                        }
-                        OwnedRetirement::Retired
+            unconfirmed => {
+                let reason = match unconfirmed {
+                    Ok(leveler_client_protocol::RetireDecision::Unsupported) => {
+                        "运行时不支持原子退休；请先让原运行时正常退出后再操作".to_string()
                     }
-                    Ok(fresh) => OwnedRetirement::Deferred {
-                        active_turns: fresh.health.active_turns,
-                        active_background_tasks: fresh.health.active_background_tasks,
-                    },
+                    Err(error) => format!("无法确认运行时原子退休：{error}"),
+                    _ => unreachable!("confirmed retirement decisions are handled above"),
+                };
+                // A fresh busy report can explain a deferral, but an idle
+                // snapshot cannot close admission and authorize child release.
+                match service.runtime_info().await {
+                    Ok(fresh)
+                        if fresh.health.active_turns > 0
+                            || fresh.health.active_background_tasks > 0 =>
+                    {
+                        OwnedRetirement::Deferred {
+                            active_turns: fresh.health.active_turns,
+                            active_background_tasks: fresh.health.active_background_tasks,
+                        }
+                    }
+                    Ok(_) => OwnedRetirement::Unavailable { reason },
                     Err(error) => OwnedRetirement::Unavailable {
-                        reason: error.to_string(),
+                        reason: format!("{reason}；无法读取运行时状态：{error}"),
                     },
                 }
             }
@@ -978,6 +985,8 @@ mod tests {
         commands: Arc<Mutex<Vec<String>>>,
         quiescent: bool,
         atomic_supported: bool,
+        retirement_error: bool,
+        pid: u32,
         /// The generation this stub claims. See `StubService::generation`.
         generation: String,
     }
@@ -990,6 +999,8 @@ mod tests {
                 commands: Arc::new(Mutex::new(Vec::new())),
                 quiescent,
                 atomic_supported,
+                retirement_error: false,
+                pid: std::process::id(),
                 generation: leveler_runtime_host::expected_config_fingerprint(&layout)
                     .unwrap_or_default(),
             })
@@ -1047,7 +1058,7 @@ mod tests {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 build: leveler_core::BuildIdentity::current(),
                 config_fingerprint: Some(self.generation.clone()),
-                pid: std::process::id(),
+                pid: self.pid,
                 health: self.health(),
             })
         }
@@ -1056,6 +1067,9 @@ mod tests {
             &self,
             _request: leveler_client_protocol::RetireRequest,
         ) -> Result<leveler_client_protocol::RetireDecision, ClientError> {
+            if self.retirement_error {
+                return Err(ClientError::Runtime("retirement outcome unknown".into()));
+            }
             if !self.atomic_supported {
                 return Ok(leveler_client_protocol::RetireDecision::Unsupported);
             }
@@ -1184,9 +1198,200 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unsupported_retirement_preserves_child_and_sends_no_commands() {
+        assert_unconfirmed_retirement_preserves_owner(false).await;
+    }
+
+    #[tokio::test]
+    async fn unanswered_retirement_preserves_child_and_sends_no_commands() {
+        assert_unconfirmed_retirement_preserves_owner(true).await;
+    }
+
+    async fn assert_unconfirmed_retirement_preserves_owner(retirement_error: bool) {
+        for quiescent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (manager, _) = manager_in(dir.path(), dir.path().join("unused.sock"));
+            let mut service = WorkingService::new(quiescent, false);
+            Arc::get_mut(&mut service).unwrap().retirement_error = retirement_error;
+            let commands = service.commands.clone();
+            let (kill, mut receiver) = oneshot::channel();
+            let mut entry = Entry {
+                status: ProjectStatus::Online,
+                kill: Some(kill),
+                service: Some(service),
+                discovered: false,
+            };
+            let result = manager.retire_owned(&mut entry).await;
+            assert!(
+                commands.lock().unwrap().is_empty(),
+                "no health snapshot may authorize a shutdown command"
+            );
+            assert!(
+                entry.kill.is_some(),
+                "the original owner retains its child handle"
+            );
+            assert!(
+                matches!(
+                    receiver.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ),
+                "no kill notification may be delivered without atomic retirement"
+            );
+            if quiescent {
+                assert!(matches!(result, OwnedRetirement::Unavailable { .. }));
+            } else {
+                assert!(matches!(
+                    result,
+                    OwnedRetirement::Deferred {
+                        active_turns: 1,
+                        active_background_tasks: 0,
+                    }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_atomic_retirement_releases_only_the_owned_child() {
+        for retire in [
+            leveler_client_protocol::RetireDecision::Accepted,
+            leveler_client_protocol::RetireDecision::AlreadyRetiring {
+                reason: Some(leveler_client_protocol::RestartReason::RestartRequested),
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (manager, _) = manager_in(dir.path(), dir.path().join("unused.sock"));
+            let service = ForeignBuildService::new(retire);
+            let commands = service.commands.clone();
+            let (kill, mut receiver) = oneshot::channel();
+            let mut entry = Entry {
+                status: ProjectStatus::Online,
+                kill: Some(kill),
+                service: Some(service),
+                discovered: false,
+            };
+            assert!(matches!(
+                manager.retire_owned(&mut entry).await,
+                OwnedRetirement::Retired
+            ));
+            assert!(entry.kill.is_none());
+            assert_eq!(receiver.try_recv(), Ok(()));
+            assert!(commands.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_unconfirmed_or_busy_runtime_preserves_real_child_until_owner_exit() {
+        use tokio::io::AsyncBufReadExt;
+        for (quiescent, atomic_supported, retirement_error) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().join("owned-project");
+            std::fs::create_dir(&repo).unwrap();
+            let repo = repo.canonicalize().unwrap();
+            let (manager, _) = manager_in(dir.path(), dir.path().join("unused.sock"));
+            let script = r#"import http.server,threading,json,os
+class Handler(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(200);self.end_headers();self.wfile.write(b'owned-service-live')
+  if self.path=='/exit':threading.Thread(target=self.server.shutdown).start()
+ def log_message(self,*args):pass
+server=http.server.HTTPServer(('127.0.0.1',0),Handler)
+print(json.dumps({'port':server.server_address[1],'pid':os.getpid()}),flush=True)
+server.serve_forever(poll_interval=0.01)
+server.server_close()
+"#;
+            let mut child = tokio::process::Command::new("python3")
+                .args(["-u", "-c", script])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                output.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let ready: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(ready["pid"].as_u64(), Some(u64::from(pid)));
+            let url = format!("http://127.0.0.1:{}", ready["port"]);
+            eprintln!("owned monitor fixture pid={pid} url={url}");
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap();
+            assert_eq!(
+                http.get(&url).send().await.unwrap().text().await.unwrap(),
+                "owned-service-live"
+            );
+            let mut service = WorkingService::new(quiescent, atomic_supported);
+            let fake = Arc::get_mut(&mut service).unwrap();
+            fake.retirement_error = retirement_error;
+            fake.pid = pid;
+            let commands = service.commands.clone();
+            let (kill, receiver) = oneshot::channel();
+            manager.state.entries.lock().unwrap().insert(
+                repo.clone(),
+                Entry {
+                    status: ProjectStatus::Online,
+                    kill: Some(kill),
+                    service: Some(service),
+                    discovered: false,
+                },
+            );
+            let mut monitoring = tokio::spawn(monitor_child(
+                child,
+                receiver,
+                manager.state.clone(),
+                repo.clone(),
+            ));
+            manager.remove(repo.to_str().unwrap()).await.unwrap();
+            // This timeout tests the monitor's wait contract after channel
+            // closure; it is not a sleep used to synchronize admission.
+            let monitor_keeps_waiting =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut monitoring)
+                    .await
+                    .is_err();
+            let after = http.get(&url).send().await;
+            let live = match after {
+                Ok(response) => response.text().await.unwrap() == "owned-service-live",
+                Err(_) => false,
+            };
+            if live {
+                http.get(format!("{url}/exit")).send().await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), monitoring)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(
+                monitor_keeps_waiting,
+                "sender drop is not an authorized child kill"
+            );
+            assert!(live, "the same owned service must survive project removal");
+            assert!(
+                commands.lock().unwrap().is_empty(),
+                "no unconfirmed shutdown command"
+            );
+            assert!(
+                !leveler_runtime_host::process_alive(pid),
+                "owner's normal HTTP exit must be reaped"
+            );
+        }
+    }
+
     /// When the runtime IS idle, the stop goes through the runtime's own
-    /// agreement (the atomic request, or a fresh idle reading for a runtime
-    /// older than it) rather than an unconditional kill.
+    /// atomic agreement. An older runtime's idle report cannot replace it.
     #[cfg(unix)]
     #[tokio::test]
     async fn restart_asks_an_idle_runtime_and_is_agreed_to() {
@@ -1204,7 +1409,7 @@ mod tests {
             // An idle runtime accepts retirement; the manager then re-attaches
             // to whatever owns the endpoint (here: the same still-serving stub,
             // because the test daemon has no process of its own to exit).
-            let _ = manager.restart(repo.to_str().unwrap()).await;
+            let result = manager.restart(repo.to_str().unwrap()).await;
             if atomic_supported {
                 assert!(
                     stop_commands(&commands).is_empty(),
@@ -1213,11 +1418,12 @@ mod tests {
                 );
             } else {
                 assert!(
-                    stop_commands(&commands)
-                        .iter()
-                        .any(|command| command.contains("ShutdownWhenIdle")),
-                    "a runtime without the atomic request is retired explicitly once it reports idle: {:?}",
-                    commands.lock().unwrap()
+                    result.is_err(),
+                    "Unsupported must not restart an idle owner"
+                );
+                assert!(
+                    stop_commands(&commands).is_empty(),
+                    "no legacy shutdown command"
                 );
             }
         }
@@ -1439,12 +1645,11 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// WEB-GENERATION-2 — a runtime of another generation that cannot retire
-    /// atomically is replaced only after its identity is proven; when it is not,
-    /// the Web reports the failure and signals nothing.
+    /// WEB-GENERATION-2 — a legacy runtime of another generation that still
+    /// owns work is deferred, regardless of whether its PID is identifiable.
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_unprovable_runtime_of_another_generation_is_a_named_failure() {
+    async fn a_busy_unsupported_runtime_of_another_generation_is_deferred() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("legacy.sock");
         let service =
@@ -1465,8 +1670,13 @@ mod tests {
             .expect_err("an unprovable runtime must not be replaced");
         assert_eq!(
             error.state,
-            Some(leveler_runtime_host::RuntimeLifecycleState::MigrationFailed),
-            "the refusal must be named: {error}"
+            Some(
+                leveler_runtime_host::RuntimeLifecycleState::UpgradeDeferred {
+                    active_turns: 1,
+                    active_background_tasks: 0,
+                }
+            ),
+            "the legacy busy deferral must be named: {error}"
         );
         assert!(!router.handles(&repo.canonicalize().unwrap()));
         // This test process is still alive: nothing was signalled.
