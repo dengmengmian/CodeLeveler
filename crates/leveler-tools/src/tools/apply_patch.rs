@@ -424,7 +424,7 @@ impl Tool for ApplyPatchTool {
         // content, so only the applier knows its line numbers — the patch text
         // the model wrote carries none, and a presenter must never re-derive
         // a position from the request.
-        let mut located: Vec<(String, Vec<AppliedHunk>)> = Vec::new();
+        let mut located: Vec<(String, String, Vec<AppliedHunk>)> = Vec::new();
         let scope = context.write_scope();
 
         for change in changes {
@@ -447,7 +447,7 @@ impl Tool for ApplyPatchTool {
                         Err(e) => return Err(ToolError::Io(format!("stat {path}: {e}"))),
                     }
                     if let Some(hunk) = applied_diff::whole_file_hunk(&content, true) {
-                        located.push((path.clone(), vec![hunk]));
+                        located.push((path.clone(), path.clone(), vec![hunk]));
                     }
                     ops.push(Op::Create {
                         path: resolved,
@@ -478,7 +478,7 @@ impl Tool for ApplyPatchTool {
                         .map_err(|e| ToolError::Io(format!("stat {path}: {e}")))?
                         .permissions();
                     if let Some(hunk) = applied_diff::whole_file_hunk(&expected, false) {
-                        located.push((path.clone(), vec![hunk]));
+                        located.push((path.clone(), path.clone(), vec![hunk]));
                     }
                     ops.push(Op::Remove {
                         path: resolved,
@@ -541,7 +541,11 @@ impl Tool for ApplyPatchTool {
                             )));
                         }
                     };
-                    located.push((path.clone(), hunks));
+                    located.push((
+                        path.clone(),
+                        move_to.clone().unwrap_or_else(|| path.clone()),
+                        hunks,
+                    ));
 
                     match move_to {
                         Some(dest) => {
@@ -677,7 +681,9 @@ impl Tool for ApplyPatchTool {
         // in metadata, never in the tool output the model reads back.
         let applied: String = located
             .iter()
-            .filter_map(|(path, hunks)| applied_diff::unified_diff(path, hunks))
+            .filter_map(|(before, after, hunks)| {
+                applied_diff::unified_diff_with_paths(before, after, hunks)
+            })
             .collect();
         let mut meta = serde_json::json!({ "modified_files": modified });
         if !applied.is_empty() {
@@ -1233,6 +1239,35 @@ mod tests {
             "move destination must be reported: {modified:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_applied_move_diff_names_the_actual_source_and_destination() {
+        let (context, dir) = ctx();
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n*** Move to: src/moved.rs\n@@\n-fn b() {}\n+fn renamed() {}\n*** End Patch";
+        let out = ApplyPatchTool
+            .execute(
+                serde_json::json!({ "patch": patch }),
+                context,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!dir.join("src/lib.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/moved.rs")).unwrap(),
+            "fn a() {}\nfn renamed() {}\n"
+        );
+        let diff = out.metadata["applied_diff"]
+            .as_str()
+            .expect("confirmed diff");
+        assert!(
+            diff.starts_with("--- a/src/lib.rs\n+++ b/src/moved.rs\n"),
+            "confirmed diff must name where the committed edit landed: {diff}"
+        );
+        assert!(diff.contains("-fn b() {}") && diff.contains("+fn renamed() {}"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

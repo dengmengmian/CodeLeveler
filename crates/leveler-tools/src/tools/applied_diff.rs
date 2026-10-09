@@ -30,10 +30,19 @@ const MAX_APPLIED_DIFF_BYTES: usize = 64 * 1024;
 /// Returns `None` when nothing was located, so a caller never publishes an
 /// empty diff that a reader would take for "no change".
 pub fn unified_diff(path: &str, hunks: &[AppliedHunk]) -> Option<String> {
+    unified_diff_with_paths(path, path, hunks)
+}
+
+/// Preserve both committed paths when an edit also moved the file.
+pub fn unified_diff_with_paths(
+    before_path: &str,
+    after_path: &str,
+    hunks: &[AppliedHunk],
+) -> Option<String> {
     if hunks.is_empty() || hunks.iter().all(|h| h.old_lines == h.new_lines) {
         return None;
     }
-    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    let mut out = format!("--- a/{before_path}\n+++ b/{after_path}\n");
     for h in hunks {
         if h.old_lines == h.new_lines {
             continue;
