@@ -521,8 +521,9 @@ pub fn git_write_protected_paths(write_root: &Path) -> Vec<PathBuf> {
 ///
 /// The set is: the workspace (when the scope has one), one private,
 /// host-created scratch directory, a Leveler-owned per-workspace tool cache,
-/// and the platform's shared temporary directory. Environment redirection for
-/// `$TMPDIR` and the toolchain caches is applied by
+/// and, for an ordinary workspace scope, the platform's shared temporary
+/// directory. Explicitly scoped/pre-claim processes receive only private temp.
+/// Environment redirection for `$TMPDIR` and the toolchain caches is applied by
 /// [`apply_sandbox_environment`].
 ///
 /// Never add a whole user directory or a host tool/config directory here: those
@@ -574,6 +575,7 @@ fn confined_writable_roots(
     workspace_root: Option<&Path>,
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
+    include_shared_temp: bool,
 ) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut add = |p: PathBuf| {
@@ -594,20 +596,22 @@ fn confined_writable_roots(
     for cache_root in cache_write_roots {
         add(cache_root.clone());
     }
-    for temp_root in shared_temp_write_roots() {
-        add(temp_root);
+    if include_shared_temp {
+        for temp_root in shared_temp_write_roots() {
+            add(temp_root);
+        }
     }
     roots
 }
 
 /// Writable roots for a pre-claim (read-only-workspace) process: scratch,
-/// toolchain caches, and the shared temp dir only — deliberately never the
-/// workspace itself.
+/// toolchain caches only. A shared temp grant would also grant any unclaimed
+/// workspace or foreign resource beneath /tmp.
 fn writable_roots_without_workspace(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
-    confined_writable_roots(None, scratch_root, cache_write_roots)
+    confined_writable_roots(None, scratch_root, cache_write_roots, false)
 }
 
 fn writable_roots(
@@ -615,7 +619,7 @@ fn writable_roots(
     scratch_root: Option<&Path>,
     cache_write_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
-    confined_writable_roots(Some(root), scratch_root, cache_write_roots)
+    confined_writable_roots(Some(root), scratch_root, cache_write_roots, true)
 }
 
 /// The write roots one [`WriteScope`] authorizes. `Unrestricted` authorizes
@@ -2773,6 +2777,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scoped_and_preclaim_roots_do_not_grant_the_shared_temp_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let allowed = workspace.path().join("allowed");
+        std::fs::create_dir(&allowed).unwrap();
+        let cache_roots = vec![cache.path().to_path_buf()];
+        for scope in [
+            WriteScope::None,
+            WriteScope::ScopedWorkspace {
+                root: workspace.path().to_path_buf(),
+                allowed: vec![allowed.clone()],
+                excluded: Vec::new(),
+            },
+        ] {
+            let roots = writable_roots_for_scope(&scope, Some(scratch.path()), &cache_roots);
+            assert!(roots.contains(&scratch.path().canonicalize().unwrap()));
+            assert!(roots.contains(&cache.path().canonicalize().unwrap()));
+            for shared in shared_temp_write_roots() {
+                let shared = shared.canonicalize().unwrap_or(shared);
+                assert!(
+                    !roots.contains(&shared),
+                    "scoped writes must not grant {shared:?}: {roots:?}"
+                );
+            }
+            assert_eq!(
+                roots.contains(&allowed),
+                matches!(scope, WriteScope::ScopedWorkspace { .. })
+            );
+        }
+        assert!(
+            writable_roots_for_scope(
+                &WriteScope::Unrestricted,
+                Some(scratch.path()),
+                &cache_roots
+            )
+            .is_empty(),
+            "Full has no confinement roots"
+        );
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn private_paths_separate_ephemeral_temp_and_persistent_build_caches() {
@@ -3576,6 +3622,23 @@ mod tests {
         );
     }
 
+    /// A private fixture outside the shared /tmp write grant. Ordinary tempdir
+    /// is under /tmp on Linux, so it cannot prove denial outside writable roots.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn private_home_fixture() -> tempfile::TempDir {
+        let home = std::env::var_os("HOME").expect("HOME for outside-grant fixture");
+        let base = tempfile::Builder::new()
+            .prefix(".leveler-boundary-test-")
+            .tempdir_in(home)
+            .expect("private outside-grant fixture");
+        let real = base.path().canonicalize().unwrap();
+        assert!(
+            !is_shared_temp_path(real.to_str().unwrap()),
+            "fixture must be outside the shared temp grant: {real:?}"
+        );
+        base
+    }
+
     /// Workspace + a sibling "outside" directory + a runner whose LEVELER_HOME
     /// is private to this test. `None` when the platform sandbox is missing.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -3597,7 +3660,7 @@ mod tests {
             eprintln!("skipping: bubblewrap is not installed");
             return None;
         }
-        let base = tempfile::tempdir().expect("base");
+        let base = private_home_fixture();
         let workspace = base.path().join("workspace");
         let outside = base.path().join("outside");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -3633,7 +3696,7 @@ mod tests {
             return;
         }
 
-        let base = tempfile::tempdir().expect("base");
+        let base = private_home_fixture();
         let workspace = base.path().join("workspace");
         std::fs::create_dir_all(workspace.join("src")).unwrap();
         std::fs::write(
@@ -3677,31 +3740,56 @@ mod tests {
             "private TMPDIR must be writable: {output:?}"
         );
 
-        let global_tmp_target = base.path().parent().unwrap().join(format!(
-            "codeleveler-global-temp-canary-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&global_tmp_target);
-        let mut shared_tmp = ProcessRequest::new(
+        let outside_target = base.path().join("outside-canary");
+        let mut outside_write = ProcessRequest::new(
             "sh",
             vec![
                 "-c".into(),
                 "touch \"$1\"".into(),
                 "sh".into(),
-                global_tmp_target.display().to_string(),
+                outside_target.display().to_string(),
             ],
             workspace.clone(),
         );
-        shared_tmp.write_scope = WriteScope::Workspace {
+        outside_write.write_scope = WriteScope::Workspace {
             root: workspace.clone(),
         };
         let output = runner
-            .run(shared_tmp, CancellationToken::new())
+            .run(outside_write, CancellationToken::new())
             .await
-            .expect("try shared temp write");
+            .expect("try outside-grant write");
         assert!(
-            !output.success() && !global_tmp_target.exists(),
-            "shared temp tree must stay read-only: {output:?}"
+            !output.success() && !outside_target.exists(),
+            "paths outside writable roots must stay read-only: {output:?}"
+        );
+
+        // Ordinary Auto temp writes remain available, using a uniquely owned
+        // directory so this canary never removes another process's file.
+        let shared_temp = tempfile::Builder::new()
+            .prefix("leveler-auto-temp-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let shared_target = shared_temp.path().join("canary");
+        let mut shared_write = ProcessRequest::new(
+            "sh",
+            vec![
+                "-c".into(),
+                "touch \"$1\"".into(),
+                "sh".into(),
+                shared_target.display().to_string(),
+            ],
+            workspace.clone(),
+        );
+        shared_write.write_scope = WriteScope::Workspace {
+            root: workspace.clone(),
+        };
+        let output = runner
+            .run(shared_write, CancellationToken::new())
+            .await
+            .expect("ordinary shared temp write");
+        assert!(
+            output.success() && shared_target.is_file(),
+            "ordinary shared temp files must remain writable: {output:?}"
         );
 
         for _ in 0..2 {
@@ -3798,7 +3886,7 @@ mod tests {
             return;
         }
 
-        let base = tempfile::tempdir().expect("base");
+        let base = private_home_fixture();
         let dependency = base.path().join("dependency");
         std::fs::create_dir_all(dependency.join("src")).unwrap();
         std::fs::write(
