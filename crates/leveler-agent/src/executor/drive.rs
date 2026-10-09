@@ -4364,6 +4364,13 @@ impl AgentHarness for Drive<'_> {
                     )
                     .await;
             }
+            // A reported fold means the message count really shrank (the notice
+            // the user reads spells counts). A fold that elides an exchange but
+            // keeps the count — the retained tail keeps the newest exchange
+            // whole, and the pin plus breadcrumb can cost exactly what the
+            // elided rounds did — is NOT reported here. Its durable record is
+            // the folded `ContextSnapshot`, which is what resume and the RC
+            // evidence read.
             if messages.len() < before {
                 (self.observer)(AgentEvent::Compacted {
                     from: before,
