@@ -11,12 +11,15 @@
 #   3. Merge: repo WINS on id collision; global fills the gaps. `default_model`
 #      always comes from the global config.
 #   4. The auto-compaction threshold is decided by the HARNESS from the model's
-#      declared limits: `min(reliable_context, context_window
-#      - effective_request_output - context_headroom_tokens)`. `reliable_context`
-#      alone is a quality bound, not a capacity, and never authorizes a request
-#      that leaves no room for its own completion. The harness's headroom is an
-#      execution-policy knob (`ExecutionOverrides::context_headroom_tokens`),
-#      not a model fact.
+#      declared limits: `min(reliable_context, <soft share> × (context_window
+#      - effective_request_output - context_headroom_tokens))`. The soft share
+#      defaults to 95% of that effective input capacity; `[context].soft_percent`
+#      and `[models.<id>].soft_compaction_percent` override it. The hard capacity
+#      remains an independent upper bound and always takes precedence.
+#      `reliable_context` alone is a quality bound, not a capacity, and never
+#      authorizes a request that leaves no room for its own completion. The
+#      harness's headroom is an execution-policy knob
+#      (`ExecutionOverrides::context_headroom_tokens`), not a model fact.
 #
 # Most users need NOTHING here — just `~/.leveler/config.toml`:
 #
