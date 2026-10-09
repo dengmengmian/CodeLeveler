@@ -1133,6 +1133,12 @@ Execution Host 的进程协议以 major/minor 和能力集合判断兼容性，�
 Runtime 的 build fingerprint 相同。不兼容时保留服务、显式报告错误。工作中的
 宿主不因 Runtime 更新而被替换；宿主自身的升级不承诺迁移现有进程。
 已经由旧 Runtime 持有的 legacy 任务保留旧清理和更新阻塞行为，不伪造迁移。
+旧 Runtime 返回 `RetireDecision::Unsupported` 时，客户端不得发送退出、强制退休
+或进程信号。它报告有运行回合或后台任务时，升级显式延期；即使健康快照显示
+空闲，也必须阻断自动迁移，因为快照不能原子关闭新任务 admission。用户先让
+旧 owner 正常结束工作并退出，再由现有 Runtime Host 连接入口启动新版本。
+这不影响支持原子退休的现代 Runtime，也不改变 Full 的工具权限语义：
+旧版本缺少原子退休能力是兼容性错误，不是权限 ASK / DENY。
 
 Execution Host 崩溃是独立故障域。正常析构时的进程树清理不能证明 SIGKILL
 后的清理。恢复必须以持久元数据和可验证的进程身份为依据；无法安全证明身份

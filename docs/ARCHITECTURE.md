@@ -1225,6 +1225,14 @@ incompatible client reports the error and leaves services running. Runtime
 updates do not replace a working Execution Host. Host upgrades do not promise
 live process migration. Legacy tasks already owned by an older Runtime retain
 their cleanup and update-blocking behavior; migration must not be fabricated.
+When an older Runtime returns `RetireDecision::Unsupported`, clients send no
+shutdown command, force-retirement command, or process signal. Reported active
+turns or background tasks defer the upgrade. An apparently idle health snapshot
+also blocks automatic migration because it cannot atomically close admission.
+The user must let the old owner finish its work and exit normally before the
+existing Runtime Host connection entry starts the new version. Modern atomic
+retirement and Full tool-permission semantics retain their existing behavior:
+lacking atomic retirement is a compatibility error, not a permission ASK/DENY.
 
 Execution Host crashes are a separate failure domain. Normal destructor cleanup
 does not prove tree cleanup after SIGKILL. Recovery requires durable metadata

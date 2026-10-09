@@ -1,42 +1,14 @@
-//! Forced migration of a runtime too old to answer the atomic retirement
-//! question.
+//! Process-identity witnesses and explicit process-control primitives retained
+//! for diagnostics and their platform contracts.
 //!
-//! # Why this is not "just kill the daemon"
+//! A PID/start/socket witness proves which process is addressed. It does not
+//! prove that the runtime has closed admission or has no owned work. Runtime
+//! reconciliation therefore never uses these signal primitives to replace an
+//! endpoint that reports `RetireDecision::Unsupported`: the old owner must exit
+//! normally before the new generation starts.
 //!
-//! A runtime that answers `RetireDecision::Unsupported` has stated that it
-//! cannot retire atomically. CodeLeveler has no released users, so that
-//! generation may be replaced without an uninterrupted-upgrade guarantee — but
-//! *may be replaced* is not *may be killed*. The only thing this module is
-//! allowed to terminate is a process it can prove is the very runtime serving
-//! this socket, right now.
-//!
-//! Three facts have to hold together, and each is re-checked at the moment of
-//! the signal rather than trusted from an earlier snapshot:
-//!
-//! 1. **Protocol capability.** The endpoint answered `Unsupported`. A
-//!    connection failure, a timeout, a truncated reply or a permission failure
-//!    is *not* capability evidence and never reaches this module — the
-//!    transport keeps those apart ([`leveler_local_transport::TransportError::PeerClosed`]
-//!    is the only transport-level fact read as `Unsupported`).
-//! 2. **Generation.** The runtime's build identity is known and differs from
-//!    ours. Version numbers are never used to guess capability.
-//! 3. **Process ownership.** The runtime reports a PID; that PID is witnessed
-//!    with its *start time*, so a PID reused by an unrelated process cannot
-//!    inherit the signal. The witness is captured, re-read immediately before
-//!    the signal, and re-read again while waiting.
-//!
-//! # Signals are never sent to a group
-//!
-//! Only the one witnessed PID is signalled. The runtime's process group can
-//! contain — or later contain — the user's own background services, which are
-//! held by the independent execution host and are not this migration's to
-//! destroy.
-//!
-//! # Windows
-//!
-//! There is no verified Windows process-identity witness here, so `windows`
-//! refuses forced migration ([`MigrationRefusal::PlatformUnsupported`]) and the
-//! caller reports it. A refusal is a supported outcome; a wrong kill is not.
+//! Signals address a single verified PID, never a process group. Windows lacks
+//! a verified process-identity witness and reports platform unsupported.
 
 use std::path::Path;
 

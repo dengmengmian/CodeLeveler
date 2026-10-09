@@ -9,9 +9,9 @@
 //!   with no terminal state, and a runtime that answers `Busy` is reported
 //!   immediately rather than after a multi-minute budget;
 //! - a runtime that answers `Busy` is never coerced: it keeps admitting work;
-//! - a runtime that positively cannot retire atomically is replaced only after
-//!   its process identity is PROVEN, and a runtime whose identity cannot be
-//!   proven is refused with nothing signalled.
+//! - a runtime without atomic retirement is preserved: busy work defers the
+//!   upgrade, and apparent idleness cannot authorize automatic migration;
+//!   the old owner must exit normally before replacement.
 //!
 //! Why a dedicated target: the budget is read from the process environment, and
 //! a test that mutates it must not race tests in another binary that expect the
@@ -91,7 +91,7 @@ struct FakeState {
     /// The runtime's authoritative answer to "may I retire now?". A runtime old
     /// enough to have no atomic retirement answers `Unsupported`; a current one
     /// answers `Busy` while work is owed. The two must never be conflated: the
-    /// first may be replaced after verification, the second must be left alone.
+    /// both must be left alone; Unsupported cannot atomically close admission.
     retire: RetireDecision,
 }
 
@@ -177,6 +177,15 @@ impl FakeOldRuntime {
 impl InteractiveRuntimeClient for FakeOldRuntime {
     async fn send(&self, command: ClientCommand) -> Result<(), ClientError> {
         self.observed.lock().unwrap().push(format!("{command:?}"));
+        // Make any mutation of an Unsupported peer externally observable to
+        // the re-exec parent, including a mistakenly sent shutdown command.
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.retire == RetireDecision::Unsupported {
+                state.health.shutting_down = true;
+                state.health.accepting_work = false;
+            }
+        }
         match command {
             ClientCommand::ShutdownWhenIdle { reason } => {
                 assert_eq!(reason, RestartReason::BuildMismatch);
@@ -783,11 +792,10 @@ async fn a_daemon_that_is_still_starting_is_not_killed() {
         .status();
 }
 
-// ── Forced migration of a runtime with no atomic retirement ──────────────────
+// ── Preserve a runtime with no atomic retirement ─────────────────────────────
 //
-// These two tests are one scenario split in two, because the only honest way to
-// prove the migration is against a REAL second process: the client under test
-// must witness a pid it did not create, verify it, and terminate exactly it.
+// A real second process and socket prove the old owner survives reconciliation,
+// even when its process identity is fully verifiable.
 
 /// The fake legacy runtime, when this test binary is re-exec'ed with
 /// `LEVELER_LEGACY_RUNTIME_SOCKET` set. It speaks the real local-transport
@@ -806,12 +814,19 @@ fn legacy_runtime_child_helper() {
         .build()
         .unwrap();
     runtime.block_on(async move {
-        let service: Arc<dyn LocalRuntimeService> = FakeOldRuntime::legacy();
+        let legacy = FakeOldRuntime::legacy();
+        if std::env::var_os("LEVELER_LEGACY_RUNTIME_BUSY").is_some() {
+            let mut state = legacy.state.lock().unwrap();
+            state.health.active_turns = 1;
+            state.health.active_background_tasks = 1;
+            state.health.quiescent = false;
+        }
+        let service: Arc<dyn LocalRuntimeService> = legacy;
         let server = LocalSocketServer::bind(&socket, service)
             .await
             .expect("the fake legacy runtime owns the endpoint");
-        // Serves until this process is signalled. Nothing here exits on its own:
-        // the point of the test is that the CLIENT is what ends it.
+        // The fixture stays alive until its parent cleans up its owned handle.
+        // Reconciliation must preserve this owner and its admission state.
         server.serve(CancellationToken::new()).await.unwrap();
     });
 }
@@ -830,21 +845,31 @@ async fn await_endpoint(socket: &std::path::Path) -> LocalSocketRuntimeClient {
     );
 }
 
-/// A runtime that cannot retire atomically is replaced in a CONTROLLED way: its
-/// identity is verified against a REAL second process, it is asked to exit, and
-/// it is confirmed gone before anything may take the endpoint.
+/// Even a currently idle legacy runtime cannot close admission atomically.
+/// Its live child and endpoint must survive an unattended upgrade attempt.
 #[tokio::test]
-async fn a_legacy_runtime_is_verified_and_terminated_before_replacement() {
+async fn an_idle_legacy_runtime_without_atomic_retirement_is_preserved() {
+    for interactive in [false, true] {
+        assert_legacy_owner_preserved(false, interactive).await;
+    }
+}
+
+#[tokio::test]
+async fn a_busy_legacy_runtime_without_atomic_retirement_is_preserved() {
+    for interactive in [false, true] {
+        assert_legacy_owner_preserved(true, interactive).await;
+    }
+}
+
+async fn assert_legacy_owner_preserved(busy: bool, interactive: bool) {
+    let _budget = BUDGET_ENV_LOCK.lock().await;
     unsafe { std::env::set_var("LEVELER_HANDOVER_DRAIN_TIMEOUT_SECS", "1") };
 
     let env = env();
     let layout = layout(&env);
     let socket = layout.socket_path();
-    // The stand-in declares, in its own command line, what it stands in for: a
-    // `serve` runtime for THIS workspace. That identification is what the
-    // migration checks, because it is the only portable way to tie a pid to a
-    // repository's runtime — and it is exactly what an UNRELATED process cannot
-    // satisfy, which is the case that must be refused.
+    // A fully identifiable workspace runtime still lacks atomic retirement.
+    // PID identity must never substitute for admission authority.
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     {
         use std::os::unix::process::CommandExt;
@@ -853,6 +878,9 @@ async fn a_legacy_runtime_is_verified_and_terminated_before_replacement() {
             std::env::current_exe().unwrap().display(),
             env.repo.display()
         ));
+    }
+    if busy {
+        command.env("LEVELER_LEGACY_RUNTIME_BUSY", "1");
     }
     let mut child = command
         .arg("--exact")
@@ -871,47 +899,91 @@ async fn a_legacy_runtime_is_verified_and_terminated_before_replacement() {
         child.id(),
         "the fake must report the pid of the process that is actually serving"
     );
+    assert_eq!(info.health.active_background_tasks, u32::from(busy));
+    assert_eq!(info.health.active_turns, u32::from(busy));
     drop(client);
 
-    // The launch is deliberately impossible: what is under test is that the
-    // handover COMPLETES (the old owner is verified and gone) and the run only
-    // fails at the spawn, never at the handover.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let ui: Arc<dyn HandoffUi> = if interactive {
+        Arc::new(AnswerableShell { seen: seen.clone() })
+    } else {
+        Arc::new(UnanswerableShell)
+    };
     let result = leveler_runtime_host::ensure_default_runtime(
         &layout,
         &DetachedRuntimeLaunch {
             executable: env.home.join("must-not-exist"),
             ready_prefix: "legacy-migration".to_string(),
         },
-        Arc::new(UnanswerableShell),
+        ui,
     )
     .await;
+    // Capture actual process/endpoint properties before cleaning up this exact
+    // spawned child handle. A failure must not leave the fixture daemon behind.
+    let alive = child.try_wait().unwrap().is_none();
+    let endpoint = LocalSocketRuntimeClient::connect(&socket).await.ok();
+    let after = if let Some(client) = endpoint {
+        Some(LocalRuntimeService::runtime_info(&client).await.unwrap())
+    } else {
+        None
+    };
+    if alive {
+        child
+            .kill()
+            .expect("stop only this fixture's spawned child handle");
+    }
+    child.wait().unwrap();
+    assert!(
+        alive,
+        "unattended legacy migration must not terminate the old owner"
+    );
+    let after = after.expect("the same legacy runtime must retain the endpoint");
+    assert_eq!(after.pid, info.pid);
+    assert_eq!(after.runtime_id, info.runtime_id);
+    assert_eq!(after.build, info.build);
+    assert_eq!(
+        after.health, info.health,
+        "Unsupported cannot retire or mutate the old owner"
+    );
+    if interactive {
+        let events = seen.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.starts_with("MigrationStarted")
+                    && !event.starts_with("MigrationTerminating")
+                    && !event.starts_with("MigrationTerminated"))
+        );
+        assert!(events.iter().any(|event| event.starts_with(if busy {
+            "UpgradeDeferred"
+        } else {
+            "MigrationFailed"
+        })));
+    }
     let error = match result {
-        Ok(_) => panic!("a runtime with no atomic retirement must be replaced"),
+        Ok(_) => panic!("legacy retirement must be explicitly unsupported"),
         Err(error) => error,
     };
-    assert!(
-        error
-            .downcast_ref::<leveler_runtime_host::EnsureError>()
-            .is_none(),
-        "the handover must not be the failure; it must fail at the launch: {error}"
-    );
-
-    // The proof of the whole procedure: the real process is gone.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait().unwrap() {
-            Some(_) => break,
-            None if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            None => panic!("the verified legacy runtime must be terminated"),
-        }
+    let refused = error.downcast_ref::<leveler_runtime_host::EnsureError>();
+    if busy {
+        assert!(
+            matches!(
+                refused,
+                Some(leveler_runtime_host::EnsureError::RetireBlocked {
+                    active_turns: 1,
+                    active_background_tasks: 1,
+                    ..
+                })
+            ),
+            "live legacy work must defer replacement: {error}"
+        );
+    } else {
+        assert!(
+            matches!(
+                refused,
+                Some(leveler_runtime_host::EnsureError::LegacyMigrationRefused { .. })
+            ),
+            "absence of atomic retirement must block replacement: {error}"
+        );
     }
-    assert!(
-        leveler_runtime_host::probe_default_runtime(&socket)
-            .await
-            .unwrap()
-            .is_none(),
-        "the endpoint must be free before a replacement starts"
-    );
 }

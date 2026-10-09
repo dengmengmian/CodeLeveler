@@ -518,9 +518,9 @@ async fn owned_host_starts_then_adopts_a_real_daemon_body() {
 ///
 /// This in-process stub reports this test process's own pid, which is exactly
 /// the adversarial case: a runtime naming a pid the client may not safely signal
-/// has to end in a refusal. The positive case — a REAL second process being
-/// verified and terminated — is
-/// `runtime_host_handover::a_legacy_runtime_is_verified_and_terminated_before_replacement`,
+/// has to end in a refusal. Even a REAL identifiable second process must be
+/// preserved when atomic retirement is unsupported; this is covered by
+/// `runtime_host_handover::an_idle_legacy_runtime_without_atomic_retirement_is_preserved`,
 /// and the end-to-end case against a real older binary is the Dogfood
 /// `DF-L01`/`DF-L02` scenarios.
 #[test]

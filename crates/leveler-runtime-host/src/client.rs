@@ -409,8 +409,8 @@ pub enum EnsureError {
     /// The previous runtime is still working and this build will not take over
     /// behind the operator's back. Distinct from a startup failure: nothing
     /// failed, and nothing was cancelled — the old runtime still owns its work
-    /// and is still serving. Raised only for a shell that cannot be asked; a
-    /// shell with a handover prompt keeps waiting instead.
+    /// and is still serving. Interactive shells may wait on modern retirement;
+    /// legacy work without atomic retirement is always deferred.
     #[error(
         "the previous runtime is still working after {waited_secs}s; \
          this build will not interrupt it to take over \
@@ -422,9 +422,8 @@ pub enum EnsureError {
         active_background_tasks: u32,
     },
     /// The previous runtime is a generation this build cannot share an endpoint
-    /// with, and it could not be replaced: either it refused the forced
-    /// migration (its process identity could not be proven) or it never
-    /// answered the atomic retirement question. Nothing was signalled, nothing
+    /// with, and it could not be replaced: it either lacks atomic retirement
+    /// or did not answer that question. Nothing was signalled, nothing
     /// was cancelled, and the request must not be retried blindly — the
     /// operator has to decide.
     #[error(
@@ -612,7 +611,6 @@ pub async fn observe_retiring_runtime(
         HANDOVER_CANCEL_GRACE,
         ui,
         None,
-        None,
     )
     .await
 }
@@ -626,7 +624,6 @@ async fn observe_retiring_runtime_with_grace(
     grace: Duration,
     ui: &dyn HandoffUi,
     requested: Option<RestartReason>,
-    workspace: Option<&Path>,
 ) -> DrainOutcome {
     let mut last = String::new();
     let mut input: Option<UnboundedReceiver<HandoffAction>> = None;
@@ -727,24 +724,29 @@ async fn observe_retiring_runtime_with_grace(
                     continue;
                 }
                 Ok(leveler_client_protocol::RetireDecision::Unsupported) => {
-                    // The endpoint positively stated that it has no atomic
-                    // retirement. Historical runtimes may be replaced without
-                    // an uninterrupted-upgrade guarantee, but only after the
-                    // process serving this socket is PROVEN to be the one this
-                    // client examined. Any refusal is terminal and reported:
-                    // a guess here is a signal delivered to the wrong process.
-                    match force_migrate_legacy_runtime(socket_path, workspace, reason, ui).await {
-                        Ok(()) => pending = None,
-                        Err(refusal) => {
-                            tracing::warn!(%refusal, "refusing to force-migrate the previous runtime");
-                            ui.emit(HandoffEvent::MigrationFailed {
-                                reason: refusal.to_string(),
-                            });
-                            return DrainOutcome::MigrationBlocked {
-                                reason: refusal.to_string(),
-                            };
-                        }
+                    // A legacy health snapshot cannot close admission: even
+                    // apparent idleness can race a newly admitted turn. Keep
+                    // the old owner untouched; only it may settle its work and
+                    // exit normally before a replacement starts.
+                    if let Some(health) = health.as_ref()
+                        && (health.active_turns > 0 || health.active_background_tasks > 0)
+                    {
+                        ui.emit(HandoffEvent::UpgradeDeferred {
+                            active_turns: health.active_turns,
+                            active_background_tasks: health.active_background_tasks,
+                        });
+                        return DrainOutcome::Deferred {
+                            active_turns: health.active_turns,
+                            active_background_tasks: health.active_background_tasks,
+                        };
                     }
+                    let reason = "the previous runtime does not support atomic retirement; \
+                                  let its owner exit normally before upgrading"
+                        .to_string();
+                    ui.emit(HandoffEvent::MigrationFailed {
+                        reason: reason.clone(),
+                    });
+                    return DrainOutcome::MigrationBlocked { reason };
                 }
                 Err(error) => {
                     // No usable answer at all: not a decision, and not a
@@ -854,176 +856,6 @@ async fn observe_retiring_runtime_with_grace(
     }
 }
 
-/// How long a forced migration waits for the graceful signal before escalating,
-/// and again before giving up on the forced one.
-#[cfg(any(unix, windows))]
-const LEGACY_TERMINATION_GRACE: Duration = Duration::from_secs(5);
-/// How often the migration re-reads the endpoint while waiting.
-#[cfg(any(unix, windows))]
-const LEGACY_TERMINATION_POLL: Duration = Duration::from_millis(50);
-/// Bound on one endpoint identity read inside the migration loop. Short on
-/// purpose: this is a liveness probe of a process that has just been signalled,
-/// not a request a person is waiting on.
-#[cfg(any(unix, windows))]
-const LEGACY_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// What an endpoint says about itself right now.
-#[cfg(any(unix, windows))]
-async fn observe_endpoint(socket_path: &Path) -> Option<(u32, String)> {
-    let client = connect_within(socket_path, LEGACY_PROBE_TIMEOUT)
-        .await
-        .ok()
-        .flatten()?;
-    let info = LocalRuntimeService::runtime_info(&client).await.ok()?;
-    Some((info.pid, info.runtime_id.as_str().to_string()))
-}
-
-/// Replace a runtime that positively cannot retire atomically.
-///
-/// The procedure is deliberately narrow. Every step either re-proves the same
-/// three facts or stops:
-///
-/// 1. read the endpoint's identity from a FRESH connection (a pid observed a
-///    second ago is a pid that may already have been reused);
-/// 2. require the identity to be usable and to differ from this build, and the
-///    socket to be a socket owned by a runtime, and witness the pid by start
-///    time ([`legacy::verify_target`]);
-/// 3. send `SIGTERM` only after re-reading BOTH the endpoint identity and the
-///    process witness, so the signal cannot land on a process that took the pid
-///    in between;
-/// 4. escalate to `SIGKILL` only after the graceful signal was ignored AND the
-///    witness still matches;
-/// 5. return only once the endpoint no longer answers as that runtime.
-///
-/// A replacement that already owns the endpoint also ends the migration: the
-/// old generation is gone either way, and the caller's next step is the same.
-///
-/// The runtime's process GROUP is never signalled. Background services are held
-/// by the independent execution host and are not this migration's to destroy.
-#[cfg(any(unix, windows))]
-async fn force_migrate_legacy_runtime(
-    socket_path: &Path,
-    workspace: Option<&Path>,
-    reason: RestartReason,
-    ui: &dyn HandoffUi,
-) -> Result<(), crate::legacy::MigrationRefusal> {
-    use crate::legacy::{
-        MigrationRefusal, TerminationSignal, process_witness, revalidate, signal_process,
-        verify_target,
-    };
-
-    let expected = leveler_core::BuildIdentity::current();
-    let client = connect_within(socket_path, LEGACY_PROBE_TIMEOUT)
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| {
-            MigrationRefusal::IdentityUnknown(format!(
-                "{} is not answering, so nothing can be proven about it",
-                socket_path.display()
-            ))
-        })?;
-    let info = LocalRuntimeService::runtime_info(&client)
-        .await
-        .map_err(|error| MigrationRefusal::IdentityUnknown(error.to_string()))?;
-    let target = verify_target(
-        socket_path,
-        info.pid,
-        info.runtime_id.as_str(),
-        &info.build,
-        &expected,
-        workspace,
-    )?;
-
-    tracing::info!(
-        pid = target.pid,
-        runtime_id = %target.runtime_id,
-        version = %target.build.version,
-        ownership = ?target.ownership,
-        ?reason,
-        event = "LegacyRuntimeMigration",
-        "replacing a runtime with no atomic retirement"
-    );
-    ui.emit(HandoffEvent::MigrationStarted {
-        pid: target.pid,
-        version: target.build.version.clone(),
-    });
-
-    let started = tokio::time::Instant::now();
-    let mut sent: Option<TerminationSignal> = None;
-    loop {
-        match observe_endpoint(socket_path).await {
-            // Nothing owns the endpoint any more: the old owner is gone.
-            None => break,
-            // A different runtime already owns the endpoint. The old
-            // generation is gone; this migration has nothing left to do.
-            Some((pid, runtime_id)) if pid != target.pid || runtime_id != target.runtime_id => {
-                tracing::info!(
-                    pid,
-                    %runtime_id,
-                    "a different runtime already owns the endpoint"
-                );
-                break;
-            }
-            Some(_) => {}
-        }
-        // The same runtime is still serving. Re-prove that the pid is still the
-        // process that was witnessed BEFORE sending anything at it.
-        revalidate(&target)?;
-        let elapsed = started.elapsed();
-        match sent {
-            None => {
-                signal_process(target.pid, TerminationSignal::Term).map_err(|error| {
-                    MigrationRefusal::ProcessUnverifiable(format!(
-                        "could not signal pid {}: {error}",
-                        target.pid
-                    ))
-                })?;
-                sent = Some(TerminationSignal::Term);
-                ui.emit(HandoffEvent::MigrationTerminating {
-                    pid: target.pid,
-                    force: false,
-                });
-            }
-            Some(TerminationSignal::Term) if elapsed >= LEGACY_TERMINATION_GRACE => {
-                signal_process(target.pid, TerminationSignal::Kill).map_err(|error| {
-                    MigrationRefusal::ProcessUnverifiable(format!(
-                        "could not force-signal pid {}: {error}",
-                        target.pid
-                    ))
-                })?;
-                sent = Some(TerminationSignal::Kill);
-                ui.emit(HandoffEvent::MigrationTerminating {
-                    pid: target.pid,
-                    force: true,
-                });
-            }
-            Some(TerminationSignal::Kill) if elapsed >= LEGACY_TERMINATION_GRACE * 2 => {
-                return Err(MigrationRefusal::DidNotExit {
-                    pid: target.pid,
-                    waited_secs: elapsed.as_secs(),
-                });
-            }
-            Some(_) => {}
-        }
-        tokio::time::sleep(LEGACY_TERMINATION_POLL).await;
-    }
-
-    // Confirmed: the endpoint does not answer as the old runtime any more, and
-    // [`process_witness`] is only consulted to describe the outcome honestly.
-    let exited = process_witness(target.pid).is_none_or(|witness| witness != target.witness);
-    tracing::info!(
-        pid = target.pid,
-        runtime_id = %target.runtime_id,
-        exited,
-        waited_ms = started.elapsed().as_millis() as u64,
-        event = "LegacyRuntimeTerminated",
-        "the runtime with no atomic retirement released the endpoint"
-    );
-    ui.emit(HandoffEvent::MigrationTerminated { pid: target.pid });
-    Ok(())
-}
-
 /// Settle a retirement end to end: obtain the runtime's authoritative decision
 /// (unless a caller already obtained it), then wait for the endpoint to be
 /// released. One loop, so the decision, its reporting and the wait can never
@@ -1034,7 +866,6 @@ async fn retire_runtime(
     socket_path: &Path,
     reason: RestartReason,
     ui: &dyn HandoffUi,
-    workspace: Option<&Path>,
 ) -> anyhow::Result<()> {
     let observed_pid = LocalRuntimeService::runtime_info(client)
         .await
@@ -1048,7 +879,6 @@ async fn retire_runtime(
         HANDOVER_CANCEL_GRACE,
         ui,
         Some(reason),
-        workspace,
     )
     .await;
     match outcome {
@@ -1128,16 +958,16 @@ pub async fn connect_global_task_runtime(
 /// - `Ok(Some(client))` — a runtime of this generation is serving the endpoint;
 ///   attach to it.
 /// - `Ok(None)` — nothing of this generation owns the endpoint any more. Either
-///   nothing was listening, or a different generation was handed over (or
-///   force-migrated after its identity was verified). The caller may start one.
+///   nothing was listening, or a different generation handed over atomically.
+///   The caller may start one.
 /// - `Err(EnsureError::UnknownGeneration)` — a runtime is answering but cannot
 ///   state which generation it is. Never silently adopted.
 /// - `Err(EnsureError::RetireBlocked)` — the previous runtime owes work and this
-///   shell cannot ask an operator whether to wait. It is UNCHANGED and still
+///   shell cannot wait, or that generation lacks atomic retirement. It is UNCHANGED and still
 ///   serving; the caller reports it and must not start a competitor.
 /// - `Err(EnsureError::LegacyMigrationRefused)` — the previous runtime cannot be
-///   replaced, and its process identity could not be proven. Nothing was
-///   signalled.
+///   replaced because atomic retirement is unavailable or unconfirmed.
+///   Its owner must exit normally first. Nothing was signalled.
 #[cfg(any(unix, windows))]
 pub async fn reconcile_runtime_generation(
     socket_path: &Path,
@@ -1156,28 +986,14 @@ pub async fn reconcile_runtime_generation(
                 expected = %expected.short(),
                 "local runtime is a different build; asking it to retire"
             );
-            retire_runtime(
-                &client,
-                socket_path,
-                RestartReason::BuildMismatch,
-                ui,
-                layout.primary_workspace(),
-            )
-            .await?;
+            retire_runtime(&client, socket_path, RestartReason::BuildMismatch, ui).await?;
             Ok(None)
         }
         RuntimeConsistency::ConfigChanged => {
             tracing::info!(
                 "local runtime loaded a different configuration generation; asking it to retire"
             );
-            retire_runtime(
-                &client,
-                socket_path,
-                RestartReason::ConfigChanged,
-                ui,
-                layout.primary_workspace(),
-            )
-            .await?;
+            retire_runtime(&client, socket_path, RestartReason::ConfigChanged, ui).await?;
             Ok(None)
         }
     }
