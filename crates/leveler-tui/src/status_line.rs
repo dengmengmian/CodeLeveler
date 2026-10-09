@@ -264,9 +264,14 @@ pub(crate) fn footer_ctx_chip(state: &AppState) -> Option<String> {
     };
 
     // The runtime's own snapshot first: it carries the resolved budget, and the
-    // TUI never recomputes a figure it was given.
+    // TUI never recomputes a figure it was given. The numerator is the
+    // snapshot's PROJECTED input — the same figure the fold thresholds and
+    // `compaction_utilization_percent` use. The provider's reported prompt
+    // tokens are a DIFFERENT measurement (actual, not projected): splicing them
+    // in would print a ratio that disagrees with the percentage beside it, so
+    // they are only the no-snapshot fallback below.
     if let Some(acc) = state.context.loaded.as_ref() {
-        let used = acc.used_tokens.max(u64::from(state.token_input));
+        let used = acc.used_tokens;
         if used > 0 {
             if let Some(capacity) = acc.input_capacity_tokens.filter(|capacity| *capacity > 0) {
                 return Some(share(
@@ -281,7 +286,8 @@ pub(crate) fn footer_ctx_chip(state: &AppState) -> Option<String> {
         }
     }
 
-    // No snapshot yet: the state's own fields, and the window is the only total.
+    // No snapshot yet: the state's own provider reported usage, and the window
+    // is the only total. This is the model-window axis, never compaction.
     // With no declared window there is no denominator, so the chip stays hidden
     // rather than showing a bare numerator.
     let window = state.context_window();
@@ -921,6 +927,60 @@ mod tests {
         // The snapshot's projected input is the figure that shows; the state's
         // own usage fields are only the no-snapshot fallback.
         state.context_tokens = 41_181;
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 10k/128k"));
+    }
+
+    /// The chip's numerator and its percentage are the SAME figure. The
+    /// provider's reported prompt tokens are a different measurement (actual
+    /// vs projected) and must never be spliced into the compaction axis; the
+    /// two numbers would then disagree inside one label.
+    #[test]
+    fn the_context_chip_never_splices_provider_tokens_into_the_projection() {
+        let mut state = test_state();
+        let projection = leveler_model::RequestProjection::project(
+            &[leveler_model::Message::text(
+                leveler_model::Role::User,
+                "x".repeat(40_000),
+            )],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        );
+        let accounting = leveler_model::ContextAccounting::compute(
+            leveler_model::ModelRef::new("m", "m"),
+            &projection,
+            Some(128_000),
+            Some(64_000),
+            None,
+        )
+        .with_input_budget(Some(96_000), Some(32_000), Some(0));
+        state.context.loaded = Some(accounting);
+        // The provider reported MORE prompt tokens than the runtime projected.
+        // The compaction axis is the projection's: 10k / 96k = 10%.
+        state.token_input = 20_000;
+        assert_eq!(
+            footer_ctx_chip(&state).as_deref(),
+            Some("上下文 10% · 10k/96k"),
+            "the shown ratio must equal the shown percentage"
+        );
+
+        // Same rule on the model-window axis when no capacity was resolved.
+        let projection = leveler_model::RequestProjection::project(
+            &[leveler_model::Message::text(
+                leveler_model::Role::User,
+                "x".repeat(40_000),
+            )],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        );
+        state.context.loaded = Some(leveler_model::ContextAccounting::compute(
+            leveler_model::ModelRef::new("m", "m"),
+            &projection,
+            Some(128_000),
+            None,
+            None,
+        ));
         assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 10k/128k"));
     }
 

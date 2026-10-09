@@ -1,0 +1,44 @@
+{
+  "id": "CS7",
+  "invariant": "provider actual usage and projected input are different measurements; only the projection is compaction utilization",
+  "accounting": {
+    "model": {
+      "provider": "mock",
+      "model": "m"
+    },
+    "context_window_tokens": 128000,
+    "compact_at_tokens": 81600,
+    "output_reservation_tokens": 32000,
+    "headroom_tokens": 0,
+    "input_capacity_tokens": 96000,
+    "fold_state": "none",
+    "used_tokens": 10000,
+    "free_tokens": 118000,
+    "token_count_kind": "estimated",
+    "pressure": "normal",
+    "categories": [],
+    "last_compaction": null,
+    "reasoning_projection": null
+  },
+  "provider": {
+    "input": 40000,
+    "output": 8000
+  },
+  "model_window": 128000,
+  "expect": {
+    "shown": true,
+    "axis": "compaction",
+    "used_tokens": 10000,
+    "input_capacity_tokens": 96000,
+    "compact_at_tokens": 81600,
+    "hard_capacity": 96000,
+    "fold_state": "none",
+    "provider_actual": 48000,
+    "render": {
+      "tui_footer": "上下文 10% · 10k/96k",
+      "web_label": "10.0k / 96.0k",
+      "web_axis_word": "压缩口径",
+      "web_names_provider": true
+    }
+  }
+}

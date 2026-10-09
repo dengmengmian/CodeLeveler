@@ -45,6 +45,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     tokens: { input: 0, output: 0 },
     contextTokens: 0,
     contextWindow: null,
+    contextUsage: null,
     ...over,
   };
 }

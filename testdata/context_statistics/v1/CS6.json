@@ -1,0 +1,43 @@
+{
+  "id": "CS6",
+  "invariant": "with no effective capacity the model window becomes its OWN named axis and no compaction percentage is shown",
+  "accounting": {
+    "model": {
+      "provider": "mock",
+      "model": "m"
+    },
+    "context_window_tokens": 128000,
+    "compact_at_tokens": 64000,
+    "output_reservation_tokens": null,
+    "headroom_tokens": null,
+    "input_capacity_tokens": null,
+    "fold_state": "none",
+    "used_tokens": 40000,
+    "free_tokens": 88000,
+    "token_count_kind": "estimated",
+    "pressure": "normal",
+    "categories": [],
+    "last_compaction": null,
+    "reasoning_projection": null
+  },
+  "provider": {
+    "input": 41000,
+    "output": 100
+  },
+  "model_window": 128000,
+  "expect": {
+    "shown": true,
+    "axis": "window",
+    "used_tokens": 40000,
+    "input_capacity_tokens": null,
+    "compact_at_tokens": 64000,
+    "hard_capacity": null,
+    "fold_state": "none",
+    "provider_actual": 41100,
+    "render": {
+      "tui_footer": "上下文 40k/128k",
+      "web_label": "40.0k / 128.0k",
+      "web_axis_word": "模型窗口占用"
+    }
+  }
+}

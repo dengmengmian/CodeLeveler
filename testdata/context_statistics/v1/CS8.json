@@ -1,0 +1,26 @@
+{
+  "id": "CS8",
+  "invariant": "statistics unavailable: the provider usage is shown only as the named model-window axis, never as compaction",
+  "accounting": null,
+  "provider": {
+    "input": 41000,
+    "output": 1000
+  },
+  "model_window": 128000,
+  "expect": {
+    "shown": true,
+    "axis": "window_provider",
+    "used_tokens": null,
+    "input_capacity_tokens": null,
+    "compact_at_tokens": null,
+    "hard_capacity": null,
+    "fold_state": null,
+    "provider_actual": 42000,
+    "render": {
+      "tui_footer": "上下文 42k/128k",
+      "web_label": "窗口 42.0k / 128.0k",
+      "web_axis_word": "模型窗口占用",
+      "web_unavailable_note": true
+    }
+  }
+}

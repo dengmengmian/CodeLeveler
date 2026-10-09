@@ -62,6 +62,9 @@ export class RuntimeBridge {
   private pendingAgentDetailQueryId: string | null = null;
   private readonly pendingAgentMutationQueryIds = new Set<string>();
   private pendingDiffQueryId: string | null = null;
+  /** This client's own in-flight context query, so a foreign or stale answer
+   *  never replaces the runtime's accounting for the session on screen. */
+  private pendingContextQueryId: string | null = null;
   /** The client's own in-flight session-history query, so a foreign or stale
    *  answer never replaces this client's transcript. */
   private pendingHistoryQueryId: string | null = null;
@@ -141,6 +144,21 @@ export class RuntimeBridge {
       before: 0,
       after: 80,
     });
+  }
+
+  /**
+   * Ask the runtime for the ContextAccounting of the session's next request.
+   *
+   * The kernel publishes this live before each request, but a resumed session,
+   * a model switch and a compaction change it without one being assembled. The
+   * client asks on open and on a settings update, exactly like the TUI, so the
+   * compaction-axis meter is correct without waiting for the next turn. The
+   * answer is the runtime's own snapshot; the client recomputes nothing.
+   */
+  private queryContext(sessionId: SessionId): void {
+    const queryId = crypto.randomUUID();
+    this.pendingContextQueryId = queryId;
+    this.deliver({ type: 'query_context', session_id: sessionId, query_id: queryId });
   }
 
   /**
@@ -254,6 +272,7 @@ export class RuntimeBridge {
     saveLastSession(snap.id);
     this.historyLoaded.delete(snap.id);
     this.requestSessionHistory(snap);
+    this.queryContext(snap.id);
     if (previousId !== snap.id || this.getState().observation === null) {
       this.queryObservability(snap.id);
     }
@@ -265,8 +284,17 @@ export class RuntimeBridge {
   private applySessionMeta(snap: UiSessionSnapshot): void {
     const { current } = this.getState();
     if (!current || current.id !== snap.id) return;
+    const previousModel = current.model;
     this.snapshotVersions.set(snap.id, snap.last_sequence ?? 0);
     this.sink({ type: 'session_meta', session: snap });
+    // A model switch changes the resolved context policy, so the accounting
+    // must be re-read; a rename/permission update does not.
+    const next = snap.model ?? null;
+    const switched =
+      previousModel === null || next === null
+        ? previousModel !== next
+        : previousModel.provider !== next.provider || previousModel.model !== next.model;
+    if (switched) this.queryContext(snap.id);
   }
 
   private applyEvent(ev: RuntimeEvent): void {
@@ -538,6 +566,17 @@ export class RuntimeBridge {
       case 'context_updated':
         this.sink({ type: 'context_estimate', tokens: ev.estimated_tokens });
         break;
+      case 'context_usage':
+        // A live push is always the freshest runtime truth.
+        this.sink({ type: 'context_usage', accounting: ev.accounting });
+        break;
+      case 'context_loaded':
+        // Only this client's own latest query may replace its accounting.
+        if (ev.query_id && ev.query_id !== this.pendingContextQueryId) break;
+        this.pendingContextQueryId = null;
+        if (ev.accounting) this.sink({ type: 'context_usage', accounting: ev.accounting });
+        else this.sink({ type: 'context_unavailable' });
+        break;
       case 'context_compacted':
         // The compaction is a durable conversation fact, not only a fading
         // toast: everything above this point is a summary to the model now, and
@@ -551,6 +590,9 @@ export class RuntimeBridge {
           kind: 'runtime_notice',
         });
         this.sink({ type: 'notice', message: `上下文已压缩 ${ev.from} → ${ev.to} 条` });
+        // The measured transcript is gone: the accounting and the provider
+        // fallback describe a request that will never be sent again.
+        this.sink({ type: 'context_reset' });
         break;
       case 'context_expanded':
         this.sink({
