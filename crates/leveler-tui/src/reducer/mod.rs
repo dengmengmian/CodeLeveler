@@ -2670,68 +2670,20 @@ mod final_nav_tests {
 
     #[test]
     fn page_keys_reach_every_code_line_after_resize() {
-        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
-
-        let mut s = state();
-        let body: String = (0..40)
-            .map(|i| format!("ROW{i:02} {} END{i:02}\n", "x".repeat(180)))
-            .collect();
-        say(&mut s, "code", &format!("```text\n{body}```"));
-        reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
-        for cols in [48, 120, 48] {
-            reduce(&mut s, Action::Resize(cols, 24));
-            let mut terminal = Terminal::new(TestBackend::new(cols, 24)).unwrap();
-            s.conv.auto_scroll = false;
-            s.conv.scroll = 0;
-            let mut painted = String::new();
-            loop {
-                terminal
-                    .draw(|frame| {
-                        crate::conversation::viewport::render(
-                            frame,
-                            Rect::new(0, 0, cols, 24),
-                            &mut s,
-                        )
-                    })
-                    .unwrap();
-                let buffer = terminal.backend().buffer();
-                for y in 0..24 {
-                    for x in 0..cols {
-                        painted.push_str(buffer[(x, y)].symbol());
-                    }
-                    painted.push('\n');
-                }
-                let before = s.conv.scroll;
-                reduce(
-                    &mut s,
-                    Action::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
-                );
-                if s.conv.scroll == before {
-                    break;
-                }
-            }
-            for i in 0..40 {
-                assert!(
-                    painted.contains(&format!("ROW{i:02}")),
-                    "source start {i} unreachable at {cols} columns"
-                );
-                assert!(
-                    painted.contains(&format!("END{i:02}")),
-                    "source tail {i} unreachable at {cols} columns"
-                );
-            }
-            while s.conv.scroll > 0 {
-                let before = s.conv.scroll;
-                reduce(
-                    &mut s,
-                    Action::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
-                );
-                assert!(
-                    s.conv.scroll < before,
-                    "PageUp must return to the code start"
-                );
-            }
-            assert!(!s.conv.auto_scroll, "manual reading stays pinned");
+        for case in crate::code_block::visibility_fixtures::cases() {
+            let mut s = state();
+            s.transcript.push_user("OTHER-MESSAGE-BEFORE".into());
+            say(&mut s, "code", &case.markdown);
+            reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted));
+            s.transcript.push_user("OTHER-MESSAGE-AFTER".into());
+            crate::code_block::visibility_fixtures::assert_paging(&mut s, case.name);
+            let text: String = s
+                .conversation_lines(44)
+                .iter()
+                .map(crate::selection::line_to_plain)
+                .collect();
+            assert!(text.contains("OTHER-MESSAGE-BEFORE"));
+            assert!(text.contains("OTHER-MESSAGE-AFTER"));
         }
     }
 

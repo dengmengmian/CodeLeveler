@@ -1357,6 +1357,11 @@ verified by deterministic tests and real dogfood — do not regress them:
 - **Bounded highlight cache**: fenced-code syntect results use a bounded LRU
   (512 entries / 4 MiB) keyed by `(lang, exact code)`, independent of the theme;
   the theme only maps colors at render time, eviction is O(1).
+- **Complete Markdown code is reachable**: closed and unclosed fences preserve
+  all code, without source-line folding or wrapped-row clipping. Long lines wrap
+  to the terminal width and the existing Conversation viewport owns scrolling;
+  the beginning, middle, end and neighboring messages remain accessible after
+  resize and history replay.
 - **Finalized-item wrap memo**: immutable transcript items reuse their wrapped
   lines; only the item whose content changed is recomputed. Items that read live
   state (ToolGroup / SubAgent / UserShell) are never memoized. **A height-only
