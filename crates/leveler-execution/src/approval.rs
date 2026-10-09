@@ -424,7 +424,7 @@ pub fn classify_command(cmd: &CommandView) -> CommandClass {
         // (PowerShell is never unwrapped; see [`is_shell_wrapper_program`].)
         let base_lower = program.to_ascii_lowercase();
         if base_lower == "cmd" || base_lower == "cmd.exe" {
-            return classify_shell_script_fallback(script);
+            return classify_shell_script_fallback(script, true);
         }
         return classify_shell_script(script);
     }
@@ -713,20 +713,23 @@ fn is_credential_store_read(program: &str, args: &[String]) -> bool {
 fn classify_shell_script(script: &str) -> CommandClass {
     match shell_ast::classify_bash_script(script) {
         Some(class) => class,
-        None => classify_shell_script_fallback(script),
+        None => classify_shell_script_fallback(script, false),
     }
 }
 
 /// String-based script classifier: splits the script into command segments
 /// and takes the strictest verdict. Fallback for scripts the bash grammar
 /// cannot parse, and the direct path for Windows `cmd /C` scripts (whose
-/// syntax the bash grammar does not cover). Redirections are not inspected
-/// here — that conservative gap is only closed on the AST path.
+/// syntax the bash grammar does not cover). Literal redirect destinations are
+/// inspected with the shell dialect's quotation rules.
 ///
 /// When the script is unparseable and still contains command substitution
 /// markers, fail closed to Dangerous: the fallback cannot walk into `$()` /
 /// backticks the way the AST path can.
-fn classify_shell_script_fallback(script: &str) -> CommandClass {
+fn classify_shell_script_fallback(script: &str, windows_cmd: bool) -> CommandClass {
+    if fallback_redirect_is_dangerous(script, windows_cmd) {
+        return CommandClass::Dangerous;
+    }
     if script.contains("$(") || script.contains('`') {
         return CommandClass::Dangerous;
     }
@@ -745,6 +748,83 @@ fn classify_shell_script_fallback(script: &str) -> CommandClass {
         }
     }
     CommandClass::Safe
+}
+
+/// The fallback must inspect literal file redirects as well as program names.
+/// In particular, `cmd /C` never passes through the Bash AST classifier.
+fn fallback_redirect_is_dangerous(script: &str, windows_cmd: bool) -> bool {
+    let mut chars = script.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if windows_cmd && ch == '^' {
+            chars.next();
+            continue;
+        }
+        if ch == '"' || (!windows_cmd && ch == '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if !matches!(ch, '>' | '<') {
+            continue;
+        }
+        while chars
+            .peek()
+            .is_some_and(|next| *next == ch || next.is_whitespace())
+        {
+            chars.next();
+        }
+        // Descriptor duplication is process I/O, not a filesystem target.
+        if chars.peek() == Some(&'&') {
+            chars.next();
+            continue;
+        }
+        let delimiter = chars
+            .peek()
+            .copied()
+            .filter(|c| *c == '"' || (!windows_cmd && *c == '\''));
+        if delimiter.is_some() {
+            chars.next();
+        }
+        let mut target = String::new();
+        while let Some(next) = chars.peek().copied() {
+            if delimiter == Some(next)
+                || (delimiter.is_none()
+                    && (next.is_whitespace() || matches!(next, '&' | '|' | ';' | '<' | '>')))
+            {
+                break;
+            }
+            if windows_cmd && delimiter.is_none() && next == '^' {
+                chars.next();
+                if let Some(escaped) = chars.next() {
+                    target.push(escaped);
+                }
+            } else {
+                target.push(chars.next().unwrap());
+            }
+        }
+        if delimiter.is_some() {
+            chars.next();
+        }
+        if matches!(target.as_str(), "/dev/null" | "/dev/stdout" | "/dev/stderr") {
+            continue;
+        }
+        if target.split(['/', '\\']).any(|segment| segment == "..") {
+            return true;
+        }
+        if crate::command::is_shared_temp_path(&target) {
+            continue;
+        }
+        if target.starts_with(['/', '\\']) || target.as_bytes().get(1) == Some(&b':') {
+            return true;
+        }
+    }
+    false
 }
 
 /// If `tokens` is a shell wrapper (`sh`/`bash`/`cmd`/…) with a `-c`/`/C` flag,
@@ -901,6 +981,65 @@ impl ApprovalPolicy {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cmd_redirections_preserve_the_auto_permission_boundary() {
+        let policy = super::ApprovalPolicy::default();
+        for (script, expected) in [
+            ("echo x > /etc/hosts", super::Requirement::NeedApproval),
+            (
+                r"echo x > ^C:\outside\file.txt",
+                super::Requirement::NeedApproval,
+            ),
+            (
+                r"echo x > C^:\outside\file.txt",
+                super::Requirement::NeedApproval,
+            ),
+            (r"echo ^> C:\outside\file.txt", super::Requirement::Auto),
+            (
+                r"echo ' > C:\outside\file.txt",
+                super::Requirement::NeedApproval,
+            ),
+            (
+                "echo x > ../../outside.txt",
+                super::Requirement::NeedApproval,
+            ),
+            (
+                r"echo x > C:\outside\file.txt",
+                super::Requirement::NeedApproval,
+            ),
+            ("echo x > workspace-file.txt", super::Requirement::Auto),
+            ("echo x >> workspace-file.txt", super::Requirement::Auto),
+            ("echo x 2>&1", super::Requirement::Auto),
+            ("echo \"literal > /etc/hosts\"", super::Requirement::Auto),
+        ] {
+            let args = vec!["/C".to_owned(), script.to_owned()];
+            let command = super::CommandView {
+                program: "cmd.exe",
+                args: &args,
+            };
+            assert_eq!(
+                policy.evaluate(
+                    super::PermissionProfile::Assisted,
+                    "shell_command",
+                    super::RiskLevel::WorkspaceWrite,
+                    Some(command)
+                ),
+                expected,
+                "{script}"
+            );
+            assert_eq!(
+                policy.evaluate(
+                    super::PermissionProfile::FullAccess,
+                    "shell_command",
+                    super::RiskLevel::WorkspaceWrite,
+                    Some(command)
+                ),
+                super::Requirement::Auto,
+                "Full: {script}"
+            );
+        }
+    }
     /// The agent must not be able to sign its own memory consent, however it
     /// dresses up the call.
     #[test]
