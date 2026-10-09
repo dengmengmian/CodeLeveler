@@ -595,6 +595,22 @@ impl crate::conversation::ConversationView {
     }
 }
 
+/// Resolve the latest tool group to the receipt currently folding it.
+/// Mouse clicks keep their exact item, while the keyboard must open the
+/// containing exploration run instead of toggling a hidden member.
+pub(crate) fn keyboard_expand_target(state: &AppState) -> Option<usize> {
+    let latest = state
+        .transcript
+        .last_tool_group_index()
+        .or_else(|| state.transcript.last_foldable_index())?;
+    let plan = plan_exploration_folds(state.transcript.items());
+    Some(
+        plan.owner[latest]
+            .map(|run| plan.runs[run].anchor)
+            .unwrap_or(latest),
+    )
+}
+
 /// Toggle the view-time exploration fold whose receipt is `item`, if any.
 /// Returns the new expanded state, or `None` when the item is not a run's
 /// anchor.
@@ -1100,6 +1116,47 @@ mod exploration_fold_tests {
         );
     }
 
+    #[test]
+    fn ctrl_o_opens_the_receipt_containing_the_latest_tool_group() {
+        let mut s = boot();
+        read(&mut s, "r1", "old-a.rs", 0);
+        read(&mut s, "r2", "old-b.rs", 1);
+        seal(&mut s);
+        narration(&mut s, "Next step");
+        read(&mut s, "r3", "latest-c.rs", 2);
+        read(&mut s, "r4", "latest-d.rs", 3);
+        seal(&mut s);
+        let collapsed = render(&s);
+        assert!(
+            !collapsed
+                .iter()
+                .any(|l| l.contains("latest-c.rs") || l.contains("latest-d.rs"))
+        );
+        let ctrl_o = crate::action::Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        crate::reducer::reduce(&mut s, ctrl_o.clone());
+        let open = render(&s);
+        assert!(open.iter().any(|l| l.contains("latest-c.rs")), "{open:?}");
+        assert!(open.iter().any(|l| l.contains("latest-d.rs")), "{open:?}");
+        assert!(
+            !open
+                .iter()
+                .any(|l| l.contains("old-a.rs") || l.contains("old-b.rs")),
+            "{open:?}"
+        );
+        assert_eq!(
+            receipts(&open)
+                .iter()
+                .filter(|l| l.starts_with('▾'))
+                .count(),
+            1
+        );
+        crate::reducer::reduce(&mut s, ctrl_o);
+        assert_eq!(render(&s), collapsed, "the same receipt closes again");
+    }
+
     fn position(lines: &[String], needle: &str) -> usize {
         lines
             .iter()
@@ -1123,10 +1180,7 @@ mod exploration_fold_tests {
         let lines = render(&s);
         let found = receipts(&lines);
         assert_eq!(found.len(), 1, "one aggregate receipt: {lines:#?}");
-        assert_eq!(
-            found[0].trim_end(),
-            "\u{25b8} 读取 2 次 \u{b7} 搜索 1 次"
-        );
+        assert_eq!(found[0].trim_end(), "\u{25b8} 读取 2 次 \u{b7} 搜索 1 次");
         assert!(
             !lines.iter().any(|l| l.contains("思考 ·")),
             "no Thought header while folded: {lines:#?}"
