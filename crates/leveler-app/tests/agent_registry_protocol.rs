@@ -40,10 +40,11 @@ struct Fixture {
     _tmp: tempfile::TempDir,
     repo: PathBuf,
     client: Arc<InProcessRuntimeClient>,
+    session: SessionId,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    async fn new() -> Self {
         home();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
@@ -51,9 +52,11 @@ impl Fixture {
         let layout =
             Layout::from_parts(repo.clone(), repo.join("configs"), tmp.path().join("state"));
         let app = Arc::new(Application::assemble(layout).expect("assemble"));
+        let model = ModelRef::parse("deepseek/test-model").unwrap();
+        let session = app.create_session(&model, "agents-session").await.unwrap();
         let client = Arc::new(InProcessRuntimeClient::new(
             app,
-            ModelRef::parse("deepseek/test-model").unwrap(),
+            model,
             PermissionProfile::Assisted,
             false,
         ));
@@ -61,6 +64,7 @@ impl Fixture {
             _tmp: tmp,
             repo,
             client,
+            session,
         }
     }
 
@@ -92,10 +96,6 @@ impl Fixture {
     }
 }
 
-fn sid() -> SessionId {
-    SessionId::new("agents-session")
-}
-
 fn draft(name: &str, capability: UiAgentCapability) -> UiAgentDraft {
     UiAgentDraft {
         name: name.into(),
@@ -117,7 +117,7 @@ async fn list(fx: &Fixture) -> Vec<leveler_client_protocol::UiAgentEntry> {
     let want = q.clone();
     fx.ask(
         ClientCommand::ListAgents {
-            session_id: sid(),
+            session_id: fx.session.clone(),
             query_id: Some(q),
         },
         move |e| match e {
@@ -140,7 +140,7 @@ async fn mutate(fx: &Fixture, command: ClientCommand) -> (bool, Option<String>) 
 
 #[tokio::test]
 async fn listing_resolves_sources_status_and_shadowing() {
-    let fx = Fixture::new();
+    let fx = Fixture::new().await;
     fx.agent_file("security-reviewer", "capability: read_only\n", "Review.");
     fx.agent_file("broken", "capability: read_only\nwirte: true\n", "x");
     fx.agent_file(
@@ -197,7 +197,7 @@ async fn listing_resolves_sources_status_and_shadowing() {
 
 #[tokio::test]
 async fn get_returns_the_instructions_or_says_why_not() {
-    let fx = Fixture::new();
+    let fx = Fixture::new().await;
     fx.agent_file(
         "security-reviewer",
         "capability: read_only\n",
@@ -206,7 +206,7 @@ async fn get_returns_the_instructions_or_says_why_not() {
     let detail = fx
         .ask(
             ClientCommand::GetAgent {
-                session_id: sid(),
+                session_id: fx.session.clone(),
                 name: "security-reviewer".into(),
                 query_id: None,
             },
@@ -225,7 +225,7 @@ async fn get_returns_the_instructions_or_says_why_not() {
     let missing = fx
         .ask(
             ClientCommand::GetAgent {
-                session_id: sid(),
+                session_id: fx.session.clone(),
                 name: "nope".into(),
                 query_id: None,
             },
@@ -241,11 +241,11 @@ async fn get_returns_the_instructions_or_says_why_not() {
 
 #[tokio::test]
 async fn create_update_delete_write_through_the_runtime() {
-    let fx = Fixture::new();
+    let fx = Fixture::new().await;
     let (ok, error) = mutate(
         &fx,
         ClientCommand::CreateAgent {
-            session_id: sid(),
+            session_id: fx.session.clone(),
             scope: UiAgentScope::Project,
             draft: Box::new(draft("frontend-worker", UiAgentCapability::ScopedWriter)),
             query_id: None,
@@ -262,7 +262,7 @@ async fn create_update_delete_write_through_the_runtime() {
     let (ok, error) = mutate(
         &fx,
         ClientCommand::UpdateAgent {
-            session_id: sid(),
+            session_id: fx.session.clone(),
             scope: UiAgentScope::Project,
             draft: Box::new(updated),
             query_id: None,
@@ -284,7 +284,7 @@ async fn create_update_delete_write_through_the_runtime() {
     let (ok, error) = mutate(
         &fx,
         ClientCommand::DeleteAgent {
-            session_id: sid(),
+            session_id: fx.session.clone(),
             scope: UiAgentScope::Project,
             name: "frontend-worker".into(),
             query_id: None,
@@ -298,13 +298,13 @@ async fn create_update_delete_write_through_the_runtime() {
 
 #[tokio::test]
 async fn a_contradictory_draft_is_refused_and_nothing_is_written() {
-    let fx = Fixture::new();
+    let fx = Fixture::new().await;
     let mut contradiction = draft("ro-writer", UiAgentCapability::ReadOnly);
     contradiction.tools = Some(vec!["read_file".into(), "apply_patch".into()]);
     let (ok, error) = mutate(
         &fx,
         ClientCommand::CreateAgent {
-            session_id: sid(),
+            session_id: fx.session.clone(),
             scope: UiAgentScope::Project,
             draft: Box::new(contradiction),
             query_id: None,
@@ -318,7 +318,7 @@ async fn a_contradictory_draft_is_refused_and_nothing_is_written() {
     let (ok, error) = mutate(
         &fx,
         ClientCommand::CreateAgent {
-            session_id: sid(),
+            session_id: fx.session.clone(),
             scope: UiAgentScope::Project,
             draft: Box::new(draft("worker", UiAgentCapability::ScopedWriter)),
             query_id: None,
@@ -331,11 +331,11 @@ async fn a_contradictory_draft_is_refused_and_nothing_is_written() {
 
 #[tokio::test]
 async fn a_user_scope_agent_lands_in_the_home_and_is_listed_as_user() {
-    let fx = Fixture::new();
+    let fx = Fixture::new().await;
     let (ok, error) = mutate(
         &fx,
         ClientCommand::CreateAgent {
-            session_id: sid(),
+            session_id: fx.session.clone(),
             scope: UiAgentScope::User,
             draft: Box::new(draft("rust-explorer-ui", UiAgentCapability::ReadOnly)),
             query_id: None,
