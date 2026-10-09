@@ -2043,6 +2043,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                model_notice: None,
                 thinking: None,
             },
         )
@@ -2624,6 +2625,7 @@ mod tests {
                 context_window: 0,
                 locale: crate::i18n::Locale::Zh,
                 untrusted_config: Vec::new(),
+                model_notice: None,
                 thinking: None,
             },
         );

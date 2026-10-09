@@ -75,6 +75,12 @@ pub struct Boot {
     /// chip must not invent a level, and must never render a provider's own
     /// parameter instead.
     pub thinking: Option<leveler_client_protocol::UiThinkingState>,
+    /// A startup fact the runtime decided while creating this session that the
+    /// person must see — today, the persisted default model was not resolvable
+    /// here and a configured model was used instead. It travels through the
+    /// launcher because the runtime's own event stream has no subscriber yet at
+    /// the moment the session is created, so a notice emitted there is lost.
+    pub model_notice: Option<String>,
 }
 
 /// A transient status-line notification.
@@ -576,6 +582,9 @@ pub struct AppState {
 impl AppState {
     pub fn new(theme: Theme, boot: Boot) -> Self {
         let dark = theme.is_dark();
+        // Read before the boot is moved into the state: this is a startup fact
+        // the launcher carried from the runtime (see `Boot::model_notice`).
+        let model_notice = boot.model_notice.clone();
         let mut state = Self {
             running: true,
             runtime_connected: true,
@@ -703,6 +712,16 @@ impl AppState {
         };
         // The composer writes images into the sentence in the session's own
         // language, so it needs the template before the first paste.
+        // A startup fact the launcher carried from the runtime: today, a
+        // persisted default model this environment could not resolve. Shown so
+        // the model on screen is explained rather than silently different from
+        // the one the user last chose.
+        if let Some(notice) = model_notice {
+            state.notification = Some(Notification {
+                level: leveler_client_protocol::NotificationLevel::Warning,
+                message: notice,
+            });
+        }
         let template = state.image_token_template();
         state.composer.set_image_token_template(&template);
         state.btw.draft.set_image_token_template(&template);

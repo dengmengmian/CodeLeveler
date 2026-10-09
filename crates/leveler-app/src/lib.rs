@@ -449,6 +449,14 @@ pub struct Application {
     permission_profiles: std::sync::Mutex<
         std::collections::HashMap<String, leveler_execution::SharedPermissionProfile>,
     >,
+    /// A startup fact this process learned while resolving the default model and
+    /// that the next created session's client must be told: today, the persisted
+    /// default was not resolvable here and a configured model was used instead.
+    ///
+    /// It lives here because the daemon's own stderr is a log file and its event
+    /// stream has no subscriber at creation time; the created session's
+    /// bootstrap is the one channel a client is guaranteed to read.
+    default_model_notice: std::sync::Mutex<Option<String>>,
 }
 
 impl Drop for Application {
@@ -690,6 +698,7 @@ impl Application {
             runtime_id: OnceLock::new(),
             boot: std::sync::Mutex::new(None),
             in_flight_commands: Default::default(),
+            default_model_notice: std::sync::Mutex::new(None),
             permission_profiles: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -900,6 +909,79 @@ impl Application {
     /// All configured model references.
     pub fn model_refs(&self) -> Vec<ModelRef> {
         self.registry.model_refs()
+    }
+
+    /// Record a startup fact for the next created session's client. Set by the
+    /// composition root right after it resolves the default model; see
+    /// [`Self::take_default_model_notice`].
+    pub fn set_default_model_notice(&self, notice: String) {
+        let mut slot = self
+            .default_model_notice
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(notice);
+    }
+
+    /// Take the startup fact, so it is reported once rather than on every new
+    /// session: the person has been told which model is in force.
+    pub fn take_default_model_notice(&self) -> Option<String> {
+        self.default_model_notice
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Whether a PERSISTENT default may name `model` in this repository.
+    ///
+    /// The persisted default is read by the next bare launch, which resolves
+    /// the DEFAULT environment: this repository's `<repo>/configs` bundle (or
+    /// `LEVELER_CONFIG_DIR`) plus the global config. A model that exists only in
+    /// an explicitly overridden bundle (`--config-dir`) would therefore make the
+    /// next `leveler` fail to start with `model … is not configured`, so such a
+    /// choice stays session-scoped. This is evidence, not policy: it answers
+    /// what a bare launch would resolve, and the caller decides.
+    pub fn model_is_in_default_environment(&self, model: &ModelRef) -> bool {
+        let Some(repo_root) = self.layout.repo_root.clone() else {
+            // No workspace: the default environment IS the home-level bundle the
+            // running layout already resolved.
+            return true;
+        };
+        let default_layout = leveler_project::Layout::resolve(repo_root, None);
+        if default_layout.config_dir == self.layout.config_dir {
+            // The running catalog came from the default bundle: whatever it
+            // offers, a bare launch in this repository offers too.
+            return true;
+        }
+        match Self::load_config(&default_layout) {
+            Ok(config) => config.models.iter().any(|candidate| {
+                candidate.profile.provider == model.provider && candidate.profile.id == model.model
+            }),
+            // The default catalog could not even be read, so nothing can be
+            // proven either way. Honor the user's explicit request (a broken
+            // config reports its own failure on write) and let the startup
+            // fallback rescue a default that turns out to be unusable — a
+            // silently skipped persist would report success and lose the write
+            // failure the person needs to see.
+            Err(_) => true,
+        }
+    }
+
+    /// A configured model to use when the persisted default does not resolve in
+    /// THIS environment.
+    ///
+    /// Order: the global config's own default when this environment can resolve
+    /// it, else the first configured model in stable order — the same last
+    /// resort a bare launch uses when no default is set. `None` only when
+    /// nothing at all is configured.
+    pub fn fallback_default_model(&self) -> Option<ModelRef> {
+        let mut configured = self.model_refs();
+        configured.sort_by_key(|reference| reference.to_string());
+        if let Some(preferred) = self.config.default_model.as_deref().and_then(ModelRef::parse)
+            && configured.contains(&preferred)
+        {
+            return Some(preferred);
+        }
+        configured.into_iter().next()
     }
 
     pub(crate) fn validate_session_workspace(
@@ -1300,7 +1382,7 @@ impl Application {
                 tool_context,
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
-                overrides: self.execution_overrides_for_session(session_scope).await?,
+                overrides: self.execution_overrides_for_session(session_scope, Some(model)).await?,
                 capabilities: Some(capabilities),
                 memory_catalog,
                 memory_expose: available_packs.memory,

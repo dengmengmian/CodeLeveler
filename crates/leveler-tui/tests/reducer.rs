@@ -89,6 +89,7 @@ fn state() -> AppState {
             context_window: 0,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     )
@@ -2351,10 +2352,15 @@ fn model_picker_confirm_selects_and_sets_default() {
     );
     assert!(s.overlay.is_none());
     assert_eq!(s.model_label, "glm/5");
-    let note = s.notification.as_ref().expect("default-model notice");
+    // The client claims only what it did: the SWITCH. Whether the choice also
+    // became the persisted default is the runtime's fact — it declines when the
+    // model is not resolvable in the default environment — so the message must
+    // not pre-claim persistence.
+    let note = s.notification.as_ref().expect("model-switch notice");
+    assert!(note.message.contains("glm/5"), "{}", note.message);
     assert!(
-        note.message.contains("默认") && note.message.contains("glm/5"),
-        "{}",
+        !note.message.contains("默认"),
+        "the client must not claim persistence before the runtime decides: {}",
         note.message
     );
 }
@@ -9114,6 +9120,7 @@ fn opened_in(locale: leveler_tui::Locale) -> AppState {
             context_window: 0,
             locale,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );

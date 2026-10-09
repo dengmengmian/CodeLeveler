@@ -275,6 +275,7 @@ mod tests {
                 context_window: 200_000,
                 locale: crate::i18n::Locale::En,
                 untrusted_config: Vec::new(),
+                model_notice: None,
                 thinking: None,
             },
         );

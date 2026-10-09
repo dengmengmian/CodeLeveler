@@ -86,6 +86,7 @@ fn opened(acc: ContextAccounting) -> AppState {
             context_window: 128_000,
             locale: leveler_tui::Locale::En,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );

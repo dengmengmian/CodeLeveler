@@ -86,6 +86,7 @@ fn state() -> AppState {
             context_window: 200_000,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );
