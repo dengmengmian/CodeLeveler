@@ -1479,13 +1479,15 @@ impl InProcessRuntimeClient {
                     ))
                 })?;
             } else {
-                let _ = self.events_for(session_id).send(RuntimeEvent::Notification {
-                    level: leveler_client_protocol::NotificationLevel::Warning,
-                    message: format!(
-                        "已切换模型 {model}，但未写入默认：它只在自定义配置目录里，\
-                         写入会让下次普通启动失败"
-                    ),
-                });
+                let _ = self
+                    .events_for(session_id)
+                    .send(RuntimeEvent::Notification {
+                        level: leveler_client_protocol::NotificationLevel::Warning,
+                        message: format!(
+                            "已切换模型 {model}，但未写入默认：它只在自定义配置目录里，\
+                             写入会让下次普通启动失败"
+                        ),
+                    });
             }
         }
         let session = self.snapshot(session_id).await?;
@@ -5612,7 +5614,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                     )));
                 }
                 explicit
-            },
+            }
             None => {
                 let preferred = self.default_runtime.model.clone();
                 if self.app.model_refs().contains(&preferred) {
@@ -5638,7 +5640,8 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         // The composition root may already have learned this while resolving the
         // default model (the daemon path resolves before any session exists, and
         // its stderr is a log file nobody reads).
-        let substitution_notice = substitution_notice.or_else(|| self.app.take_default_model_notice());
+        let substitution_notice =
+            substitution_notice.or_else(|| self.app.take_default_model_notice());
         let (session_id, inserted) = if let Some(request_id) = request.request_id.as_ref() {
             let db = self
                 .app

@@ -345,11 +345,7 @@ async fn a_model_only_a_custom_config_dir_offers_is_not_written_as_the_default()
     std::fs::create_dir_all(repo.join("configs")).unwrap();
     let bundle = tmp.path().join("other-configs");
     write_bundle(&bundle);
-    let layout = Layout::from_parts(
-        repo,
-        bundle,
-        tmp.path().join("state"),
-    );
+    let layout = Layout::from_parts(repo, bundle, tmp.path().join("state"));
     let app = Arc::new(Application::assemble(layout).unwrap());
     let model = ModelRef::new("mock", "m");
     assert!(
@@ -400,7 +396,6 @@ async fn a_model_only_a_custom_config_dir_offers_is_not_written_as_the_default()
         message.contains("未写入默认") && message.contains("mock/m"),
         "the notice names the outcome and the model: {message}"
     );
-
 }
 
 /// Case 8: an unresolvable PERSISTED default must not leave the UI unable to
@@ -459,8 +454,5 @@ async fn an_unresolvable_persisted_default_substitutes_instead_of_bricking_start
     )
     .await
     .expect_err("an explicitly requested unknown model is an error");
-    assert!(
-        error.to_string().contains("is not configured"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("is not configured"), "{error}");
 }
