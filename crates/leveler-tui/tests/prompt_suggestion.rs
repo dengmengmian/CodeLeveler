@@ -68,6 +68,7 @@ fn opened() -> AppState {
             context_window: 200_000,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );
@@ -94,6 +95,7 @@ fn a0_opening_an_idle_session_requests_an_initial_prediction() {
             context_window: 200_000,
             locale: leveler_tui::Locale::Zh,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );
@@ -610,6 +612,7 @@ fn a3_incomplete_turn_without_a_next_step_falls_back_to_localized_continue() {
             context_window: 200_000,
             locale: leveler_tui::Locale::En,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );

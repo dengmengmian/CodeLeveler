@@ -1549,6 +1549,7 @@ fn replay_history(
             context_window: 0,
             locale: state.locale,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );

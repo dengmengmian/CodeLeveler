@@ -34,7 +34,7 @@ use leveler_runtime_host::{
 use crate::cli::{OutputFormat, RunMode};
 use crate::common::{
     build_approver, map_mode, project_default_mode, resolve_mode, resolve_model,
-    spawn_interrupt_handler, wire_mode,
+    resolve_model_with_notice, spawn_interrupt_handler, wire_mode,
 };
 use crate::output::Line;
 use crate::render::{emit_jsonl, render_event};
@@ -968,7 +968,7 @@ pub(crate) async fn cmd_tui(
             .map(crate::common::parse_model_ref)
             .transpose()?;
         let client = Arc::new(client);
-        let (session_id, context_window) = if let Some(id) = session.as_deref() {
+        let (session_id, context_window, model_notice) = if let Some(id) = session.as_deref() {
             let session_id = leveler_core::SessionId::new(id);
             let snap = client.snapshot(&session_id).await.map_err(|e| {
                 anyhow::anyhow!(
@@ -1027,7 +1027,8 @@ pub(crate) async fn cmd_tui(
                         .and_then(|g| g.context_window_for(&m.to_string()))
                 })
                 .unwrap_or(0);
-            (session_id, window)
+            // A resumed session keeps its own model; nothing was substituted.
+            (session_id, window, None)
         } else {
             // R006 R6-P5: bare `leveler tui` silently starts a NEW session, so
             // an interrupted long-running goal is easy to abandon by accident —
@@ -1043,7 +1044,12 @@ pub(crate) async fn cmd_tui(
                     auto_approve,
                 ))
                 .await?;
-            (bootstrap.session.id, bootstrap.context_window)
+            if let Some(notice) = bootstrap.notice.as_deref() {
+                // Also on stderr: the alternate screen wipes the status line on
+                // exit, and a startup fact must survive in the scrollback.
+                eprintln!("{notice}");
+            }
+            (bootstrap.session.id, bootstrap.context_window, bootstrap.notice)
         };
         let global = leveler_app::GlobalConfig::load()?;
         let boot = leveler_tui::Boot {
@@ -1063,6 +1069,11 @@ pub(crate) async fn cmd_tui(
             // own vocabulary, and the TUI adopts it from the first snapshot; a
             // boot value here would be a guess about capability.
             thinking: None,
+            // A startup fact the runtime decided while creating the session
+            // (today: a persisted default model this environment could not
+            // resolve). Shown as a status notice because it is why the model on
+            // screen is not the one the user last chose.
+            model_notice,
         };
         // A phone can be served over this connection.
         //
@@ -1109,7 +1120,7 @@ pub(crate) async fn cmd_tui(
 
     let app = Arc::new(Application::assemble(layout)?);
     app.reconcile_execution_services().await?;
-    let model_ref = resolve_model(app.as_ref(), model)?;
+    let (model_ref, model_notice) = resolve_model_with_notice(app.as_ref(), model)?;
 
     // One resolution per launch. A resume falls back to the PERSISTED mode
     // (never a default), a new session falls back to the project default; an
@@ -1226,6 +1237,7 @@ pub(crate) async fn cmd_tui(
             .iter()
             .find(|m| m.profile.id == model_ref.model && m.profile.provider == model_ref.provider)
             .and_then(|m| leveler_app::ui_thinking_state(Some(&m.profile), None)),
+        model_notice,
     };
 
     // `/remote`: the agent serves paired phones over this same in-process
@@ -1285,7 +1297,14 @@ pub(crate) async fn cmd_serve(
 ) -> anyhow::Result<std::process::ExitCode> {
     let socket_path = socket.unwrap_or_else(|| layout.socket_path());
     let app = Arc::new(Application::assemble(layout)?);
-    let model_ref = resolve_model(app.as_ref(), model)?;
+    let (model_ref, model_notice) = resolve_model_with_notice(app.as_ref(), model)?;
+    // The daemon's own stderr goes to `daemon.log`, which nobody reads. Keep the
+    // fact on the application instead so the next created session can hand it to
+    // its client with the bootstrap — the one channel a client is guaranteed to
+    // read, since it subscribes to the session stream only after the call.
+    if let Some(notice) = model_notice {
+        app.set_default_model_notice(notice);
+    }
     let default_mode = resolve_mode(mode, project_default_mode(&app.layout));
 
     // Minted here so the runtime can retire this process itself once work

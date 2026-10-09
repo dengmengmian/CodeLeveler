@@ -15,42 +15,70 @@ use crate::cli::RunMode;
 use crate::output::Line;
 
 /// Resolve the model reference: CLI flag, else `.leveler/config.yaml` default,
-/// else the single configured model.
+/// else the global default, else the first configured model.
+///
+/// A persisted default this environment cannot resolve is abandoned with a
+/// notice rather than carried forward: carrying it used to end in
+/// `model … is not configured` at the first model call, which for the TUI meant
+/// the interface never opened at all.
 pub(crate) fn resolve_model(app: &Application, model: Option<String>) -> anyhow::Result<ModelRef> {
-    let chosen = choose_model(app, model)?;
+    let (chosen, notice) = resolve_model_with_notice(app, model)?;
+    if let Some(notice) = notice {
+        // Every caller of this is a one-shot command whose stderr is the
+        // person's screen; an interactive caller takes the notice instead.
+        eprintln!("{notice}");
+    }
+    Ok(chosen)
+}
+
+/// [`resolve_model`], carrying the abandoned-default notice to the caller so an
+/// interactive front end can show it where the person will actually see it.
+pub(crate) fn resolve_model_with_notice(
+    app: &Application,
+    model: Option<String>,
+) -> anyhow::Result<(ModelRef, Option<String>)> {
+    let (chosen, notice) = choose_model(app, model)?;
     // Every caller of this is about to make a model call. A provider whose key
     // is missing is knowable here, and saying so here is the difference between
     // a fix the user can apply and the provider's own wire advice.
     ensure_provider_key(&app.config.providers, &chosen)?;
-    Ok(chosen)
+    Ok((chosen, notice))
 }
 
-fn choose_model(app: &Application, model: Option<String>) -> anyhow::Result<ModelRef> {
+fn choose_model(
+    app: &Application,
+    model: Option<String>,
+) -> anyhow::Result<(ModelRef, Option<String>)> {
+    // An explicit flag is the user's own intent: used verbatim, and a bad value
+    // fails later with the resolver's own message rather than being silently
+    // replaced by something else.
     if let Some(m) = model {
-        return parse_model_ref(&m);
+        return Ok((parse_model_ref(&m)?, None));
     }
-    if let Some(m) = app
-        .project_config()
-        .model
-        .as_deref()
-        .and_then(ModelRef::parse)
-    {
-        return Ok(m);
+    let configured = app.model_refs();
+    let persisted = [
+        app.project_config().model.as_deref().and_then(ModelRef::parse),
+        app.config.default_model.as_deref().and_then(ModelRef::parse),
+    ];
+    let mut abandoned: Vec<String> = Vec::new();
+    for candidate in persisted.into_iter().flatten() {
+        if configured.contains(&candidate) {
+            let notice = notice_for(&abandoned, &candidate);
+            return Ok((candidate, notice));
+        }
+        abandoned.push(candidate.to_string());
     }
-    // Global config default (~/.leveler/config.toml).
-    if let Some(m) = app
-        .config
-        .default_model
-        .as_deref()
-        .and_then(ModelRef::parse)
-    {
-        return Ok(m);
-    }
-    let mut refs = app.model_refs();
+    let mut refs = configured;
     refs.sort_by_key(|r| r.to_string());
-    refs.into_iter().next().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no models configured\n\
+    refs.into_iter()
+        .next()
+        .map(|chosen| {
+            let notice = notice_for(&abandoned, &chosen);
+            (chosen, notice)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no models configured\n\
                  \n\
                  Run `leveler init` to set this up interactively, or create \
                  ~/.leveler/config.toml (or $LEVELER_HOME/config.toml) with a \
@@ -66,8 +94,21 @@ fn choose_model(app: &Application, model: Option<String>) -> anyhow::Result<Mode
                  \n\
                  Then: export DEEPSEEK_API_KEY=… && leveler doctor\n\
                  (Repo-local configs/models/*.yaml still works for developers.)"
-        )
-    })
+            )
+        })
+}
+
+/// The one wording for "a persisted default was not usable here", shared by
+/// the headless stderr path and the interactive startup notice.
+fn notice_for(abandoned: &[String], chosen: &ModelRef) -> Option<String> {
+    if abandoned.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "默认模型 {} 在本环境不可用（已从配置中移除？），本次改用 {chosen}；\
+         用 /model 选择一个可用的模型",
+        abandoned.join("、")
+    ))
 }
 
 pub(crate) fn map_mode(mode: RunMode) -> PermissionProfile {

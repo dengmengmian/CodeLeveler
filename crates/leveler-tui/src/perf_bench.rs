@@ -48,6 +48,7 @@ fn opened() -> AppState {
             context_window: 200_000,
             locale: crate::i18n::Locale::Zh,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     );

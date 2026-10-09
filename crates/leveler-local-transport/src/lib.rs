@@ -139,6 +139,14 @@ pub struct CreateSessionRequest {
 pub struct SessionBootstrap {
     pub session: UiSessionSnapshot,
     pub context_window: u32,
+    /// A startup fact the runtime decided while creating this session that the
+    /// person must see (today: the persisted default model could not be
+    /// resolved here, so a configured model was used instead). It travels with
+    /// the bootstrap because a client subscribes to the session's stream only
+    /// after this call returns, and a notice emitted earlier would be lost.
+    /// Additive: an older peer ignores it, a newer one treats absence as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 /// Bytes of one registered attachment, loaded from the runtime media store.
@@ -2267,6 +2275,7 @@ mod tests {
             Ok(SessionBootstrap {
                 session: self.snapshot.lock().unwrap().clone(),
                 context_window: 128_000,
+                notice: None,
             })
         }
 

@@ -1467,11 +1467,26 @@ impl InProcessRuntimeClient {
             supersede_pending_approvals(&self.pending, session_id);
         }
         if let ClientCommand::SetDefaultModel { model, .. } = command {
-            crate::global_config::GlobalConfig::save_default_model(model).map_err(|error| {
-                ClientError::Runtime(format!(
-                    "已切换到 {model}，但默认模型保存失败：{error}；下次启动可能恢复原模型"
-                ))
-            })?;
+            // A persistent default is read by the NEXT bare launch, whose
+            // environment may not contain a model that only a `--config-dir`
+            // bundle offered. Writing it anyway is how a temporary environment
+            // bricks the default one (`model … is not configured` at startup),
+            // so the choice stays session-scoped and the user is told why.
+            if self.app.model_is_in_default_environment(model) {
+                crate::global_config::GlobalConfig::save_default_model(model).map_err(|error| {
+                    ClientError::Runtime(format!(
+                        "已切换到 {model}，但默认模型保存失败：{error}；下次启动可能恢复原模型"
+                    ))
+                })?;
+            } else {
+                let _ = self.events_for(session_id).send(RuntimeEvent::Notification {
+                    level: leveler_client_protocol::NotificationLevel::Warning,
+                    message: format!(
+                        "已切换模型 {model}，但未写入默认：它只在自定义配置目录里，\
+                         写入会让下次普通启动失败"
+                    ),
+                });
+            }
         }
         let session = self.snapshot(session_id).await?;
         let _ = self
@@ -5578,17 +5593,52 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
                 return Ok(leveler_local_transport::SessionBootstrap {
                     session,
                     context_window,
+                    // A retried creation returns the receipt of the first call;
+                    // the substitution notice was delivered there.
+                    notice: None,
                 });
             }
         }
-        let model = request
-            .model
-            .unwrap_or_else(|| self.default_runtime.model.clone());
-        if !self.app.model_refs().contains(&model) {
-            return Err(ClientError::Runtime(format!(
-                "model `{model}` is not configured"
-            )));
-        }
+        // An EXPLICIT request is the user's own intent and stays a hard error.
+        // A DEFAULT that this environment cannot resolve (a leftover from a
+        // bundle that is gone, a hand-edited config) must not leave the UI
+        // unable to start: fall back to a configured model and say so.
+        let mut substitution: Option<(ModelRef, ModelRef)> = None;
+        let model = match request.model.clone() {
+            Some(explicit) => {
+                if !self.app.model_refs().contains(&explicit) {
+                    return Err(ClientError::Runtime(format!(
+                        "model `{explicit}` is not configured"
+                    )));
+                }
+                explicit
+            },
+            None => {
+                let preferred = self.default_runtime.model.clone();
+                if self.app.model_refs().contains(&preferred) {
+                    preferred
+                } else {
+                    let fallback = self.app.fallback_default_model().ok_or_else(|| {
+                        ClientError::Runtime(format!(
+                            "model `{preferred}` is not configured, and this environment has no\
+                             other configured model to fall back to"
+                        ))
+                    })?;
+                    substitution = Some((fallback.clone(), preferred));
+                    fallback
+                }
+            }
+        };
+        let substitution_notice = substitution.as_ref().map(|(used, missing)| {
+            format!(
+                "默认模型 {missing} 在本环境不可用（已从配置中移除？），本次改用 {used}\
+                 ；用 /model 选择并确认一个可用的模型"
+            )
+        });
+        // The composition root may already have learned this while resolving the
+        // default model (the daemon path resolves before any session exists, and
+        // its stderr is a log file nobody reads).
+        let substitution_notice = substitution_notice.or_else(|| self.app.take_default_model_notice());
         let (session_id, inserted) = if let Some(request_id) = request.request_id.as_ref() {
             let db = self
                 .app
@@ -5670,6 +5720,7 @@ impl leveler_local_transport::LocalRuntimeService for InProcessRuntimeClient {
         Ok(leveler_local_transport::SessionBootstrap {
             session,
             context_window,
+            notice: substitution_notice,
         })
     }
 

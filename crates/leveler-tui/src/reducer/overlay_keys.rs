@@ -65,7 +65,11 @@ pub(super) fn handle_overlay_key(state: &mut AppState, key: KeyEvent) -> Vec<Eff
                     state.thinking = None;
                     state.notification = Some(Notification {
                         level: NotificationLevel::Info,
-                        message: format!("已切换模型并设为默认: {model}"),
+                        // Neutral on purpose: whether the choice also became the
+                        // PERSISTED default is the runtime's fact, not this
+                        // client's to claim. The runtime says so itself when it
+                        // declines (a model only this environment can resolve).
+                        message: format!("已切换模型: {model}"),
                     });
                     vec![Effect::Send(ClientCommand::SetDefaultModel {
                         session_id: state.session_id.clone(),

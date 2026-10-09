@@ -43,16 +43,22 @@ async fn config_guard() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 fn write_repo_config(root: &std::path::Path) {
-    std::fs::create_dir_all(root.join("configs/providers")).unwrap();
-    std::fs::create_dir_all(root.join("configs/models")).unwrap();
+    write_bundle(&root.join("configs"));
+}
+
+/// A provider/model bundle at an arbitrary directory — the shape an explicit
+/// `--config-dir` points at.
+fn write_bundle(config_dir: &std::path::Path) {
+    std::fs::create_dir_all(config_dir.join("providers")).unwrap();
+    std::fs::create_dir_all(config_dir.join("models")).unwrap();
     std::fs::write(
-        root.join("configs/providers/mock.yaml"),
+        config_dir.join("providers/mock.yaml"),
         "id: mock\nprotocol: openai_chat\nbase_url: http://127.0.0.1:9\n\
          retry:\n  max_attempts: 1\n  initial_backoff_ms: 10\n  max_backoff_ms: 10\n",
     )
     .unwrap();
     std::fs::write(
-        root.join("configs/models/m.yaml"),
+        config_dir.join("models/m.yaml"),
         r#"
 id: m
 provider: mock
@@ -323,4 +329,138 @@ async fn a_config_write_failure_is_reported_as_a_partial_failure() {
     );
 
     std::fs::remove_dir(&path).unwrap();
+}
+
+/// Case 7: a model that only a NON-default config bundle offers must not become
+/// the persistent default. The next bare launch resolves `<repo>/configs` + the
+/// global config, so persisting it is how a temporary environment bricks the
+/// default one (`model … is not configured` at startup). The switch still
+/// happens — session-scoped — and the runtime says why the default did not move.
+#[tokio::test]
+async fn a_model_only_a_custom_config_dir_offers_is_not_written_as_the_default() {
+    let _guard = config_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_global_default("default_model = \"old/keep\"\n");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("configs")).unwrap();
+    let bundle = tmp.path().join("other-configs");
+    write_bundle(&bundle);
+    let layout = Layout::from_parts(
+        repo,
+        bundle,
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(Application::assemble(layout).unwrap());
+    let model = ModelRef::new("mock", "m");
+    assert!(
+        app.model_refs().contains(&model),
+        "this process's bundle offers the model"
+    );
+    assert!(
+        !app.model_is_in_default_environment(&model),
+        "a bare launch in this repository would not resolve it"
+    );
+
+    let session_id = app.create_session(&model, "goal").await.unwrap();
+    let client = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        model.clone(),
+        PermissionProfile::Assisted,
+        false,
+    ));
+    let mut events = client.subscribe_session(&session_id);
+
+    client
+        .send_observed(ClientCommand::SetDefaultModel {
+            session_id: session_id.clone(),
+            model: model.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session_model(&client, &session_id).await,
+        model,
+        "the session switch itself is not gated on persistability"
+    );
+    assert_eq!(
+        GlobalConfig::load().unwrap().default_model.as_deref(),
+        Some("old/keep"),
+        "a model only this environment can resolve must not become the default"
+    );
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .expect("a notice is emitted")
+        .expect("stream alive");
+    let leveler_client_protocol::RuntimeEvent::Notification { level, message } = notice else {
+        panic!("expected a notification, got {notice:?}");
+    };
+    assert_eq!(level, leveler_client_protocol::NotificationLevel::Warning);
+    assert!(
+        message.contains("未写入默认") && message.contains("mock/m"),
+        "the notice names the outcome and the model: {message}"
+    );
+
+}
+
+/// Case 8: an unresolvable PERSISTED default must not leave the UI unable to
+/// start. The runtime substitutes a configured model and reports it with the
+/// bootstrap — the one channel the client is guaranteed to read, because it is
+/// not subscribed to the session stream yet at creation time.
+#[tokio::test]
+async fn an_unresolvable_persisted_default_substitutes_instead_of_bricking_startup() {
+    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService};
+
+    let _guard = config_guard().await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_global_default("default_model = \"mock/gone\"\n");
+    let (app, _client, _session_id) = build(&tmp).await;
+    let gone = ModelRef::new("mock", "gone");
+    assert!(
+        !app.model_refs().contains(&gone),
+        "the persisted default is unresolvable here"
+    );
+    let client = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        gone.clone(),
+        PermissionProfile::Assisted,
+        false,
+    ));
+    let request = CreateSessionRequest {
+        request_id: None,
+        collaboration: leveler_lifecycle::CollaborationMode::Chat,
+        workspace: leveler_local_transport::CreateWorkspaceSelection::RuntimeDefault,
+        goal: "interactive session".to_string(),
+        model: None,
+        mode: leveler_client_protocol::PermissionProfile::Assisted,
+        approval_policy: leveler_client_protocol::ApprovalPolicy::Interactive,
+    };
+    let bootstrap = LocalRuntimeService::create_session(&*client, request.clone())
+        .await
+        .expect("an unusable default must not brick session creation");
+    assert_eq!(
+        bootstrap.session.model.as_ref(),
+        Some(&ModelRef::new("mock", "m")),
+        "a configured model is used instead"
+    );
+    let notice = bootstrap.notice.expect("the substitution is reported");
+    assert!(
+        notice.contains("mock/gone") && notice.contains("mock/m"),
+        "the notice names what was missing and what was used: {notice}"
+    );
+
+    // An EXPLICIT request is the user's own intent: still a hard error.
+    let error = LocalRuntimeService::create_session(
+        &*client,
+        CreateSessionRequest {
+            model: Some(ModelRef::new("mock", "nope")),
+            ..request
+        },
+    )
+    .await
+    .expect_err("an explicitly requested unknown model is an error");
+    assert!(
+        error.to_string().contains("is not configured"),
+        "{error}"
+    );
 }

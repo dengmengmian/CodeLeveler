@@ -52,6 +52,7 @@ fn boot(locale: leveler_tui::Locale) -> AppState {
             context_window: 200_000,
             locale,
             untrusted_config: Vec::new(),
+            model_notice: None,
             thinking: None,
         },
     )
