@@ -413,8 +413,11 @@ pub(crate) mod visibility_fixtures {
                 );
                 let buffer = terminal.backend().buffer();
                 let top_pad = (content.height as usize).saturating_sub(expected.len());
-                for row in visited.len().max(state.conv.scroll)
-                    ..(state.conv.scroll + content.height as usize).min(expected.len())
+                for (row, expected_row) in expected
+                    .iter()
+                    .enumerate()
+                    .take((state.conv.scroll + content.height as usize).min(expected.len()))
+                    .skip(visited.len().max(state.conv.scroll))
                 {
                     let y = content.y + (row - state.conv.scroll + top_pad) as u16;
                     let mut text = String::new();
@@ -426,7 +429,7 @@ pub(crate) mod visibility_fixtures {
                     }
                     assert_eq!(
                         text.trim_end(),
-                        expected[row],
+                        expected_row,
                         "{label} {cols}x{rows} row {row}"
                     );
                     visited.push(text.trim_end().to_owned());
