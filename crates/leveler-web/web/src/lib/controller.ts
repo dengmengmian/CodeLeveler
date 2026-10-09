@@ -430,9 +430,8 @@ export class RuntimeBridge {
         this.sink({
           type: 'reasoning_completed',
           elapsedMs: ev.elapsed_ms,
-          // The segment's text is what the live row accumulated; the runtime
-          // measured the duration, the UI never invents one.
-          text: current.reasoning,
+          // The reducer freezes its accumulated segment after queued deltas.
+          // A React render may still expose the previous (empty) segment here.
         });
         break;
       case 'command_progress':

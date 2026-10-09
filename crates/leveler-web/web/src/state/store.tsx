@@ -401,7 +401,7 @@ export type Action =
        *  it accumulated. Never inferred by the UI. */
       type: 'reasoning_completed';
       elapsedMs: number;
-      text: string;
+      text?: string;
     }
   | { type: 'btw_started'; question: string; time: string }
   | { type: 'btw_delta'; delta: string }
@@ -921,7 +921,7 @@ export function reducer(state: AppState, action: Action): void {
       // it here is what turns live Thinking into a folded Thought; without it
       // the Web had no completed-Thought history at all.
       if (!state.current) return;
-      const text = action.text.trim();
+      const text = (action.text ?? state.current.reasoning).trim();
       if (text !== '') {
         state.current.thoughts.push({
           id: `th-${nextSeq()}`,

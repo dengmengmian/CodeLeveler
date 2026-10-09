@@ -52,3 +52,22 @@ it('a completed thought-only turn remains visible without any tool rows', () => 
   const html = renderToStaticMarkup(<AgentRunBlock variant="process" />);
   expect((html.match(/data-thought-id=/g) ?? []).length).toBe(4);
 });
+
+it('actual zero-duration wire segments survive a deferred React reducer commit', () => {
+  if (!state.current) throw new Error('actual session missing');
+  state.current.thoughts = [];
+  state.current.reasoning = '';
+  const pending: Action[] = [];
+  const bridge = new RuntimeBridge(action => pending.push(action), () => state);
+  const events = JSON.parse(traceSource).frames.filter((frame: {type: string}) => frame.type === 'event').map((frame: {event: unknown}) => frame.event);
+  const delta = events.find((event: {type: string}) => event.type === 'reasoning_delta');
+  const completed = events.find((event: {type: string}) => event.type === 'reasoning_completed');
+  const apply = (event: unknown) => (bridge as unknown as {applyEvent(event: unknown): void}).applyEvent(event);
+  // Same incoming batch, while getState still exposes the previous render.
+  apply(delta);
+  apply(completed);
+  for (const action of pending) reducer(state, action);
+  expect(state.current.thoughts).toHaveLength(1);
+  expect(state.current.thoughts[0].text).toBe(delta.delta);
+  expect(state.current.thoughts[0].elapsedMs).toBe(0);
+});
