@@ -16,37 +16,7 @@ use leveler_storage::{EngineStores, EventStore, SessionRecord};
 use crate::log::{DanglingCall, EventLog, SnapshotView};
 use crate::{EngineError, EngineEvent, ExecutionKind, TaskOutcome};
 
-/// Bound prior messages for a model request.
-///
-/// **Under threshold:** always use full `raw` from MessageRepository — a
-/// ContextSnapshot is never a permanent replacement for later turns.
-/// **Over threshold:** merge snapshot (compact base) with the raw tail that
-/// arrived after the snapshot was taken, then fold if still oversized. A
-/// snapshot with a `through_ordinal` watermark appends exactly `raw[n..]`;
-/// only watermark-less legacy snapshots use suffix-overlap inference.
-///
-/// `summary` is a handoff briefing for the fold; callers that can produce
-/// one lazily go through [`crate::RawTranscript::assemble`], which asks for
-/// it only when the merged base is still over `threshold`.
-///
-/// Returns `(messages_for_model, wrote_compact)` — `wrote_compact` means the
-/// caller should persist a new ContextSnapshot.
-pub fn budget_prior_messages(
-    raw: Vec<leveler_model::Message>,
-    snapshot: Option<SnapshotView>,
-    summary: Option<&str>,
-    active_objective: Option<&str>,
-    threshold: u64,
-) -> (Vec<leveler_model::Message>, bool) {
-    match merge_prior_messages(raw, 0, snapshot, threshold) {
-        (base, PriorMerge::Fits { merged }) => (base, merged),
-        (base, PriorMerge::Over { base_tokens }) => {
-            fold_prior_messages(base, base_tokens, summary, active_objective, threshold)
-        }
-    }
-}
-
-/// What [`merge_prior_messages`] found: the merged base fits (and whether a
+/// What the merge found: the merged base fits (and whether a
 /// snapshot was merged into it, i.e. a shorter snapshot is worth persisting),
 /// or it is still over threshold and must be folded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,28 +25,11 @@ pub(crate) enum PriorMerge {
     Over { base_tokens: u64 },
 }
 
-/// Step one of [`budget_prior_messages`]: the raw transcript under threshold,
-/// or the latest snapshot merged with its post-snapshot tail. No model call
-/// is needed to get here, so a caller decides whether a summary is worth
-/// producing only after seeing `PriorMerge::Over`.
-pub(crate) fn merge_prior_messages(
-    raw: Vec<leveler_model::Message>,
-    // Absolute ordinal `raw[0]` sits at. Non-zero when the caller loaded only
-    // the reachable tail; the snapshot watermark is absolute, so it must be
-    // rebased before it indexes `raw`.
-    raw_offset: u64,
-    snapshot: Option<SnapshotView>,
-    threshold: u64,
-) -> (Vec<leveler_model::Message>, PriorMerge) {
-    merge_prior_messages_measured(
-        raw,
-        raw_offset,
-        snapshot,
-        threshold,
-        &leveler_context::estimate_tokens,
-    )
-}
-
+/// The merge step of the ONE context-loading entry
+/// ([`crate::RawTranscript::assemble_measured`]): the raw transcript under
+/// threshold, or the latest snapshot merged with its post-snapshot tail. No
+/// model call is needed to get here, so a caller decides whether a summary is
+/// worth producing only after seeing `PriorMerge::Over`.
 pub(crate) fn merge_prior_messages_measured(
     raw: Vec<leveler_model::Message>,
     raw_offset: u64,
@@ -142,32 +95,6 @@ pub(crate) fn merge_prior_messages_measured(
             base_tokens: tokens,
         },
     )
-}
-
-/// Step two of [`budget_prior_messages`]: fold a merged base that is still
-/// over threshold.
-pub(crate) fn fold_prior_messages(
-    base: Vec<leveler_model::Message>,
-    base_tokens: u64,
-    summary: Option<&str>,
-    active_objective: Option<&str>,
-    threshold: u64,
-) -> (Vec<leveler_model::Message>, bool) {
-    // HCH-FIX-2: bound the retained tail by TOKENS as well as by count —
-    // half the fold threshold, mirroring the agent loop's `budget / 2`
-    // (drive loop passes `current_budget / 2`). With `0` here, a single
-    // huge tool result inside the last 12 messages rode through a
-    // 24k-threshold fold intact, retaining 5-19x the threshold.
-    let folded = leveler_context::compact_messages(
-        &base,
-        leveler_context::COMPACT_KEEP_RECENT,
-        threshold / 2,
-        summary,
-        active_objective,
-    );
-    let changed =
-        leveler_context::estimate_tokens(&folded) < base_tokens || folded.len() < base.len();
-    (folded, changed || base_tokens > threshold)
 }
 
 /// Append raw messages that post-date the snapshot. Snapshot is often a
@@ -729,6 +656,22 @@ pub async fn acknowledge_crash_window(
 
 #[cfg(test)]
 mod multi_turn_session_tests {
+    /// The default-estimator merge, as a test convenience. The production entry
+    /// is [`RawTranscript::assemble_measured`], which supplies its own measure.
+    fn merge_prior_messages(
+        raw: Vec<leveler_model::Message>,
+        raw_offset: u64,
+        snapshot: Option<SnapshotView>,
+        threshold: u64,
+    ) -> (Vec<leveler_model::Message>, PriorMerge) {
+        merge_prior_messages_measured(
+            raw,
+            raw_offset,
+            snapshot,
+            threshold,
+            &leveler_context::estimate_tokens,
+        )
+    }
     use super::*;
     use leveler_model::{ContentPart, Message, Role};
 
@@ -884,17 +827,16 @@ mod multi_turn_session_tests {
             msg(Role::Assistant, "second answer"),
         ];
         let snap = vec![msg(Role::User, "stale snapshot only")];
-        let (out, compacted) = budget_prior_messages(
+        let (out, merge) = merge_prior_messages(
             raw.clone(),
+            0,
             Some(SnapshotView {
                 messages: snap,
                 through_ordinal: None,
             }),
-            None,
-            None,
             100_000,
         );
-        assert!(!compacted);
+        assert!(matches!(merge, PriorMerge::Fits { merged: false }));
         assert_eq!(out.len(), raw.len());
         assert!(
             out.iter()
@@ -931,16 +873,16 @@ mod multi_turn_session_tests {
         let threshold = leveler_context::estimate_tokens(&expected_base) + 10;
         assert!(leveler_context::estimate_tokens(&raw) > threshold);
 
-        let (out, _) = budget_prior_messages(
+        let (out, merge) = merge_prior_messages(
             raw.clone(),
+            0,
             Some(SnapshotView {
                 messages: snap,
                 through_ordinal: None,
             }),
-            None,
-            None,
             threshold,
         );
+        assert!(matches!(merge, PriorMerge::Fits { merged: true }));
 
         // Quantify the duplication: every text in the last-12 raw window that
         // appears more than once in the merged output is a duplicate.
@@ -962,81 +904,6 @@ mod multi_turn_session_tests {
             duplicated > 0,
             "characterization: the fallback is expected to duplicate the window \
              (if this starts passing with 0, the heuristic changed — re-audit OPT-5)"
-        );
-    }
-
-    /// HCH-FIX-2: the engine fold must bound the retained recent tail by
-    /// TOKENS, not only by message count. A single huge tool result inside
-    /// the last 12 messages used to ride through a 24k-threshold fold intact
-    /// (keep_recent_tokens = 0), leaving ~5-19x the threshold behind.
-    #[test]
-    fn engine_fold_bounds_the_retained_tail_by_tokens() {
-        let threshold: u64 = 24_000;
-        let mut raw = long_prior(20);
-        // A huge tool-ish payload well inside the last 12 messages:
-        // ~300 KiB ASCII ≈ 75k estimated tokens on its own.
-        raw.push(msg(Role::Assistant, &"x".repeat(300 * 1024)));
-        for i in 0..3 {
-            raw.push(msg(Role::Assistant, &format!("tail {i}")));
-        }
-        let before = leveler_context::estimate_tokens(&raw);
-        assert!(
-            before > threshold,
-            "precondition: over threshold ({before})"
-        );
-
-        let (folded, changed) = budget_prior_messages(
-            raw,
-            None,
-            Some("summary of earlier work"),
-            Some("obj"),
-            threshold,
-        );
-
-        assert!(changed, "an over-threshold prior must fold");
-        let after = leveler_context::estimate_tokens(&folded);
-        assert!(
-            after <= threshold,
-            "a {threshold}-token fold must not retain {after} tokens"
-        );
-    }
-
-    #[test]
-    fn budget_prior_merges_snapshot_tail_when_over_threshold() {
-        // Oversized raw with a compact snap that ends with a shared suffix;
-        // messages after that suffix must appear in the merged prior.
-        let mut raw = long_prior(40);
-        let shared = msg(Role::Assistant, "shared recent window tail");
-        let after = msg(Role::User, "POST_SNAPSHOT_MARKER unique follow-up");
-        raw.push(shared.clone());
-        raw.push(after.clone());
-        let snap = vec![
-            msg(Role::User, "[compact summary of early work]"),
-            shared.clone(),
-        ];
-        let tokens = leveler_context::estimate_tokens(&raw);
-        assert!(tokens > 200, "need over-threshold raw: {tokens}");
-        let (out, compacted) = budget_prior_messages(
-            raw,
-            Some(SnapshotView {
-                messages: snap,
-                through_ordinal: None,
-            }),
-            None,
-            Some("fix login"),
-            200,
-        );
-        assert!(compacted);
-        let joined: String = out
-            .iter()
-            .map(|m| m.text_content())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            joined.contains("POST_SNAPSHOT_MARKER")
-                || joined.contains("shared recent window")
-                || joined.contains("login"),
-            "over-threshold merge/compact must not drop the active topic: {joined}"
         );
     }
 
@@ -1078,14 +945,13 @@ mod multi_turn_session_tests {
             "raw must exceed the threshold"
         );
 
-        let (out, _) = budget_prior_messages(
+        let (out, _) = merge_prior_messages(
             raw,
+            0,
             Some(SnapshotView {
                 messages: snap,
                 through_ordinal: Some(watermark),
             }),
-            None,
-            None,
             threshold,
         );
         assert_eq!(
@@ -1093,47 +959,6 @@ mod multi_turn_session_tests {
             6,
             "snapshot(3) + raw[wm..](3): the duplicate round after the \
              watermark must survive the merge: {out:?}"
-        );
-    }
-
-    #[test]
-    fn budget_prior_folds_with_the_model_summary_when_given() {
-        // The engine pre-request path passes a model handoff briefing; the
-        // fold must carry it instead of a bare no-summary breadcrumb.
-        let raw = long_prior(40);
-        let (out, compacted) = budget_prior_messages(
-            raw,
-            None,
-            Some("HANDOFF_SUMMARY_TEXT for the elided rounds"),
-            Some("fix login"),
-            200,
-        );
-        assert!(compacted);
-        let joined: String = out
-            .iter()
-            .map(|m| m.text_content())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            joined.contains("HANDOFF_SUMMARY_TEXT"),
-            "the provided summary must survive into the folded transcript: {joined}"
-        );
-    }
-
-    #[test]
-    fn budget_prior_compacts_oversized_history() {
-        let raw = long_prior(40);
-        let tokens = leveler_context::estimate_tokens(&raw);
-        assert!(
-            tokens > 100,
-            "synthetic history should be non-trivial: {tokens}"
-        );
-        let (out, compacted) =
-            budget_prior_messages(raw.clone(), None, None, Some("fix login"), 200);
-        assert!(compacted, "must take compact path when over threshold");
-        assert!(
-            leveler_context::estimate_tokens(&out) < tokens || out.len() < raw.len(),
-            "compacted transcript should shrink"
         );
     }
 }
