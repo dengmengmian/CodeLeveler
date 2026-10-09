@@ -22,18 +22,18 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use leveler_agent::coding::factory::TurnProfile;
 use leveler_agent::coding::policy::{
     DEFAULT_CONTEXT_SOFT_PERCENT, ExecutionOverrides, ExecutionRole, resolve_execution_policy,
     validate_context_soft_percent,
 };
-use leveler_agent::coding::factory::TurnProfile;
 use leveler_agent::{AgentEvent, ContinuationPolicy, Executor, NoopSink, StepLimits};
 use leveler_core::{RequestId, ToolCallId};
 use leveler_execution::{PermissionProfile, Workspace};
 use leveler_model::{
     ContentPart, FinishReason, Message, ModelError, ModelEvent, ModelEventStream, ModelProfile,
-    ModelRef, ModelRequest, ModelResponse, ModelRuntime, ReasoningReplayContract, RequestProjection,
-    Role, TokenUsage, ToolCall,
+    ModelRef, ModelRequest, ModelResponse, ModelRuntime, ReasoningReplayContract,
+    RequestProjection, Role, TokenUsage, ToolCall,
 };
 use leveler_tools::ToolContext;
 
@@ -72,14 +72,15 @@ impl ModelRuntime for Script {
         cancellation: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         let response = self.generate(request, cancellation).await?;
-        let mut events: Vec<Result<ModelEvent, ModelError>> = vec![Ok(ModelEvent::MessageStarted {
-            request_id: response.request_id.clone(),
-        })];
+        let mut events: Vec<Result<ModelEvent, ModelError>> =
+            vec![Ok(ModelEvent::MessageStarted {
+                request_id: response.request_id.clone(),
+            })];
         for part in &response.message.content {
             match part {
-                ContentPart::Text { text } => {
-                    events.push(Ok(ModelEvent::TextDelta { delta: text.clone() }))
-                }
+                ContentPart::Text { text } => events.push(Ok(ModelEvent::TextDelta {
+                    delta: text.clone(),
+                })),
                 ContentPart::ToolCall { call } => {
                     events.push(Ok(ModelEvent::ToolCallCompleted { call: call.clone() }))
                 }
@@ -130,7 +131,11 @@ fn answer(text: &str) -> ModelResponse {
 fn workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(dir.path().join("src/lib.rs"), "pub fn value() -> i32 { 1 }\n").unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn value() -> i32 { 1 }\n",
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("src/big.rs"),
         "// padding line for compaction pressure\n".repeat(80),
@@ -196,7 +201,10 @@ async fn run_case(window: u32, reliable: u32, output: u32, percent: u8, rounds: 
     let executor = Executor::new(
         runtime.clone(),
         Arc::new(leveler_tools::default_registry()),
-        ToolContext::new(Workspace::new(dir.path()).unwrap(), PermissionProfile::Assisted),
+        ToolContext::new(
+            Workspace::new(dir.path()).unwrap(),
+            PermissionProfile::Assisted,
+        ),
         ModelRef::new("mock", "m"),
         0,
     )
@@ -217,7 +225,8 @@ async fn run_case(window: u32, reliable: u32, output: u32, percent: u8, rounds: 
     let max_projected = requests
         .iter()
         .map(|request| {
-            RequestProjection::for_request(request, ReasoningReplayContract::NONE).estimated_tokens()
+            RequestProjection::for_request(request, ReasoningReplayContract::NONE)
+                .estimated_tokens()
         })
         .fold(0, u64::max);
     Observed {
@@ -230,7 +239,7 @@ async fn run_case(window: u32, reliable: u32, output: u32, percent: u8, rounds: 
             .filter(|request| request.tool_choice == leveler_model::ToolChoice::None)
             .count(),
         max_projected: max_projected.min(hard),
-        answered: matches!(outcome, Ok(_)),
+        answered: outcome.is_ok(),
     }
 }
 

@@ -330,7 +330,11 @@ impl Agent {
                     self.compact_at,
                     self.compaction.lock().ok().and_then(|g| *g),
                 )
-                .with_input_budget(self.input_capacity, self.output_reservation, self.headroom)
+                .with_input_budget(
+                    self.input_capacity,
+                    self.output_reservation,
+                    self.headroom,
+                )
             };
             harness.on_event(AgentEvent::ContextUsage(accounting));
 

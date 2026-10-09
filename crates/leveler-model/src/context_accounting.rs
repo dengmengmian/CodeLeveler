@@ -950,14 +950,8 @@ mod tests {
         let win = Some(128_000u32);
         let fold = Some(64_000u32);
         let capacity = Some(96_000u64);
-        let p = |used: u64| {
-            compute_pressure(
-                used,
-                win.map(u64::from),
-                fold.map(u64::from),
-                capacity,
-            )
-        };
+        let p =
+            |used: u64| compute_pressure(used, win.map(u64::from), fold.map(u64::from), capacity);
         // Below 80% of the soft threshold → normal.
         assert_eq!(p(40_000), ContextPressure::Normal);
         // 80%..soft → warning; exactly AT the soft threshold is still not a
@@ -983,7 +977,7 @@ mod tests {
     /// it is never re-derived from a rounded percentage.
     #[test]
     fn pressure_follows_the_classifier_at_every_boundary() {
-        for (used, soft, capacity, ) in [
+        for (used, soft, capacity) in [
             (0u64, 100u64, Some(200u64)),
             (79, 100, Some(200)),
             (80, 100, Some(200)),

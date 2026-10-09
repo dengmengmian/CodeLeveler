@@ -481,7 +481,8 @@ pub fn resolve_execution_policy(
         &profile.limits,
         resolved_output_cap,
         o.context_headroom_tokens.unwrap_or(0),
-        o.context_soft_percent.unwrap_or(DEFAULT_CONTEXT_SOFT_PERCENT),
+        o.context_soft_percent
+            .unwrap_or(DEFAULT_CONTEXT_SOFT_PERCENT),
     );
 
     ResolvedExecutionPolicy {
@@ -710,8 +711,7 @@ mod tests {
         assert_eq!(unknown.quality_boundary, 0);
         assert_eq!(unknown.hard_capacity(), None);
         assert_eq!(
-            ResolvedContextPolicy::resolve(&limits(128_000, 0, 8_192), 0, 0, 85)
-                .pressure_threshold,
+            ResolvedContextPolicy::resolve(&limits(128_000, 0, 8_192), 0, 0, 85).pressure_threshold,
             101_836,
             "no quality declaration → 85% of the capacity, not the whole bound"
         );
@@ -720,8 +720,7 @@ mod tests {
         // misdeclaration; the harness cannot claim a hard bound it can never
         // satisfy, so it folds on the quality boundary instead of forcing a
         // fold that cannot fit (which would abort the task).
-        let exhausted =
-            ResolvedContextPolicy::resolve(&limits(8_192, 4_096, 8_191), 0, 8_192, 85);
+        let exhausted = ResolvedContextPolicy::resolve(&limits(8_192, 4_096, 8_191), 0, 8_192, 85);
         assert_eq!(exhausted.pressure_threshold, 4_096);
         assert_eq!(exhausted.hard_capacity(), None);
         assert!(exhausted.folding_enabled());
@@ -774,8 +773,13 @@ mod tests {
             (1_048_576, 786_432, 393_216, 655_360, 557_056),
         ];
         for (window, reliable, output, capacity, soft) in cases {
-            let policy = ResolvedContextPolicy::resolve(&limits(window, reliable, output), 0, 0, 85);
-            assert_eq!(policy.hard_capacity(), Some(u64::from(capacity)), "w={window}");
+            let policy =
+                ResolvedContextPolicy::resolve(&limits(window, reliable, output), 0, 0, 85);
+            assert_eq!(
+                policy.hard_capacity(),
+                Some(u64::from(capacity)),
+                "w={window}"
+            );
             assert_eq!(policy.pressure_threshold, soft, "w={window}");
             assert!(
                 u64::from(policy.pressure_threshold) < u64::from(capacity),
@@ -826,8 +830,7 @@ mod tests {
     #[test]
     fn a_percentage_never_crosses_the_hard_capacity() {
         for percent in [1u8, 50, 85, 99, 100] {
-            let policy =
-                ResolvedContextPolicy::resolve(&limits(262_144, 0, 65_536), 0, 0, percent);
+            let policy = ResolvedContextPolicy::resolve(&limits(262_144, 0, 65_536), 0, 0, percent);
             let capacity = u64::from(capacity_of(&policy));
             assert!(
                 u64::from(policy.pressure_threshold) <= capacity,
@@ -846,7 +849,8 @@ mod tests {
             100
         );
         assert!(
-            validate_context_soft_percent(0).is_err() && validate_context_soft_percent(101).is_err()
+            validate_context_soft_percent(0).is_err()
+                && validate_context_soft_percent(101).is_err()
         );
         assert!(validate_context_soft_percent(85).is_ok());
     }
@@ -898,8 +902,7 @@ mod tests {
             share(&default.context_policy)
         );
         assert!(
-            default.context_policy.pressure_threshold
-                < capacity_of(&default.context_policy).max(1),
+            default.context_policy.pressure_threshold < capacity_of(&default.context_policy).max(1),
             "the product default leaves a real soft zone"
         );
     }

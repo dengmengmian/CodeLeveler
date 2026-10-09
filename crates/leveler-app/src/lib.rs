@@ -1254,7 +1254,9 @@ impl Application {
         if let Some(model) = model
             && let Some(percent) = self.config.soft_percent_for(model)
         {
-            overrides.get_or_insert_with(Default::default).context_soft_percent = Some(percent);
+            overrides
+                .get_or_insert_with(Default::default)
+                .context_soft_percent = Some(percent);
         }
         if let Some(scope) = session_scope {
             let db = self.open_database().await?;
@@ -1386,7 +1388,9 @@ impl Application {
                 tool_context,
                 model: model.clone(),
                 commit_co_author: self.config.vcs_co_author,
-                overrides: self.execution_overrides_for_session(session_scope, Some(model)).await?,
+                overrides: self
+                    .execution_overrides_for_session(session_scope, Some(model))
+                    .await?,
                 capabilities: Some(capabilities),
                 memory_catalog,
                 memory_expose: available_packs.memory,
