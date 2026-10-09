@@ -1109,3 +1109,441 @@ fn perf_full_code_visibility() {
         }
     }
 }
+
+/// Standalone audit fixtures. All generated text is retained; no presentation
+/// limit or timing acceptance threshold belongs to this measurement harness.
+fn independent_audit_fixtures() -> Vec<(&'static str, String)> {
+    let code = |n: usize| -> String {
+        let body: String = (0..n)
+            .map(|i| format!("let AUDIT_ROW_{i:05} = {i}; // END_{i:05}\n"))
+            .collect();
+        format!("```rust\n{body}```\n")
+    };
+    vec![
+        ("A-short-markdown", long_markdown_no_code(1_000)),
+        ("B-code-100", code(100)),
+        ("C-code-1000", code(1000)),
+        ("D-code-100KB", one_giant_fence(100_000)),
+        ("E-markdown-160KB", long_markdown(160_000)),
+        ("F-code-1MB", one_giant_fence(1_000_000)),
+        (
+            "G-single-10000",
+            format!("```text\n{}\n```\n", "x".repeat(10_000)),
+        ),
+        ("H-tool-receipts", "Tool receipt audit\n".into()),
+        ("I-session-history", "History audit\n".into()),
+        (
+            "J-unicode",
+            format!("```text\n{}```\n", "中文🙂e\u{301}组合👩‍💻\n".repeat(1000)),
+        ),
+    ]
+}
+
+#[test]
+fn independent_audit_fixture_contract() {
+    let fixtures = independent_audit_fixtures();
+    assert_eq!(fixtures.len(), 10);
+    assert!(fixtures[5].1.len() >= 1_000_000);
+    assert_eq!(
+        fixtures[6].1.lines().nth(1).unwrap().chars().count(),
+        10_000
+    );
+    assert_eq!(fixtures[1].1.lines().count(), 102);
+    assert_eq!(fixtures[2].1.lines().count(), 1002);
+    assert!(fixtures[9].1.contains("中文🙂e\u{301}组合👩‍💻"));
+}
+
+/// In-process latency: excludes the terminal OS write and the run-loop wakeup.
+/// Cold distributions have fewer samples and must not be interpreted as a
+/// reliable population p99. Raw samples make that limitation inspectable.
+#[test]
+#[ignore = "independent audit only; release build, --exact --ignored --nocapture --test-threads=1"]
+fn perf_independent_audit() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+    use std::rc::Rc;
+
+    struct AuditSamples {
+        times: Vec<f64>,
+        profile_before: String,
+    }
+    fn report(shape: &str, cols: u16, rows: u16, stage: &str, measured: AuditSamples) {
+        let samples = measured.times;
+        assert!(!samples.is_empty());
+        assert!(samples.iter().all(|x| x.is_finite() && *x >= 0.0));
+        println!(
+            "INDEPENDENT_AUDIT {}",
+            serde_json::json!({
+                "shape": shape, "cols": cols, "rows": rows, "stage": stage,
+                "n": samples.len(), "p50_ms": pct(samples.clone(), 0.5),
+                "p95_ms": pct(samples.clone(), 0.95), "p99_ms": pct(samples.clone(), 0.99),
+                "samples_ms": samples, "profile_before": measured.profile_before, "profile": crate::profile::report(),
+            })
+        );
+    }
+    fn sample(n: usize, mut action: impl FnMut()) -> AuditSamples {
+        // Drain setup histograms; cumulative counter deltas use this snapshot.
+        let profile_before = crate::profile::report();
+        let times = (0..n)
+            .map(|_| {
+                let start = Instant::now();
+                action();
+                start.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        AuditSamples {
+            times,
+            profile_before,
+        }
+    }
+    let filter = std::env::var("LEVELER_AUDIT_FIXTURE").ok();
+    for (shape, text) in independent_audit_fixtures() {
+        if filter
+            .as_ref()
+            .is_some_and(|value| !shape.starts_with(value))
+        {
+            continue;
+        }
+        for (cols, rows) in [(48, 20), (80, 24), (120, 40)] {
+            let theme = Theme::no_color();
+            let area = Rect::new(0, 0, cols, rows);
+            let width = crate::conversation::geometry::content_rect(area).width as usize;
+            report(
+                shape,
+                cols,
+                rows,
+                "cold-parse-highlight",
+                sample(5, || {
+                    crate::markdown::highlight_cache_clear();
+                    std::hint::black_box(crate::markdown::MdDoc::parse(&text));
+                }),
+            );
+            let doc = crate::markdown::MdDoc::parse(&text);
+            let before = crate::markdown::highlight_cache_stats();
+            report(
+                shape,
+                cols,
+                rows,
+                "warm-parse-highlight",
+                sample(30, || {
+                    std::hint::black_box(crate::markdown::MdDoc::parse(&text));
+                }),
+            );
+            let after = crate::markdown::highlight_cache_stats();
+            report(
+                shape,
+                cols,
+                rows,
+                "layout-wrap",
+                sample(30, || {
+                    std::hint::black_box(doc.to_lines(width, &theme));
+                }),
+            );
+            // Fenced fixtures contain only code: remove the fixed header/gutter
+            // spans and compare every code byte, including Unicode graphemes.
+            if text.starts_with("```") {
+                let source = text
+                    .lines()
+                    .skip(1)
+                    .take(text.lines().count() - 2)
+                    .collect::<String>();
+                let rendered = doc.to_lines(width, &theme);
+                let header_rows = usize::from(text.lines().count() > 6);
+                let visible: String = rendered
+                    .iter()
+                    .skip(header_rows)
+                    .flat_map(|line| line.spans.iter().skip(1).map(|span| span.content.as_ref()))
+                    .collect();
+                assert_eq!(visible, source, "{shape}: full code at {cols}x{rows}");
+            }
+            let mut state = opened();
+            state.size = (cols, rows);
+            if shape == "I-session-history" {
+                push_history(&mut state, 1000, 256);
+            }
+            if shape == "H-tool-receipts" {
+                for i in 0..1000 {
+                    let id = ToolCallId::new(format!("audit-tool-{i}"));
+                    runtime(
+                        &mut state,
+                        RuntimeEvent::ToolCallStarted {
+                            id: id.clone(),
+                            name: "read_file".into(),
+                            arguments: format!("{{\"path\":\"src/audit_{i}.rs\"}}"),
+                            parallel: false,
+                            model_step: None,
+                            answer_effect: None,
+                        },
+                    );
+                    runtime(
+                        &mut state,
+                        RuntimeEvent::ToolCallCompleted {
+                            id,
+                            ok: true,
+                            preview: format!("receipt {i}"),
+                            duration_ms: 1,
+                            applied_diff: None,
+                            exit_code: None,
+                            stop: None,
+                        },
+                    );
+                }
+            }
+            runtime(
+                &mut state,
+                RuntimeEvent::AssistantMessageStarted {
+                    message_id: MessageId::new("audit-live"),
+                },
+            );
+            runtime(
+                &mut state,
+                RuntimeEvent::AssistantTextDelta {
+                    message_id: MessageId::new("audit-live"),
+                    delta: text.clone(),
+                },
+            );
+            state.conv.auto_scroll = false;
+            let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+            report(
+                shape,
+                cols,
+                rows,
+                "initial-projection-and-draw",
+                sample(1, || {
+                    terminal
+                        .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                        .unwrap();
+                }),
+            );
+            let projected = state.conversation_lines(width);
+            report(
+                shape,
+                cols,
+                rows,
+                "stable-viewport-draw",
+                sample(100, || {
+                    terminal
+                        .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                        .unwrap();
+                }),
+            );
+            assert!(Rc::ptr_eq(&projected, &state.conversation_lines(width)));
+            let mut key_n = 0;
+            report(
+                shape,
+                cols,
+                rows,
+                "page-key-and-draw",
+                sample(100, || {
+                    key_n += 1;
+                    let key = if key_n % 2 == 0 {
+                        KeyCode::PageUp
+                    } else {
+                        KeyCode::PageDown
+                    };
+                    reduce(
+                        &mut state,
+                        Action::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+                    );
+                    terminal
+                        .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                        .unwrap();
+                }),
+            );
+            assert!(Rc::ptr_eq(&projected, &state.conversation_lines(width)));
+            let mut edge_n = 0;
+            report(
+                shape,
+                cols,
+                rows,
+                "top-bottom-viewport-draw",
+                sample(100, || {
+                    edge_n += 1;
+                    // Explicit viewport offsets isolate paint cost from repeated
+                    // page-key travel; real input routing is measured on a PTY.
+                    state.conv.scroll = if edge_n % 2 == 0 { 0 } else { usize::MAX };
+                    terminal
+                        .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                        .unwrap();
+                }),
+            );
+            let mut reflow_n = 0;
+            report(
+                shape,
+                cols,
+                rows,
+                "resize-reflow-and-draw",
+                sample(30, || {
+                    reflow_n += 1;
+                    let size = if reflow_n % 2 == 0 {
+                        area
+                    } else {
+                        Rect::new(0, 0, cols - 4, rows)
+                    };
+                    reduce(&mut state, Action::Resize(size.width, size.height));
+                    terminal.resize(size).unwrap();
+                    terminal
+                        .draw(|f| crate::conversation::viewport::render(f, size, &mut state))
+                        .unwrap();
+                }),
+            );
+            reduce(&mut state, Action::Resize(cols, rows));
+            terminal.resize(area).unwrap();
+            report(
+                shape,
+                cols,
+                rows,
+                "stream-prose-after-complete-block",
+                sample(30, || {
+                    runtime(
+                        &mut state,
+                        RuntimeEvent::AssistantTextDelta {
+                            message_id: MessageId::new("audit-live"),
+                            delta: "\nAudit streaming continuation with complete text.\n".into(),
+                        },
+                    );
+                    terminal
+                        .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                        .unwrap();
+                }),
+            );
+            println!(
+                "INDEPENDENT_AUDIT_FIXTURE {}",
+                serde_json::json!({
+                    "shape": shape, "cols": cols, "rows": rows, "bytes": text.len(),
+                    "fnv1a64": format!("{:016x}", text.bytes().fold(0xcbf29ce484222325_u64, |h, x| (h ^ u64::from(x)).wrapping_mul(0x100000001b3))),
+                    "initial_projected_rows": projected.len(), "full_code_verified": text.starts_with("```"),
+                    "warm_highlight_hits": after.0 - before.0, "warm_highlight_misses": after.1 - before.1,
+                    "stable_projection_reused": true, "terminal_backend": "TestBackend",
+                    "initial_sample_count": 1, "cold_sample_count": 5,
+                })
+            );
+        }
+    }
+    if filter.is_none() {
+        for target in [100_000, 1_000_000] {
+            let fenced = one_giant_fence(target);
+            let body = fenced
+                .strip_prefix("```rust\n")
+                .unwrap()
+                .strip_suffix("```\n")
+                .unwrap();
+            for (cols, rows) in [(48, 20), (80, 24), (120, 40)] {
+                let shape = format!("growing-unclosed-code-{target}");
+                let area = Rect::new(0, 0, cols, rows);
+                let mut state = opened();
+                state.size = (cols, rows);
+                runtime(
+                    &mut state,
+                    RuntimeEvent::AssistantMessageStarted {
+                        message_id: MessageId::new("audit-open"),
+                    },
+                );
+                runtime(
+                    &mut state,
+                    RuntimeEvent::AssistantTextDelta {
+                        message_id: MessageId::new("audit-open"),
+                        delta: "```rust\n".into(),
+                    },
+                );
+                let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+                let mut offset = 0;
+                let mut cumulative_bytes = Vec::new();
+                let samples = sample(5, || {
+                    let end = (offset + body.len().div_ceil(5)).min(body.len());
+                    runtime(
+                        &mut state,
+                        RuntimeEvent::AssistantTextDelta {
+                            message_id: MessageId::new("audit-open"),
+                            delta: body[offset..end].into(),
+                        },
+                    );
+                    offset = end;
+                    cumulative_bytes.push(offset);
+                    terminal
+                        .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                        .unwrap();
+                });
+                report(
+                    &shape,
+                    cols,
+                    rows,
+                    "growing-unclosed-code-delta-and-draw",
+                    samples,
+                );
+                assert_eq!(offset, body.len());
+                let doc = crate::markdown::MdDoc::parse(&format!("```rust\n{body}"));
+                let width = crate::conversation::geometry::content_rect(area).width as usize;
+                let projected = doc.to_lines(width, &Theme::no_color());
+                let visible: String = projected
+                    .iter()
+                    .skip(1)
+                    .flat_map(|line| line.spans.iter().skip(1).map(|span| span.content.as_ref()))
+                    .collect();
+                assert_eq!(visible, body.replace('\n', ""));
+                println!(
+                    "INDEPENDENT_AUDIT_FIXTURE {}",
+                    serde_json::json!({
+                        "shape": shape, "cols": cols, "rows": rows, "bytes": body.len(),
+                        "cumulative_body_bytes_per_sample": cumulative_bytes,
+                        "distribution_semantics": "five increasing prefixes, not repeated equal-size frames",
+                        "full_code_verified": true, "projected_rows": projected.len(),
+                    })
+                );
+            }
+        }
+        for n in [10, 100, 1000] {
+            for (cols, rows) in [(48, 20), (80, 24), (120, 40)] {
+                let shape = format!("N-history-{n}");
+                let mut state = opened();
+                state.size = (cols, rows);
+                push_history(&mut state, n, 256);
+                runtime(
+                    &mut state,
+                    RuntimeEvent::AssistantMessageStarted {
+                        message_id: MessageId::new("audit-growth"),
+                    },
+                );
+                runtime(
+                    &mut state,
+                    RuntimeEvent::AssistantTextDelta {
+                        message_id: MessageId::new("audit-growth"),
+                        delta: "Growth audit".into(),
+                    },
+                );
+                let area = Rect::new(0, 0, cols, rows);
+                let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+                report(
+                    &shape,
+                    cols,
+                    rows,
+                    "history-cold-build-and-draw",
+                    sample(1, || {
+                        terminal
+                            .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                            .unwrap();
+                    }),
+                );
+                report(
+                    &shape,
+                    cols,
+                    rows,
+                    "history-delta-and-draw",
+                    sample(30, || {
+                        runtime(
+                            &mut state,
+                            RuntimeEvent::AssistantTextDelta {
+                                message_id: MessageId::new("audit-growth"),
+                                delta: " growth".into(),
+                            },
+                        );
+                        terminal
+                            .draw(|f| crate::conversation::viewport::render(f, area, &mut state))
+                            .unwrap();
+                    }),
+                );
+            }
+        }
+    }
+    crate::profile::emit_report();
+}
