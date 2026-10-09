@@ -525,6 +525,119 @@ async fn chat_compacts_when_history_oversized_and_persists_snapshot() {
     );
 }
 
+/// A fold has ONE retention decision. Every round the fold removes from the
+/// active surface must have been inside the briefing request; otherwise a band
+/// of history disappears from the request the model actually receives without
+/// ever being offered to the summarizer that is supposed to replace it.
+///
+/// The band only opens when the newest messages are heavy: the token budget can
+/// only *shrink* the count-bounded tail, so the fold drops the messages its
+/// (smaller) budget cannot afford while a briefing derived from a larger budget
+/// stops earlier. Twelve heavy rounds — the shape of a coding session with
+/// large tool outputs — make the two cuts differ.
+///
+/// The invariant is observed end to end, from the requests the provider
+/// received: a seed round is either still in the chat request or it was part of
+/// the briefing request.
+#[tokio::test]
+async fn every_fold_elided_round_reaches_the_briefing_request() {
+    let h = harness(vec![
+        text("BRIEFING_MARKER: the login timeout was investigated"),
+        text("compact-aware answer"),
+    ])
+    .await;
+    let s = spec(&h, "chat session");
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    // 40 light rounds then 12 heavy ones (~6000 estimated tokens each, the size
+    // of a capped tool result). The heavy tail is over BOTH the fold's and the
+    // briefing's tail budget, so both cuts land inside it — and the fold, whose
+    // budget is smaller, keeps strictly fewer rounds than the briefing covers.
+    let light = "login-timeout-path-and-retry-policy ".repeat(40);
+    let heavy = "h".repeat(24_000);
+    let mut payloads = vec![
+        serde_json::to_string(&Message::text(Role::System, "sys")).unwrap(),
+        serde_json::to_string(&Message::text(Role::User, "fix login")).unwrap(),
+    ];
+    for index in 0..40 {
+        payloads.push(
+            serde_json::to_string(&Message::text(
+                Role::Assistant,
+                format!("SEED_{index:03} {light}"),
+            ))
+            .unwrap(),
+        );
+    }
+    for index in 40..52 {
+        payloads.push(
+            serde_json::to_string(&Message::text(
+                Role::Assistant,
+                format!("SEED_{index:03} {heavy}"),
+            ))
+            .unwrap(),
+        );
+    }
+    MessageRepository::new(&h.db)
+        .append(&session, &payloads, leveler_core::now())
+        .await
+        .unwrap();
+
+    h.engine
+        .chat(
+            &session,
+            &s,
+            vec![ContentPart::Text {
+                text: "what about the timeout we just discussed?".into(),
+            }],
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chat should succeed");
+
+    let requests = h.requests.lock().unwrap().clone();
+    let briefing: Vec<String> = requests
+        .iter()
+        .filter(|request| matches!(request.tool_choice, leveler_model::ToolChoice::None))
+        .map(request_blob)
+        .collect();
+    assert_eq!(
+        briefing.len(),
+        1,
+        "an over-threshold chat asks for exactly one briefing"
+    );
+    let main: String = requests
+        .iter()
+        .filter(|request| !matches!(request.tool_choice, leveler_model::ToolChoice::None))
+        .map(request_blob)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut main_hits = 0usize;
+    let mut briefing_hits = 0usize;
+    let mut nowhere = Vec::new();
+    for index in 0..52 {
+        let marker = format!("SEED_{index:03}");
+        if main.contains(&marker) {
+            main_hits += 1;
+        } else if briefing[0].contains(&marker) {
+            briefing_hits += 1;
+        } else {
+            nowhere.push(index);
+        }
+    }
+    assert!(
+        nowhere.is_empty(),
+        "{} rounds were elided from the chat request without ever reaching the \
+         briefing request: {nowhere:?}",
+        nowhere.len()
+    );
+    assert!(
+        briefing_hits > 0,
+        "the fixture must fold a real middle: main={main_hits} briefing={briefing_hits}"
+    );
+}
+
 #[tokio::test]
 async fn second_chat_after_compact_still_sees_first_chat_turn() {
     // AC2: snapshot must not erase the previous chat exchange for the next turn.

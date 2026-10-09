@@ -74,6 +74,11 @@ pub fn round_boundary(messages: &[Message], start: usize) -> usize {
 /// tool-call is never separated from its tool-result (the provider rejects
 /// orphaned tool calls).
 ///
+/// This is the ONE owner of "which rounds leave the active surface". The fold
+/// ([`compact_messages`]) and the briefing request (`summary_request`) cut with
+/// these same facts, so what is elided and what is handed to the summarizer
+/// cannot diverge.
+///
 /// `keep_recent` bounds the working set by MESSAGE COUNT; `keep_recent_tokens`
 /// (0 = disabled) additionally bounds it by an estimated TOKEN budget. A fixed
 /// count is fragile: a single huge tool output inside the last `keep_recent`
@@ -81,7 +86,7 @@ pub fn round_boundary(messages: &[Message], start: usize) -> usize {
 /// The token cap can only *shrink* the retained tail (drop older-of-recent into
 /// the summarized middle), never grow it, so count-based behavior is unchanged
 /// whenever the recent window fits the budget.
-pub(crate) fn compaction_span(
+pub fn compaction_span(
     messages: &[Message],
     keep_recent: usize,
     keep_recent_tokens: u64,
