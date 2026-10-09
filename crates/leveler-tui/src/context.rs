@@ -12,7 +12,9 @@
 use std::collections::{HashMap, HashSet};
 
 use leveler_client_protocol::{ClientCommand, CommandId};
-use leveler_model::{ContextAccounting, ContextCategory, ContextPressure, TokenCountKind};
+use leveler_model::{
+    ContextAccounting, ContextCategory, ContextPressure, FoldRequirement, TokenCountKind,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -203,10 +205,19 @@ fn context_screen(
     let dim = Style::default().fg(theme.text.muted);
     let secondary = Style::default().fg(theme.text.secondary);
     let window = acc.context_window_tokens.filter(|w| *w > 0);
+    // Two AXES, never mixed. The compaction axis is the effective input capacity
+    // the runtime resolved (window − output reservation − headroom) and it is
+    // what the fold thresholds are measured against; the model-window axis is
+    // the declared fact. This screen draws one axis at a time — the compaction
+    // one when it exists, because that is the one the thresholds live on — and
+    // names the other explicitly.
+    let capacity = acc.input_capacity_tokens.filter(|c| *c > 0);
+    let total = capacity.or(window);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Header: the model, the real numbers, and the runtime-derived pressure.
+    // Header: the model, the real numbers, the runtime-derived pressure and the
+    // fold state the harness ACTUALLY decided (never a rounded percentage).
     let used = fmt_tokens(acc.used_tokens);
     let mut head = vec![Span::styled(
         acc.model.to_string(),
@@ -214,11 +225,11 @@ fn context_screen(
             .fg(theme.accent.primary)
             .add_modifier(Modifier::BOLD),
     )];
-    match window {
-        Some(w) => {
-            let pct = acc.used_tokens as f64 * 100.0 / w as f64;
+    match total {
+        Some(total) => {
+            let pct = acc.used_tokens as f64 * 100.0 / total as f64;
             head.push(Span::styled(
-                format!(" · {used} / {} · {pct:.1}%", fmt_tokens(w)),
+                format!(" · {used} / {} · {pct:.1}%", fmt_tokens(total)),
                 Style::default().fg(theme.text.primary),
             ));
         }
@@ -233,7 +244,40 @@ fn context_screen(
     head.push(pressure_span(acc.pressure, t, theme));
     lines.push(Line::from(head));
 
-    if let Some(free) = acc.free_tokens {
+    // The model-window axis, only when it is not already the total above.
+    if let (Some(cap), Some(w)) = (capacity, window)
+        && cap != w
+    {
+        let pct = acc.used_tokens as f64 * 100.0 / w as f64;
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {} / {} · {pct:.1}%",
+                t.context_window_axis,
+                used,
+                fmt_tokens(w)
+            ),
+            dim,
+        )));
+    }
+    let mut budget: Vec<String> = Vec::new();
+    if let Some(reservation) = acc.output_reservation_tokens.filter(|value| *value > 0) {
+        budget.push(format!(
+            "{} {}",
+            t.context_output_reservation,
+            fmt_tokens(reservation)
+        ));
+    }
+    if let Some(headroom) = acc.headroom_tokens.filter(|value| *value > 0) {
+        budget.push(format!("{} {}", t.context_headroom, fmt_tokens(headroom)));
+    }
+    if !budget.is_empty() {
+        lines.push(Line::from(Span::styled(budget.join(" · "), dim)));
+    }
+    // Without a resolved capacity the window is the only total, so keep the
+    // absolute free figure instead of a ratio against nothing.
+    if capacity.is_none()
+        && let Some(free) = acc.free_tokens
+    {
         lines.push(Line::from(Span::styled(
             format!("{} {}", t.context_free, fmt_tokens(free)),
             dim,
@@ -248,7 +292,7 @@ fn context_screen(
     // share a row the breakdown is narrower, and a row laid out for the full
     // pane would have its token columns clipped away.
     const GAP: usize = 3;
-    let shape = window.map(|_| GridShape::for_width(width));
+    let shape = total.map(|_| GridShape::for_width(width));
     let left_w = shape.map(|s| s.cols * 2 - 1).unwrap_or(0);
     let side_by_side = shape.is_some() && left_w + GAP + 34 <= width;
     let right_w = if side_by_side {
@@ -259,16 +303,18 @@ fn context_screen(
 
     // The map needs a window: a grid drawn against an unknown total would be a
     // fabricated percentage. Without one, the breakdown stands alone.
-    let grid = match (window, shape) {
-        (Some(w), Some(shape)) => {
+    let grid = match (total, shape) {
+        (Some(total), Some(shape)) => {
             let slices = context_grid::slices_from(acc);
-            let cells = context_grid::draw(&slices, shape, w, acc.compact_at_tokens);
+            let cells = context_grid::draw(&slices, shape, total, acc.compact_at_tokens);
             Some(grid_lines(&cells, shape, &colors, theme))
         }
         _ => None,
     };
 
-    let breakdown = breakdown_lines(acc, view, &rows, &colors, window, right_w, theme, t);
+    // One denominator for the whole screen: the same total the map and the
+    // thresholds use, so no percentage here is a share of a different number.
+    let breakdown = breakdown_lines(acc, view, &rows, &colors, total, right_w, theme, t);
 
     let header = lines.len();
     let (body, focus) = compose_body(grid, breakdown, side_by_side, left_w, header, view.selected);
@@ -276,14 +322,28 @@ fn context_screen(
 
     lines.push(Line::from(""));
     if let Some(at) = acc.compact_at_tokens {
-        let pct = window
-            .map(|w| format!(" · {:.1}%", at as f64 * 100.0 / w as f64))
+        let pct = total
+            .map(|total| format!(" · {:.1}%", at as f64 * 100.0 / total as f64))
             .unwrap_or_default();
         lines.push(Line::from(Span::styled(
             format!("◈ {} {}{pct}", t.context_compact_at, fmt_tokens(at)),
             secondary,
         )));
     }
+    if let Some(hard) = capacity {
+        lines.push(Line::from(Span::styled(
+            format!("◆ {} {}", t.context_hard_capacity, fmt_tokens(hard)),
+            secondary,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} {}",
+            t.context_fold_state,
+            fold_state_text(acc.fold_state, t)
+        ),
+        secondary,
+    )));
     lines.push(Line::from(Span::styled(
         accounting_kind(acc.token_count_kind, t),
         dim,
@@ -546,6 +606,15 @@ fn accounting_kind(kind: TokenCountKind, t: &UiText) -> String {
     }
 }
 
+/// The fold state the harness actually decided, in the user's words.
+fn fold_state_text(state: FoldRequirement, t: &UiText) -> &'static str {
+    match state {
+        FoldRequirement::None => t.context_fold_state_none,
+        FoldRequirement::Soft => t.context_fold_state_soft,
+        FoldRequirement::HardRequired => t.context_fold_state_hard,
+    }
+}
+
 fn compaction_line(acc: &ContextAccounting, t: &UiText) -> String {
     match &acc.last_compaction {
         Some(record) => {
@@ -617,6 +686,13 @@ mod tests {
             model: ModelRef::new("deepseek", "deepseek-chat"),
             context_window_tokens: Some(128_000),
             compact_at_tokens: Some(64_000),
+            // The resolved budget: a 32K completion reservation leaves 96K of
+            // effective input capacity, and 85% of it is the 81.6K soft bound —
+            // a declared quality boundary of 64K binds first.
+            output_reservation_tokens: Some(32_000),
+            headroom_tokens: Some(0),
+            input_capacity_tokens: Some(96_000),
+            fold_state: FoldRequirement::None,
             used_tokens: used,
             free_tokens: Some(128_000 - used),
             token_count_kind: TokenCountKind::Estimated,
@@ -716,6 +792,10 @@ mod tests {
             model: ModelRef::new("m", "m"),
             context_window_tokens: Some(0),
             compact_at_tokens: None,
+            output_reservation_tokens: None,
+            headroom_tokens: None,
+            input_capacity_tokens: None,
+            fold_state: FoldRequirement::None,
             used_tokens: 0,
             free_tokens: Some(0),
             token_count_kind: TokenCountKind::Estimated,

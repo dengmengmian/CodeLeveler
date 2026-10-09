@@ -3011,7 +3011,7 @@ impl InProcessRuntimeClient {
                         .await
                         .map_err(|e| e.to_string())?;
                     let overrides = app
-                        .execution_overrides_for_session(Some(session_id.as_str()))
+                        .execution_overrides_for_session(Some(session_id.as_str()), Some(&model))
                         .await
                         .map_err(|e| e.to_string())?;
                     let policy = leveler_agent::coding::resolve_execution_policy(

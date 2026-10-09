@@ -4,7 +4,8 @@
 
 use leveler_client_protocol::SessionId;
 use leveler_model::{
-    CompactionRecord, ContextAccounting, ContextCategory, ContextPressure, ModelRef, TokenCountKind,
+    CompactionRecord, ContextAccounting, ContextCategory, ContextPressure, FoldRequirement,
+    ModelRef, TokenCountKind,
 };
 use leveler_tui::screen::Screen;
 use leveler_tui::state::{AppState, Boot};
@@ -55,6 +56,10 @@ fn snapshot() -> ContextAccounting {
         model: ModelRef::new("deepseek", "deepseek-chat"),
         context_window_tokens: Some(128_000),
         compact_at_tokens: Some(64_000),
+        output_reservation_tokens: Some(32_000),
+        headroom_tokens: Some(0),
+        input_capacity_tokens: Some(96_000),
+        fold_state: FoldRequirement::None,
         used_tokens: used,
         free_tokens: Some(128_000 - used),
         token_count_kind: TokenCountKind::Estimated,
@@ -169,4 +174,57 @@ fn visual_context_screen() {
         println!("\n══════════ /context {w}x{h} ══════════");
         print!("{}", screen_text(&mut s, w, h));
     }
+}
+
+/// The screen shows the two axes with their OWN denominators, and the fold
+/// state comes from the classifier — not from a rounded percentage.
+#[test]
+fn the_screen_separates_the_compaction_axis_from_the_model_window() {
+    // The fixture in this file is a 128K window with a 96K effective input
+    // capacity and a 64K soft threshold; force the soft state by filling the
+    // request past the threshold.
+    let mut accounting = snapshot();
+    accounting.used_tokens = 70_000;
+    accounting.compact_at_tokens = Some(64_000);
+    accounting.input_capacity_tokens = Some(96_000);
+    accounting.output_reservation_tokens = Some(32_000);
+    accounting.headroom_tokens = Some(0);
+    accounting.fold_state = FoldRequirement::Soft;
+    accounting.pressure = ContextPressure::Critical;
+    let mut state = opened(accounting.clone());
+    let joined = screen_text(&mut state, 100, 40);
+    assert!(joined.contains("70k / 96k"), "compaction axis first:\n{joined}");
+    assert!(
+        joined.contains("Model window") && joined.contains("70k / 128k"),
+        "the model window axis is named, not mixed in:\n{joined}"
+    );
+    assert!(joined.contains("Output reservation 32k"), "{joined}");
+    assert!(joined.contains("Soft threshold"), "{joined}");
+    assert!(joined.contains("Hard capacity 96k"), "{joined}");
+    assert!(
+        joined.contains("Fold state"),
+        "the real state is shown:\n{joined}"
+    );
+    // The two percentages must not collapse into one number: 70k/96k is 72.9%
+    // of the compaction axis and 54.7% of the window.
+    assert!(joined.contains("72.9%"), "{joined}");
+    assert!(joined.contains("54.7%"), "{joined}");
+}
+
+/// Without a resolved capacity the screen must not invent one: the window is
+/// the only total and the fold thresholds are simply not shown.
+#[test]
+fn no_resolved_capacity_shows_no_compaction_denominator() {
+    let mut accounting = snapshot();
+    accounting.input_capacity_tokens = None;
+    accounting.output_reservation_tokens = None;
+    accounting.headroom_tokens = None;
+    accounting.compact_at_tokens = None;
+    accounting.fold_state = FoldRequirement::None;
+    accounting.pressure = ContextPressure::Normal;
+    let mut state = opened(accounting);
+    let joined = screen_text(&mut state, 100, 40);
+    assert!(!joined.contains("Hard capacity"), "{joined}");
+    assert!(!joined.contains("Soft threshold"), "{joined}");
+    assert!(!joined.contains("Model window"), "{joined}");
 }
