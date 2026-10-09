@@ -10,10 +10,6 @@ pub use leveler_model::FoldRequirement;
 /// How many trailing messages (the working set) auto-compaction keeps verbatim.
 pub const COMPACT_KEEP_RECENT: usize = 12;
 
-/// Default token estimate threshold for host-side pre-request compact (engine chat).
-/// Matches a conservative mid-size window so long histories fold before the API call.
-pub const PRE_REQUEST_COMPACT_THRESHOLD: u64 = 24_000;
-
 /// The instruction that asks the model to write a handoff briefing for the
 /// rounds compaction is about to elide. A bare "N steps dropped" breadcrumb
 /// throws away every decision, dead end, and finding from those rounds, so the

@@ -15,8 +15,8 @@ pub mod symbols;
 
 pub use compaction::{
     ACTIVE_OBJECTIVE_MARKER, COMPACT_KEEP_RECENT, COMPACTION_SUMMARY_BUDGET_TOKENS,
-    FoldRequirement, PRE_REQUEST_COMPACT_THRESHOLD, accepted_summary, compact_messages,
-    compaction_span, estimate_tokens, retention_tail_budget, round_boundary, summary_request,
+    FoldRequirement, accepted_summary, compact_messages, compaction_span, estimate_tokens,
+    retention_tail_budget, round_boundary, summary_request,
 };
 pub use context::{ContextCompiler, ContextPackage, estimate_text_tokens};
 pub use guard::{ContentFingerprint, FileStateTracker};

@@ -394,12 +394,6 @@ impl ResolvedContextPolicy {
     }
 }
 
-/// The interactive-chat fold threshold. Chat holds a conservative window;
-/// a task folds at the model's own declared reliable context. Resolved
-/// through this one seam so the two cannot drift apart unnoticed (C2.1
-/// recorded them diverging: 24k vs the task budget).
-pub const CHAT_CONTEXT_BUDGET: u32 = crate::PRE_REQUEST_COMPACT_THRESHOLD as u32;
-
 /// The fully resolved execution configuration for one executor. For the
 /// numeric budget fields `0` means unlimited, matching executor semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]

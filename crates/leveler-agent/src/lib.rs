@@ -40,9 +40,7 @@ pub use executor::{
 pub use leveler_agent_core::{
     BudgetDimension, BudgetExhaustion, DEFAULT_MODEL_STEP_CEILING, ModelStepLimits,
 };
-pub use leveler_context::{
-    COMPACT_KEEP_RECENT, PRE_REQUEST_COMPACT_THRESHOLD, compact_messages, estimate_tokens,
-};
+pub use leveler_context::{COMPACT_KEEP_RECENT, compact_messages, estimate_tokens};
 pub use leveler_engine::{
     ChildToolEvent, EventBarrier, ExecutionFence, ModelCallKind, ModelRequestRecord, PortError,
     TranscriptSink,
