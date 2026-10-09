@@ -582,7 +582,8 @@ impl GlobalConfig {
     /// model, where the user can see which entry is wrong.
     fn validate_context_soft_percent(&self) -> Result<(), GlobalConfigError> {
         if let Some(percent) = self.context.soft_percent
-            && let Err(reason) = leveler_agent::coding::policy::validate_context_soft_percent(percent)
+            && let Err(reason) =
+                leveler_agent::coding::policy::validate_context_soft_percent(percent)
         {
             return Err(GlobalConfigError::Parse(format!("[context] {reason}")));
         }
@@ -1106,7 +1107,10 @@ impl GlobalConfig {
         let model_soft_percent: Vec<(String, u8)> = self
             .models
             .iter()
-            .filter_map(|(id, m)| m.soft_compaction_percent.map(|percent| (id.clone(), percent)))
+            .filter_map(|(id, m)| {
+                m.soft_compaction_percent
+                    .map(|percent| (id.clone(), percent))
+            })
             .collect();
         let context_soft_percent = self.context.soft_percent;
         let models = self
@@ -1470,8 +1474,7 @@ mod tests {
     /// config value nobody wrote.
     #[test]
     fn an_unset_soft_percent_leaves_the_product_default() {
-        let cfg: GlobalConfig =
-            toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
+        let cfg: GlobalConfig = toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
         assert_eq!(cfg.soft_percent_for("p/m"), None);
         assert_eq!(cfg.into_bundle().context_soft_percent, None);
     }

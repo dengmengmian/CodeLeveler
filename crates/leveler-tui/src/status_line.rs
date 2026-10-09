@@ -879,7 +879,7 @@ mod tests {
         let projection = leveler_model::RequestProjection::project(
             &[leveler_model::Message::text(
                 leveler_model::Role::User,
-                &"x".repeat(40_000),
+                "x".repeat(40_000),
             )],
             &[],
             leveler_model::ReasoningReplayContract::NONE,
@@ -904,7 +904,7 @@ mod tests {
         let projection = leveler_model::RequestProjection::project(
             &[leveler_model::Message::text(
                 leveler_model::Role::User,
-                &"x".repeat(40_000),
+                "x".repeat(40_000),
             )],
             &[],
             leveler_model::ReasoningReplayContract::NONE,

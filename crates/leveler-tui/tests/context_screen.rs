@@ -194,7 +194,10 @@ fn the_screen_separates_the_compaction_axis_from_the_model_window() {
     accounting.pressure = ContextPressure::Critical;
     let mut state = opened(accounting.clone());
     let joined = screen_text(&mut state, 100, 40);
-    assert!(joined.contains("70k / 96k"), "compaction axis first:\n{joined}");
+    assert!(
+        joined.contains("70k / 96k"),
+        "compaction axis first:\n{joined}"
+    );
     assert!(
         joined.contains("Model window") && joined.contains("70k / 128k"),
         "the model window axis is named, not mixed in:\n{joined}"
