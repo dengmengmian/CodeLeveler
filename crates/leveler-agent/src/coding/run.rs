@@ -919,6 +919,8 @@ impl CodingRuntime {
                     log,
                     session_id,
                     &raw,
+                    objective,
+                    continuing,
                     workspace,
                     summarizer,
                     cancellation,
@@ -999,11 +1001,14 @@ impl CodingRuntime {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn checkpointed_prior(
         &self,
         log: &EventLog<'_>,
         session_id: &SessionId,
         raw: &leveler_engine::RawTranscript,
+        objective: Option<&str>,
+        continuing: bool,
         workspace: Option<&dyn crate::coding::checkpoint::WorkspaceFacts>,
         summarizer: &dyn leveler_engine::ContextSummarizer,
         _cancellation: &CancellationToken,
@@ -1012,7 +1017,7 @@ impl CodingRuntime {
     ) -> Result<Option<Vec<leveler_model::Message>>, EngineError> {
         let policy = self.resolved_context_policy().await?;
         let threshold = self.context_threshold().await?;
-        let tools = self
+        let executor = self
             .factory
             .build(
                 TurnProfile::Chat {
@@ -1021,14 +1026,21 @@ impl CodingRuntime {
                 },
                 None,
             )
-            .await?
-            .request_tool_definitions();
+            .await?;
+        let tools = executor.request_tool_definitions();
+        // The SAME projection `assembled_prior` measures: control context, tool
+        // schemas and history. A checkpoint prior is only worth returning when
+        // the request built from it is legal, and legality is a property of the
+        // real request, not of the transcript alone.
+        let request = objective.unwrap_or_default();
+        let control = executor.measurement_control_context(request, request, continuing);
         let measure = |messages: &[Message]| {
-            leveler_model::RequestProjection::project(
+            leveler_model::RequestProjection::project_with_control_context(
                 messages,
                 &tools,
                 policy.reasoning_replay,
                 policy.reasoning_retention,
+                &control,
             )
             .estimated_tokens()
         };
@@ -1058,12 +1070,26 @@ impl CodingRuntime {
         if measure(&raw.messages) <= threshold {
             return Ok(None);
         }
-        // The checkpoint keeps a count-bounded tail verbatim below, so the
-        // briefing is asked for exactly that prefix: the cut here and the cut
-        // there come from the ONE span owner (`compaction_span`).
+        // The verbatim tail is bounded by BOTH the round count and a token
+        // budget sized from the same projected accounting the fold uses — and
+        // the cut comes from the ONE span owner. A count-only tail can be many
+        // times the intended budget when the newest rounds are large tool
+        // results, so the checkpoint prior itself becomes an unsendable
+        // request.
         let keep_recent_messages = policy.context_policy.retention.keep_recent_messages;
+        let (tail_budget, _) = policy
+            .context_policy
+            .retention_budget_from_projection(&raw.messages, measure);
+        let keep_recent_tokens = tail_budget.unwrap_or(1).max(1);
+        let Some((_, tail_start)) = leveler_context::compaction_span(
+            &raw.messages,
+            keep_recent_messages,
+            keep_recent_tokens,
+        ) else {
+            return Ok(None);
+        };
         let Some(summary) = summarizer
-            .summarize(&raw.messages, keep_recent_messages, 0)
+            .summarize(&raw.messages, keep_recent_messages, keep_recent_tokens)
             .await?
         else {
             return Ok(None);
@@ -1085,10 +1111,6 @@ impl CodingRuntime {
                     observer,
                 )
                 .await?;
-                let tail_start = leveler_context::round_boundary(
-                    &raw.messages,
-                    raw.messages.len().saturating_sub(keep_recent_messages),
-                );
                 let mut prior = Vec::with_capacity(1 + raw.messages.len() - tail_start);
                 prior.push(leveler_model::Message::user(
                     record.payload.context_block(),
@@ -1097,6 +1119,20 @@ impl CodingRuntime {
                     },
                 ));
                 prior.extend_from_slice(&raw.messages[tail_start..]);
+                // Fail closed: the checkpoint prior must fit what the caller can
+                // send. A prior that does not is not a context to hand to the
+                // model; the caller falls back to the fold path, which re-measures
+                // the request and refuses an impossible one explicitly.
+                let projected = measure(&prior);
+                if projected > threshold {
+                    tracing::warn!(
+                        operation = "goal_checkpoint",
+                        projected_tokens = projected,
+                        quality_threshold = threshold,
+                        "goal checkpoint prior still exceeds the context budget; using the fold path"
+                    );
+                    return Ok(None);
+                }
                 Ok(Some(prior))
             }
             Ok(None) => Ok(None),
@@ -2762,6 +2798,8 @@ impl CodingRuntime {
                     log,
                     session_id,
                     &raw,
+                    Some(goal),
+                    true,
                     repo.map(GitWorkspace::new)
                         .as_ref()
                         .map(|w| w as &dyn crate::coding::checkpoint::WorkspaceFacts),
