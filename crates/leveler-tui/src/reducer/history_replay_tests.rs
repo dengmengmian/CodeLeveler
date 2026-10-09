@@ -1081,3 +1081,82 @@ fn a_settled_command_reads_as_one_row_live_and_replayed() {
         "history must read exactly as it ran"
     );
 }
+
+#[test]
+fn resumed_history_preserves_full_code_visibility_matrix() {
+    for case in crate::code_block::visibility_fixtures::cases() {
+        let mut s = state();
+        let effects = open(
+            &mut s,
+            vec![
+                message(UiRole::User, "OTHER-MESSAGE-BEFORE"),
+                message(UiRole::Assistant, &case.markdown),
+                message(UiRole::User, "OTHER-MESSAGE-AFTER"),
+            ],
+        );
+        // First verify the reopened text-only snapshot, then the authoritative
+        // history replacement uses exactly the same visible paging contract.
+        crate::code_block::visibility_fixtures::assert_paging(&mut s, case.name);
+        let answer = MessageId::new("code-answer");
+        let history = vec![
+            entry(
+                0,
+                true,
+                RuntimeEvent::UserMessageAdded {
+                    message: message(UiRole::User, "OTHER-MESSAGE-BEFORE"),
+                },
+            ),
+            entry(
+                1,
+                false,
+                RuntimeEvent::AssistantMessageStarted {
+                    message_id: answer.clone(),
+                },
+            ),
+            entry(
+                2,
+                false,
+                RuntimeEvent::AssistantTextDelta {
+                    message_id: answer.clone(),
+                    delta: case.markdown.clone(),
+                },
+            ),
+            entry(
+                3,
+                false,
+                RuntimeEvent::AssistantMessageCompleted { message_id: answer },
+            ),
+            entry(4, false, RuntimeEvent::TurnCompleted),
+            entry(
+                5,
+                true,
+                RuntimeEvent::UserMessageAdded {
+                    message: message(UiRole::User, "OTHER-MESSAGE-AFTER"),
+                },
+            ),
+        ];
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+                query_id: history_query(&effects),
+                session_id: SessionId::new("s1"),
+                entries: history,
+                omitted_turns: 0,
+            }),
+        );
+        assert!(
+            s.transcript.items().iter().any(|item| matches!(item,
+            TranscriptItem::Assistant(block) if block.text == case.markdown)),
+            "{} replay must preserve the original Markdown",
+            case.name
+        );
+        crate::code_block::visibility_fixtures::assert_paging(&mut s, case.name);
+        let projected: String = s
+            .conversation_lines(44)
+            .iter()
+            .map(crate::selection::line_to_plain)
+            .collect();
+        assert!(projected.contains("OTHER-MESSAGE-BEFORE"));
+        assert!(projected.contains("OTHER-MESSAGE-AFTER"));
+    }
+}

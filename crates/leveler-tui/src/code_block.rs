@@ -302,3 +302,162 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod visibility_fixtures {
+    pub struct Case {
+        pub name: &'static str,
+        pub markdown: String,
+        pub bodies: Vec<String>,
+    }
+
+    fn rows(n: usize, payload: &str) -> String {
+        (0..n)
+            .map(|i| format!("ROW-{i:04} {payload} END-{i:04}\n"))
+            .collect()
+    }
+
+    fn fence(name: &'static str, body: String, closed: bool) -> Case {
+        Case {
+            name,
+            markdown: format!("```rust\n{body}{}", if closed { "```\n" } else { "" }),
+            bodies: vec![body],
+        }
+    }
+
+    pub fn cases() -> Vec<Case> {
+        let six: String = (0..6)
+            .map(|i| {
+                let start = format!("ROW-{i:04} ");
+                let end = if i == 5 {
+                    " CRITICAL-INNER-END".to_owned()
+                } else {
+                    format!(" END-{i:04}")
+                };
+                format!(
+                    "{start}{}{end}\n",
+                    "x".repeat(180 - start.len() - end.len())
+                )
+            })
+            .collect();
+        let mut cases = vec![
+            fence("A-six-long-lines", six, true),
+            fence("B-twenty", rows(20, "let value = 42;"), true),
+            fence("C-hundred", rows(100, "let value = 42;"), true),
+            fence("D-thousand", rows(1000, "let value = 42;"), true),
+            fence("E-hundred-kib", rows(1024, &"x".repeat(81)), true),
+            fence("F-single-long-line", rows(1, &"x".repeat(10_000)), true),
+            fence(
+                "G-cjk",
+                rows(20, "// 中文注释：完整展示每一行，不省略正文。"),
+                true,
+            ),
+            fence(
+                "H-graphemes",
+                rows(20, "// 🦀 👩‍💻 e\u{301} o\u{308} 中文"),
+                true,
+            ),
+            fence("I-unclosed", rows(100, "let value = 42;"), false),
+        ];
+        let first = rows(20, "first fence");
+        let second = rows(20, "second fence");
+        cases.push(Case {
+            name: "J-multiple-fences",
+            markdown: format!("```rust\n{first}```\n\n```text\n{second}```\n"),
+            bodies: vec![first, second],
+        });
+        let body = rows(20, "ordinary code");
+        cases.push(Case {
+            name: "K-surrounding-markdown",
+            markdown: format!(
+                "BEFORE-CODE-PARAGRAPH\n\n```rust\n{body}```\n\nAFTER-CODE-PARAGRAPH\n"
+            ),
+            bodies: vec![body],
+        });
+        cases
+    }
+
+    /// Check the actual viewport cells reached by the real paging reducer.
+    /// Overlapping pages are compared with the authoritative projection once,
+    /// so an unreachable, reordered, or duplicated screen row cannot pass.
+    pub fn assert_paging(state: &mut crate::state::AppState, label: &str) {
+        use crate::action::Action;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+        use unicode_width::UnicodeWidthStr;
+
+        for (cols, rows) in [(48, 20), (80, 24), (120, 40), (48, 20)] {
+            crate::reducer::reduce(state, Action::Resize(cols, rows));
+            let area = Rect::new(0, 0, cols, rows);
+            let content = crate::conversation::geometry::content_rect(area);
+            state.conv.rect = Some((content.x, content.y, content.width, content.height));
+            state.conv.auto_scroll = false;
+            state.conv.scroll = 0;
+            let projection = state.conversation_lines(content.width as usize);
+            let expected: Vec<String> = projection
+                .iter()
+                .map(|line| crate::selection::line_to_plain(line).trim_end().to_owned())
+                .collect();
+            let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+            let mut visited = Vec::new();
+            loop {
+                terminal
+                    .draw(|frame| crate::conversation::viewport::render(frame, area, state))
+                    .unwrap();
+                assert!(
+                    std::rc::Rc::ptr_eq(
+                        &projection,
+                        &state.conversation_lines(content.width as usize)
+                    ),
+                    "{label} scroll/repaint must reuse the same full projection"
+                );
+                let buffer = terminal.backend().buffer();
+                let top_pad = (content.height as usize).saturating_sub(expected.len());
+                for row in visited.len().max(state.conv.scroll)
+                    ..(state.conv.scroll + content.height as usize).min(expected.len())
+                {
+                    let y = content.y + (row - state.conv.scroll + top_pad) as u16;
+                    let mut text = String::new();
+                    let mut x = content.x;
+                    while x < content.right() {
+                        let symbol = buffer[(x, y)].symbol();
+                        text.push_str(symbol);
+                        x += symbol.width().max(1) as u16;
+                    }
+                    assert_eq!(
+                        text.trim_end(),
+                        expected[row],
+                        "{label} {cols}x{rows} row {row}"
+                    );
+                    visited.push(text.trim_end().to_owned());
+                }
+                let before = state.conv.scroll;
+                crate::reducer::reduce(
+                    state,
+                    Action::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+                );
+                if state.conv.scroll == before {
+                    break;
+                }
+            }
+            assert_eq!(
+                visited, expected,
+                "{label} every visual row must be pageable at {cols}x{rows}"
+            );
+            while state.conv.scroll > 0 {
+                let before = state.conv.scroll;
+                crate::reducer::reduce(
+                    state,
+                    Action::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+                );
+                assert!(
+                    state.conv.scroll < before,
+                    "{label} PageUp must reach the beginning"
+                );
+            }
+            if expected.len() > content.height as usize {
+                assert!(!state.conv.auto_scroll, "reading stays pinned");
+            }
+        }
+    }
+}

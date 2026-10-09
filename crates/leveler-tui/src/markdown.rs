@@ -1950,6 +1950,49 @@ mod tests {
     }
 
     #[test]
+    fn full_code_visibility_contract_matrix() {
+        let theme = Theme::no_color();
+        for case in crate::code_block::visibility_fixtures::cases() {
+            let doc = MdDoc::parse(&case.markdown);
+            let blocks: Vec<_> = doc
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, MdBlock::Code { .. }))
+                .collect();
+            assert_eq!(blocks.len(), case.bodies.len(), "{} fence count", case.name);
+            for width in [48, 80, 120, 48] {
+                for (block, source) in blocks.iter().zip(&case.bodies) {
+                    let mut projected = Vec::new();
+                    render_block(
+                        block,
+                        width,
+                        &theme,
+                        AssistantTone::Plain,
+                        false,
+                        &mut projected,
+                    );
+                    let header_rows = usize::from(
+                        source.lines().count() > crate::code_block::SHORT_CODE_MAX_LINES,
+                    );
+                    let visible: String = projected
+                        .iter()
+                        .skip(header_rows)
+                        .flat_map(|line| {
+                            line.spans.iter().skip(1).map(|span| span.content.as_ref())
+                        })
+                        .collect();
+                    assert_eq!(
+                        visible,
+                        source.replace('\n', ""),
+                        "{} width {width}: exact text/order/count",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn code_fence_preserves_all_text_across_resize() {
         let theme = Theme::no_color();
         for source_lines in [6, 40] {

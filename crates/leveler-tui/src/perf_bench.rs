@@ -987,3 +987,125 @@ fn synth_long_history(turns: usize) -> Vec<crate::record::RecordedEvent> {
     }
     out
 }
+
+/// Complete-code workloads, with the same fixture and sampling protocol on
+/// either side of a presentation change. No timing threshold or hidden body
+/// limit: visibility is enforced by the non-ignored contract matrix.
+#[test]
+#[ignore = "manual comparable full-code performance harness; run with --ignored --nocapture"]
+fn perf_full_code_visibility() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+
+    fn report(shape: &str, cols: u16, rows: u16, stage: &str, samples: Vec<f64>) {
+        println!(
+            "FULL_CODE_PERF {}",
+            serde_json::json!({
+                "shape": shape, "cols": cols, "rows": rows, "stage": stage,
+                "median_ms": median(samples.clone()), "p95_ms": pct(samples.clone(), 0.95),
+                "samples_ms": samples,
+            })
+        );
+    }
+    let thousand: String = (0..1000)
+        .map(|i| format!("let row_{i:04} = {i}; // visible code\n"))
+        .collect();
+    let giant: String = (0..1000)
+        .map(|i| format!("// ROW-{i:04} {} END-{i:04}\n", "x".repeat(100)))
+        .collect();
+    let fixtures = [
+        ("normal-markdown", long_markdown_no_code(1_000)),
+        ("large-markdown", long_markdown(160_000)),
+        ("thousand-lines", format!("```rust\n{thousand}```\n")),
+        ("hundred-kib-code", format!("```rust\n{giant}```\n")),
+        (
+            "long-single-line",
+            format!("```text\nBEGIN {} END\n```\n", "x".repeat(10_000)),
+        ),
+    ];
+    for (shape, text) in fixtures {
+        for (cols, rows) in [(48, 20), (80, 24), (120, 40)] {
+            let mut cold = Vec::new();
+            for _ in 0..5 {
+                crate::markdown::highlight_cache_clear();
+                let started = Instant::now();
+                let _ = crate::markdown::MdDoc::parse(&text);
+                cold.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            report(shape, cols, rows, "cold-parse-highlight", cold);
+            let theme = Theme::no_color();
+            let doc = crate::markdown::MdDoc::parse(&text);
+            let area = Rect::new(0, 0, cols, rows);
+            let content = crate::conversation::geometry::content_rect(area);
+            let mut layout = Vec::new();
+            for _ in 0..15 {
+                let started = Instant::now();
+                let _ = doc.to_lines(content.width as usize, &theme);
+                layout.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            report(shape, cols, rows, "layout", layout);
+            let mut state = opened();
+            state.theme = theme;
+            state.size = (cols, rows);
+            stream_assistant(&mut state, "full-code", &text);
+            state.conv.auto_scroll = false;
+            let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+            terminal
+                .draw(|frame| crate::conversation::viewport::render(frame, area, &mut state))
+                .unwrap();
+            let projected_rows = state.conversation_lines(content.width as usize).len();
+            println!(
+                "FULL_CODE_PERF_FIXTURE {}",
+                serde_json::json!({
+                    "shape": shape, "cols": cols, "rows": rows,
+                    "bytes": text.len(), "projected_rows": projected_rows,
+                })
+            );
+            let mut draw = Vec::new();
+            let mut scroll = Vec::new();
+            let mut resize = Vec::new();
+            for i in 0..15 {
+                let started = Instant::now();
+                terminal
+                    .draw(|frame| crate::conversation::viewport::render(frame, area, &mut state))
+                    .unwrap();
+                draw.push(started.elapsed().as_secs_f64() * 1000.0);
+                let started = Instant::now();
+                let key = if i % 2 == 0 {
+                    KeyCode::PageDown
+                } else {
+                    KeyCode::PageUp
+                };
+                reduce(
+                    &mut state,
+                    Action::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+                );
+                terminal
+                    .draw(|frame| crate::conversation::viewport::render(frame, area, &mut state))
+                    .unwrap();
+                scroll.push(started.elapsed().as_secs_f64() * 1000.0);
+                let width = if i % 2 == 0 {
+                    cols.saturating_sub(8)
+                } else {
+                    cols.saturating_sub(4)
+                };
+                let resized = Rect::new(0, 0, width, rows);
+                let started = Instant::now();
+                reduce(&mut state, Action::Resize(width, rows));
+                terminal.resize(resized).unwrap();
+                terminal
+                    .draw(|frame| crate::conversation::viewport::render(frame, resized, &mut state))
+                    .unwrap();
+                resize.push(started.elapsed().as_secs_f64() * 1000.0);
+                reduce(&mut state, Action::Resize(cols, rows));
+                terminal.resize(area).unwrap();
+                terminal
+                    .draw(|frame| crate::conversation::viewport::render(frame, area, &mut state))
+                    .unwrap();
+            }
+            report(shape, cols, rows, "cached-viewport-draw", draw);
+            report(shape, cols, rows, "page-key-and-draw", scroll);
+            report(shape, cols, rows, "resize-and-draw", resize);
+        }
+    }
+}

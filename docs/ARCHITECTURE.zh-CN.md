@@ -1252,6 +1252,9 @@ dogfood 验证，不要在后续改动中回退：
   painted frame 节奏重建一次；不得退回“每个 delta 重建一次”。
 - **有界高亮缓存**：代码块 syntect 结果使用有界 LRU（512 项 / 4 MiB），key 为
   `(lang, 代码内容)`，与主题无关；主题只在渲染期映射颜色，代价 O(1) 淘汰。
+- **Markdown 代码块全文可达**：闭合与未闭合围栏都保留全部代码，不按源行数
+  折叠或按换行后的显示行数裁切。长行按终端宽度换行，现有 Conversation 视口
+  负责滚动；缩放和历史重放后，开头、中间、末尾及相邻消息仍可访问。
 - **finalized item 包裹结果 memo**：不可变 transcript item 复用已 wrap 行，只有
   内容变化的 item 重新计算；读取 live 状态的 item（ToolGroup / SubAgent /
   UserShell）不进入 memo。**仅高度变化的 resize 也必须使投影失效**。
