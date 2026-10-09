@@ -71,6 +71,14 @@ fn bridge_with_paired_device(
     dir: &tempfile::TempDir,
     scope: PairingScope,
 ) -> (AgentBridge, Arc<Mutex<Vec<ClientCommand>>>) {
+    bridge_with_host_policy(dir, scope, false)
+}
+
+fn bridge_with_host_policy(
+    dir: &tempfile::TempDir,
+    scope: PairingScope,
+    allow_full_access: bool,
+) -> (AgentBridge, Arc<Mutex<Vec<ClientCommand>>>) {
     let path = dir.path().join("remote").join("devices.json");
     let mut devices = TrustedDevices::load(&path).expect("empty store loads");
     devices
@@ -87,7 +95,13 @@ fn bridge_with_paired_device(
     let delivered = runtime.delivered.clone();
     let routes = Arc::new(SingleProject::new(PROJECT_ID, "repo", Arc::new(runtime)));
     (
-        AgentBridge::new(routes, devices, RUNTIME_ID, runtime_key(), false),
+        AgentBridge::new(
+            routes,
+            devices,
+            RUNTIME_ID,
+            runtime_key(),
+            allow_full_access,
+        ),
         delivered,
     )
 }
@@ -312,7 +326,7 @@ async fn a_signed_but_disallowed_command_is_refused() {
 
 /// `FullAccess` needs the host's own opt-in, which a device cannot supply.
 #[tokio::test]
-async fn full_access_is_refused_without_the_host_opt_in() {
+async fn full_access_selection_requires_the_host_opt_in() {
     let dir = tempfile::tempdir().unwrap();
     let (bridge, delivered) = bridge_with_paired_device(&dir, PairingScope::Interactive);
 
@@ -321,12 +335,10 @@ async fn full_access_is_refused_without_the_host_opt_in() {
         mode: PermissionProfile::FullAccess,
     })
     .unwrap();
-    let frame = upstream(
-        &device_key(),
-        DEVICE_ID,
-        RUNTIME_ID,
-        &deliver_body(&command),
+    let setting = format!(
+        r#"{{"type":"deliver_versioned_setting","command_id":"cmd-full","session_id":"s1","expected_version":0,"command":{command}}}"#
     );
+    let frame = upstream(&device_key(), DEVICE_ID, RUNTIME_ID, &setting);
 
     assert_eq!(
         bridge
@@ -337,6 +349,26 @@ async fn full_access_is_refused_without_the_host_opt_in() {
         "permission_profile_not_allowed_remote"
     );
     assert!(delivered.lock().unwrap().is_empty());
+
+    // The same authenticated setting reaches the runtime when the host has
+    // selected its opt-in; this gate governs selecting Full, not executing it.
+    let opted_in_dir = tempfile::tempdir().unwrap();
+    let (opted_in, delivered) =
+        bridge_with_host_policy(&opted_in_dir, PairingScope::Interactive, true);
+    assert!(matches!(
+        opted_in
+            .admit_upstream(PROJECT_ID, &frame, AT, None)
+            .await
+            .unwrap(),
+        Admitted::Delivered { .. }
+    ));
+    assert!(matches!(
+        delivered.lock().unwrap().as_slice(),
+        [ClientCommand::SetPermissionProfile {
+            session_id,
+            mode: PermissionProfile::FullAccess,
+        }] if session_id == &SessionId::new("s1")
+    ));
 }
 
 /// An observe pairing may watch and nothing more.

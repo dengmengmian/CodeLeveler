@@ -510,7 +510,8 @@ impl Windows {
     }
 
     /// Wait until `turns` turns exist and the last one has ended with its
-    /// task terminal committed (the session is no longer running).
+    /// task terminal committed. A turn interruption projects a non-running
+    /// session before TaskFinished commits its outcome and releases ownership.
     async fn settled(&self, turns: usize) -> Vec<(String, Option<String>)> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -522,9 +523,16 @@ impl Windows {
                 .unwrap()
                 .unwrap()
                 .status;
+            let outcome = leveler_storage::SessionRepository::new(&db)
+                .execution(&self.session)
+                .await
+                .unwrap()
+                .unwrap()
+                .3;
             if rows.len() == turns
                 && rows.iter().all(|(status, _)| status != "running")
                 && status.as_str() != "running"
+                && outcome.is_some()
             {
                 return rows;
             }

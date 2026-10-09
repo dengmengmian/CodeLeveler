@@ -983,7 +983,31 @@ compatibility:
         [Effect::Send(command @ ClientCommand::SetThinkingLevel { .. })] => command.clone(),
         other => panic!("the composer must emit one command: {other:?}"),
     };
-    client.send(command).await.unwrap();
+    // Runtime settings require the version observed by the production TUI
+    // dispatcher. Raw/unversioned delivery remains refused and changes nothing.
+    let mut envelope = leveler_client_protocol::CommandEnvelope {
+        command_id: leveler_client_protocol::CommandId::generate(),
+        session_id: session.clone(),
+        expected_version: None,
+        issued_at: leveler_core::now().to_rfc3339(),
+        command,
+    };
+    let refused = client.deliver(envelope.clone()).await.unwrap_err();
+    assert!(
+        matches!(refused, leveler_client_protocol::ClientError::Runtime(ref message)
+            if message.contains("snapshot version required")),
+        "{refused:?}"
+    );
+    let unchanged = client.snapshot(&session).await.unwrap();
+    assert_eq!(
+        Some(unchanged.last_sequence.unwrap_or(0)),
+        s.snapshot_version
+    );
+    assert_eq!(unchanged.thinking.as_ref().unwrap().session_override, None);
+
+    envelope.command_id = leveler_client_protocol::CommandId::generate();
+    envelope.expected_version = Some(s.snapshot_version.expect("observed runtime version"));
+    client.deliver(envelope).await.unwrap();
 
     // The runtime re-projects and answers with its own snapshot; nothing here
     // fabricates one.
