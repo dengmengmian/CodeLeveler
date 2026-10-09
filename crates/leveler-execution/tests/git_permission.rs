@@ -474,6 +474,24 @@ async fn a_denied_credential_store_is_not_a_failed_git_operation() {
         eprintln!("skipping: no OS write-confinement wrapper on this host");
         return;
     }
+    // A Linux tempfile beneath /tmp is writable by the ordinary temp grant,
+    // so it cannot represent a denied credential store outside the grant.
+    #[cfg(unix)]
+    let root = {
+        let home = std::env::var_os("HOME").expect("HOME for denied-store fixture");
+        let root = tempfile::Builder::new()
+            .prefix(".leveler-credential-test-")
+            .tempdir_in(home)
+            .unwrap();
+        let real = root.path().canonicalize().unwrap();
+        let shared = std::fs::canonicalize("/tmp").unwrap();
+        assert!(
+            !real.starts_with(shared),
+            "credential fixture must be outside shared temp"
+        );
+        root
+    };
+    #[cfg(not(unix))]
     let root = tempfile::tempdir().unwrap();
     let work = root.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
