@@ -154,6 +154,7 @@ impl LocalRuntimeService for FakeRuntime {
         let session = self.snapshot(&SessionId::new("s-new")).await?;
         Ok(SessionBootstrap {
             session,
+            notice: None,
             context_window: 128_000,
         })
     }

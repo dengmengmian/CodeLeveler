@@ -109,6 +109,7 @@ impl LocalRuntimeService for RecordingRuntime {
         session.goal = request.goal;
         Ok(SessionBootstrap {
             session,
+            notice: None,
             context_window: 128_000,
         })
     }

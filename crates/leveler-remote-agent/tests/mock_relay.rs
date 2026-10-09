@@ -91,6 +91,7 @@ impl LocalRuntimeService for FakeRuntime {
         Ok(SessionBootstrap {
             session: snapshot_for("s-new"),
             context_window: 128_000,
+            notice: None,
         })
     }
 }
@@ -203,6 +204,7 @@ async fn a_relay_authored_response_is_rejected_by_the_device() {
     let forged_body = serde_json::to_vec(&SessionBootstrap {
         session: snapshot_for("s-attacker"),
         context_window: 128_000,
+        notice: None,
     })
     .unwrap();
     let forged = SignedEnvelope::sign(
