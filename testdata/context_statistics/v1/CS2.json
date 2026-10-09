@@ -1,0 +1,43 @@
+{
+  "id": "CS2",
+  "invariant": "a window whose completion reservation is huge still measures compaction against what is left, never the whole window",
+  "accounting": {
+    "model": {
+      "provider": "mock",
+      "model": "m"
+    },
+    "context_window_tokens": 1048576,
+    "compact_at_tokens": 334233,
+    "output_reservation_tokens": 655360,
+    "headroom_tokens": 0,
+    "input_capacity_tokens": 393216,
+    "fold_state": "none",
+    "used_tokens": 100000,
+    "free_tokens": 948576,
+    "token_count_kind": "estimated",
+    "pressure": "normal",
+    "categories": [],
+    "last_compaction": null,
+    "reasoning_projection": null
+  },
+  "provider": {
+    "input": 101000,
+    "output": 500
+  },
+  "model_window": 1048576,
+  "expect": {
+    "shown": true,
+    "axis": "compaction",
+    "used_tokens": 100000,
+    "input_capacity_tokens": 393216,
+    "compact_at_tokens": 334233,
+    "hard_capacity": 393216,
+    "fold_state": "none",
+    "provider_actual": 101500,
+    "render": {
+      "tui_footer": "上下文 25% · 100k/393k",
+      "web_label": "100.0k / 393.2k",
+      "web_axis_word": "压缩口径"
+    }
+  }
+}

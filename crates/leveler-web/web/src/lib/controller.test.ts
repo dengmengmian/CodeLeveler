@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { Action, AppState } from '../state/store';
 import { initialState, reducer } from '../state/store';
-import type { ClientCommand, RuntimeEvent, UpFrame, UiSessionSnapshot } from '../types/protocol';
+import type { ClientCommand, ContextAccounting, RuntimeEvent, UpFrame, UiSessionSnapshot } from '../types/protocol';
 import { RuntimeBridge } from './controller';
 import { loadLastSession, saveLastSession } from './lastSession';
 
@@ -821,4 +821,114 @@ describe('durable history admission follows accepted snapshot facts before React
     expect(h.sent.filter(command => command.type === 'query_session_history')).toHaveLength(1);
   });
 
+});
+
+describe('context statistics come from the runtime accounting', () => {
+  const accounting: ContextAccounting = {
+    model: { provider: 'mock', model: 'a' },
+    context_window_tokens: 128_000,
+    compact_at_tokens: 91_200,
+    output_reservation_tokens: 32_000,
+    headroom_tokens: 0,
+    input_capacity_tokens: 96_000,
+    fold_state: 'none',
+    used_tokens: 10_000,
+    free_tokens: 118_000,
+    token_count_kind: 'estimated',
+    pressure: 'normal',
+    categories: [],
+    last_compaction: null,
+    reasoning_projection: null,
+  };
+
+  function sessionSnapshot(model: string): UiSessionSnapshot {
+    const [provider, id] = model.split('/');
+    return {
+      id: 's1',
+      goal: 'g',
+      mode: 'assisted',
+      status: 'idle',
+      messages: [],
+      last_sequence: 20,
+      model: { provider, model: id },
+    };
+  }
+
+  function ownedQuery(h: Harness, index = 0): string {
+    const queries = h.sent.filter((command) => command.type === 'query_context');
+    const query = queries[index];
+    if (!query || query.type !== 'query_context') throw new Error('missing query_context');
+    return query.query_id ?? '';
+  }
+
+  function openedOnS1(model = 'mock/a'): Harness {
+    const h = harness();
+    h.apply({ type: 'session_opened', session: sessionSnapshot(model) });
+    return h;
+  }
+
+  it('asks the runtime for the accounting when a session opens (resume included)', () => {
+    const h = openedOnS1();
+    expect(h.sent.filter((command) => command.type === 'query_context')).toHaveLength(1);
+    expect(ownedQuery(h)).not.toBe('');
+  });
+
+  it('adopts only the accounting it asked for', () => {
+    const h = openedOnS1();
+    h.apply({ type: 'context_loaded', query_id: 'foreign', accounting });
+    expect(h.state.current?.contextUsage ?? null).toBeNull();
+    h.apply({ type: 'context_loaded', query_id: ownedQuery(h), accounting });
+    expect(h.state.current?.contextUsage?.used_tokens).toBe(10_000);
+    expect(h.state.current?.contextUsage?.input_capacity_tokens).toBe(96_000);
+    expect(h.state.current?.contextUsage?.compact_at_tokens).toBe(91_200);
+  });
+
+  it('takes the live context_usage push', () => {
+    const h = openedOnS1();
+    h.apply({ type: 'context_usage', accounting });
+    expect(h.state.current?.contextUsage?.fold_state).toBe('none');
+  });
+
+  it("drops the previous model's accounting on a switch and re-asks", () => {
+    const h = openedOnS1('mock/a');
+    h.apply({ type: 'context_loaded', query_id: ownedQuery(h), accounting });
+    if (h.state.current) h.state.current.tokens = { input: 5_000, output: 100 };
+    const before = h.sent.length;
+    h.apply({ type: 'session_updated', session: sessionSnapshot('mock/b') });
+    expect(h.state.current?.contextUsage ?? null).toBeNull();
+    expect(h.state.current?.tokens).toEqual({ input: 0, output: 0 });
+    expect(
+      h.sent.slice(before).filter((command) => command.type === 'query_context'),
+    ).toHaveLength(1);
+  });
+
+  it('drops the accounting and the provider fallback on compaction', () => {
+    const h = openedOnS1();
+    h.apply({ type: 'context_loaded', query_id: ownedQuery(h), accounting });
+    if (h.state.current) h.state.current.tokens = { input: 5_000, output: 100 };
+    h.apply({ type: 'context_compacted', from: 4, to: 1 });
+    expect(h.state.current?.contextUsage ?? null).toBeNull();
+    expect(h.state.current?.tokens).toEqual({ input: 0, output: 0 });
+  });
+
+  it('clears the accounting when the runtime answers none', () => {
+    const h = openedOnS1();
+    h.apply({ type: 'context_loaded', query_id: ownedQuery(h), accounting });
+    // A later open re-asks, and a restarted runtime has no live accounting.
+    h.apply({ type: 'session_opened', session: sessionSnapshot('mock/a') });
+    h.apply({ type: 'context_loaded', query_id: ownedQuery(h, 1), accounting: null });
+    expect(h.state.current?.contextUsage ?? null).toBeNull();
+  });
+
+  it('a delayed answer to a superseded query is ignored, not applied late', () => {
+    const h = openedOnS1();
+    const first = ownedQuery(h);
+    h.apply({ type: 'session_opened', session: sessionSnapshot('mock/a') });
+    const second = ownedQuery(h, 1);
+    expect(second).not.toBe(first);
+    h.apply({ type: 'context_loaded', query_id: first, accounting });
+    expect(h.state.current?.contextUsage ?? null).toBeNull();
+    h.apply({ type: 'context_loaded', query_id: second, accounting });
+    expect(h.state.current?.contextUsage?.used_tokens).toBe(10_000);
+  });
 });

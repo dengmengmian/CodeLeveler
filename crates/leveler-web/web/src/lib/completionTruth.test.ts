@@ -11,7 +11,7 @@ function session(over: Partial<SessionView> = {}): SessionView {
     activity: null, reasoning: '', reasoningSuperseded: false, thoughts: [], historyOmittedTurns: 0, turnStartedAt: null,
     lastTurn: null, model: null, availableModels: [], permission: 'assisted',
     collaboration: 'chat', reasoningEffort: null,
-    tokens: { input: 0, output: 0 }, contextTokens: 0, contextWindow: null,
+    tokens: { input: 0, output: 0 }, contextTokens: 0, contextWindow: null, contextUsage: null,
     ...over,
   };
 }

@@ -14,6 +14,7 @@ import type {
   AttachmentRef,
   ChildOutcome,
   ChildStop,
+  ContextAccounting,
   ModelRef,
   PermissionProfile,
   ProjectInfo,
@@ -258,6 +259,12 @@ export interface SessionView {
   contextTokens: number;
   /** 来自 SessionBootstrap；不知道时 CTX 表按 0% */
   contextWindow: number | null;
+  /**
+   * runtime 对“下一个请求”的上下文账本（projected 输入 / 有效输入容量 /
+   * soft 阈值 / fold 状态）。来自 `context_usage` 推送或 `query_context`
+   * 回答；UI 不重建任何一条策略。没有它时只展示明确命名的模型窗口轴。
+   */
+  contextUsage: ContextAccounting | null;
 }
 
 export type ConnectionStatus = 'connecting' | 'online';
@@ -461,6 +468,12 @@ export type Action =
   | { type: 'completion'; report: UiCompletionReport }
   | { type: 'token_usage'; input: number; output: number }
   | { type: 'context_estimate'; tokens: number }
+  /** Runtime ContextAccounting of the next request (live push or query answer). */
+  | { type: 'context_usage'; accounting: ContextAccounting }
+  /** The runtime has no current accounting (no request assembled yet). */
+  | { type: 'context_unavailable' }
+  /** The accounting AND the provider fallback are stale (model switch / fold). */
+  | { type: 'context_reset' }
   | { type: 'turn_active'; value: boolean }
   | { type: 'turn_terminal'; outcome: TurnOutcome; detail?: string | null }
   | { type: 'seed_composer'; text: string | null }
@@ -584,6 +597,7 @@ function viewFromSnapshot(
     tokens: sameSession ? prev.tokens : { input: 0, output: 0 },
     contextTokens: sameSession ? prev.contextTokens : 0,
     contextWindow: contextWindow ?? (sameSession ? prev.contextWindow : null),
+    contextUsage: sameSession ? (prev.contextUsage ?? null) : null,
   };
 }
 
@@ -651,11 +665,27 @@ function markBusy(current: SessionView): void {
   }
 }
 
+/** Same provider/model identity; `null` is only equal to `null`. */
+function sameModel(a: ModelRef | null, b: ModelRef | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.provider === b.provider && a.model === b.model;
+}
+
 /** TUI `apply_meta`: header fields only. Does not touch transcript, tools, agents, lastTurn. */
 function applySessionMeta(current: SessionView, snap: UiSessionSnapshot): void {
   current.repository = snap.repository ?? null;
   current.branch = snap.branch ?? null;
+  const previousModel = current.model;
   current.model = snap.model ?? null;
+  if (!sameModel(previousModel, current.model)) {
+    // A model switch changes the resolved policy the accounting was measured
+    // against, and the provider fallback described the previous model's
+    // requests. Both must go; the refreshed query answers with the new policy's
+    // numbers (or nothing, until a request is assembled).
+    current.contextUsage = null;
+    current.tokens = { input: 0, output: 0 };
+    current.contextTokens = 0;
+  }
   current.availableModels = snap.available_models ?? [];
   current.permission = snap.mode;
   if (snap.status) current.status = snap.status;
@@ -1199,6 +1229,19 @@ export function reducer(state: AppState, action: Action): void {
         state.current.tokens = { input: action.input, output: action.output };
         // input 是本轮完整 prompt，加 output 即回复后的窗口占用；取代不累加。
         state.current.contextTokens = action.input + action.output;
+      }
+      return;
+    case 'context_usage':
+      if (state.current) state.current.contextUsage = action.accounting;
+      return;
+    case 'context_unavailable':
+      if (state.current) state.current.contextUsage = null;
+      return;
+    case 'context_reset':
+      if (state.current) {
+        state.current.contextUsage = null;
+        state.current.tokens = { input: 0, output: 0 };
+        state.current.contextTokens = 0;
       }
       return;
     case 'context_estimate':

@@ -239,3 +239,46 @@ fn a_none_answer_clears_the_previous_sessions_gauge() {
     );
     assert!(s.context.loaded.is_none());
 }
+
+/// A delayed answer to an OWN, already-superseded query must not be applied
+/// late: the view's accounting belongs to the latest query it issued.
+#[test]
+fn a_delayed_answer_to_a_superseded_query_is_ignored() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot("deepseek/v3"),
+        }),
+    );
+    let first = s.context.pending_query_id.clone().expect("first query");
+    // A second open supersedes the first before its answer arrives.
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened {
+            session: snapshot("deepseek/v3"),
+        }),
+    );
+    let second = s.context.pending_query_id.clone().expect("second query");
+    assert_ne!(first, second);
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ContextLoaded {
+            query_id: Some(first),
+            accounting: Some(accounting()),
+        }),
+    );
+    assert!(
+        s.context.loaded.is_none(),
+        "a superseded answer must not be applied late"
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ContextLoaded {
+            query_id: Some(second),
+            accounting: Some(accounting()),
+        }),
+    );
+    assert!(s.context.loaded.is_some());
+}

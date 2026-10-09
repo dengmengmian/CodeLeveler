@@ -1,0 +1,26 @@
+{
+  "id": "CS9",
+  "invariant": "statistics unavailable and no declared window: only the provider actual number may be named, and the TUI hides the gauge",
+  "accounting": null,
+  "provider": {
+    "input": 5000,
+    "output": 500
+  },
+  "model_window": null,
+  "expect": {
+    "shown": false,
+    "axis": "none",
+    "used_tokens": null,
+    "input_capacity_tokens": null,
+    "compact_at_tokens": null,
+    "hard_capacity": null,
+    "fold_state": null,
+    "provider_actual": 5500,
+    "render": {
+      "tui_footer": null,
+      "web_label": "5.5k",
+      "web_axis_word": "provider 实际用量",
+      "web_unavailable_note": true
+    }
+  }
+}

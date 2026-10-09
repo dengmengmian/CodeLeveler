@@ -25,6 +25,8 @@ mod code_block;
 pub mod composer;
 pub mod context;
 pub mod context_grid;
+#[cfg(test)]
+mod context_statistics_contract;
 pub mod conversation;
 mod diff_view;
 pub mod external_editor;

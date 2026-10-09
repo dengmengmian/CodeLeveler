@@ -1,0 +1,43 @@
+{
+  "id": "CS3",
+  "invariant": "the soft threshold is the runtime's resolved number (85% here): crossing it is fold_state=soft",
+  "accounting": {
+    "model": {
+      "provider": "mock",
+      "model": "m"
+    },
+    "context_window_tokens": 128000,
+    "compact_at_tokens": 81600,
+    "output_reservation_tokens": 32000,
+    "headroom_tokens": 0,
+    "input_capacity_tokens": 96000,
+    "fold_state": "soft",
+    "used_tokens": 82000,
+    "free_tokens": 46000,
+    "token_count_kind": "estimated",
+    "pressure": "critical",
+    "categories": [],
+    "last_compaction": null,
+    "reasoning_projection": null
+  },
+  "provider": {
+    "input": 83000,
+    "output": 300
+  },
+  "model_window": 128000,
+  "expect": {
+    "shown": true,
+    "axis": "compaction",
+    "used_tokens": 82000,
+    "input_capacity_tokens": 96000,
+    "compact_at_tokens": 81600,
+    "hard_capacity": 96000,
+    "fold_state": "soft",
+    "provider_actual": 83300,
+    "render": {
+      "tui_footer": "上下文 85% · 82k/96k",
+      "web_label": "82.0k / 96.0k",
+      "web_axis_word": "压缩口径"
+    }
+  }
+}
