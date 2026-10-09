@@ -1950,7 +1950,35 @@ mod tests {
     }
 
     #[test]
-    fn long_code_fence_folds_middle() {
+    fn code_fence_preserves_all_text_across_resize() {
+        let theme = Theme::no_color();
+        for source_lines in [6, 40] {
+            let body: String = (0..source_lines)
+                .map(|i| format!("row{i:02}-{}-END{i:02}\n", "x".repeat(180)))
+                .collect();
+            for info in ["text", "text snippet.rs:1"] {
+                for closing in ["```", ""] {
+                    let doc = MdDoc::parse(&format!("```{info}\n{body}{closing}"));
+                    for width in [48, 120, 48] {
+                        let lines = doc.to_lines(width, &theme);
+                        let visible: String = lines
+                            .iter()
+                            .skip(1)
+                            .flat_map(|l| l.spans.iter().skip(1).map(|s| s.content.as_ref()))
+                            .collect();
+                        assert_eq!(
+                            visible,
+                            body.replace('\n', ""),
+                            "width {width}, source lines {source_lines}, info {info}, closing {closing}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_code_fence_preserves_middle_for_conversation_scrolling() {
         let body: String = (0..40).map(|i| format!("line {i}\n")).collect();
         let doc = MdDoc::parse(&format!("```rust\n{body}```"));
         let lines = doc.to_lines(60, &Theme::no_color());
@@ -1958,15 +1986,13 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert!(
-            text.iter().any(|l| l.contains("lines omitted")),
-            "long fence must fold: {text:?}"
-        );
-        assert!(
-            text.len() < 40,
-            "folded code must not flood conversation: {} lines",
-            text.len()
-        );
+        for i in 0..40 {
+            assert!(
+                text.iter().any(|l| l.trim() == format!("line {i}")),
+                "source line {i} must remain readable"
+            );
+        }
+        assert!(!text.iter().any(|l| l.contains("lines omitted")));
     }
 
     #[test]

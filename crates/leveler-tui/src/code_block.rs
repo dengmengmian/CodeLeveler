@@ -2,7 +2,7 @@
 //!
 //! Strategy:
 //! - **Short** snippets (≤4 lines, no path): inline style — indent + highlight, no box/bg.
-//! - **Long / file** content: light header (path:line) + fold; no solid black fill.
+//! - **Long / file** content: light header (path:line), complete scrollable body; no solid black fill.
 //!
 //! Diffs never enter here — use [`crate::diff_view`].
 
@@ -14,11 +14,6 @@ use crate::theme::Theme;
 
 /// Lines at or below this count render as inline (no container), unless a path header exists.
 pub const SHORT_CODE_MAX_LINES: usize = 4;
-/// Visible body lines before folding kicks in (header is extra).
-pub const CODE_BLOCK_MAX_BODY: usize = 14;
-const FOLD_HEAD: usize = 6;
-const FOLD_TAIL: usize = 4;
-
 /// Parsed fence info string (`rust`, `go path/file.go:10`, `webhook.go:792`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FenceMeta {
@@ -101,45 +96,6 @@ fn compact_title(path: &str) -> String {
         .to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FoldPart {
-    Range { start: usize, end: usize },
-    Omitted { count: usize },
-}
-
-/// Plan a height-capped, middle-folded view of a code fence body.
-pub fn fold_plan(line_count: usize) -> Vec<FoldPart> {
-    if line_count == 0 {
-        return Vec::new();
-    }
-    if line_count <= CODE_BLOCK_MAX_BODY {
-        return vec![FoldPart::Range {
-            start: 0,
-            end: line_count,
-        }];
-    }
-    let head = FOLD_HEAD.min(line_count);
-    let tail = FOLD_TAIL.min(line_count.saturating_sub(head));
-    let omitted = line_count.saturating_sub(head + tail);
-    if omitted == 0 {
-        return vec![FoldPart::Range {
-            start: 0,
-            end: line_count,
-        }];
-    }
-    vec![
-        FoldPart::Range {
-            start: 0,
-            end: head,
-        },
-        FoldPart::Omitted { count: omitted },
-        FoldPart::Range {
-            start: line_count - tail,
-            end: line_count,
-        },
-    ]
-}
-
 /// Whether this fence should use the light container (vs inline).
 pub fn needs_container(title: Option<&str>, line_count: usize) -> bool {
     title.is_some() || line_count > SHORT_CODE_MAX_LINES
@@ -188,7 +144,7 @@ fn render_inline<F>(
     }
 }
 
-/// Light container: path header + optional fold. Gutter is border only (no fill).
+/// Light container: path header + complete body. Gutter is border only (no fill).
 fn render_container<F>(
     title: Option<&str>,
     lang: Option<&str>,
@@ -214,36 +170,13 @@ fn render_container<F>(
         ),
     ]));
 
-    let plan = fold_plan(line_count);
-    let mut body_rows = 0usize;
-    for part in plan {
-        match part {
-            FoldPart::Range { start, end } => {
-                for idx in start..end {
-                    if body_rows >= CODE_BLOCK_MAX_BODY {
-                        break;
-                    }
-                    for row in line_render(idx) {
-                        if body_rows >= CODE_BLOCK_MAX_BODY {
-                            break;
-                        }
-                        let mut spans =
-                            vec![Span::styled("  ", Style::default().fg(theme.border.normal))];
-                        spans.extend(row);
-                        out.push(Line::from(spans));
-                        body_rows += 1;
-                    }
-                }
-            }
-            FoldPart::Omitted { count } => {
-                out.push(Line::from(vec![
-                    Span::styled("  ", Style::default().fg(theme.border.normal)),
-                    Span::styled(
-                        format!("⋮ {count} lines omitted"),
-                        Style::default().fg(theme.text.muted),
-                    ),
-                ]));
-            }
+    // The conversation viewport owns scrolling. A separate source-line fold or
+    // screen-row cap here makes wrapped code unreachable at narrow widths.
+    for idx in 0..line_count {
+        for row in line_render(idx) {
+            let mut spans = vec![Span::styled("  ", Style::default().fg(theme.border.normal))];
+            spans.extend(row);
+            out.push(Line::from(spans));
         }
     }
 }
@@ -266,6 +199,40 @@ pub fn tone_code_rgb(rgb: (u8, u8, u8), theme: &Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_code_keeps_every_screen_row() {
+        let theme = Theme::no_color();
+        for source_lines in [1, 4, 6, 40] {
+            let mut out = Vec::new();
+            render_code_block(
+                None,
+                Some("rust"),
+                source_lines,
+                48,
+                &theme,
+                |i| {
+                    (0..5)
+                        .map(|j| vec![Span::raw(format!("source-{i}-wrapped-{j}"))])
+                        .collect()
+                },
+                &mut out,
+            );
+            let text: Vec<String> = out
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            for i in 0..source_lines {
+                for j in 0..5 {
+                    assert!(
+                        text.iter()
+                            .any(|line| line.contains(&format!("source-{i}-wrapped-{j}"))),
+                        "missing source {i} screen row {j} at 48 columns"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_lang_and_path_with_line() {
@@ -322,18 +289,16 @@ mod tests {
             text.iter().any(|l| l.contains("webhook.go:792")),
             "{text:?}"
         );
-        assert!(text.iter().any(|l| l.contains("lines omitted")), "{text:?}");
+        assert_eq!(text.len(), 31, "header plus all source lines");
+        assert!(
+            text.iter().any(|l| l.contains("line 15")),
+            "middle must remain readable"
+        );
         assert!(
             !text
                 .iter()
                 .any(|l| l.starts_with('┌') || l.starts_with('┃')),
             "no heavy black box: {text:?}"
         );
-    }
-
-    #[test]
-    fn fold_long_block_omits_middle() {
-        let p = fold_plan(40);
-        assert!(p.iter().any(|x| matches!(x, FoldPart::Omitted { .. })));
     }
 }
