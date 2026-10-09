@@ -510,7 +510,14 @@ mod tests {
     #[test]
     fn a_terminal_phase_states_itself_and_never_wears_the_live_marker() {
         let theme = Theme::dark();
-        let paused = spans(GoalPhase::Paused, "你好", "3m 00s", Some("已暂停"), &theme, 120);
+        let paused = spans(
+            GoalPhase::Paused,
+            "你好",
+            "3m 00s",
+            Some("已暂停"),
+            &theme,
+            120,
+        );
         assert_eq!(plain(&paused), "◐ 你好 · 3m 00s · 已暂停");
         assert!(!plain(&paused).contains('↗'), "{} ", plain(&paused));
         let failed = spans(GoalPhase::Failed, "你好", "1s", Some("失败"), &theme, 120);
@@ -577,7 +584,14 @@ mod tests {
         let theme = Theme::dark();
         // The phase word is dropped when it cannot fit, and the live marker is
         // NOT substituted for it: the glyph keeps stating the phase.
-        let paused = spans(GoalPhase::Paused, "some goal", "9m 47s", Some("已暂停"), &theme, 10);
+        let paused = spans(
+            GoalPhase::Paused,
+            "some goal",
+            "9m 47s",
+            Some("已暂停"),
+            &theme,
+            10,
+        );
         assert_eq!(plain(&paused), "◐ 9m 47s");
         assert!(width(&paused) <= 10, "{}", width(&paused));
     }

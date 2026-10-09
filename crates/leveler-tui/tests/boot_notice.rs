@@ -1,6 +1,6 @@
 //! A startup fact the launcher carried (see `Boot::model_notice`) must be shown.
-use leveler_tui::state::{AppState, Boot};
 use leveler_client_protocol::{NotificationLevel, SessionId};
+use leveler_tui::state::{AppState, Boot};
 
 fn boot(notice: Option<String>) -> Boot {
     Boot {
@@ -20,7 +20,10 @@ fn boot(notice: Option<String>) -> Boot {
 
 #[test]
 fn a_boot_model_notice_is_shown_as_a_warning() {
-    let state = AppState::new(leveler_tui::Theme::no_color(), boot(Some("默认模型 x 不可用".into())));
+    let state = AppState::new(
+        leveler_tui::Theme::no_color(),
+        boot(Some("默认模型 x 不可用".into())),
+    );
     let note = state.notification.expect("the startup fact must be shown");
     assert_eq!(note.level, NotificationLevel::Warning);
     assert!(note.message.contains("默认模型 x 不可用"));

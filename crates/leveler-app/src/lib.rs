@@ -976,7 +976,11 @@ impl Application {
     pub fn fallback_default_model(&self) -> Option<ModelRef> {
         let mut configured = self.model_refs();
         configured.sort_by_key(|reference| reference.to_string());
-        if let Some(preferred) = self.config.default_model.as_deref().and_then(ModelRef::parse)
+        if let Some(preferred) = self
+            .config
+            .default_model
+            .as_deref()
+            .and_then(ModelRef::parse)
             && configured.contains(&preferred)
         {
             return Some(preferred);

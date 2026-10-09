@@ -57,8 +57,14 @@ fn choose_model(
     }
     let configured = app.model_refs();
     let persisted = [
-        app.project_config().model.as_deref().and_then(ModelRef::parse),
-        app.config.default_model.as_deref().and_then(ModelRef::parse),
+        app.project_config()
+            .model
+            .as_deref()
+            .and_then(ModelRef::parse),
+        app.config
+            .default_model
+            .as_deref()
+            .and_then(ModelRef::parse),
     ];
     let mut abandoned: Vec<String> = Vec::new();
     for candidate in persisted.into_iter().flatten() {

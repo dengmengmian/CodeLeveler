@@ -1049,7 +1049,11 @@ pub(crate) async fn cmd_tui(
                 // exit, and a startup fact must survive in the scrollback.
                 eprintln!("{notice}");
             }
-            (bootstrap.session.id, bootstrap.context_window, bootstrap.notice)
+            (
+                bootstrap.session.id,
+                bootstrap.context_window,
+                bootstrap.notice,
+            )
         };
         let global = leveler_app::GlobalConfig::load()?;
         let boot = leveler_tui::Boot {

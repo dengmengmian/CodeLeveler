@@ -2041,8 +2041,7 @@ fn command_unit_lines(
                 out.push(body_line(line));
             }
             out.push(marker_line(
-                t.command_output_omitted
-                    .replace("{}", &omitted.to_string()),
+                t.command_output_omitted.replace("{}", &omitted.to_string()),
             ));
             for line in &logical[tail_start..] {
                 out.push(body_line(line));
