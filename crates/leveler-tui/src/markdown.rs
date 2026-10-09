@@ -1321,6 +1321,120 @@ pub fn highlight_cache_clear() {
     cache.clear();
 }
 
+/// Test-only capacity observation. This measures reachable payload capacities,
+/// not allocator RSS or syntect's private checkpoint heap. Held documents can
+/// retain highlighted rows after memo eviction, so their union is separate.
+#[cfg(test)]
+pub(crate) fn highlight_cache_owned_snapshot(held_docs: &[&MdDoc]) -> serde_json::Value {
+    highlight_cache_snapshot_inner(&lock_cache(), held_docs)
+}
+
+#[cfg(test)]
+fn highlight_cache_snapshot_inner(
+    cache: &HighlightCache,
+    held_docs: &[&MdDoc],
+) -> serde_json::Value {
+    use std::collections::HashSet;
+    use std::mem::size_of;
+
+    #[derive(Default)]
+    struct Payload {
+        sources: HashSet<usize>,
+        rows: HashSet<usize>,
+        outputs: HashSet<usize>,
+        source_bytes: usize,
+        language_bytes: usize,
+        row_vectors: usize,
+        row_strings: usize,
+        output_vectors: usize,
+        active_vector: usize,
+    }
+    impl Payload {
+        fn source(&mut self, source: &Arc<str>) {
+            if self
+                .sources
+                .insert(Arc::as_ptr(source) as *const () as usize)
+            {
+                // Arc<str> has an exact-sized UTF-8 payload, not String spare capacity.
+                self.source_bytes += source.len();
+            }
+        }
+        fn row(&mut self, row: &HighlightedLine) {
+            if self.rows.insert(Arc::as_ptr(row) as usize) {
+                self.row_vectors += row.capacity() * size_of::<((u8, u8, u8), String)>();
+                self.row_strings += row.iter().map(|(_, text)| text.capacity()).sum::<usize>();
+            }
+        }
+        fn output(&mut self, output: &Arc<HighlightedLines>) {
+            if self.outputs.insert(Arc::as_ptr(output) as usize) {
+                self.output_vectors += output.capacity() * size_of::<HighlightedLine>();
+                for row in output.iter() {
+                    self.row(row);
+                }
+            }
+        }
+        fn value(&self) -> serde_json::Value {
+            // Vec descriptors are themselves inline payload inside each Arc.
+            // Arc headers/allocator rounding are deliberately not inferred.
+            let vector_inline = (self.rows.len() + self.outputs.len()) * size_of::<Vec<usize>>();
+            serde_json::json!({
+                "unique_source_allocations": self.sources.len(),
+                "source_utf8_bytes": self.source_bytes,
+                "language_string_capacity_bytes": self.language_bytes,
+                "unique_row_allocations": self.rows.len(),
+                "row_vec_capacity_bytes": self.row_vectors,
+                "row_string_capacity_bytes": self.row_strings,
+                "unique_output_vec_allocations": self.outputs.len(),
+                "output_vec_capacity_bytes": self.output_vectors,
+                "active_raw_vec_capacity_bytes": self.active_vector,
+                "arc_vector_inline_payload_bytes": vector_inline,
+                "measured_payload_capacity_bytes": self.source_bytes + self.language_bytes
+                    + self.row_vectors + self.row_strings + self.output_vectors + self.active_vector + vector_inline,
+            })
+        }
+    }
+    let mut payload = Payload::default();
+    for entry in cache.entries.values() {
+        payload.source(&entry.code);
+        payload.language_bytes += entry.lang.as_ref().map_or(0, String::capacity);
+        payload.output(&entry.lines);
+    }
+    if let Some(active) = &cache.active {
+        payload.source(&active.code);
+        payload.language_bytes += active.lang.as_ref().map_or(0, String::capacity);
+        payload.active_vector = active.raw_lines.capacity() * size_of::<HighlightedLine>();
+        for row in &active.raw_lines {
+            payload.row(row);
+        }
+    }
+    let cache_value = payload.value();
+    for doc in held_docs {
+        for block in &doc.blocks {
+            if let MdBlock::Code { lines, .. } = block {
+                payload.output(lines);
+            }
+        }
+    }
+    serde_json::json!({
+        "schema": "highlight-cache-capacity/v1",
+        "entries": cache.entries.len(), "map_capacity": cache.entries.capacity(),
+        "accounted_source_budget_bytes": cache.total_bytes,
+        "source_budget_limit_bytes": HIGHLIGHT_CACHE_MAX_BYTES,
+        "entry_limit": HIGHLIGHT_CACHE_MAX_ENTRIES,
+        "active_checkpoint_count": usize::from(cache.active.is_some()),
+        "exact_hits": cache.hits, "memo_misses": cache.misses,
+        "cache_and_active": cache_value,
+        "held_document_count": held_docs.len(),
+        "union_with_held_documents": payload.value(),
+        "inline_cache_storage_bytes": size_of::<HighlightCache>(),
+        "initialized_entry_inline_bytes": cache.entries.len() * size_of::<(u64, HighlightEntry)>(),
+        "map_bucket_payload_capacity_estimate_bytes": cache.entries.capacity() * size_of::<(u64, HighlightEntry)>(),
+        "unknown": ["Arc allocation headers/padding", "HashMap control bytes/physical bucket count",
+                    "allocator metadata/rounding", "Syntect private state heap", "whole MdDoc prose/metadata and assistant source/layout"],
+        "scope": "unique cache+active reachable code payload capacities; union adds held Code.lines only, not full document heap or exclusive ownership",
+    })
+}
+
 /// Memoized [`highlight_code`]. While a message streams, every painted frame
 /// re-parses the whole message; completed fenced blocks inside it are byte-for-
 /// byte identical between frames, so this turns their repeated syntect work into
@@ -1497,6 +1611,55 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::theme::ThemeId;
+
+    #[test]
+    fn owned_snapshot_deduplicates_shared_rows_and_observes_document_retention() {
+        let memo = Mutex::new(HighlightCache::default());
+        let first = highlight_code_with_cache("a\nb", None, &memo);
+        let second = highlight_code_with_cache("a\nbc\n", None, &memo);
+        let mut old = MdDoc::default();
+        old.blocks.push(MdBlock::Code {
+            lang: None,
+            title: None,
+            lines: first,
+        });
+        let mut new = MdDoc::default();
+        new.blocks.push(MdBlock::Code {
+            lang: None,
+            title: None,
+            lines: second,
+        });
+        let docs = [&old, &new];
+        let mut cache = memo.lock().unwrap();
+        let before = highlight_cache_snapshot_inner(&cache, &docs);
+        assert_eq!(before["cache_and_active"]["unique_source_allocations"], 2);
+        assert_eq!(before["cache_and_active"]["source_utf8_bytes"], 8);
+        assert_eq!(before["cache_and_active"]["unique_row_allocations"], 3);
+        assert_eq!(
+            before["cache_and_active"],
+            before["union_with_held_documents"]
+        );
+        assert_eq!(before["active_checkpoint_count"], 1);
+        cache.clear();
+        let after = highlight_cache_snapshot_inner(&cache, &docs);
+        assert_eq!(
+            after["cache_and_active"]["measured_payload_capacity_bytes"],
+            0
+        );
+        assert_eq!(after["active_checkpoint_count"], 0);
+        assert_eq!(after["union_with_held_documents"]["source_utf8_bytes"], 0);
+        assert_eq!(
+            after["union_with_held_documents"]["unique_row_allocations"],
+            3
+        );
+        assert!(
+            after["union_with_held_documents"]["measured_payload_capacity_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0,
+            "clearing the memo cannot free payload retained by old MdDocs"
+        );
+    }
 
     #[test]
     fn growing_code_reuses_complete_lines_actual_syntect_work() {

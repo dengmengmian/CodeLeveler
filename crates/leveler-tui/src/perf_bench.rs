@@ -1564,3 +1564,207 @@ fn perf_independent_audit() {
     }
     crate::profile::emit_report();
 }
+
+/// Measure retained cache payload separately from source bytes and process RSS.
+/// Run only as an exact ignored test in a fresh process; snapshots are outside
+/// timed parse/layout regions and do not claim allocator or Syntect private heap.
+#[test]
+#[ignore = "Gate C owned-capacity audit; exact fresh process, --nocapture --test-threads=1"]
+fn perf_highlight_owned_capacity_audit() {
+    let values = ["LEVELER_TUI_PROFILE", "LEVELER_TUI_PROFILE_OUT"]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)));
+    leveler_core::install_environment(leveler_core::EnvSnapshot::new(
+        values,
+        std::env::current_dir().unwrap(),
+        std::env::temp_dir(),
+    ))
+    .expect("run the owned-capacity audit alone in a fresh process");
+    assert!(crate::profile::enabled(), "enable the actual profiler");
+    let emit = |shape: &str,
+                stage: &str,
+                text: &str,
+                samples_ms: Vec<f64>,
+                before: ((u64, u64), String),
+                docs: &[&crate::markdown::MdDoc]| {
+        let after = crate::markdown::highlight_cache_stats();
+        println!(
+            "CACHE_OWNED_AUDIT {}",
+            serde_json::json!({
+                "shape": shape, "stage": stage, "utf8_bytes": text.len(),
+                "fnv1a64": format!("{:016x}", text.bytes().fold(0xcbf29ce484222325_u64, |h, x| (h ^ u64::from(x)).wrapping_mul(0x100000001b3))),
+                "samples_ms": samples_ms, "cache_hits": after.0-before.0.0,
+                "cache_misses": after.1-before.0.1,
+                "profile_before": before.1, "profile": crate::profile::report(),
+                "profile_contract": "counter deltas are stage local; before drains earlier histogram samples, after histograms cover only this operation",
+                "layout_widths": if stage == "held-doc-layout-three-widths" { Some([48,80,120]) } else { None },
+                "layout_contract": "each layout sample corresponds in order to a different content width; not terminal resize and not an equal-workload pooled distribution",
+                "owned_capacity": crate::markdown::highlight_cache_owned_snapshot(docs),
+                "held_docs": docs.len(),
+                "timing_contract": "parse/layout only; capacity snapshot outside timed region",
+                "memory_contract": "cache/active/held-code payload capacities; not whole MdDoc, allocator or Syntect heap",
+            })
+        );
+    };
+    for (shape, text) in independent_audit_fixtures()
+        .into_iter()
+        .filter(|(shape, _)| matches!(shape.as_bytes()[0], b'B' | b'C' | b'D' | b'E' | b'F'))
+    {
+        crate::markdown::highlight_cache_clear();
+        let before = (
+            crate::markdown::highlight_cache_stats(),
+            crate::profile::report(),
+        );
+        let started = Instant::now();
+        let doc = crate::markdown::MdDoc::parse(&text);
+        emit(
+            shape,
+            "cold",
+            &text,
+            vec![started.elapsed().as_secs_f64() * 1000.0],
+            before,
+            &[&doc],
+        );
+        let before = (
+            crate::markdown::highlight_cache_stats(),
+            crate::profile::report(),
+        );
+        let warm: Vec<_> = (0..30)
+            .map(|_| {
+                let started = Instant::now();
+                std::hint::black_box(crate::markdown::MdDoc::parse(&text));
+                started.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        emit(shape, "warm-attempt-30", &text, warm, before, &[&doc]);
+        let before = (
+            crate::markdown::highlight_cache_stats(),
+            crate::profile::report(),
+        );
+        let resized: Vec<_> = [48usize, 80, 120]
+            .into_iter()
+            .map(|width| {
+                let started = Instant::now();
+                std::hint::black_box(doc.to_lines(width, &Theme::no_color()));
+                started.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        emit(
+            shape,
+            "held-doc-layout-three-widths",
+            &text,
+            resized,
+            before,
+            &[&doc],
+        );
+        crate::markdown::highlight_cache_clear();
+        let before = (
+            crate::markdown::highlight_cache_stats(),
+            crate::profile::report(),
+        );
+        emit(
+            shape,
+            "cache-cleared-doc-still-held",
+            &text,
+            vec![],
+            before,
+            &[&doc],
+        );
+    }
+    let stable = long_markdown(160_000);
+    assert_eq!(stable.matches("```rust\n").count(), 574);
+    let giant = one_giant_fence(1_000_000);
+    let body = giant
+        .strip_prefix("```rust\n")
+        .unwrap()
+        .strip_suffix("```\n")
+        .unwrap();
+    let prefixes: Vec<_> = (1..=5)
+        .map(|i| format!("```rust\n{}", &body[..body.len() * i / 5]))
+        .collect();
+    crate::markdown::highlight_cache_clear();
+    let mut held = Vec::new();
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let before = (
+            crate::markdown::highlight_cache_stats(),
+            crate::profile::report(),
+        );
+        let started = Instant::now();
+        held.push(crate::markdown::MdDoc::parse(prefix));
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        emit(
+            "F-growing-prefix",
+            &format!("prefix-{}", i + 1),
+            prefix,
+            vec![ms],
+            before,
+            &held.iter().collect::<Vec<_>>(),
+        );
+    }
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let before = (
+            crate::markdown::highlight_cache_stats(),
+            crate::profile::report(),
+        );
+        let started = Instant::now();
+        std::hint::black_box(crate::markdown::MdDoc::parse(prefix));
+        emit(
+            "F-growing-prefix",
+            &format!("exact-replay-{}", i + 1),
+            prefix,
+            vec![started.elapsed().as_secs_f64() * 1000.0],
+            before,
+            &held.iter().collect::<Vec<_>>(),
+        );
+    }
+    drop(held);
+    // Re-enter two real documents rather than only appending to one fence.
+    // This catches eviction of the small working set by a large entry, and
+    // eviction of a cached large entry by the 574 sequential small blocks.
+    crate::markdown::highlight_cache_clear();
+    let before = (
+        crate::markdown::highlight_cache_stats(),
+        crate::profile::report(),
+    );
+    let stable_doc = crate::markdown::MdDoc::parse(&stable);
+    let giant_doc = crate::markdown::MdDoc::parse(&giant);
+    let mixed = format!("{stable}\n{giant}");
+    emit(
+        "E-plus-F",
+        "mixed-history-setup",
+        &mixed,
+        vec![],
+        before,
+        &[&stable_doc, &giant_doc],
+    );
+    for turn in 0..30 {
+        let before = (
+            crate::markdown::highlight_cache_stats(),
+            crate::profile::report(),
+        );
+        let started = Instant::now();
+        std::hint::black_box(crate::markdown::MdDoc::parse(&stable));
+        std::hint::black_box(crate::markdown::MdDoc::parse(&giant));
+        emit(
+            "E-plus-F",
+            &format!("history-reentry-{}", turn + 1),
+            &mixed,
+            vec![started.elapsed().as_secs_f64() * 1000.0],
+            before,
+            &[&stable_doc, &giant_doc],
+        );
+    }
+    crate::markdown::highlight_cache_clear();
+    let before = (
+        crate::markdown::highlight_cache_stats(),
+        crate::profile::report(),
+    );
+    emit(
+        "E-plus-F",
+        "cache-cleared-history-still-held",
+        &mixed,
+        vec![],
+        before,
+        &[&stable_doc, &giant_doc],
+    );
+}
