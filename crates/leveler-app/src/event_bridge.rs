@@ -631,6 +631,24 @@ impl EventBridge {
                 // it here would render the same Thought twice. A replay never sees
                 // those transient events, so the durable event is its only carrier.
                 let streamed = std::mem::take(&mut self.reasoning_streamed);
+                // Replayed / non-streamed path: the durable event is the only
+                // carrier of this round's reasoning, so render each segment as a
+                // completed Thought before the answer text. The model context is
+                // untouched — it reads reasoning from the message store, never
+                // from this projection.
+                if !streamed {
+                    for segment in reasoning {
+                        let _ = self.events.send(RuntimeEvent::ReasoningStarted);
+                        if !segment.text.is_empty() {
+                            let _ = self.events.send(RuntimeEvent::ReasoningDelta {
+                                delta: segment.text,
+                            });
+                        }
+                        let _ = self.events.send(RuntimeEvent::ReasoningCompleted {
+                            elapsed_ms: segment.duration_ms,
+                        });
+                    }
+                }
                 // Near-duplicate fold: a nudged model that re-states the
                 // summary the nudge answered is collapsed into one notice
                 // instead of rendering the repeat. Display only — the
@@ -663,24 +681,6 @@ impl EventBridge {
                     self.recent_assistant_texts.push_back(text.clone());
                     if self.recent_assistant_texts.len() > FOLD_LOOKBACK {
                         self.recent_assistant_texts.pop_front();
-                    }
-                }
-                // Replayed / non-streamed path: the durable event is the only
-                // carrier of this round's reasoning, so render each segment as a
-                // completed Thought before the answer text. The model context is
-                // untouched — it reads reasoning from the message store, never
-                // from this projection.
-                if !streamed {
-                    for segment in reasoning {
-                        let _ = self.events.send(RuntimeEvent::ReasoningStarted);
-                        if !segment.text.is_empty() {
-                            let _ = self.events.send(RuntimeEvent::ReasoningDelta {
-                                delta: segment.text,
-                            });
-                        }
-                        let _ = self.events.send(RuntimeEvent::ReasoningCompleted {
-                            elapsed_ms: segment.duration_ms,
-                        });
                     }
                 }
                 // Streamed path: close the open message. Non-streamed fallback:
@@ -2529,6 +2529,39 @@ mod projection_equivalence {
                 "delta:已同步。",
                 "msg_done",
             ]
+        );
+    }
+
+    #[test]
+    fn replayed_completed_thought_survives_a_folded_closeout_summary() {
+        let summary = "Implemented the requested change, verified the complete runtime lifecycle, and preserved the original session history and execution evidence.";
+        let shapes = project(vec![
+            EngineEvent::AssistantMessage {
+                text: summary.into(),
+                reasoning: vec![],
+            },
+            closeout_nudge(),
+            EngineEvent::AssistantMessage {
+                text: summary.into(),
+                reasoning: vec![leveler_model::ReasoningSegment {
+                    text: "The completed reasoning is independent of repeated answer prose.".into(),
+                    duration_ms: 123,
+                }],
+            },
+        ]);
+        assert_eq!(
+            shapes.iter().filter(|s| *s == "reasoning_done:123").count(),
+            1,
+            "folding narration must preserve the completed Thought: {shapes:?}"
+        );
+        assert!(
+            shapes.iter().any(|s| s
+                == "reasoning:The completed reasoning is independent of repeated answer prose.")
+        );
+        assert_eq!(
+            shapes.iter().filter(|s| *s == "msg_done").count(),
+            1,
+            "the repeated summary still folds"
         );
     }
 

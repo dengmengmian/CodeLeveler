@@ -1387,7 +1387,10 @@ verified by deterministic tests and real dogfood — do not regress them:
 - **A Thought is a first-level transcript entry**: its rail covers its own body
   and nothing else, and the tool row that follows it is a SIBLING at the same
   first column — never a child of the Thought. A new reasoning segment is always
-  the one mutable entry at the tail.
+  the one mutable entry at the tail. Completed reasoning is independent of
+  narration deduplication: folding repeated closeout prose must retain the
+  Thought body and duration in both live delivery and replay, without repeating
+  reasoning already emitted by the stream.
 - **A Thought's relation to an exploration fold has exactly three, mutually
   exclusive states**: a finished Thought that is NOT part of a run is its own
   collapsed header and no receipt speaks for it; a finished Thought that is

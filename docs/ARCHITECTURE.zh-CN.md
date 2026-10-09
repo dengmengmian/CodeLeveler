@@ -1276,7 +1276,9 @@ dogfood 验证，不要在后续改动中回退：
   `Truncated`，用户手动设置的模式不会被后续事件改写。
 - **Thought 是 transcript 的一级条目**：其 rail 只覆盖自身正文，Tool 与它是
   sibling（同一个首列锚点），不能表现成 Thought 的子节点。新的 reasoning 段
-  永远是 tail 上的那个可变条目。
+  永远是 tail 上的那个可变条目。已完成 reasoning 与 narration 去重相互独立；
+  bridge 折叠重复 closeout 文本时仍须保留 Thought 正文和 duration，live 与 replay
+  采用相同语义，已流式发布的 reasoning 不重复发布。
 - **Thought 与 exploration fold 的关系只有三种互斥状态**：不在 run 中的已完成
   Thought 是它自己的 collapsed header，没有任何回执替它折叠；在 run 中且仍为
   `Collapsed` 的已完成 Thought 与 Tool 成员一样被折叠——collapsed run 把它与
