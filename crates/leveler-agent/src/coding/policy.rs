@@ -139,7 +139,12 @@ pub struct ExecutionOverrides {
 ///
 /// `100` would mean "fold only at the hard bound" — the pre-percentage
 /// behaviour — so the knob keeps that reachable without a code path.
-pub const DEFAULT_CONTEXT_SOFT_PERCENT: u8 = 85;
+///
+/// `95` is the current evidence-backed default: real-model pressure testing
+/// showed earlier soft folding added summary overhead, prefix-cache disruption
+/// and repeated exploration without improving task correctness. The hard
+/// capacity stays an independent upper bound and always takes precedence.
+pub const DEFAULT_CONTEXT_SOFT_PERCENT: u8 = 95;
 
 /// Reject a soft percentage that cannot describe a threshold.
 ///
@@ -619,8 +624,8 @@ mod tests {
         p.limits.max_output_tokens = 393_216;
         let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
         assert_eq!(
-            resolved.context_policy.pressure_threshold, 557_056,
-            "the share of the reserved capacity (85% of 655_360) caps the quality bound"
+            resolved.context_policy.pressure_threshold, 622_592,
+            "the share of the reserved capacity (95% of 655_360) caps the quality bound"
         );
         // A quality bound below capacity is left alone.
         p.limits.reliable_context = 400_000;
@@ -646,7 +651,7 @@ mod tests {
             "the reservation must be the cap this request actually carries"
         );
         assert_eq!(
-            resolved.context_policy.pressure_threshold, 557_056,
+            resolved.context_policy.pressure_threshold, 622_592,
             "the share of the capacity (window − reservation) caps the quality bound"
         );
     }
@@ -775,6 +780,43 @@ mod tests {
             assert!(
                 u64::from(policy.pressure_threshold) < u64::from(capacity),
                 "the soft threshold stays strictly below capacity (w={window})"
+            );
+        }
+    }
+
+    /// The PRODUCT DEFAULT resolves through the same arithmetic on every window
+    /// shape the repository ships. 95% is a share of the effective input
+    /// capacity, so a 32K and a 1M route get their own number without any model
+    /// name appearing in the policy.
+    #[test]
+    fn the_product_default_is_a_share_on_every_shipped_window() {
+        let cases = [
+            // window, reliable, output, capacity, default soft at 95%
+            (32_768u32, 0u32, 4_096u32, 28_672u32, 27_238u32),
+            (131_072, 65_536, 8_192, 122_880, 65_536),
+            (262_144, 196_608, 65_536, 196_608, 186_777),
+            (1_048_576, 786_432, 393_216, 655_360, 622_592),
+        ];
+        for (window, reliable, output, capacity, soft) in cases {
+            let policy = ResolvedContextPolicy::resolve(
+                &limits(window, reliable, output),
+                0,
+                0,
+                DEFAULT_CONTEXT_SOFT_PERCENT,
+            );
+            assert_eq!(
+                policy.soft_percent, DEFAULT_CONTEXT_SOFT_PERCENT,
+                "w={window}"
+            );
+            assert_eq!(
+                policy.hard_capacity(),
+                Some(u64::from(capacity)),
+                "w={window}"
+            );
+            assert_eq!(policy.pressure_threshold, soft, "w={window}");
+            assert!(
+                u64::from(policy.pressure_threshold) <= u64::from(capacity),
+                "the default never crosses the hard capacity (w={window})"
             );
         }
     }
