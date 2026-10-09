@@ -289,7 +289,7 @@ export function turnTerminalFromEvent(type,messages,tools){
  if(type==='turn_truncated')return 'truncated';
  if(type==='turn_incomplete')return 'incomplete';
  if(type==='turn_failed')return 'failed';
- if(type==='turn_cancelled')return 'cancelled';
+ if(type==='turn_cancelled'||type==='task_cancelled')return 'cancelled';
  return null;
 }
 

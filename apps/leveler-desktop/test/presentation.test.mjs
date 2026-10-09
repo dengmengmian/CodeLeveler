@@ -206,3 +206,8 @@ test('the public Settings shortcut opens once and respects composition and an ex
  for(const state of [{composing:true,modalOpen:false,settingsOpen:false},{composing:false,modalOpen:true,settingsOpen:false},{composing:false,modalOpen:false,settingsOpen:true}])assert.equal(activateSettingsShortcut(state,open),false);
  assert.equal(opens,1);
 });
+import {turnTerminalFromEvent} from '../src/presentation.mjs';
+test('durable TaskCancelled renders cancellation while publishing progress remains nonterminal',()=>{
+ assert.equal(turnTerminalFromEvent('task_cancelled',[],[]),'cancelled');
+ assert.equal(turnTerminalFromEvent('turn_finalizing',[],[]),null);
+});

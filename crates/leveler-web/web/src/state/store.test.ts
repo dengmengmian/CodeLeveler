@@ -848,3 +848,19 @@ describe('agent registry', () => {
     expect(state.agents.loaded).toBe(false);
   });
 });
+
+
+describe('durable task cancellation snapshot', () => {
+  it('terminal task status cannot be revived by transitional finalization metadata and retains completed Thoughts', () => {
+    const state = stateWithSession({ status: 'running' });
+    reducer(state, { type: 'reasoning_delta', delta: 'completed' });
+    reducer(state, { type: 'reasoning_completed', elapsedMs: 0 });
+    reducer(state, { type: 'reasoning_delta', delta: 'live interrupted' });
+    reducer(state, { type: 'agent_activity', label: '正在发布任务结果' });
+    reducer(state, { type: 'snapshot', session: snapshot({ status: 'cancelled', task_status: 'cancelled', finalization_stage: 'publishing_terminal' }) });
+    expect(state.current?.turnActive).toBe(false);
+    expect(state.current?.activity).toBeNull();
+    expect(state.current?.reasoning).toBe('');
+    expect(state.current?.thoughts.map(thought => thought.text)).toEqual(['completed']);
+  });
+});
