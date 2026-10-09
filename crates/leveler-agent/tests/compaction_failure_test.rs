@@ -219,6 +219,8 @@ fn soft_policy() -> ResolvedContextPolicy {
         output_reservation: 1_000,
         headroom: 0,
         pressure_threshold: 500,
+        // The percentage is bypassed: these fixtures drive exact thresholds.
+        soft_percent: 100,
         retention: ContextRetentionPolicy {
             keep_recent_messages: 2,
             keep_recent_tokens: 0,
@@ -235,6 +237,7 @@ fn walled_policy() -> ResolvedContextPolicy {
         output_reservation: 100,
         headroom: 0,
         pressure_threshold: 1,
+        soft_percent: 100,
         retention: ContextRetentionPolicy {
             // No compactible middle: the mechanical fold has nothing to elide.
             keep_recent_messages: 1_000,
@@ -472,6 +475,8 @@ async fn a_hard_summary_failure_folds_mechanically_when_that_fits() {
         output_reservation: 0,
         headroom: 0,
         pressure_threshold: 1,
+        // The percentage is bypassed: these fixtures drive exact thresholds.
+        soft_percent: 100,
         retention: ContextRetentionPolicy {
             keep_recent_messages: 2,
             keep_recent_tokens: 0,

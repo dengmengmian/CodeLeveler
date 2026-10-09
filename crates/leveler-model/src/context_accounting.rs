@@ -37,6 +37,70 @@ pub enum TokenCountKind {
     Mixed,
 }
 
+/// What a measured request's pressure means for the context fold, and
+/// therefore what a failed briefing costs the turn.
+///
+/// The fold has TWO bounds, and they answer different questions. The quality
+/// threshold is where recall is expected to degrade — folding there is a
+/// quality choice that may be abandoned. The hard capacity is where a request
+/// can no longer legally be sent — folding there is REQUIRED, and a fold that
+/// cannot be produced must still be brought under capacity mechanically or the
+/// turn fails explicitly.
+///
+/// This is the ONE contract every active-context entry shares: coding/drive,
+/// chat, resume and the accounting that REPORTS which state a request is in.
+/// Entries provide the measured facts (projected tokens, resolved bounds); this
+/// decides what a failure means — and, because the display reads this same
+/// function, a shown trigger state can never disagree with the decision.
+///
+/// It lives beside the threshold arithmetic ([`ModelLimits`]) rather than in a
+/// harness: the classification is a comparison of three numbers and every
+/// consumer must read the same implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FoldRequirement {
+    /// At or below the quality boundary: nothing to fold.
+    None,
+    /// Over the quality boundary but within hard capacity. Sending the request
+    /// uncompacted is legal, so a failed briefing keeps the original active
+    /// history and the turn continues.
+    Soft,
+    /// Over the hard capacity. Without a fold the request cannot legally be
+    /// sent, so a failed briefing must be folded mechanically or the turn
+    /// fails without ever sending an oversized request.
+    HardRequired,
+}
+
+impl FoldRequirement {
+    /// Classify from facts only.
+    ///
+    /// `hard_capacity` is `None` when the model declares no window: with no
+    /// hard limit there is no request compaction is obliged to make legal, so
+    /// nothing may claim a hard requirement.
+    pub fn classify(
+        projected_tokens: u64,
+        quality_threshold: u64,
+        hard_capacity: Option<u64>,
+    ) -> Self {
+        if let Some(capacity) = hard_capacity
+            && projected_tokens > capacity
+        {
+            return Self::HardRequired;
+        }
+        if projected_tokens > quality_threshold {
+            return Self::Soft;
+        }
+        Self::None
+    }
+
+    /// Whether a fold must succeed (mechanically at minimum) before the next
+    /// request can be sent.
+    pub fn fold_is_mandatory(self) -> bool {
+        matches!(self, Self::HardRequired)
+    }
+}
+
 /// Deterministic context-pressure level derived from real thresholds — never
 /// a model's judgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,9 +171,27 @@ pub struct ContextAccounting {
     /// The model's declared context window (an exact declared fact), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<u64>,
-    /// The fold threshold (`reliable_context`), when known.
+    /// The SOFT fold threshold: where compaction is expected and may be
+    /// abandoned. It is strictly below [`Self::input_capacity_tokens`] whenever
+    /// both are known, because a percentage policy reserves the completion
+    /// first and takes its share of what is left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_at_tokens: Option<u64>,
+    /// The completion this harness reserves per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_reservation_tokens: Option<u64>,
+    /// Extra safety margin on top of the completion reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headroom_tokens: Option<u64>,
+    /// The EFFECTIVE INPUT CAPACITY: `window − reservation − headroom`, when a
+    /// window is declared and leaves input room. This — never the whole model
+    /// window — is the denominator of compaction utilization, and it is the same
+    /// number [`Self::fold_state`] compares against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_capacity_tokens: Option<u64>,
+    /// The exact decision for THIS request, from the one classifier the harness
+    /// folds with. A display may not re-derive it from a rounded percentage.
+    pub fold_state: FoldRequirement,
     /// Estimated input tokens of this request — the sum of the top-level
     /// categories, by construction.
     pub used_tokens: u64,
@@ -320,28 +402,88 @@ impl ContextAccounting {
         let used_tokens: u64 = top.iter().map(|c| c.tokens).sum();
 
         let free_tokens = context_window.map(|w| u64::from(w).saturating_sub(used_tokens));
-        let pressure = compute_pressure(
-            used_tokens,
-            context_window.map(u64::from),
-            compact_at.map(u64::from),
-        );
 
         Self {
             model,
             context_window_tokens: context_window.map(u64::from),
             compact_at_tokens: compact_at.map(u64::from),
+            // A caller that has not supplied the resolved budget has not
+            // claimed a hard bound; `with_input_budget` adds it from the SAME
+            // policy the request was folded with.
+            output_reservation_tokens: None,
+            headroom_tokens: None,
+            input_capacity_tokens: None,
+            fold_state: FoldRequirement::classify(
+                used_tokens,
+                compact_at.map(u64::from).unwrap_or(u64::MAX),
+                None,
+            ),
             used_tokens,
             free_tokens,
             token_count_kind: TokenCountKind::Estimated,
-            pressure,
+            pressure: compute_pressure(
+                used_tokens,
+                context_window.map(u64::from),
+                compact_at.map(u64::from),
+                None,
+            ),
             categories: top,
             last_compaction,
             reasoning_projection: Some(projection.summary().clone()),
         }
     }
+
+    /// Attach the resolved budget this request was measured against, from the
+    /// harness's [`ResolvedContextPolicy`] — not re-derived here.
+    ///
+    /// The thresholds are the policy's own numbers; this only publishes them
+    /// beside the request they judged, and re-derives the state with the same
+    /// classifier so a display can never disagree with the fold decision.
+    pub fn with_input_budget(
+        mut self,
+        input_capacity: Option<u32>,
+        output_reservation: Option<u32>,
+        headroom: Option<u32>,
+    ) -> Self {
+        self.input_capacity_tokens = input_capacity.map(u64::from);
+        self.output_reservation_tokens = output_reservation.map(u64::from);
+        self.headroom_tokens = headroom.map(u64::from);
+        self.fold_state = FoldRequirement::classify(
+            self.used_tokens,
+            self.compact_at_tokens.unwrap_or(u64::MAX),
+            self.input_capacity_tokens,
+        );
+        self.pressure = compute_pressure(
+            self.used_tokens,
+            self.context_window_tokens,
+            self.compact_at_tokens,
+            self.input_capacity_tokens,
+        );
+        self
+    }
 }
 
 impl ContextAccounting {
+    /// Compaction utilization in whole percent: projected input over the
+    /// EFFECTIVE INPUT CAPACITY. `None` when no capacity is known — a caller
+    /// must not substitute the model window and call it utilization.
+    pub fn compaction_utilization_percent(&self) -> Option<u64> {
+        Self::percent(self.used_tokens, self.input_capacity_tokens?)
+    }
+
+    /// Model-window utilization in whole percent: projected input over the
+    /// model's declared window. A DIFFERENT axis from
+    /// [`Self::compaction_utilization_percent`] and never a substitute for it.
+    pub fn window_utilization_percent(&self) -> Option<u64> {
+        Self::percent(self.used_tokens, self.context_window_tokens?)
+    }
+
+    /// Whole percent of `part` in `whole`, saturating and never dividing by
+    /// zero. The one place the client-facing ratios are computed.
+    fn percent(part: u64, whole: u64) -> Option<u64> {
+        (whole > 0).then(|| part.saturating_mul(100) / whole)
+    }
+
     /// Estimated tokens of the historical-reasoning channel in THIS request —
     /// exactly the projection the wire carries, and zero when the route
     /// carries none.
@@ -366,13 +508,27 @@ impl ContextAccounting {
     }
 }
 
-/// `used` against the fold threshold and the hard window. Deterministic.
+/// `used` against the resolved thresholds. Deterministic, and derived from the
+/// SAME classifier the fold uses ([`FoldRequirement::classify`]) so the shown
+/// state is the decision, not an approximation of it.
+///
+/// `Warning` is presentation only: approaching the soft threshold, measured
+/// against the real number (80% of it), never against a rounded percentage.
 fn compute_pressure(
     used: u64,
     context_window: Option<u64>,
     compact_at: Option<u64>,
+    input_capacity: Option<u64>,
 ) -> ContextPressure {
-    if let Some(window) = context_window
+    if FoldRequirement::classify(used, compact_at.unwrap_or(u64::MAX), input_capacity)
+        != FoldRequirement::None
+    {
+        return ContextPressure::Critical;
+    }
+    // No hard bound could be formed, but the physical window is known and the
+    // request has reached it: still Critical, and never a silent "Normal".
+    if input_capacity.is_none()
+        && let Some(window) = context_window
         && window > 0
         && used >= window
     {
@@ -380,13 +536,9 @@ fn compute_pressure(
     }
     if let Some(threshold) = compact_at
         && threshold > 0
+        && used >= threshold * 8 / 10
     {
-        if used >= threshold {
-            return ContextPressure::Critical;
-        }
-        if used >= threshold * 8 / 10 {
-            return ContextPressure::Warning;
-        }
+        return ContextPressure::Warning;
     }
     ContextPressure::Normal
 }
@@ -797,26 +949,57 @@ mod tests {
     fn pressure_tracks_the_fold_threshold_deterministically() {
         let win = Some(128_000u32);
         let fold = Some(64_000u32);
-        // Below 80% of the fold threshold → normal.
+        let capacity = Some(96_000u64);
+        let p = |used: u64| {
+            compute_pressure(
+                used,
+                win.map(u64::from),
+                fold.map(u64::from),
+                capacity,
+            )
+        };
+        // Below 80% of the soft threshold → normal.
+        assert_eq!(p(40_000), ContextPressure::Normal);
+        // 80%..soft → warning; exactly AT the soft threshold is still not a
+        // fold (`FoldRequirement` is strictly "over"), so it stays a warning.
+        assert_eq!(p(55_000), ContextPressure::Warning);
+        assert_eq!(p(64_000), ContextPressure::Warning);
+        // ONE token over the soft threshold is the real Soft state → critical.
+        assert_eq!(p(64_001), ContextPressure::Critical);
+        // Over the hard capacity is the real Hard state → critical.
+        assert_eq!(p(96_001), ContextPressure::Critical);
+        // At the hard capacity the request is still legal, so the classifier
+        // says Soft, and the display follows the classifier.
+        assert_eq!(p(96_000), ContextPressure::Critical);
+        // No hard bound could be formed, but the physical window is reached:
+        // critical, never a silent normal.
         assert_eq!(
-            compute_pressure(40_000, win.map(u64::from), fold.map(u64::from)),
-            ContextPressure::Normal
-        );
-        // 80%..100% → warning.
-        assert_eq!(
-            compute_pressure(55_000, win.map(u64::from), fold.map(u64::from)),
-            ContextPressure::Warning
-        );
-        // At/above the fold threshold → critical.
-        assert_eq!(
-            compute_pressure(64_000, win.map(u64::from), fold.map(u64::from)),
+            compute_pressure(128_000, win.map(u64::from), None, None),
             ContextPressure::Critical
         );
-        // At/above the hard window → critical even with no fold threshold.
-        assert_eq!(
-            compute_pressure(128_000, win.map(u64::from), None),
-            ContextPressure::Critical
-        );
+    }
+
+    /// The pressure level is the real fold decision plus a presentation band —
+    /// it is never re-derived from a rounded percentage.
+    #[test]
+    fn pressure_follows_the_classifier_at_every_boundary() {
+        for (used, soft, capacity, ) in [
+            (0u64, 100u64, Some(200u64)),
+            (79, 100, Some(200)),
+            (80, 100, Some(200)),
+            (99, 100, Some(200)),
+            (100, 100, Some(200)),
+            (101, 100, Some(200)),
+            (200, 100, Some(200)),
+            (201, 100, Some(200)),
+        ] {
+            let state = FoldRequirement::classify(used, soft, capacity);
+            let pressure = compute_pressure(used, None, Some(soft), capacity);
+            match state {
+                FoldRequirement::None => assert_ne!(pressure, ContextPressure::Critical, "{used}"),
+                _ => assert_eq!(pressure, ContextPressure::Critical, "{used}"),
+            }
+        }
     }
 
     #[test]
@@ -844,6 +1027,34 @@ mod tests {
             ContextAccounting::compute(model(), &projection(&messages, &[]), None, None, None);
         assert_eq!(acc.context_window_tokens, None);
         assert_eq!(acc.free_tokens, None);
+        assert_eq!(
+            acc.compaction_utilization_percent(),
+            None,
+            "a utilization number needs a real input capacity, not a window"
+        );
+    }
+
+    /// The two utilization axes are separate, and compaction utilization is
+    /// over the EFFECTIVE INPUT CAPACITY — never the whole model window.
+    #[test]
+    fn utilization_axes_use_their_own_denominators() {
+        let messages = vec![text(Role::User, &"x".repeat(4_000))];
+        let acc = ContextAccounting::compute(
+            model(),
+            &projection(&messages, &[]),
+            Some(128_000),
+            Some(64_000),
+            None,
+        )
+        .with_input_budget(Some(96_000), Some(32_000), Some(0));
+        assert_eq!(acc.used_tokens, 1_000);
+        assert_eq!(acc.input_capacity_tokens, Some(96_000));
+        assert_eq!(acc.output_reservation_tokens, Some(32_000));
+        assert_eq!(acc.headroom_tokens, Some(0));
+        assert_eq!(acc.compaction_utilization_percent(), Some(1));
+        assert_eq!(acc.window_utilization_percent(), Some(0));
+        assert_eq!(acc.fold_state, FoldRequirement::None);
+        assert_eq!(acc.pressure, ContextPressure::Normal);
     }
 
     #[test]

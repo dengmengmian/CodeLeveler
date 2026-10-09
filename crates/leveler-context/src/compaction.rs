@@ -2,6 +2,11 @@
 
 use leveler_model::{ContentPart, Message, Role, RuntimeNoticeKind, TranscriptOrigin};
 
+/// The fold decision is the SAME type the harness resolves and the accounting
+/// publishes ([`leveler_model::FoldRequirement`]); re-exported here so every
+/// context-lifecycle caller keeps importing it from this crate.
+pub use leveler_model::FoldRequirement;
+
 /// How many trailing messages (the working set) auto-compaction keeps verbatim.
 pub const COMPACT_KEEP_RECENT: usize = 12;
 
@@ -162,64 +167,6 @@ pub fn retention_tail_budget(
         return None;
     }
     Some((dynamic / LOW_WATER_DIVISOR).saturating_sub(summary_budget))
-}
-
-/// What a measured request's pressure means for the context fold, and
-/// therefore what a failed briefing costs the turn.
-///
-/// The fold has TWO bounds, and they answer different questions. The quality
-/// threshold is where recall is expected to degrade — folding there is a
-/// quality choice that may be abandoned. The hard capacity is where a request
-/// can no longer legally be sent — folding there is REQUIRED, and a fold that
-/// cannot be produced must still be brought under capacity mechanically or the
-/// turn fails explicitly.
-///
-/// This is the ONE contract every active-context entry shares: coding/drive,
-/// chat, resume and [`crate`]-level assembly. Entries provide the measured
-/// facts (projected tokens, resolved bounds); this decides what a failure
-/// means. A caller must never re-derive the split from a model identity, a
-/// turn count, or an "is it stuck" guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FoldRequirement {
-    /// At or below the quality boundary: nothing to fold.
-    None,
-    /// Over the quality boundary but within hard capacity. Sending the request
-    /// uncompacted is legal, so a failed briefing keeps the original active
-    /// history and the turn continues.
-    Soft,
-    /// Over the hard capacity. Without a fold the request cannot legally be
-    /// sent, so a failed briefing must be folded mechanically or the turn
-    /// fails without ever sending an oversized request.
-    HardRequired,
-}
-
-impl FoldRequirement {
-    /// Classify from facts only.
-    ///
-    /// `hard_capacity` is `None` when the model declares no window: with no
-    /// hard limit there is no request compaction is obliged to make legal, so
-    /// nothing may claim a hard requirement.
-    pub fn classify(
-        projected_tokens: u64,
-        quality_threshold: u64,
-        hard_capacity: Option<u64>,
-    ) -> Self {
-        if let Some(capacity) = hard_capacity
-            && projected_tokens > capacity
-        {
-            return Self::HardRequired;
-        }
-        if projected_tokens > quality_threshold {
-            return Self::Soft;
-        }
-        Self::None
-    }
-
-    /// Whether a fold must succeed (mechanically at minimum) before the next
-    /// request can be sent.
-    pub fn fold_is_mandatory(self) -> bool {
-        matches!(self, Self::HardRequired)
-    }
 }
 
 /// Marker for the host-pinned active objective re-injected after compaction.

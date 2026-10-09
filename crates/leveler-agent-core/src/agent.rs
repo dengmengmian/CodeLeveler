@@ -41,8 +41,17 @@ pub struct Agent {
     reasoning_replay: ReasoningReplayContract,
     /// The model's declared context window (exact fact), when the host knows it.
     context_window: Option<u32>,
-    /// The fold threshold (`reliable_context`), when the host knows it.
+    /// The SOFT fold threshold the host resolved, when it knows one.
     compact_at: Option<u32>,
+    /// The EFFECTIVE INPUT CAPACITY (window − completion reservation − safety
+    /// headroom) the host resolved. `None` = no hard bound could be formed.
+    /// The accounting publishes it so compaction utilization has a
+    /// model-agnostic denominator; the kernel never derives it.
+    input_capacity: Option<u32>,
+    /// The completion reservation the request carries.
+    output_reservation: Option<u32>,
+    /// Safety headroom beyond the reservation.
+    headroom: Option<u32>,
     /// Shared record of the most recent compaction fold, written by the
     /// harness that owns folding and read here when the accounting snapshot
     /// is built. The kernel never folds — it only reports what the fold did.
@@ -63,6 +72,9 @@ impl Agent {
             reasoning_replay: ReasoningReplayContract::NONE,
             context_window: None,
             compact_at: None,
+            input_capacity: None,
+            output_reservation: None,
+            headroom: None,
             compaction: Arc::new(Mutex::new(None)),
         }
     }
@@ -121,9 +133,25 @@ impl Agent {
         self
     }
 
-    /// Declare the fold threshold (`reliable_context`) the harness folds at.
+    /// Declare the SOFT fold threshold the harness folds at.
     pub fn with_compact_at(mut self, compact_at: u32) -> Self {
         self.compact_at = Some(compact_at);
+        self
+    }
+
+    /// Declare the resolved input budget this request is measured against:
+    /// the effective input capacity, the completion reservation and the safety
+    /// headroom. All three come from the harness's `ResolvedContextPolicy`; the
+    /// kernel does not compute a threshold and does not re-derive a percent.
+    pub fn with_input_budget(
+        mut self,
+        input_capacity: Option<u32>,
+        output_reservation: u32,
+        headroom: u32,
+    ) -> Self {
+        self.input_capacity = input_capacity;
+        self.output_reservation = (output_reservation > 0).then_some(output_reservation);
+        self.headroom = (headroom > 0).then_some(headroom);
         self
     }
 
@@ -302,6 +330,7 @@ impl Agent {
                     self.compact_at,
                     self.compaction.lock().ok().and_then(|g| *g),
                 )
+                .with_input_budget(self.input_capacity, self.output_reservation, self.headroom)
             };
             harness.on_event(AgentEvent::ContextUsage(accounting));
 

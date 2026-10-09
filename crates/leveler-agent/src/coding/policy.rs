@@ -121,6 +121,40 @@ pub struct ExecutionOverrides {
     /// reservation. `None` means none declared — there is no measured extra
     /// margin to claim, so nothing is invented.
     pub context_headroom_tokens: Option<u32>,
+    /// Harness context policy: the SOFT compaction percent of the effective
+    /// INPUT capacity. `None` → [`DEFAULT_CONTEXT_SOFT_PERCENT`]. This is the
+    /// one seam through which an operator, a model entry or the eval harness
+    /// can move the soft threshold; no provider ever computes it.
+    pub context_soft_percent: Option<u8>,
+}
+
+/// The product default soft threshold, as a percent of the effective input
+/// capacity.
+///
+/// Percentage-of-effective-input rather than a fixed token count: the SAME
+/// number serves a 32K and a 1M window route, so no model needs its own
+/// threshold and no provider computes one. The completion is reserved first
+/// (`context_window − output_reservation − headroom`), which is what makes the
+/// share model-agnostic; see [`ResolvedContextPolicy::resolve`].
+///
+/// `100` would mean "fold only at the hard bound" — the pre-percentage
+/// behaviour — so the knob keeps that reachable without a code path.
+pub const DEFAULT_CONTEXT_SOFT_PERCENT: u8 = 85;
+
+/// Reject a soft percentage that cannot describe a threshold.
+///
+/// A percent is a policy knob, so this is a config-time FACT check: below 1
+/// there is no threshold (every request folds), and above 100 would claim a
+/// soft bound past the hard capacity that the classifier still honours, which
+/// is a misdeclaration rather than a preference.
+pub fn validate_context_soft_percent(value: u8) -> Result<u8, String> {
+    if !(1..=100).contains(&value) {
+        return Err(format!(
+            "context soft percent ({value}) must be between 1 and 100; it is a share of the \
+             effective input capacity, and 100 means 'fold only at the hard bound'"
+        ));
+    }
+    Ok(value)
 }
 
 /// The harness's context policy for one executor seat: how much of a model's
@@ -146,10 +180,15 @@ pub struct ResolvedContextPolicy {
     pub output_reservation: u32,
     /// Extra safety margin on top of the reservation; `0` = none declared.
     pub headroom: u32,
-    /// The pressure threshold: `min(quality_boundary, capacity)` where
-    /// `capacity = window - output_reservation - headroom`. `0` = folding
-    /// disabled (no window declared).
+    /// The SOFT pressure threshold: `min(percentage × capacity, quality_boundary)`
+    /// where `capacity = window - output_reservation - headroom` and the
+    /// percentage is [`Self::soft_percent`]. Strictly below the effective input
+    /// capacity whenever that capacity exists. `0` = folding disabled (no
+    /// window declared).
     pub pressure_threshold: u32,
+    /// The share of the effective input capacity the soft threshold takes.
+    /// Resolved once here so every caller and the accounting read one number.
+    pub soft_percent: u8,
     /// How much recent history stays verbatim across a fold.
     pub retention: ContextRetentionPolicy,
 }
@@ -194,6 +233,7 @@ impl Default for ResolvedContextPolicy {
             output_reservation: 0,
             headroom: 0,
             pressure_threshold: 0,
+            soft_percent: DEFAULT_CONTEXT_SOFT_PERCENT,
             retention: ContextRetentionPolicy::from_threshold(0),
         }
     }
@@ -210,6 +250,7 @@ impl ResolvedContextPolicy {
         limits: &leveler_model::ModelLimits,
         output_reservation: u32,
         headroom: u32,
+        soft_percent: u8,
     ) -> Self {
         let window = limits.context_window;
         let reservation = if output_reservation > 0 {
@@ -217,22 +258,34 @@ impl ResolvedContextPolicy {
         } else {
             limits.max_output_tokens
         };
+        // A percent is a policy knob, so a caller that hands over a nonsensical
+        // one is clamped to the meaningful range rather than allowed to invent
+        // a threshold past the hard capacity. Config loaders validate and name
+        // the file (`validate_context_soft_percent`); this is the last line of
+        // defence for values that arrive from anywhere else.
+        let soft_percent = soft_percent.clamp(1, 100);
         if window == 0 {
             // No declared window: there is nothing to bound, and `0` keeps its
             // established meaning of "folding disabled" rather than inventing
-            // a threshold.
+            // a threshold. A percentage of an unknown capacity is not a number.
             return Self {
                 context_window: 0,
                 quality_boundary: limits.reliable_context,
                 output_reservation: reservation,
                 headroom,
                 pressure_threshold: 0,
+                soft_percent,
                 retention: ContextRetentionPolicy::from_threshold(0),
             };
         }
+        // The EFFECTIVE INPUT CAPACITY is everything the request may use: the
+        // declared window with this harness's completion reservation and safety
+        // headroom removed. Every percentage bound is taken from THIS number,
+        // never from the whole window, so a route that reserves a large
+        // completion cannot be handed a soft threshold inside its output.
         let capacity = window.saturating_sub(reservation).saturating_sub(headroom);
         // The quality boundary: where recall is expected to degrade. With no
-        // declaration the usable capacity is the only bound — and when the
+        // declaration the percentage below is the only bound — and when the
         // reservation has consumed the whole window there is no capacity to
         // name, so the window itself is the bound.
         let quality = if limits.reliable_context == 0 {
@@ -240,17 +293,25 @@ impl ResolvedContextPolicy {
         } else {
             limits.reliable_context
         };
-        // A reservation plus headroom that exhausts the window leaves no input
-        // capacity. `hard_capacity()` reports `None` for that: a hard bound of
-        // zero would mark every request as over capacity and force a fold that
-        // can never fit, aborting the task. Folding therefore runs on the
-        // quality boundary alone — the behaviour that existed before a capacity
-        // was derived — which is the honest reading of a route whose declared
-        // completion cap exceeds its window (e.g. a reduced-context route that
-        // keeps the model's full output declaration).
+        // A percentage of the effective input capacity, in u64 so a 4 GiB-class
+        // window times 100 cannot overflow; the result is bounded by the
+        // capacity it came from. `min` with the declared quality boundary keeps
+        // a model whose measured recall degrades earlier folding earlier than
+        // the share would — the share never RAISES an existing boundary.
+        let percentage = (u64::from(capacity) * u64::from(soft_percent) / 100) as u32;
         let pressure_threshold = if capacity > 0 {
-            quality.min(capacity).max(1)
+            percentage.min(quality).max(1)
         } else {
+            // A reservation plus headroom that exhausts the window leaves no
+            // input capacity. `hard_capacity()` reports `None` for that: a hard
+            // bound of zero would mark every request as over capacity and force
+            // a fold that can never fit, aborting the task. A percentage of
+            // zero capacity is not a threshold, so folding runs on the declared
+            // quality boundary alone — the behaviour that existed before a
+            // capacity was derived, and the honest reading of a route whose
+            // declared completion cap exceeds its window. Config validation
+            // refuses such a profile where it is written; this is the runtime
+            // reading of an already-persisted one.
             quality.max(1)
         };
         Self {
@@ -259,6 +320,7 @@ impl ResolvedContextPolicy {
             output_reservation: reservation,
             headroom,
             pressure_threshold,
+            soft_percent,
             retention: ContextRetentionPolicy::from_threshold(pressure_threshold),
         }
     }
@@ -420,6 +482,7 @@ pub fn resolve_execution_policy(
         &profile.limits,
         resolved_output_cap,
         o.context_headroom_tokens.unwrap_or(0),
+        o.context_soft_percent.unwrap_or(DEFAULT_CONTEXT_SOFT_PERCENT),
     );
 
     ResolvedExecutionPolicy {
@@ -530,6 +593,18 @@ mod tests {
         .expect("valid test profile")
     }
 
+    /// One model's declared limits, as a test would write them.
+    fn limits(window: u32, quality: u32, output: u32) -> leveler_model::ModelLimits {
+        leveler_model::ModelLimits {
+            context_window: window,
+            reliable_context: quality,
+            max_output_tokens: output,
+            max_tool_schema_bytes: 32_768,
+            max_parallel_tool_calls: 1,
+            max_tool_output_bytes: None,
+        }
+    }
+
     fn goal_turn() -> TurnProfile {
         TurnProfile::Goal {
             continuation: ContinuationPolicy::UntilTerminal,
@@ -550,8 +625,8 @@ mod tests {
         p.limits.max_output_tokens = 393_216;
         let resolved = resolve_execution_policy(&p, ExecutionRole::Main, &goal_turn(), None);
         assert_eq!(
-            resolved.context_policy.pressure_threshold, 655_360,
-            "the completion reservation must cap the quality bound"
+            resolved.context_policy.pressure_threshold, 557_056,
+            "the share of the reserved capacity (85% of 655_360) caps the quality bound"
         );
         // A quality bound below capacity is left alone.
         p.limits.reliable_context = 400_000;
@@ -577,8 +652,8 @@ mod tests {
             "the reservation must be the cap this request actually carries"
         );
         assert_eq!(
-            resolved.context_policy.pressure_threshold, 655_360,
-            "capacity (window − reservation) caps the quality bound"
+            resolved.context_policy.pressure_threshold, 557_056,
+            "the share of the capacity (window − reservation) caps the quality bound"
         );
     }
 
@@ -588,22 +663,18 @@ mod tests {
     #[test]
     fn context_policy_separates_capacity_quality_reservation_and_retention() {
         use super::{ContextRetentionPolicy, ResolvedContextPolicy};
-        let limits = |window, quality, output| leveler_model::ModelLimits {
-            context_window: window,
-            reliable_context: quality,
-            max_output_tokens: output,
-            max_tool_schema_bytes: 32_768,
-            max_parallel_tool_calls: 1,
-            max_tool_output_bytes: None,
-        };
 
-        // Capacity binds: the quality bound sits above the usable window.
-        let policy = ResolvedContextPolicy::resolve(&limits(1_048_576, 786_432, 393_216), 0, 0);
+        // Capacity binds: the quality bound sits above the usable window, so the
+        // PERCENTAGE of the effective input capacity is the threshold.
+        let policy = ResolvedContextPolicy::resolve(&limits(1_048_576, 786_432, 393_216), 0, 0, 85);
         assert_eq!(policy.quality_boundary, 786_432);
         assert_eq!(policy.output_reservation, 393_216);
         assert_eq!(policy.headroom, 0);
-        assert_eq!(policy.pressure_threshold, 655_360);
-        assert_eq!(policy.retention.keep_recent_tokens, 327_680);
+        assert_eq!(policy.soft_percent, 85);
+        // capacity 655_360; 85% = 557_056, below the declared quality boundary.
+        assert_eq!(policy.pressure_threshold, 557_056);
+        assert_eq!(policy.hard_capacity(), Some(655_360));
+        assert_eq!(policy.retention.keep_recent_tokens, 278_528);
         assert_eq!(
             policy.retention.keep_recent_messages,
             leveler_context::COMPACT_KEEP_RECENT
@@ -613,34 +684,45 @@ mod tests {
         // budget grows: the reservation is the effective one, not the model's
         // maximum capability.
         let smaller =
-            ResolvedContextPolicy::resolve(&limits(1_048_576, 786_432, 393_216), 32_768, 0);
+            ResolvedContextPolicy::resolve(&limits(1_048_576, 786_432, 393_216), 32_768, 0, 85);
         assert_eq!(smaller.output_reservation, 32_768);
-        assert_eq!(smaller.pressure_threshold, 786_432, "quality binds now");
+        assert_eq!(
+            smaller.pressure_threshold, 786_432,
+            "the declared quality boundary now binds"
+        );
 
-        // Quality binds when it sits below capacity…
-        let quality = ResolvedContextPolicy::resolve(&limits(128_000, 64_000, 8_192), 0, 0);
+        // Quality binds when it sits below the percentage…
+        let quality = ResolvedContextPolicy::resolve(&limits(128_000, 64_000, 8_192), 0, 0, 85);
         assert_eq!(quality.pressure_threshold, 64_000);
         // …and headroom only ever lowers it.
-        let headroom = ResolvedContextPolicy::resolve(&limits(128_000, 64_000, 8_192), 0, 65_536);
+        let headroom =
+            ResolvedContextPolicy::resolve(&limits(128_000, 64_000, 8_192), 0, 65_536, 85);
         assert_eq!(headroom.headroom, 65_536);
-        assert_eq!(headroom.pressure_threshold, 54_272);
+        assert_eq!(headroom.pressure_threshold, 46_131, "85% of 54_272");
+        // 100% is the pre-percentage behaviour, kept reachable through the knob.
+        // (A declared quality boundary still binds below it.)
+        let at_capacity = ResolvedContextPolicy::resolve(&limits(128_000, 0, 8_192), 0, 0, 100);
+        assert_eq!(at_capacity.pressure_threshold, capacity_of(&at_capacity));
 
         // An undeclared window keeps folding disabled (`0`), and an undeclared
         // quality bound is not invented.
-        let unknown = ResolvedContextPolicy::resolve(&limits(0, 0, 0), 0, 0);
+        let unknown = ResolvedContextPolicy::resolve(&limits(0, 0, 0), 0, 0, 85);
         assert!(!unknown.folding_enabled());
         assert_eq!(unknown.quality_boundary, 0);
+        assert_eq!(unknown.hard_capacity(), None);
         assert_eq!(
-            ResolvedContextPolicy::resolve(&limits(128_000, 0, 8_192), 0, 0).pressure_threshold,
-            119_808,
-            "no quality declaration → capacity is the whole bound"
+            ResolvedContextPolicy::resolve(&limits(128_000, 0, 8_192), 0, 0, 85)
+                .pressure_threshold,
+            101_836,
+            "no quality declaration → 85% of the capacity, not the whole bound"
         );
 
         // A reservation plus headroom that exhausts the window is a
         // misdeclaration; the harness cannot claim a hard bound it can never
         // satisfy, so it folds on the quality boundary instead of forcing a
         // fold that cannot fit (which would abort the task).
-        let exhausted = ResolvedContextPolicy::resolve(&limits(8_192, 4_096, 8_191), 0, 8_192);
+        let exhausted =
+            ResolvedContextPolicy::resolve(&limits(8_192, 4_096, 8_191), 0, 8_192, 85);
         assert_eq!(exhausted.pressure_threshold, 4_096);
         assert_eq!(exhausted.hard_capacity(), None);
         assert!(exhausted.folding_enabled());
@@ -650,7 +732,8 @@ mod tests {
         // must not derive `hard_capacity() == Some(0)` from that: the zero
         // marks every request over capacity and aborts the task with a fold
         // that can never fit. It folds on the quality boundary instead.
-        let over_window = ResolvedContextPolicy::resolve(&limits(131_072, 24_000, 393_216), 0, 0);
+        let over_window =
+            ResolvedContextPolicy::resolve(&limits(131_072, 24_000, 393_216), 0, 0, 85);
         assert_eq!(over_window.output_reservation, 393_216);
         assert_eq!(over_window.quality_boundary, 24_000);
         assert_eq!(over_window.pressure_threshold, 24_000);
@@ -660,7 +743,7 @@ mod tests {
         // The retention budget is its own field, not a fraction re-derived at
         // the call site: a policy with a different threshold keeps the same
         // shape of relationship but a different number.
-        let other = ResolvedContextPolicy::resolve(&limits(64_000, 32_000, 4_000), 0, 0);
+        let other = ResolvedContextPolicy::resolve(&limits(64_000, 32_000, 4_000), 0, 0, 85);
         assert_eq!(other.pressure_threshold, 32_000);
         assert_eq!(other.retention.keep_recent_tokens, 16_000);
         assert_eq!(
@@ -669,6 +752,119 @@ mod tests {
                 keep_recent_messages: leveler_context::COMPACT_KEEP_RECENT,
                 keep_recent_tokens: 16_000,
             }
+        );
+    }
+
+    fn capacity_of(policy: &ResolvedContextPolicy) -> u32 {
+        policy
+            .context_window
+            .saturating_sub(policy.output_reservation)
+            .saturating_sub(policy.headroom)
+    }
+
+    /// The percent is a share of the EFFECTIVE INPUT CAPACITY, so one algorithm
+    /// serves every window: 32K, 128K, 256K and 1M resolve the same way, and no
+    /// model name, provider or protocol appears in the arithmetic.
+    #[test]
+    fn percentage_soft_threshold_is_model_agnostic() {
+        let cases = [
+            // window, reliable, output, expected capacity, expected soft
+            (32_768u32, 0u32, 4_096u32, 28_672u32, 24_371u32),
+            (131_072, 65_536, 8_192, 122_880, 65_536),
+            (262_144, 196_608, 65_536, 196_608, 167_116),
+            (1_048_576, 786_432, 393_216, 655_360, 557_056),
+        ];
+        for (window, reliable, output, capacity, soft) in cases {
+            let policy = ResolvedContextPolicy::resolve(&limits(window, reliable, output), 0, 0, 85);
+            assert_eq!(policy.hard_capacity(), Some(u64::from(capacity)), "w={window}");
+            assert_eq!(policy.pressure_threshold, soft, "w={window}");
+            assert!(
+                u64::from(policy.pressure_threshold) < u64::from(capacity),
+                "the soft threshold stays strictly below capacity (w={window})"
+            );
+        }
+    }
+
+    /// Percentages outside the meaningful range are clamped at the runtime and
+    /// named at config load, and no percentage may cross the hard capacity.
+    #[test]
+    fn a_percentage_never_crosses_the_hard_capacity() {
+        for percent in [1u8, 50, 85, 99, 100] {
+            let policy =
+                ResolvedContextPolicy::resolve(&limits(262_144, 0, 65_536), 0, 0, percent);
+            let capacity = u64::from(capacity_of(&policy));
+            assert!(
+                u64::from(policy.pressure_threshold) <= capacity,
+                "pct={percent} soft={} capacity={capacity}",
+                policy.pressure_threshold
+            );
+        }
+        // A nonsensical knob is clamped, not honoured: 0 has no threshold and
+        // 200 would claim a bound past the hard capacity.
+        assert_eq!(
+            ResolvedContextPolicy::resolve(&limits(131_072, 0, 8_192), 0, 0, 0).soft_percent,
+            1
+        );
+        assert_eq!(
+            ResolvedContextPolicy::resolve(&limits(131_072, 0, 8_192), 0, 0, 200).soft_percent,
+            100
+        );
+        assert!(
+            validate_context_soft_percent(0).is_err() && validate_context_soft_percent(101).is_err()
+        );
+        assert!(validate_context_soft_percent(85).is_ok());
+    }
+
+    /// A window at the top of `u32` cannot overflow the share arithmetic.
+    #[test]
+    fn the_share_arithmetic_cannot_overflow() {
+        let policy = ResolvedContextPolicy::resolve(&limits(u32::MAX, 0, 0), 0, 0, 85);
+        assert_eq!(policy.hard_capacity(), Some(u64::from(u32::MAX)));
+        assert_eq!(
+            policy.pressure_threshold,
+            (u64::from(u32::MAX) * 85 / 100) as u32
+        );
+    }
+
+    /// The override travels: the resolved policy reports the percent it used,
+    /// so the accounting and the operator read one number.
+    #[test]
+    fn the_soft_percent_reaches_the_resolved_policy() {
+        // The share of the effective input capacity, floored by the declared
+        // quality boundary and never below one token. ONE arithmetic, and the
+        // test mirrors it instead of hard-coding a number.
+        let share = |policy: &ResolvedContextPolicy| {
+            (u32::from(policy.soft_percent) * capacity_of(policy) / 100)
+                .min(policy.quality_boundary.max(1))
+                .max(1)
+        };
+        let resolved = resolve_execution_policy(
+            &profile(),
+            ExecutionRole::Main,
+            &goal_turn(),
+            Some(&ExecutionOverrides {
+                context_soft_percent: Some(75),
+                ..ExecutionOverrides::default()
+            }),
+        );
+        assert_eq!(resolved.context_policy.soft_percent, 75);
+        assert_eq!(
+            resolved.context_policy.pressure_threshold,
+            share(&resolved.context_policy)
+        );
+        let default = resolve_execution_policy(&profile(), ExecutionRole::Main, &goal_turn(), None);
+        assert_eq!(
+            default.context_policy.soft_percent,
+            DEFAULT_CONTEXT_SOFT_PERCENT
+        );
+        assert_eq!(
+            default.context_policy.pressure_threshold,
+            share(&default.context_policy)
+        );
+        assert!(
+            default.context_policy.pressure_threshold
+                < capacity_of(&default.context_policy).max(1),
+            "the product default leaves a real soft zone"
         );
     }
 

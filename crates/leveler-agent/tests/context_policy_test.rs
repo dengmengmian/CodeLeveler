@@ -176,7 +176,7 @@ fn resolved_policy() -> ResolvedContextPolicy {
         "max_tool_schema_bytes": 32_768, "max_parallel_tool_calls": 1
     }))
     .unwrap();
-    ResolvedContextPolicy::resolve(&limits, 1_024, 0)
+    ResolvedContextPolicy::resolve(&limits, 1_024, 0, 85)
 }
 
 /// The bare executor carries the policies its composition root injects (the
