@@ -1159,6 +1159,23 @@ fn independent_audit_fixture_contract() {
 #[test]
 #[ignore = "independent audit only; release build, --exact --ignored --nocapture --test-threads=1"]
 fn perf_independent_audit() {
+    // A library test does not run the CLI composition root, so explicitly
+    // install only the profiler inputs instead of importing credentials or
+    // unrelated host configuration into this deterministic fixture.
+    let values = ["LEVELER_TUI_PROFILE", "LEVELER_TUI_PROFILE_OUT"]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)));
+    let snapshot = leveler_core::EnvSnapshot::new(
+        values,
+        std::env::current_dir().unwrap(),
+        std::env::temp_dir(),
+    );
+    leveler_core::install_environment(snapshot)
+        .expect("run this audit as an isolated exact test in a fresh process");
+    assert!(
+        crate::profile::enabled(),
+        "independent audit requires the actual profiler enabled"
+    );
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
     use std::rc::Rc;
