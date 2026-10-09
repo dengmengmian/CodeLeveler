@@ -1613,3 +1613,76 @@ fn conversation_corpus_projects_the_frozen_tree() {
         }
     }
 }
+
+/// The compacted model context must not replace the conversation restored
+/// through the client's actual history response boundary.
+#[test]
+fn conversation_c10_durable_history_replay_preserves_full_tree_and_reversible_thought() {
+    let doc = corpus("C10");
+    let entries: Vec<leveler_client_protocol::UiHistoryEntry> =
+        serde_json::from_value(doc["paths"]["replay"].clone()).expect("C10 durable replay entries");
+    let mut state = opened_bare();
+    // A stale context-only placeholder on screen must be replaced by the
+    // authoritative full history, rather than retained or appended twice.
+    state.transcript.push_user("对话摘要（已压缩历史）".into());
+    let query = leveler_client_protocol::CommandId::new("conversation-C10-replay");
+    state.history_query = Some(query.clone());
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: Some(query),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+    assert!(
+        state.history_query.is_none(),
+        "the real history query was consumed"
+    );
+    let expected = doc["expect"]["items"].as_array().expect("C10 items");
+    assert_corpus_items("C10/replay", expected, &conversation_tree(&state));
+    let painted = text(&state);
+    for forbidden in doc["expect"]["forbidden_text"]
+        .as_array()
+        .expect("forbidden text")
+    {
+        assert!(!painted.contains(forbidden.as_str().unwrap()), "{painted}");
+    }
+    assert_eq!(
+        painted.matches("先看解析器").count(),
+        1,
+        "first user is visible exactly once"
+    );
+    assert_eq!(
+        painted.matches("把 parse 修好").count(),
+        1,
+        "second user is visible exactly once"
+    );
+    assert!(
+        painted.contains("- fn parse() {}"),
+        "confirmed removal remains in full: {painted}"
+    );
+    assert!(
+        painted.contains("+ fn parse() { ok() }"),
+        "confirmed addition remains in full: {painted}"
+    );
+    assert_eq!(thoughts(&state).len(), 1);
+    assert_eq!(thoughts(&state)[0].duration_ms, Some(1600));
+    assert_eq!(thoughts(&state)[0].display, DisplayMode::Collapsed);
+    assert!(
+        !painted.contains("先看入口。"),
+        "replayed reasoning starts folded"
+    );
+    let thought = thought_index(&state);
+    toggle_fold(&mut state, thought);
+    assert!(
+        text(&state).contains("先看入口。"),
+        "the original thought is reversible"
+    );
+    toggle_fold(&mut state, thought);
+    assert!(
+        !text(&state).contains("先看入口。"),
+        "the original thought folds back"
+    );
+}
