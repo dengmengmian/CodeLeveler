@@ -19,12 +19,6 @@ pub struct AppliedHunk {
     pub new_lines: Vec<String>,
 }
 
-/// Upper bound on a published applied diff. It travels through the durable
-/// event log and into the UI, and a patch past this size is not something a
-/// conversation renders anyway — so an oversized one publishes nothing and the
-/// UI falls back to an unnumbered diff, rather than bloating every reader.
-const MAX_APPLIED_DIFF_BYTES: usize = 64 * 1024;
-
 /// Render located hunks as a unified diff with numeric headers.
 ///
 /// Returns `None` when nothing was located, so a caller never publishes an
@@ -80,7 +74,7 @@ pub fn unified_diff_with_paths(
             out.push('\n');
         }
     }
-    (out.len() <= MAX_APPLIED_DIFF_BYTES).then_some(out)
+    Some(out)
 }
 
 /// How many lines at the start and at the end are identical on both sides.

@@ -1378,7 +1378,10 @@ verified by deterministic tests and real dogfood — do not regress them:
   not "output" but the change the user is being shown; its canonical diff is
   painted whole, whatever the viewport height or fold state. There is no preview
   budget, no `… +N lines` substitution and no diffstat-only form. The
-  full-screen Diff page and the Conversation agree.
+  full-screen Diff page and the Conversation agree. The execution tool retains
+  the complete diff after a successful commit without a byte budget dropping
+  it. When the edit also moves a file, both diff paths identify the actual source
+  and committed destination.
 - **A transcript entry's fold is presentation state only**: `Collapsed` /
   `Truncated` / `Expanded` belongs to the TUI and never enters the Runtime,
   the event log or persistence. Thoughts and tool groups share ONE fold

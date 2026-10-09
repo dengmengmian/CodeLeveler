@@ -1267,7 +1267,8 @@ dogfood 验证，不要在后续改动中回退：
 - **Confirmed Edit Diff 始终完整可见**：已确认的 edit 结果不是“输出”，而是
   用户正在被展示的修改；其 canonical diff 必须整段绘制，不受视口高度或折叠态
   影响，不存在 preview 预算、`… +N lines` 替代或 diffstat-only 形态。全屏 Diff
-  页与 Conversation 一致。
+  页与 Conversation 一致。执行工具在成功提交后生成的完整 diff 不按字节预算丢弃；
+  同时移动文件时，diff 两侧路径必须对应真实源路径与已提交目标路径。
 - **Ctrl+G 跳到最终回答**：锚点复用同一份 memoized 投影；无 Final 时只提示，
   不移动视口。
 - **Transcript entry 的折叠是纯 presentation 状态**：`Collapsed` / `Truncated`
