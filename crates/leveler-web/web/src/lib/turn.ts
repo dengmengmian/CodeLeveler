@@ -37,6 +37,7 @@ export function turnEndFromEvent(ev: RuntimeEvent): TurnEnd | null {
     case 'turn_failed':
       return { outcome: 'failed', detail: ev.error };
     case 'turn_cancelled':
+    case 'task_cancelled':
       return { outcome: 'cancelled', detail: null };
     default:
       return null;

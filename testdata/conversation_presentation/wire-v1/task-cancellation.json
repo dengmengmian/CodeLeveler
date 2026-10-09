@@ -1,0 +1,615 @@
+{
+  "producer": {
+    "kind": "actual_chromium_ws_cancel_task_trace",
+    "identity": {
+      "commit": "83f9797ac958b4057ab038e316256d91525cb9aa",
+      "source_status": "M apps/leveler-desktop/scripts/conversation.mjs\n M crates/leveler-web/web/src/lib/controller.test.ts\n M crates/leveler-web/web/src/lib/controller.ts\n?? apps/leveler-desktop/scripts/conversation-runtime.mjs",
+      "binary_sha256": "24c2994d18d87bd883b6113f3b39e5fa0a8030e88c0f3fd4db23c39eaee57b29",
+      "binary_version": "1.0.12 (83f9797ac958)",
+      "scripts": {
+        "/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/apps/leveler-desktop/scripts/conversation.mjs": "5212d36bdca75e42e525ec949a533559502e7a741c45eb18e8280d66238628b7",
+        "/Users/mengmian/Develop/app/dengmengmian/CodeLeveler/apps/leveler-desktop/scripts/conversation-runtime.mjs": "b43ea0a0b1bfdf136aa57389a798d22763aa0e0fdc7898c5d599797c148e59c3",
+        "/Users/mengmian/Develop/app/dengmengmian/dogfood/eval/pty/mock_provider.py": "67ef7699128af5c47a30fc9c3cbd183d0acf6f1bd0073c921f15b2c0e04c159d"
+      }
+    },
+    "qualification": false,
+    "note": "Author consumer fixture, not a release qualification result."
+  },
+  "frames": [
+    {
+      "type": "snapshot",
+      "session": {
+        "id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+        "repository": "/private/tmp/cl-p35-k6hPr1/workspace",
+        "goal": "受控取消：在真实推理流中停止",
+        "task_status": "idle",
+        "model": {
+          "provider": "fixture",
+          "model": "main"
+        },
+        "mode": "assisted",
+        "branch": null,
+        "status": "created",
+        "messages": [],
+        "pending_interactions": [],
+        "available_models": [
+          {
+            "provider": "fixture",
+            "model": "main"
+          }
+        ],
+        "vision": false,
+        "last_sequence": null,
+        "active_tools": [],
+        "plan": null,
+        "diff": null,
+        "checkpoints": [],
+        "recaps": [],
+        "user_shells": [],
+        "completion_report": null,
+        "thinking": {
+          "configured": "high",
+          "current": "high",
+          "effective": "auto",
+          "access": "unsupported"
+        },
+        "work_profile": "single",
+        "collaboration": "chat"
+      }
+    },
+    {
+      "type": "snapshot",
+      "session": {
+        "id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+        "repository": "/private/tmp/cl-p35-k6hPr1/workspace",
+        "goal": "受控取消：在真实推理流中停止",
+        "task_status": "idle",
+        "model": {
+          "provider": "fixture",
+          "model": "main"
+        },
+        "mode": "assisted",
+        "branch": null,
+        "status": "created",
+        "messages": [],
+        "pending_interactions": [],
+        "available_models": [
+          {
+            "provider": "fixture",
+            "model": "main"
+          }
+        ],
+        "vision": false,
+        "last_sequence": null,
+        "active_tools": [],
+        "plan": null,
+        "diff": null,
+        "checkpoints": [],
+        "recaps": [],
+        "user_shells": [],
+        "completion_report": null,
+        "thinking": {
+          "configured": "high",
+          "current": "high",
+          "effective": "auto",
+          "access": "unsupported"
+        },
+        "work_profile": "single",
+        "collaboration": "chat"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "checkpoint_created",
+        "checkpoint": {
+          "id": "d440396c-1a5e-47b3-97c6-4223bdebda46",
+          "label": "受控取消：在真实推理流中停止",
+          "ordinal": 0
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "user_message_added",
+        "message": {
+          "id": "ba1ab5c4-be8a-49bd-9284-b04fef7eef48",
+          "role": "user",
+          "text": "受控取消：在真实推理流中停止"
+        }
+      }
+    },
+    {
+      "type": "ack",
+      "command_id": "71c2b9ae-d5ec-45b7-9108-0692c13265e9"
+    },
+    {
+      "type": "ack",
+      "command_id": "8f285a78-3803-42df-a250-bf9ce25c3123"
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "session_list",
+        "sessions": [
+          {
+            "id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+            "task_status": "running",
+            "goal": "受控取消：在真实推理流中停止",
+            "status": "running",
+            "model": "fixture/main",
+            "updated_at": "2026-10-09T01:43:43.963754+00:00",
+            "repository": "/private/tmp/cl-p35-k6hPr1/workspace"
+          },
+          {
+            "id": "0c0265fc-b526-4048-a1cb-bbe0574cd138",
+            "task_status": "answered",
+            "task_terminal": {
+              "sequence": 63,
+              "outcome": "completed",
+              "stop": "answered",
+              "reason": null,
+              "warnings": []
+            },
+            "goal": "看下现在最新模型，同步更新配置",
+            "status": "completed",
+            "declaration": "answered",
+            "model": "fixture/main",
+            "updated_at": "2026-10-09T01:43:43.553192+00:00",
+            "repository": "/private/tmp/cl-p35-k6hPr1/workspace"
+          }
+        ]
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "memory_list",
+        "query_id": "ddc1448f-63f2-4720-bd2d-752915545a24",
+        "memory_dir": "/tmp/cl-p35-k6hPr1/home/state/projects/-private-tmp-cl-p35-k6hPr1-workspace-72a206e7bb03b8d4/memory",
+        "active": [],
+        "archived": [],
+        "pending": []
+      }
+    },
+    {
+      "type": "ack",
+      "command_id": "12636df9-c89c-424c-bb1e-49ca92c6a54f"
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "session_history_loaded",
+        "query_id": "28b00f54-94a4-40e8-8ab3-3f1909789ec2",
+        "session_id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+        "entries": [],
+        "omitted_turns": 0
+      }
+    },
+    {
+      "type": "ack",
+      "command_id": "95b775cb-b03c-4a96-9dab-000d2469290b"
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "30b94bbf-c069-46eb-9305-97fa5d65bc33",
+        "observation": {
+          "session": {
+            "session_id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+            "goal": "受控取消：在真实推理流中停止",
+            "repository": "/private/tmp/cl-p35-k6hPr1/workspace",
+            "created_at": "2026-10-09T01:43:43.900872+00:00",
+            "updated_at": "2026-10-09T01:43:43.962919+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 1,
+            "request_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 0,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 62
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T01:43:43.963754+00:00",
+              "turn_id": "d1e2953b-11e5-458e-9755-74e168105e73",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "d1e2953b-11e5-458e-9755-74e168105e73"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 1,
+          "requests": [],
+          "tools": [],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "ack",
+      "command_id": "192a0dfe-d62e-4bba-9707-99a25b9943a0"
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "a93d608f-4dad-49d1-a9e7-8c192a820904",
+        "observation": {
+          "session": {
+            "session_id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+            "goal": "受控取消：在真实推理流中停止",
+            "repository": "/private/tmp/cl-p35-k6hPr1/workspace",
+            "created_at": "2026-10-09T01:43:43.900872+00:00",
+            "updated_at": "2026-10-09T01:43:43.962919+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 1,
+            "request_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 0,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 62
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T01:43:43.963754+00:00",
+              "turn_id": "d1e2953b-11e5-458e-9755-74e168105e73",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "d1e2953b-11e5-458e-9755-74e168105e73"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 1,
+          "requests": [],
+          "tools": [],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "ack",
+      "command_id": "63b90043-f5a2-4858-86e4-8c90b61848cc"
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "790f4ad1-e451-4e64-b2dc-18a7e57cbb51",
+        "observation": {
+          "session": {
+            "session_id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+            "goal": "受控取消：在真实推理流中停止",
+            "repository": "/private/tmp/cl-p35-k6hPr1/workspace",
+            "created_at": "2026-10-09T01:43:43.900872+00:00",
+            "updated_at": "2026-10-09T01:43:43.962919+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 1,
+            "request_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 0,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 62
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T01:43:43.963754+00:00",
+              "turn_id": "d1e2953b-11e5-458e-9755-74e168105e73",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "d1e2953b-11e5-458e-9755-74e168105e73"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 1,
+          "requests": [],
+          "tools": [],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "ack",
+      "command_id": "705f23a6-9c0d-40da-a556-e0969ab318f7"
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "context_usage",
+        "accounting": {
+          "model": {
+            "provider": "fixture",
+            "model": "main"
+          },
+          "context_window_tokens": 131072,
+          "compact_at_tokens": 65536,
+          "used_tokens": 8171,
+          "free_tokens": 122901,
+          "token_count_kind": "estimated",
+          "pressure": "normal",
+          "categories": [
+            {
+              "name": "tool_definitions",
+              "label": "Tool definitions",
+              "tokens": 6091
+            },
+            {
+              "name": "system",
+              "label": "System",
+              "tokens": 2027
+            },
+            {
+              "name": "messages",
+              "label": "Messages",
+              "tokens": 53,
+              "children": [
+                {
+                  "name": "user",
+                  "label": "User",
+                  "tokens": 53
+                }
+              ]
+            }
+          ],
+          "reasoning_projection": {
+            "requested": "all",
+            "contract": {
+              "representation": "none",
+              "scope": "never",
+              "missing": "omit",
+              "integrity": "unconstrained",
+              "state": "client_managed",
+              "native_context": {
+                "reasoning_pruning": false,
+                "native_compaction": false,
+                "server_state": false
+              }
+            },
+            "captured_turns": 0,
+            "carried_turns": 0,
+            "protocol_protected_turns": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_attempt_reset",
+        "message_id": null
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_started"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_delta",
+        "delta": "长推理片段 000：检查 provider catalog 与推荐映射。\n"
+      }
+    },
+    {
+      "type": "snapshot",
+      "session": {
+        "id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+        "repository": "/private/tmp/cl-p35-k6hPr1/workspace",
+        "goal": "受控取消：在真实推理流中停止",
+        "task_status": "running",
+        "model": {
+          "provider": "fixture",
+          "model": "main"
+        },
+        "mode": "assisted",
+        "branch": null,
+        "status": "running",
+        "messages": [
+          {
+            "id": "d52573e2-f2ba-4c83-8f90-e37cf2c15dcf",
+            "role": "user",
+            "text": "受控取消：在真实推理流中停止",
+            "ordinal": 0
+          }
+        ],
+        "pending_interactions": [],
+        "available_models": [
+          {
+            "provider": "fixture",
+            "model": "main"
+          }
+        ],
+        "vision": false,
+        "last_sequence": 1,
+        "active_tools": [],
+        "plan": null,
+        "diff": null,
+        "checkpoints": [
+          {
+            "id": "d440396c-1a5e-47b3-97c6-4223bdebda46",
+            "label": "受控取消：在真实推理流中停止",
+            "ordinal": 0
+          }
+        ],
+        "recaps": [],
+        "user_shells": [],
+        "completion_report": null,
+        "thinking": {
+          "configured": "high",
+          "current": "high",
+          "effective": "auto",
+          "access": "unsupported"
+        },
+        "work_profile": "single",
+        "collaboration": "chat"
+      }
+    },
+    {
+      "type": "ack",
+      "command_id": "c3ff58ac-d839-42d3-8721-1e9c18e096ee"
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "resolving_outcome"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "publishing_terminal"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "task_cancelled"
+      }
+    },
+    {
+      "type": "snapshot",
+      "session": {
+        "id": "1292f38d-b78d-45a6-8ee2-81e20d301d84",
+        "repository": "/private/tmp/cl-p35-k6hPr1/workspace",
+        "goal": "受控取消：在真实推理流中停止",
+        "task_status": "cancelled",
+        "task_terminal": {
+          "sequence": 7,
+          "outcome": "cancelled",
+          "stop": null,
+          "reason": "user_cancelled_task",
+          "warnings": []
+        },
+        "model": {
+          "provider": "fixture",
+          "model": "main"
+        },
+        "mode": "assisted",
+        "branch": null,
+        "status": "cancelled",
+        "messages": [
+          {
+            "id": "5457447d-1a8b-4db2-b7e6-afb65dd2365b",
+            "role": "user",
+            "text": "受控取消：在真实推理流中停止",
+            "ordinal": 0
+          }
+        ],
+        "pending_interactions": [],
+        "available_models": [
+          {
+            "provider": "fixture",
+            "model": "main"
+          }
+        ],
+        "vision": false,
+        "last_sequence": 7,
+        "active_tools": [],
+        "plan": null,
+        "diff": null,
+        "checkpoints": [
+          {
+            "id": "d440396c-1a5e-47b3-97c6-4223bdebda46",
+            "label": "受控取消：在真实推理流中停止",
+            "ordinal": 0
+          }
+        ],
+        "recaps": [],
+        "user_shells": [],
+        "completion_report": null,
+        "thinking": {
+          "configured": "high",
+          "current": "high",
+          "effective": "auto",
+          "access": "unsupported"
+        },
+        "work_profile": "single",
+        "collaboration": "chat"
+      }
+    }
+  ]
+}

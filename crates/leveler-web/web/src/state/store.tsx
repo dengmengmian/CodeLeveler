@@ -525,13 +525,15 @@ function viewFromSnapshot(
     seq: nextSeq(),
   }));
   const s = snap.status.toLowerCase();
-  const turnActive =
+  // Durable task cancellation outranks transitional publishing metadata.
+  const taskCancelled = snap.task_status === 'cancelled';
+  const turnActive = !taskCancelled && (
     s.includes('run') ||
     s.includes('busy') ||
     snap.finalization_stage != null ||
     tools.length > 0 ||
     pendingApprovals.length > 0 ||
-    pendingClarifications.length > 0;
+    pendingClarifications.length > 0);
   const sameSession = prev !== null && prev.id === snap.id;
   return {
     id: snap.id,
@@ -553,16 +555,16 @@ function viewFromSnapshot(
     memory: sameSession ? prev.memory : null,
     turnActive,
     activity:
-      snap.finalization_stage != null
+      taskCancelled ? null : snap.finalization_stage != null
         ? finalizationStageLabel(snap.finalization_stage)
         : sameSession
           ? prev.activity
           : null,
-    reasoning: sameSession ? prev.reasoning : '',
-    reasoningSuperseded: sameSession ? prev.reasoningSuperseded : false,
+    reasoning: !taskCancelled && sameSession ? prev.reasoning : '',
+    reasoningSuperseded: !taskCancelled && sameSession ? prev.reasoningSuperseded : false,
     thoughts: sameSession ? prev.thoughts : [],
     historyOmittedTurns: sameSession ? (prev.historyOmittedTurns ?? 0) : 0,
-    turnStartedAt: sameSession ? prev.turnStartedAt : turnActive ? Date.now() : null,
+    turnStartedAt: taskCancelled ? null : sameSession ? prev.turnStartedAt : turnActive ? Date.now() : null,
     lastTurn: sameSession ? prev.lastTurn : null,
     model: snap.model ?? null,
     availableModels: snap.available_models ?? [],

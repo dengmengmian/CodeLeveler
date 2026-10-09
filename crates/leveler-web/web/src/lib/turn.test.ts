@@ -12,8 +12,13 @@ describe('turn truth', () => {
       [{ type: 'turn_incomplete', reason: 'budget' }, 'incomplete'],
       [{ type: 'turn_failed', error: 'boom' }, 'failed'],
       [{ type: 'turn_cancelled' }, 'cancelled'],
+      [{ type: 'task_cancelled' }, 'cancelled'],
     ];
     for (const [event, outcome] of cases) expect(turnEndFromEvent(event)?.outcome).toBe(outcome);
+  });
+
+  it('finalization progress is not a terminal fact', () => {
+    expect(turnEndFromEvent({ type: 'turn_finalizing', stage: 'publishing_terminal' })).toBeNull();
   });
 
   it('presents completion and incompletion directly', () => {

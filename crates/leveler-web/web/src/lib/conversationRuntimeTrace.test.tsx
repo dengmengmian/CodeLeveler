@@ -6,6 +6,7 @@ import { Timeline } from '../components/Timeline';
 import { AgentRunBlock } from '../components/AgentRunBlock';
 import { foldedThoughts, turnBlocks } from './conversationPresentation';
 import { groupExecutionRounds } from './executionRounds';
+import cancellationSource from '../../../testdata/conversation_presentation/wire-v1/task-cancellation.json?raw';
 import traceSource from '../../../testdata/conversation_presentation/wire-v1/full-execution.json?raw';
 
 let state: AppState;
@@ -77,4 +78,43 @@ it('actual zero-duration wire segments survive a deferred React reducer commit',
   expect(state.current.thoughts).toHaveLength(1);
   expect(state.current.thoughts[0].text).toBe(delta.delta);
   expect(state.current.thoughts[0].elapsedMs).toBe(0);
+});
+
+
+it('actual TaskCancelled wire ends live reasoning and its subsequent snapshot cannot revive publishing chrome', () => {
+  state = structuredClone(initialState); state.draft = false;
+  const bridge = new RuntimeBridge(action => reducer(state, action), () => state);
+  Object.assign(bridge, { ws: { send: () => true, setSession() {} } });
+  const frames = JSON.parse(cancellationSource).frames;
+  const handle = (frame: unknown) => (bridge as unknown as { handleFrame(frame: unknown): void }).handleFrame(frame);
+  for (const frame of frames) {
+    if (frame.type === 'event' && frame.event.type === 'task_cancelled') {
+      expect(state.current?.turnActive).toBe(true);
+      expect(state.current?.reasoning).not.toBe('');
+    }
+    handle(frame);
+    if (frame.type === 'event' && frame.event.type === 'task_cancelled') {
+      expect(state.current?.turnActive).toBe(false);
+      expect(state.current?.reasoning).toBe('');
+      expect(state.current?.lastTurn?.outcome).toBe('cancelled');
+    }
+  }
+  expect(state.current?.turnActive).toBe(false);
+  expect(state.current?.activity).toBeNull();
+  expect(state.current?.reasoning).toBe('');
+  expect(renderToStaticMarkup(<Timeline />)).not.toContain('thought live');
+});
+
+
+it('delivery ACK and publishing progress do not end the live turn', () => {
+  if (!state.current) throw new Error('missing session');
+  reducer(state, { type: 'turn_active', value: true });
+  reducer(state, { type: 'reasoning_delta', delta: 'pending' });
+  const bridge = new RuntimeBridge(action => reducer(state, action), () => state);
+  Object.assign(bridge, { ws: { send: () => true, setSession() {} } });
+  const handle = (frame: unknown) => (bridge as unknown as { handleFrame(frame: unknown): void }).handleFrame(frame);
+  handle({ type: 'ack', command_id: 'cancel-intent-admitted' });
+  handle({ type: 'event', event: { type: 'turn_finalizing', stage: 'publishing_terminal' } });
+  expect(state.current.turnActive).toBe(true);
+  expect(state.current.reasoning).toBe('pending');
 });
