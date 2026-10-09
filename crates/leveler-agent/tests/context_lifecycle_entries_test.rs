@@ -493,7 +493,7 @@ async fn a_provider_fault_is_reported_as_no_briefing() {
 
     let history = soft_history();
     let result = summarizer
-        .summarize(&history)
+        .summarize(&history, 12, 0)
         .await
         .expect("a provider fault is not a fatal assembly error");
     assert_eq!(result, None, "no briefing was produced");
@@ -529,7 +529,7 @@ async fn a_cancelled_task_is_reported_as_cancelled() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        summarizer.summarize(&soft_history()),
+        summarizer.summarize(&soft_history(), 12, 0),
     )
     .await
     .expect("the cancelled summary must return promptly");

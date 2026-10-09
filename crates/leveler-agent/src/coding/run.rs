@@ -384,6 +384,8 @@ impl leveler_engine::ContextSummarizer for ModelSummarizer<'_> {
     async fn summarize(
         &self,
         messages: &[leveler_model::Message],
+        keep_recent: usize,
+        keep_recent_tokens: u64,
     ) -> Result<Option<String>, EngineError> {
         let profile = self
             .runtime
@@ -403,9 +405,11 @@ impl leveler_engine::ContextSummarizer for ModelSummarizer<'_> {
             self.runtime,
             self.model,
             crate::ModelCallKind::Compaction.default_reasoning_effort(),
+            // The CALLER's retention, not a policy re-derived here: the
+            // briefing must replace exactly the rounds the fold removes.
             messages,
-            policy.context_policy.retention.keep_recent_messages,
-            policy.context_policy.retention.keep_recent_tokens,
+            keep_recent,
+            keep_recent_tokens,
             policy.max_output_tokens,
         )
         .await
@@ -1054,7 +1058,14 @@ impl CodingRuntime {
         if measure(&raw.messages) <= threshold {
             return Ok(None);
         }
-        let Some(summary) = summarizer.summarize(&raw.messages).await? else {
+        // The checkpoint keeps a count-bounded tail verbatim below, so the
+        // briefing is asked for exactly that prefix: the cut here and the cut
+        // there come from the ONE span owner (`compaction_span`).
+        let keep_recent_messages = policy.context_policy.retention.keep_recent_messages;
+        let Some(summary) = summarizer
+            .summarize(&raw.messages, keep_recent_messages, 0)
+            .await?
+        else {
             return Ok(None);
         };
         match crate::coding::checkpoint::create_goal_checkpoint(
@@ -1076,9 +1087,7 @@ impl CodingRuntime {
                 .await?;
                 let tail_start = leveler_context::round_boundary(
                     &raw.messages,
-                    raw.messages
-                        .len()
-                        .saturating_sub(policy.context_policy.retention.keep_recent_messages),
+                    raw.messages.len().saturating_sub(keep_recent_messages),
                 );
                 let mut prior = Vec::with_capacity(1 + raw.messages.len() - tail_start);
                 prior.push(leveler_model::Message::user(

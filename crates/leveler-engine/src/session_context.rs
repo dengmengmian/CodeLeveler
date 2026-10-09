@@ -23,6 +23,15 @@ use crate::{EngineError, EngineEvent};
 /// snapshot with its tail still leaves the context over threshold — so a
 /// turn that fits from the snapshot never pays for a summary it would drop.
 ///
+/// # The elision facts are the caller's
+///
+/// `keep_recent` / `keep_recent_tokens` ARE the fold's retention, handed to
+/// the summarizer so it replaces exactly the rounds the fold is about to
+/// remove. The summarizer must not re-derive a retention of its own: a
+/// briefing written from a wider tail leaves the messages between the two
+/// cuts in neither the request nor the briefing — history that vanishes with
+/// no record anywhere in the prompt. One decision, one owner.
+///
 /// # Failure contract
 ///
 /// The summarizer owns ONLY the summary call. It does not decide what a
@@ -43,6 +52,8 @@ pub trait ContextSummarizer: Send + Sync {
     async fn summarize(
         &self,
         messages: &[leveler_model::Message],
+        keep_recent: usize,
+        keep_recent_tokens: u64,
     ) -> Result<Option<String>, EngineError>;
 }
 
@@ -265,7 +276,11 @@ impl RawTranscript {
                 let requirement =
                     FoldRequirement::classify(base_tokens, quality_threshold, hard_capacity);
                 let summary = match summarizer {
-                    Some(summarizer) => summarizer.summarize(&base).await?,
+                    Some(summarizer) => {
+                        summarizer
+                            .summarize(&base, keep_recent, keep_recent_tokens)
+                            .await?
+                    }
                     None => None,
                 };
                 match requirement {
@@ -534,7 +549,12 @@ mod fold_semantics_tests {
 
     #[async_trait::async_trait]
     impl ContextSummarizer for FakeSummarizer {
-        async fn summarize(&self, _messages: &[Message]) -> Result<Option<String>, EngineError> {
+        async fn summarize(
+            &self,
+            _messages: &[Message],
+            _keep_recent: usize,
+            _keep_recent_tokens: u64,
+        ) -> Result<Option<String>, EngineError> {
             match self.0 {
                 Briefing::Produced(text) => Ok(Some(text.to_string())),
                 Briefing::Unavailable => Ok(None),
@@ -722,5 +742,124 @@ mod fold_semantics_tests {
         let context = result.expect("assembly");
         assert!(!context.compacted);
         assert_eq!(context.prior, original);
+    }
+
+    /// What the summarizer was asked for: the fold's own retention facts and
+    /// the exact messages they select.
+    struct RecordingSummarizer {
+        seen: std::sync::Mutex<Option<(usize, u64, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextSummarizer for RecordingSummarizer {
+        async fn summarize(
+            &self,
+            messages: &[Message],
+            keep_recent: usize,
+            keep_recent_tokens: u64,
+        ) -> Result<Option<String>, EngineError> {
+            *self.seen.lock().unwrap() = Some((
+                keep_recent,
+                keep_recent_tokens,
+                messages.iter().map(|m| m.text_content()).collect(),
+            ));
+            Ok(Some("briefing".to_string()))
+        }
+    }
+
+    /// The briefing is asked for with the FOLD's retention facts, and therefore
+    /// covers every round the fold removes.
+    ///
+    /// The tail is count-bounded at four rounds, so a token budget narrower
+    /// than it must drop the oldest of them; those dropped rounds are exactly
+    /// what the briefing has to replace. A summarizer deriving its own retention
+    /// (e.g. half the quality threshold) would stop earlier and leave the band
+    /// between the two cuts in neither the request nor the briefing.
+    #[tokio::test]
+    async fn the_briefing_is_asked_for_the_rounds_the_fold_elides() {
+        let store = leveler_storage::MemoryEventStore::default();
+        let log = EventLog::new(&store, SessionId::generate());
+        // head (User) + 19 light rounds + 4 heavy rounds (~4000 tokens each).
+        let mut messages = vec![Message::text(Role::User, "the objective")];
+        for index in 0..19 {
+            messages.push(Message::text(Role::Assistant, format!("light {index}")));
+        }
+        for index in 0..4 {
+            messages.push(Message::text(
+                Role::Assistant,
+                format!("heavy {index} {}", "h".repeat(16_000)),
+            ));
+        }
+        let original = messages.clone();
+        let raw = RawTranscript {
+            messages,
+            offset: 0,
+        };
+        let summarizer = RecordingSummarizer {
+            seen: std::sync::Mutex::new(None),
+        };
+        let context = raw
+            .assemble_measured(
+                &log,
+                Some(&summarizer),
+                None,
+                20, // the message count is the pressure figure in this fixture
+                None,
+                4,
+                8_000,
+                &count,
+            )
+            .await
+            .expect("assembly");
+        assert!(context.compacted, "the fixture must fold");
+
+        let (keep_recent, keep_recent_tokens, seen) = summarizer
+            .seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a briefing was requested");
+        assert_eq!(
+            (keep_recent, keep_recent_tokens),
+            (4, 8_000),
+            "the briefing is asked with the fold's own retention facts"
+        );
+        assert_eq!(
+            seen.len(),
+            original.len(),
+            "the summarizer owns the slice; the caller hands over the facts"
+        );
+        // The fold's actual cut, read from the folded surface: the trailing run
+        // of `prior` that is still the original transcript IS the kept tail.
+        let tail_len = context
+            .prior
+            .iter()
+            .rev()
+            .take_while(|message| original.contains(message))
+            .count();
+        let actual_tail_start = original.len() - tail_len;
+        let (_, briefed_end) =
+            leveler_context::compaction_span(&original, keep_recent, keep_recent_tokens)
+                .expect("the fixture has a foldable middle");
+        assert_eq!(
+            actual_tail_start, briefed_end,
+            "the fold cuts where the one span owner says"
+        );
+        assert!(actual_tail_start > 1, "the fixture really folds a middle");
+        let elided = &original[1..actual_tail_start];
+        let briefed = &seen[..briefed_end];
+        assert!(
+            elided
+                .iter()
+                .any(|message| message.text_content().starts_with("heavy 0 ")),
+            "a heavy round the fold elides is in the fixture"
+        );
+        for message in elided {
+            assert!(
+                briefed.contains(&message.text_content()),
+                "an elided round never reached the briefing: {:.40}",
+                message.text_content()
+            );
+        }
     }
 }
