@@ -43,7 +43,7 @@
     "user_texts": []
   },
   "id": "C1",
-  "invariant": "different model_step => different ExecutionRound; the presenter never synthesizes narration",
+  "invariant": "different model_step => different ExecutionRound; the presenter never synthesizes narration; the COLLAPSED view may merge consecutive exploration rounds into ONE receipt (semantic separation != visual separation), because expanding that receipt restores each round's own members in order",
   "paths": {
     "live": [
       {
@@ -110,5 +110,14 @@
       }
     ]
   },
-  "title": "prose-free multi-round"
+  "title": "prose-free multi-round",
+  "rendered": {
+    "contains": [
+      "▸ 读取 2 个文件 · 搜索 1 次"
+    ],
+    "excludes": [
+      "读取 src/a.rs",
+      "读取 src/b.rs"
+    ]
+  }
 }
