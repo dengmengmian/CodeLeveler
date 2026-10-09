@@ -83,6 +83,9 @@ pub struct GlobalConfig {
     /// UI preferences (theme, …).
     #[serde(default)]
     ui: GlobalUi,
+    /// Harness context policy for every model.
+    #[serde(default)]
+    context: GlobalContext,
     /// Which browser the browser capability drives.
     #[serde(default)]
     browser: GlobalBrowser,
@@ -241,6 +244,22 @@ struct GlobalBrowser {
     default: Option<String>,
 }
 
+/// `[context]`. Harness context policy for EVERY model.
+///
+/// The share is a percentage of the model's EFFECTIVE INPUT CAPACITY
+/// (`context_window − completion reservation − safety headroom`), so one
+/// number serves a 32K and a 1M route: no model needs its own threshold and no
+/// provider computes one. A model entry may override it with
+/// `soft_compaction_percent`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalContext {
+    /// Soft compaction percent of the effective input capacity. Unset → the
+    /// product default (`DEFAULT_CONTEXT_SOFT_PERCENT`).
+    #[serde(default)]
+    soft_percent: Option<u8>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalUi {
@@ -375,6 +394,10 @@ struct GlobalModel {
     /// Omitted → 48 KiB. Lower it for a model with a small reliable context.
     #[serde(default)]
     max_tool_output_bytes: Option<usize>,
+    /// This model's SOFT compaction percent, overriding `[context].soft_percent`.
+    /// A share of the effective input capacity, never a token count.
+    #[serde(default)]
+    soft_compaction_percent: Option<u8>,
     /// Whether the provider accepts a caller-chosen `temperature`. Kimi For
     /// Coding rejects every value but its own default (HTTP 400), so set this
     /// false there. Defaults to true.
@@ -452,6 +475,11 @@ pub struct GlobalBundle {
     /// Idle automatic affordances the user may switch off.
     pub assist_prompt_suggestions: bool,
     pub assist_away_summary: bool,
+    /// Harness context policy: the global soft compaction percent, when set.
+    pub context_soft_percent: Option<u8>,
+    /// Per-model soft compaction percent, keyed by the table id as written
+    /// (`[models.<id>].soft_compaction_percent`).
+    pub model_soft_percent: Vec<(String, u8)>,
 }
 
 /// A typed error from loading the global config, so callers and tests can tell
@@ -544,7 +572,47 @@ impl GlobalConfig {
             toml::from_str(text).map_err(|e| GlobalConfigError::Parse(e.to_string()))?;
         cfg.validate_browser()?;
         cfg.validate_reasoning()?;
+        cfg.validate_context_soft_percent()?;
         Ok(cfg)
+    }
+
+    /// A soft percent is a share of the effective input capacity. Out of range
+    /// is a misdeclaration, not a preference: below 1 there is no threshold and
+    /// above 100 would claim a bound past the hard capacity. Named at load, per
+    /// model, where the user can see which entry is wrong.
+    fn validate_context_soft_percent(&self) -> Result<(), GlobalConfigError> {
+        if let Some(percent) = self.context.soft_percent
+            && let Err(reason) = leveler_agent::coding::policy::validate_context_soft_percent(percent)
+        {
+            return Err(GlobalConfigError::Parse(format!("[context] {reason}")));
+        }
+        for (id, model) in &self.models {
+            if let Some(percent) = model.soft_compaction_percent
+                && let Err(reason) =
+                    leveler_agent::coding::policy::validate_context_soft_percent(percent)
+            {
+                return Err(GlobalConfigError::Parse(format!(
+                    "model `{id}` soft_compaction_percent: {reason}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The SOFT compaction percent to use for `model`: its own entry first, then
+    /// `[context].soft_percent`. `None` leaves the product default in force.
+    ///
+    /// Accepts `provider/model` or the bare table id, like
+    /// [`Self::context_window_for`].
+    pub fn soft_percent_for(&self, model: &str) -> Option<u8> {
+        let id = model
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(model);
+        self.models
+            .get(id)
+            .and_then(|entry| entry.soft_compaction_percent)
+            .or(self.context.soft_percent)
     }
 
     fn validate_browser(&self) -> Result<(), GlobalConfigError> {
@@ -1033,6 +1101,14 @@ impl GlobalConfig {
             })
             .collect();
 
+        // The per-model soft percent is harness policy, not a model fact, so it
+        // is collected BEFORE the model entries are consumed into profiles.
+        let model_soft_percent: Vec<(String, u8)> = self
+            .models
+            .iter()
+            .filter_map(|(id, m)| m.soft_compaction_percent.map(|percent| (id.clone(), percent)))
+            .collect();
+        let context_soft_percent = self.context.soft_percent;
         let models = self
             .models
             .into_iter()
@@ -1120,6 +1196,8 @@ impl GlobalConfig {
                 .and_then(leveler_browser::BrowserProduct::parse),
             assist_prompt_suggestions: self.assist.prompt_suggestions,
             assist_away_summary: self.assist.away_summary,
+            context_soft_percent,
+            model_soft_percent,
         }
     }
 }
@@ -1357,6 +1435,72 @@ mod tests {
         assert_eq!(
             cfg.thinking_level_for("deepseek-chat"),
             ThinkingLevel::Medium
+        );
+    }
+
+    /// The soft compaction percent is a SHARE of the effective input capacity,
+    /// so one global number serves every model; a model entry overrides it and
+    /// the lookup accepts `provider/model` or the bare id.
+    #[test]
+    fn the_soft_compaction_percent_resolves_global_then_model() {
+        let toml = r#"
+            [context]
+            soft_percent = 75
+
+            [models."deepseek-flash"]
+            provider = "deepseek"
+            soft_compaction_percent = 90
+
+            [models."k3"]
+            provider = "moonshot"
+        "#;
+        let cfg: GlobalConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.soft_percent_for("deepseek/deepseek-flash"), Some(90));
+        assert_eq!(cfg.soft_percent_for("deepseek-flash"), Some(90));
+        assert_eq!(cfg.soft_percent_for("moonshot/k3"), Some(75));
+        let bundle = cfg.into_bundle();
+        assert_eq!(bundle.context_soft_percent, Some(75));
+        assert_eq!(
+            bundle.model_soft_percent,
+            vec![("deepseek-flash".to_string(), 90)]
+        );
+    }
+
+    /// Unset leaves the product default in force — the harness default is not a
+    /// config value nobody wrote.
+    #[test]
+    fn an_unset_soft_percent_leaves_the_product_default() {
+        let cfg: GlobalConfig =
+            toml::from_str("[models.m]\nprovider = \"p\"\n").unwrap();
+        assert_eq!(cfg.soft_percent_for("p/m"), None);
+        assert_eq!(cfg.into_bundle().context_soft_percent, None);
+    }
+
+    /// Out of range is a misdeclaration named at load, per entry.
+    #[test]
+    fn an_impossible_soft_percent_is_refused_where_it_is_written() {
+        for (toml, needle) in [
+            ("[context]\nsoft_percent = 0\n", "[context]"),
+            ("[context]\nsoft_percent = 101\n", "[context]"),
+            (
+                "[models.m]\nprovider = \"p\"\nsoft_compaction_percent = 200\n",
+                "model `m`",
+            ),
+        ] {
+            let error = GlobalConfig::from_toml_str(toml)
+                .err()
+                .unwrap_or_else(|| panic!("{toml} must be refused"));
+            assert!(error.to_string().contains(needle), "{toml}: {error}");
+        }
+        assert!(GlobalConfig::from_toml_str("[context]\nsoft_percent = 100\n").is_ok());
+    }
+
+    /// A model may not invent a key: the section is closed.
+    #[test]
+    fn the_context_section_rejects_unknown_keys() {
+        assert!(
+            GlobalConfig::from_toml_str("[context]\nsoft_pct = 85\n").is_err(),
+            "an unknown key must not be silently ignored"
         );
     }
 

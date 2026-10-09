@@ -2426,6 +2426,7 @@
       "type": "object",
       "required": [
         "categories",
+        "fold_state",
         "model",
         "pressure",
         "token_count_kind",
@@ -2439,7 +2440,7 @@
           }
         },
         "compact_at_tokens": {
-          "description": "The fold threshold (`reliable_context`), when known.",
+          "description": "The SOFT fold threshold: where compaction is expected and may be abandoned. It is strictly below [`Self::input_capacity_tokens`] whenever both are known, because a percentage policy reserves the completion first and takes its share of what is left.",
           "type": [
             "integer",
             "null"
@@ -2456,8 +2457,34 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "fold_state": {
+          "description": "The exact decision for THIS request, from the one classifier the harness folds with. A display may not re-derive it from a rounded percentage.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FoldRequirement"
+            }
+          ]
+        },
         "free_tokens": {
           "description": "`context_window - used` when the window is known.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "headroom_tokens": {
+          "description": "Extra safety margin on top of the completion reservation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "input_capacity_tokens": {
+          "description": "The EFFECTIVE INPUT CAPACITY: `window − reservation − headroom`, when a window is declared and leaves input room. This — never the whole model window — is the denominator of compaction utilization, and it is the same number [`Self::fold_state`] compares against.",
           "type": [
             "integer",
             "null"
@@ -2478,6 +2505,15 @@
         },
         "model": {
           "$ref": "#/definitions/ModelRef"
+        },
+        "output_reservation_tokens": {
+          "description": "The completion this harness reserves per request.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
         },
         "pressure": {
           "$ref": "#/definitions/ContextPressure"
@@ -2851,6 +2887,32 @@
           "type": "string",
           "enum": [
             "publishing_terminal"
+          ]
+        }
+      ]
+    },
+    "FoldRequirement": {
+      "description": "What a measured request's pressure means for the context fold, and therefore what a failed briefing costs the turn.\n\nThe fold has TWO bounds, and they answer different questions. The quality threshold is where recall is expected to degrade — folding there is a quality choice that may be abandoned. The hard capacity is where a request can no longer legally be sent — folding there is REQUIRED, and a fold that cannot be produced must still be brought under capacity mechanically or the turn fails explicitly.\n\nThis is the ONE contract every active-context entry shares: coding/drive, chat, resume and the accounting that REPORTS which state a request is in. Entries provide the measured facts (projected tokens, resolved bounds); this decides what a failure means — and, because the display reads this same function, a shown trigger state can never disagree with the decision.\n\nIt lives beside the threshold arithmetic ([`ModelLimits`]) rather than in a harness: the classification is a comparison of three numbers and every consumer must read the same implementation.",
+      "oneOf": [
+        {
+          "description": "At or below the quality boundary: nothing to fold.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "Over the quality boundary but within hard capacity. Sending the request uncompacted is legal, so a failed briefing keeps the original active history and the turn continues.",
+          "type": "string",
+          "enum": [
+            "soft"
+          ]
+        },
+        {
+          "description": "Over the hard capacity. Without a fold the request cannot legally be sent, so a failed briefing must be folded mechanically or the turn fails without ever sending an oversized request.",
+          "type": "string",
+          "enum": [
+            "hard_required"
           ]
         }
       ]

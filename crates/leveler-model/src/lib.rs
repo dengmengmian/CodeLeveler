@@ -37,7 +37,7 @@ pub use authority::{
 };
 pub use context_accounting::{
     COMPACTION_BREADCRUMB_MARKER, CompactionRecord, ContextAccounting, ContextCategory,
-    ContextPressure, TokenCountKind,
+    ContextPressure, FoldRequirement, TokenCountKind,
 };
 pub use error::{
     DeliveryState, ModelError, ModelErrorKind, Retryability, StreamProgress, TransportFault,

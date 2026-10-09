@@ -86,15 +86,23 @@ export interface CompactionRecord {
 /** What one assembled model request is made of. */
 export interface ContextAccounting {
   categories: ContextCategory[];
-  /** The fold threshold (`reliable_context`), when known. */
+  /** The SOFT fold threshold: where compaction is expected and may be abandoned. It is strictly below [`Self::input_capacity_tokens`] whenever both are known, because a percentage policy reserves the completion first and takes its share of what is left. */
   compact_at_tokens?: number | null;
   /** The model's declared context window (an exact declared fact), when known. */
   context_window_tokens?: number | null;
+  /** The exact decision for THIS request, from the one classifier the harness folds with. A display may not re-derive it from a rounded percentage. */
+  fold_state: FoldRequirement;
   /** `context_window - used` when the window is known. */
   free_tokens?: number | null;
+  /** Extra safety margin on top of the completion reservation. */
+  headroom_tokens?: number | null;
+  /** The EFFECTIVE INPUT CAPACITY: `window − reservation − headroom`, when a window is declared and leaves input room. This — never the whole model window — is the denominator of compaction utilization, and it is the same number [`Self::fold_state`] compares against. */
+  input_capacity_tokens?: number | null;
   /** Most recent compaction fold, when one has run. */
   last_compaction?: CompactionRecord | null;
   model: ModelRef;
+  /** The completion this harness reserves per request. */
+  output_reservation_tokens?: number | null;
   pressure: ContextPressure;
   /** What the request projection did with the requested reasoning-retention arm: which turns carried reasoning, and how many the route contract had to keep against the request. Present on every snapshot computed from a projection, so an overridden treatment is visible rather than assumed. */
   reasoning_projection?: ReasoningProjectionSummary | null;
@@ -201,6 +209,15 @@ export type FinalizationStage =
   | 'resolving_outcome'
   /** Commit and publish the canonical terminal fact. */
   | 'publishing_terminal';
+
+/** What a measured request's pressure means for the context fold, and therefore what a failed briefing costs the turn. The fold has TWO bounds, and they answer different questions. The quality threshold is where recall is expected to degrade — folding there is a quality choice that may be abandoned. The hard capacity is where a request can no longer legally be sent — folding there is REQUIRED, and a fold that cannot be produced must still be brought under capacity mechanically or the turn fails explicitly. This is the ONE contract every active-context entry shares: coding/drive, chat, resume and the accounting that REPORTS which state a request is in. Entries provide the measured facts (projected tokens, resolved bounds); this decides what a failure means — and, because the display reads this same function, a shown trigger state can never disagree with the decision. It lives beside the threshold arithmetic ([`ModelLimits`]) rather than in a harness: the classification is a comparison of three numbers and every consumer must read the same implementation. */
+export type FoldRequirement =
+  /** At or below the quality boundary: nothing to fold. */
+  | 'none'
+  /** Over the quality boundary but within hard capacity. Sending the request uncompacted is legal, so a failed briefing keeps the original active history and the turn continues. */
+  | 'soft'
+  /** Over the hard capacity. Without a fold the request cannot legally be sent, so a failed briefing must be folded mechanically or the turn fails without ever sending an oversized request. */
+  | 'hard_required';
 
 /** Identifies a single assistant/user message in the transcript. A protocol-level id (the runtime persists messages as an ordered log, not by id); it lets streaming deltas target the right in-flight message. */
 export type MessageId = string;

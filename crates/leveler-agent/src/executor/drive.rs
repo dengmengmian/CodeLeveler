@@ -621,6 +621,17 @@ impl Executor {
             .with_context_window(self.policy.context_policy.context_window)
             .with_reasoning_replay(self.policy.reasoning_replay)
             .with_compact_at(self.policy.context_policy.pressure_threshold)
+            // The accounting publishes the SAME resolved budget the fold
+            // decisions read: effective input capacity, the completion
+            // reservation and the safety headroom. One policy, one snapshot.
+            .with_input_budget(
+                self.policy
+                    .context_policy
+                    .hard_capacity()
+                    .map(|capacity| capacity.min(u64::from(u32::MAX)) as u32),
+                self.policy.context_policy.output_reservation,
+                self.policy.context_policy.headroom,
+            )
             .with_reasoning_retention(self.policy.reasoning_retention)
             .with_compaction_record(compaction_record.clone());
         let mut result = agent.run(messages, &mut harness, cancellation).await;
@@ -5121,6 +5132,7 @@ mod fold_requirement_tests {
             output_reservation: 1_024,
             headroom: 0,
             pressure_threshold: 32_768 - 1_024,
+            soft_percent: 100,
             retention: P::default().retention,
         }
     }
@@ -5134,6 +5146,7 @@ mod fold_requirement_tests {
             output_reservation: 8_192,
             headroom: 0,
             pressure_threshold: 65_536,
+            soft_percent: 100,
             retention: P::default().retention,
         }
     }
