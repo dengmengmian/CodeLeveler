@@ -687,7 +687,7 @@ mod tests {
             context_window_tokens: Some(128_000),
             compact_at_tokens: Some(64_000),
             // The resolved budget: a 32K completion reservation leaves 96K of
-            // effective input capacity, and 85% of it is the 81.6K soft bound —
+            // effective input capacity, and 95% of it is the 91.2K soft bound —
             // a declared quality boundary of 64K binds first.
             output_reservation_tokens: Some(32_000),
             headroom_tokens: Some(0),

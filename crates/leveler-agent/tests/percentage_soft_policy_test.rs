@@ -23,7 +23,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use leveler_agent::coding::policy::{
-    ExecutionOverrides, ExecutionRole, resolve_execution_policy, validate_context_soft_percent,
+    DEFAULT_CONTEXT_SOFT_PERCENT, ExecutionOverrides, ExecutionRole, resolve_execution_policy,
+    validate_context_soft_percent,
 };
 use leveler_agent::coding::factory::TurnProfile;
 use leveler_agent::{AgentEvent, ContinuationPolicy, Executor, NoopSink, StepLimits};
@@ -331,7 +332,7 @@ fn the_declared_quality_boundary_can_only_lower_the_share() {
     .context_policy;
     assert_eq!(early.pressure_threshold, 40_000, "the declaration binds");
     let late = resolve_execution_policy(
-        &profile(131_072, 110_000, 8_192),
+        &profile(131_072, 120_000, 8_192),
         ExecutionRole::Main,
         &goal_turn(),
         None,
@@ -339,7 +340,7 @@ fn the_declared_quality_boundary_can_only_lower_the_share() {
     .context_policy;
     assert_eq!(
         late.pressure_threshold,
-        85 * (131_072 - 8_192) / 100,
+        u32::from(DEFAULT_CONTEXT_SOFT_PERCENT) * (131_072u32 - 8_192) / 100,
         "a declaration above the share cannot raise it"
     );
 }
