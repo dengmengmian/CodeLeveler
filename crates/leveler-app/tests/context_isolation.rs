@@ -980,6 +980,120 @@ async fn context_inspection_is_local_and_never_enters_the_conversation() {
     );
 }
 
+/// A model switch changes the resolved context policy (window, reservation,
+/// soft threshold), so the accounting the runtime published for the previous
+/// model must not be served as current under the new one. The runtime drops it;
+/// the next assembled request republishes it with the new policy.
+#[tokio::test]
+async fn a_model_switch_drops_the_published_context_accounting() {
+    isolate_global_config();
+    let server = MockServer::start(vec![text("answer")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("configs/providers")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("configs/models")).unwrap();
+    std::fs::write(
+        tmp.path().join("configs/providers/mock.yaml"),
+        format!(
+            "id: mock\nprotocol: openai_chat\nbase_url: {}\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+    // Two models with DIFFERENT windows: the switch must change the resolved
+    // capacity, which is exactly what makes the old accounting wrong.
+    for (id, window) in [("m", 128_000u32), ("narrow", 32_000u32)] {
+        std::fs::write(
+            tmp.path().join(format!("configs/models/{id}.yaml")),
+            format!(
+                "id: {id}\nprovider: mock\nmodel_id: {id}\nprotocol: openai_chat\n\
+                 capabilities: {{ streaming: true, tool_calling: true, parallel_tool_calls: false, structured_output: true, reasoning: false, vision: false }}\n\
+                 limits: {{ context_window: {window}, reliable_context: {}, max_output_tokens: 1024, max_tool_schema_bytes: 8192, max_parallel_tool_calls: 1 }}\n\
+                 compatibility: {{ synthesize_tool_call_ids: true, drop_unsupported_fields: true }}\n",
+                window * 3 / 4,
+            ),
+        )
+        .unwrap();
+    }
+    let layout = Layout::from_parts(
+        tmp.path().to_path_buf(),
+        tmp.path().join("configs"),
+        tmp.path().join("state"),
+    );
+    let app = Arc::new(
+        Application::assemble(layout)
+            .unwrap()
+            .with_collaboration(leveler_agent::CollaborationMode::Chat),
+    );
+    let model = ModelRef::new("mock", "m");
+    let session = app.create_session(&model, "goal").await.unwrap();
+    let client = Arc::new(InProcessRuntimeClient::new(
+        app.clone(),
+        model,
+        PermissionProfile::Assisted,
+        false,
+    ));
+    let mut rx = client.subscribe();
+
+    client
+        .send(ClientCommand::SubmitMessage {
+            session_id: session.clone(),
+            content: "hello".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut rx).await;
+
+    let before = query_context_optional(&client, &mut rx, &session).await;
+    let before = before.expect("the request that just ran published an accounting");
+    assert_eq!(before.context_window_tokens, Some(128_000));
+    assert!(before.input_capacity_tokens.is_some(), "{before:?}");
+
+    client
+        .send_observed(ClientCommand::SelectModel {
+            session_id: session.clone(),
+            model: ModelRef::new("mock", "narrow"),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        query_context_optional(&client, &mut rx, &session)
+            .await
+            .is_none(),
+        "the previous model's window and soft threshold must not survive the switch"
+    );
+}
+
+/// Like [`query_context`], but `None` is a valid answer (a session whose
+/// runtime holds no current accounting) and is returned rather than fatal.
+async fn query_context_optional(
+    client: &Arc<InProcessRuntimeClient>,
+    rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    session: &SessionId,
+) -> Option<leveler_model::ContextAccounting> {
+    let query_id = CommandId::generate();
+    client
+        .send(ClientCommand::QueryContext {
+            session_id: session.clone(),
+            query_id: Some(query_id.clone()),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Ok(RuntimeEvent::ContextLoaded {
+                query_id: answered,
+                accounting,
+            })) if answered.as_ref() == Some(&query_id) => return accounting,
+            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => panic!("the context query was never answered"),
+        }
+    }
+}
+
 /// A timed-out summary consumes the remaining wall time even though no epoch
 /// is committed. A second manual request must not receive that time again.
 #[tokio::test]

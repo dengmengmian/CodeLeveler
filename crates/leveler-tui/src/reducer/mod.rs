@@ -88,6 +88,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             let refresh = state.active_screen == Screen::Trace
                 && crate::observability::should_refresh_trace(&event);
             let opened = matches!(event, RuntimeEvent::SessionOpened { .. });
+            let session_updated = matches!(&event, RuntimeEvent::SessionUpdated { .. });
             let restored_history = matches!(
                 &event,
                 RuntimeEvent::SessionHistoryLoaded { query_id, session_id, .. }
@@ -119,6 +120,15 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                 effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
                     session_id: state.session_id.clone(),
                 }));
+            }
+            // Opening/resuming a session and changing a setting both make the
+            // runtime's live accounting current (or, after a model switch or a
+            // compaction, explicitly none). Ask for it so the compaction-axis
+            // gauge and `/context` are right without waiting for the next turn.
+            // The answer is the runtime's own snapshot; the client never
+            // recomputes one.
+            if opened || session_updated {
+                effects.push(Effect::Send(crate::context::issue_query(state)));
             }
             // History owns the restored transcript; ask only after its matching
             // response, while the user has left this input window untouched.
@@ -1882,6 +1892,8 @@ fn apply_remote(state: &mut AppState, outcome: crate::action::RemoteOutcome) {
 mod child_identity_tests;
 #[cfg(test)]
 mod command_row_tests;
+#[cfg(test)]
+mod context_refresh_tests;
 #[cfg(test)]
 mod history_replay_tests;
 
