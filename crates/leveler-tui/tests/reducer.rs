@@ -1301,6 +1301,21 @@ fn help_expand_copy_matches_latest_group_semantics() {
         "the binding targets the TOOL GROUP it says it does: {}",
         t.key_expand
     );
+    // The help prints the key in its own column, so a description that repeats
+    // it renders as `Ctrl+O   Ctrl+O：…`.
+    assert!(
+        !t.key_expand.contains("Ctrl+O"),
+        "the description must not repeat the key label: {}",
+        t.key_expand
+    );
+    for locale in [leveler_tui::Locale::Zh, leveler_tui::Locale::En] {
+        let text = locale.text();
+        assert!(
+            !text.key_expand.contains("Ctrl+O"),
+            "{locale:?} repeats the key label: {}",
+            text.key_expand
+        );
+    }
 }
 
 #[test]
