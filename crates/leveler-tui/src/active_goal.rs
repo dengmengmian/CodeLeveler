@@ -299,7 +299,17 @@ pub fn header(state: &AppState, max: usize) -> Vec<Span<'static>> {
         goal.phase()
     };
     let elapsed = fmt_elapsed(goal.elapsed_at(now).as_secs());
-    spans(phase, goal.title(), &elapsed, &state.theme, max)
+    // A terminal/paused phase must SAY so in the header. The glyph alone (◐/!)
+    // and a decoration arrow read as a live turn: on a failed turn the header
+    // kept `◐ <task> · 3m 00s ↗` for as long as the user looked at it, which is
+    // exactly the "is my task still running?" question the header exists to
+    // answer. Running/resuming keep the marker; paused/failed state the phase.
+    let note = match phase {
+        GoalPhase::Paused => Some(state.t().goal_phase_paused),
+        GoalPhase::Failed => Some(state.t().goal_phase_failed),
+        GoalPhase::Running | GoalPhase::Resuming | GoalPhase::Completed => None,
+    };
+    spans(phase, goal.title(), &elapsed, note, &state.theme, max)
 }
 
 pub fn has_visible_goal(state: &AppState) -> bool {
@@ -313,19 +323,37 @@ pub fn has_visible_goal(state: &AppState) -> bool {
 ///
 /// Priority when space runs out is glyph + elapsed + detail affordance first,
 /// title last: the full objective is always reachable even when its summary is
-/// truncated away.
+/// truncated away. A `note` (the phase word for a paused/failed turn) outranks
+/// the title too: "still running?" must stay answerable in a narrow pane.
 pub fn spans(
     phase: GoalPhase,
     title: &str,
     elapsed: &str,
+    note: Option<&str>,
     theme: &Theme,
     max: usize,
 ) -> Vec<Span<'static>> {
     let ink = Style::default().fg(phase.ink(theme));
     let glyph = phase.glyph();
     let elapsed_w = UnicodeWidthStr::width(elapsed);
-    // `glyph`, a separating space, the elapsed clock, and " ↗".
-    let minimum = 1 + 1 + elapsed_w + 2;
+    // A live turn is trailed by the accent marker; a paused/failed one is
+    // trailed by its phase word instead, so the two can never look alike.
+    // When the word does not fit, it is dropped rather than replaced by the
+    // live marker: a narrow pane must never paint a dead turn as a live one.
+    let tail = match note {
+        Some(note) => {
+            let word = format!(" · {note}");
+            if 1 + 1 + elapsed_w + UnicodeWidthStr::width(word.as_str()) <= max {
+                word
+            } else {
+                String::new()
+            }
+        }
+        None => " ↗".to_string(),
+    };
+    let tail_w = UnicodeWidthStr::width(tail.as_str());
+    // `glyph`, a separating space, the elapsed clock, and the tail.
+    let minimum = 1 + 1 + elapsed_w + tail_w;
     if minimum > max {
         // Not even the clock fits; the identity header keeps the row.
         return Vec::new();
@@ -334,15 +362,15 @@ pub fn spans(
         vec![
             Span::styled(format!("{glyph} "), ink),
             Span::styled(elapsed.to_string(), ink),
-            Span::styled(" ↗", Style::default().fg(theme.accent.primary)),
+            Span::styled(tail.clone(), Style::default().fg(theme.accent.primary)),
         ]
     };
     let title = title.trim();
     if title.is_empty() {
         return clock();
     }
-    // `glyph`, space, title, " · ", elapsed, " ↗".
-    let fixed = 1 + 1 + 3 + elapsed_w + 2;
+    // `glyph`, space, title, " · ", elapsed, and the tail.
+    let fixed = 1 + 1 + 3 + elapsed_w + tail_w;
     let title_room = max.saturating_sub(fixed);
     if title_room < MIN_TITLE_COLS {
         return clock();
@@ -353,7 +381,7 @@ pub fn spans(
         Span::styled(shown, Style::default().fg(theme.text.primary)),
         Span::styled(" · ", Style::default().fg(theme.text.muted)),
         Span::styled(elapsed.to_string(), ink),
-        Span::styled(" ↗", Style::default().fg(theme.accent.primary)),
+        Span::styled(tail, Style::default().fg(theme.accent.primary)),
     ]
 }
 
@@ -465,6 +493,7 @@ mod tests {
             GoalPhase::Running,
             "修复断线后任务续接",
             "6m 42s",
+            None,
             &theme,
             120,
         );
@@ -473,6 +502,22 @@ mod tests {
         assert_eq!(spans[1].style.fg, Some(theme.text.primary));
         assert_eq!(spans[0].style.fg, Some(theme.status.running));
         assert_eq!(spans[3].style.fg, Some(theme.status.running));
+    }
+
+    /// A turn that has ENDED must not be painted as a live one. The header may
+    /// keep a failed/paused indicator (it is actionable), but it has to state
+    /// the phase and must not wear the live marker.
+    #[test]
+    fn a_terminal_phase_states_itself_and_never_wears_the_live_marker() {
+        let theme = Theme::dark();
+        let paused = spans(GoalPhase::Paused, "你好", "3m 00s", Some("已暂停"), &theme, 120);
+        assert_eq!(plain(&paused), "◐ 你好 · 3m 00s · 已暂停");
+        assert!(!plain(&paused).contains('↗'), "{} ", plain(&paused));
+        let failed = spans(GoalPhase::Failed, "你好", "1s", Some("失败"), &theme, 120);
+        assert_eq!(plain(&failed), "! 你好 · 1s · 失败");
+        // Running keeps the live marker.
+        let running = spans(GoalPhase::Running, "你好", "1s", None, &theme, 120);
+        assert_eq!(plain(&running), "◆ 你好 · 1s ↗");
     }
 
     #[test]
@@ -485,7 +530,7 @@ mod tests {
             (GoalPhase::Completed, theme.status.success),
             (GoalPhase::Failed, theme.status.error),
         ] {
-            let spans = spans(phase, "t", "1s", &theme, 80);
+            let spans = spans(phase, "t", "1s", None, &theme, 80);
             assert_eq!(spans[0].style.fg, Some(color), "{phase:?}");
             assert_eq!(spans[3].style.fg, Some(color), "{phase:?}");
         }
@@ -498,6 +543,7 @@ mod tests {
             GoalPhase::Running,
             "非常长的中文目标名称需要被截断",
             "6m 42s",
+            None,
             &theme,
             20,
         );
@@ -519,6 +565,7 @@ mod tests {
             GoalPhase::Running,
             "修复断线后任务续接修复断线",
             "10s",
+            None,
             &theme,
             24,
         );
@@ -528,18 +575,20 @@ mod tests {
     #[test]
     fn a_very_narrow_row_keeps_only_the_glyph_and_clock() {
         let theme = Theme::dark();
-        let spans = spans(GoalPhase::Paused, "some goal", "9m 47s", &theme, 10);
-        assert_eq!(plain(&spans), "◐ 9m 47s ↗");
-        assert_eq!(width(&spans), 10);
+        // The phase word is dropped when it cannot fit, and the live marker is
+        // NOT substituted for it: the glyph keeps stating the phase.
+        let paused = spans(GoalPhase::Paused, "some goal", "9m 47s", Some("已暂停"), &theme, 10);
+        assert_eq!(plain(&paused), "◐ 9m 47s");
+        assert!(width(&paused) <= 10, "{}", width(&paused));
     }
 
     #[test]
     fn too_narrow_for_the_clock_yields_no_indicator() {
         let theme = Theme::dark();
-        assert!(spans(GoalPhase::Running, "t", "1m 00s", &theme, 4).is_empty());
+        assert!(spans(GoalPhase::Running, "t", "1m 00s", None, &theme, 4).is_empty());
         // Empty title still degrades to the clock when the clock fits.
         assert_eq!(
-            plain(&spans(GoalPhase::Running, "", "6s", &theme, 8)),
+            plain(&spans(GoalPhase::Running, "", "6s", None, &theme, 8)),
             "◆ 6s ↗"
         );
     }
@@ -552,7 +601,7 @@ mod tests {
             "修复：断线/ESC 后任务无法续接",
             "fix\u{2028}line break",
         ] {
-            let spans = spans(GoalPhase::Running, title, "2m 05s", &theme, 30);
+            let spans = spans(GoalPhase::Running, title, "2m 05s", None, &theme, 30);
             let text = plain(&spans);
             assert!(!text.contains('\n'), "one row only: {text:?}");
             assert!(

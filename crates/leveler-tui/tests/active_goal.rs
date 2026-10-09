@@ -256,7 +256,54 @@ fn completion_turns_green_and_fails_stay() {
     assert_eq!(goal.phase(), leveler_tui::active_goal::GoalPhase::Failed);
     assert!(!goal.is_expired(std::time::Instant::now() + std::time::Duration::from_secs(3600)));
     let screen = rendered(&mut failed, 80, 12);
+    // The failure indicator stays (it is actionable) but must never read as a
+    // live turn: it states the phase and drops the live marker.
     assert!(screen.contains("! 调查 Windows CI flaky test"), "{screen}");
+    assert!(
+        screen.contains("失败"),
+        "a failed turn says so in words: {screen}"
+    );
+    assert!(
+        !screen.contains('↗'),
+        "a failed turn never wears the live marker: {screen}"
+    );
+}
+
+/// A resumable failure pauses the goal: the header must say `已暂停` instead of
+/// leaving `◐ … ↗`, which is what the audit read as "still running".
+#[test]
+fn a_paused_turn_states_the_phase_and_drops_the_live_marker() {
+    let mut state = state();
+    submit(&mut state, "跑完整测试");
+    reduce(
+        &mut state,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "provider unavailable".into(),
+            failure: Some(leveler_client_protocol::UiFailure {
+                category: leveler_client_protocol::FailureCategory::Provider,
+                source: leveler_client_protocol::FailureSource::Provider,
+                provider: None,
+                model: None,
+                provider_code: None,
+                request_id: None,
+                status: Some(503),
+                retries: Some(3),
+                retryability: leveler_client_protocol::FailureRetryability::Safe,
+                delivery: leveler_client_protocol::FailureDelivery::Responded,
+                summary: "模型服务暂时不可用。".to_string(),
+                detail: String::new(),
+            }),
+        }),
+    );
+    let goal = state.active_goal.as_ref().unwrap();
+    assert_eq!(goal.phase(), leveler_tui::active_goal::GoalPhase::Paused);
+    let screen = rendered(&mut state, 80, 12);
+    assert!(screen.contains("◐"), "{screen}");
+    assert!(screen.contains("已暂停"), "the phase is stated: {screen}");
+    assert!(
+        !screen.contains('↗'),
+        "a paused turn never wears the live marker: {screen}"
+    );
 }
 
 #[test]
