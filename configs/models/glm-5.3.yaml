@@ -22,7 +22,8 @@ limits:
   # Quality bound: where long-context recall is expected to degrade.
   # Declared facts only — never a runtime cap, and no longer the fold
   # threshold by itself: the effective threshold is
-  # `min(reliable_context, context_window - max_output_tokens - headroom)`.
+  # `min(reliable_context, soft_percent% × (context_window - max_output_tokens
+  # - headroom))`, where the soft share defaults to 95%.
   reliable_context: 786432
   max_output_tokens: 131072
   max_tool_schema_bytes: 32768
