@@ -1590,11 +1590,7 @@ fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
 ///
 /// The mouse path is unchanged: a click targets exactly the row it lands on.
 fn toggle_current_expand(state: &mut AppState) {
-    let Some(index) = state
-        .transcript
-        .last_tool_group_index()
-        .or_else(|| state.transcript.last_foldable_index())
-    else {
+    let Some(index) = crate::conversation::build::keyboard_expand_target(state) else {
         return;
     };
     if let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index) {
