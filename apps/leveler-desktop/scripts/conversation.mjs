@@ -8,6 +8,7 @@ import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
+if(process.env.LEVELER_CONVERSATION_SCENARIO==='full-execution'){await import('./conversation-runtime.mjs');}else{
 const root=fileURLToPath(new URL('..',import.meta.url));
 const temporary=await mkdtemp('/tmp/leveler-desktop-conversation-'),home=path.join(temporary,'home');await mkdir(home);
 const output=process.env.LEVELER_ACCEPTANCE_OUTPUT||path.join(root,'acceptance-output/desktop');await mkdir(output,{recursive:true});
@@ -79,4 +80,6 @@ try{
 finally{
  try{if(application&&clipboardCaptured)await application.evaluate(async({clipboard})=>{const original=globalThis.__conversationClipboard;if(original.length)await clipboard.write(original);else clipboard.clear();delete globalThis.__conversationClipboard;});}
  finally{if(application)await application.close();await new Promise(resolve=>server.close(resolve));await cleanupRuntime();}
+}
+
 }
