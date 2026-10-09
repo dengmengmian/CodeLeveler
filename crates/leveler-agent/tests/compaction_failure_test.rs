@@ -546,3 +546,67 @@ async fn a_successful_compaction_still_folds() {
         "a produced briefing must still commit a fold"
     );
 }
+
+/// A fold that elides real history but leaves the message COUNT unchanged is
+/// durable in its `ContextSnapshot`, not in the `Compacted` notice.
+///
+/// The retained tail keeps the newest exchange whole (the provider refuses an
+/// orphaned tool result) and the objective pin plus breadcrumb can cost about
+/// what the elided rounds did, so the count is not a reliable "a fold happened"
+/// signal. The notice spells counts and stays count-based; anything that must
+/// not miss a real fold — resume, the RC evidence — reads the persisted folded
+/// surface, whose breadcrumb row is the product's own marker.
+#[tokio::test]
+async fn a_count_equal_fold_is_recorded_in_its_snapshot_not_the_notice() {
+    let dir = workspace();
+    // The first round reads the LARGE file, the newest one the small file: the
+    // fold keeps the newest exchange whole and elides the large one, releasing
+    // real context, while the message count stays the same.
+    let mut script = vec![read(0, "src/big.rs"), read(1, "src/lib.rs")];
+    script.push(answer("done"));
+    let runtime = CompactionRuntime::new(script, Summary::Produced);
+    let mut events = Vec::new();
+    let outcome = executor(
+        dir.path(),
+        runtime.clone(),
+        soft_policy(),
+        StepLimits::default(),
+    )
+    .run(
+        "investigate the source",
+        &mut |event| events.push(event),
+        &mut NoopSink,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("turn");
+
+    assert_eq!(outcome.stop_reason, StopReason::Answered);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Compacted { .. })),
+        "the count did not shrink, so the count-spelled notice must not claim it did"
+    );
+    let folded = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ContextSnapshot { messages } => Some(messages.clone()),
+            _ => None,
+        })
+        .expect("the folded surface is persisted for resume");
+    assert!(
+        folded.iter().any(|message| message
+            .text_content()
+            .contains(COMPACTION_BREADCRUMB_MARKER)),
+        "the snapshot carries the product's own fold marker: {folded:?}"
+    );
+    assert!(
+        !folded
+            .iter()
+            .any(|message| message.content.iter().any(|part| matches!(part,
+                ContentPart::ToolResult { result }
+                    if result.content.contains("padding line for compaction pressure")))),
+        "the elided round's result really left the active surface: {folded:?}"
+    );
+}
