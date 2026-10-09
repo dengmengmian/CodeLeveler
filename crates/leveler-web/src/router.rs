@@ -531,6 +531,7 @@ mod tests {
             let snapshot = self.snapshot(&self.known[0]).await?;
             Ok(SessionBootstrap {
                 session: snapshot,
+                notice: None,
                 context_window: 4096,
             })
         }

@@ -117,6 +117,7 @@ impl LocalRuntimeService for TestService {
         *self.last_create.lock().unwrap() = Some(request);
         Ok(SessionBootstrap {
             session: self.mock.snapshot(&SessionId::new("s1")).await?,
+            notice: None,
             context_window: 4096,
         })
     }
