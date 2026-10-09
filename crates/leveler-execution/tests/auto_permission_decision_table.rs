@@ -45,15 +45,23 @@ fn full(command_line: &str) -> Requirement {
 }
 
 fn assert_allowed(command_line: &str) {
-    assert_eq!(auto(command_line), Requirement::Auto, "Auto must allow");
-    assert_eq!(full(command_line), Requirement::Auto, "Full must allow");
+    assert_eq!(
+        auto(command_line),
+        Requirement::Auto,
+        "Auto must allow: {command_line}"
+    );
+    assert_eq!(
+        full(command_line),
+        Requirement::Auto,
+        "Full must allow: {command_line}"
+    );
 }
 
 fn assert_asked(command_line: &str) {
     assert_eq!(
         auto(command_line),
         Requirement::NeedApproval,
-        "Auto must ask for a dangerous operation"
+        "Auto must ask for a dangerous operation: {command_line}"
     );
     assert_eq!(
         full(command_line),
@@ -129,6 +137,14 @@ fn auto_allows_temporary_and_workspace_file_operations() {
         "cargo build",
         "npm run build",
     ] {
+        // `shell_invocation` executes cmd on Windows: exercise native temporary
+        // destinations there instead of POSIX /tmp and $TMPDIR spellings.
+        #[cfg(windows)]
+        let native_command_line = command_line
+            .replace("/tmp/", "%TEMP%\\")
+            .replace("$TMPDIR/", "%TEMP%\\");
+        #[cfg(windows)]
+        let command_line = native_command_line.as_str();
         assert_allowed(command_line);
     }
 }
