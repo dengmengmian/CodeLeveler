@@ -1692,3 +1692,131 @@ async fn tool_rounds_stay_paired_across_follow_up_failure_retry_and_resume() {
         assert!(paired, "{id} is in the resumed history with its result");
     }
 }
+
+/// The goal checkpoint's verbatim tail is bounded by BOTH the round count and a
+/// token budget, exactly like the fold's tail — and what it returns must still
+/// fit the model's usable window.
+///
+/// The old shape kept a count-bounded tail and never measured the result, so a
+/// recent stretch of near-cap tool results could push the first request past the
+/// model's hard capacity: the request is then rejected by the provider, and the
+/// durable checkpoint that caused it is not the thing the user asked for.
+#[tokio::test]
+async fn a_heavy_recent_tail_never_pushes_the_goal_request_past_capacity() {
+    let h = harness(vec![
+        text("first window answer"),
+        text("briefing for the heavy transcript"),
+        text("resumed answer"),
+    ])
+    .await;
+    let mut s = spec(&h, "keep the parser contract");
+    s.runtime.continuation = ContinuationPolicy::bounded(1);
+    let session = h.engine.create_task(&s).await.unwrap();
+
+    // A first bounded window creates the goal the checkpoint path needs.
+    let _ = h
+        .engine
+        .run(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("bounded first window");
+
+    // Six near-cap tool rounds: 6 x 47KiB results. Realistic (the per-result cap
+    // is 48KiB) and far heavier than the mock model's usable window once the
+    // harness contract and tool schemas are added.
+    let mut payloads = vec![
+        serde_json::to_string(&Message::text(
+            Role::User,
+            "GOAL_HEAD keep the parser contract",
+        ))
+        .unwrap(),
+    ];
+    for index in 0..6 {
+        let call_id = format!("heavy-{index}");
+        payloads.push(
+            serde_json::to_string(&Message::from_parts(
+                Role::Assistant,
+                vec![ContentPart::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new(call_id.clone()),
+                        name: "run_command".into(),
+                        arguments: serde_json::json!({"command": "cat big.log"}),
+                    },
+                }],
+                None,
+            ))
+            .unwrap(),
+        );
+        payloads.push(
+            serde_json::to_string(&Message::from_parts(
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    result: leveler_model::ToolResultContent {
+                        call_id: ToolCallId::new(call_id),
+                        content: format!("HEAVY_{index} {}", "x".repeat(47 * 1024)),
+                        is_error: false,
+                    },
+                }],
+                None,
+            ))
+            .unwrap(),
+        );
+    }
+    MessageRepository::new(&h.db)
+        .append(&session, &payloads, leveler_core::now())
+        .await
+        .unwrap();
+
+    h.engine
+        .resume(&session, &s, &mut |_| {}, CancellationToken::new())
+        .await
+        .expect("the resumed goal turn must not send an illegal request");
+
+    // The provider-visible request, not the transcript: the tail is only legal
+    // if the request built from it fits the window minus the completion
+    // reservation (mock profile: 128000 - 4096).
+    let requests = h.requests.lock().unwrap().clone();
+    let main = requests
+        .iter()
+        .rev()
+        .find(|request| !matches!(request.tool_choice, leveler_model::ToolChoice::None))
+        .expect("the resumed goal asks the model");
+
+    // The provider-visible request, not the transcript: the tail is only legal
+    // if the request built from it fits the window minus the completion
+    // reservation (mock profile: 128000 - 4096).
+    let projected = leveler_model::RequestProjection::for_request(
+        main,
+        leveler_model::ReasoningReplayContract::NONE,
+    )
+    .estimated_tokens();
+    let hard_capacity = 128_000 - 4_096;
+    assert!(
+        projected <= hard_capacity,
+        "the first resumed request must fit the model's usable window: \
+         projected {projected} > capacity {hard_capacity}"
+    );
+
+    // The elided prefix was offered to the briefing, and the task anchor the
+    // checkpoint carries is still in the request.
+    let briefing = requests
+        .iter()
+        .find(|request| matches!(request.tool_choice, leveler_model::ToolChoice::None))
+        .expect("an over-threshold goal asks for a briefing");
+    let briefing_body = serde_json::to_string(&briefing.messages).unwrap();
+    let main_body = serde_json::to_string(&main.messages).unwrap();
+    let elided = (0..6)
+        .filter(|index| !main_body.contains(&format!("HEAVY_{index}")))
+        .count();
+    assert!(elided > 0, "the fixture must elide heavy rounds");
+    for index in 0..6 {
+        let marker = format!("HEAVY_{index}");
+        assert!(
+            main_body.contains(&marker) || briefing_body.contains(&marker),
+            "an elided heavy round must reach the briefing: {marker}"
+        );
+    }
+    assert!(
+        main_body.contains("keep the parser contract"),
+        "the goal anchor survives the checkpoint cut"
+    );
+}
