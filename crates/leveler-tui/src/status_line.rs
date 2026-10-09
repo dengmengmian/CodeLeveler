@@ -238,24 +238,62 @@ pub(crate) fn fmt_tokens_compact(n: u32) -> String {
     }
 }
 
-/// Footer context line: `Context 8k/1M`. Hidden until real usage is known.
+/// Footer context line on the COMPACTION axis: `Context 34% · 8k/24k`.
+///
+/// The denominator is the resolved EFFECTIVE INPUT CAPACITY, not the model
+/// window: that is the number the fold thresholds are measured against, so it is
+/// the one a user watching compaction needs. When the runtime resolved no
+/// capacity the window is the only total and the older `Context 8k/1M` shape
+/// stays — the two are never mixed into one number.
+///
+/// Hidden until real usage is known.
 pub(crate) fn footer_ctx_chip(state: &AppState) -> Option<String> {
+    let t = state.t();
+    // The compaction axis: projected input over the effective input capacity.
+    let share = |percent: u64, used: u64, total: u64| {
+        t.footer_context_share
+            .replacen("{}", &percent.to_string(), 1)
+            .replacen("{}", &fmt_tokens_compact(used as u32), 1)
+            .replacen("{}", &fmt_tokens_compact(total as u32), 1)
+    };
+    // The model-window axis, whose shape names itself.
+    let window_shape = |used: u64, window: u64| {
+        t.footer_context
+            .replacen("{}", &fmt_tokens_compact(used as u32), 1)
+            .replacen("{}", &fmt_tokens_compact(window as u32), 1)
+    };
+
+    // The runtime's own snapshot first: it carries the resolved budget, and the
+    // TUI never recomputes a figure it was given.
+    if let Some(acc) = state.context.loaded.as_ref() {
+        let used = acc.used_tokens.max(u64::from(state.token_input));
+        if used > 0 {
+            if let Some(capacity) = acc.input_capacity_tokens.filter(|capacity| *capacity > 0) {
+                return Some(share(
+                    acc.compaction_utilization_percent().unwrap_or(0),
+                    used,
+                    capacity,
+                ));
+            }
+            if let Some(window) = acc.context_window_tokens.filter(|window| *window > 0) {
+                return Some(window_shape(used, window));
+            }
+        }
+    }
+
+    // No snapshot yet: the state's own fields, and the window is the only total.
+    // With no declared window there is no denominator, so the chip stays hidden
+    // rather than showing a bare numerator.
     let window = state.context_window();
     if window == 0 {
         return None;
     }
-    let used = state.context_tokens.max(state.token_input);
+    let used = u64::from(state.context_tokens.max(state.token_input));
     // Fresh session with zero usage: hide — don't show a fake 0/window gauge.
     if used == 0 {
         return None;
     }
-    Some(
-        state
-            .t()
-            .footer_context
-            .replacen("{}", &fmt_tokens_compact(used), 1)
-            .replacen("{}", &fmt_tokens_compact(window), 1),
-    )
+    Some(window_shape(used, u64::from(window)))
 }
 
 /// Prefix-cache hit rate when the provider reported cached tokens.
@@ -829,6 +867,60 @@ mod tests {
             footer_usage_line(&state).as_deref(),
             Some("上下文 41k/1M · 缓存 42%")
         );
+    }
+
+    /// The footer's context chip is the COMPACTION axis when the runtime
+    /// resolved an effective input capacity, and the model-window axis (the
+    /// older shape) when it did not. The two are never mixed into one number.
+    #[test]
+    fn footer_ctx_chip_uses_the_resolved_effective_input_capacity() {
+        let mut state = test_state();
+        let projection = leveler_model::RequestProjection::project(
+            &[leveler_model::Message::text(
+                leveler_model::Role::User,
+                &"x".repeat(40_000),
+            )],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        );
+        let accounting = leveler_model::ContextAccounting::compute(
+            leveler_model::ModelRef::new("m", "m"),
+            &projection,
+            Some(128_000),
+            Some(64_000),
+            None,
+        )
+        .with_input_budget(Some(96_000), Some(32_000), Some(0));
+        state.context.loaded = Some(accounting);
+        // 10 000 projected tokens of a 96 000-token effective input capacity.
+        assert_eq!(
+            footer_ctx_chip(&state).as_deref(),
+            Some("上下文 10% · 10k/96k")
+        );
+        // With no resolved capacity the window is the only total, and the old
+        // shape — which names that axis by itself — is what shows.
+        let projection = leveler_model::RequestProjection::project(
+            &[leveler_model::Message::text(
+                leveler_model::Role::User,
+                &"x".repeat(40_000),
+            )],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        );
+        let window_only = leveler_model::ContextAccounting::compute(
+            leveler_model::ModelRef::new("m", "m"),
+            &projection,
+            Some(128_000),
+            None,
+            None,
+        );
+        state.context.loaded = Some(window_only);
+        // The snapshot's projected input is the figure that shows; the state's
+        // own usage fields are only the no-snapshot fallback.
+        state.context_tokens = 41_181;
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 10k/128k"));
     }
 
     #[test]

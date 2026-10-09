@@ -174,6 +174,24 @@ pub struct LoadedConfig {
     pub assist_prompt_suggestions: bool,
     /// `[assist].away_summary`: the idle "welcome back" recap affordance.
     pub assist_away_summary: bool,
+    /// `[context].soft_percent`: the harness soft compaction percent for every
+    /// model that does not override it. `None` → the product default.
+    pub context_soft_percent: Option<u8>,
+    /// `[models.<id>].soft_compaction_percent`, keyed by the table id as
+    /// written. A per-model share of the effective input capacity.
+    pub model_context_soft_percent: Vec<(String, u8)>,
+}
+
+impl LoadedConfig {
+    /// The soft compaction percent for `model`: its own entry first, then the
+    /// global default. `None` leaves the product default in force.
+    pub fn soft_percent_for(&self, model: &leveler_model::ModelRef) -> Option<u8> {
+        self.model_context_soft_percent
+            .iter()
+            .find(|(name, _)| name == model.model.as_str())
+            .map(|(_, percent)| *percent)
+            .or(self.context_soft_percent)
+    }
 }
 
 /// The ONE decision about whether durable project memory is part of this
@@ -338,6 +356,8 @@ impl Default for LoadedConfig {
             browser_default: None,
             assist_prompt_suggestions: true,
             assist_away_summary: true,
+            context_soft_percent: None,
+            model_context_soft_percent: Vec::new(),
         }
     }
 }
@@ -552,6 +572,8 @@ impl Application {
             browser_default: global.browser_default,
             assist_prompt_suggestions: global.assist_prompt_suggestions,
             assist_away_summary: global.assist_away_summary,
+            context_soft_percent: global.context_soft_percent,
+            model_context_soft_percent: global.model_soft_percent,
         })
     }
 
@@ -1136,8 +1158,18 @@ impl Application {
     pub(crate) async fn execution_overrides_for_session(
         &self,
         session_scope: Option<&str>,
+        model: Option<&leveler_model::ModelRef>,
     ) -> Result<Option<leveler_agent::coding::ExecutionOverrides>, AppError> {
         let mut overrides = self.execution_overrides.clone();
+        // Harness context policy: the model's own `soft_compaction_percent`,
+        // else `[context].soft_percent`. A model that declares neither keeps the
+        // product default (`None`), so the resolution chain stays one ladder:
+        // explicit override → model entry → global default → product default.
+        if let Some(model) = model
+            && let Some(percent) = self.config.soft_percent_for(model)
+        {
+            overrides.get_or_insert_with(Default::default).context_soft_percent = Some(percent);
+        }
         if let Some(scope) = session_scope {
             let db = self.open_database().await?;
             let raw = SessionRepository::new(&db)
