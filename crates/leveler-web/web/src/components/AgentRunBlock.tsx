@@ -15,6 +15,7 @@ import {
 import { useBridge } from '../state/bridge';
 import { completionTruth } from '../lib/completionTruth';
 import {
+  confirmedDiffs,
   foldedThoughts,
   turnBlocks,
   type FoldedThought,
@@ -28,6 +29,7 @@ import { formatSeconds, statsLine, summarizeTools } from '../lib/toolstats';
 import { presentTurnEnd, turnFooterPrimary } from '../lib/turn';
 import { CopyButton } from './CopyButton';
 import { ToolCallRow } from './ToolCallRow';
+import { ConfirmedDiffBlock } from './ConfirmedDiffBlock';
 
 /** 每秒重渲染以刷新耗时；active=false 时停走。 */
 export function useElapsedSeconds(startedAt: number | null, active: boolean): number {
@@ -76,6 +78,9 @@ function ExecutionRoundBlock({
         <span className="rs-round-label">{roundHeadline(round)}</span>
         <span className="rs-round-stat">{statsLine(stats)}</span>
       </div>
+      {!showRows && confirmedDiffs(round.tools).map(diff => (
+        <ConfirmedDiffBlock key={diff.toolId} diff={diff} />
+      ))}
       {showRows && (
         <div className="rs-tools">
           {round.tools.map((t) => (
@@ -173,10 +178,10 @@ export function AgentRunBlock({
   if (variant === 'process') {
     const tools = toolsProp ?? current?.tools ?? [];
     const backgroundTasks = bgProp ?? current?.backgroundTasks ?? [];
-    if (tools.length === 0 && backgroundTasks.length === 0) return null;
+    const thoughts = thoughtsProp ?? foldedThoughts(current?.thoughts ?? []);
+    if (tools.length === 0 && backgroundTasks.length === 0 && thoughts.length === 0) return null;
     const stats = summarizeTools(tools);
     const rounds = groupExecutionRounds(tools);
-    const thoughts = thoughtsProp ?? [];
     return (
       <div className="run-summary r-process tone-muted">
         {tools.length > 0 && <div className="rs-sub">{statsLine(stats)}</div>}

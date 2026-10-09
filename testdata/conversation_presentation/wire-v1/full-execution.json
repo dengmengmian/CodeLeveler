@@ -1,0 +1,5844 @@
+{
+  "producer": {
+    "source_sha": "ac1bc5a22a7bdc6056cb0abcd02ba5a99de34435",
+    "binary_sha256": "7bb5e72700cb0219eb1da14066c3738572a50b480bd9949067b5178e35764b70",
+    "provider_sha256": "67ef7699128af5c47a30fc9c3cbd183d0acf6f1bd0073c921f15b2c0e04c159d",
+    "scenario": "full_execution",
+    "raw_capture": "phase35/web-baseline/wire-frames.json"
+  },
+  "frames": [
+    {
+      "type": "snapshot",
+      "session": {
+        "id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+        "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+        "goal": "看下现在最新模型，同步更新配置",
+        "task_status": "idle",
+        "model": {
+          "provider": "fixture",
+          "model": "main"
+        },
+        "mode": "assisted",
+        "branch": null,
+        "status": "created",
+        "messages": [],
+        "pending_interactions": [],
+        "available_models": [
+          {
+            "provider": "fixture",
+            "model": "main"
+          }
+        ],
+        "vision": false,
+        "last_sequence": null,
+        "active_tools": [],
+        "plan": null,
+        "diff": null,
+        "checkpoints": [],
+        "recaps": [],
+        "user_shells": [],
+        "completion_report": null,
+        "thinking": {
+          "configured": "high",
+          "current": "high",
+          "effective": "auto",
+          "access": "unsupported"
+        },
+        "work_profile": "single",
+        "collaboration": "chat"
+      }
+    },
+    {
+      "type": "snapshot",
+      "session": {
+        "id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+        "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+        "goal": "看下现在最新模型，同步更新配置",
+        "task_status": "idle",
+        "model": {
+          "provider": "fixture",
+          "model": "main"
+        },
+        "mode": "assisted",
+        "branch": null,
+        "status": "created",
+        "messages": [],
+        "pending_interactions": [],
+        "available_models": [
+          {
+            "provider": "fixture",
+            "model": "main"
+          }
+        ],
+        "vision": false,
+        "last_sequence": null,
+        "active_tools": [],
+        "plan": null,
+        "diff": null,
+        "checkpoints": [],
+        "recaps": [],
+        "user_shells": [],
+        "completion_report": null,
+        "thinking": {
+          "configured": "high",
+          "current": "high",
+          "effective": "auto",
+          "access": "unsupported"
+        },
+        "work_profile": "single",
+        "collaboration": "chat"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "checkpoint_created",
+        "checkpoint": {
+          "id": "c13027ed-64e1-400e-94f2-d9851399bc13",
+          "label": "看下现在最新模型，同步更新配置",
+          "ordinal": 0
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "user_message_added",
+        "message": {
+          "id": "a5a1c7ec-d2e5-4a6d-9bac-654602a0fe2c",
+          "role": "user",
+          "text": "看下现在最新模型，同步更新配置"
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "memory_list",
+        "query_id": "74856047-bb72-4f70-9791-c2f756bf9e70",
+        "memory_dir": "/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/home/state/projects/-private-tmp-codeleveler-stability-20261009-phase35-web-baseline-isolated-1pkshh-workspace-3fb3da68be59f7f8/memory",
+        "active": [],
+        "archived": [],
+        "pending": []
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "b0314a7b-fef5-40a9-9161-20ac3ed406a7",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 1,
+            "request_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 0,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 1,
+          "requests": [],
+          "tools": [],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "679bd61c-5a9b-4add-8ef4-3d3a73224835",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 1,
+            "request_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 0,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 1,
+          "requests": [],
+          "tools": [],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "02f26d76-a8f9-4a52-8d35-1e9f1ce08d63",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 1,
+            "request_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 0,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 1,
+          "requests": [],
+          "tools": [],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "context_usage",
+        "accounting": {
+          "model": {
+            "provider": "fixture",
+            "model": "main"
+          },
+          "context_window_tokens": 131072,
+          "compact_at_tokens": 65536,
+          "used_tokens": 8193,
+          "free_tokens": 122879,
+          "token_count_kind": "estimated",
+          "pressure": "normal",
+          "categories": [
+            {
+              "name": "tool_definitions",
+              "label": "Tool definitions",
+              "tokens": 6091
+            },
+            {
+              "name": "system",
+              "label": "System",
+              "tokens": 2047
+            },
+            {
+              "name": "messages",
+              "label": "Messages",
+              "tokens": 55,
+              "children": [
+                {
+                  "name": "user",
+                  "label": "User",
+                  "tokens": 55
+                }
+              ]
+            }
+          ],
+          "reasoning_projection": {
+            "requested": "all",
+            "contract": {
+              "representation": "none",
+              "scope": "never",
+              "missing": "omit",
+              "integrity": "unconstrained",
+              "state": "client_managed",
+              "native_context": {
+                "reasoning_pruning": false,
+                "native_compaction": false,
+                "server_state": false
+              }
+            },
+            "captured_turns": 0,
+            "carried_turns": 0,
+            "protocol_protected_turns": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_attempt_reset",
+        "message_id": null
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_started"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_delta",
+        "delta": "先看 provider catalog。"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_completed",
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_started",
+        "id": "c1",
+        "name": "read_file",
+        "arguments": "{\"path\":\"src/models.rs\"}",
+        "parallel": true,
+        "model_step": 1,
+        "answer_effect": "work"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_started",
+        "id": "c2",
+        "name": "read_file",
+        "arguments": "{\"path\":\"src/config.rs\"}",
+        "parallel": true,
+        "model_step": 1,
+        "answer_effect": "work"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "dc1876f5-8bb2-42b2-8cb2-1f3687210c52",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 6,
+            "request_count": 1,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 2,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 8194,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 8194,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 6,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 0,
+              "failed": 0,
+              "unfinished": 2
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "98694d4f-bcc5-4904-91b8-5022b5280ac3",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 6,
+            "request_count": 1,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 2,
+            "tool_finished": 0,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 8194,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 8194,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 6,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 0,
+              "failed": 0,
+              "unfinished": 2
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_completed",
+        "id": "c1",
+        "ok": true,
+        "preview": "     1 const RECOMMENDED: &[&str] = &[\"gpt-5.6\"];\n",
+        "duration_ms": 22
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_completed",
+        "id": "c2",
+        "ok": true,
+        "preview": "     1 const MODELS: &str = \"recommended\";\n",
+        "duration_ms": 21
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "context_usage",
+        "accounting": {
+          "model": {
+            "provider": "fixture",
+            "model": "main"
+          },
+          "context_window_tokens": 131072,
+          "compact_at_tokens": 65536,
+          "used_tokens": 8258,
+          "free_tokens": 122814,
+          "token_count_kind": "estimated",
+          "pressure": "normal",
+          "categories": [
+            {
+              "name": "tool_definitions",
+              "label": "Tool definitions",
+              "tokens": 6091
+            },
+            {
+              "name": "system",
+              "label": "System",
+              "tokens": 2049
+            },
+            {
+              "name": "messages",
+              "label": "Messages",
+              "tokens": 118,
+              "children": [
+                {
+                  "name": "user",
+                  "label": "User",
+                  "tokens": 55
+                },
+                {
+                  "name": "tool_calls",
+                  "label": "Tool calls",
+                  "tokens": 26,
+                  "calls": 2
+                },
+                {
+                  "name": "tool_results",
+                  "label": "Tool results",
+                  "tokens": 37,
+                  "calls": 2,
+                  "children": [
+                    {
+                      "name": "read_file",
+                      "label": "read_file",
+                      "tokens": 37,
+                      "calls": 2
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "reasoning_projection": {
+            "requested": "all",
+            "contract": {
+              "representation": "none",
+              "scope": "never",
+              "missing": "omit",
+              "integrity": "unconstrained",
+              "state": "client_managed",
+              "native_context": {
+                "reasoning_pruning": false,
+                "native_compaction": false,
+                "server_state": false
+              }
+            },
+            "captured_turns": 1,
+            "carried_turns": 0,
+            "protocol_protected_turns": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_attempt_reset",
+        "message_id": null
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_started"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_delta",
+        "delta": "再核对推荐映射。"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_completed",
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "616ce7cc-3a54-42bd-87b4-6d51dbd9b462",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 9,
+            "request_count": 2,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 2,
+            "tool_finished": 2,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 9,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_started",
+        "id": "c3",
+        "name": "grep",
+        "arguments": "{\"pattern\":\"recommended\"}",
+        "parallel": true,
+        "model_step": 2,
+        "answer_effect": "work"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_started",
+        "id": "c4",
+        "name": "grep",
+        "arguments": "{\"pattern\":\"MODELS\"}",
+        "parallel": true,
+        "model_step": 2,
+        "answer_effect": "work"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "ec28754d-eea7-4c40-a9c5-651693802399",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 14,
+            "request_count": 2,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 4,
+            "tool_finished": 2,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 14,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 0,
+              "failed": 0,
+              "unfinished": 2
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_completed",
+        "id": "c3",
+        "ok": true,
+        "preview": "src/config.rs:1:const MODELS: &str = \"recommended\";\n",
+        "duration_ms": 3
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_completed",
+        "id": "c4",
+        "ok": true,
+        "preview": "src/config.rs:1:const MODELS: &str = \"recommended\";\n",
+        "duration_ms": 3
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "8c0f39f2-e922-4309-b551-b4e1c9dfb82c",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 14,
+            "request_count": 2,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 4,
+            "tool_finished": 2,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 14,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "6018b3b8-a643-4775-a575-1b4acdaebbde",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 17,
+            "request_count": 2,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 4,
+            "tool_finished": 4,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 17,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "c0feacea-bc02-449b-afd9-c8c9ff98d98e",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 17,
+            "request_count": 2,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 4,
+            "tool_finished": 4,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 17,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "738dcde9-6e3e-4c66-91db-6ae14cc51de7",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 17,
+            "request_count": 2,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 4,
+            "tool_finished": 4,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 2,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 16453,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 17,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "context_usage",
+        "accounting": {
+          "model": {
+            "provider": "fixture",
+            "model": "main"
+          },
+          "context_window_tokens": 131072,
+          "compact_at_tokens": 65536,
+          "used_tokens": 8320,
+          "free_tokens": 122752,
+          "token_count_kind": "estimated",
+          "pressure": "normal",
+          "categories": [
+            {
+              "name": "tool_definitions",
+              "label": "Tool definitions",
+              "tokens": 6091
+            },
+            {
+              "name": "system",
+              "label": "System",
+              "tokens": 2049
+            },
+            {
+              "name": "messages",
+              "label": "Messages",
+              "tokens": 180,
+              "children": [
+                {
+                  "name": "user",
+                  "label": "User",
+                  "tokens": 55
+                },
+                {
+                  "name": "tool_calls",
+                  "label": "Tool calls",
+                  "tokens": 47,
+                  "calls": 4
+                },
+                {
+                  "name": "tool_results",
+                  "label": "Tool results",
+                  "tokens": 78,
+                  "calls": 4,
+                  "children": [
+                    {
+                      "name": "grep",
+                      "label": "grep",
+                      "tokens": 41,
+                      "calls": 2
+                    },
+                    {
+                      "name": "read_file",
+                      "label": "read_file",
+                      "tokens": 37,
+                      "calls": 2
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "reasoning_projection": {
+            "requested": "all",
+            "contract": {
+              "representation": "none",
+              "scope": "never",
+              "missing": "omit",
+              "integrity": "unconstrained",
+              "state": "client_managed",
+              "native_context": {
+                "reasoning_pruning": false,
+                "native_compaction": false,
+                "server_state": false
+              }
+            },
+            "captured_turns": 2,
+            "carried_turns": 0,
+            "protocol_protected_turns": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_attempt_reset",
+        "message_id": null
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_message_started",
+        "message_id": "19de3cfd-a57d-4121-95c6-d50ea37ae23e"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_text_delta",
+        "message_id": "19de3cfd-a57d-4121-95c6-d50ea37ae23e",
+        "delta": "映射还停在旧模型，先改掉。"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_message_completed",
+        "message_id": "19de3cfd-a57d-4121-95c6-d50ea37ae23e"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_started",
+        "id": "c5",
+        "name": "apply_patch",
+        "arguments": "{\"patch\":\"*** Begin Patch\\n*** Update File: src/models.rs\\n@@\\n-const RECOMMENDED: &[&str] = &[\\\"gpt-5.6\\\"];\\n+const RECOMMENDED: &[&str] = &[\\\"gpt-6\\\"];\\n*** End Patch\"}",
+        "parallel": false,
+        "model_step": 3,
+        "answer_effect": "work"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "36b30946-984e-45a7-a598-dd55b03fbac4",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 21,
+            "request_count": 3,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 5,
+            "tool_finished": 4,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 3,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 24775,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 3,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 24775,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            },
+            {
+              "sequence": 21,
+              "created_at": "2026-10-09T00:40:57.953786+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 21,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            },
+            {
+              "id": "60ae3091-5bb5-4227-9c4e-a6cdc43075ef",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8322,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.953186+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            },
+            {
+              "name": "apply_patch",
+              "class": "edit",
+              "calls": 1,
+              "succeeded": 0,
+              "failed": 0,
+              "unfinished": 1
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_completed",
+        "id": "c5",
+        "ok": true,
+        "preview": "Applied patch:\nM src/models.rs\n",
+        "duration_ms": 13,
+        "applied_diff": "--- a/src/models.rs\n+++ b/src/models.rs\n@@ -1,1 +1,1 @@\n-const RECOMMENDED: &[&str] = &[\"gpt-5.6\"];\n+const RECOMMENDED: &[&str] = &[\"gpt-6\"];\n"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "context_usage",
+        "accounting": {
+          "model": {
+            "provider": "fixture",
+            "model": "main"
+          },
+          "context_window_tokens": 131072,
+          "compact_at_tokens": 65536,
+          "used_tokens": 8418,
+          "free_tokens": 122654,
+          "token_count_kind": "estimated",
+          "pressure": "normal",
+          "categories": [
+            {
+              "name": "tool_definitions",
+              "label": "Tool definitions",
+              "tokens": 6091
+            },
+            {
+              "name": "system",
+              "label": "System",
+              "tokens": 2049
+            },
+            {
+              "name": "messages",
+              "label": "Messages",
+              "tokens": 278,
+              "children": [
+                {
+                  "name": "user",
+                  "label": "User",
+                  "tokens": 55
+                },
+                {
+                  "name": "assistant",
+                  "label": "Assistant",
+                  "tokens": 13
+                },
+                {
+                  "name": "tool_calls",
+                  "label": "Tool calls",
+                  "tokens": 120,
+                  "calls": 5
+                },
+                {
+                  "name": "tool_results",
+                  "label": "Tool results",
+                  "tokens": 90,
+                  "calls": 5,
+                  "children": [
+                    {
+                      "name": "grep",
+                      "label": "grep",
+                      "tokens": 41,
+                      "calls": 2
+                    },
+                    {
+                      "name": "read_file",
+                      "label": "read_file",
+                      "tokens": 37,
+                      "calls": 2
+                    },
+                    {
+                      "name": "apply_patch",
+                      "label": "apply_patch",
+                      "tokens": 12,
+                      "calls": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "reasoning_projection": {
+            "requested": "all",
+            "contract": {
+              "representation": "none",
+              "scope": "never",
+              "missing": "omit",
+              "integrity": "unconstrained",
+              "state": "client_managed",
+              "native_context": {
+                "reasoning_pruning": false,
+                "native_compaction": false,
+                "server_state": false
+              }
+            },
+            "captured_turns": 2,
+            "carried_turns": 0,
+            "protocol_protected_turns": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_attempt_reset",
+        "message_id": null
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_started"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_delta",
+        "delta": "跑一下映射测试。"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_completed",
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "520b7b86-efbc-407f-87d8-b36c3106066c",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 24,
+            "request_count": 3,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 5,
+            "tool_finished": 5,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 3,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 24775,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 3,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 24775,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            },
+            {
+              "sequence": 21,
+              "created_at": "2026-10-09T00:40:57.953786+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 22,
+              "created_at": "2026-10-09T00:40:57.963655+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 28,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "21"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 24,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            },
+            {
+              "id": "60ae3091-5bb5-4227-9c4e-a6cdc43075ef",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8322,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.953186+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            },
+            {
+              "name": "apply_patch",
+              "class": "edit",
+              "calls": 1,
+              "succeeded": 1,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 10,
+              "avg_ms": 10
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_started",
+        "id": "c6",
+        "name": "run_command",
+        "arguments": "{\"args\":[\"-c\",\"echo tests-passed\"],\"program\":\"sh\"}",
+        "parallel": false,
+        "model_step": 4,
+        "answer_effect": "work"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "3199a884-559c-4d4e-9b3a-343a3fa8bde6",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 28,
+            "request_count": 4,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 6,
+            "tool_finished": 5,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 4,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 33195,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 4,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 33195,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            },
+            {
+              "sequence": 21,
+              "created_at": "2026-10-09T00:40:57.953786+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 22,
+              "created_at": "2026-10-09T00:40:57.963655+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 28,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "21"
+                }
+              ]
+            },
+            {
+              "sequence": 28,
+              "created_at": "2026-10-09T00:40:57.969259+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "shell",
+              "title": "run_command",
+              "target": "sh",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c6"
+                },
+                {
+                  "key": "Tool",
+                  "value": "run_command"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 28,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            },
+            {
+              "id": "60ae3091-5bb5-4227-9c4e-a6cdc43075ef",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8322,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.953186+00:00"
+            },
+            {
+              "id": "288c1ebf-0822-4399-89c9-9d62defc0d5b",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8420,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.968710+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            },
+            {
+              "name": "apply_patch",
+              "class": "edit",
+              "calls": 1,
+              "succeeded": 1,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 10,
+              "avg_ms": 10
+            },
+            {
+              "name": "run_command",
+              "class": "shell",
+              "calls": 1,
+              "succeeded": 0,
+              "failed": 0,
+              "unfinished": 1
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_output",
+        "id": "c6",
+        "stream": "stdout",
+        "chunk": "tests-passed\n"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "tool_call_completed",
+        "id": "c6",
+        "ok": true,
+        "preview": "exit: 0\n--- stdout ---\ntests-passed\n\n[execution policy] Filesystem writes were confined to the granted paths.\n\n[note] a workspace mutation baseline was unavailable; file changes made by this command were not tracked and cannot be rolled back.\n",
+        "duration_ms": 42,
+        "exit_code": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "context_usage",
+        "accounting": {
+          "model": {
+            "provider": "fixture",
+            "model": "main"
+          },
+          "context_window_tokens": 131072,
+          "compact_at_tokens": 65536,
+          "used_tokens": 8540,
+          "free_tokens": 122532,
+          "token_count_kind": "estimated",
+          "pressure": "normal",
+          "categories": [
+            {
+              "name": "tool_definitions",
+              "label": "Tool definitions",
+              "tokens": 6091
+            },
+            {
+              "name": "system",
+              "label": "System",
+              "tokens": 2050
+            },
+            {
+              "name": "messages",
+              "label": "Messages",
+              "tokens": 399,
+              "children": [
+                {
+                  "name": "user",
+                  "label": "User",
+                  "tokens": 55
+                },
+                {
+                  "name": "assistant",
+                  "label": "Assistant",
+                  "tokens": 13
+                },
+                {
+                  "name": "tool_calls",
+                  "label": "Tool calls",
+                  "tokens": 144,
+                  "calls": 6
+                },
+                {
+                  "name": "tool_results",
+                  "label": "Tool results",
+                  "tokens": 187,
+                  "calls": 6,
+                  "children": [
+                    {
+                      "name": "run_command",
+                      "label": "run_command",
+                      "tokens": 97,
+                      "calls": 1
+                    },
+                    {
+                      "name": "grep",
+                      "label": "grep",
+                      "tokens": 41,
+                      "calls": 2
+                    },
+                    {
+                      "name": "read_file",
+                      "label": "read_file",
+                      "tokens": 37,
+                      "calls": 2
+                    },
+                    {
+                      "name": "apply_patch",
+                      "label": "apply_patch",
+                      "tokens": 12,
+                      "calls": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "reasoning_projection": {
+            "requested": "all",
+            "contract": {
+              "representation": "none",
+              "scope": "never",
+              "missing": "omit",
+              "integrity": "unconstrained",
+              "state": "client_managed",
+              "native_context": {
+                "reasoning_pruning": false,
+                "native_compaction": false,
+                "server_state": false
+              }
+            },
+            "captured_turns": 3,
+            "carried_turns": 0,
+            "protocol_protected_turns": 0
+          }
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_attempt_reset",
+        "message_id": null
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_started"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_delta",
+        "delta": "测试通过，确认 catalog 默认值没有回退。"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "reasoning_completed",
+        "elapsed_ms": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_message_started",
+        "message_id": "c205e913-1376-4028-827b-a9bf76f9f501"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_text_delta",
+        "message_id": "c205e913-1376-4028-827b-a9bf76f9f501",
+        "delta": "已同步最新模型。"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "9490e069-22cf-47b2-aa71-8154dc44657d",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:57.899899+00:00",
+            "status": "running",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 30,
+            "request_count": 5,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 6,
+            "tool_finished": 6,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 66,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 5,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 41736,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 5,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 41736,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            },
+            {
+              "sequence": 21,
+              "created_at": "2026-10-09T00:40:57.953786+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 22,
+              "created_at": "2026-10-09T00:40:57.963655+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 28,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "21"
+                }
+              ]
+            },
+            {
+              "sequence": 28,
+              "created_at": "2026-10-09T00:40:57.969259+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "shell",
+              "title": "run_command",
+              "target": "sh",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c6"
+                },
+                {
+                  "key": "Tool",
+                  "value": "run_command"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 29,
+              "created_at": "2026-10-09T00:40:58.008161+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "shell",
+              "title": "run_command",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 73,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c6"
+                },
+                {
+                  "key": "Tool",
+                  "value": "run_command"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "28"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 30,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            },
+            {
+              "id": "60ae3091-5bb5-4227-9c4e-a6cdc43075ef",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8322,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.953186+00:00"
+            },
+            {
+              "id": "288c1ebf-0822-4399-89c9-9d62defc0d5b",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8420,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.968710+00:00"
+            },
+            {
+              "id": "ee56f3be-5b49-4660-becc-410e5085efe7",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "stop",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8541,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:58.013705+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            },
+            {
+              "name": "apply_patch",
+              "class": "edit",
+              "calls": 1,
+              "succeeded": 1,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 10,
+              "avg_ms": 10
+            },
+            {
+              "name": "run_command",
+              "class": "shell",
+              "calls": 1,
+              "succeeded": 1,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 39,
+              "avg_ms": 39
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 1,
+            "workspace_snapshots": 0,
+            "review_stages": []
+          },
+          "relations": []
+        }
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "assistant_message_completed",
+        "message_id": "c205e913-1376-4028-827b-a9bf76f9f501"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "settling_dependencies"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_progress",
+        "phase": "active",
+        "closing": false,
+        "no_progress_streak": 0
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "settling_dependencies"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "settling_dependencies"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "review"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "resolving_outcome"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_finalizing",
+        "stage": "publishing_terminal"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "turn_answered"
+      }
+    },
+    {
+      "type": "event",
+      "event": {
+        "type": "observability_loaded",
+        "query_id": "df15af17-b9b8-4eae-a0d8-318f980b7610",
+        "observation": {
+          "session": {
+            "session_id": "f43405bc-aec8-4472-9da9-b6aea356c51f",
+            "goal": "看下现在最新模型，同步更新配置",
+            "repository": "/private/tmp/codeleveler-stability-20261009/phase35/web-baseline/isolated-1pkshh/workspace",
+            "created_at": "2026-10-09T00:40:57.833906+00:00",
+            "updated_at": "2026-10-09T00:40:58.018564+00:00",
+            "status": "completed",
+            "model": "fixture/main",
+            "work_profile": "single",
+            "collaboration": "chat",
+            "last_sequence": 43,
+            "request_count": 5,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_latency_ms": 2,
+            "last_latency_ms": 2,
+            "request_failures": 0,
+            "request_retries": 0,
+            "tool_started": 6,
+            "tool_finished": 6,
+            "compact_count": 0,
+            "subagent_started": 0,
+            "duration_ms": 185,
+            "lanes": [
+              {
+                "lane": "main",
+                "requests": 5,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 41736,
+                "projected_reasoning_tokens": 0
+              },
+              {
+                "lane": "children",
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+              },
+              {
+                "lane": "total",
+                "requests": 5,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "projected_input_tokens": 41736,
+                "projected_reasoning_tokens": 0
+              }
+            ]
+          },
+          "window": [
+            {
+              "sequence": 1,
+              "created_at": "2026-10-09T00:40:57.900908+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn started",
+              "target": "chat",
+              "status": "info",
+              "event_type": "turn_started",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                }
+              ]
+            },
+            {
+              "sequence": 5,
+              "created_at": "2026-10-09T00:40:57.911066+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/models.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 6,
+              "created_at": "2026-10-09T00:40:57.911898+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "src/config.rs",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 7,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c1"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "5"
+                }
+              ]
+            },
+            {
+              "sequence": 8,
+              "created_at": "2026-10-09T00:40:57.929845+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "read",
+              "title": "read_file",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 18,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c2"
+                },
+                {
+                  "key": "Tool",
+                  "value": "read_file"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "6"
+                }
+              ]
+            },
+            {
+              "sequence": 13,
+              "created_at": "2026-10-09T00:40:57.935483+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "recommended",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 14,
+              "created_at": "2026-10-09T00:40:57.936208+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "MODELS",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 15,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 26,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c3"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "13"
+                }
+              ]
+            },
+            {
+              "sequence": 16,
+              "created_at": "2026-10-09T00:40:57.937530+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "search",
+              "title": "grep",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 8,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c4"
+                },
+                {
+                  "key": "Tool",
+                  "value": "grep"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "14"
+                }
+              ]
+            },
+            {
+              "sequence": 21,
+              "created_at": "2026-10-09T00:40:57.953786+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 22,
+              "created_at": "2026-10-09T00:40:57.963655+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "edit",
+              "title": "apply_patch",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 28,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c5"
+                },
+                {
+                  "key": "Tool",
+                  "value": "apply_patch"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "21"
+                }
+              ]
+            },
+            {
+              "sequence": 28,
+              "created_at": "2026-10-09T00:40:57.969259+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "shell",
+              "title": "run_command",
+              "target": "sh",
+              "status": "running",
+              "event_type": "tool_call_started",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c6"
+                },
+                {
+                  "key": "Tool",
+                  "value": "run_command"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                }
+              ]
+            },
+            {
+              "sequence": 29,
+              "created_at": "2026-10-09T00:40:58.008161+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "shell",
+              "title": "run_command",
+              "target": "",
+              "status": "ok",
+              "duration_ms": 73,
+              "event_type": "tool_call_finished",
+              "fields": [
+                {
+                  "key": "Call",
+                  "value": "c6"
+                },
+                {
+                  "key": "Tool",
+                  "value": "run_command"
+                },
+                {
+                  "key": "Agent",
+                  "value": "main"
+                },
+                {
+                  "key": "PairedStart",
+                  "value": "28"
+                }
+              ]
+            },
+            {
+              "sequence": 34,
+              "created_at": "2026-10-09T00:40:58.016260+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "finalization started",
+              "target": "2026-10-09T00:40:58.014659+00:00",
+              "status": "running",
+              "event_type": "finalization_started",
+              "fields": [
+                {
+                  "key": "At",
+                  "value": "2026-10-09T00:40:58.014659+00:00"
+                }
+              ]
+            },
+            {
+              "sequence": 36,
+              "created_at": "2026-10-09T00:40:58.016260+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "finalization settling_dependencies",
+              "target": "2026-10-09T00:40:58.014661+00:00",
+              "status": "running",
+              "event_type": "finalization_phase_started",
+              "fields": [
+                {
+                  "key": "Phase",
+                  "value": "settling_dependencies"
+                },
+                {
+                  "key": "At",
+                  "value": "2026-10-09T00:40:58.014661+00:00"
+                }
+              ]
+            },
+            {
+              "sequence": 37,
+              "created_at": "2026-10-09T00:40:58.016260+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "finalization settling_turn",
+              "target": "2026-10-09T00:40:58.014751+00:00",
+              "status": "running",
+              "event_type": "finalization_phase_started",
+              "fields": [
+                {
+                  "key": "Phase",
+                  "value": "settling_turn"
+                },
+                {
+                  "key": "At",
+                  "value": "2026-10-09T00:40:58.014751+00:00"
+                }
+              ]
+            },
+            {
+              "sequence": 38,
+              "created_at": "2026-10-09T00:40:58.016914+00:00",
+              "turn_id": "e1adcce8-e676-4177-aee5-ccf3f551346d",
+              "class": "terminal",
+              "title": "turn Completed",
+              "target": "Answered",
+              "status": "ok",
+              "event_type": "turn_finished",
+              "fields": [
+                {
+                  "key": "Turn",
+                  "value": "e1adcce8-e676-4177-aee5-ccf3f551346d"
+                },
+                {
+                  "key": "Model steps",
+                  "value": "5"
+                },
+                {
+                  "key": "Outcome",
+                  "value": "Completed"
+                }
+              ]
+            },
+            {
+              "sequence": 39,
+              "created_at": "2026-10-09T00:40:58.017433+00:00",
+              "class": "terminal",
+              "title": "finalization review",
+              "target": "2026-10-09T00:40:58.017425+00:00",
+              "status": "running",
+              "event_type": "finalization_phase_started",
+              "fields": [
+                {
+                  "key": "Phase",
+                  "value": "review"
+                },
+                {
+                  "key": "At",
+                  "value": "2026-10-09T00:40:58.017425+00:00"
+                }
+              ]
+            },
+            {
+              "sequence": 40,
+              "created_at": "2026-10-09T00:40:58.017776+00:00",
+              "class": "agent",
+              "title": "review not_required",
+              "target": "independent_review off",
+              "status": "info",
+              "event_type": "review_stage",
+              "fields": [
+                {
+                  "key": "Action",
+                  "value": "not_required"
+                }
+              ]
+            },
+            {
+              "sequence": 41,
+              "created_at": "2026-10-09T00:40:58.018050+00:00",
+              "class": "terminal",
+              "title": "finalization resolving_outcome",
+              "target": "2026-10-09T00:40:58.018042+00:00",
+              "status": "running",
+              "event_type": "finalization_phase_started",
+              "fields": [
+                {
+                  "key": "Phase",
+                  "value": "resolving_outcome"
+                },
+                {
+                  "key": "At",
+                  "value": "2026-10-09T00:40:58.018042+00:00"
+                }
+              ]
+            },
+            {
+              "sequence": 42,
+              "created_at": "2026-10-09T00:40:58.018277+00:00",
+              "class": "terminal",
+              "title": "finalization publishing_terminal",
+              "target": "2026-10-09T00:40:58.018271+00:00",
+              "status": "running",
+              "event_type": "finalization_phase_started",
+              "fields": [
+                {
+                  "key": "Phase",
+                  "value": "publishing_terminal"
+                },
+                {
+                  "key": "At",
+                  "value": "2026-10-09T00:40:58.018271+00:00"
+                }
+              ]
+            },
+            {
+              "sequence": 43,
+              "created_at": "2026-10-09T00:40:58.018564+00:00",
+              "class": "terminal",
+              "title": "task Completed",
+              "target": "",
+              "status": "info",
+              "event_type": "task_finished",
+              "fields": [
+                {
+                  "key": "Outcome",
+                  "value": "Completed"
+                }
+              ]
+            }
+          ],
+          "window_from": 1,
+          "window_to": 43,
+          "requests": [
+            {
+              "id": "eeada93d-101b-46bf-ae86-204931ac58e8",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8194,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.910537+00:00"
+            },
+            {
+              "id": "ebab1343-2b14-48bd-8bb4-6804384133ce",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8259,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.935071+00:00"
+            },
+            {
+              "id": "60ae3091-5bb5-4227-9c4e-a6cdc43075ef",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8322,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.953186+00:00"
+            },
+            {
+              "id": "288c1ebf-0822-4399-89c9-9d62defc0d5b",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "tool_calls",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8420,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:57.968710+00:00"
+            },
+            {
+              "id": "ee56f3be-5b49-4660-becc-410e5085efe7",
+              "provider": "fixture",
+              "model": "main",
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "finish_reason": "stop",
+              "latency_ms": 2,
+              "retry_count": 0,
+              "projected_input_tokens": 8541,
+              "projected_reasoning_tokens": 0,
+              "created_at": "2026-10-09T00:40:58.013705+00:00"
+            }
+          ],
+          "tools": [
+            {
+              "name": "read_file",
+              "class": "read",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 36,
+              "avg_ms": 18
+            },
+            {
+              "name": "grep",
+              "class": "search",
+              "calls": 2,
+              "succeeded": 2,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 3,
+              "avg_ms": 1
+            },
+            {
+              "name": "apply_patch",
+              "class": "edit",
+              "calls": 1,
+              "succeeded": 1,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 10,
+              "avg_ms": 10
+            },
+            {
+              "name": "run_command",
+              "class": "shell",
+              "calls": 1,
+              "succeeded": 1,
+              "failed": 0,
+              "unfinished": 0,
+              "total_ms": 39,
+              "avg_ms": 39
+            }
+          ],
+          "agents": [],
+          "recovery": {
+            "interrupted_turns": 0,
+            "workspace_snapshots": 0,
+            "review_stages": [
+              "not_required"
+            ]
+          },
+          "relations": []
+        }
+      }
+    }
+  ]
+}

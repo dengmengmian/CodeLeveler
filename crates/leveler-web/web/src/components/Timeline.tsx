@@ -79,7 +79,7 @@ function renderSlot(
       key={`process-${slot.userSeq}-${index}`}
       variant="process"
       tools={trace?.tools}
-      thoughts={foldedThoughts(trace?.thoughts ?? [])}
+      thoughts={trace ? foldedThoughts(trace.thoughts) : undefined}
       backgroundTasks={trace?.backgroundTasks}
     />
   );
