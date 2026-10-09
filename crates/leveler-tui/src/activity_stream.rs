@@ -8,7 +8,7 @@
 //!
 //! - **Search / Read / List — compact receipt.** A stretch of two or more
 //!   successful exploration calls collapses to ONE line that counts by kind
-//!   (`› 读取 7 个文件 · 搜索 2 次`). A burst of reads is not a decision log:
+//!   (`› 读取 7 次 · 搜索 2 次`). A burst of reads is not a decision log:
 //!   the files add nothing a reader acts on, and a row each is the
 //!   execution-log waterfall this contract removes. A LONE exploration call
 //!   keeps its evidence row (aggregating one call loses the target for no
@@ -554,7 +554,7 @@ fn push_expanded_detail(
 enum DisclosureClass {
     /// Shell commands — "Ran N shell commands".
     Shell,
-    /// File/symbol reads — "Read N files".
+    /// File/symbol read operations — not distinct file counts.
     Read,
     /// Searches and LSP lookups — "Searched codebase".
     Search,
@@ -721,7 +721,7 @@ pub(crate) fn exploration_fold_member_lines(
 }
 
 /// Whether this call is a directory listing (counted separately in the
-/// receipt: "列出 2 个目录" is a different fact from "读取 2 个文件").
+/// receipt: "列出 2 个目录" is a different fact from "读取 2 次").
 fn is_list_call(name: &str) -> bool {
     matches!(
         crate::tool_taxonomy::lookup(name).map(|e| e.kind),
@@ -730,7 +730,7 @@ fn is_list_call(name: &str) -> bool {
 }
 
 /// The bare verb a lone exploration row wears: the same vocabulary the
-/// aggregate receipt counts in, so `› 读取 a.rs` and `▸ 读取 2 个文件` read as
+/// aggregate receipt counts in, so `› 读取 a.rs` and `▸ 读取 2 次` read as
 /// one family instead of a sentence beside a tool-catalogue entry.
 ///
 /// Mirrors [`exploration_receipt_label`]'s kind split exactly — List, then
@@ -2874,7 +2874,7 @@ pub(crate) fn render_activity(
 /// into neutral [`ToolCallBlock`]s here and then run through the module's own
 /// [`disclosure_label`]. The only deliberate difference from Conversation is
 /// the fold: a finished run of the same tool reads as one settled line
-/// ("读取 6 个文件") instead of a per-call row, because a child's steps are a
+/// ("读取 6 次") instead of a per-call row, because a child's steps are a
 /// transient summary, not the evidence surface the parent transcript is.
 ///
 /// Returned lines are relative to the caller's body indent.
@@ -3270,6 +3270,32 @@ mod tests {
 
     // ── Activity weight: what a success actually proves ─────────────────────
 
+    #[test]
+    fn repeated_reads_report_operations_not_distinct_files() {
+        let calls = (0..40)
+            .map(|_| call("read_file", r#"{"path":"README.md"}"#, ToolStatus::Ok))
+            .collect();
+        let g = group(calls);
+        for (locale, expected) in [
+            (Locale::Zh, "读取 40 次"),
+            (Locale::En, "40 read operations"),
+        ] {
+            let text = render_group_text(&g, 100, locale).join("\n");
+            assert!(text.contains(expected), "{text}");
+            assert!(
+                !text.contains("40 个文件") && !text.contains("40 files"),
+                "{text}"
+            );
+            let mut running = g.clone();
+            running.open = true;
+            let text = render_group_text(&running, 100, locale).join("\n");
+            assert!(
+                text.contains("正在读取 · 40 次") || text.contains("Reading · 40 operations"),
+                "{text}"
+            );
+        }
+    }
+
     /// R1: exploration in flight reads as in flight, never as a result.
     #[test]
     fn running_reads_show_progress_not_success() {
@@ -3304,11 +3330,7 @@ mod tests {
             .collect();
         let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
         assert_eq!(lines.len(), 1, "one live receipt: {lines:?}");
-        assert_eq!(
-            lines[0].trim_end(),
-            "\u{25cc} 正在读取 · 4 个文件",
-            "{lines:?}"
-        );
+        assert_eq!(lines[0].trim_end(), "\u{25cc} 正在读取 · 4 次", "{lines:?}");
         assert!(
             !lines[0].contains("f0.rs"),
             "the files are not re-listed: {lines:?}"
@@ -3331,7 +3353,7 @@ mod tests {
     fn closed_reads_are_one_compact_receipt() {
         let lines = render_group_text(&group(reads(4)), 100, Locale::Zh);
         assert_eq!(lines.len(), 1, "one line, no children: {lines:?}");
-        assert_eq!(lines[0].trim_end(), "\u{25b8} 读取 4 个文件", "{lines:?}");
+        assert_eq!(lines[0].trim_end(), "\u{25b8} 读取 4 次", "{lines:?}");
         assert!(
             !lines[0].contains("f0.rs"),
             "the files are not re-listed: {lines:?}"
@@ -3352,7 +3374,7 @@ mod tests {
         let lines = render_group_text(&opened, 100, Locale::Zh);
         assert_eq!(
             lines[0].trim_end(),
-            "\u{25be} 读取 4 个文件",
+            "\u{25be} 读取 4 次",
             "the aggregate header stays: {lines:?}"
         );
         let text = lines.join("\n");
@@ -3554,7 +3576,7 @@ mod tests {
     // ── Tool Run: a stretch of the same tool is ONE segment ─────────────────
     //
     // Consecutive calls of the same tool used to print the tool's name once per
-    // row under a header that counted them ("▸ 读取 6 个文件" over six rows each
+    // row under a header that counted them ("▸ 读取 6 次" over six rows each
     // starting "读取文件"). The count says what the rows below already show and
     // the label says it six more times. A run states the tool once and lets its
     // children carry only what differs: the target, and how it ended.
@@ -4871,11 +4893,7 @@ mod tests {
             .collect();
         let lines = render_group_text(&open_group(calls), 100, Locale::Zh);
         assert_eq!(lines.len(), 1, "one receipt: {lines:?}");
-        assert_eq!(
-            lines[0].trim_end(),
-            "\u{25cc} 正在读取 · 7 个文件",
-            "{lines:?}"
-        );
+        assert_eq!(lines[0].trim_end(), "\u{25cc} 正在读取 · 7 次", "{lines:?}");
         assert!(
             !lines[0].contains(".rs"),
             "every member is accounted for by the count, not a row: {lines:?}"
@@ -5422,7 +5440,7 @@ mod tests {
         ]);
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert!(
-            lines[0].starts_with('▸') && lines[0].contains("读取 1 个文件 · 搜索 1 次"),
+            lines[0].starts_with('▸') && lines[0].contains("读取 1 次 · 搜索 1 次"),
             "the exploration stretch is one receipt: {lines:?}"
         );
         assert!(
@@ -5759,7 +5777,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "one receipt: {lines:?}");
         assert_eq!(
             lines[0].trim_end(),
-            "\u{25b8} 读取 2 个文件 \u{b7} 搜索 2 次",
+            "\u{25b8} 读取 2 次 \u{b7} 搜索 2 次",
             "{lines:?}"
         );
         // A failure keeps the stretch's rows so the failing target is visible.
@@ -5776,7 +5794,7 @@ mod tests {
     }
 
     /// A lone finished call is one row, and that row is the evidence: the
-    /// summary header it used to wear said "读取 1 个文件" and dropped the
+    /// summary header it used to wear said "读取 1 次" and dropped the
     /// filename, which is the only part worth reading.
     #[test]
     fn a_single_read_is_one_row_naming_its_file() {
@@ -5792,7 +5810,7 @@ mod tests {
             "the row is the evidence: {lines:?}"
         );
         assert!(
-            !lines[0].contains("读取 1 个文件"),
+            !lines[0].contains("读取 1 次"),
             "no summary over a single row: {lines:?}"
         );
     }

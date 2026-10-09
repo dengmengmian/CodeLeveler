@@ -2333,7 +2333,7 @@ mod tests {
     fn sub_agent_detail_folds_tool_runs_and_never_shows_raw_tool_names() {
         let mut state = running_child_with_activity();
         let text = render_text(&mut state, 90, 40);
-        assert!(text.contains("读取 6 个文件"), "{text}");
+        assert!(text.contains("读取 6 次"), "{text}");
         assert!(text.contains("执行了 9 个命令"), "{text}");
         assert!(
             !text.contains("run_command"),

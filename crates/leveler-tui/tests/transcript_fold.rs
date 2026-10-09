@@ -431,10 +431,7 @@ fn tool_group_1_and_2_consecutive_exploration_is_one_group() {
     settle_group(&mut s);
 
     let rows = lines(&s);
-    let receipts: Vec<&String> = rows
-        .iter()
-        .filter(|l| l.contains("读取 2 个文件"))
-        .collect();
+    let receipts: Vec<&String> = rows.iter().filter(|l| l.contains("读取 2 次")).collect();
     assert_eq!(receipts.len(), 1, "one group, one receipt: {rows:?}");
     assert!(
         receipts[0].contains("搜索 2 次"),
@@ -497,7 +494,7 @@ fn tool_group_4_collapsing_returns_to_one_row() {
     );
     assert!(
         rows.iter()
-            .any(|l| l.starts_with('▸') && l.contains("读取 2 个文件")),
+            .any(|l| l.starts_with('▸') && l.contains("读取 2 次")),
         "{rows:?}"
     );
 }
@@ -520,7 +517,7 @@ fn tool_group_5_a_run_breaks_the_exploration_group() {
     let rows = lines(&s);
     let receipt = rows
         .iter()
-        .position(|l| l.contains("读取 2 个文件"))
+        .position(|l| l.contains("读取 2 次"))
         .expect("the exploration receipt");
     let run = rows
         .iter()
@@ -578,7 +575,7 @@ fn run_thought_1_a_folded_thought_is_a_participant_of_the_run() {
     let rows = lines(&s);
     let receipt = rows
         .iter()
-        .find(|l| l.contains("读取 2 个文件"))
+        .find(|l| l.contains("读取 2 次"))
         .expect("the run receipt");
     assert!(
         !receipt.contains("思考"),
@@ -680,7 +677,7 @@ fn run_thought_4_an_open_thought_survives_the_collapsed_run() {
 
     let rows = lines(&s);
     assert!(
-        rows.iter().any(|l| l.contains("读取 2 个文件")),
+        rows.iter().any(|l| l.contains("读取 2 次")),
         "the run still forms and folds its members: {rows:?}"
     );
     assert!(
@@ -718,7 +715,7 @@ fn run_thought_5_a_thought_outside_a_run_keeps_its_own_header() {
         "a lone read keeps its own row: {rows:?}"
     );
     assert!(
-        !rows.iter().any(|l| l.contains("读取 1 个文件")),
+        !rows.iter().any(|l| l.contains("读取 1 次")),
         "no receipt for a single read: {rows:?}"
     );
 }
@@ -979,7 +976,7 @@ fn single_explore_4_two_or_more_still_aggregate() {
     read_in_round(&mut s, "r2", "b.rs", 1);
     settle_group(&mut s);
     let text = text(&s);
-    assert!(text.contains("▸ 读取 2 个文件"), "{text}");
+    assert!(text.contains("▸ 读取 2 次"), "{text}");
     assert!(!text.contains("a.rs"), "members stay folded: {text}");
 }
 
@@ -999,7 +996,7 @@ fn single_explore_5_expanded_members_use_direct_rows() {
         .expect("a group");
     toggle_fold(&mut s, group);
     let text = text(&s);
-    assert!(text.contains("▾ 读取 1 个文件 · 搜索 1 次"), "{text}");
+    assert!(text.contains("▾ 读取 1 次 · 搜索 1 次"), "{text}");
     assert!(text.contains("› 读取 a.rs"), "{text}");
     assert!(text.contains("› 搜索 \"missing model\""), "{text}");
 }
@@ -1154,7 +1151,7 @@ fn conversation_c2_exploration_is_one_collapsed_receipt() {
     assert_eq!(expected["members_visible"], false);
     let painted = text(&s);
     assert!(
-        painted.contains("读取 2 个文件 · 搜索 1 次"),
+        painted.contains("读取 2 次 · 搜索 1 次"),
         "the merged receipt is on screen: {painted}"
     );
     assert!(
