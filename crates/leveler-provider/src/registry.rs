@@ -75,6 +75,8 @@ pub enum RegistryError {
         reliable: u32,
         window: u32,
     },
+    #[error("model `{model}` cannot describe a usable request: {reason}")]
+    InvalidModelLimits { model: String, reason: String },
 }
 
 /// Inputs to assemble a registry. API keys are resolved by the caller (the app
@@ -343,15 +345,31 @@ fn adapter_for(config: &ProviderConfig) -> Result<Arc<dyn ProtocolAdapter>, Regi
 }
 
 /// Build the HTTP client for a provider with its configured timeouts/headers.
-/// The compaction threshold must leave headroom below the hard window, or a
-/// request can be sent (compaction only fires afterward) that exceeds the window
-/// and fails. A `reliable_context` of 0 means "disabled" and is allowed.
+///
+/// Two declarations must leave room to send anything at all:
+///
+/// * the compaction threshold must sit below the hard window, or a request can
+///   be sent (compaction only fires afterward) that exceeds the window and
+///   fails. A `reliable_context` of 0 means "disabled" and is allowed.
+/// * the declared limits must describe a usable request at all
+///   ([`leveler_model::validate_model_limits`]). Without input capacity the
+///   completion reservation consumes the whole window and `hard_capacity()` has
+///   no bound to report — a misdeclaration that silently removes the
+///   mandatory-fold guarantee instead of failing where it is made. The YAML
+///   catalog validates each file on load; this is the common gate for profiles
+///   that arrive from the resident `config.toml`.
 fn validate_limits(model: &str, limits: &leveler_model::ModelLimits) -> Result<(), RegistryError> {
     if limits.reliable_context > 0 && limits.reliable_context >= limits.context_window {
         return Err(RegistryError::InvalidLimits {
             model: model.to_string(),
             reliable: limits.reliable_context,
             window: limits.context_window,
+        });
+    }
+    if let Err(reason) = leveler_model::validate_model_limits(limits) {
+        return Err(RegistryError::InvalidModelLimits {
+            model: model.to_string(),
+            reason,
         });
     }
     Ok(())
@@ -541,6 +559,44 @@ mod limits_tests {
             validate_limits("m", &limits(64_000, 65_000)),
             Err(RegistryError::InvalidLimits { .. })
         ));
+    }
+
+    #[test]
+    fn a_completion_reservation_that_eats_the_window_is_rejected() {
+        let mut limits = limits(131_072, 24_000);
+        limits.max_output_tokens = 393_216;
+        assert!(matches!(
+            validate_limits("m", &limits),
+            Err(RegistryError::InvalidModelLimits { .. })
+        ));
+        // Equal is still no input room.
+        limits.max_output_tokens = 131_072;
+        assert!(matches!(
+            validate_limits("m", &limits),
+            Err(RegistryError::InvalidModelLimits { .. })
+        ));
+        // One token of room is a tight but consistent declaration.
+        limits.max_output_tokens = 131_071;
+        assert!(validate_limits("m", &limits).is_ok());
+        // `0` means "undeclared", not "reserve everything".
+        limits.max_output_tokens = 0;
+        assert!(validate_limits("m", &limits).is_ok());
+    }
+
+    /// The rule has ONE implementation: the provider gate delegates to the
+    /// model-level fact check rather than repeating its condition.
+    #[test]
+    fn the_provider_gate_reports_the_model_level_reason() {
+        let mut limits = limits(131_072, 24_000);
+        limits.max_output_tokens = 200_000;
+        let Err(RegistryError::InvalidModelLimits { model, reason }) =
+            validate_limits("m", &limits)
+        else {
+            panic!("the declaration must be refused");
+        };
+        assert_eq!(model, "m");
+        assert!(reason.contains("200000"), "{reason}");
+        assert!(reason.contains("131072"), "{reason}");
     }
 }
 
