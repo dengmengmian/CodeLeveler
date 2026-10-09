@@ -154,12 +154,13 @@ export class RuntimeBridge {
    * diff, notices, terminals) — this client replays them through the SAME
    * reducer the live stream uses.
    */
-  private requestSessionHistory(sessionId: SessionId): void {
-    const current = this.getState().current;
-    if (!current || current.id !== sessionId) return;
-    // A running turn owns the transcript: replaying under it would fight the
-    // live events for the same rows.
-    if (current.turnActive) return;
+  private requestSessionHistory(snapshot: UiSessionSnapshot): void {
+    // This snapshot has passed selection/version admission. React may still
+    // expose the previous session or its old busy state until dispatch commits.
+    const status = (snapshot.task_status ?? snapshot.status).toLowerCase();
+    if (status.includes('run') || status.includes('busy') || snapshot.finalization_stage != null ||
+        (snapshot.active_tools?.length ?? 0) > 0 || (snapshot.pending_interactions?.length ?? 0) > 0) return;
+    const sessionId = snapshot.id;
     if (this.pendingHistoryQueryId !== null) return;
     const queryId = crypto.randomUUID();
     this.pendingHistoryQueryId = queryId;
@@ -230,9 +231,8 @@ export class RuntimeBridge {
   private applySnapshot(snap: UiSessionSnapshot, contextWindow?: number | null): void {
     const { current, draft } = this.getState();
     const previousId = current?.id;
-    // A reopen (this client is being handed a session it was not showing) is
-    // the other moment the durable log, not the model context, is the truth.
-    const reopen = previousId !== undefined && previousId !== snap.id;
+    const knownVersion = this.snapshotVersions.get(snap.id);
+    if (knownVersion !== undefined && (snap.last_sequence ?? 0) < knownVersion) return;
     // 广播流里可能夹带别会话的 session_opened：只接收当前会话的整量；
     // 例外一是 selectSession 后等待目标会话 snapshot 的窗口期；
     // 例外二是 `/clear`：宿主刚建的新会话 id 与当前不同，正是要切过去的那个。
@@ -252,10 +252,8 @@ export class RuntimeBridge {
     this.snapshotVersions.set(snap.id, snap.last_sequence ?? 0);
     this.sink({ type: 'snapshot', session: snap, contextWindow });
     saveLastSession(snap.id);
-    if (reopen) {
-      this.historyLoaded.delete(snap.id);
-      this.requestSessionHistory(snap.id);
-    }
+    this.historyLoaded.delete(snap.id);
+    this.requestSessionHistory(snap);
     if (previousId !== snap.id || this.getState().observation === null) {
       this.queryObservability(snap.id);
     }
@@ -280,11 +278,6 @@ export class RuntimeBridge {
         return;
       case 'session_opened':
         this.applySnapshot(ev.session);
-        // The runtime pushed a snapshot, which means the transcript may have
-        // changed under us (`/compact`, a restored checkpoint, a resumed
-        // session). Re-read the durable log rather than trusting the model
-        // context the snapshot carries.
-        this.requestSessionHistory(ev.session.id);
         return;
       case 'session_updated':
         this.applySessionMeta(ev.session);
@@ -415,13 +408,14 @@ export class RuntimeBridge {
         this.sink({ type: 'reasoning_delta', delta: ev.delta });
         break;
       case 'session_history_loaded': {
+        // A foreign response must not consume this selection's correlation ID.
+        if (ev.session_id !== current.id) break;
         // Only this client's own answer, for the session on screen.
         if (this.pendingHistoryQueryId !== null && ev.query_id === this.pendingHistoryQueryId) {
           this.pendingHistoryQueryId = null;
         } else if (ev.query_id !== undefined && ev.query_id !== null) {
           break;
         }
-        if (ev.session_id !== current.id) break;
         this.historyLoaded.add(ev.session_id);
         this.replayHistory(ev.entries ?? [], ev.omitted_turns ?? 0);
         break;

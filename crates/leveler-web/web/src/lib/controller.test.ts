@@ -561,6 +561,7 @@ describe('session_updated vs session_opened', () => {
         status: 'idle',
         messages: [],
         active_tools: [],
+        last_sequence: 18,
       },
     });
     expect(state.current?.tools).toHaveLength(0);
@@ -768,4 +769,56 @@ describe('snapshot concurrency', () => {
     expect(frames.filter(frame => (frame.type === 'deliver' || frame.type === 'deliver_versioned_setting') && frame.command.type === 'rename_session')).toHaveLength(0);
     expect(frames[0]).toEqual({ type: 'snapshot', session_id: 'unobserved' });
   });
+});
+
+describe('durable history admission follows accepted snapshot facts before React commits', () => {
+  function deferred(currentSession = false) {
+    const state: AppState = structuredClone(initialState);
+    state.draft = false;
+    if (currentSession) reducer(state, { type: 'snapshot', session: { id: 'history-s', repository: '/repo', goal: 'g', model: null, mode: 'assisted', branch: null, status: 'running', task_status: 'running', messages: [], last_sequence: 20 } });
+    const queued: Action[] = [], sent: ClientCommand[] = [];
+    const bridge = new RuntimeBridge(action => queued.push(action), () => state);
+    Object.assign(bridge, { ws: { send(frame: UpFrame) { if (frame.type === 'deliver' || frame.type === 'deliver_versioned_setting') sent.push(frame.command); return true; }, setSession() {} } });
+    const frame = (session: UiSessionSnapshot) => (bridge as unknown as { handleFrame(frame: unknown): void }).handleFrame({ type: 'snapshot', session });
+    const idle: UiSessionSnapshot = { id: 'history-s', repository: '/repo', goal: 'g', model: null, mode: 'assisted', branch: null, status: 'idle', task_status: 'answered', messages: [], last_sequence: 30 };
+    return { state, queued, sent, bridge, frame, idle };
+  }
+  it('initial restored idle snapshot requests its own correlated durable history with current still null', () => {
+    const h = deferred(); h.frame(h.idle);
+    expect(h.state.current).toBeNull();
+    const query = h.sent.find(command => command.type === 'query_session_history');
+    expect(query).toMatchObject({ type: 'query_session_history', session_id: h.idle.id });
+    expect(query && 'query_id' in query ? query.query_id : '').not.toBe('');
+    h.frame(h.idle);
+    expect(h.sent.filter(command => command.type === 'query_session_history')).toHaveLength(1);
+  });
+  it('accepted compact idle snapshot requests history despite the previous live view still being busy', () => {
+    const h = deferred(true); h.frame(h.idle);
+    expect(h.state.current?.turnActive).toBe(true);
+    expect(h.sent.filter(command => command.type === 'query_session_history')).toHaveLength(1);
+  });
+  it('authoritative running, stale and foreign snapshots cannot admit replay', () => {
+    const h = deferred(true);
+    h.frame({ ...h.idle, status: 'running', task_status: 'running' });
+    h.frame({ ...h.idle, last_sequence: 29 });
+    h.frame({ ...h.idle, id: 'foreign' });
+    expect(h.sent.filter(command => command.type === 'query_session_history')).toHaveLength(0);
+  });
+  it('accepts an initial unversioned legacy snapshot but rejects one after observing a newer running snapshot', () => {
+    const initial = deferred(); initial.frame({ ...initial.idle, last_sequence: null });
+    expect(initial.sent.filter(command => command.type === 'query_session_history')).toHaveLength(1);
+    const observed = deferred(true);
+    observed.frame({ ...observed.idle, status: 'running', task_status: 'running' });
+    observed.frame({ ...observed.idle, last_sequence: null });
+    expect(observed.sent.filter(command => command.type === 'query_session_history')).toHaveLength(0);
+  });
+  it('a foreign history response cannot consume the selected session correlation', () => {
+    const h = deferred(true); h.frame(h.idle);
+    const query = h.sent.find(command => command.type === 'query_session_history');
+    if (!query || query.type !== 'query_session_history') throw new Error('missing query');
+    (h.bridge as unknown as { handleFrame(frame: unknown): void }).handleFrame({ type: 'event', event: { type: 'session_history_loaded', session_id: 'foreign', query_id: query.query_id, entries: [], omitted_turns: 0 } });
+    h.frame(h.idle);
+    expect(h.sent.filter(command => command.type === 'query_session_history')).toHaveLength(1);
+  });
+
 });
