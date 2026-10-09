@@ -876,7 +876,47 @@ fn a_command_settles_in_place_without_a_duplicate_row() {
     );
 }
 
-/// A chatty command cannot grow the conversation without bound.
+/// A failed command's row IS a one-line summary — so it must say how much it is
+/// not showing. Without the count a 60-line compiler report reads as a
+/// one-line result, and the fold that hides the rest is never discoverable.
+#[test]
+fn a_failed_command_declares_the_output_its_one_row_hides() {
+    let mut s = state();
+    start(&mut s, "c1");
+    let chunk: String = (1..=60).map(|i| format!("line {i}\n")).collect();
+    output(&mut s, "c1", &chunk);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("c1"),
+            ok: false,
+            preview: "error[E0277]: cannot add `&str` to `u64`\n".into(),
+            duration_ms: 120,
+            applied_diff: None,
+            exit_code: Some(101),
+            stop: None,
+        }),
+    );
+    let rows = plain(&s);
+    let summary = rows
+        .iter()
+        .find(|l| l.contains("cannot add"))
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert!(
+        summary.contains("(+59"),
+        "the summary must name what it hides (60 lines - 1 shown): {summary:?}"
+    );
+    assert!(
+        rows.len() < 20,
+        "and it stays a summary, not a dump: {}",
+        rows.len()
+    );
+}
+
+/// A chatty command cannot grow the conversation without bound — and it keeps
+/// BOTH ends of its output: a compiler report states the diagnostic and its
+/// `--> file:line` at the top and the summary at the bottom, so a tail-only
+/// window made the one line the user needed unreachable.
 #[test]
 fn expanded_output_is_bounded_and_says_what_it_hid() {
     let mut s = state();
@@ -886,9 +926,27 @@ fn expanded_output_is_bounded_and_says_what_it_hid() {
     let (_, row) = cell_of(&s, "$ certbot");
     click(&mut s, 6, row);
     let lines = plain(&s);
-    assert!(lines.iter().any(|l| l.contains("line 200")), "{lines:?}");
-    assert!(!lines.iter().any(|l| l.ends_with("line 1")), "{lines:?}");
-    assert!(lines.iter().any(|l| l.contains("行未显示")), "{lines:?}");
+    let trimmed: Vec<&str> = lines.iter().map(|l| l.trim()).collect();
+    assert!(
+        trimmed.contains(&"line 1"),
+        "the opening (where an error location lives) must survive: {lines:?}"
+    );
+    assert!(
+        trimmed.contains(&"line 200"),
+        "the closing summary must survive: {lines:?}"
+    );
+    let omitted = lines
+        .iter()
+        .find(|l| l.contains("行未显示"))
+        .unwrap_or_else(|| panic!("the omitted middle must be named: {lines:?}"));
+    assert!(
+        omitted.contains("其余") && omitted.contains("174"),
+        "the count is of the OMITTED MIDDLE (200 - 6 head - 20 tail), not a dropped head: {omitted:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("line 100")),
+        "the middle is omitted, not drawn: {lines:?}"
+    );
     assert!(lines.len() < 60, "{}", lines.len());
 }
 

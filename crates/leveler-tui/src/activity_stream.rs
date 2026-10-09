@@ -1764,6 +1764,13 @@ fn push_command_rows(
 /// Most output rows an expanded command shows; the rest is named, not drawn.
 const COMMAND_OUTPUT_ROWS: usize = 20;
 
+/// Rows of an expanded command's OPENING that stay visible beside its tail.
+///
+/// A compiler report states the diagnostic and its `--> file:line` at the top
+/// and the summary at the bottom, so a window that keeps only one end makes
+/// the other unreachable: `前 N 行未显示` hid the very line the user needed.
+const COMMAND_OUTPUT_HEAD_ROWS: usize = 6;
+
 /// Output rows a RUNNING command shows under its row: enough to see it move.
 pub(crate) const LIVE_TAIL_ROWS: usize = 6;
 
@@ -1898,14 +1905,22 @@ fn command_head(
 
 /// `137 行` for a finished command's output: counted, never poured into the
 /// transcript. `+` marks a count taken from a preview the runtime capped.
-fn command_output_count(call: &ToolCallBlock, t: &UiText) -> Option<String> {
+/// Output line count for a call's result and whether that count is a lower
+/// bound (the runtime capped the copy it sent). ONE computation, so the head
+/// fact and the collapsed fold hint cannot disagree.
+fn output_line_count(call: &ToolCallBlock) -> (usize, bool) {
     let streamed = call.output.lines().filter(|l| !l.trim().is_empty()).count();
     let previewed = preview_body_lines(call).len();
     let n = streamed.max(previewed);
+    let capped = streamed < previewed && preview_truncated(call) || call.output_truncated;
+    (n, capped)
+}
+
+fn command_output_count(call: &ToolCallBlock, t: &UiText) -> Option<String> {
+    let (n, capped) = output_line_count(call);
     if n == 0 {
         return None;
     }
-    let capped = streamed < previewed && preview_truncated(call) || call.output_truncated;
     let (pre, post) = split_placeholder(t.tool_output_lines);
     Some(format!("{pre}{n}{}{post}", if capped { "+" } else { "" }))
 }
@@ -1990,31 +2005,52 @@ fn command_unit_lines(
         } else {
             preview_body_lines(call)
         };
-        let hidden = logical.len().saturating_sub(COMMAND_OUTPUT_ROWS);
-        if hidden > 0 || call.output_truncated {
-            out.push(clip_line(
-                vec![Span::styled(
-                    format!(
-                        "{body_indent}{}",
-                        t.command_output_hidden
-                            .replace("{}", &hidden.max(1).to_string())
-                    ),
-                    meta,
-                )],
-                width,
-            ));
-        }
         let avail = width
             .saturating_sub(UnicodeWidthStr::width(body_indent.as_str()))
             .max(1);
-        for line in &logical[hidden..] {
-            out.push(clip_line(
+        let body_line = |line: &str| {
+            clip_line(
                 vec![Span::styled(
                     format!("{body_indent}{}", truncate_display(line, avail)),
                     Style::default().fg(theme.ink(Ink::Settled)),
                 )],
                 width,
+            )
+        };
+        let marker_line = |text: String| {
+            clip_line(
+                vec![Span::styled(format!("{body_indent}{text}"), meta)],
+                width,
+            )
+        };
+        let tail_start = logical.len().saturating_sub(COMMAND_OUTPUT_ROWS);
+        if call.output_truncated {
+            // This client keeps a byte TAIL, not the whole stream: the head is
+            // gone at the source, so only the surviving tail can be drawn and
+            // how much was dropped is not knowable here. Saying so beats
+            // drawing the tail as if it were the whole result.
+            out.push(marker_line(t.command_output_head_dropped.to_string()));
+            for line in &logical[tail_start..] {
+                out.push(body_line(line));
+            }
+        } else if logical.len() > COMMAND_OUTPUT_HEAD_ROWS + COMMAND_OUTPUT_ROWS {
+            // Head AND tail, with the omitted middle named rather than silently
+            // dropped: both ends of a long result carry decisions.
+            let omitted = logical.len() - COMMAND_OUTPUT_HEAD_ROWS - COMMAND_OUTPUT_ROWS;
+            for line in &logical[..COMMAND_OUTPUT_HEAD_ROWS] {
+                out.push(body_line(line));
+            }
+            out.push(marker_line(
+                t.command_output_omitted
+                    .replace("{}", &omitted.to_string()),
             ));
+            for line in &logical[tail_start..] {
+                out.push(body_line(line));
+            }
+        } else {
+            for line in &logical {
+                out.push(body_line(line));
+            }
         }
     } else if call.status == ToolStatus::Running
         && crate::tool_taxonomy::result_lifetime(&call.name)
@@ -2073,7 +2109,20 @@ fn command_unit_lines(
         && let Some(note) = failed_one_line_summary(call, t)
     {
         let stem = format!("{rail}  \u{2514} ");
-        let room = width.saturating_sub(UnicodeWidthStr::width(stem.as_str()));
+        // The one-row summary is a SUMMARY: when the command printed more than
+        // it, the row must say so. Without the count a 60-line compiler report
+        // reads as a one-line result.
+        let (total, capped) = output_line_count(call);
+        let hidden = total.saturating_sub(1);
+        let hint = if hidden > 0 {
+            let n = format!("{hidden}{}", if capped { "+" } else { "" });
+            format!(" {}", t.fold_more_lines_short.replace("{}", &n))
+        } else {
+            String::new()
+        };
+        let room = width.saturating_sub(
+            UnicodeWidthStr::width(stem.as_str()) + UnicodeWidthStr::width(hint.as_str()),
+        );
         out.push(clip_line(
             vec![
                 Span::styled(stem, subtle),
@@ -2081,6 +2130,7 @@ fn command_unit_lines(
                     truncate_display(&note, room.max(1)),
                     Style::default().fg(theme.ink(Ink::Settled)),
                 ),
+                Span::styled(hint, meta),
             ],
             width,
         ));

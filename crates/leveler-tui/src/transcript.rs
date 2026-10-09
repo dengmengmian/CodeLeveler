@@ -1327,6 +1327,16 @@ impl TranscriptState {
         (0..self.items.len()).rposition(|i| self.is_foldable_at(i))
     }
 
+    /// The index of the most recent TOOL GROUP — the entry `Ctrl+O` targets.
+    ///
+    /// `Ctrl+O` means "the latest工具组" in the product's own help, so its
+    /// target must be that, not whatever entry happened to fold last: a live
+    /// Thought sits after the tool group it belongs to, and a toggle that
+    /// follows the Thought makes every tool body unreachable from the keyboard.
+    pub fn last_tool_group_index(&self) -> Option<usize> {
+        (0..self.items.len()).rposition(|i| matches!(self.items[i], TranscriptItem::ToolGroup(_)))
+    }
+
     /// Classify replayed history, where no live event order survives: inside
     /// each user-delimited turn the LAST assistant message is the answer and
     /// every earlier one was interim narration. Only touches still-unclassified

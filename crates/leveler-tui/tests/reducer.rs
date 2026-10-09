@@ -1205,9 +1205,11 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
             applied_diff: None,
         }),
     );
-    // The live Thought is the latest foldable entry, so Ctrl+O opens IT and
-    // leaves the settled tool group alone. Both are foldable; only the newest
-    // one is the toggle's target.
+    // The live Thought sits AFTER the tool group of the round it belongs to.
+    // Ctrl+O means "最新工具组" (the product's own help), so it must reach the
+    // TOOL GROUP: targeting whatever folded last sent every keyboard fold to the
+    // Thought and left every tool body mouse-only. A Thought outside the tool
+    // group is toggled by clicking its own row.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ReasoningDelta {
@@ -1229,15 +1231,58 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
         .collect();
     assert_eq!(
         groups.iter().filter(|e| **e).count(),
-        0,
-        "Ctrl+O opens the live Thought, not the settled tool group: {groups:?}"
+        1,
+        "Ctrl+O opens the TOOL GROUP even with a live Thought after it: {groups:?}"
     );
-    let opened_thought = s.transcript.items().iter().any(|i| {
+    let open_thought = s.transcript.items().iter().any(|i| {
         matches!(i, TranscriptItem::Thought(b) if b.display == leveler_tui::fold::DisplayMode::Expanded)
     });
     assert!(
-        opened_thought,
-        "the live Thought opened: {:?}",
+        !open_thought,
+        "the Thought stays as it was; the tool group is the keyboard target: {:?}",
+        s.transcript.items()
+    );
+    // A second Ctrl+O closes it again (a toggle, not a one-way expand).
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+    );
+    let closed: Vec<_> = s
+        .transcript
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            TranscriptItem::ToolGroup(g) => Some(g.expanded()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        closed.iter().all(|e| !*e),
+        "Ctrl+O toggles the tool group: {closed:?}"
+    );
+}
+
+/// With no tool group at all the key is not dead: it reaches the newest
+/// foldable entry (a Thought), which is what the same key did before.
+#[test]
+fn ctrl_o_still_reaches_the_newest_foldable_without_a_tool_group() {
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ReasoningDelta {
+            delta: "only reasoning here".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+    );
+    let open_thought = s.transcript.items().iter().any(|i| {
+        matches!(i, TranscriptItem::Thought(b) if b.display == leveler_tui::fold::DisplayMode::Expanded)
+    });
+    assert!(
+        open_thought,
+        "no tool group: the newest foldable is still reachable: {:?}",
         s.transcript.items()
     );
 }
@@ -1247,10 +1292,13 @@ fn help_expand_copy_matches_latest_group_semantics() {
     let s = state();
     let t = s.t();
     assert!(
-        t.key_expand.contains("最新")
-            || t.key_expand.contains("latest")
-            || t.key_expand.contains("当前思考"),
-        "help must describe latest-group/thinking priority: {}",
+        t.key_expand.contains("最新") || t.key_expand.contains("latest"),
+        "help names the binding's target: {}",
+        t.key_expand
+    );
+    assert!(
+        t.key_expand.contains("工具组") || t.key_expand.contains("tool group"),
+        "the binding targets the TOOL GROUP it says it does: {}",
         t.key_expand
     );
 }
