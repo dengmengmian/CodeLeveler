@@ -13,8 +13,8 @@ use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEn
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{HighlightState, ThemeSet};
+use syntect::parsing::{ParseState, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -84,7 +84,7 @@ enum MdBlock {
     Code {
         lang: Option<String>,
         title: Option<String>,
-        lines: Arc<Vec<Vec<((u8, u8, u8), String)>>>,
+        lines: Arc<HighlightedLines>,
     },
     /// A GFM table: a header row plus body rows, each cell a run of spans.
     /// `align` has one entry per column (from the separator row).
@@ -239,7 +239,12 @@ impl MdDoc {
                     let lang = code_lang.take();
                     let title = code_title.take();
                     let lines = if lang.as_deref() == Some("diff") {
-                        Arc::new(highlight_diff(&code_buf))
+                        Arc::new(
+                            highlight_diff(&code_buf)
+                                .into_iter()
+                                .map(Arc::new)
+                                .collect(),
+                        )
                     } else {
                         highlight_code_cached(&code_buf, lang.as_deref())
                     };
@@ -1170,7 +1175,8 @@ fn theme_set() -> &'static ThemeSet {
 }
 
 /// Per-line syntax-highlighted runs: `(rgb, text)` per segment.
-type HighlightedLines = Vec<Vec<((u8, u8, u8), String)>>;
+type HighlightedLine = Arc<Vec<((u8, u8, u8), String)>>;
+type HighlightedLines = Vec<HighlightedLine>;
 
 /// Upper bounds for the memoized highlight cache. The cache is derived data:
 /// the same `(lang, code)` always maps to the same highlighted runs, and the
@@ -1182,7 +1188,7 @@ const HIGHLIGHT_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 struct HighlightEntry {
     lang: Option<String>,
-    code: String,
+    code: Arc<str>,
     lines: Arc<HighlightedLines>,
     /// Monotonic use counter; the smallest value is the eviction victim.
     last_used: u64,
@@ -1198,9 +1204,28 @@ struct HighlightCache {
     total_bytes: usize,
     hits: u64,
     misses: u64,
+    /// Only the latest computed block can continue. Its source and rows share
+    /// payload with the exact memo; old streaming prefixes retain no states.
+    active: Option<HighlightContinuation>,
+}
+
+struct HighlightContinuation {
+    lang: Option<String>,
+    code: Arc<str>,
+    committed_bytes: usize,
+    complete_lines: usize,
+    state: (HighlightState, ParseState),
+    /// Keep complete empty rows even when the display drops the final one.
+    raw_lines: HighlightedLines,
 }
 
 impl HighlightCache {
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+        self.active = None;
+    }
     /// Bump and return the next use stamp.
     fn next_tick(&mut self) -> u64 {
         self.tick = self.tick.wrapping_add(1);
@@ -1211,7 +1236,7 @@ impl HighlightCache {
     fn get(&mut self, key: u64, lang: Option<&str>, code: &str) -> Option<Arc<HighlightedLines>> {
         let tick = self.next_tick();
         let entry = self.entries.get_mut(&key)?;
-        if entry.lang.as_deref() != lang || entry.code != code {
+        if entry.lang.as_deref() != lang || entry.code.as_ref() != code {
             return None;
         }
         entry.last_used = tick;
@@ -1219,12 +1244,18 @@ impl HighlightCache {
         Some(entry.lines.clone())
     }
 
-    fn put(&mut self, key: u64, lang: Option<String>, code: String, lines: Arc<HighlightedLines>) {
+    fn put(
+        &mut self,
+        key: u64,
+        lang: Option<String>,
+        code: Arc<str>,
+        lines: Arc<HighlightedLines>,
+    ) {
         let tick = self.next_tick();
         self.misses = self.misses.wrapping_add(1);
         let bytes = code.len();
         self.total_bytes += bytes;
-        self.entries.insert(
+        let replaced = self.entries.insert(
             key,
             HighlightEntry {
                 lang,
@@ -1233,6 +1264,9 @@ impl HighlightCache {
                 last_used: tick,
             },
         );
+        if let Some(old) = replaced {
+            self.total_bytes = self.total_bytes.saturating_sub(old.code.len());
+        }
         // Evict least-recently-used entries. The just-inserted entry is always
         // kept, even if a single block alone exceeds the byte bound, because a
         // single oversized block is still the most valuable cache entry.
@@ -1284,8 +1318,7 @@ pub fn highlight_cache_stats() -> (u64, u64) {
 #[cfg(test)]
 pub fn highlight_cache_clear() {
     let mut cache = lock_cache();
-    cache.entries.clear();
-    cache.total_bytes = 0;
+    cache.clear();
 }
 
 /// Memoized [`highlight_code`]. While a message streams, every painted frame
@@ -1293,35 +1326,136 @@ pub fn highlight_cache_clear() {
 /// byte identical between frames, so this turns their repeated syntect work into
 /// a cache hit. Only the still-growing tail block can miss.
 fn highlight_code_cached(code: &str, lang: Option<&str>) -> Arc<HighlightedLines> {
+    #[cfg(test)]
+    if HIGHLIGHT_TEST_COLD.with(|cold| cold.get()) {
+        return Arc::new(highlight_code(code, lang));
+    }
+    highlight_code_with_cache(code, lang, highlight_cache())
+}
+
+fn highlight_code_with_cache(
+    code: &str,
+    lang: Option<&str>,
+    memo: &Mutex<HighlightCache>,
+) -> Arc<HighlightedLines> {
     if code.is_empty() {
         return Arc::new(Vec::new());
     }
     let key = highlight_key(code, lang);
-    let hit = {
-        let mut cache = lock_cache();
-        cache.get(key, lang, code)
+    let (hit, previous) = {
+        let mut cache = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let hit = cache.get(key, lang, code);
+        let previous = if hit.is_none() {
+            cache.active.take()
+        } else {
+            None
+        };
+        (hit, previous)
     };
     if let Some(lines) = hit {
         crate::profile::add("tui.syntect_cache_hit_count", 1);
         return lines;
     }
     let started = crate::profile::start();
-    let lines = Arc::new(highlight_code(code, lang));
+    let reuse = previous
+        .as_ref()
+        .is_some_and(|p| p.lang.as_deref() == lang && code.starts_with(p.code.as_ref()));
+    let source: Arc<str> = Arc::from(code);
+    let (lines, active) = highlight_continued(source.clone(), lang, previous.filter(|_| reuse));
+    crate::profile::add(
+        if reuse {
+            "tui.syntect_continuation_count"
+        } else {
+            "tui.syntect_cold_count"
+        },
+        1,
+    );
     crate::profile::stop(started, "tui.syntect_ms");
     crate::profile::add("tui.syntect_cache_miss_count", 1);
     {
-        let mut cache = lock_cache();
-        cache.put(
-            key,
-            lang.map(str::to_string),
-            code.to_string(),
-            lines.clone(),
-        );
+        let mut cache = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.put(key, lang.map(str::to_string), source, lines.clone());
+        cache.active = active;
     }
     lines
 }
 
+fn highlight_continued(
+    code: Arc<str>,
+    lang: Option<&str>,
+    previous: Option<HighlightContinuation>,
+) -> (Arc<HighlightedLines>, Option<HighlightContinuation>) {
+    let ss = syntax_set();
+    let theme = &theme_set().themes["base16-ocean.dark"];
+    let syntax = lang
+        .and_then(|l| ss.find_syntax_by_token(l))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let (mut h, mut raw, start) = match previous {
+        Some(mut p) => {
+            p.raw_lines.truncate(p.complete_lines);
+            crate::profile::add("tui.syntect_complete_lines_reused", p.complete_lines as u64);
+            (
+                HighlightLines::from_state(theme, p.state.0, p.state.1),
+                p.raw_lines,
+                p.committed_bytes,
+            )
+        }
+        None => (HighlightLines::new(syntax, theme), Vec::new(), 0),
+    };
+    let committed = code.rfind('\n').map_or(0, |i| i + 1);
+    let mut valid = true;
+    for line in LinesWithEndings::from(&code[start..committed]) {
+        let (row, ok) = highlight_one_line(&mut h, line, ss);
+        valid &= ok;
+        raw.push(row);
+    }
+    let complete_lines = raw.len();
+    // One checkpoint per computed suffix, not per line. Partial lines are
+    // replayed from this checkpoint and never advance its parse state.
+    let state = h.state();
+    if committed < code.len() {
+        let mut tail = HighlightLines::from_state(theme, state.0.clone(), state.1.clone());
+        let (row, ok) = highlight_one_line(&mut tail, &code[committed..], ss);
+        valid &= ok;
+        raw.push(row);
+    }
+    let mut display = raw.clone();
+    if display.last().is_some_and(|line| line.is_empty()) {
+        display.pop();
+    }
+    let active = valid.then(|| HighlightContinuation {
+        lang: lang.map(str::to_string),
+        code,
+        committed_bytes: committed,
+        complete_lines,
+        state,
+        raw_lines: raw,
+    });
+    (Arc::new(display), active)
+}
+
+fn highlight_one_line(
+    h: &mut HighlightLines<'_>,
+    line: &str,
+    ss: &SyntaxSet,
+) -> (HighlightedLine, bool) {
+    record_highlight_work(line);
+    let ranges = h.highlight_line(line, ss);
+    let valid = ranges.is_ok();
+    let row = ranges
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(style, text)| {
+            let c = style.foreground;
+            ((c.r, c.g, c.b), text.trim_end_matches('\n').to_string())
+        })
+        .filter(|(_, text)| !text.is_empty())
+        .collect();
+    (Arc::new(row), valid)
+}
+
 /// Syntax-highlight a code block into per-line colored runs.
+#[cfg(test)]
 fn highlight_code(code: &str, lang: Option<&str>) -> HighlightedLines {
     let ss = syntax_set();
     let syntax = lang
@@ -1332,16 +1466,7 @@ fn highlight_code(code: &str, lang: Option<&str>) -> HighlightedLines {
 
     let mut out = Vec::new();
     for line in LinesWithEndings::from(code) {
-        let ranges = h.highlight_line(line, ss).unwrap_or_default();
-        let rendered: Vec<((u8, u8, u8), String)> = ranges
-            .into_iter()
-            .map(|(style, text)| {
-                let c = style.foreground;
-                ((c.r, c.g, c.b), text.trim_end_matches('\n').to_string())
-            })
-            .filter(|(_, t)| !t.is_empty())
-            .collect();
-        out.push(rendered);
+        out.push(highlight_one_line(&mut h, line, ss).0);
     }
     // Drop a trailing empty line from the final newline.
     if out.last().map(|l| l.is_empty()).unwrap_or(false) {
@@ -1350,10 +1475,230 @@ fn highlight_code(code: &str, lang: Option<&str>) -> HighlightedLines {
     out
 }
 
+/// Count the work actually submitted to syntect, including reprocessed tails.
+fn record_highlight_work(line: &str) {
+    crate::profile::add("tui.syntect_lines_processed", 1);
+    crate::profile::add("tui.syntect_bytes_processed", line.len() as u64);
+    #[cfg(test)]
+    HIGHLIGHT_TEST_WORK.with(|work| {
+        let (lines, bytes) = work.get();
+        work.set((lines + 1, bytes + line.len()));
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    // Test-thread local: parallel markdown tests cannot perturb this observer.
+    static HIGHLIGHT_TEST_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static HIGHLIGHT_TEST_COLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::theme::ThemeId;
+
+    #[test]
+    fn growing_code_reuses_complete_lines_actual_syntect_work() {
+        let memo = Mutex::new(HighlightCache::default());
+        let mut source = String::from("// gate_b_actual_work_unique_prefix\n");
+        for i in 0..20 {
+            source.push_str(&format!("let gate_b_work_{i} = {i};\n"));
+        }
+        source.push_str("let gate_b_partial");
+        let original = highlight_code_with_cache(&source, Some("rust"), &memo);
+        let original_snapshot = (*original).clone();
+        source.push_str(" = 42;\n");
+        HIGHLIGHT_TEST_WORK.with(|work| work.set((0, 0)));
+        let grown = highlight_code_with_cache(&source, Some("rust"), &memo);
+        let observed = HIGHLIGHT_TEST_WORK.with(|work| work.get());
+        assert_eq!(
+            observed,
+            (1, "let gate_b_partial = 42;\n".len()),
+            "only the previously incomplete line may be submitted to syntect again"
+        );
+        assert_eq!(*grown, highlight_code(&source, Some("rust")));
+        assert_eq!(
+            *original, original_snapshot,
+            "old highlighted snapshots stay immutable"
+        );
+        assert!(
+            Arc::ptr_eq(&original[0], &grown[0]),
+            "stable row payload is shared"
+        );
+    }
+
+    fn assert_append_equivalence(code: &str, lang: Option<&str>) {
+        let memo = Mutex::new(HighlightCache::default());
+        for end in code
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(code.len()))
+        {
+            let prefix = &code[..end];
+            let actual = highlight_code_with_cache(prefix, lang, &memo);
+            assert_eq!(
+                *actual,
+                highlight_code(prefix, lang),
+                "append boundary {end}, lang {lang:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_highlight_matches_cold_at_every_multiline_append() {
+        for (lang, code) in [
+            (
+                "rust",
+                "/* outer\n /* nested */\n end */\nlet s = r###\"multi\nline\"###;\n",
+            ),
+            ("python", "s = '''first\nsecond'''\nprint(s)\n"),
+            (
+                "javascript",
+                "/* multi\nline */\nconst t = `你好\n${1 + 2} 👩‍💻é`;\n",
+            ),
+            ("no-such-language", "raw\r\n中文\n\n\nlast"),
+            ("rust", "\n\n/* x\r\ny */\r\nlet v = 1;\r\n\n\n"),
+        ] {
+            assert_append_equivalence(code, Some(lang));
+        }
+        assert_append_equivalence("plain\n\n\ntail", None);
+    }
+
+    #[test]
+    fn incremental_nonappend_language_and_interleaving_fall_back_correctly() {
+        let memo = Mutex::new(HighlightCache::default());
+        for (lang, code) in [
+            ("rust", "/* first\nsecond"),
+            ("rust", "/* changed\nsecond */\n"),
+            ("python", "/* changed\nsecond */\n"),
+            ("rust", "short"),
+            ("rust", "shorter\n"),
+            ("rust", "unrelated\n"),
+            ("rust", "shorter\ntail"),
+        ] {
+            let actual = highlight_code_with_cache(code, Some(lang), &memo);
+            assert_eq!(*actual, highlight_code(code, Some(lang)));
+            let cache = memo.lock().unwrap();
+            assert_eq!(
+                cache.total_bytes,
+                cache.entries.values().map(|e| e.code.len()).sum::<usize>()
+            );
+            if let Some(active) = &cache.active {
+                let entry = &cache.entries[&highlight_key(&active.code, active.lang.as_deref())];
+                assert!(
+                    Arc::ptr_eq(&active.code, &entry.code),
+                    "no duplicated active source allocation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_clear_discards_checkpoint_and_exact_hit_does_no_work() {
+        let memo = Mutex::new(HighlightCache::default());
+        let code = "// cold_clear_unique\nlet x = 1;\n";
+        let first = highlight_code_with_cache(code, Some("rust"), &memo);
+        HIGHLIGHT_TEST_WORK.with(|work| work.set((0, 0)));
+        let hit = highlight_code_with_cache(code, Some("rust"), &memo);
+        assert!(Arc::ptr_eq(&first, &hit));
+        assert_eq!(HIGHLIGHT_TEST_WORK.with(|work| work.get()), (0, 0));
+        memo.lock().unwrap().clear();
+        let again = highlight_code_with_cache(code, Some("rust"), &memo);
+        assert_eq!(*first, *again);
+        assert_eq!(HIGHLIGHT_TEST_WORK.with(|work| work.get()), (2, code.len()));
+    }
+
+    #[test]
+    fn growing_code_preserves_bounded_exact_prefix_replay_without_syntect_work() {
+        let memo = Mutex::new(HighlightCache::default());
+        let prefix = "// gate_b_retained_prefix\nlet x = 1;\npartial";
+        let old = highlight_code_with_cache(prefix, Some("rust"), &memo);
+        highlight_code_with_cache(&format!("{prefix} suffix\n"), Some("rust"), &memo);
+        HIGHLIGHT_TEST_WORK.with(|work| work.set((0, 0)));
+        let replay = highlight_code_with_cache(prefix, Some("rust"), &memo);
+        assert_eq!(
+            HIGHLIGHT_TEST_WORK.with(|work| work.get()),
+            (0, 0),
+            "existing bounded exact memo must keep an old prefix available on replay"
+        );
+        assert!(Arc::ptr_eq(&old, &replay));
+    }
+
+    #[test]
+    fn incremental_growth_retains_bounded_exact_memo_with_one_checkpoint() {
+        let memo = Mutex::new(HighlightCache::default());
+        let mut code = String::new();
+        let mut retained_source_bytes = 0;
+        for n in 1..=100 {
+            code.push_str("x\n");
+            retained_source_bytes += code.len();
+            highlight_code_with_cache(&code, None, &memo);
+            let cache = memo.lock().unwrap();
+            assert_eq!(cache.entries.len(), n);
+            assert!(cache.entries.len() <= HIGHLIGHT_CACHE_MAX_ENTRIES);
+            assert_eq!(cache.total_bytes, retained_source_bytes);
+            assert!(cache.total_bytes <= HIGHLIGHT_CACHE_MAX_BYTES);
+            assert!(cache.active.is_some());
+        }
+    }
+
+    #[test]
+    fn highlight_cache_replacement_counts_retained_source_and_checks_collision() {
+        let mut cache = HighlightCache::default();
+        let key = 123;
+        let first = Arc::new(Vec::new());
+        let second = Arc::new(Vec::new());
+        cache.put(key, None, Arc::from("old"), first);
+        cache.put(key, None, Arc::from("new-longer"), second.clone());
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.total_bytes, "new-longer".len());
+        assert!(
+            cache.get(key, None, "old").is_none(),
+            "collision cannot return wrong rows"
+        );
+        assert!(cache.get(key, Some("rust"), "new-longer").is_none());
+        assert!(Arc::ptr_eq(
+            &cache.get(key, None, "new-longer").unwrap(),
+            &second
+        ));
+    }
+
+    #[test]
+    fn incremental_markdown_layout_matches_cold_during_fence_and_reference_growth() {
+        let theme = Theme::dark();
+        for markdown in [
+            "intro **bold\n\n```rust\n/* start\r\n end */\r\nlet x = r#\"你好\nraw\"#;\n\n```\n\n[ref][id]\n\n[id]: https://example.com\n",
+            "```diff\n--- a/file\n+++ b/file\n-old\n+new\n```\n\n| A | B |\n|---|---|\n| x | y |\n",
+        ] {
+            let mut previous: Option<(MdDoc, MdDoc)> = None;
+            for end in markdown
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(markdown.len()))
+            {
+                let actual = MdDoc::parse(&markdown[..end]);
+                HIGHLIGHT_TEST_COLD.with(|cold| cold.set(true));
+                let reference = MdDoc::parse(&markdown[..end]);
+                HIGHLIGHT_TEST_COLD.with(|cold| cold.set(false));
+                assert_eq!(actual, reference, "full parse at byte {end}");
+                for width in [48, 80, 120] {
+                    assert_eq!(
+                        actual.to_lines(width, &theme),
+                        reference.to_lines(width, &theme),
+                        "layout at byte {end}, width {width}"
+                    );
+                }
+                if let Some((old, snapshot)) = previous.take() {
+                    assert_eq!(
+                        old, snapshot,
+                        "rendering a later prefix cannot mutate prior MdDoc"
+                    );
+                }
+                previous = Some((actual.clone(), actual));
+            }
+        }
+    }
 
     #[test]
     fn parses_headings_bold_and_code() {
