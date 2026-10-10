@@ -1437,7 +1437,7 @@ server.server_close()
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(armed, "armed\n");
+        assert!(matches!(armed.as_str(), "armed\n" | "armed\r\n"));
         assert!(
             leveler_runtime_host::process_alive(pid),
             "owned child actually alive before timeout"
