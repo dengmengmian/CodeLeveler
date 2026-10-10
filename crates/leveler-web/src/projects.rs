@@ -1410,9 +1410,12 @@ server.server_close()
         // Keep the RED test hygienic even when the old helper has not reaped.
         let status = child.wait().await.unwrap();
         assert!(error.contains("startup-exit-sentinel"), "{error}");
+        assert!(error.contains(&format!("owned pid=Some({pid})")), "{error}");
         assert!(error.contains("wait=Ok("), "{error}");
         assert_eq!(status.code(), Some(7));
         assert!(reaped, "failed startup must be explicitly reaped");
+        assert_eq!(child.try_wait().unwrap(), Some(status));
+        #[cfg(unix)]
         assert!(!leveler_runtime_host::process_alive(pid));
     }
 
@@ -1438,10 +1441,13 @@ server.server_close()
         .unwrap()
         .unwrap();
         assert!(matches!(armed.as_str(), "armed\n" | "armed\r\n"));
+        assert_eq!(child.id(), Some(pid));
         assert!(
-            leveler_runtime_host::process_alive(pid),
-            "owned child actually alive before timeout"
+            child.try_wait().unwrap().is_none(),
+            "the same owned child has no exit status before timeout"
         );
+        #[cfg(unix)]
+        assert!(leveler_runtime_host::process_alive(pid));
         let error = owned_fixture_ready(
             &mut child,
             &mut output,
@@ -1464,6 +1470,12 @@ server.server_close()
             reaped,
             "timeout must kill and explicitly reap the exact owned child"
         );
+        let status = child
+            .try_wait()
+            .unwrap()
+            .expect("owned child actually exited");
+        assert_eq!(child.wait().await.unwrap(), status);
+        #[cfg(unix)]
         assert!(!leveler_runtime_host::process_alive(pid));
     }
 
@@ -1507,6 +1519,9 @@ server.server_close()
             .unwrap()
             .unwrap();
         assert_eq!(status.code(), Some(0));
+        assert!(child.id().is_none());
+        assert_eq!(child.try_wait().unwrap(), Some(status));
+        #[cfg(unix)]
         assert!(
             !leveler_runtime_host::process_alive(pid),
             "normal HTTP owner exit is reaped"
