@@ -501,6 +501,7 @@ pub fn revalidate(target: &LegacyRuntimeTarget) -> Result<(), MigrationRefusal> 
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn build(tag: &str) -> BuildIdentity {
         BuildIdentity {
             version: "1.0.12".into(),
