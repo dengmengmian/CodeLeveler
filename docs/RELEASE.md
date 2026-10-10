@@ -11,9 +11,12 @@ Web and Desktop are outside this release's qualification scope.
 - Streaming syntax highlighting reuses completed-line Syntect state. An unfinished line is highlighted again from its saved state, preserving cross-line syntax and the complete code text.
 - The bounded highlight cache retains 640 entries instead of 512, addressing the measured 574-block history workload. The existing source-byte budget and LRU eviction remain in place.
 - Failed turns and durable cancellation are shown as terminal outcomes. Repeated cancellation waits instead of promising a force operation.
+- The TUI rejects non-terminal stdin or stdout with an unsupported-terminal error before entering raw mode.
 
 ## Runtime and context
 
+- Auto permission classification inspects literal `cmd.exe` redirection destinations using Windows quotation and caret-escape rules. Full remains unrestricted.
+- Pre-claim and explicitly scoped filesystem writes no longer receive an implicit shared temporary-directory grant. Ordinary Auto temporary writes remain available, and Full stays unconfined.
 - Interactive command acknowledgements follow durable application; cancellation is persisted before acknowledgement and reconciled after interruption.
 - Resuming a Goal recovers interrupted lineage from fenced durable turn facts, and ordinary continuation goes through the existing runtime owner.
 - Soft compaction uses a percentage of the effective input capacity, with a 95% default. Terminal context utilization follows runtime accounting on resume and after policy changes.
