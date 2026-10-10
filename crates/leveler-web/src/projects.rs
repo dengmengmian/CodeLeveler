@@ -1280,9 +1280,174 @@ mod tests {
         }
     }
 
+    /// A failed test startup retains evidence and reaps only its owned child.
+    async fn owned_fixture_ready(
+        child: &mut tokio::process::Child,
+        output: &mut tokio::io::BufReader<tokio::process::ChildStdout>,
+        stderr_path: &std::path::Path,
+        budget: std::time::Duration,
+    ) -> Result<serde_json::Value, String> {
+        use tokio::io::AsyncBufReadExt;
+        let pid = child.id();
+        let started = tokio::time::Instant::now();
+        let mut line = Vec::new();
+        let mut stdout_eof = false;
+        // read_until preserves partial stdout if timeout cancels the read.
+        let result = async {
+            let read = tokio::time::timeout(budget, output.read_until(b'\n', &mut line))
+                .await
+                .map_err(|_| format!("READY timeout after {budget:?}"))?
+                .map_err(|error| format!("READY stdout read: {error}"))?;
+            if read == 0 {
+                stdout_eof = true;
+                return Err("READY stdout EOF".to_owned());
+            }
+            let ready: serde_json::Value =
+                serde_json::from_slice(&line).map_err(|error| format!("READY JSON: {error}"))?;
+            if ready["pid"].as_u64() != pid.map(u64::from) {
+                return Err("READY PID mismatch".to_owned());
+            }
+            if !matches!(ready["port"].as_u64(), Some(1..=65535)) {
+                return Err("READY port invalid".to_owned());
+            }
+            Ok(ready)
+        }
+        .await;
+        match result {
+            Ok(ready) => Ok(ready),
+            Err(cause) => {
+                // EOF can precede observable process exit. Give that exit
+                // only the remaining startup budget, then clean up if needed.
+                let natural_exit = if stdout_eof {
+                    match tokio::time::timeout(
+                        budget.saturating_sub(started.elapsed()),
+                        child.wait(),
+                    )
+                    .await
+                    {
+                        Ok(status) => format!("EOF wait={status:?}"),
+                        Err(_) => "EOF wait timed out within startup budget".to_owned(),
+                    }
+                } else {
+                    "no EOF wait".to_owned()
+                };
+                let before = child.try_wait();
+                let state = match &before {
+                    Ok(Some(status)) => format!("exited {status}"),
+                    Ok(None) => "alive".to_owned(),
+                    Err(error) => format!("try_wait failed: {error}"),
+                };
+                // Even on an observation error, cleanup remains confined to
+                // this Child handle. kill_on_drop is only panic insurance.
+                let kill = if matches!(before, Ok(Some(_))) {
+                    "unnecessary".to_owned()
+                } else {
+                    match child.start_kill() {
+                        Ok(()) => "requested".to_owned(),
+                        Err(error) => format!("failed: {error}"),
+                    }
+                };
+                let reaped = child.wait().await;
+                let stderr = match std::fs::read_to_string(stderr_path) {
+                    Ok(stderr) => stderr,
+                    Err(error) => format!("stderr capture failed: {error}"),
+                };
+                Err(format!(
+                    "{cause}; owned pid={pid:?}; before cleanup={state}; {natural_exit}; kill={kill}; wait={reaped:?}; stdout={:?}; stderr={stderr:?}",
+                    String::from_utf8_lossy(&line),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_fixture_startup_exit_reports_stderr_and_reaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_path = dir.path().join("startup.stderr");
+        let mut child = tokio::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                "import sys;print('startup-exit-sentinel',file=sys.stderr,flush=True);sys.exit(7)",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let error = owned_fixture_ready(
+            &mut child,
+            &mut output,
+            &stderr_path,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        let reaped = child.id().is_none();
+        // Keep the RED test hygienic even when the old helper has not reaped.
+        let status = child.wait().await.unwrap();
+        assert!(error.contains("startup-exit-sentinel"), "{error}");
+        assert!(error.contains("wait=Ok("), "{error}");
+        assert_eq!(status.code(), Some(7));
+        assert!(reaped, "failed startup must be explicitly reaped");
+        assert!(!leveler_runtime_host::process_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn owned_fixture_startup_timeout_reports_alive_child_and_reaps() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_path = dir.path().join("startup.stderr");
+        let mut child = tokio::process::Command::new("python3")
+            .args(["-u", "-c", "import sys,threading;print('startup-alive-sentinel',file=sys.stderr,flush=True);print('armed',flush=True);threading.Event().wait()"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .kill_on_drop(true)
+            .spawn().unwrap();
+        let pid = child.id().unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut armed = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            output.read_line(&mut armed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(armed, "armed\n");
+        assert!(
+            leveler_runtime_host::process_alive(pid),
+            "owned child actually alive before timeout"
+        );
+        let error = owned_fixture_ready(
+            &mut child,
+            &mut output,
+            &stderr_path,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        let reaped = child.id().is_none();
+        if !reaped {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+        assert!(error.contains("startup-alive-sentinel"), "{error}");
+        assert!(
+            error.contains("timeout") && error.contains("alive"),
+            "{error}"
+        );
+        assert!(
+            reaped,
+            "timeout must kill and explicitly reap the exact owned child"
+        );
+        assert!(!leveler_runtime_host::process_alive(pid));
+    }
+
     #[tokio::test]
     async fn removing_unconfirmed_or_busy_runtime_preserves_real_child_until_owner_exit() {
-        use tokio::io::AsyncBufReadExt;
         for (quiescent, atomic_supported, retirement_error) in [
             (true, false, false),
             (false, false, false),
@@ -1294,34 +1459,46 @@ mod tests {
             std::fs::create_dir(&repo).unwrap();
             let repo = repo.canonicalize().unwrap();
             let (manager, _) = manager_in(dir.path(), dir.path().join("unused.sock"));
-            let script = r#"import http.server,threading,json,os
+            let script = r#"import sys
+print('startup: before imports',file=sys.stderr,flush=True)
+import http.server,threading,json,os,socket
+original_getfqdn=socket.getfqdn
+def observed_getfqdn(*args,**kwargs):
+ print('startup: before reverse DNS',file=sys.stderr,flush=True)
+ result=original_getfqdn(*args,**kwargs)
+ print('startup: after reverse DNS',file=sys.stderr,flush=True)
+ return result
+socket.getfqdn=observed_getfqdn
+print('startup: imports complete; before HTTP bind',file=sys.stderr,flush=True)
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
   self.send_response(200);self.end_headers();self.wfile.write(b'owned-service-live')
   if self.path=='/exit':threading.Thread(target=self.server.shutdown).start()
  def log_message(self,*args):pass
 server=http.server.HTTPServer(('127.0.0.1',0),Handler)
+print('startup: HTTP bound; before READY',file=sys.stderr,flush=True)
 print(json.dumps({'port':server.server_address[1],'pid':os.getpid()}),flush=True)
 server.serve_forever(poll_interval=0.01)
 server.server_close()
 "#;
+            let stderr_path = dir.path().join("owned-service.stderr");
             let mut child = tokio::process::Command::new("python3")
                 .args(["-u", "-c", script])
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::fs::File::create(&stderr_path).unwrap())
+                .kill_on_drop(true)
                 .spawn()
                 .unwrap();
             let pid = child.id().unwrap();
             let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
-            let mut line = String::new();
-            tokio::time::timeout(
+            let ready = owned_fixture_ready(
+                &mut child,
+                &mut output,
+                &stderr_path,
                 std::time::Duration::from_secs(5),
-                output.read_line(&mut line),
             )
             .await
-            .unwrap()
             .unwrap();
-            let ready: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(ready["pid"].as_u64(), Some(u64::from(pid)));
             let url = format!("http://127.0.0.1:{}", ready["port"]);
             eprintln!("owned monitor fixture pid={pid} url={url}");
