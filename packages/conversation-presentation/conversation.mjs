@@ -116,11 +116,11 @@ function memberTarget(tool) {
   return '';
 }
 
-/** The receipt headline: `读取 N 个文件 · 搜索 M 次`, only the parts that exist.
+/** The receipt headline: `读取 N 次 · 搜索 M 次`, only the parts that exist.
  * @param {number} reads @param {number} searches @returns {string} */
 export function explorationLabel(reads, searches) {
   const parts = [];
-  if (reads > 0) parts.push(`读取 ${reads} 个文件`);
+  if (reads > 0) parts.push(`读取 ${reads} 次`);
   if (searches > 0) parts.push(`搜索 ${searches} 次`);
   return parts.join(' · ');
 }

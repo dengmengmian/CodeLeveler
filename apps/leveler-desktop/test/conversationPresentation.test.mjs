@@ -122,7 +122,7 @@ test('C2: consecutive exploration is ONE collapsed, reversible receipt', () => {
   ];
   const receipts = groupExploration(tools);
   assert.equal(receipts.length, 1, 'one receipt, not three rows');
-  assert.equal(receipts[0].label, '读取 2 个文件 · 搜索 1 次');
+  assert.equal(receipts[0].label, '读取 2 次 · 搜索 1 次');
   assert.equal(receipts[0].folded, true, 'collapsed by default');
   assert.deepEqual(
     receipts[0].members.map((member) => member.target),
@@ -422,4 +422,17 @@ test('the conversation corpus C1..C10 projects the frozen tree (desktop)', async
   }
   assert.deepEqual(failures, []);
   assert.equal(compared >= 11, true, `paths compared: ${compared}`);
+});
+
+// A receipt counts read operations, including repeated reads of one path.
+test('repeated reads count operations rather than distinct files', () => {
+  const tools = [
+    { id: 'r1', name: 'read_file', arguments: '{"path":"src/models.rs"}', status: 'ok', seq: 1 },
+    { id: 'r2', name: 'read_file', arguments: '{"path":"src/models.rs"}', status: 'ok', seq: 2 },
+  ];
+  const [receipt] = groupExploration(tools);
+  assert.equal(receipt.reads, 2);
+  assert.equal(receipt.label, '读取 2 次');
+  assert.deepEqual(receipt.members.map(member => member.id), ['r1', 'r2']);
+  assert.deepEqual(receipt.members.map(member => member.target), ['src/models.rs', 'src/models.rs']);
 });

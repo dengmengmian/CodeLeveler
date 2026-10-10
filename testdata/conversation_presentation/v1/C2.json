@@ -1,7 +1,7 @@
 {
   "id": "C2",
   "title": "consecutive exploration collapses into one reversible receipt",
-  "invariant": "consecutive read-only exploration (read/search/list/grep/glob) is ONE collapsed receipt '读取 N 个文件 · 搜索 M 次'; its members are not a waterfall, and opening it restores the real member chronology",
+  "invariant": "consecutive read-only exploration (read/search/list/grep/glob) is ONE collapsed receipt '读取 N 次 · 搜索 M 次'; its members are not a waterfall, and opening it restores the real member chronology",
   "paths": {
     "live": [
       { "event": { "type": "user_message_added", "message": { "id": "u1", "role": "user", "text": "找一下推荐模型在哪" } } },

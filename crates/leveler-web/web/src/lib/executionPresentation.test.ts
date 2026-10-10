@@ -11,12 +11,17 @@
 // contract v1 §I10 (fixture C10) and the Web test
 // `a snapshot-opened session cannot rebuild durable tool rounds yet`.
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import type { Action, AppState, SessionView } from '../state/store';
 import { initialState, reducer } from '../state/store';
 import type { RuntimeEvent } from '../types/protocol';
 import { RuntimeBridge } from './controller';
-import { failureReason, displayPreview, projectTurn } from './executionRounds';
+import { groupExecutionRounds, projectTurn } from './executionRounds';
+import { foldedThoughts, turnBlocks } from './conversationPresentation';
+import { ExplorationReceiptRow } from '../components/ExplorationReceiptRow';
+import { ToolCallRow } from '../components/ToolCallRow';
 import { isTurnUser } from './presentationKind';
 
 /**
@@ -54,6 +59,12 @@ const FIXTURE_SOURCES: readonly string[] = [
   fixtureC13,
   fixtureC14,
 ];
+
+// Render the real tool rows without a live app dispatch provider.
+vi.mock('../state/store', async (original) => ({
+  ...await original<typeof import('../state/store')>(),
+  useAppDispatch: () => () => {},
+}));
 
 const localStore = new Map<string, string>();
 
@@ -155,11 +166,24 @@ function project(session: SessionView) {
   return { items, user_texts, reasoning_visible };
 }
 
-/** Whatever a failure presentation would put on screen for these tools. */
+/** Actual collapsed exploration and tool-failure component output. */
 function renderedText(session: SessionView): string {
-  return session.tools
-    .map((t) => [failureReason(t.preview ?? ''), displayPreview(t)].filter(Boolean).join('\n'))
-    .join('\n');
+  const blocks = turnBlocks(foldedThoughts(session.thoughts), groupExecutionRounds(session.tools));
+  const markup = blocks.map((block) => {
+    if (block.kind === 'receipt') {
+      return renderToStaticMarkup(createElement(ExplorationReceiptRow, {
+        receipt: block.receipt,
+        hiddenThoughts: block.thoughts,
+      }));
+    }
+    if (block.kind === 'round') {
+      return block.round.tools.map((tool) =>
+        renderToStaticMarkup(createElement(ToolCallRow, { tool }))).join(' ');
+    }
+    return '';
+  }).join(' ');
+  // Component boundaries carry the visual spacing between glyphs and labels.
+  return markup.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 interface Fixture {
