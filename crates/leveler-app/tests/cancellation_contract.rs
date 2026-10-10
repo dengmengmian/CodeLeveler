@@ -36,9 +36,9 @@ use std::time::Duration;
 
 use leveler_app::runtime_boot::{RuntimeBootLease, StateDirBootLiveness};
 use leveler_app::{Application, InProcessRuntimeClient};
+use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient};
 #[cfg(unix)]
-use leveler_client_protocol::UiCommandStop;
-use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEvent};
+use leveler_client_protocol::{RuntimeEvent, UiCommandStop};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
