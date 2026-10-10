@@ -36,9 +36,9 @@ use std::time::Duration;
 
 use leveler_app::runtime_boot::{RuntimeBootLease, StateDirBootLiveness};
 use leveler_app::{Application, InProcessRuntimeClient};
-use leveler_client_protocol::{
-    ClientCommand, InteractiveRuntimeClient, RuntimeEvent, UiCommandStop,
-};
+#[cfg(unix)]
+use leveler_client_protocol::UiCommandStop;
+use leveler_client_protocol::{ClientCommand, InteractiveRuntimeClient, RuntimeEvent};
 use leveler_execution::PermissionProfile;
 use leveler_model::ModelRef;
 use leveler_project::Layout;
@@ -259,6 +259,7 @@ async fn settled(app: &Application, session: &leveler_core::SessionId) {
 }
 
 /// Watch for the first event matching `predicate`, within a bounded window.
+#[cfg(unix)]
 async fn wait_for_event<T>(
     rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
     mut predicate: impl FnMut(&RuntimeEvent) -> Option<T>,
