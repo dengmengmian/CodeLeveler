@@ -1,7 +1,7 @@
 //! Terminal lifecycle: raw mode + bracketed paste + mouse capture for the
 //! alternate-screen workbench (Conversation scroll wheel / drag).
 
-use std::io::{self, Stdout};
+use std::io::{self, IsTerminal, Stdout};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -22,6 +22,14 @@ impl TerminalGuard {
     /// The guard is armed immediately after the first state change so any later
     /// init failure (or panic) still restores cooked mode.
     pub fn enter() -> io::Result<(Self, Stdout)> {
+        // Windows console APIs can open a console despite redirected handles.
+        // Check the actual streams before changing terminal state on every OS.
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "interactive TUI requires terminal stdin and stdout",
+            ));
+        }
         install_panic_hook();
         enable_raw_mode()?;
         // Armed now: Drop restores raw mode even if the next execute! fails.
@@ -86,6 +94,39 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_refuses_non_terminal_handles_before_raw_mode() {
+        const CHILD: &str = "LEVELER_TEST_NONTTY_GUARD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let failure = TerminalGuard::enter()
+                .err()
+                .expect("redirected handles must be refused");
+            assert_eq!(failure.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                failure
+                    .to_string()
+                    .contains("requires terminal stdin and stdout")
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "terminal::tests::guard_refuses_non_terminal_handles_before_raw_mode",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "non-terminal child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     /// Document the init contract: raw mode is armed before secondary
     /// setup, so a failed later step still restores via Drop/restore().
