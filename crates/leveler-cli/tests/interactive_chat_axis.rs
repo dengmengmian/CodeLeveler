@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use leveler_storage::{Database, SessionRepository};
@@ -93,6 +94,10 @@ compatibility:
 /// interactive entry points create their session before they touch the
 /// terminal, then fail to enter it, which is all these tests need.
 fn leveler(env: &TestEnv, args: &[&str]) -> Command {
+    static INVOCATION: AtomicU64 = AtomicU64::new(0);
+    let id = INVOCATION.fetch_add(1, Ordering::Relaxed);
+    let stdout = std::fs::File::create(env.home.join(format!("leveler-{id}.stdout.log"))).unwrap();
+    let stderr = std::fs::File::create(env.home.join(format!("leveler-{id}.stderr.log"))).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_leveler"));
     command
         .arg("--repo")
@@ -101,9 +106,34 @@ fn leveler(env: &TestEnv, args: &[&str]) -> Command {
         .env("LEVELER_HOME", &env.home)
         .env("LEVELER_CONFIG_DIR", &env.config_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
     command
+}
+
+fn diagnostics(env: &TestEnv) -> String {
+    let mut paths: Vec<_> = std::fs::read_dir(&env.home)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".log")
+        })
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            format!(
+                "{}:\n{}",
+                path.display(),
+                std::fs::read_to_string(&path).unwrap()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Run a `leveler tui` launch to completion. It is expected to fail taking over
@@ -117,8 +147,9 @@ fn run_to_completion(env: &TestEnv, args: &[&str], timeout: Duration) -> ExitSta
         }
         assert!(
             Instant::now() < deadline,
-            "`leveler {}` never exited within {timeout:?}",
-            args.join(" ")
+            "`leveler {}` never exited within {timeout:?}: {}",
+            args.join(" "),
+            diagnostics(env)
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -148,24 +179,30 @@ fn spawn_serve(env: &TestEnv, ready: &Path) -> ManagedChild {
     ManagedChild::spawn(&mut command).expect("spawn leveler serve")
 }
 
-fn wait_ready(ready: &Path, child: &mut ManagedChild, timeout: Duration) {
+fn wait_ready(env: &TestEnv, ready: &Path, child: &mut ManagedChild, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         if ready.is_file() {
             return;
         }
         if let Some(status) = child.try_wait().expect("child status") {
-            panic!("daemon exited before readiness: {status}");
+            panic!(
+                "daemon exited before readiness: {status}: {}",
+                diagnostics(env)
+            );
         }
         assert!(
             Instant::now() < deadline,
-            "daemon never became ready within {timeout:?}"
+            "daemon never became ready within {timeout:?}: {}",
+            diagnostics(env)
         );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-/// SIGINT is the daemon's documented Ctrl+C shutdown path.
+/// Unix exercises the documented SIGINT path; Windows reaps only the test's
+/// owned child, without claiming a graceful Ctrl+C qualification.
+#[cfg(unix)]
 fn stop_daemon(child: &mut ManagedChild) {
     let _ = Command::new("kill")
         .arg("-2")
@@ -181,6 +218,12 @@ fn stop_daemon(child: &mut ManagedChild) {
     let _ = child.kill();
     let _ = child.wait();
     panic!("daemon did not stop on SIGINT");
+}
+
+#[cfg(windows)]
+fn stop_daemon(child: &mut ManagedChild) {
+    child.kill().expect("stop owned test daemon");
+    child.wait().expect("reap owned test daemon");
 }
 
 /// The single per-repository state dir under the isolated home, once this
@@ -244,7 +287,7 @@ async fn both_transports_open_a_new_interactive_session_as_chat() {
     let daemon_env = test_env("http://127.0.0.1:9");
     let ready = daemon_env.home.join("ready.json");
     let mut daemon = spawn_serve(&daemon_env, &ready);
-    wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    wait_ready(&daemon_env, &ready, &mut daemon, Duration::from_secs(30));
     let status = run_to_completion(&daemon_env, &["tui"], Duration::from_secs(60));
     assert!(
         !status.success(),
@@ -343,7 +386,7 @@ async fn resuming_a_session_keeps_its_persisted_axis() {
     // T6 — resume the same Goal session through the daemon.
     let ready = env.home.join("ready.json");
     let mut daemon = spawn_serve(&env, &ready);
-    wait_ready(&ready, &mut daemon, Duration::from_secs(30));
+    wait_ready(&env, &ready, &mut daemon, Duration::from_secs(30));
     let _ = run_to_completion(
         &env,
         &["tui", "--session", goal_id.as_str()],
