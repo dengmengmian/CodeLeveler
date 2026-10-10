@@ -491,7 +491,18 @@ impl leveler_execution::Approver for DenyAll {
 #[tokio::test]
 async fn headless_chat_runs_the_chat_profile() {
     let (tmp, server, _app, _client) = harness(vec![text("hi there")]).await;
+    // This fixture measures Chat rounds, not the independent memory worker.
+    std::fs::create_dir_all(tmp.path().join(".leveler")).unwrap();
+    std::fs::write(
+        tmp.path().join(".leveler/config.yaml"),
+        "memory:\n  enabled: false\n",
+    )
+    .unwrap();
     let app = headless_app(&tmp, leveler_agent::CollaborationMode::Chat);
+    assert!(
+        !app.memory_policy().enabled(),
+        "this Chat-axis fixture isolates the agent round from auxiliary memory calls"
+    );
     let outcome = run_headless(&app, leveler_agent::CollaborationMode::Chat, "just chat").await;
 
     assert_eq!(
@@ -504,7 +515,18 @@ async fn headless_chat_runs_the_chat_profile() {
         1,
         "a chat turn is not continued by the goal lifecycle"
     );
+    assert_eq!(
+        outcome.model_steps, 1,
+        "a Chat answer has one agent model step"
+    );
     let bodies = server.request_bodies().await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "one complete HTTP request must be observed"
+    );
+    let request: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(request["stream"], serde_json::json!(true));
     assert!(
         !bodies[0].contains("\"update_goal\""),
         "a chat request must not carry the goal executor: {}",
@@ -524,6 +546,10 @@ async fn headless_goal_quiet_answer_is_continued_not_completed() {
         outcome.stop_reason,
         leveler_agent::StopReason::Completed,
         "going quiet is not a Goal completion"
+    );
+    assert!(
+        outcome.model_steps > 1,
+        "a quiet Goal must start another agent model step"
     );
     assert!(
         server.request_count() > 1,
