@@ -40,8 +40,10 @@ pub(crate) fn map_reqwest_error(err: &reqwest::Error) -> ModelError {
     } else if err.is_timeout() {
         (ModelErrorKind::Timeout, DeliveryState::SentNoResponse)
     } else if err.is_body() || err.is_decode() {
-        // The provider answered; the response could not be read.
-        (ModelErrorKind::Decode, DeliveryState::SentNoResponse)
+        // This mapper only handles HTTP send/body reads, including response
+        // decompression, never application JSON decoding. The stream owner
+        // attaches any observed output before deciding whether to retry.
+        (ModelErrorKind::Transport, DeliveryState::SentNoResponse)
     } else {
         // A mid-request reset or other transport fault: whether the request
         // was delivered cannot be established here.

@@ -19,6 +19,9 @@ pub enum MockResponse {
     /// 200 stream written as separate raw byte chunks (to force fragmentation),
     /// each flushed with a small delay, then a clean close.
     RawChunks { chunks: Vec<Vec<u8>> },
+    /// 200 with a body shorter than its declared Content-Length, then close.
+    /// Unlike a clean SSE EOF, this produces an actual HTTP body read error.
+    TruncatedBody { body: String, content_type: String },
     /// A 200 JSON body preceded by `silent_ms` of complete silence — no
     /// headers, no bytes — the shape of a non-streaming provider whose model
     /// is still thinking.
@@ -198,6 +201,16 @@ impl MockServer {
 /// Write the scripted response (the request was already drained/recorded).
 async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result<()> {
     match response {
+        MockResponse::TruncatedBody { body, content_type } => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len() + 1
+            );
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(body.as_bytes()).await?;
+            stream.flush().await?;
+        }
         MockResponse::Sse { body } => {
             let header = "HTTP/1.1 200 OK\r\n\
                  Content-Type: text/event-stream\r\n\
