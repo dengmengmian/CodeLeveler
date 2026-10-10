@@ -844,3 +844,102 @@ async fn cancellation_interrupts_provider_stream_body() {
         "cancel must wake provider stream read"
     );
 }
+
+async fn assert_body_read_failure(response: MockResponse) {
+    let server = MockServer::start_one(response).await;
+    let error = registry(&server)
+        .generate(request(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(server.request_count(), 1);
+    let bodies = server.request_bodies().await;
+    assert_eq!(bodies.len(), 1, "one fully drained and recorded request");
+    serde_json::from_str::<serde_json::Value>(&bodies[0]).unwrap();
+    assert_eq!(
+        error.kind,
+        leveler_model::ModelErrorKind::Transport,
+        "{error:?}"
+    );
+    assert_eq!(
+        error.delivery_state,
+        leveler_model::DeliveryState::SentNoResponse
+    );
+    assert!(
+        error.message.contains("body"),
+        "raw HTTP diagnostic: {error:?}"
+    );
+}
+
+/// Incomplete HTTP delivery is not evidence of malformed model JSON.
+#[tokio::test]
+async fn body_read_truncated_nonstream_is_transport() {
+    assert_body_read_failure(MockResponse::TruncatedBody {
+        body: "{\"choices\":".into(),
+        content_type: "application/json".into(),
+    })
+    .await;
+}
+
+/// HTTP decompression runs before the protocol decoder sees model JSON.
+#[tokio::test]
+async fn body_read_invalid_gzip_is_transport() {
+    assert_body_read_failure(MockResponse::StatusWithHeaders {
+        code: 200,
+        body: "not gzip bytes".into(),
+        headers: vec![("Content-Encoding".into(), "gzip".into())],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn body_read_stream_failure_is_one_physical_attempt() {
+    let server = MockServer::start(vec![
+        MockResponse::TruncatedBody {
+            body: String::new(),
+            content_type: "text/event-stream".into(),
+        },
+        MockResponse::sse(&[
+            r#"{"choices":[{"delta":{"content":"must not replay"},"finish_reason":"stop"}]}"#,
+        ]),
+    ])
+    .await;
+    let mut stream = registry(&server)
+        .stream(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut failure = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Err(error) | Ok(ModelEvent::Error { error }) => {
+                failure = Some(error);
+                break;
+            }
+            Ok(ModelEvent::MessageCompleted { .. }) => panic!("broken body cannot complete"),
+            _ => {}
+        }
+    }
+    assert_eq!(server.request_count(), 1);
+    let bodies = server.request_bodies().await;
+    assert_eq!(bodies.len(), 1);
+    serde_json::from_str::<serde_json::Value>(&bodies[0]).unwrap();
+    let error = failure.expect("actual HTTP body read failure");
+    assert_eq!(
+        error.kind,
+        leveler_model::ModelErrorKind::Transport,
+        "{error:?}"
+    );
+    assert!(error.message.contains("body"), "raw diagnostic: {error:?}");
+}
+
+#[tokio::test]
+async fn complete_http_invalid_json_remains_protocol_decode() {
+    let server = MockServer::start_one(MockResponse::json_ok("{\"choices\":")).await;
+    let error = registry(&server)
+        .generate(request(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, leveler_model::ModelErrorKind::Decode);
+    assert_eq!(error.retryability(), leveler_model::Retryability::Never);
+    assert_eq!(server.request_count(), 1);
+    assert_eq!(server.request_bodies().await.len(), 1);
+}
