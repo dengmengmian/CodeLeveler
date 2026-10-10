@@ -1280,6 +1280,27 @@ mod tests {
         }
     }
 
+    const OWNED_HTTP_SERVICE_SCRIPT: &str = r#"import sys
+print('startup: before imports',file=sys.stderr,flush=True)
+import http.server,threading,json,os,socketserver
+print('startup: imports complete; before HTTP bind',file=sys.stderr,flush=True)
+# This numeric-loopback fixture needs a real bind, not external reverse DNS.
+class OwnedHTTPServer(http.server.HTTPServer):
+ def server_bind(self):
+  socketserver.TCPServer.server_bind(self)
+  self.server_name,self.server_port=self.server_address[:2]
+class Handler(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(200);self.end_headers();self.wfile.write(b'owned-service-live')
+  if self.path=='/exit':threading.Thread(target=self.server.shutdown).start()
+ def log_message(self,*args):pass
+server=OwnedHTTPServer(('127.0.0.1',0),Handler)
+print('startup: HTTP bound; before READY',file=sys.stderr,flush=True)
+print(json.dumps({'port':server.server_address[1],'pid':os.getpid()}),flush=True)
+server.serve_forever(poll_interval=0.01)
+server.server_close()
+"#;
+
     /// A failed test startup retains evidence and reaps only its owned child.
     async fn owned_fixture_ready(
         child: &mut tokio::process::Child,
@@ -1447,6 +1468,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_http_fixture_does_not_depend_on_reverse_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_path = dir.path().join("dns-trap.stderr");
+        let script = format!(
+            "import socket\ndef forbidden_reverse_dns(*args,**kwargs):\n raise AssertionError('reverse-dns-trap-sentinel')\nsocket.getfqdn=forbidden_reverse_dns\n{OWNED_HTTP_SERVICE_SCRIPT}"
+        );
+        let mut child = tokio::process::Command::new("python3")
+            .args(["-u", "-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let ready = owned_fixture_ready(
+            &mut child,
+            &mut output,
+            &stderr_path,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready["pid"].as_u64(), Some(u64::from(pid)));
+        let url = format!("http://127.0.0.1:{}", ready["port"]);
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert_eq!(
+            http.get(&url).send().await.unwrap().text().await.unwrap(),
+            "owned-service-live"
+        );
+        http.get(format!("{url}/exit")).send().await.unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(
+            !leveler_runtime_host::process_alive(pid),
+            "normal HTTP owner exit is reaped"
+        );
+    }
+
+    #[tokio::test]
     async fn removing_unconfirmed_or_busy_runtime_preserves_real_child_until_owner_exit() {
         for (quiescent, atomic_supported, retirement_error) in [
             (true, false, false),
@@ -1459,31 +1526,10 @@ mod tests {
             std::fs::create_dir(&repo).unwrap();
             let repo = repo.canonicalize().unwrap();
             let (manager, _) = manager_in(dir.path(), dir.path().join("unused.sock"));
-            let script = r#"import sys
-print('startup: before imports',file=sys.stderr,flush=True)
-import http.server,threading,json,os,socket
-original_getfqdn=socket.getfqdn
-def observed_getfqdn(*args,**kwargs):
- print('startup: before reverse DNS',file=sys.stderr,flush=True)
- result=original_getfqdn(*args,**kwargs)
- print('startup: after reverse DNS',file=sys.stderr,flush=True)
- return result
-socket.getfqdn=observed_getfqdn
-print('startup: imports complete; before HTTP bind',file=sys.stderr,flush=True)
-class Handler(http.server.BaseHTTPRequestHandler):
- def do_GET(self):
-  self.send_response(200);self.end_headers();self.wfile.write(b'owned-service-live')
-  if self.path=='/exit':threading.Thread(target=self.server.shutdown).start()
- def log_message(self,*args):pass
-server=http.server.HTTPServer(('127.0.0.1',0),Handler)
-print('startup: HTTP bound; before READY',file=sys.stderr,flush=True)
-print(json.dumps({'port':server.server_address[1],'pid':os.getpid()}),flush=True)
-server.serve_forever(poll_interval=0.01)
-server.server_close()
-"#;
+
             let stderr_path = dir.path().join("owned-service.stderr");
             let mut child = tokio::process::Command::new("python3")
-                .args(["-u", "-c", script])
+                .args(["-u", "-c", OWNED_HTTP_SERVICE_SCRIPT])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::fs::File::create(&stderr_path).unwrap())
                 .kill_on_drop(true)
