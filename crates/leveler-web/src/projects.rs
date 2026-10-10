@@ -898,12 +898,10 @@ mod tests {
         ClientCommand, ClientError, InteractiveRuntimeClient, RuntimeEvent, SessionId,
         UiSessionSnapshot, mock::MockRuntimeClient,
     };
-    use leveler_local_transport::{
-        CreateSessionRequest, LocalRuntimeService, LocalSocketRuntimeClient, SessionBootstrap,
-    };
+    use leveler_local_transport::{CreateSessionRequest, LocalRuntimeService, SessionBootstrap};
     // Unix-socket daemon fixture is unix-only (Windows stubs return Unavailable).
     #[cfg(unix)]
-    use leveler_local_transport::LocalSocketServer;
+    use leveler_local_transport::{LocalSocketRuntimeClient, LocalSocketServer};
 
     /// Minimal primary service: the manager tests never exercise commands.
     struct StubService {
@@ -1087,6 +1085,7 @@ mod tests {
     /// Only the commands that would STOP a runtime. The router legitimately
     /// asks a newly attached daemon for its session list, so a bare "no commands"
     /// assertion would be about the wrong thing.
+    #[cfg(unix)]
     fn stop_commands(commands: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         commands
             .lock()
