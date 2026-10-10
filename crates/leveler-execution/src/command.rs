@@ -4210,7 +4210,7 @@ mod tests {
             eprintln!("skipping: go is not installed");
             return;
         }
-        let base = tempfile::tempdir().expect("base");
+        let base = private_home_fixture();
         let base_path = base.path().canonicalize().unwrap();
         // The sealed "gate" dir contains the leveler-home-shaped cache tree,
         // exactly like an eval launched with LEVELER_HOME under its cwd.
@@ -4258,6 +4258,13 @@ mod tests {
         // And the seal still holds for non-writable content beside the caches.
         let key = sealed.join("case.yaml");
         std::fs::write(&key, "answer").unwrap();
+        let key = key.canonicalize().unwrap();
+        for root in writable_roots(&workspace, Some(scratch.path()), &cache_roots) {
+            assert!(
+                !key.starts_with(&root),
+                "answer key overlaps writable root: {root:?}"
+            );
+        }
         let (program, args) = sandbox_command_with_read_denials(
             "cat",
             &[key.display().to_string()],
@@ -4355,11 +4362,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn declared_read_denials_survive_every_escape_the_eval_actually_used() {
-        let base = std::env::temp_dir().join(format!(
-            "leveler-readdeny-{}",
-            std::process::id() as u64 * 37 + 13
-        ));
-        std::fs::remove_dir_all(&base).ok();
+        let owned_base = private_home_fixture();
+        let base = owned_base.path().canonicalize().unwrap();
         let secret = base.join("host");
         let workspace = base.join("workspace");
         std::fs::create_dir_all(&secret).unwrap();
@@ -4372,6 +4376,13 @@ mod tests {
         // Real runs give the command a private scratch root; git needs one.
         let scratch = base.join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
+        let secret = secret.canonicalize().unwrap();
+        for root in writable_roots(&workspace, Some(&scratch), &[]) {
+            assert!(
+                !secret.starts_with(&root),
+                "sealed fixture overlaps writable root: {root:?}"
+            );
+        }
         let run = |cmd: &str| {
             let (program, args) = sandbox_command_with_read_denials(
                 "/bin/sh",
@@ -4462,8 +4473,6 @@ mod tests {
             String::from_utf8_lossy(&run("git log --oneline").stdout).contains("seed"),
             "workspace history must be readable"
         );
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// C2.3C-S Layer B — the escape hatch closes when a harness has sealed
