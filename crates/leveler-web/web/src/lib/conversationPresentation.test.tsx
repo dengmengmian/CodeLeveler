@@ -535,7 +535,7 @@ describe('conversation presentation rendering (Web)', () => {
           kind: 'exploration_receipt',
           reads: 2,
           searches: 1,
-          label: '读取 2 个文件 · 搜索 1 次',
+          label: '读取 2 次 · 搜索 1 次',
           folded: true,
           members: [
             { id: 't1', name: 'read_file', target: 'src/models.rs', status: 'done' },
@@ -549,7 +549,7 @@ describe('conversation presentation rendering (Web)', () => {
         ]}
       />,
     );
-    expect(markup).toContain('读取 2 个文件 · 搜索 1 次');
+    expect(markup).toContain('读取 2 次 · 搜索 1 次');
     expect(markup).not.toContain('src/models.rs');
     expect(markup).not.toContain('先看映射。');
   });

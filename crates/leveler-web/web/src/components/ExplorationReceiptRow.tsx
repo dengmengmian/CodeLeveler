@@ -1,7 +1,7 @@
 // Exploration receipt (探索回执): consecutive read-only calls as ONE reversible fold.
 //
 // The reference collapses consecutive read-only exploration into a single
-// `▸ 读取 N 个文件 · 搜索 M 次` receipt. Collapsed, the receipt stands in for its
+// `▸ 读取 N 次 · 搜索 M 次` receipt. Collapsed, the receipt stands in for its
 // members — including the completed Thoughts the fold was hiding, which is what
 // "FoldedThought" means. Opening it restores the real member chronology; the
 // fold hides, it never destroys.

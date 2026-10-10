@@ -21,7 +21,7 @@ it may not reorder, rewrite or invent.
 | User | The user's own line, exactly once, in its place. |
 | Thinking (live) | `思考中…` plus the body being written. Visible while the model is thinking. |
 | Thought (completed) | ONE folded `思考 · Ns` block per runtime reasoning segment; `Ns` is the runtime's measurement. The body comes back on demand. Never assistant prose. |
-| Exploration receipt | Consecutive read-only calls (read/list/glob/grep/search/lsp) collapse into ONE `读取 N 个文件 · 搜索 M 次` receipt, collapsed by default and reversible. A single explorer renders as its own compact row. |
+| Exploration receipt | Consecutive read-only calls (read/list/glob/grep/search/lsp) collapse into ONE `读取 N 次 · 搜索 M 次` receipt, collapsed by default and reversible. A single explorer renders as its own compact row. |
 | Tool row | The runtime's own status. No lifecycle noise (`Tool started`, `等待中`). |
 | Run (collapsed) | A command's output is not painted by default; its failure IS: status, exit code and the first line that reports the failure, chosen by the reference's rule. A runtime execution row is never the reason. |
 | Confirmed Diff | The runtime's `applied_diff`, displayed **in full, directly**: no collapse, no click, no preview budget, no row cap, no `… +N lines`, no diffstat-only summary. The requested patch is a different fact and is never a substitute. |
