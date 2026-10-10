@@ -206,8 +206,16 @@ async fn the_unsandboxed_exec_grant_does_not_leak() {
 #[tokio::test]
 async fn full_access_has_no_codeleveler_sandbox() {
     let fixture = Fixture::new();
-    let outside = tempfile::tempdir().expect("outside");
+    let home = std::env::var_os("HOME").expect("HOME for outside-grant fixture");
+    let outside = tempfile::Builder::new()
+        .prefix(".leveler-auto-outside-")
+        .tempdir_in(home)
+        .expect("outside-grant fixture");
     let outside_path = outside.path().canonicalize().expect("canonical");
+    let shared_temp = Path::new("/tmp").canonicalize().expect("shared temp root");
+    assert!(!outside_path.starts_with(&shared_temp));
+    assert!(!outside_path.starts_with(&fixture.workspace));
+    assert!(!outside_path.starts_with(fixture._home.path().canonicalize().unwrap()));
 
     // Auto genuinely fences this path: the same write must fail.
     let fenced = format!("echo x > {}", outside_path.join("fenced.txt").display());
