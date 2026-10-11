@@ -764,10 +764,30 @@ fn render_notice(frame: &mut Frame, area: Rect, state: &AppState) {
 
 // ── Input box ───────────────────────────────────────────────────────────────
 
+/// Rows of the composer box that fit in `height`, and how many leading rows
+/// were dropped.
+///
+/// The box is a top border, the content rows, then the bottom border. A short
+/// slot used to keep the prefix (`take(height)`), which deletes the bottom
+/// border and leaves the footer painted through an open frame. Keep the tail
+/// so the closing border survives.
+fn clip_composer_box(lines: Vec<Line<'static>>, height: usize) -> (Vec<Line<'static>>, usize) {
+    if height == 0 {
+        return (Vec::new(), 0);
+    }
+    if lines.len() <= height {
+        return (lines, 0);
+    }
+    let skip = lines.len() - height;
+    let shown: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
+    (shown, skip)
+}
+
 fn render_input(frame: &mut Frame, area: Rect, state: &mut AppState) {
     state.input_rect = Some((area.x, area.y, area.width, area.height));
     let (lines, (cx, cy)) = composer_box_lines(state, area.width as usize);
-    let shown: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
+    let (shown, skip) = clip_composer_box(lines, area.height as usize);
+    let cy = cy.saturating_sub(skip as u16);
     frame.render_widget(Paragraph::new(shown), area);
     // Cursor only when Input owns focus (Conversation focus is for scrolling).
     let input_focused = state.overlay.is_none()
@@ -948,6 +968,42 @@ mod tests {
     use super::*;
     use leveler_client_protocol::PlanStepStatus;
     use leveler_client_protocol::{SessionId, UiPlan, UiPlanStep};
+
+    #[test]
+    fn a_short_composer_slot_keeps_the_bottom_border() {
+        let lines = vec![
+            Line::from("TOP"),
+            Line::from("CONTENT"),
+            Line::from("BOTTOM"),
+        ];
+        let (shown, skip) = clip_composer_box(lines, 2);
+        assert_eq!(skip, 1, "drop the top border, not the closing one");
+        assert_eq!(line_text(&shown[0]), "CONTENT");
+        assert_eq!(line_text(&shown[1]), "BOTTOM");
+    }
+
+    #[test]
+    fn a_composer_slot_that_fits_drops_nothing() {
+        let lines = vec![Line::from("TOP"), Line::from("BOTTOM")];
+        let (shown, skip) = clip_composer_box(lines, 4);
+        assert_eq!(skip, 0);
+        assert_eq!(shown.len(), 2);
+        assert_eq!(line_text(&shown[1]), "BOTTOM");
+    }
+
+    #[test]
+    fn a_zero_height_composer_slot_draws_nothing() {
+        let (shown, skip) = clip_composer_box(vec![Line::from("TOP")], 0);
+        assert!(shown.is_empty());
+        assert_eq!(skip, 0);
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 
     fn test_state() -> AppState {
         AppState::new(
