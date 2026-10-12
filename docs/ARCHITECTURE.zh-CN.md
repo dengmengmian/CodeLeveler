@@ -1286,20 +1286,24 @@ dogfood 验证，不要在后续改动中回退：
   采用相同语义，已流式发布的 reasoning 不重复发布。
 - **Thought 使用有界预览与完成摘要**：live Thought 在对话 tail 显示 header 与
   最新最多 3 行换行后的正文，思考状态由 header 表达，不另占光标行。独立的
-  completed Thought 默认不占历史行，显式展开后显示正文与 header；空白正文的
-  completed Thought 不显示。用户手动展开后，后续事件
+  completed Thought 默认不占历史行，也没有其它入口。空白正文的
+  completed Thought 不显示。Ctrl+O 一次显示所有这类 header（有无工具组都一样），
+  点 header 只打开它自己的正文；没有工具组时该键的折叠目标是最新 Thought，
+  因此那一条会完整打开。用户手动展开后，后续事件
   不自动收起。原始文本、duration、事件、持久化与 provider replay 保持不变。
-  Ctrl+O 展开最新工具组；没有工具时打开最新 Thought。探索回执展开时
-  不显示已完成的 Thought header 或正文，原始思考仍保留在 transcript。
   状态栏继续根据当前 streaming 事实显示思考，完成后清除该状态。
-- **探索回执逐层独立折叠**：默认关闭 parent；打开回执只恢复按真实 chronology
-  排列的工具 header，不显示已完成的 Thought，也不连带打开工具正文。每个工具复用自身 `expanded`
-  展示状态，可独立打开 / 收起。关闭 parent 隐藏全部
-  子项，同时保留读者明确选择，重开时恢复；新子项默认收起。独立 Thought 与单个
-  探索工具仍有自己的入口；失败摘要、running 反馈与已确认 Edit diff 的契约不变。
+- **探索回执逐层独立折叠**：默认关闭 parent。打开回执按真实 chronology 恢复成员行：
+  每个探索工具带自己的正文入口，且其中每个已完成的 Thought 恢复 header，
+  因此聚合回执不会藏住 transcript 里仍然保存的推理。Ctrl+O 另外在回执保持关闭时也恢复
+  成员与独立 Thought 的 header，并展开该 run 的工具正文，所以 40 次读取的正文
+  也能从键盘到达。每个工具与每个 Thought 的正文仍复用自身的 `expanded` 展示状态。
+  关闭 parent 隐藏全部成员行，同时保留读者明确选择，重开时恢复；新子项默认收起。
+  独立 Thought 与单个探索工具仍有自己的入口；失败摘要、running 反馈与已确认 Edit diff
+  的契约不变。
 - **探索回执是 view-time fold，不是聚合覆盖**：连续 Read / Search / List，以及
   它们之间已完成的默认折叠 Thought，只改变折叠态的呈现；原始 Thought / Tool
-  entry 始终保留，展开按真实 chronology 恢复工具成员，已完成的 Thought 不参与展示。Run / Edit
+  entry 始终保留，展开按真实 chronology 恢复全部工具成员与每个已完成 Thought 的
+  header。Run / Edit
   / MCP / 权限 / 失败 / Narration / Final 是 breaker。聚合标签只统计工具，不发明
   执行阶段名（如“后端验证”），Thought 不计入标签；失败的探索目标永远直接可见。
 - **工具详细内容默认折叠**：Read / Search / List / Run 默认只画 header 与结果；

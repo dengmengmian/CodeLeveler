@@ -1757,23 +1757,45 @@ fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
     })]
 }
 
-/// Ctrl+O (keyboard fold): toggle the LATEST TOOL GROUP.
+/// Ctrl+O (keyboard fold): the latest command's details, and the reasoning the
+/// reader cannot otherwise see.
 ///
-/// The product's help names this binding "展开/收起最新工具组", so its target
-/// is the newest execution group — never "whatever entry folded last". A live
+/// The product's help names this binding "展开/收起最新工具组及思考详情", so its
+/// target is the newest execution group — never "whatever entry folded last". A live
 /// Thought always sits after the tool group of the round it belongs to, so a
 /// latest-foldable target sent every Ctrl+O to the Thought and left the tool
 /// body reachable only by mouse. A transcript with no tool group at all still
 /// falls back to the newest foldable, so the key is never dead.
 ///
-/// The mouse path is unchanged: a click targets exactly the row it lands on.
+/// "Details" has two owners and both are asked: the receipt's own fold (its
+/// member rows) and each member call's own disclosure (their bodies). The
+/// second is what keeps a 40-read receipt's file content reachable from the
+/// keyboard. On top of that, Ctrl+O reveals the header of every completed
+/// Thought that is hidden by default, so reasoning the transcript still holds
+/// is never unreachable; each body stays folded until its own header is opened.
+///
+/// The mouse path is unchanged: a click targets exactly the row it lands on and
+/// opens one level.
 fn toggle_current_expand(state: &mut AppState) {
-    let Some(index) = crate::conversation::build::keyboard_expand_target(state) else {
-        return;
-    };
-    if let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index) {
+    if let Some(index) = crate::conversation::build::keyboard_expand_target(state)
+        && let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index)
+    {
         state.tools_expanded = expanded;
+        for item in crate::conversation::build::keyboard_detail_items(state, index) {
+            state
+                .transcript
+                .set_exploration_calls_expanded(item, expanded);
+        }
+        state.conv.plain.clear();
+        state.conv.plain_width = 0;
     }
+    // Independent of which command is newest: the reasoning headers follow the
+    // key too, so a transcript whose only hidden entry is a Thought still
+    // answers Ctrl+O.
+    state.conv.reasoning_headers = !state.conv.reasoning_headers;
+    state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
+    state.conv.plain.clear();
+    state.conv.plain_width = 0;
 }
 
 /// Jump conversation viewport to bottom (auto-follow resumes).

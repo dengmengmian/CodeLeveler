@@ -1403,18 +1403,23 @@ verified by deterministic tests and real dogfood — do not regress them:
 - **Thoughts use bounded previews and completion summaries**: a live Thought at
   the conversation tail shows its header and at most the latest three wrapped
   body rows. The header reports streaming without an extra cursor row. A completed
-  standalone Thought occupies no history row until explicitly opened; settled
-  Thoughts with blank bodies remain hidden. Manually expanded Thoughts stay open
-  through later events. Raw text, duration, events, persistence,
-  and provider replay remain unchanged. Ctrl+O opens the latest tool group;
-  without tools it opens the latest Thought. Opening an exploration receipt
-  shows neither completed Thought headers nor their bodies; raw reasoning remains
-  in the transcript. The status
+  standalone Thought occupies no history row until it is asked for; settled
+  Thoughts with blank bodies remain hidden. Ctrl+O reveals every such header at
+  once — with or without a tool group — and a header's own click opens exactly
+  that body; without any tool group the key's fold target is the newest Thought,
+  so that one opens fully. Manually expanded Thoughts stay open through later
+  events. Raw text, duration, events, persistence,
+  and provider replay remain unchanged. The status
   strip reports the current streaming fact and clears it at completion.
-- **Exploration receipts fold independently at each level**: parents start closed;
-  opening a receipt restores tool headers in real chronology without displaying
-  completed Thoughts or opening tool bodies. Each tool reuses its own `expanded`
-  presentation state. Closing a parent hides every child while
+- **Exploration receipts fold independently at each level**: parents start closed.
+  Opening a receipt restores its member rows in real chronology: every exploration
+  call with its own body disclosure, and a header for each finished Thought that
+  sat between them — so the aggregate never hides reasoning the transcript still
+  holds. Ctrl+O additionally reveals the member and standalone Thought headers
+  even while a receipt stays closed, and opens the run's tool details, so a
+  40-read receipt's file content is reachable from the keyboard. Each tool and
+  each Thought reuses its own `expanded` presentation state for its body.
+  Closing a parent hides every member row while
   retaining explicit reader choices for reopening; new children start collapsed.
   Standalone Thoughts and single exploration calls keep their own disclosure.
   Failure summaries, running feedback, and confirmed Edit diffs retain their contracts.
@@ -1422,8 +1427,8 @@ verified by deterministic tests and real dogfood — do not regress them:
 - **An exploration receipt is a view-time fold, not an aggregate overlay**:
   consecutive Read / Search / List calls, plus the finished default-collapsed
   Thoughts between them, only change how the collapsed run is painted; every
-  original Thought / tool entry is kept, and expanding restores tool members
-  in real chronology while completed Thoughts stay hidden. A run, an edit, an MCP dispatch, a permission
+  original Thought / tool entry is kept, and expanding restores every tool member
+  and every finished Thought header in real chronology. A run, an edit, an MCP dispatch, a permission
   hold, a failure, narration and the Final are breakers. The aggregate label
   counts tools only and never invents an execution-stage name; Thoughts never
   count, and a failed exploration target is always directly visible.

@@ -891,7 +891,7 @@ mod tests {
         s.transcript.toggle_call_at(item, 0);
         let frame = visible_window(&mut s, 80, 24);
         assert!(frame.contains("最后一行"));
-        assert!(frame.contains("▸ 读取 docs/ARCHITECTURE.md"));
+        assert!(frame.contains("› 读取 docs/ARCHITECTURE.md"));
         write_dump("nested-one-child-open", &frame);
         s.transcript.toggle_call_at(item, 0);
         let frame = visible_window(&mut s, 80, 24);
