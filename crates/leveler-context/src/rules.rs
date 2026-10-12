@@ -452,6 +452,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repository_rules_deliver_tdd_and_minimum_verification() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root");
+        let config = leveler_project::config::ProjectConfig::load(root)
+            .expect("repository verification config");
+        let policy = RuleDeliveryPolicy {
+            always: config.rules.always_delivered,
+            budget_bytes: config.rules.budget_bytes,
+        };
+        let content = std::fs::read_to_string(root.join("AGENTS.md"))
+            .expect("repository development instructions");
+        let delivery = deliver_sections_with_policy("AGENTS.md", content.trim(), &policy);
+        let delivered = delivery
+            .delivered
+            .iter()
+            .map(|section| section.content.as_str())
+            .collect::<String>();
+        assert!(
+            delivered.contains("先写一个最小"),
+            "TDD behavior must be delivered"
+        );
+        assert!(
+            delivered.contains("最小充分验证"),
+            "verification policy must be delivered"
+        );
+        assert!(
+            delivery.omitted.is_empty(),
+            "repository rules must fit the budget"
+        );
+        assert!(!delivery.first_section_clipped);
+        for needle in &policy.always {
+            assert!(
+                delivery.delivered.iter().any(|section| {
+                    section
+                        .heading
+                        .to_lowercase()
+                        .contains(&needle.to_lowercase())
+                        || section.id.to_lowercase().contains(&needle.to_lowercase())
+                }),
+                "configured rule heading was not delivered: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn loads_agents_md_and_rules() {
         let dir =
             std::env::temp_dir().join(format!("leveler-rules-{}", std::process::id() as u64 + 51));
