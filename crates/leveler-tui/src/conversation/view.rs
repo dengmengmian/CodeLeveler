@@ -157,18 +157,18 @@ pub struct ConversationView {
     /// a long finalized history from being re-wrapped on every streaming frame:
     /// only the item whose content changed is recomputed.
     pub item_cache: std::cell::RefCell<ItemLineCache>,
-    /// View-time exploration folds the reader opened, keyed by the run's
+    /// View-time process folds the reader opened, keyed by the run's
     /// anchor call id (the first exploration call of the run's first group).
     ///
     /// PRESENTATION ONLY. It never enters the transcript, the event log or
     /// resume: a fold is re-derived from the same semantic items every build,
     /// and an unopened run is simply collapsed.
-    pub(crate) exploration_folds:
+    pub(crate) process_folds:
         std::cell::RefCell<std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
     /// Ctrl+O asked for the reasoning that is folded away: every completed
     /// Thought then paints its header, and a click opens that one body.
     ///
-    /// PRESENTATION ONLY, like [`Self::exploration_folds`]: it never enters the
+    /// PRESENTATION ONLY, like [`Self::process_folds`]: it never enters the
     /// transcript, the event log or resume, so a reopened session starts with
     /// the reasoning hidden again.
     pub(crate) reasoning_headers: bool,
@@ -192,7 +192,7 @@ impl Default for ConversationView {
             plain_width: 0,
             cache: std::cell::RefCell::new(None),
             item_cache: std::cell::RefCell::new(ItemLineCache::default()),
-            exploration_folds: std::cell::RefCell::new(std::collections::HashSet::new()),
+            process_folds: std::cell::RefCell::new(std::collections::HashSet::new()),
             reasoning_headers: false,
         }
     }

@@ -4,6 +4,13 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
+## [Unreleased]
+
+### Changed
+
+- Settled TUI tool processes fold across model rounds into one clickable receipt with counts by tool kind and explicit failure, stopped, and unknown outcomes. Opening the receipt restores member headers in order; each member retains its own details. Confirmed edit diffs remain fully visible.
+- Lone commands no longer repeat a group title; background wait receipts stay inside their drawer, and background completion updates the matching starter without a duplicate transcript notice.
+
 ## [1.0.14] - 2026-10-12
 
 Turns the terminal into a primitives-first editor surface — input editing,

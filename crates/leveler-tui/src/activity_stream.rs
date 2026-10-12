@@ -1,53 +1,19 @@
-//! Conversation activity stream: per-call tool evidence.
+//! Tool activity rows and their per-call evidence.
 //!
-//! Product surface, not a tool trace — but evidence, not a summary. Every
-//! user-visible call owns a row that answers four questions: which tool ran, on
-//! what, what came back, and what state it is in.
+//! The conversation's view-time process planner folds settled ordinary work
+//! across model rounds into one receipt. Opening it restores real member
+//! headers in chronology; each call keeps its own output drawer. Failure,
+//! cancellation and unknown outcomes remain explicit on the receipt.
 //!
-//! **One execution-presentation contract, three shapes:**
+//! This renderer also owns live execution groups, which retain stable parent
+//! and child rows while the model may still extend them. Concurrent batches
+//! are derived from observed overlap, never inferred from adjacency. A lone
+//! settled command needs no redundant group title above its own row.
 //!
-//! - **Search / Read / List — compact receipt.** A stretch of two or more
-//!   successful exploration calls collapses to ONE line that counts by kind
-//!   (`› 读取 7 次 · 搜索 2 次`). A burst of reads is not a decision log:
-//!   the files add nothing a reader acts on, and a row each is the
-//!   execution-log waterfall this contract removes. A LONE exploration call
-//!   keeps its evidence row (aggregating one call loses the target for no
-//!   compactness), and a stretch containing a FAILURE falls back to rows so the
-//!   failing target stays inspectable.
-//! - **Run / Shell / Test — one logical execution.** A run keeps its command
-//!   and its outcome (`› 执行命令 · 完成 1 项` / `└─ ✓ $ cargo test · 8.2s`).
-//!   The started/completed/waiting lifecycle is NEVER written into history as
-//!   separate rows: it lives in the single live activity while the command runs
-//!   and freezes to the receipt on completion.
-//! - **Edit — inline diff.** A diff IS the result, so it is never folded into
-//!   a count; consecutive same-file patches merge into one node.
-//!
-//! Mixed stretches that are not exploration keep the per-call rows below their
-//! disclosure header.
-//!
-//! - **Silent** tools (ls/find probes, goal bookkeeping): hidden per-call.
-//! - **User-visible**: every Normal/Important call renders a head row (`›`
-//!   anchor + action + inline target) and, collapsed, one `└` result line. No
-//!   whole-line tinting: only the status glyph carries a status color.
-//! - `›` is the transcript's first-level execution anchor (`▌` user, `●`
-//!   agent, `›` tool). It says a tool ran here — never a status, a fold state
-//!   or a cursor.
-//! - Consecutive calls of the SAME tool read as one RUN: the tool is named
-//!   once, and each call becomes a `├─`/`└─` child carrying only what differs.
-//!   A count of children would be the children said twice; a count of
-//!   FAILURES rides on the head, because nothing else shows it at a glance.
-//! - A group that is not a run keeps a clickable `▸/▾` summary as a HEADER
-//!   over its rows. That fold governs each call's OUTPUT — the one thing it
-//!   may hide. The header exists from the group's FIRST second (`⋮ 正在执行 ·
-//!   N 个命令`) and closing only rewrites it (`▸ … · 全部成功`), so a close
-//!   never inserts a row or shifts the children under it. A lone non-shell
-//!   call gets no header: it may still become a run, whose own head then owns
-//!   the stretch. Either way the group's FIRST row is the click target.
-//! - Calls the reducer OBSERVED in flight together ([`ToolCallBlock::batch`])
-//!   keep their own header, which is the ONLY row that claims concurrency:
-//!   a run's tree says "same tool, one after another", never "at once".
-//! - Consecutive same-file patches merge into one edit node whose diff is
-//!   always complete; consecutive identical failures merge with a `×N` count.
+//! Confirmed edits are results rather than tool output: their complete
+//! canonical diffs are always visible, regardless of any fold state.
+//! Interaction and bookkeeping keep their own surfaces. No presentation fold
+//! merges, removes or changes the underlying calls or runtime facts.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -130,6 +96,55 @@ pub(crate) fn render_group_rows(
         .iter()
         .filter(|c| is_conversation_visible(c))
         .collect();
+    // A lone settled command needs no group title above its own drawer.
+    // Multi-call history is folded by the conversation's cross-round planner.
+    if !group.open
+        && group_is_finished(group)
+        && group_is_disclosable(group)
+        && let [call] = visible.as_slice()
+    {
+        if is_shell_call(call) {
+            let (lines, stoppable) = command_unit_lines(
+                call,
+                theme,
+                width,
+                locale,
+                t,
+                group.expanded(),
+                now_elapsed_secs,
+                None,
+                false,
+                focused_command,
+            );
+            push_command_rows(rows, 0, index_of(call), stoppable, lines.len());
+            return lines;
+        }
+        if call.name == "wait_task" {
+            let mut lines = process_member_lines(
+                call,
+                theme,
+                width,
+                locale,
+                t,
+                now_elapsed_secs,
+                awaiting_approval,
+            );
+            if group.expanded() && !call.expanded {
+                let mut opened = (*call).clone();
+                opened.expanded = true;
+                lines = process_member_lines(
+                    &opened,
+                    theme,
+                    width,
+                    locale,
+                    t,
+                    now_elapsed_secs,
+                    awaiting_approval,
+                );
+            }
+            return lines;
+        }
+    }
     // Execution-presentation contract, shape 1: Search / Read / List is ONE
     // view-time fold. The collapsed group paints the aggregate receipt; an
     // expanded group paints the receipt and then every real member row, so the
@@ -650,22 +665,16 @@ fn exploration_members(group: &ToolGroupBlock) -> Vec<&ToolCallBlock> {
         .collect()
 }
 
-/// Whether one call is eligible to be counted by a view-time exploration fold:
-/// visible, non-destructive, and exploration. The fold planner uses this to
-/// collect the members a receipt speaks for without knowing any tool name.
-pub(crate) fn is_exploration_fold_call(call: &ToolCallBlock) -> bool {
-    is_conversation_visible(call) && is_exploration_call(call)
+/// Whether one ordinary work call can appear under a process receipt. Edits,
+/// decisions and bookkeeping keep their own surfaces and never join it.
+pub(crate) fn is_process_fold_call(call: &ToolCallBlock) -> bool {
+    is_conversation_visible(call) && disclosure_class(&call.name) != DisclosureClass::Excluded
 }
 
-/// Whether this group is a settled, non-destructive EXPLORATION participant in
-/// a view-time fold.
-///
-/// Stricter than [`group_is_compact_exploration`]: a single call still
-/// participates (a finished Thought beside it already gives the fold a reason
-/// to exist), but the group must be closed and every visible call must have
-/// SUCCEEDED. A failure, an edit, a command or an unknown tool is a breaker,
-/// so a fold can never hide a target the reader needs.
-pub(crate) fn group_is_exploration_fold_member(group: &ToolGroupBlock) -> bool {
+/// A closed, settled work group can join a cross-round process receipt.
+/// Failures remain countable and inspectable. Live detached processes cannot
+/// join merely because their spawning tool call has already returned.
+pub(crate) fn group_is_process_fold_member(group: &ToolGroupBlock) -> bool {
     if group.open || !group_is_finished(group) {
         return false;
     }
@@ -675,32 +684,176 @@ pub(crate) fn group_is_exploration_fold_member(group: &ToolGroupBlock) -> bool {
         .filter(|c| is_conversation_visible(c))
         .collect();
     !visible.is_empty()
-        && visible
-            .iter()
-            .all(|c| is_exploration_call(c) && c.status == ToolStatus::Ok)
+        && group_is_disclosable(group)
+        && !visible.iter().any(|c| {
+            started_in_background(c) && matches!(detached_outcome(c), DetachedOutcome::Running)
+        })
 }
 
-/// The exploration calls one fold participant contributes, in order.
-pub(crate) fn group_exploration_fold_calls(group: &ToolGroupBlock) -> Vec<&ToolCallBlock> {
+/// The work calls one fold participant contributes, in order.
+pub(crate) fn group_process_fold_calls(group: &ToolGroupBlock) -> Vec<&ToolCallBlock> {
     group
         .calls
         .iter()
-        .filter(|c| is_exploration_fold_call(c))
+        .filter(|c| is_process_fold_call(c))
         .collect()
 }
 
-/// The aggregate receipt row of a view-time exploration fold that spans
-/// several groups (and the finished Thoughts between them). `members` are the
-/// real exploration calls the fold speaks for, in chronology; Thoughts never
+/// The aggregate receipt row of a process fold spanning several groups and
+/// the finished Thoughts between them. Members retain chronology; Thoughts never
 /// count toward the label.
-pub(crate) fn exploration_fold_receipt_line(
+pub(crate) fn process_fold_receipt_line(
     members: &[&ToolCallBlock],
     theme: &Theme,
     width: usize,
     t: &UiText,
     expanded: bool,
 ) -> Line<'static> {
-    exploration_receipt_line(members, theme, width, t, false, expanded)
+    process_receipt_line(members, theme, width, t, expanded)
+}
+
+/// Counts only visible tool calls. Failed calls remain in their kind bucket,
+/// with a separate attention suffix; expanding restores their real targets.
+fn process_receipt_line(
+    members: &[&ToolCallBlock],
+    theme: &Theme,
+    width: usize,
+    t: &UiText,
+    expanded: bool,
+) -> Line<'static> {
+    let mut parts = Vec::new();
+    let exploration = exploration_receipt_label(members, t, false);
+    if !exploration.is_empty() {
+        parts.push(exploration);
+    }
+    let commands = members.iter().filter(|c| is_shell_call(c)).count();
+    if commands > 0 {
+        parts.push(t.disclosure_shell_many.replace("{}", &commands.to_string()));
+    }
+    let work = members
+        .iter()
+        .filter(|c| disclosure_class(&c.name) == DisclosureClass::Work)
+        .count();
+    if work > 0 {
+        parts.push(t.disclosure_tools_many.replace("{}", &work.to_string()));
+    }
+    let mut attention = Vec::new();
+    let failed = members
+        .iter()
+        .filter(|c| {
+            if needs_network_permission(c) {
+                return false;
+            }
+            if started_in_background(c) {
+                matches!(detached_outcome(c), DetachedOutcome::Failed { .. })
+                    || c.status == ToolStatus::Failed
+            } else {
+                c.status == ToolStatus::Failed && !needs_network_permission(c)
+            }
+        })
+        .count();
+    if failed > 0 {
+        attention.push(Span::styled(
+            format!(" · ✗ {}", t.batch_failed.replace("{}", &failed.to_string())),
+            Style::default().fg(theme.status.error),
+        ));
+    }
+    let permission = members
+        .iter()
+        .filter(|c| c.status == ToolStatus::Failed && needs_network_permission(c))
+        .count();
+    if permission > 0 {
+        attention.push(Span::styled(
+            format!(
+                " · ⚠ {}",
+                t.batch_needs_network.replace("{}", &permission.to_string())
+            ),
+            Style::default().fg(theme.status.warning),
+        ));
+    }
+    for (status, label, glyph) in [
+        (ToolStatus::Cancelled, t.command_stopped, "⊘"),
+        (ToolStatus::Unknown, t.command_unknown, "?"),
+    ] {
+        let count = members
+            .iter()
+            .filter(|c| {
+                c.status == status
+                    || (status == ToolStatus::Cancelled
+                        && started_in_background(c)
+                        && matches!(detached_outcome(c), DetachedOutcome::Stopped { .. }))
+            })
+            .count();
+        if count > 0 {
+            attention.push(Span::styled(
+                format!(" · {glyph} {label} ×{count}"),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+    }
+    let suffix_width: usize = attention
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let mut spans = vec![
+        Span::styled(
+            if expanded { "▾ " } else { "▸ " },
+            Style::default().fg(theme.text.muted),
+        ),
+        Span::styled(
+            truncate_display(
+                &parts.join(" · "),
+                width.saturating_sub(2 + suffix_width).max(1),
+            ),
+            Style::default().fg(theme.text.muted),
+        ),
+    ];
+    spans.extend(attention);
+    clip_line(spans, width)
+}
+
+/// A parent opens only member headers. A child owns its command/output drawer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_member_lines(
+    call: &ToolCallBlock,
+    theme: &Theme,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    now_elapsed_secs: u64,
+    awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+) -> Vec<Line<'static>> {
+    if is_shell_call(call) {
+        let (mut lines, _) = command_unit_lines(
+            call,
+            theme,
+            width,
+            locale,
+            t,
+            false,
+            now_elapsed_secs,
+            None,
+            awaits(call, awaiting_approval),
+            None,
+        );
+        if !call.expanded {
+            lines.truncate(1);
+        }
+        return lines;
+    }
+    let mut lines = exploration_fold_member_lines(
+        call,
+        theme,
+        width,
+        locale,
+        t,
+        now_elapsed_secs,
+        awaiting_approval,
+    );
+    if !call.expanded {
+        lines.truncate(1);
+    }
+    lines
 }
 
 /// One group's member rows inside an OPEN fold, indented one level under the
@@ -728,10 +881,11 @@ pub(crate) fn exploration_fold_member_lines(
         None,
         awaits(call, awaiting_approval),
         true,
-        true,
+        is_exploration_call(call),
     );
     // The parent only reveals target rows. Each call owns its full detail.
     if call.expanded {
+        lines.truncate(1);
         // All available exploration output stays reachable through the normal
         // conversation viewport, including long and wrapped read results.
         if let Some(preview) = &call.preview {
@@ -6052,13 +6206,17 @@ mod tests {
             ToolStatus::Failed,
         );
         wait.preview = Some("task_id: bg-1\nstatus: exited\nexit_code: 1".into());
-        let rows = render_group_text(&group(vec![wait]), 120, Locale::Zh);
+        let mut g = group(vec![wait]);
+        let rows = render_group_text(&g, 120, Locale::Zh);
         assert!(!rows.is_empty(), "a failed wait must not vanish: {rows:?}");
         assert!(rows[0].contains("等待后台任务"), "{rows:?}");
         assert!(rows[0].contains('\u{2717}'), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("task_id:")));
+        g.display = crate::fold::DisplayMode::Expanded;
+        let rows = render_group_text(&g, 120, Locale::Zh);
         assert!(
             rows.iter().any(|r| r.contains("bg-1")),
-            "the task failure detail is still reachable: {rows:?}"
+            "the wire receipt is reachable by expanding: {rows:?}"
         );
     }
 
@@ -6104,15 +6262,15 @@ mod tests {
         let lines = render_group_text(&g, 100, Locale::Zh);
         assert_eq!(
             lines.len(),
-            2,
-            "a stage row plus the one command row: {lines:?}"
+            1,
+            "one command drawer without a redundant stage title: {lines:?}"
         );
         assert!(
-            lines[1].starts_with(&format!("  {TOOL_ANCHOR} ✓ $ cargo test")),
+            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✓ $ cargo test")),
             "the row names the command it ran: {lines:?}"
         );
         assert!(
-            lines[1].ends_with("1 行"),
+            lines[0].ends_with("1 行"),
             "how much it printed is counted on the row: {lines:?}"
         );
         assert!(
@@ -6170,15 +6328,15 @@ mod tests {
         let lines = render_group_text(&g, 120, Locale::Zh);
         assert_eq!(
             lines.len(),
-            3,
-            "a stage row, the call's row and its error: {lines:?}"
+            2,
+            "the command and its failure summary: {lines:?}"
         );
         assert!(
-            lines[1].starts_with(&format!("  {TOOL_ANCHOR} ✗ $ cargo test")),
+            lines[0].starts_with(&format!("{TOOL_ANCHOR} ✗ $ cargo test")),
             "the row names the failure and the command: {lines:?}"
         );
         assert!(
-            lines[2].starts_with("    └ ") && lines[2].contains("error: no such command"),
+            lines[1].starts_with("  └ ") && lines[1].contains("error: no such command"),
             "result row carries the first error line: {lines:?}"
         );
         assert!(
@@ -6596,14 +6754,21 @@ mod compact_command_tests {
     /// tests pin the COMMAND row's shape; the parent row and the child indent
     /// have their own lifecycle test.
     fn body(lines: Vec<String>) -> Vec<String> {
-        let lines = if lines.first().is_some_and(|l| is_stage_parent(l)) {
+        let has_parent = lines.first().is_some_and(|l| is_stage_parent(l));
+        let lines = if has_parent {
             lines.into_iter().skip(1).collect::<Vec<_>>()
         } else {
             lines
         };
         lines
             .into_iter()
-            .map(|l| l.strip_prefix(GROUP_BODY_INDENT).unwrap_or(&l).to_string())
+            .map(|l| {
+                if has_parent {
+                    l.strip_prefix(GROUP_BODY_INDENT).unwrap_or(&l).to_string()
+                } else {
+                    l
+                }
+            })
             .collect()
     }
 

@@ -229,11 +229,11 @@ fn build_conversation(
     let mut new_units: Vec<super::view::CachedUnit> = Vec::new();
 
     let items = state.transcript.items();
-    let folds = plan_exploration_folds(items);
+    let folds = plan_process_folds(items);
     let mut idx = 0;
     while idx < items.len() {
         let item = &items[idx];
-        // A view-time exploration run paints as ONE unit: the aggregate
+        // A view-time process run paints as ONE unit: the aggregate
         // receipt, plus whatever its current fold state reveals. Nothing is
         // merged — the run's items stay in the transcript and opening the fold
         // restores only its tools, in their real order.
@@ -244,7 +244,7 @@ fn build_conversation(
                 out.push(Line::from(""));
             }
             let before_item = out.len();
-            render_exploration_fold(
+            render_process_fold(
                 state,
                 fold,
                 &mut out,
@@ -428,13 +428,13 @@ fn build_conversation(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// View-time exploration folds
+// View-time process folds
 // ───────────────────────────────────────────────────────────────────────────
 //
 // A provider that reasons between tool calls makes the transcript alternate
 // `Thought / ToolGroup / Thought / ToolGroup`, which paints a wall of `◆`
 // headers over one-row reads. The fix is PRESENTATION ONLY: a chronological run
-// of finished Thoughts and settled non-destructive exploration groups
+// of finished Thoughts and settled non-destructive work groups
 // is painted as ONE aggregate receipt until the reader opens it. Nothing is
 // merged or reordered — the same semantic items stay in the transcript, and
 // opening the fold restores them in their real order.
@@ -448,16 +448,16 @@ enum SlotKind {
     Thought,
 }
 
-/// One item inside a view-time exploration run.
+/// One item inside a view-time process run.
 #[derive(Debug)]
 struct FoldSlot {
     item: usize,
 }
 
-/// One derived exploration run. `end` is exclusive.
+/// One derived process run. `end` is exclusive.
 #[derive(Debug)]
-struct ExplorationFold {
-    /// The run's first exploration group — the toggle target and the run's
+struct ProcessFold {
+    /// The run's first work group — the toggle target and the run's
     /// stable identity. Its first call's id keys the view-time fold set.
     anchor: usize,
     start: usize,
@@ -468,10 +468,10 @@ struct ExplorationFold {
 }
 
 #[derive(Debug, Default)]
-struct ExplorationFolds {
+struct ProcessFolds {
     /// For each transcript item, the run index it belongs to.
     owner: Vec<Option<usize>>,
-    runs: Vec<ExplorationFold>,
+    runs: Vec<ProcessFold>,
 }
 
 /// Classify one transcript item for a run, or `None` when it ends the run.
@@ -483,7 +483,7 @@ fn classify_fold_item(item: &TranscriptItem) -> Option<SlotKind> {
         // A live Thought is the tail itself; a run never folds around it.
         TranscriptItem::Thought(_) => None,
         TranscriptItem::ToolGroup(group)
-            if crate::activity_stream::group_is_exploration_fold_member(group) =>
+            if crate::activity_stream::group_is_process_fold_member(group) =>
         {
             // The run's fold state is the fold SET, not the group's own
             // drawer: a member that was opened before the fold formed is still
@@ -495,15 +495,15 @@ fn classify_fold_item(item: &TranscriptItem) -> Option<SlotKind> {
     }
 }
 
-/// Derive every view-time exploration run in one pass.
+/// Derive every view-time process run in one pass.
 ///
-/// A run folds only when it holds at least one exploration group and counts at
-/// least two exploration calls: a lone read keeps its own target row, and a
+/// A run folds only when it holds at least one work group and counts at
+/// least two work calls: a lone read keeps its own target row, and a
 /// run of only Thoughts has an empty label and nothing to compact. When a
 /// candidate run does not fold, the whole candidate is skipped — no sub-run of
 /// it can have more members, so none can fold either.
-fn plan_exploration_folds(items: &[TranscriptItem]) -> ExplorationFolds {
-    let mut plan = ExplorationFolds {
+fn plan_process_folds(items: &[TranscriptItem]) -> ProcessFolds {
+    let mut plan = ProcessFolds {
         owner: vec![None; items.len()],
         runs: Vec::new(),
     };
@@ -520,7 +520,7 @@ fn plan_exploration_folds(items: &[TranscriptItem]) -> ExplorationFolds {
             if kind == SlotKind::MemberGroup {
                 if let Some(TranscriptItem::ToolGroup(group)) = items.get(j) {
                     for (ci, call) in group.calls.iter().enumerate() {
-                        if crate::activity_stream::is_exploration_fold_call(call) {
+                        if crate::activity_stream::is_process_fold_call(call) {
                             members.push((j, ci));
                         }
                     }
@@ -536,7 +536,7 @@ fn plan_exploration_folds(items: &[TranscriptItem]) -> ExplorationFolds {
                 for k in i..j {
                     plan.owner[k] = Some(run);
                 }
-                plan.runs.push(ExplorationFold {
+                plan.runs.push(ProcessFold {
                     anchor,
                     start: i,
                     end: j,
@@ -554,12 +554,12 @@ fn plan_exploration_folds(items: &[TranscriptItem]) -> ExplorationFolds {
 /// The stable identity of a run: its anchor group's first exploration call.
 fn fold_anchor_key(
     items: &[TranscriptItem],
-    fold: &ExplorationFold,
+    fold: &ProcessFold,
 ) -> Option<leveler_client_protocol::ToolCallId> {
     let TranscriptItem::ToolGroup(group) = items.get(fold.anchor)? else {
         return None;
     };
-    crate::activity_stream::group_exploration_fold_calls(group)
+    crate::activity_stream::group_process_fold_calls(group)
         .first()
         .map(|call| call.id.clone())
 }
@@ -567,23 +567,20 @@ fn fold_anchor_key(
 /// Whether a view-time exploration fold is open. Presentation-only state kept
 /// on the conversation view, keyed by the run's anchor call id.
 impl crate::conversation::ConversationView {
-    pub(crate) fn exploration_fold_expanded(
-        &self,
-        key: &leveler_client_protocol::ToolCallId,
-    ) -> bool {
-        self.exploration_folds.borrow().contains(key)
+    pub(crate) fn process_fold_expanded(&self, key: &leveler_client_protocol::ToolCallId) -> bool {
+        self.process_folds.borrow().contains(key)
     }
 }
 
 /// Resolve the latest tool group to the receipt currently folding it.
 /// Mouse clicks keep their exact item, while the keyboard must open the
-/// containing exploration run instead of toggling a hidden member.
+/// containing process run instead of toggling a hidden member.
 pub(crate) fn keyboard_expand_target(state: &AppState) -> Option<usize> {
     let latest = state
         .transcript
         .last_tool_group_index()
         .or_else(|| state.transcript.last_foldable_index())?;
-    let plan = plan_exploration_folds(state.transcript.items());
+    let plan = plan_process_folds(state.transcript.items());
     Some(
         plan.owner[latest]
             .map(|run| plan.runs[run].anchor)
@@ -597,7 +594,7 @@ pub(crate) fn keyboard_expand_target(state: &AppState) -> Option<usize> {
 /// for the latest command's details asks for the whole run's.
 pub(crate) fn keyboard_detail_items(state: &AppState, target: usize) -> Vec<usize> {
     let items = state.transcript.items();
-    let plan = plan_exploration_folds(items);
+    let plan = plan_process_folds(items);
     match plan.owner.get(target).copied().flatten() {
         Some(run) => plan.runs[run].slots.iter().map(|slot| slot.item).collect(),
         None => vec![target],
@@ -608,15 +605,15 @@ pub(crate) fn keyboard_detail_items(state: &AppState, target: usize) -> Vec<usiz
 /// Returns the new expanded state, or `None` when the item is not a run's
 /// anchor.
 ///
-/// Only the run's ANCHOR (its first exploration group) opens or closes the
+/// Only the run's ANCHOR (its first work group) opens or closes the
 /// fold. A member row inside an open fold keeps its own fold: a
 /// click there must reveal tool details, never collapse the run around it.
 ///
 /// Kept beside the planner so the run the reader clicked is resolved by the
 /// same derivation that painted it — the hit can never describe another run.
-pub(crate) fn toggle_exploration_fold(state: &mut AppState, item: usize) -> Option<bool> {
+pub(crate) fn toggle_process_fold(state: &mut AppState, item: usize) -> Option<bool> {
     let items = state.transcript.items();
-    let plan = plan_exploration_folds(items);
+    let plan = plan_process_folds(items);
     let run = plan.owner.get(item).copied().flatten()?;
     let fold = plan.runs.get(run)?;
     if fold.anchor != item {
@@ -624,7 +621,7 @@ pub(crate) fn toggle_exploration_fold(state: &mut AppState, item: usize) -> Opti
     }
     let key = fold_anchor_key(items, fold)?;
     let expanded = {
-        let mut folds = state.conv.exploration_folds.borrow_mut();
+        let mut folds = state.conv.process_folds.borrow_mut();
         if folds.remove(&key) {
             false
         } else {
@@ -640,12 +637,12 @@ pub(crate) fn toggle_exploration_fold(state: &mut AppState, item: usize) -> Opti
     Some(expanded)
 }
 
-/// Paint one view-time exploration run as a unit: the aggregate receipt, then
+/// Paint one view-time process run as a unit: the aggregate receipt, then
 /// the members the current fold state reveals.
 #[allow(clippy::too_many_arguments)]
-fn render_exploration_fold(
+fn render_process_fold(
     state: &AppState,
-    fold: &ExplorationFold,
+    fold: &ProcessFold,
     out: &mut Vec<Line<'static>>,
     hits: &mut Vec<(usize, usize)>,
     commands: &mut Vec<super::view::CommandHit>,
@@ -655,7 +652,7 @@ fn render_exploration_fold(
 ) {
     let items = state.transcript.items();
     let expanded =
-        fold_anchor_key(items, fold).is_some_and(|key| state.conv.exploration_fold_expanded(&key));
+        fold_anchor_key(items, fold).is_some_and(|key| state.conv.process_fold_expanded(&key));
     let members: Vec<&crate::transcript::ToolCallBlock> = fold
         .members
         .iter()
@@ -666,7 +663,7 @@ fn render_exploration_fold(
         .collect();
     // The receipt IS the fold's disclosure row: its click toggles the run.
     hits.push((out.len(), fold.anchor));
-    out.push(crate::activity_stream::exploration_fold_receipt_line(
+    out.push(crate::activity_stream::process_fold_receipt_line(
         &members, theme, width, t, expanded,
     ));
     let body_start = out.len();
@@ -700,7 +697,7 @@ fn render_exploration_fold(
             Some(TranscriptItem::Thought(_)) => {}
             Some(TranscriptItem::ToolGroup(group)) if expanded => {
                 for (call_index, call) in group.calls.iter().enumerate() {
-                    if !crate::activity_stream::is_exploration_fold_call(call) {
+                    if !crate::activity_stream::is_process_fold_call(call) {
                         continue;
                     }
                     commands.push(super::view::CommandHit {
@@ -709,7 +706,7 @@ fn render_exploration_fold(
                         call: call_index,
                         stoppable: false,
                     });
-                    out.extend(crate::activity_stream::exploration_fold_member_lines(
+                    out.extend(crate::activity_stream::process_member_lines(
                         call,
                         theme,
                         child_width,
@@ -999,7 +996,7 @@ mod tests {
     }
 }
 
-/// View-time exploration folds: the presentation contracts the Conversation
+/// View-time process folds: the presentation contracts the Conversation
 /// IA now guarantees. These tests drive the SAME build path the UI paints.
 #[cfg(test)]
 mod exploration_fold_tests {
@@ -1092,6 +1089,267 @@ mod exploration_fold_tests {
             .iter()
             .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn settled_process_collapses_commands_reads_and_failures_across_rounds() {
+        let mut s = boot();
+        read(&mut s, "r1", "before.rs", 0);
+        thought(&mut s, "inspect the result");
+        tool(
+            &mut s,
+            "c1",
+            "run_command",
+            serde_json::json!({"program":"cargo", "args":["test"], "description":"Run regression tests"}),
+            1,
+            false,
+        );
+        read(&mut s, "r2", "after.rs", 2);
+        narration(&mut s, "The test failed; investigate next.");
+
+        let collapsed = render(&s);
+        let summaries = receipts(&collapsed);
+        assert_eq!(summaries.len(), 1, "one process receipt: {collapsed:#?}");
+        assert!(summaries[0].contains("读取 2 次"), "{collapsed:#?}");
+        assert!(summaries[0].contains("1 个命令"), "{collapsed:#?}");
+        assert!(summaries[0].contains("1 个失败"), "{collapsed:#?}");
+        assert!(
+            !collapsed.iter().any(|r| r.contains("before.rs")
+                || r.contains("cargo test")
+                || r.contains("alpha"))
+        );
+        assert!(collapsed.iter().any(|r| r.contains("The test failed")));
+
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let open = render(&s);
+        assert!(position(&open, "before.rs") < position(&open, "Run regression tests"));
+        assert!(position(&open, "Run regression tests") < position(&open, "after.rs"));
+        assert!(
+            !open.iter().any(|r| r.contains("$ cargo test")),
+            "opening the parent only reveals headers: {open:#?}"
+        );
+        let hit = s
+            .command_hit_at(80, position(&open, "Run regression tests"))
+            .expect("command retains its own click target");
+        s.transcript.toggle_call_at(hit.item, hit.call);
+        assert!(render(&s).iter().any(|r| r.contains("$ cargo test")));
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        assert!(!render(&s).iter().any(|r| r.contains("$ cargo test")));
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        assert!(
+            render(&s).iter().any(|r| r.contains("$ cargo test")),
+            "the child display choice survives closing its parent"
+        );
+    }
+
+    #[test]
+    fn a_settled_single_command_has_one_description_row() {
+        let mut s = boot();
+        tool(
+            &mut s,
+            "c1",
+            "run_command",
+            serde_json::json!({"program":"git", "args":["status"], "description":"Check working tree"}),
+            0,
+            true,
+        );
+        narration(&mut s, "Checked.");
+        let lines = render(&s);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|r| r.contains("Check working tree"))
+                .count(),
+            1
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|r| r.contains("完成 1 项") || r.contains("执行命令")),
+            "no redundant group title: {lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|r| r.contains("alpha") || r.contains("$ git status"))
+        );
+        let hit = s
+            .command_hit_at(80, position(&lines, "Check working tree"))
+            .expect("one row remains clickable");
+        s.transcript.toggle_call_at(hit.item, hit.call);
+        assert!(render(&s).iter().any(|r| r.contains("$ git status")));
+    }
+
+    #[test]
+    fn failed_exploration_stays_in_the_receipt_and_is_reachable() {
+        let mut s = boot();
+        read(&mut s, "r1", "a.rs", 0);
+        tool(
+            &mut s,
+            "r2",
+            "read_file",
+            serde_json::json!({"path":"missing.rs"}),
+            1,
+            false,
+        );
+        narration(&mut s, "One file could not be read.");
+        let lines = render(&s);
+        assert_eq!(receipts(&lines).len(), 1, "{lines:#?}");
+        assert!(receipts(&lines)[0].contains("1 个失败"), "{lines:#?}");
+        assert!(!lines.iter().any(|r| r.contains("missing.rs")));
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let lines = render(&s);
+        assert!(lines.iter().any(|r| r.contains("missing.rs")));
+        assert!(
+            s.command_hit_at(80, position(&lines, "missing.rs"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_settled_background_wait_hides_its_wire_receipt_until_opened() {
+        let mut s = boot();
+        tool(
+            &mut s,
+            "w1",
+            "wait_task",
+            serde_json::json!({"task_id":"bg-2"}),
+            0,
+            false,
+        );
+        s.transcript.complete_tool(
+            &ToolCallId::new("w1"),
+            false,
+            "task_id: bg-2\nstatus: exited\nnext_cursor: 11647\nexit_code: Some(2)".into(),
+            211_300,
+            None,
+        );
+        narration(&mut s, "Investigate the failed task.");
+        let lines = render(&s);
+        assert!(
+            !lines.iter().any(|r| r.contains("next_cursor")
+                || r.contains("Some(2)")
+                || r.contains("完成 0 项")),
+            "wire fields stay inside the drawer: {lines:#?}"
+        );
+        let target = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, target);
+        assert!(
+            render(&s).iter().any(|r| r.contains("next_cursor")),
+            "the original evidence stays inspectable"
+        );
+    }
+
+    #[test]
+    fn a_process_receipt_counts_the_detached_process_outcome() {
+        let mut s = boot();
+        tool(
+            &mut s,
+            "bg",
+            "run_command",
+            serde_json::json!({"program":"make", "args":["ci"], "background":true}),
+            0,
+            true,
+        );
+        s.transcript.complete_tool(
+            &ToolCallId::new("bg"),
+            true,
+            "task_id: bg-2\nstatus: running".into(),
+            40,
+            None,
+        );
+        read(&mut s, "r1", "README.md", 1);
+        s.transcript
+            .note_background_exit("bg-2", false, false, Some(2), 34_900);
+        narration(&mut s, "CI failed.");
+        let lines = render(&s);
+        assert_eq!(receipts(&lines).len(), 1, "{lines:#?}");
+        assert!(
+            receipts(&lines)[0].contains("1 个失败"),
+            "spawn success cannot hide process failure: {lines:#?}"
+        );
+        s.transcript
+            .note_background_exit("bg-2", false, true, None, 34_900);
+        assert!(
+            !render(&s).iter().any(|r| r.contains("个失败")),
+            "a stopped process is not a failure"
+        );
+    }
+
+    #[test]
+    fn live_work_and_full_diffs_never_disappear_inside_process_receipts() {
+        let mut s = boot();
+        read(&mut s, "r1", "before.rs", 0);
+        read(&mut s, "r2", "config.rs", 1);
+        s.transcript.push_tool_started(
+            ToolCallId::new("live"),
+            "run_command".into(),
+            serde_json::json!({"program":"make", "args":["ci"]}).to_string(),
+            false,
+            0,
+            Some(2),
+            None,
+        );
+        let lines = render(&s);
+        assert!(
+            lines.iter().any(|r| r.contains("make ci")),
+            "running work stays visible: {lines:#?}"
+        );
+        s.transcript
+            .complete_tool(&ToolCallId::new("live"), true, "ok".into(), 100, None);
+        tool(
+            &mut s,
+            "edit",
+            "apply_patch",
+            serde_json::json!({"path":"changed.rs"}),
+            3,
+            true,
+        );
+        let diff = format!(
+            "@@ -1,1 +1,81 @@\n context\n{}",
+            (0..80)
+                .map(|n| format!("+change_{n}\n"))
+                .collect::<String>()
+        );
+        s.transcript.complete_tool(
+            &ToolCallId::new("edit"),
+            true,
+            "applied".into(),
+            1,
+            Some(diff),
+        );
+        read(&mut s, "r3", "after.rs", 4);
+        read(&mut s, "r4", "next.rs", 5);
+        narration(&mut s, "Done.");
+        for width in [28, 80, 120] {
+            let lines: Vec<String> = s
+                .conversation_lines(width)
+                .iter()
+                .map(crate::selection::line_to_plain)
+                .collect();
+            assert_eq!(
+                receipts(&lines).len(),
+                2,
+                "the edit separates the receipts at width {width}: {lines:#?}"
+            );
+            for n in 0..80 {
+                assert!(
+                    lines.iter().any(|r| r.contains(&format!("change_{n}"))),
+                    "diff line {n} missing at width {width}"
+                );
+            }
+            let anchor = first_group_index(&s);
+            crate::conversation::interaction::toggle_fold(&mut s, anchor);
+            let lines: Vec<String> = s
+                .conversation_lines(width)
+                .iter()
+                .map(crate::selection::line_to_plain)
+                .collect();
+            assert!(lines.iter().any(|r| r.contains("change_79")));
+            crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        }
     }
 
     #[test]
@@ -1238,7 +1496,7 @@ mod exploration_fold_tests {
             .collect()
     }
 
-    /// The index of the run's anchor: its first exploration group.
+    /// The index of the run's anchor: its first work group.
     fn first_group_index(s: &AppState) -> usize {
         s.transcript
             .items()
@@ -1536,9 +1794,10 @@ mod exploration_fold_tests {
         assert_eq!(block.text, "keep me visible");
     }
 
-    /// TOOL-IA-6: a Run is its own block and breaks the exploration fold.
+    /// A settled command joins the process receipt; its chronology is restored
+    /// only when the reader opens that receipt.
     #[test]
-    fn a_command_breaks_the_run() {
+    fn a_settled_command_joins_the_run() {
         let mut s = boot();
         thought(&mut s, "t1");
         read(&mut s, "r1", "a.rs", 0);
@@ -1557,20 +1816,15 @@ mod exploration_fold_tests {
         seal(&mut s);
 
         let lines = render(&s);
-        assert_eq!(
-            receipts(&lines).len(),
-            2,
-            "the Run split the run: {lines:#?}"
-        );
+        assert_eq!(receipts(&lines).len(), 1, "one process receipt: {lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("cargo test")));
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let lines = render(&s);
         let run = position(&lines, "cargo test");
-        let first = position(&lines, "\u{25b8}");
-        let second = lines
-            .iter()
-            .rposition(|l| l.starts_with('\u{25b8}'))
-            .expect("second receipt");
         assert!(
-            first < run && run < second,
-            "the Run sits between: {lines:#?}"
+            position(&lines, "b.rs") < run && run < position(&lines, "c.rs"),
+            "the command retains its chronological place: {lines:#?}"
         );
     }
 

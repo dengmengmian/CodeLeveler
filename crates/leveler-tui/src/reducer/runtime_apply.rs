@@ -1007,9 +1007,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // The command row reads the starter preview. Activity chrome is
             // session-local and replay keeps only the transcript, so the exit
             // has to land on the call the row already shows.
-            state
-                .transcript
-                .note_background_exit(&task_id, ok, stopped, exit_code, duration_ms);
+            let has_starter = state.transcript.note_background_exit(
+                &task_id,
+                ok,
+                stopped,
+                exit_code,
+                duration_ms,
+            );
             let t = state.t();
             // Terminal is history, but the TUI keeps the entry so the Activity
             // row and its detail stay reopenable. The registry record is the
@@ -1053,7 +1057,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 };
                 (message, NotificationLevel::Warning)
             };
-            state.transcript.push_note(message.clone());
+            if !has_starter {
+                state.transcript.push_note(message.clone());
+            }
             state.notification = Some(Notification { level, message });
         }
         RuntimeEvent::BackgroundTaskOutput { task_id, chunk } => {

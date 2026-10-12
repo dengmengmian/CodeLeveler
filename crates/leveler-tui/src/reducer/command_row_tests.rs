@@ -1051,7 +1051,7 @@ fn a_reconnect_restores_the_running_clock_and_output() {
 /// click target. The group still opens — the hierarchy must not cost the only
 /// mouse route to a call's output.
 #[test]
-fn clicking_a_mixed_group_header_opens_every_call_in_it() {
+fn clicking_a_mixed_group_header_reveals_each_calls_own_drawer() {
     let mut s = state();
     s.transcript.push_user("看看状态".into());
     for (id, name, args) in [
@@ -1090,19 +1090,26 @@ fn clicking_a_mixed_group_header_opens_every_call_in_it() {
         "{:?}",
         plain(&s)
     );
-    let (line, _) = row_with(&s, "README.md").expect("the first row");
     assert!(
-        plain(&s)[..line].iter().any(|l| l.contains('\u{25b8}')),
-        "the parent folds above it: {:?}",
-        plain(&s)
+        row_with(&s, "README.md").is_none(),
+        "member targets start hidden"
     );
 
     let (col, row) = cell_of(&s, "完成 2 项操作");
     click(&mut s, col, row);
+    assert!(row_with(&s, "README.md").is_some());
+    assert!(
+        !plain(&s).iter().any(|l| l.contains("t1 output line")),
+        "parent opens headers only"
+    );
+    let (col, row) = cell_of(&s, "README.md");
+    click(&mut s, col, row);
+    let (col, row) = cell_of(&s, "TaskStatus");
+    click(&mut s, col, row);
     assert!(
         plain(&s).iter().any(|l| l.contains("t1 output line"))
             && plain(&s).iter().any(|l| l.contains("t2 output line")),
-        "the click opened the whole group: {:?}",
+        "each child has an independent output drawer: {:?}",
         plain(&s)
     );
     // The open group is taller, so the row moved: ask again where it is.
