@@ -232,10 +232,12 @@ fn secondary_pages_use_the_shared_shell() {
     );
     assert!(!lines[0].contains("CodeLeveler"), "no stacked app header");
     assert!(lines[1].starts_with('─'), "rule under the header");
+    // Help now owns a search box, so its footer teaches searching rather than
+    // plain scrolling.
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("Esc") && l.contains("滚动")),
+            .any(|l| l.contains("Esc") && l.contains("搜索")),
         "footer hint present:\n{}",
         lines.join("\n")
     );

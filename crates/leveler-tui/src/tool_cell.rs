@@ -439,6 +439,48 @@ pub(crate) fn summary_is_command_line(name: &str, arguments: &str) -> bool {
     }
 }
 
+/// Full executable command for disclosure, before summary path compaction.
+pub(crate) fn command_detail(name: &str, arguments: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    if name == "shell_command" {
+        return v
+            .get("cmd")
+            .or_else(|| v.get("command"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+    }
+    let program = v.get("program")?.as_str()?.trim();
+    if program.is_empty() {
+        return None;
+    }
+    let quote = |arg: &str| {
+        if !arg.is_empty()
+            && arg
+                .chars()
+                .all(|c| c.is_alphanumeric() || "_./-=:,@%+".contains(c))
+        {
+            arg.to_string()
+        } else {
+            format!("'{}'", arg.replace('\'', "'\"'\"'"))
+        }
+    };
+    let mut parts = vec![quote(program)];
+    if let Some(args) = v.get("args").and_then(|v| v.as_array()) {
+        parts.extend(args.iter().filter_map(|v| v.as_str()).map(quote));
+    }
+    Some(parts.join(" "))
+}
+
+pub(crate) fn command_description(arguments: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    v.get("description")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn execute_command_summary(name: &str, v: &serde_json::Value, t: &crate::i18n::UiText) -> String {
     // Only shell_command owns `cmd`. A run_command carrying `cmd` is an
     // INVALID call the runtime refuses — rendering it as `$ …` would paint a

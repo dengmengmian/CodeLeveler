@@ -122,15 +122,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         );
     }
 
-    // Pad ABOVE, not below: a short conversation should sit against the
-    // composer the way terminal output does, instead of pinning to the top of
-    // the viewport and leaving a band of dead space between the last line and
-    // the input box. Once the transcript is taller than the viewport this pad
-    // is empty and scrolling behaves exactly as before.
-    //
-    // An empty session is the exception. It has no output to grow upward from —
-    // it has a title card, and a title card pressed against the input box under
-    // a screenful of void reads as a bug rather than a welcome, so centre it.
+    // Real transcripts grow downward from the viewport top. The empty-session
+    // splash alone is centered; hit-testing consumes this same geometry policy.
     if lines.len() < height {
         let above = crate::conversation::geometry::painted_top_padding(state, lines.len(), height);
         let mut padded = vec![Line::from(""); above];
@@ -460,6 +453,10 @@ mod tests {
     #[test]
     fn the_highlight_keeps_its_rail_position_when_the_window_scrolls() {
         let mut state = state_with_scrollable_history();
+        let thought = state.transcript.items().len() - 1;
+        state
+            .transcript
+            .set_item_display(thought, crate::fold::DisplayMode::Expanded);
         let accent = state.theme.accent.secondary;
         let content = crate::conversation::geometry::content_rect(AREA);
         let width = content.width as usize;

@@ -7,7 +7,7 @@
 //!   (only when there is one; see `workbench::render_notice`)
 //! - **Status** (1 line): live activity only (empty when idle)
 //! - **Input border**: `{model} [(effort)] · permission · session`
-//! - **Footer** (1 line): runtime context + local wall clock — `Context 8k/1M · 22:22`
+//! - **Footer** (1 line): runtime context + local wall clock — `█░░░░░░░ 3%/1M · cache 42% · 22:22`
 //!
 //! Vertical breathing (workbench): blank above the input when status/queue/plan
 //! chrome is visible; blank between input and the Context footer always.
@@ -238,68 +238,29 @@ pub(crate) fn fmt_tokens_compact(n: u32) -> String {
     }
 }
 
-/// Footer context line on the COMPACTION axis: `Context 34% · 8k/24k`.
-///
-/// The denominator is the resolved EFFECTIVE INPUT CAPACITY, not the model
-/// window: that is the number the fold thresholds are measured against, so it is
-/// the one a user watching compaction needs. When the runtime resolved no
-/// capacity the window is the only total and the older `Context 8k/1M` shape
-/// stays — the two are never mixed into one number.
-///
-/// Hidden until real usage is known.
-pub(crate) fn footer_ctx_chip(state: &AppState) -> Option<String> {
-    let t = state.t();
-    // The compaction axis: projected input over the effective input capacity.
-    let share = |percent: u64, used: u64, total: u64| {
-        t.footer_context_share
-            .replacen("{}", &percent.to_string(), 1)
-            .replacen("{}", &fmt_tokens_compact(used as u32), 1)
-            .replacen("{}", &fmt_tokens_compact(total as u32), 1)
-    };
-    // The model-window axis, whose shape names itself.
-    let window_shape = |used: u64, window: u64| {
-        t.footer_context
-            .replacen("{}", &fmt_tokens_compact(used as u32), 1)
-            .replacen("{}", &fmt_tokens_compact(window as u32), 1)
-    };
-
-    // The runtime's own snapshot first: it carries the resolved budget, and the
-    // TUI never recomputes a figure it was given. The numerator is the
-    // snapshot's PROJECTED input — the same figure the fold thresholds and
-    // `compaction_utilization_percent` use. The provider's reported prompt
-    // tokens are a DIFFERENT measurement (actual, not projected): splicing them
-    // in would print a ratio that disagrees with the percentage beside it, so
-    // they are only the no-snapshot fallback below.
+/// Project runtime input onto the full model window. The input budget belongs
+/// to the inspector and compaction policy, not this gauge. Provider usage is
+/// only the no-snapshot fallback; no fields are mixed across measurements.
+fn footer_context_usage(state: &AppState) -> Option<(u64, u64, u64)> {
     if let Some(acc) = state.context.loaded.as_ref() {
-        let used = acc.used_tokens;
-        if used > 0 {
-            if let Some(capacity) = acc.input_capacity_tokens.filter(|capacity| *capacity > 0) {
-                return Some(share(
-                    acc.compaction_utilization_percent().unwrap_or(0),
-                    used,
-                    capacity,
-                ));
-            }
-            if let Some(window) = acc.context_window_tokens.filter(|window| *window > 0) {
-                return Some(window_shape(used, window));
-            }
+        if acc.used_tokens == 0 {
+            return None;
         }
+        let total = acc.context_window_tokens.filter(|n| *n > 0)?;
+        return Some((acc.used_tokens, total, acc.window_utilization_percent()?));
     }
-
-    // No snapshot yet: the state's own provider reported usage, and the window
-    // is the only total. This is the model-window axis, never compaction.
-    // With no declared window there is no denominator, so the chip stays hidden
-    // rather than showing a bare numerator.
-    let window = state.context_window();
-    if window == 0 {
-        return None;
-    }
+    let total = u64::from(state.context_window());
     let used = u64::from(state.context_tokens.max(state.token_input));
-    // Fresh session with zero usage: hide — don't show a fake 0/window gauge.
-    if used == 0 {
+    if used == 0 || total == 0 {
         return None;
     }
-    Some(window_shape(used, u64::from(window)))
+    Some((used, total, used.saturating_mul(100) / total))
+}
+
+/// Compact context chip. Hidden until usage and a denominator are known.
+pub(crate) fn footer_ctx_chip(state: &AppState) -> Option<String> {
+    let (_, total, percent) = footer_context_usage(state)?;
+    Some(format!("{}%/{}", percent, fmt_tokens_compact(total as u32)))
 }
 
 /// Prefix-cache hit rate when the provider reported cached tokens.
@@ -315,20 +276,49 @@ pub(crate) fn footer_cache_chip(state: &AppState) -> Option<String> {
     Some(state.t().footer_cache.replace("{}", &pct.to_string()))
 }
 
-/// Footer usage line: `Context 21k/1M · cache 42%` — each chip optional.
-///
-/// Hidden until real usage is known. The wall clock is a separate cell placed
-/// by the row's owner (`workbench::render_footer`), which owns the width budget
-/// and the clock's priority; this only reports the usage chips.
-pub(crate) fn footer_usage_line(state: &AppState) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(ctx) = footer_ctx_chip(state) {
-        parts.push(ctx);
+/// One-row usage chips. The bar yields first, then cache, then capacity;
+/// the clock's space is reserved by the workbench before passing this budget.
+pub(crate) fn footer_usage_line(state: &AppState, max_width: usize) -> Option<Line<'static>> {
+    let dim = Style::default().fg(state.theme.text.secondary);
+    let mut spans = Vec::new();
+    let ctx = footer_ctx_chip(state);
+    let cache = footer_cache_chip(state);
+    let mut text = [ctx.as_deref(), cache.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if let Some((used, total, pct)) = footer_context_usage(state) {
+        const CELLS: usize = 8;
+        if UnicodeWidthStr::width(text.as_str()) + CELLS < max_width {
+            let filled = if used >= total {
+                CELLS
+            } else {
+                used.saturating_mul(CELLS as u64).div_ceil(total) as usize
+            };
+            let color = match pct {
+                90.. => state.theme.status.error,
+                70..=89 => state.theme.status.warning,
+                _ => state.theme.status.info,
+            };
+            spans.push(Span::styled("█".repeat(filled), Style::default().fg(color)));
+            spans.push(Span::styled(
+                "░".repeat(CELLS - filled),
+                Style::default().fg(state.theme.text.subtle),
+            ));
+            spans.push(Span::raw(" "));
+        } else if UnicodeWidthStr::width(text.as_str()) > max_width {
+            text = ctx.unwrap_or_default();
+            if UnicodeWidthStr::width(text.as_str()) > max_width {
+                text = format!("{pct}%");
+            }
+        }
     }
-    if let Some(cache) = footer_cache_chip(state) {
-        parts.push(cache);
+    if text.is_empty() || UnicodeWidthStr::width(text.as_str()) > max_width {
+        return None;
     }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    spans.push(Span::styled(text, dim));
+    Some(Line::from(spans))
 }
 
 fn truncate_to_width(s: &str, width: usize) -> String {
@@ -864,23 +854,29 @@ mod tests {
         let mut state = test_state();
         state.context_tokens = 41_181;
         state.context_window_tokens = 1_048_576;
-        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 41k/1M"));
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("3%/1M"));
         assert_eq!(footer_cache_chip(&state), None);
-        assert_eq!(footer_usage_line(&state).as_deref(), Some("上下文 41k/1M"));
+        assert_eq!(
+            footer_usage_line(&state, 20)
+                .map(|line| line.to_string())
+                .as_deref(),
+            Some("█░░░░░░░ 3%/1M")
+        );
         state.token_input = 1000;
         state.token_cached = 420;
         assert_eq!(footer_cache_chip(&state).as_deref(), Some("缓存 42%"));
         assert_eq!(
-            footer_usage_line(&state).as_deref(),
-            Some("上下文 41k/1M · 缓存 42%")
+            footer_usage_line(&state, 20)
+                .map(|line| line.to_string())
+                .as_deref(),
+            Some("3%/1M · 缓存 42%")
         );
     }
 
-    /// The footer's context chip is the COMPACTION axis when the runtime
-    /// resolved an effective input capacity, and the model-window axis (the
-    /// older shape) when it did not. The two are never mixed into one number.
+    /// The footer always describes the full model-window axis; the inspector
+    /// retains the runtime input budget and compaction thresholds.
     #[test]
-    fn footer_ctx_chip_uses_the_resolved_effective_input_capacity() {
+    fn footer_ctx_chip_uses_the_full_model_window() {
         let mut state = test_state();
         let projection = leveler_model::RequestProjection::project(
             &[leveler_model::Message::text(
@@ -900,13 +896,9 @@ mod tests {
         )
         .with_input_budget(Some(96_000), Some(32_000), Some(0));
         state.context.loaded = Some(accounting);
-        // 10 000 projected tokens of a 96 000-token effective input capacity.
-        assert_eq!(
-            footer_ctx_chip(&state).as_deref(),
-            Some("上下文 10% · 10k/96k")
-        );
-        // With no resolved capacity the window is the only total, and the old
-        // shape — which names that axis by itself — is what shows.
+        // 10 000 projected tokens of the full 128 000-token model window.
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("7%/128k"));
+        // With no resolved capacity the percentage uses the model window.
         let projection = leveler_model::RequestProjection::project(
             &[leveler_model::Message::text(
                 leveler_model::Role::User,
@@ -927,12 +919,12 @@ mod tests {
         // The snapshot's projected input is the figure that shows; the state's
         // own usage fields are only the no-snapshot fallback.
         state.context_tokens = 41_181;
-        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 10k/128k"));
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("7%/128k"));
     }
 
-    /// The chip's numerator and its percentage are the SAME figure. The
+    /// The bar and percentage use the SAME projected input. The
     /// provider's reported prompt tokens are a different measurement (actual
-    /// vs projected) and must never be spliced into the compaction axis; the
+    /// vs projected) and must never be spliced into the model-window axis; the
     /// two numbers would then disagree inside one label.
     #[test]
     fn the_context_chip_never_splices_provider_tokens_into_the_projection() {
@@ -956,12 +948,12 @@ mod tests {
         .with_input_budget(Some(96_000), Some(32_000), Some(0));
         state.context.loaded = Some(accounting);
         // The provider reported MORE prompt tokens than the runtime projected.
-        // The compaction axis is the projection's: 10k / 96k = 10%.
+        // The model-window axis is the projection's: 10k / 128k = 7%.
         state.token_input = 20_000;
         assert_eq!(
             footer_ctx_chip(&state).as_deref(),
-            Some("上下文 10% · 10k/96k"),
-            "the shown ratio must equal the shown percentage"
+            Some("7%/128k"),
+            "provider input must not change the projected percentage"
         );
 
         // Same rule on the model-window axis when no capacity was resolved.
@@ -981,7 +973,81 @@ mod tests {
             None,
             None,
         ));
-        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("上下文 10k/128k"));
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("7%/128k"));
+    }
+
+    #[test]
+    fn footer_window_bar_and_color_ignore_output_reservation() {
+        let mut state = test_state();
+        state.theme = crate::theme::Theme::dark();
+        let projection = leveler_model::RequestProjection::project(
+            &[leveler_model::Message::text(
+                leveler_model::Role::User,
+                "hello",
+            )],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        );
+        let mut accounting = leveler_model::ContextAccounting::compute(
+            leveler_model::ModelRef::new("deepseek", "deepseek-flash"),
+            &projection,
+            Some(1_048_576),
+            None,
+            None,
+        )
+        .with_input_budget(Some(655_360), Some(393_216), Some(0));
+        accounting.used_tokens = 13_136;
+        state.context.loaded = Some(accounting.clone());
+        state.token_input = 1000;
+        state.token_cached = 970;
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("1%/1M"));
+        assert_eq!(
+            footer_usage_line(&state, 80).unwrap().to_string(),
+            "█░░░░░░░ 1%/1M · 缓存 97%"
+        );
+        for (used, expected_pct, filled, color) in [
+            (600_000, 57, 5, state.theme.status.info),
+            (800_000, 76, 7, state.theme.status.warning),
+            (950_000, 90, 8, state.theme.status.error),
+        ] {
+            accounting.used_tokens = used;
+            state.context.loaded = Some(accounting.clone());
+            let line = footer_usage_line(&state, 80).unwrap();
+            assert_eq!(
+                footer_ctx_chip(&state).unwrap(),
+                format!("{expected_pct}%/1M")
+            );
+            assert_eq!(line.spans[0].content.as_ref(), "█".repeat(filled));
+            assert_eq!(line.spans[0].style.fg, Some(color));
+        }
+    }
+
+    #[test]
+    fn footer_does_not_invent_a_window_for_a_loaded_snapshot() {
+        let mut state = test_state();
+        state.context_tokens = 10_000;
+        state.context_window_tokens = 128_000;
+        let projection = leveler_model::RequestProjection::project(
+            &[leveler_model::Message::text(
+                leveler_model::Role::User,
+                "hello",
+            )],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        );
+        let mut acc = leveler_model::ContextAccounting::compute(
+            leveler_model::ModelRef::new("m", "m"),
+            &projection,
+            None,
+            None,
+            None,
+        )
+        .with_input_budget(Some(96_000), Some(32_000), Some(0));
+        acc.used_tokens = 10_000;
+        state.context.loaded = Some(acc);
+        assert_eq!(footer_ctx_chip(&state), None);
     }
 
     #[test]
@@ -1004,8 +1070,10 @@ mod tests {
         state.token_cached = 990;
         state.clock_label = "22:22".into();
         assert_eq!(
-            footer_usage_line(&state).as_deref(),
-            Some("上下文 254k/1M · 缓存 99%")
+            footer_usage_line(&state, 20)
+                .map(|line| line.to_string())
+                .as_deref(),
+            Some("24%/1M · 缓存 99%")
         );
     }
 
@@ -1015,7 +1083,7 @@ mod tests {
     fn footer_usage_line_is_hidden_without_usage() {
         let mut state = test_state();
         state.clock_label = "09:07".into();
-        assert_eq!(footer_usage_line(&state), None);
+        assert_eq!(footer_usage_line(&state, 100), None);
     }
 
     #[test]
@@ -1426,7 +1494,10 @@ mod tests {
             ),
         );
         let text = status_text(&state);
-        assert!(text.contains("执行命令 node --version"), "{text}");
+        assert!(
+            text.contains("命令运行中") && !text.contains("node --version"),
+            "{text}"
+        );
         assert!(
             !text.contains("4m 54s"),
             "the turn's clock is not the command's: {text}"

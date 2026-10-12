@@ -1160,3 +1160,133 @@ fn resumed_history_preserves_full_code_visibility_matrix() {
         assert!(projected.contains("OTHER-MESSAGE-AFTER"));
     }
 }
+
+fn conversation_rows(s: &AppState) -> Vec<String> {
+    crate::conversation::build::build_conversation_lines(s, 120)
+        .iter()
+        .map(crate::selection::line_to_plain)
+        .map(|line| line.trim_end().to_string())
+        .collect()
+}
+
+/// The shell row records that a process was detached. Once that process
+/// exits, the same row has to say how it ended. `↗ 后台运行` is only true
+/// while it is still running.
+#[test]
+fn a_background_command_row_settles_when_the_process_exits() {
+    let cases = [
+        ("ok", true, false, Some(0), "\u{2713}", "25.0s"),
+        ("failed", false, false, Some(1), "\u{2717}", "exit 1"),
+        ("stopped", false, true, Some(143), "\u{2298}", "已停止"),
+    ];
+    for (name, ok, stopped, exit_code, glyph, fact) in cases {
+        let mut live = state();
+        for event in background_sleep_events(name) {
+            reduce(&mut live, Action::Runtime(event));
+        }
+        let running = conversation_rows(&live);
+        let row = running
+            .iter()
+            .find(|line| line.contains("sleep 25"))
+            .unwrap_or_else(|| panic!("{name} start row missing: {running:#?}"));
+        assert!(
+            row.contains("后台运行") && row.contains('\u{2197}'),
+            "{name} should still be running: {row}"
+        );
+
+        reduce(
+            &mut live,
+            Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+                task_id: format!("t-{name}"),
+                exit_code,
+                duration_ms: 25_000,
+                ok,
+                stopped,
+                output: String::new(),
+            }),
+        );
+        let settled = conversation_rows(&live);
+        let row = settled
+            .iter()
+            .find(|line| line.contains("sleep 25"))
+            .unwrap_or_else(|| panic!("{name} settled row missing: {settled:#?}"));
+        assert!(
+            !row.contains("后台运行") && !row.contains('\u{2197}'),
+            "{name} still looks running: {row}"
+        );
+        assert!(row.contains(glyph), "{name} glyph: {row}");
+        assert!(row.contains(fact), "{name} fact: {row}");
+    }
+
+    let mut replayed = state();
+    let effects = open(&mut replayed, vec![message(UiRole::User, "后台睡一下")]);
+    let mut entries: Vec<_> = background_sleep_events("ok")
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| entry(i as u64 * 100, i == 0, event))
+        .collect();
+    entries.push(entry(
+        9_000,
+        false,
+        RuntimeEvent::BackgroundTaskExited {
+            task_id: "t-ok".into(),
+            exit_code: Some(0),
+            duration_ms: 25_000,
+            ok: true,
+            stopped: false,
+            output: String::new(),
+        },
+    ));
+    reduce(
+        &mut replayed,
+        Action::Runtime(RuntimeEvent::SessionHistoryLoaded {
+            query_id: history_query(&effects),
+            session_id: SessionId::new("s1"),
+            entries,
+            omitted_turns: 0,
+        }),
+    );
+    let row = conversation_rows(&replayed)
+        .into_iter()
+        .find(|line| line.contains("sleep 25"))
+        .expect("replayed row");
+    assert!(
+        !row.contains("后台运行") && row.contains('\u{2713}') && row.contains("25.0s"),
+        "replay keeps the running mark: {row}"
+    );
+}
+
+fn background_sleep_events(name: &str) -> Vec<RuntimeEvent> {
+    let task_id = format!("t-{name}");
+    vec![
+        RuntimeEvent::UserMessageAdded {
+            message: message(UiRole::User, "后台睡一下"),
+        },
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new(format!("c-{name}")),
+            name: "run_command".into(),
+            arguments: r#"{"program":"sleep","args":["25"],"background":true}"#.into(),
+            parallel: false,
+            model_step: Some(1),
+            answer_effect: None,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new(format!("c-{name}")),
+            ok: true,
+            preview: format!(
+                "background task started\ntask_id: {task_id}\nprogram: sleep\nstatus: running\n"
+            ),
+            duration_ms: 40,
+            applied_diff: None,
+            exit_code: Some(0),
+            stop: None,
+        },
+        RuntimeEvent::BackgroundTaskStarted {
+            task_id,
+            program: "sleep".into(),
+            args: vec!["25".into()],
+            pid: Some(9),
+        },
+        RuntimeEvent::TurnAnswered,
+    ]
+}

@@ -833,9 +833,9 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
         (area.width as usize).saturating_sub(6),
     );
     let usage = show_secondary
-        .then(|| crate::status_line::footer_usage_line(state))
+        .then(|| crate::status_line::footer_usage_line(state, width.saturating_sub(clock_w + GAP)))
         .flatten();
-    let usage_w = usage.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
+    let usage_w = usage.as_ref().map(Line::width).unwrap_or(0);
 
     // The background summary is placed before the usage/clock chips. It is the
     // only place background work is visible on the main screen, so a long task
@@ -935,7 +935,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
     {
         let start = usage_start.unwrap_or(0);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(text, dim))),
+            Paragraph::new(text),
             Rect {
                 x: area.x + start as u16,
                 y: area.y,
@@ -1190,7 +1190,7 @@ mod tests {
         );
         let plan_row = row_of(&lines, "edit module");
         let input_row = row_of(&lines, "Type a message");
-        let footer_row = row_of(&lines, "Context");
+        let footer_row = row_of(&lines, "29%/200k");
         let roster_row = row_of(&lines, "agents running");
         assert!(plan_row < input_row, "plan must stay above the composer");
         assert!(input_row < footer_row, "composer above the Context footer");
@@ -1258,7 +1258,7 @@ mod tests {
             .collect();
         let pending_row = row_of(&lines, "Not sent · 9");
         let input_row = row_of(&lines, "Type a message");
-        let footer_row = row_of(&lines, "Context");
+        let footer_row = row_of(&lines, "29%/200k");
         let roster_row = row_of(&lines, "agents running");
         assert!(pending_row < input_row, "{lines:#?}");
         assert!(
@@ -1327,7 +1327,7 @@ mod tests {
             })
             .collect();
         let body_row = row_of(&lines, "git push");
-        let footer_row = row_of(&lines, "Context");
+        let footer_row = row_of(&lines, "29%/200k");
         let roster_row = row_of(&lines, "agents running");
         assert!(
             body_row < footer_row,
@@ -1357,7 +1357,7 @@ mod tests {
             crate::multi_agent::TaskTeamView::default(),
             true,
         );
-        let footer_row = row_of(&lines, "Context");
+        let footer_row = row_of(&lines, "29%/200k");
         assert!(
             lines
                 .iter()
@@ -1756,6 +1756,85 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn short_transcript_first_message_stays_at_top_through_thinking_and_resize() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = test_state();
+        state.transcript.push_user("stable first question".into());
+        state.conv.auto_scroll = true;
+        for (stage, width, height) in [
+            ("first", 80, 24),
+            ("live", 80, 24),
+            ("done", 80, 24),
+            ("resized", 100, 32),
+            ("narrowed", 60, 28),
+        ] {
+            if stage == "live" {
+                state.transcript.append_thought(
+                    "first reasoning line\nsecond reasoning line\nthird reasoning line",
+                );
+            } else if stage == "done" {
+                state.transcript.finish_thought(Some(400));
+            }
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::render::render(frame, &mut state))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..height)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let first_row = rows
+                .iter()
+                .position(|row| row.contains("stable first question"))
+                .unwrap();
+            let (_, top, _, _) = state.conv.rect.unwrap();
+            if stage == "live" {
+                assert!(rows.iter().any(|row| row.contains("third reasoning line")));
+            } else if stage == "done" {
+                assert!(!rows.iter().any(|row| row.contains("reasoning line")));
+            }
+            assert_eq!(
+                first_row,
+                top as usize,
+                "{stage}: first message must start at viewport top:\n{}",
+                rows.join("\n")
+            );
+            let (x, _, _, _) = state.conv.rect.unwrap();
+            assert_eq!(
+                crate::conversation::geometry::screen_to_content(&state, x, first_row as u16)
+                    .unwrap()
+                    .row,
+                0
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual short conversation visual evidence"]
+    fn short_transcript_top_visual_evidence() {
+        let dir = std::path::Path::new("/tmp/leveler-top-preview");
+        std::fs::create_dir_all(dir).unwrap();
+        let mut state = test_state();
+        state.transcript.push_user("stable first question".into());
+        state.conv.auto_scroll = true;
+        for stage in ["first", "live", "done"] {
+            if stage == "live" {
+                state.transcript.append_thought(
+                    "first reasoning line\nsecond reasoning line\nthird reasoning line",
+                );
+            } else if stage == "done" {
+                state.transcript.finish_thought(Some(400));
+            }
+            std::fs::write(
+                dir.join(format!("{stage}.txt")),
+                screen_rows(&mut state, 80).join("\n"),
+            )
+            .unwrap();
+        }
+    }
+
     fn status_fixture(collaboration: &str, busy: bool) -> AppState {
         let mut state = test_state();
         state.model_label = "deepseek/deepseek-v4-flash".into();
@@ -1923,7 +2002,7 @@ mod tests {
         // hints. That left content still starts on the workspace gutter.
         let footer_row = lines
             .iter()
-            .position(|l| l.contains("15k/1M") || l.contains("15k"))
+            .position(|l| l.contains("1%/1M"))
             .unwrap_or_else(|| panic!("footer context line missing:\n{}", lines.join("\n")));
         let first = lines[footer_row].find(|c: char| !c.is_whitespace());
         assert_eq!(
@@ -1975,7 +2054,7 @@ mod tests {
         // CJK glyph has an empty continuation cell between it and its neighbour.
         let footer = lines
             .iter()
-            .find(|l| l.contains("254k/1M"))
+            .find(|l| l.contains("24%/1M"))
             .unwrap_or_else(|| panic!("footer context line missing:\n{}", lines.join("\n")));
         assert!(footer.contains("99%"), "usage chips stay visible: {footer}");
         // The clock anchors the right edge and is separated from the chips.
@@ -2044,6 +2123,91 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn footer_context_bar_tracks_usage_color_and_yields_before_numbers() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for (used, expected_color) in [
+            (2_000, 0),
+            (138_000, 0),
+            (140_000, 1),
+            (178_000, 1),
+            (180_000, 2),
+            (220_000, 2),
+        ] {
+            let mut state = test_state();
+            state.theme = crate::theme::Theme::default();
+            state.locale = crate::i18n::Locale::En;
+            state.context_tokens = used;
+            state.token_input = 1_000;
+            state.token_cached = 990;
+            state.clock_label = "09:30".into();
+            let color = match expected_color {
+                0 => state.theme.status.info,
+                1 => state.theme.status.warning,
+                _ => state.theme.status.error,
+            };
+            for width in [100, 30] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| render_footer(frame, frame.area(), &mut state))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text = (0..width)
+                    .map(|x| buffer[(x, 0)].symbol())
+                    .collect::<String>();
+                assert!(text.contains(&format!("{}%/200k", used / 2_000)), "{text}");
+                assert!(text.contains("cache 99%"), "{text}");
+                assert!(!text.contains("上下文"), "{text}");
+                if width == 100 {
+                    let bar = (0..width)
+                        .find(|&x| buffer[(x, 0)].symbol() == "█")
+                        .expect("filled bar");
+                    assert_eq!(buffer[(bar, 0)].fg, color, "{text}");
+                } else {
+                    assert!(!text.contains('█') && !text.contains('░'), "{text}");
+                }
+            }
+        }
+    }
+
+    /// Writes real workbench frames for visual inspection, never production data.
+    #[test]
+    #[ignore = "manual footer visual evidence"]
+    fn footer_context_visual_evidence() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let dir = std::path::Path::new("/tmp/leveler-footer-preview");
+        std::fs::create_dir_all(dir).unwrap();
+        for (name, used, width) in [
+            ("low", 2_000, 100),
+            ("warning", 140_000, 100),
+            ("high", 180_000, 100),
+            ("narrow", 2_000, 30),
+        ] {
+            let mut state = test_state();
+            state.theme = crate::theme::Theme::default();
+            state.context_tokens = used;
+            state.token_input = 1_000;
+            state.token_cached = 990;
+            state.clock_label = "09:30".into();
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal
+                .draw(|frame| crate::render::render(frame, &mut state))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let mut output = String::new();
+            for y in 0..20 {
+                let mut x = 0;
+                while x < width {
+                    let symbol = buf[(x, y)].symbol();
+                    output.push_str(symbol);
+                    x += UnicodeWidthStr::width(symbol).max(1) as u16;
+                }
+                output.push('\n');
+            }
+            std::fs::write(dir.join(format!("{name}.txt")), output).unwrap();
+        }
+    }
+
     /// Case 1 — empty session: the clock shares the hint row and is never a
     /// line of its own below it (the "empty transcript item" the user saw).
     #[test]
@@ -2100,23 +2264,33 @@ mod tests {
         assert_eq!(col + 5, 40 - crate::layout::WORKSPACE_GUTTER_X as usize);
     }
 
-    /// Case 2/3 — usage chips ride next to the clock when there is room, and
-    /// yield to it when the row is narrow. The clock always survives.
+    /// Case 2/3 — the context bar is the first thing to yield on a narrow row;
+    /// the numbers and the clock survive. The clock always survives.
     #[test]
-    fn usage_chips_yield_to_the_clock_when_the_row_is_narrow() {
+    fn usage_bar_yields_before_the_numbers_when_the_row_is_narrow() {
         let wide = render_clock_case(100, 24, "09:30", true, false);
         let wide_row = row_of(&wide, "09:30");
         assert!(
-            wide[wide_row].contains("18k"),
+            wide[wide_row].contains("9%/200k"),
             "usage shown when wide: {:?}",
+            wide[wide_row]
+        );
+        assert!(
+            wide[wide_row].contains('█') || wide[wide_row].contains('░'),
+            "the bar is painted when the row has room: {:?}",
             wide[wide_row]
         );
 
         let narrow = render_clock_case(24, 24, "09:30", true, false);
         let nrow = row_of(&narrow, "09:30");
         assert!(
-            !narrow[nrow].contains("18k"),
-            "usage yields on a narrow row: {:?}",
+            !narrow[nrow].contains('█') && !narrow[nrow].contains('░'),
+            "the bar yields on a narrow row: {:?}",
+            narrow[nrow]
+        );
+        assert!(
+            narrow[nrow].contains("9%/200k"),
+            "the numbers outlive the bar: {:?}",
             narrow[nrow]
         );
         assert_eq!(narrow.iter().filter(|l| l.contains("09:30")).count(), 1);

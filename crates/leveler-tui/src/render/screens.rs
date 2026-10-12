@@ -13,79 +13,134 @@ use super::text::{sanitize_terminal_line, truncate_display, wrap};
 
 pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     let theme = &state.theme;
-    let t = state.t();
+    let zh = state.locale == crate::i18n::Locale::Zh;
     let page = crate::secondary::SecondaryPage {
-        title: t.help_title,
+        title: state.t().help_title,
         status: crate::secondary::main_status_spans(state, area.width as usize),
-        hint: t.help_scroll,
+        hint: if zh {
+            "输入搜索 · ↑↓ 选择 · PageUp/Down 翻页 · Esc 返回"
+        } else {
+            "Type to search · ↑↓ select · PageUp/Down · Esc back"
+        },
     };
-    let layout = crate::secondary::layout(area, 0);
+    let layout = crate::secondary::layout(area, 1);
     crate::secondary::draw_header(frame, &layout, &page, theme);
     crate::secondary::draw_footer(frame, &layout, &page, theme);
-
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        t.help_commands.to_string(),
-        Style::default().fg(theme.text.secondary),
-    ))];
-    for (cat, cmds) in crate::screen::slash_commands_grouped(t) {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  {}", crate::screen::category_label(cat, t)),
-            Style::default()
-                .fg(theme.text.secondary)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for (name, desc) in cmds {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {name:<14}"),
-                    Style::default().fg(theme.accent.primary),
-                ),
-                Span::raw(desc.to_string()),
-            ]));
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(sanitize_terminal_line(&format!(
+            "{}{}",
+            if zh { "搜索: " } else { "Search: " },
+            state.help.query
+        ))),
+        layout.composer,
+    );
+    let matches = state.help.matches(state.t());
+    let mut lines = Vec::new();
+    let mut focus = 0;
+    for (index, entry) in matches.iter().enumerate() {
+        let selected = index == state.help.selected;
+        if selected {
+            focus = lines.len();
         }
+        let text = sanitize_terminal_line(&format!(
+            "{}{}  {}",
+            if selected { "› " } else { "  " },
+            entry.binding,
+            entry.description
+        ));
+        let style = Style::default().fg(if selected {
+            theme.accent.primary
+        } else {
+            theme.text.primary
+        });
+        lines.extend(
+            wrap(&text, layout.content.width as usize)
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, style))),
+        );
     }
-    lines.push(Line::from(""));
+    if matches.is_empty() {
+        lines.push(Line::from(if zh {
+            "无匹配结果"
+        } else {
+            "No matches"
+        }));
+    }
+    render_list_focused(frame, layout.content, lines, focus, theme);
+    search_cursor(frame, layout.composer, &state.help.query, zh);
+}
 
-    // The composer hint row carries only the few keys that matter in the
-    // moment; this table is the complete list.
-    let keys = [
-        ("Enter", t.key_submit),
-        ("Ctrl+J / Alt+Enter", t.key_newline),
-        ("Ctrl+X Ctrl+E", t.key_editor),
-        ("Shift+Tab", t.key_permission),
-        ("Tab", t.key_tab_focus),
-        (&format!("↑/↓ ({})", t.help_scope_input), t.key_history),
-        (
-            &format!("↑/↓ ({})", t.help_scope_conversation),
-            t.key_scroll_messages,
-        ),
-        ("PageUp/PageDown", t.key_scroll_page),
-        ("Ctrl+C", t.key_cancel_quit),
-        ("Ctrl+M", t.key_model),
-        ("Ctrl+V", t.key_paste_image),
-        ("Ctrl+O", t.key_expand),
-        ("Ctrl+?", t.help_title),
-        ("Ctrl+D/T/S", t.key_screens),
-        ("Ctrl+End / Ctrl+↓", t.key_jump),
-        ("Ctrl+G", t.key_final_nav),
-        ("End", t.key_end),
-        ("Esc", t.key_esc),
-    ];
-    lines.push(Line::from(Span::styled(
-        t.help_keys.to_string(),
-        Style::default().fg(theme.text.secondary),
-    )));
-    for (k, d) in keys {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {k:<20}"),
-                Style::default().fg(theme.accent.primary),
-            ),
-            Span::raw(d.to_string()),
-        ]));
+pub(super) fn render_history_search(frame: &mut Frame, area: Rect, state: &AppState) {
+    // Runtime approval/clarification always owns the foreground while pending.
+    if state.overlay.is_some()
+        || state.update.is_some()
+        || state.surface != crate::btw::SurfaceFocus::Main
+    {
+        return;
     }
-    render_scrolled(frame, layout.content, state, lines);
+    let Some(search) = &state.history_search else {
+        return;
+    };
+    let zh = state.locale == crate::i18n::Locale::Zh;
+    let height = area.height.min(12);
+    let panel = Rect {
+        y: area.y + area.height.saturating_sub(height),
+        height,
+        ..area
+    };
+    frame.render_widget(ratatui::widgets::Clear, panel);
+    let block = Block::default().borders(Borders::ALL).title(if zh {
+        "输入历史 · Enter 放回草稿 · Esc 取消"
+    } else {
+        "Input history · Enter edit · Esc cancel"
+    });
+    let inner = block.inner(panel);
+    frame.render_widget(block, panel);
+    let [query_area, results] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(sanitize_terminal_line(&format!(
+            "{}{}",
+            if zh { "搜索: " } else { "Search: " },
+            search.query
+        ))),
+        query_area,
+    );
+    let matches = search.matches(state.composer.history());
+    let mut lines = Vec::new();
+    for (index, text) in matches.iter().enumerate() {
+        let selected = index == search.selected;
+        let preview = sanitize_terminal_line(&text.replace('\n', " ↵ "));
+        lines.push(Line::from(Span::styled(
+            format!("{}{}", if selected { "› " } else { "  " }, preview),
+            Style::default().fg(if selected {
+                state.theme.accent.primary
+            } else {
+                state.theme.text.primary
+            }),
+        )));
+    }
+    if matches.is_empty() {
+        lines.push(Line::from(if zh {
+            "无匹配历史"
+        } else {
+            "No matching history"
+        }));
+    }
+    render_list_focused(frame, results, lines, search.selected, &state.theme);
+    search_cursor(frame, query_area, &search.query, zh);
+}
+
+fn search_cursor(frame: &mut Frame, area: Rect, query: &str, zh: bool) {
+    if area.width > 0 && area.height > 0 {
+        let text = sanitize_terminal_line(&format!(
+            "{}{}",
+            if zh { "搜索: " } else { "Search: " },
+            query
+        ));
+        let x = UnicodeWidthStr::width(text.as_str()).min(area.width.saturating_sub(1) as usize);
+        frame.set_cursor_position((area.x + x as u16, area.y));
+    }
 }
 
 pub(crate) fn screen_title(title: &str, theme: &Theme) -> Line<'static> {
@@ -278,4 +333,93 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
         ]));
     }
     render_list_focused(frame, layout.content, lines, state.sessions_selected, theme);
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn state() -> AppState {
+        AppState::new(
+            Theme::no_color(),
+            crate::state::Boot {
+                session_id: leveler_client_protocol::SessionId::new("search-test"),
+                user: "u".into(),
+                version: "test".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 0,
+                locale: crate::i18n::Locale::En,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        )
+    }
+    fn help_text(state: &AppState, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_help_screen(frame, frame.area(), state))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+    #[test]
+    fn history_search_never_covers_an_overlay_or_another_surface() {
+        let mut state = state();
+        state.history_search = Some(crate::history_search::HistorySearch::default());
+        state.overlay = Some(crate::overlay::Overlay::ModelPicker(Box::new(
+            crate::overlay::SelectionModel::new("picker", Vec::new(), false),
+        )));
+        for surface in [
+            crate::btw::SurfaceFocus::Main,
+            crate::btw::SurfaceFocus::Btw,
+        ] {
+            state.surface = surface;
+            let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new("foreground owner"),
+                        frame.area(),
+                    );
+                    render_history_search(frame, frame.area(), &state);
+                })
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("foreground owner"));
+            assert!(!text.contains("Input history"));
+            state.overlay = None;
+        }
+    }
+    #[test]
+    fn help_selection_remains_visible_after_narrow_resize() {
+        let mut state = state();
+        state.help.selected = state.help.matches(state.t()).len() - 1;
+        for (width, height) in [(80, 24), (28, 10), (18, 7)] {
+            let text = help_text(&state, width, height);
+            assert!(
+                text.contains("› Esc"),
+                "selected row missing at {width}x{height}: {text}"
+            );
+        }
+        state.help.query = "ctrl+j".into();
+        state.help.selected = 0;
+        assert!(help_text(&state, 28, 10).contains("Ctrl+J"));
+        state.help.query = "missing-binding".into();
+        assert!(help_text(&state, 28, 10).contains("No matches"));
+    }
 }

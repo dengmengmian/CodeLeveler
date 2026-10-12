@@ -167,7 +167,7 @@ fn call(s: &AppState, id: &str) -> crate::transcript::ToolCallBlock {
 fn screen_row_of(s: &AppState, abs_line: usize) -> u16 {
     let (_, ry, rw, rh) = s.conv.rect.unwrap();
     let total = s.conversation_lines(rw as usize).len();
-    let pad = (rh as usize).saturating_sub(total);
+    let pad = crate::conversation::geometry::painted_top_padding(s, total, rh as usize);
     ry + (pad + abs_line) as u16
 }
 
@@ -1164,4 +1164,132 @@ fn diff_failed_is_a_distinct_state_from_loading_and_empty() {
     );
     assert!(s.diff_error.is_none(), "success clears the failure");
     assert!(s.diff.is_some(), "an empty diff is still a loaded answer");
+}
+
+#[test]
+fn command_status_omits_command_on_start_and_heartbeat() {
+    let mut s = state();
+    start(&mut s, "command-status");
+    assert_eq!(s.activity.as_deref(), Some("命令运行中"));
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::CommandProgress {
+            label: "du -sh ~/Develop/* | sort -rh | head -20".into(),
+            elapsed_ms: 24_000,
+        }),
+    );
+    assert_eq!(s.activity.as_deref(), Some("命令运行中"));
+    assert_eq!(s.activity_elapsed_secs, Some(24));
+}
+
+#[test]
+fn background_command_identity_is_complete_live_and_restored() {
+    let mut s = state();
+    let script = format!(
+        "printf '甲乙  丙丁'\n{}\nprintf 'FINAL_COMMAND_MARKER'",
+        "echo content; ".repeat(30)
+    );
+    let program = "/custom path/bash";
+    let args = vec!["-c".to_string(), script.clone()];
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "full-command".into(),
+            program: program.into(),
+            args: args.clone(),
+            pid: Some(42),
+        }),
+    );
+    let live_label = s.background_task_labels["full-command"].label.clone();
+    assert!(live_label.contains("FINAL_COMMAND_MARKER"), "{live_label}");
+    assert!(
+        live_label.starts_with("'/custom path/bash' -c '"),
+        "{live_label}"
+    );
+    assert!(live_label.contains("甲乙  丙丁") && live_label.contains('\n'));
+    let mut snap = leveler_client_protocol::UiSessionSnapshot {
+        id: SessionId::new("s1"),
+        repository: Some("/repo".into()),
+        task_status: None,
+        task_terminal: None,
+        goal: "g".into(),
+        model: None,
+        mode: leveler_client_protocol::PermissionProfile::Assisted,
+        branch: None,
+        status: "busy".into(),
+        finalization_stage: None,
+        messages: Vec::new(),
+        pending_interactions: Vec::new(),
+        available_models: Vec::new(),
+        vision: false,
+        last_sequence: None,
+        active_tools: Vec::new(),
+        active_background_tasks: Vec::new(),
+        plan: None,
+        diff: None,
+        checkpoints: Vec::new(),
+        recaps: Vec::new(),
+        user_shells: Vec::new(),
+        completion_report: None,
+        thinking: None,
+        work_profile: None,
+        collaboration: None,
+        children: Vec::new(),
+    };
+    snap.active_background_tasks = vec![leveler_client_protocol::UiActiveBackgroundTask {
+        task_id: "full-command".into(),
+        program: program.into(),
+        args,
+        elapsed_ms: 90_000,
+        pid: Some(42),
+    }];
+    let mut restored = state();
+    reduce(
+        &mut restored,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
+    );
+    assert_eq!(
+        restored.background_task_labels["full-command"].label,
+        live_label
+    );
+}
+
+#[test]
+fn paused_background_unread_grows_after_log_cap() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskStarted {
+            task_id: "cap".into(),
+            program: "echo".into(),
+            args: vec![],
+            pid: None,
+        }),
+    );
+    s.background_task_views.insert(
+        "cap".into(),
+        crate::activity::ActivityView {
+            follow: false,
+            ..Default::default()
+        },
+    );
+    for _ in 0..2 {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BackgroundTaskOutput {
+                task_id: "cap".into(),
+                chunk: format!("{}\n", "x".repeat(70_000)),
+            }),
+        );
+    }
+    assert_eq!(s.background_task_views["cap"].unread, 2);
+    s.background_task_views.clear();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskOutput {
+            task_id: "cap".into(),
+            chunk: "unopened log\n".into(),
+        }),
+    );
+    assert!(s.background_task_views.is_empty());
 }

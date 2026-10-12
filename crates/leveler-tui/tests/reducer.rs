@@ -1539,9 +1539,10 @@ fn visible_quit_prompt_is_enough_to_confirm_quit() {
 }
 
 #[test]
-fn command_progress_heartbeat_names_the_running_command_with_elapsed() {
-    // Long-command heartbeat: the status line must read "运行 cargo test · <mm:ss>"
-    // instead of a bare "等待模型" while a command runs (runtime observability).
+fn command_progress_heartbeat_names_the_phase_with_the_commands_elapsed() {
+    // Long-command heartbeat: the status line states the phase and the elapsed
+    // instead of a bare "等待模型" (runtime observability). The command's own
+    // identity lives in its conversation row, so the strip must not repeat it.
     let mut s = state();
     reduce(
         &mut s,
@@ -1551,12 +1552,18 @@ fn command_progress_heartbeat_names_the_running_command_with_elapsed() {
         }),
     );
     assert_eq!(s.status, RuntimeStatus::Busy);
-    // The elapsed belongs to the command, not to the label — assert what the
-    // status line actually renders.
+    // The elapsed belongs to the command; the phase is the session's locale.
     let activity = s.activity.clone().unwrap_or_default();
-    assert!(activity.contains("cargo test"), "activity: {activity}");
+    assert_eq!(
+        activity,
+        s.t().command_activity_running,
+        "activity: {activity}"
+    );
     let frame = rendered(&mut s, 120, 20);
-    assert!(frame.contains("cargo test"), "status: {frame}");
+    assert!(
+        frame.contains(s.t().command_activity_running),
+        "status: {frame}"
+    );
     assert!(frame.contains("2m 31s"), "status: {frame}");
 }
 
@@ -3153,9 +3160,10 @@ fn slash_new_starts_a_fresh_session() {
 
 /// Entry points closed by the command-surface closure. Each capability lives
 /// elsewhere: `/new` (was `/clear`), `/collab plan`, `$skill`, Ctrl+V,
-/// Ctrl+X Ctrl+E, Ctrl+T, `leveler doctor`, Ctrl+C. `/skill` is not listed
-/// here: it is now the prefix of the `/skills` inspector, so Enter completes
-/// it rather than reporting it unknown.
+/// Ctrl+X Ctrl+E, Ctrl+T, Ctrl+C. `/skill` is not listed here: it is now the
+/// prefix of the `/skills` inspector, so Enter completes it rather than
+/// reporting it unknown. `/doctor` is no longer closed either: it opens the
+/// local terminal diagnostics screen.
 #[test]
 fn closed_commands_are_unknown_and_send_nothing() {
     for command in [
@@ -3165,7 +3173,6 @@ fn closed_commands_are_unknown_and_send_nothing() {
         "/paste",
         "/editor",
         "/tools",
-        "/doctor",
         "/quit",
         "/q",
     ] {
@@ -3207,7 +3214,15 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
     reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(s.active_screen, Screen::Help);
     let frame = rendered(&mut s, 120, 80);
-    for key_name in ["Ctrl+C", "Ctrl+V", "Ctrl+X Ctrl+E", "Ctrl+D/T/S"] {
+    for key_name in [
+        "Ctrl+C",
+        "Ctrl+V",
+        "Ctrl+X Ctrl+E",
+        "Ctrl+D/T/S",
+        "Ctrl+R",
+        "Ctrl+Z",
+        "Ctrl+Y",
+    ] {
         assert!(
             frame.contains(key_name),
             "help must list {key_name}: {frame}"
@@ -3217,7 +3232,7 @@ fn help_lists_the_keys_that_replaced_closed_commands() {
         "/quit", "/paste", "/editor", "/clear",
         // `/skills` is a live inspector, so the guard is the bare command with
         // a trailing gap — `/skills` never matches this.
-        "/skill ", "/plan", "/doctor",
+        "/skill ", "/plan",
     ] {
         assert!(
             !frame.contains(closed),
@@ -4175,9 +4190,11 @@ fn enter_on_partial_slash_only_completes_before_executing() {
 fn info_screens_scroll_with_keys_and_reset_on_exit() {
     let mut s = opened();
     reduce(&mut s, key(KeyCode::Esc)); // clear any notification
-    typed(&mut s, "/help");
+    // `/doctor` is the scrollable info screen here; `/help` has its own search
+    // box, so ↑/↓ move the result selection instead of the page offset.
+    typed(&mut s, "/doctor");
     reduce(&mut s, key(KeyCode::Enter));
-    assert_eq!(s.active_screen, Screen::Help);
+    assert_eq!(s.active_screen, Screen::Doctor);
 
     reduce(&mut s, key(KeyCode::Down));
     reduce(&mut s, key(KeyCode::Down));
@@ -4191,7 +4208,7 @@ fn info_screens_scroll_with_keys_and_reset_on_exit() {
 
     reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
-    typed(&mut s, "/help");
+    typed(&mut s, "/doctor");
     reduce(&mut s, key(KeyCode::Enter));
     assert_eq!(s.screen_scroll, 0, "scroll resets when reopening a screen");
 }
@@ -6869,6 +6886,10 @@ fn mouse_click_without_drag_on_url_opens_browser() {
     s.conv.rect = Some((0, 3, 80, 20));
     s.conv.auto_scroll = false;
     s.conv.scroll = 0;
+    // A real, non-empty conversation: the empty-session splash centers its
+    // filler, and filler rows are not click targets.
+    s.transcript
+        .push_user("Local: http://localhost:3000".into());
     s.conv.plain = vec!["  Local: http://localhost:3000".into()];
     s.conv.plain_width = 80;
 
@@ -6943,6 +6964,7 @@ fn mouse_click_on_url_glued_to_chinese_prose_opens_clean_host() {
     // Matches real assistant copy that previously produced toast:
     // "已在浏览器打开 http://localhost:8081，前端页面可以直接打开。"
     let line = "访问地址：http://localhost:8081，前端页面可以直接打开。";
+    s.transcript.push_user(line.into());
     s.conv.plain = vec![line.into()];
     s.conv.plain_width = 100;
 
@@ -9258,11 +9280,15 @@ fn the_running_command_heartbeat_follows_the_locale() {
         }),
     );
     let activity = s.activity.clone().unwrap_or_default();
+    assert_eq!(
+        activity,
+        s.t().command_activity_running,
+        "the phase is the session's own words"
+    );
     assert!(
         !has_han(&activity),
         "an English session must not be told 运行: {activity}"
     );
-    assert!(activity.contains("cargo test"), "{activity}");
 }
 
 // ---- Assistant prose presentation, driven by real event order ----

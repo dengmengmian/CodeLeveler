@@ -2,7 +2,7 @@
 //!
 //! Single source for every layout fact the viewport, the renderer, and the
 //! mouse path share: content width, viewport height, live-edge scroll,
-//! bottom-alignment padding, and the screen→content mapping. The renderer and
+//! vertical padding, and the screen→content mapping. The renderer and
 //! the reducer both call THESE functions; neither keeps its own copy of a
 //! formula.
 
@@ -76,24 +76,17 @@ pub fn max_scroll(total: usize, height: usize) -> usize {
     total.saturating_sub(height.max(1))
 }
 
-/// Blank filler rows painted ABOVE a transcript shorter than the viewport
-/// (bottom alignment). Zero once content fills the screen.
-pub fn top_padding(total: usize, height: usize) -> usize {
-    height.saturating_sub(total)
-}
-
 /// Blank rows the renderer actually paints above the content this frame.
 /// Policy lives HERE, not in the viewport: an empty session's splash is
-/// vertically centered (half the padding above), a normal short transcript
-/// is bottom-aligned (all of it above), and a full viewport has none. The
+/// vertically centered (half the spare rows above); real transcripts start
+/// at the top, regardless of how much space remains below them. The
 /// painter and `screen_to_content` both consume this — if they ever used
 /// different padding, painted rows and mapped rows would disagree.
 pub fn painted_top_padding(state: &AppState, total: usize, height: usize) -> usize {
-    let pad = top_padding(total, height);
     if crate::splash::conversation_is_empty(state) {
-        pad / 2
+        height.saturating_sub(total) / 2
     } else {
-        pad
+        0
     }
 }
 
@@ -108,6 +101,8 @@ pub fn effective_scroll(scroll: usize, auto_follow: bool, total: usize, height: 
 /// Conversation viewport. Used for clicks and while dragging a selection so
 /// the endpoint tracks the pointer even in an edge hot zone or briefly
 /// outside the rect.
+/// Unpainted filler rows are not click targets; an active selection may still
+/// clamp there so dragging beyond the text reaches its first or last row.
 pub fn screen_to_content(
     state: &AppState,
     col: u16,
@@ -136,6 +131,11 @@ pub fn screen_to_content(
     );
     let viewport_row = (clamped_row - ry) as usize;
     let pad = painted_top_padding(state, total, height);
+    if !state.conv.selection.dragging
+        && (viewport_row < pad || viewport_row.saturating_sub(pad) >= total.saturating_sub(scroll))
+    {
+        return None;
+    }
     let abs_row = (scroll + viewport_row.saturating_sub(pad)).min(total.saturating_sub(1));
     let abs_col = (clamped_col - rx) as usize;
     Some(crate::selection::TextPos {
@@ -262,16 +262,34 @@ mod tests {
         for i in 0..5 {
             s.transcript.push_user(format!("row {i}"));
         }
-        assert_roundtrip(&s, "short bottom-aligned");
+        assert_eq!(painted_top_padding(&s, 5, 20), 0);
+        assert_roundtrip(&s, "short top-aligned");
     }
 
     #[test]
     fn empty_splash_paint_and_mapping_agree() {
-        // The splash is CENTERED (pad/2 above), unlike the bottom-aligned
+        // The splash is CENTERED (pad/2 above), unlike the top-aligned
         // normal short transcript — the mapping must follow the same policy.
         let s = test_state();
         assert!(crate::splash::conversation_is_empty(&s));
+        assert_eq!(painted_top_padding(&s, 5, 20), 7);
         assert_roundtrip(&s, "centered splash");
+    }
+
+    #[test]
+    fn short_transcript_blank_rows_are_not_click_targets_but_drag_clamps() {
+        let mut s = test_state();
+        s.transcript.push_user("one question".into());
+        let (x, y, _, height) = s.conv.rect.unwrap();
+        let bottom = y + height - 1;
+        assert!(screen_to_content(&s, x, bottom).is_none());
+        assert_eq!(
+            crate::conversation::interaction::hit_test(&s, x, bottom),
+            crate::conversation::interaction::Hit::Outside
+        );
+        let total = crate::conversation::build::conversation_line_count(&s, content_width(&s));
+        s.conv.selection.dragging = true;
+        assert_eq!(screen_to_content(&s, x, bottom).unwrap().row, total - 1);
     }
 
     #[test]
@@ -282,5 +300,7 @@ mod tests {
         }
         s.conv.scroll = 17;
         assert_roundtrip(&s, "long scrolled");
+        s.conv.auto_scroll = true;
+        assert_roundtrip(&s, "long following tail");
     }
 }

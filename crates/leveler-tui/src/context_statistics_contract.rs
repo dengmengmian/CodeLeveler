@@ -7,7 +7,8 @@
 //! effective input capacity), the soft threshold, the hard capacity and the
 //! fold state.
 //!
-//! This test pins the terminal's rendering of that corpus. It never derives a
+//! The footer presents the model-window axis while the inspector retains the
+//! compaction axis. This test pins the terminal's rendering of that corpus. It never derives a
 //! threshold: `compact_at_tokens` and `input_capacity_tokens` come from the
 //! fixture exactly as the runtime published them.
 

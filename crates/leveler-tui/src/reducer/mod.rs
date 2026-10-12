@@ -75,7 +75,27 @@ fn insert_file_references(state: &mut AppState, text: &str) -> bool {
 /// means no second path can observe the same ready state and submit the item
 /// again.
 pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
+    if state.update.is_some() {
+        state.history_search = None;
+    }
+    if state.surface == SurfaceFocus::Main {
+        state
+            .composer
+            .set_edit_attachments(&state.pending_attachments);
+    } else {
+        state.composer.set_edit_attachments(&[]);
+    }
+    let grouped = matches!(
+        &action,
+        Action::Paste(_) | Action::TextInput(_) | Action::EditorFinished(_)
+    );
+    if grouped {
+        state.composer.begin_edit_group();
+    }
     let mut effects = reduce_action(state, action);
+    if grouped {
+        state.composer.end_edit_group();
+    }
     if let Some(advance) = drain_pending_input(state) {
         effects.push(advance);
     }
@@ -83,6 +103,23 @@ pub fn reduce(state: &mut AppState, action: Action) -> Vec<Effect> {
 }
 
 fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
+    // Search owns all text, including terminal paste/burst events. A query
+    // that resembles a file path must not stage an attachment behind it.
+    if state.overlay.is_none()
+        && state.surface == SurfaceFocus::Main
+        && let Action::Paste(text) | Action::TextInput(text) = &action
+    {
+        if let Some(search) = state.history_search.as_mut() {
+            search.query.push_str(text);
+            search.selected = 0;
+            return Vec::new();
+        }
+        if state.active_screen == Screen::Help {
+            state.help.query.push_str(text);
+            state.help.selected = 0;
+            return Vec::new();
+        }
+    }
     match action {
         Action::Runtime(event) => {
             let refresh = state.active_screen == Screen::Trace
@@ -102,7 +139,28 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     | RuntimeEvent::TurnCompletedWithWarnings { .. }
                     | RuntimeEvent::TurnAnswered
             );
+            // Only semantic boundaries can auto-fold a Thought or regroup
+            // exploration receipts. Deltas must not rebuild the projection.
+            let fold_boundary = matches!(
+                &event,
+                RuntimeEvent::ReasoningCompleted { .. }
+                    | RuntimeEvent::AssistantMessageStarted { .. }
+                    | RuntimeEvent::ToolCallStarted { .. }
+                    | RuntimeEvent::ToolCallCompleted { .. }
+                    | RuntimeEvent::TurnCompleted
+                    | RuntimeEvent::TurnCompletedWithWarnings { .. }
+                    | RuntimeEvent::TurnAnswered
+                    | RuntimeEvent::TurnTruncated { .. }
+                    | RuntimeEvent::TurnIncomplete { .. }
+                    | RuntimeEvent::TurnFailed { .. }
+                    | RuntimeEvent::TurnCancelled
+                    | RuntimeEvent::TaskCancelled
+            );
+            let anchor = fold_boundary
+                .then(|| interaction::reading_anchor(state))
+                .flatten();
             apply_runtime(state, event);
+            interaction::restore_reading_anchor(state, anchor);
             let mut effects = Vec::new();
             // A reopened conversation shows its text from the snapshot at
             // once; what ran in it comes from the durable history.
@@ -355,6 +413,11 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
         }
         Action::Key(key) => {
             let effects = handle_key(state, key);
+            if let Some(attachments) = state.composer.take_restored_attachments()
+                && state.surface == SurfaceFocus::Main
+            {
+                state.pending_attachments = attachments;
+            }
             // One choke point for the image invariant: whatever that key did
             // to the text, the tokens left in it and the staged images are
             // brought back into agreement before anything is drawn or sent.
@@ -611,7 +674,9 @@ fn snapshot_awaits_interaction(
 /// `Shift`+mouse is ignored so the terminal can offer native selection as a fallback
 /// when mouse capture is not fully exclusive.
 fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
-    if state.overlay.is_some() {
+    if state.overlay.is_some()
+        || (state.surface == SurfaceFocus::Main && state.history_search.is_some())
+    {
         return Vec::new();
     }
     // Shift+drag: do not capture selection — leave room for terminal-native select.
@@ -633,6 +698,47 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 })
     {
         return screen_nav::cancel_background_task(state, task_id);
+    }
+    if state.active_screen == Screen::ActivityList {
+        let point = (mouse.column, mouse.row).into();
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            if let Some((_, id)) = state
+                .background_list_hits
+                .iter()
+                .find(|(rect, _)| rect.contains(point))
+            {
+                state.background_list_selected = Some(id.clone());
+                crate::activity::focus_background_list(state);
+            } else if state
+                .background_output_rect
+                .is_some_and(|rect| rect.contains(point))
+            {
+                crate::activity::focus_background_output(state);
+            }
+        } else if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                1
+            };
+            if state
+                .background_list_rect
+                .is_some_and(|rect| rect.contains(point))
+            {
+                crate::activity::focus_background_list(state);
+                crate::activity::move_list_selection(state, delta);
+            } else if state
+                .background_output_rect
+                .is_some_and(|rect| rect.contains(point))
+            {
+                crate::activity::focus_background_output(state);
+                crate::activity::scroll_selected_output(state, delta * 3);
+            }
+        }
+        return Vec::new();
     }
     if state.active_screen != Screen::Conversation {
         return Vec::new();
@@ -765,7 +871,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                     Hit::Command { item, call } => {
                         // Clicking a command row toggles its output. Stopping
                         // is the contextual `x` on the keyboard-focused row.
-                        state.transcript.toggle_call_at(item, call);
+                        interaction::toggle_call(state, item, call);
                         state.conv.plain.clear();
                         interaction::clear_selection_drag(state);
                         state.conv.selection.clear();
@@ -843,14 +949,14 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                         &state.conv.selection,
                     );
                     match crate::selection::copy_to_clipboard(&text) {
-                        Ok(()) if !text.is_empty() => {
+                        Ok(receipt) if !text.is_empty() => {
                             let n = text.chars().count();
                             state.notification = Some(Notification {
                                 level: NotificationLevel::Info,
-                                message: format!("已复制 {n} 字符"),
+                                message: clipboard_notice(&receipt, n, state.locale),
                             });
                         }
-                        Ok(()) => {}
+                        Ok(_) => {}
                         Err(e) => {
                             state.notification = Some(Notification {
                                 level: NotificationLevel::Warning,
@@ -891,6 +997,43 @@ fn open_url(state: &mut AppState, url: &str) -> Vec<Effect> {
         message: format!("正在浏览器打开 {url}…"),
     });
     vec![Effect::OpenWebUrl(url.to_string())]
+}
+
+fn clipboard_notice(
+    receipt: &crate::clipboard::CopyReceipt,
+    count: usize,
+    locale: crate::i18n::Locale,
+) -> String {
+    use crate::clipboard::{ClipboardRoute, Delivery};
+    let routes = receipt
+        .routes
+        .iter()
+        .map(|route| match route {
+            ClipboardRoute::Native => "native",
+            ClipboardRoute::Tmux => "tmux buffer",
+            ClipboardRoute::Osc52 => "OSC52",
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let mut message = match (receipt.delivery, locale) {
+        (Delivery::VerifiedNative, crate::i18n::Locale::Zh) => {
+            format!("已复制 {count} 字符（本机剪贴板回读已验证）")
+        }
+        (Delivery::VerifiedNative, crate::i18n::Locale::En) => {
+            format!("Copied {count} characters (local clipboard readback verified)")
+        }
+        (Delivery::SentUnverified, crate::i18n::Locale::Zh) => {
+            format!("已发送 {count} 字符到 {routes}；本机剪贴板未验证")
+        }
+        (Delivery::SentUnverified, crate::i18n::Locale::En) => {
+            format!("Sent {count} characters via {routes}; local clipboard unverified")
+        }
+    };
+    if !receipt.failures.is_empty() {
+        message.push_str(" · ");
+        message.push_str(&receipt.failures.join("; "));
+    }
+    message
 }
 
 fn point_in_rect(x: u16, y: u16, rect: Option<(u16, u16, u16, u16)>) -> bool {
@@ -934,6 +1077,41 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let btw = state.surface == SurfaceFocus::Btw;
+
+    if !btw && let Some(mut search) = state.history_search.take() {
+        if is_ctrl_c(&key) {
+            state.disarm_ctrlc();
+            return Vec::new();
+        }
+        let accepted = key.code == KeyCode::Enter;
+        if !search.handle_key(key, &mut state.composer) {
+            state.history_search = Some(search);
+        } else if accepted {
+            touch_slash_filter(state);
+        }
+        state.disarm_ctrlc();
+        return Vec::new();
+    }
+    if !btw
+        && ctrl
+        && key.code == KeyCode::Char('r')
+        && state.active_screen == Screen::Conversation
+        && state.workbench_focus == WorkbenchFocus::Input
+        && state.update.is_none()
+    {
+        state.history_search = Some(crate::history_search::HistorySearch::default());
+        state.disarm_ctrlc();
+        return Vec::new();
+    }
+    if state.active_screen == Screen::Conversation
+        && state.workbench_focus == WorkbenchFocus::Input
+        && ((ctrl && matches!(key.code, KeyCode::Char('z' | 'Z' | 'y')))
+            || (alt && key.code == KeyCode::Char('z')))
+    {
+        state.composer.apply_editing_key(key);
+        touch_slash_filter(state);
+        return request_file_candidates(state);
+    }
 
     // A finished `/update` panel is the narrowest thing on screen: Esc closes
     // it before anything else. While the update is still in flight there is
@@ -1539,7 +1717,7 @@ fn toggle_selected_command(state: &mut AppState) {
         state.command_selected = None;
         return;
     };
-    state.transcript.toggle_call_at(item, call);
+    interaction::toggle_call(state, item, call);
     state.conv.plain.clear();
 }
 
@@ -1892,6 +2070,8 @@ mod command_row_tests;
 mod context_refresh_tests;
 #[cfg(test)]
 mod history_replay_tests;
+#[cfg(test)]
+mod input_recovery_tests;
 
 #[cfg(test)]
 mod pending_input_tests;
@@ -1957,11 +2137,11 @@ mod disclosure_tests {
     }
 
     /// Screen row of absolute content line `abs_line` under the current rect
-    /// (short transcripts render bottom-aligned, so pad rows come first).
+    /// (padding comes from the same geometry policy as the renderer).
     fn screen_row_of(s: &AppState, abs_line: usize) -> u16 {
         let (_, ry, rw, rh) = s.conv.rect.unwrap();
         let total = s.conversation_lines_and_hits(rw as usize).0.len();
-        let pad = (rh as usize).saturating_sub(total);
+        let pad = crate::conversation::geometry::painted_top_padding(s, total, rh as usize);
         ry + (pad + abs_line) as u16
     }
 
@@ -2458,10 +2638,10 @@ mod disclosure_tests {
     }
 
     #[test]
-    fn bottom_aligned_short_transcript_clicks_land_on_each_group() {
+    fn top_aligned_short_transcript_clicks_land_on_each_group() {
         let mut s = test_state();
         three_groups(&mut s);
-        // Short transcript renders bottom-aligned: pad rows precede content.
+        // Short transcript starts at the viewport top.
         let hits = s.conversation_lines_and_hits(80).1.as_ref().clone();
         assert_eq!(hits.len(), 3);
         for (line, item) in hits {
@@ -2645,6 +2825,78 @@ mod final_nav_tests {
         // 12 conversation rows, like 80×24 paints after chrome.
         s.conv.rect = Some((2, 3, 76, 12));
         s
+    }
+
+    #[test]
+    fn background_page_mouse_selects_rows_and_scrolls_each_pane() {
+        let mut s = state();
+        for id in ["bg-one", "bg-two"] {
+            let mut chrome = crate::state::BackgroundTaskChrome::running(id, 0);
+            chrome.output = (0..60).map(|n| format!("log-{n}\n")).collect();
+            s.background_task_labels.insert(id.into(), chrome);
+        }
+        crate::activity::open_background_list(&mut s);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::render::render(f, &mut s)).unwrap();
+        let second = crate::activity::background_job_list(&s)
+            .rows()
+            .nth(1)
+            .unwrap()
+            .id
+            .as_key()
+            .to_string();
+        let first = crate::activity::background_job_list(&s)
+            .rows()
+            .next()
+            .unwrap()
+            .id
+            .as_key()
+            .to_string();
+        // Locate the second row through the actual painted text.
+        let buffer = terminal.backend().buffer();
+        let y = (0..24)
+            .find(|y| {
+                (0..80)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains(&second)
+            })
+            .unwrap();
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(s.background_list_selected.as_deref(), Some(second.as_str()));
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(s.background_list_selected.as_deref(), Some(first.as_str()));
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: 15,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            s.background_list_focus,
+            crate::activity::BackgroundPane::Output
+        );
+        assert!(!crate::activity::background_task_view(&s, &first).follow);
     }
 
     fn say(s: &mut AppState, id: &str, text: &str) {

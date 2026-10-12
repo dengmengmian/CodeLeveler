@@ -273,6 +273,8 @@ pub struct AppState {
     /// resume is a policy the runtime has not decided.
     pub unfinished_goals: Vec<leveler_client_protocol::UiUnfinishedGoal>,
     pub composer: Composer,
+    pub history_search: Option<crate::history_search::HistorySearch>,
+    pub help: crate::help::HelpSearch,
     /// The structured next step offered as ghost text after a turn ends, or
     /// `None`. Presentation state only: see [`crate::suggestion`] — it is not
     /// composer content, not a draft, not history, and never submitted on its
@@ -454,6 +456,9 @@ pub struct AppState {
     pub background_footer_hit: Option<(u16, u16, u16)>,
     /// Painted stop controls, bound to their screen and exact task identity.
     /// These are hit regions only; cancellation rechecks the live projection.
+    pub background_list_hits: Vec<(ratatui::layout::Rect, String)>,
+    pub background_list_rect: Option<ratatui::layout::Rect>,
+    pub background_output_rect: Option<ratatui::layout::Rect>,
     pub background_stop_hits: Vec<(Screen, ratatui::layout::Rect, String)>,
     /// Which pane owns ↑/↓ on the Background Tasks page: the task list or the
     /// selected task's live output. Presentation state only.
@@ -597,6 +602,8 @@ impl AppState {
             team: crate::multi_agent::TaskTeamView::default(),
             unfinished_goals: Vec::new(),
             composer: Composer::new(),
+            history_search: None,
+            help: crate::help::HelpSearch::default(),
             prompt_suggestion: None,
             prompt_suggestion_allowed: true,
             away_summary_due_at: None,
@@ -668,6 +675,9 @@ impl AppState {
             background_list_selected: None,
             background_failures_seen: std::collections::HashSet::new(),
             background_footer_hit: None,
+            background_list_hits: Vec::new(),
+            background_list_rect: None,
+            background_output_rect: None,
             background_stop_hits: Vec::new(),
             background_list_focus: crate::activity::BackgroundPane::List,
             background_task_views: std::collections::HashMap::new(),

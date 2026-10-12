@@ -35,7 +35,7 @@
     "fold_state": "hard_required",
     "provider_actual": 98100,
     "render": {
-      "tui_footer": "上下文 101% · 97k/96k",
+      "tui_footer": "75%/128k",
       "web_label": "97.0k / 96.0k",
       "web_axis_word": "压缩口径"
     }

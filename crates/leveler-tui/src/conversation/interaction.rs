@@ -16,7 +16,7 @@ const SELECTION_EDGE_ROWS: u16 = 2;
 /// The semantic target under a Conversation screen cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
-    /// A command call's row → that call. Clicking toggles its output; stopping
+    /// A tool call's row → that call. Clicking toggles its output; stopping
     /// is the contextual `x` on the focused row.
     Command { item: usize, call: usize },
     /// A tool-disclosure header row → the transcript item to toggle.
@@ -143,13 +143,7 @@ pub fn jump_to_live_edge(state: &mut AppState) {
 ///
 /// Returns the entry's new expand state, or `None` when it is not foldable.
 pub fn toggle_fold(state: &mut AppState, item: usize) -> Option<bool> {
-    let width = geometry::content_width(state);
-    let followed = state.conv.auto_scroll && !crate::splash::conversation_is_empty(state);
-    let anchor = if followed {
-        None
-    } else {
-        top_of_viewport(state, width)
-    };
+    let anchor = reading_anchor(state);
 
     // A view-time exploration run is folded by its own presentation state; a
     // single entry folds through its block. Both resolve the SAME item index,
@@ -159,21 +153,44 @@ pub fn toggle_fold(state: &mut AppState, item: usize) -> Option<bool> {
         None => state.transcript.toggle_item_display(item)?.is_expanded(),
     };
 
-    if !followed
-        && let Some((anchor_item, offset)) = anchor
-        && let Some((start, end)) = state.item_span(anchor_item, width)
-    {
-        // Keep the anchored line at the top edge. The offset may sit on the
-        // blank separator right after the item, so it is clamped to the item's
-        // height, not to its last line.
-        state.conv.scroll = start + offset.min(end.saturating_sub(start));
-    }
+    restore_reading_anchor(state, anchor);
     // The plain-text projection backs selection and URL hit-testing; the fold
     // changed the lines under it, so it must be rebuilt on next use.
     state.conv.plain.clear();
     state.conv.plain_width = 0;
     Some(expanded)
 }
+/// Toggle one child without changing its parent or the reader's position.
+pub fn toggle_call(state: &mut AppState, item: usize, call: usize) -> Option<bool> {
+    let anchor = reading_anchor(state);
+    let expanded = state.transcript.toggle_call_at(item, call)?;
+    restore_reading_anchor(state, anchor);
+    state.conv.plain.clear();
+    state.conv.plain_width = 0;
+    Some(expanded)
+}
+
+/// Capture the visible item before a presentation boundary changes its height.
+/// Streaming deltas do not use this: projection still follows painted frames.
+pub(crate) fn reading_anchor(state: &AppState) -> Option<(usize, usize)> {
+    if state.conv.auto_scroll {
+        None
+    } else {
+        top_of_viewport(state, geometry::content_width(state))
+    }
+}
+
+/// Keep the same item and row at the top after a fold or runtime boundary.
+pub(crate) fn restore_reading_anchor(state: &mut AppState, anchor: Option<(usize, usize)>) {
+    if let Some((item, offset)) = anchor
+        && let Some((start, end)) = state.item_span(item, geometry::content_width(state))
+    {
+        // A removed body offset stays within the surviving item or on its
+        // following separator, matching manual fold anchoring.
+        state.conv.scroll = start + offset.min(end.saturating_sub(start));
+    }
+}
+
 /// The transcript item and intra-item offset painted at the viewport's top
 /// edge, as the reader is currently looking at it.
 fn top_of_viewport(state: &AppState, width: usize) -> Option<(usize, usize)> {
@@ -183,8 +200,8 @@ fn top_of_viewport(state: &AppState, width: usize) -> Option<(usize, usize)> {
     let count = state.transcript.len();
     let anchor = (0..count).rev().find(|&i| {
         state
-            .item_start_line(i, width)
-            .is_some_and(|start| start <= painted)
+            .item_span(i, width)
+            .is_some_and(|(start, end)| start < end && start <= painted)
     })?;
     let start = state.item_start_line(anchor, width)?;
     Some((anchor, painted - start))
@@ -243,4 +260,43 @@ pub fn clear_selection_drag(state: &mut AppState) {
     state.conv.selection_edge_dir = 0;
     state.conv.selection_edge_streak = 0;
     state.conv.selection_last_mouse = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicitly_opened_completed_thought_can_anchor_the_viewport() {
+        let mut state = AppState::new(
+            crate::theme::Theme::no_color(),
+            crate::state::Boot {
+                session_id: leveler_client_protocol::SessionId::new("anchor"),
+                user: "u".into(),
+                version: "test".into(),
+                show_welcome: false,
+                draft_path: None,
+                history_path: None,
+                context_window: 200_000,
+                locale: crate::i18n::Locale::Zh,
+                untrusted_config: Vec::new(),
+                model_notice: None,
+                thinking: None,
+            },
+        );
+        state.size = (80, 24);
+        state.conv.rect = Some((0, 2, 80, 5));
+        state.transcript.push_user("history\n".repeat(40));
+        state.transcript.append_thought("hidden reasoning");
+        state.transcript.finish_thought(Some(400));
+        state.transcript.push_note("tail\n".repeat(40));
+        let (start, end) = state.item_span(1, 80).unwrap();
+        assert_eq!(end - start, 0, "collapsed completed reasoning has no row");
+        toggle_fold(&mut state, 1);
+        let (start, end) = state.item_span(1, 80).unwrap();
+        assert_eq!(end - start, 2, "explicit details show the header and body");
+        state.conv.auto_scroll = false;
+        state.conv.scroll = start;
+        assert_eq!(top_of_viewport(&state, 80), Some((1, 0)));
+    }
 }

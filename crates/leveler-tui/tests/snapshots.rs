@@ -100,17 +100,6 @@ fn render_at(width: u16, height: u16, state: &mut AppState) -> String {
 }
 
 /// Last `n` buffer lines — sticky footer/input chrome only (splash may use ↑/↓).
-/// The footer context chip's label, without its counts — the tests here assert
-/// placement and presence, never the wording, which the locale table owns.
-fn ctx_label() -> &'static str {
-    leveler_tui::Locale::Zh
-        .text()
-        .footer_context
-        .split(" {}")
-        .next()
-        .expect("the context chip has a label")
-}
-
 fn sticky_chrome(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -186,7 +175,7 @@ fn renders_welcome_header_and_composer_at_standard_sizes() {
             "idle token counts should be hidden at {w}x{h}: {chrome}"
         );
         assert!(
-            !chrome.contains(ctx_label()),
+            !chrome.contains('%') && !chrome.contains('░'),
             "fresh-session context line should be hidden at {w}x{h}: {chrome}"
         );
     }
@@ -204,9 +193,9 @@ fn context_chip_appears_on_footer_after_usage_update() {
     );
 
     let text = render_at(100, 24, &mut state);
-    // Footer is context-only: Context 24k/200k (compact, not full commas).
+    // Footer reports model-window utilization and capacity without a label.
     assert!(
-        text.contains(&format!("{} 24k/", ctx_label())),
+        text.contains("12%/200k"),
         "footer context line missing: {text}"
     );
     let chrome = sticky_chrome(&text, 6);
@@ -233,7 +222,7 @@ fn footer_shows_cache_hit_rate_when_provider_reports_it() {
     state.context_tokens = 1000;
     let text = render_at(100, 24, &mut state);
     assert!(
-        text.contains(ctx_label())
+        text.contains("0%/200k")
             && text.contains(
                 &leveler_tui::Locale::Zh
                     .text()
@@ -1170,11 +1159,11 @@ fn showing_and_hiding_the_hints_keeps_the_conversation_the_same_height() {
     );
 }
 
-/// A short conversation must sit against the composer, the way terminal output
-/// does — not pin to the top of the viewport and leave a band of dead space
-/// between the last line and the input box.
+/// A short conversation starts at the viewport top: unused rows stay below the
+/// transcript so streaming and Thought folding never move the first message.
+/// Only the empty-session splash is centered.
 #[test]
-fn a_short_conversation_sits_against_the_composer() {
+fn a_short_conversation_starts_at_the_viewport_top() {
     let mut state = opened_state();
     reduce(
         &mut state,
@@ -1201,8 +1190,8 @@ fn a_short_conversation_sits_against_the_composer() {
         .position(|l| l.contains('›'))
         .expect("composer must be on screen");
 
-    // The filler belongs ABOVE the content: several blank rows between the
-    // header rule and the first message, and none of consequence below it.
+    // The filler belongs BELOW the content: the message sits against the top of
+    // the viewport, and the spare rows stay between it and the composer.
     let blank_above = lines[..content]
         .iter()
         .rev()
@@ -1213,12 +1202,12 @@ fn a_short_conversation_sits_against_the_composer() {
         .filter(|l| l.trim().is_empty())
         .count();
     assert!(
-        blank_above >= 3,
-        "a short transcript must be pushed down by filler, got {blank_above} blank rows above\n{text}"
+        blank_above <= 2,
+        "a short transcript starts at the top, got {blank_above} blank rows above\n{text}"
     );
     assert!(
-        blank_below <= 2,
-        "content must sit against the composer, got {blank_below} blank rows below\n{text}"
+        blank_below >= 3,
+        "unused rows stay below the transcript, got {blank_below} blank rows below\n{text}"
     );
 }
 
@@ -1372,9 +1361,10 @@ fn no_rendered_line_exceeds_the_terminal_width() {
     }
 }
 
-/// The approval overlay replaces the composer, so it must not also leave the
-/// conversation stranded at the top with dead space — the decision should sit
-/// where the input box was, right under the work that prompted it.
+/// The approval overlay replaces the composer, so it takes the composer's slot
+/// at the bottom while the work that prompted it stays at the viewport top.
+/// The spare rows between them are the transcript's own top alignment, not a
+/// layout gap.
 #[test]
 fn the_approval_overlay_sits_where_the_composer_was() {
     let mut state = opened_state();
@@ -1421,13 +1411,18 @@ fn the_approval_overlay_sits_where_the_composer_was() {
         overlay > prompt,
         "the decision belongs below the work — prompt at {prompt}, overlay at {overlay}:\n{text}"
     );
-    let blanks = lines[prompt + 1..overlay]
-        .iter()
-        .filter(|l| l.trim().is_empty())
-        .count();
     assert!(
-        blanks <= 3,
-        "{blanks} blank rows between the prompt and the approval:\n{text}"
+        prompt <= 6,
+        "a short transcript starts at the top — prompt at {prompt}:\n{text}"
+    );
+    assert!(
+        overlay * 2 >= lines.len(),
+        "the overlay takes the composer's slot in the bottom half — overlay at {overlay} of {}:\n{text}",
+        lines.len()
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains('›')),
+        "the overlay replaces the composer rather than stacking above it:\n{text}"
     );
 }
 

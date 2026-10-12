@@ -228,8 +228,13 @@ fn context_screen(
     match total {
         Some(total) => {
             let pct = acc.used_tokens as f64 * 100.0 / total as f64;
+            let axis = if capacity.is_some() {
+                t.context_input_capacity
+            } else {
+                t.context_window_axis
+            };
             head.push(Span::styled(
-                format!(" · {used} / {} · {pct:.1}%", fmt_tokens(total)),
+                format!(" · {axis} {used} / {} · {pct:.1}%", fmt_tokens(total)),
                 Style::default().fg(theme.text.primary),
             ));
         }
@@ -305,7 +310,17 @@ fn context_screen(
     // fabricated percentage. Without one, the breakdown stands alone.
     let grid = match (total, shape) {
         (Some(total), Some(shape)) => {
-            let slices = context_grid::slices_from(acc);
+            let mut slices = context_grid::slices_from(acc);
+            // Runtime free_tokens is window-based. This screen selects an
+            // input-capacity axis when available, including its free slice.
+            slices.retain(|slice| !slice.free);
+            if acc.free_tokens.is_some() {
+                slices.push(context_grid::GridSlice {
+                    key: "free".to_string(),
+                    tokens: total.saturating_sub(acc.used_tokens),
+                    free: true,
+                });
+            }
             let cells = context_grid::draw(&slices, shape, total, acc.compact_at_tokens);
             Some(grid_lines(&cells, shape, &colors, theme))
         }
@@ -473,7 +488,12 @@ fn breakdown_lines(
             theme,
         ));
     }
-    if let Some(free) = acc.free_tokens {
+    // Use the selected display axis, without rewriting the snapshot's
+    // authoritative free_tokens (which always belongs to the model window).
+    let free = acc
+        .free_tokens
+        .map(|free| window.map_or(free, |total| total.saturating_sub(acc.used_tokens)));
+    if let Some(free) = free {
         lines.push(free_line(free, window, theme, t));
     }
     lines
@@ -723,6 +743,67 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .filter(|s| s.content.as_ref() == glyph)
             .count()
+    }
+
+    #[test]
+    fn inspector_names_input_capacity_separately_from_model_window() {
+        let acc = snapshot();
+        let view = ContextView::default();
+        let lines = render(&acc, &view, 120);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Input capacity"), "{text}");
+        assert!(text.contains("Model window"), "{text}");
+        assert!(text.contains("Output reservation"), "{text}");
+    }
+
+    #[test]
+    fn inspector_free_and_map_share_the_input_capacity_axis() {
+        let projection = leveler_model::RequestProjection::project(
+            &[leveler_model::Message::text(
+                leveler_model::Role::User,
+                "x".repeat(2_097_152),
+            )],
+            &[],
+            leveler_model::ReasoningReplayContract::NONE,
+            leveler_model::ReasoningRetention::All,
+        );
+        let acc = ContextAccounting::compute(
+            leveler_model::ModelRef::new("deepseek", "deepseek-flash"),
+            &projection,
+            Some(1_048_576),
+            Some(557_056),
+            None,
+        )
+        .with_input_budget(Some(655_360), Some(393_216), Some(0));
+        assert_eq!(acc.used_tokens, 524_288);
+        assert_eq!(
+            acc.free_tokens,
+            Some(524_288),
+            "runtime free remains window based"
+        );
+        let view = ContextView {
+            loaded: Some(acc.clone()),
+            ..ContextView::default()
+        };
+        let lines = render(&acc, &view, 120);
+        let free_row = lines
+            .iter()
+            .map(ToString::to_string)
+            .find(|line| line.contains("○ Free"))
+            .unwrap();
+        assert!(
+            free_row.contains("131.1k") && free_row.contains("20.0%"),
+            "{free_row}"
+        );
+        let cells = GridShape::for_width(120).cells();
+        assert!(
+            glyph_count(&lines, "●") >= cells * 79 / 100,
+            "used cells must represent 80% of input capacity, not 50% of full window"
+        );
     }
 
     #[test]

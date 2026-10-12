@@ -319,6 +319,7 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     let BackgroundListBody {
         lines,
         selected_line,
+        task_rows,
     } = background_list_body(state, &list, body.width as usize, theme, t);
 
     // The list is capped to a third of the pane (min 3 rows) so the live log
@@ -333,12 +334,12 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     };
     let rule_area = Rect {
         y: body.y + list_height,
-        height: 1,
+        height: body.height.saturating_sub(list_height).min(1),
         ..body
     };
     let detail_area = Rect {
-        y: body.y + list_height + 1,
-        height: body.height.saturating_sub(list_height + 1),
+        y: body.y + list_height + rule_area.height,
+        height: body.height.saturating_sub(list_height + rule_area.height),
         ..body
     };
 
@@ -350,6 +351,19 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         .map(|line| line.saturating_sub(list_area.height.saturating_sub(1) as usize))
         .unwrap_or(0)
         .min(max_offset);
+    state.background_list_rect = Some(list_area);
+    for (line, id) in task_rows {
+        if line >= offset && line < offset + list_area.height as usize {
+            state.background_list_hits.push((
+                Rect {
+                    y: list_area.y + (line - offset) as u16,
+                    height: 1,
+                    ..list_area
+                },
+                id,
+            ));
+        }
+    }
     let visible: Vec<Line<'static>> = lines
         .into_iter()
         .skip(offset)
@@ -388,23 +402,49 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     } else {
         None
     };
-    // The stop button overlays the fact line's right edge; reserve its cells so
-    // a long fact string can never run underneath it.
-    let detail_width = detail_area
+    // Identity and facts stay fixed while only the command/log content scrolls.
+    let header_width = detail_area
         .width
         .saturating_sub(stop_rect.map_or(0, |r| r.width + 2));
-    let detail =
-        background_detail_pane_lines(state, &summary, &task_id, detail_width as usize, theme, t);
-    let total = detail.len();
-    crate::activity::sync_background_task_view(state, &task_id, total, detail_area.height as usize);
+    let mut header = background_detail_pane_lines(
+        state,
+        &summary,
+        &task_id,
+        detail_area.width as usize,
+        theme,
+        t,
+    );
+    let detail = header.split_off(2);
+    let header =
+        background_detail_header_lines(state, &summary, &task_id, header_width as usize, theme, t);
+    let header_height = detail_area.height.min(2);
+    frame.render_widget(
+        Paragraph::new(header),
+        Rect {
+            width: header_width,
+            height: header_height,
+            ..detail_area
+        },
+    );
+    let output_area = Rect {
+        y: detail_area.y + header_height,
+        height: detail_area.height.saturating_sub(header_height),
+        ..detail_area
+    };
+    state.background_output_rect = Some(output_area);
+    crate::activity::sync_background_task_view(
+        state,
+        &task_id,
+        detail.len(),
+        output_area.height as usize,
+    );
     let view = crate::activity::background_task_view(state, &task_id);
-    let offset = view.scroll.min(view.max_scroll);
     let visible: Vec<Line<'static>> = detail
         .into_iter()
-        .skip(offset)
-        .take(detail_area.height as usize)
+        .skip(view.scroll.min(view.max_scroll))
+        .take(output_area.height as usize)
         .collect();
-    frame.render_widget(Paragraph::new(visible), detail_area);
+    frame.render_widget(Paragraph::new(visible), output_area);
     if let Some(rect) = stop_rect {
         render_background_stop(frame, rect, &task_id, state);
     }
@@ -457,6 +497,7 @@ fn background_page_hint(
 }
 
 struct BackgroundListBody {
+    task_rows: Vec<(usize, String)>,
     lines: Vec<Line<'static>>,
     selected_line: Option<usize>,
 }
@@ -497,6 +538,7 @@ fn background_list_body(
 ) -> BackgroundListBody {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut selected_line = None;
+    let mut task_rows = Vec::new();
     let selected = state.background_list_selected.as_deref();
     if list.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -506,6 +548,7 @@ fn background_list_body(
         return BackgroundListBody {
             lines,
             selected_line,
+            task_rows,
         };
     }
     if !list.running.is_empty() {
@@ -518,6 +561,7 @@ fn background_list_body(
             if on {
                 selected_line = Some(lines.len());
             }
+            task_rows.push((lines.len(), summary.id.as_key().to_string()));
             lines.push(background_list_row(
                 summary,
                 exit_code_for(state, summary.id.as_key()),
@@ -538,6 +582,7 @@ fn background_list_body(
             if on {
                 selected_line = Some(lines.len());
             }
+            task_rows.push((lines.len(), summary.id.as_key().to_string()));
             lines.push(background_list_row(
                 summary,
                 exit_code_for(state, summary.id.as_key()),
@@ -550,6 +595,7 @@ fn background_list_body(
     BackgroundListBody {
         lines,
         selected_line,
+        task_rows,
     }
 }
 
@@ -813,7 +859,7 @@ fn background_detail_body(
 /// The Background Tasks page's detail pane: identity + runtime facts, then the
 /// task's real retained output. The facts come from the same projection the
 /// list uses, so the two panes can never disagree about a task's state.
-fn background_detail_pane_lines(
+fn background_detail_header_lines(
     state: &AppState,
     summary: &crate::activity::ActivitySummary,
     task_id: &str,
@@ -831,8 +877,8 @@ fn background_detail_pane_lines(
         theme,
     );
     let glyph = crate::activity::activity_glyph(summary.status);
-    let status_w = unicode_width::UnicodeWidthStr::width(status_text.as_str()) + 3;
-    let label = truncate_display(&summary.title, width.saturating_sub(status_w).max(8));
+    let status_w = unicode_width::UnicodeWidthStr::width(status_text.as_str()) + 4;
+    let label = truncate_display(&summary.title, width.saturating_sub(status_w));
     lines.push(Line::from(vec![
         Span::styled(
             label,
@@ -879,6 +925,31 @@ fn background_detail_pane_lines(
         ),
         Style::default().fg(theme.text.muted),
     )));
+    lines
+}
+
+fn background_detail_pane_lines(
+    state: &AppState,
+    summary: &crate::activity::ActivitySummary,
+    task_id: &str,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    let mut lines = background_detail_header_lines(state, summary, task_id, width, theme, t);
+    let chrome = crate::activity::background_chrome(state, task_id);
+    lines.push(Line::from(""));
+    lines.push(section_line(t.activity_command_label, theme));
+    for row in wrap(
+        &format!("$ {}", sanitize_terminal_line(&summary.title)),
+        content_width(width).max(1),
+    ) {
+        lines.push(detail_line(
+            row,
+            Style::default().fg(theme.text.primary),
+            width,
+        ));
+    }
     lines.push(Line::from(""));
     lines.push(section_line(t.activity_output_label, theme));
     let output = chrome.map(|c| c.output.as_str()).unwrap_or("");
@@ -891,7 +962,7 @@ fn background_detail_pane_lines(
         return lines;
     }
     for raw in output.lines() {
-        lines.push(background_output_line(raw, width, theme));
+        lines.extend(background_output_lines(raw, width, theme));
     }
     lines
 }
@@ -899,44 +970,23 @@ fn background_detail_pane_lines(
 /// One retained output line. The runtime tags every chunk with its stream
 /// (`[stdout] ` / `[stderr] `); stderr and the truncation marker must stay
 /// visible, so they are styled instead of being flattened into stdout.
-fn background_output_line(raw: &str, width: usize, theme: &Theme) -> Line<'static> {
+fn background_output_lines(raw: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let line = sanitize_terminal_line(raw);
-    let avail = content_width(width);
-    let indent = crate::layout::DETAIL_BODY_INDENT;
-    if let Some(rest) = line.strip_prefix("[stderr] ") {
-        return Line::from(vec![
-            Span::raw(indent),
-            Span::styled(
-                "[stderr] ",
-                Style::default()
-                    .fg(theme.status.error)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                truncate_display(rest, avail.saturating_sub(9)),
-                Style::default().fg(theme.status.error),
-            ),
-        ]);
-    }
-    if let Some(rest) = line.strip_prefix("[stdout] ") {
-        return Line::from(vec![
-            Span::raw(indent),
-            Span::styled(
-                truncate_display(rest, avail),
-                Style::default().fg(theme.text.secondary),
-            ),
-        ]);
-    }
-    // A truncated-prefix marker or an untagged continuation line.
-    let style = if line.starts_with('…') {
+    let stderr = line.starts_with("[stderr] ");
+    let text = line.strip_prefix("[stdout] ").unwrap_or(&line);
+    let style = if stderr {
+        Style::default()
+            .fg(theme.status.error)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with('…') {
         Style::default().fg(theme.text.muted)
     } else {
         Style::default().fg(theme.text.secondary)
     };
-    Line::from(Span::styled(
-        format!("{indent}{}", truncate_display(&line, avail)),
-        style,
-    ))
+    wrap(text, content_width(width).max(1))
+        .into_iter()
+        .map(|row| detail_line(row, style, width))
+        .collect()
 }
 
 /// A sub-agent's body. The semantic task, then either the running call or the
@@ -1127,8 +1177,7 @@ pub use transcript_lines::{
     sub_agent_tree_lines,
 };
 pub(crate) use transcript_lines::{
-    paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail, thought_lines, turn_end_marker,
-    user_shell_lines,
+    paint_reasoning_rail, reasoning_rail_rows, sub_agent_detail, turn_end_marker, user_shell_lines,
 };
 
 pub(crate) use panes::pad_line_to_width;
@@ -1148,6 +1197,9 @@ use screens::{render_diff_screen, render_help_screen, render_sessions_screen};
 /// Plan / Input / Footer). Other screens keep the classic full-screen panes.
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     state.background_stop_hits.clear();
+    state.background_list_hits.clear();
+    state.background_list_rect = None;
+    state.background_output_rect = None;
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
         return;
@@ -1167,6 +1219,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         if let Some(view) = &state.update {
             crate::update::render_panel(frame, area, view, &state.theme, state.t());
         }
+        screens::render_history_search(frame, area, state);
         return;
     }
 
@@ -1188,6 +1241,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Plan => render_plan_screen(frame, area, state),
         Screen::Goal => render_goal_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
+        Screen::Doctor => crate::terminal_diagnostics::render_screen(frame, area, state),
         Screen::Trace => crate::observability::render_trace_screen(frame, area, state),
         Screen::Context => crate::context::render_context_screen(frame, area, state),
         Screen::Clean => crate::clean::render_clean_screen(frame, area, state),
@@ -2156,6 +2210,128 @@ mod tests {
     /// A background Activity Detail shows the real command, its retained
     /// output, and the viewport's follow state — the same surface the child
     /// detail uses, not a second background-specific screen.
+    #[test]
+    fn background_page_keeps_identity_visible_at_log_tail() {
+        let mut state = test_state();
+        let mut chrome = crate::state::BackgroundTaskChrome::running(
+            "unique-task-command-with-a-very-long-full-command-to-wrap-over-many-terminal-columns",
+            0,
+        );
+        chrome.output = (0..80).map(|n| format!("[stdout] log-{n}\n")).collect();
+        chrome.pid = Some(12345);
+        state
+            .background_task_labels
+            .insert("bg-tail".into(), chrome);
+        crate::activity::open_background_list(&mut state);
+        for (w, h) in [(80, 24), (40, 12)] {
+            let text = render_text(&mut state, w, h);
+            assert!(text.contains("unique-task"), "{text}");
+            assert!(text.contains("12345"), "fixed facts missing: {text}");
+            let header_y = state.background_output_rect.unwrap().y.saturating_sub(2) as usize;
+            let header = text.lines().nth(header_y).unwrap();
+            assert!(header.contains("运行中"), "fixed status missing: {header}");
+            assert!(
+                header.contains(state.t().background_stop_button),
+                "stop missing: {header}"
+            );
+            assert!(text.contains("log-79"), "tail missing: {text}");
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.contains("log-")
+                        && line.contains(state.t().background_stop_button)),
+                "stop overlays log: {text}"
+            );
+        }
+        render_text(&mut state, 10, 3);
+    }
+
+    #[test]
+    fn background_page_resize_does_not_create_unread_output() {
+        let mut state = test_state();
+        let mut chrome = crate::state::BackgroundTaskChrome::running("cmd", 0);
+        chrome.output = (0..50)
+            .map(|n| format!("[stdout] line-{n}-{}\n", "内容".repeat(30)))
+            .collect();
+        state
+            .background_task_labels
+            .insert("bg-resize".into(), chrome);
+        crate::activity::open_background_list(&mut state);
+        render_text(&mut state, 80, 24);
+        crate::activity::scroll_selected_output(&mut state, -8);
+        let old_scroll = crate::activity::background_task_view(&state, "bg-resize").scroll;
+        render_text(&mut state, 40, 12);
+        assert_eq!(
+            crate::activity::background_task_view(&state, "bg-resize").unread,
+            0
+        );
+        crate::reducer::reduce(
+            &mut state,
+            crate::action::Action::Runtime(
+                leveler_client_protocol::RuntimeEvent::BackgroundTaskOutput {
+                    task_id: "bg-resize".into(),
+                    chunk: "[stderr] fresh-line\n".into(),
+                },
+            ),
+        );
+        render_text(&mut state, 40, 12);
+        let view = crate::activity::background_task_view(&state, "bg-resize");
+        assert_eq!(view.unread, 1);
+        assert_eq!(view.scroll, old_scroll);
+        assert!(!view.follow);
+        crate::activity::bottom_selected_output(&mut state);
+        let text = render_text(&mut state, 40, 12);
+        assert!(text.contains("fresh-line"), "{text}");
+        assert_eq!(
+            crate::activity::background_task_view(&state, "bg-resize").unread,
+            0
+        );
+    }
+
+    #[test]
+    fn background_page_full_command_and_unicode_output_are_reachable() {
+        let mut state = test_state();
+        let command = "printf 甲乙丙丁戊己庚辛壬癸 --long-command-tail";
+        let mut chrome = crate::state::BackgroundTaskChrome::running(command, 0);
+        chrome.output = "[stderr] 甲乙丙丁戊己庚辛壬癸ABCDEFGHIJ-output-tail".into();
+        state
+            .background_task_labels
+            .insert("bg-long".into(), chrome);
+        let summary = crate::activity::background_job_list(&state)
+            .rows()
+            .next()
+            .unwrap()
+            .clone();
+        let rows = super::background_detail_pane_lines(
+            &state,
+            &summary,
+            "bg-long",
+            20,
+            &state.theme,
+            state.t(),
+        );
+        let joined = rows
+            .iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim_start()
+                    .to_string()
+            })
+            .collect::<String>();
+        assert!(
+            joined.contains("--long-command-tail"),
+            "command cut: {joined}"
+        );
+        assert!(
+            joined.contains("ABCDEFGHIJ-output-tail"),
+            "output cut: {joined}"
+        );
+        assert!(rows.iter().all(|row| row.width() <= 20), "row overflow");
+    }
+
     #[test]
     fn background_detail_shows_command_output_and_follow_state() {
         let mut state = test_state();

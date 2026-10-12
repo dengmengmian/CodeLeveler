@@ -35,7 +35,7 @@
     "fold_state": "none",
     "provider_actual": 41100,
     "render": {
-      "tui_footer": "上下文 40k/128k",
+      "tui_footer": "31%/128k",
       "web_label": "40.0k / 128.0k",
       "web_axis_word": "模型窗口占用"
     }

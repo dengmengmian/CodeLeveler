@@ -220,6 +220,16 @@ The default permission profile is `assisted`. Ordinary repository writes, builds
 
 `leveler doctor` reports the effective host capabilities. If a restricted mode needs an isolation backend that is missing, execution fails instead of pretending to be sandboxed.
 
+## TUI editing and terminal diagnostics
+
+In the input area, `Ctrl+Z` undoes an edit, `Ctrl+Shift+Z` or `Alt+Z` redoes it, and `Ctrl+Y` restores recently killed text. Undo restores paste blocks, file references, and the original image attachment bindings. Submission and session changes end the draft's edit history. Each undo/redo stack is bounded to 100 entries and 8 MiB.
+
+`Ctrl+R` searches submitted input history. `Enter` restores the selected entry to the draft for editing without sending it; `Esc` or `Ctrl+C` closes search and preserves the original draft. `/help` searches commands, shortcuts, and descriptions.
+
+`/doctor` shows local terminal diagnostics. `leveler doctor` also reports terminal, SSH/tmux, color hints, newline keys, and clipboard routes. Diagnostics do not change clipboard contents or terminal settings; capabilities without evidence remain unknown.
+
+In an ordinary local terminal, copying selected conversation text prefers the native clipboard with readback verification. Over SSH, the remote host's native clipboard is skipped in favor of OSC52. Since a tmux server cannot establish its current client's location, tmux also skips the native clipboard, writes the tmux paste buffer, and sends OSC52. Successful OSC52/tmux writes are reported as sent with local clipboard delivery unverified. Clipboard forwarding or passthrough may need to be enabled in your terminal. OSC52 text is limited to 64 KiB, with an explicit error above the limit.
+
 ## Browser and web search
 
 Each goal starts with the base coding tools. The model loads optional capabilities when needed; the runtime exposes their tools only when they are available and permitted.

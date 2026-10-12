@@ -259,6 +259,15 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             if key.code == KeyCode::Esc {
                 close_screen(state);
             } else {
+                let page = page_size(state);
+                let t = state.t();
+                state.help.handle_key(key, t, page);
+            }
+        }
+        Screen::Doctor => {
+            if key.code == KeyCode::Esc {
+                close_screen(state);
+            } else {
                 scroll_screen_key(state, &key, true);
             }
         }

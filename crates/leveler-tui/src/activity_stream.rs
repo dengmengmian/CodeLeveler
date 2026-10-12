@@ -160,6 +160,9 @@ pub(crate) fn render_group_rows(
                 t,
                 now_elapsed_secs,
                 awaiting_approval,
+                rows,
+                &index_of,
+                out.len(),
             ));
         }
         return out;
@@ -311,6 +314,9 @@ pub(crate) fn render_group_rows(
                         t,
                         now_elapsed_secs,
                         awaiting_approval,
+                        rows,
+                        &index_of,
+                        out.len(),
                     ));
                 }
             }
@@ -477,9 +483,8 @@ fn awaits(
 /// under the aggregate header.
 ///
 /// This is what makes the fold VIEW-TIME only: the group still holds every real
-/// call, and opening it paints each one with its own target and detail. Members
-/// are never shell commands ([`folds_into_exploration`] admits only Search /
-/// Read / List), so none of them reports a command row.
+/// call. Opening it reveals each target; every member owns its own detail
+/// disclosure. Member hit rows reuse the per-call map and are never stoppable.
 #[allow(clippy::too_many_arguments)]
 fn expanded_exploration_body(
     members: &[&ToolCallBlock],
@@ -489,26 +494,27 @@ fn expanded_exploration_body(
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    rows: &mut Vec<CommandRow>,
+    index_of: &dyn Fn(&ToolCallBlock) -> usize,
+    offset: usize,
 ) -> Vec<Line<'static>> {
     let body_width = width.saturating_sub(GROUP_BODY_INDENT.len());
     let mut body = Vec::new();
     for call in members {
-        body.extend(unit_lines(
+        rows.push(CommandRow {
+            line: offset + body.len(),
+            call: index_of(call),
+            stoppable: false,
+        });
+        body.extend(exploration_fold_member_lines(
             call,
             theme,
             body_width,
             locale,
             t,
-            true,
-            1,
-            None,
             now_elapsed_secs,
-            None,
-            awaits(call, awaiting_approval),
-            true,
-            true,
+            awaiting_approval,
         ));
-        append_call_detail(call, theme, body_width, true, locale, t, &mut body);
     }
     for line in body.iter_mut() {
         line.spans.insert(
@@ -701,7 +707,7 @@ pub(crate) fn exploration_fold_receipt_line(
 /// aggregate receipt. No receipt of its own: the fold already stated it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exploration_fold_member_lines(
-    calls: &[&ToolCallBlock],
+    call: &ToolCallBlock,
     theme: &Theme,
     width: usize,
     locale: Locale,
@@ -709,15 +715,45 @@ pub(crate) fn exploration_fold_member_lines(
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
 ) -> Vec<Line<'static>> {
-    expanded_exploration_body(
-        calls,
+    let mut lines = unit_lines(
+        call,
         theme,
         width,
         locale,
         t,
+        false,
+        1,
+        None,
         now_elapsed_secs,
-        awaiting_approval,
-    )
+        None,
+        awaits(call, awaiting_approval),
+        true,
+        true,
+    );
+    // The parent only reveals target rows. Each call owns its full detail.
+    if call.expanded {
+        // All available exploration output stays reachable through the normal
+        // conversation viewport, including long and wrapped read results.
+        if let Some(preview) = &call.preview {
+            for (index, line) in crate::render::wrap(preview, width.saturating_sub(4).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if index == 0 { "  └ " } else { "    " };
+                let base = Style::default().fg(theme.text.secondary);
+                let link = crate::url_link::link_style(theme.accent.primary);
+                let mut spans = vec![Span::styled(lead, Style::default().fg(theme.text.muted))];
+                spans.extend(crate::url_link::spans_with_bare_urls(&line, base, link));
+                lines.push(Line::from(spans));
+            }
+        }
+    }
+    if let Some(header) = lines.first_mut()
+        && let Some(disclosure) = header.spans.first_mut()
+    {
+        disclosure.content = if call.expanded { "▾ " } else { "▸ " }.into();
+    }
+    lines
 }
 
 /// Whether this call is a directory listing (counted separately in the
@@ -1803,13 +1839,7 @@ fn command_head(
     now_elapsed_secs: u64,
     awaiting_approval: bool,
 ) -> CommandHead {
-    let duration = call.duration_ms.map(|ms| {
-        if ms < 60_000 {
-            format!("{:.1}s", ms as f64 / 1000.0)
-        } else {
-            crate::status_line::fmt_elapsed(ms / 1000)
-        }
-    });
+    let duration = call.duration_ms.map(format_command_duration);
     let head = |glyph, glyph_color, facts: Vec<Option<String>>, stoppable| CommandHead {
         glyph,
         glyph_color,
@@ -1847,15 +1877,40 @@ fn command_head(
                 true,
             ),
         },
-        // A backgrounded command was STARTED, not finished: the call returns
-        // the moment the process detaches. `↗` is the mark the activity strip
-        // already gives a background process; its detail lives there.
-        ToolStatus::Ok if started_in_background(call) => head(
-            "\u{2197}",
-            theme.accent.primary,
-            vec![Some(t.command_backgrounded.to_string())],
-            false,
-        ),
+        // Detach succeeded. The process outcome is stamped onto the preview
+        // when it exits; until that stamp the row is still running. The
+        // call's own duration and exit code are the spawn, not the process.
+        ToolStatus::Ok if started_in_background(call) => match detached_outcome(call) {
+            DetachedOutcome::Running => head(
+                "\u{2197}",
+                theme.accent.primary,
+                vec![Some(t.command_backgrounded.to_string())],
+                false,
+            ),
+            DetachedOutcome::Exited { duration } => {
+                head("\u{2713}", theme.status.success, vec![duration], false)
+            }
+            DetachedOutcome::Failed {
+                duration,
+                exit_code,
+            } => head(
+                "\u{2717}",
+                theme.status.error,
+                vec![
+                    duration,
+                    exit_code
+                        .filter(|code| *code != 0)
+                        .map(|code| format!("exit {code}")),
+                ],
+                false,
+            ),
+            DetachedOutcome::Stopped { duration } => head(
+                "\u{2298}",
+                theme.text.muted,
+                vec![Some(t.command_stopped.to_string()), duration],
+                false,
+            ),
+        },
         ToolStatus::Ok => head(
             "\u{2713}",
             theme.status.success,
@@ -1958,8 +2013,11 @@ fn command_unit_lines(
             .map(str::to_string)
             .unwrap_or_else(|| format!("{TOOL_ANCHOR} "))
     };
-    let prompt = crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
-    let mut command = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    let description = crate::tool_cell::command_description(&call.arguments);
+    let prompt = description.is_none()
+        && crate::tool_cell::summary_is_command_line(&call.name, &call.arguments);
+    let mut command = description
+        .unwrap_or_else(|| strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t)));
     // A shell call the runtime refused can carry no renderable command line.
     // Duration and exit code would then be the whole row, so name the tool:
     // every visible row must say what ran.
@@ -1983,7 +2041,10 @@ fn command_unit_lines(
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
     let room = width.saturating_sub(used + UnicodeWidthStr::width(facts.as_str()));
-    spans.push(Span::styled(truncate_display(&command, room.max(1)), body));
+    spans.push(Span::styled(
+        truncate_display(&command, room.clamp(1, 64)),
+        body,
+    ));
     if !facts.is_empty() {
         spans.push(Span::styled(facts, meta));
     }
@@ -1998,6 +2059,20 @@ fn command_unit_lines(
     let body_indent = format!("{rail}    ");
     let open = call.expanded || group_expanded;
     if open {
+        let avail = width
+            .saturating_sub(UnicodeWidthStr::width(body_indent.as_str()))
+            .max(1);
+        if let Some(command) = crate::tool_cell::command_detail(&call.name, &call.arguments) {
+            for row in
+                crate::render::text::wrap_with_caret(&format!("$ {command}"), (0, 0), avail, 0, 0).0
+            {
+                let line = row.text;
+                out.push(clip_line(
+                    vec![Span::styled(format!("{body_indent}{line}"), body)],
+                    width,
+                ));
+            }
+        }
         // Live output while it streamed; a call seen only finished (history,
         // replay) has just the runtime's preview.
         let logical: Vec<&str> = if !call.output.is_empty() {
@@ -2023,6 +2098,9 @@ fn command_unit_lines(
                 width,
             )
         };
+        if logical.is_empty() {
+            out.push(marker_line(t.command_no_output.to_string()));
+        }
         let tail_start = logical.len().saturating_sub(COMMAND_OUTPUT_ROWS);
         if call.output_truncated {
             // This client keeps a byte TAIL, not the whole stream: the head is
@@ -2065,6 +2143,15 @@ fn command_unit_lines(
             .filter(|l| !l.trim().is_empty())
             .collect();
         let hidden = logical.len().saturating_sub(LIVE_TAIL_ROWS);
+        if logical.is_empty() && !awaiting_approval {
+            out.push(clip_line(
+                vec![Span::styled(
+                    format!("{body_indent}{}", t.command_no_output),
+                    meta,
+                )],
+                width,
+            ));
+        }
         let stem = format!("{rail}  \u{2514} ");
         let indent = " ".repeat(UnicodeWidthStr::width(stem.as_str()));
         let room = width
@@ -2571,6 +2658,69 @@ fn started_in_background(call: &ToolCallBlock) -> bool {
             .ok()
             .and_then(|v| v.get("background")?.as_bool())
             .unwrap_or(false)
+}
+
+/// How a detached process ended, as stamped onto its starter preview.
+///
+/// Absent, or `status: running`, means the process is still going. The
+/// numbers are the process lifetime, never the spawn clock on the call.
+enum DetachedOutcome {
+    Running,
+    Exited {
+        duration: Option<String>,
+    },
+    Failed {
+        duration: Option<String>,
+        exit_code: Option<i32>,
+    },
+    Stopped {
+        duration: Option<String>,
+    },
+}
+
+fn detached_outcome(call: &ToolCallBlock) -> DetachedOutcome {
+    let Some(preview) = call.preview.as_deref() else {
+        return DetachedOutcome::Running;
+    };
+    let mut seen = DetachedOutcome::Running;
+    let mut duration_ms = None;
+    let mut exit_code = None;
+    for line in preview.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("status:") {
+            seen = match rest.trim() {
+                "exited" => DetachedOutcome::Exited { duration: None },
+                "failed" => DetachedOutcome::Failed {
+                    duration: None,
+                    exit_code: None,
+                },
+                "stopped" => DetachedOutcome::Stopped { duration: None },
+                _ => DetachedOutcome::Running,
+            };
+        } else if let Some(rest) = line.strip_prefix("duration_ms:") {
+            duration_ms = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("exit_code:") {
+            exit_code = rest.trim().parse().ok();
+        }
+    }
+    let duration = duration_ms.map(format_command_duration);
+    match seen {
+        DetachedOutcome::Exited { .. } => DetachedOutcome::Exited { duration },
+        DetachedOutcome::Failed { .. } => DetachedOutcome::Failed {
+            duration,
+            exit_code,
+        },
+        DetachedOutcome::Stopped { .. } => DetachedOutcome::Stopped { duration },
+        DetachedOutcome::Running => DetachedOutcome::Running,
+    }
+}
+
+fn format_command_duration(ms: u64) -> String {
+    if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        crate::status_line::fmt_elapsed(ms / 1000)
+    }
 }
 
 fn needs_network_permission(call: &ToolCallBlock) -> bool {
@@ -6143,7 +6293,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_renders_dollar_prompt_and_hides_json_and_cd() {
+    fn shell_command_compacts_its_head_and_preserves_cwd_in_details() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/example".into());
         let args =
             format!(r#"{{"cmd":"cd {home}/Develop/app/codeleveler && cargo test --workspace"}}"#);
@@ -6165,10 +6315,11 @@ mod tests {
             "must not leak JSON args: {lines:?}"
         );
         assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains(&home) || l.contains("Develop/app")),
-            "must not leak absolute cwd: {lines:?}"
+            !head.contains(&home)
+                && lines
+                    .iter()
+                    .any(|l| l.contains(&format!("cd {home}/Develop/app"))),
+            "compact head and full command detail: {lines:?}"
         );
     }
 
@@ -6483,6 +6634,38 @@ mod compact_command_tests {
     }
 
     #[test]
+    fn command_details_preserve_the_full_unicode_command() {
+        let command =
+            "cd /tmp/真实目录 && echo '完整命令  的参数' | sort -rh | head -25; echo 命令末尾";
+        let mut c = cmd(
+            &serde_json::json!({"cmd": command, "description": "统计目录"}).to_string(),
+            ToolStatus::Running,
+        );
+        c.name = "shell_command".into();
+        c.expanded = true;
+        let rows = body(text(&lines_at(c, &Theme::no_color(), 32, 4)));
+        assert!(rows[0].contains("统计目录"), "{rows:?}");
+        let detail: String = rows
+            .iter()
+            .skip(1)
+            .take_while(|r| !r.contains("尚无输出"))
+            .map(|r| r.strip_prefix("    ").unwrap_or(r))
+            .collect();
+        assert!(detail.contains(command), "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| UnicodeWidthStr::width(r.as_str()) <= 32)
+        );
+    }
+
+    #[test]
+    fn command_waiting_without_output_says_so() {
+        let c = cmd(SED, ToolStatus::Running);
+        let rows = body(text(&lines_at(c, &Theme::no_color(), 100, 4)));
+        assert!(rows.iter().any(|r| r.contains("尚无输出")), "{rows:?}");
+    }
+
+    #[test]
     fn a_finished_command_is_one_row_that_leads_with_the_command() {
         let mut c = cmd(SED, ToolStatus::Ok);
         c.duration_ms = Some(200);
@@ -6516,7 +6699,8 @@ mod compact_command_tests {
         );
         c.started_elapsed_secs = 10;
         let rows = body(text(&lines_at(c, &Theme::no_color(), 100, 16)));
-        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[1].contains("尚无输出"));
         assert!(
             rows[0].starts_with("\u{203a} \u{25cc} $ go build ./cmd/..."),
             "{rows:?}"
