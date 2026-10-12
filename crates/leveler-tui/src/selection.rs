@@ -2,7 +2,7 @@
 //!
 //! Mouse drag inside the Conversation viewport builds a lightweight selection
 //! (display-column based). On release, the selected plain text is copied to
-//! the system clipboard via `arboard`.
+//! the clipboard through terminal-aware routes with an evidence-bearing receipt.
 
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -225,16 +225,9 @@ pub fn apply_selection_highlight(
     }
 }
 
-/// Copy text to the system clipboard. Returns true on success.
-pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    if text.is_empty() {
-        return Ok(());
-    }
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
-    clipboard
-        .set_text(text.to_string())
-        .map_err(|e| format!("clipboard set failed: {e}"))
+/// Copy selected text; forwarding is not proof that the outer clipboard received it.
+pub fn copy_to_clipboard(text: &str) -> Result<crate::clipboard::CopyReceipt, String> {
+    crate::clipboard::copy(text)
 }
 
 /// Flatten a ratatui Line to plain text (for selection extraction).

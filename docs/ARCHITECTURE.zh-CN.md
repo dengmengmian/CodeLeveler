@@ -1278,29 +1278,39 @@ dogfood 验证，不要在后续改动中回退：
   / `Expanded` 只属于 TUI，不进入 Runtime、事件或持久化。Thought 与 ToolGroup
   等条目共用同一套 fold 语义；完成后的 Thought 自动折叠，running 条目的下限是
   `Truncated`，用户手动设置的模式不会被后续事件改写。
+- **Footer 上下文占用条是纯展示**：百分比、分母、条长和颜色统一采用运行时 projected input / 完整模型上下文窗口口径。只有无快照时才使用 provider usage；快照窗口未知时不显示占用。显示占用百分比与模型窗口容量，不再重复“上下文”标签。现有 `/context` 详情明确标注输入容量、模型窗口与输出预留；压缩策略与阈值仍使用输入容量口径。详情网格与构成明细的剩余量由当前展示口径派生；运行时快照的 `free_tokens` 保持模型窗口剩余量语义。8 格条只随用量变化，低于 70% 用 info 色、70–89% 用 warning 色、90% 起用 error 色；无动画。窄窗口依次隐藏占用条、缓存和容量，时钟与权限 / collaboration 控件保持优先；无 usage 不伪造占用。缓存仍使用现有 provider usage 口径。
 - **Thought 是 transcript 的一级条目**：其 rail 只覆盖自身正文，Tool 与它是
   sibling（同一个首列锚点），不能表现成 Thought 的子节点。新的 reasoning 段
   永远是 tail 上的那个可变条目。已完成 reasoning 与 narration 去重相互独立；
   bridge 折叠重复 closeout 文本时仍须保留 Thought 正文和 duration，live 与 replay
   采用相同语义，已流式发布的 reasoning 不重复发布。
-- **Thought 与 exploration fold 的关系只有三种互斥状态**：不在 run 中的已完成
-  Thought 是它自己的 collapsed header，没有任何回执替它折叠；在 run 中且仍为
-  `Collapsed` 的已完成 Thought 与 Tool 成员一样被折叠——collapsed run 把它与
-  成员一起隐藏，它不计入聚合标签，但 semantic data 不删除，展开 run 时按真实
-  chronology 恢复它的 header 与每个 Tool 成员；读者手动展开过的 Thought 是
-  pinned，任何折叠态都不隐藏它，“隐藏”永远不适用于 open Thought。只有已显示在
-  屏幕上的 Thought（独立存在、或被 run 展开恢复）才可点击，点击后展开完整
-  reasoning body。
+- **Thought 使用有界预览与完成摘要**：live Thought 在对话 tail 显示 header 与
+  最新最多 3 行换行后的正文，思考状态由 header 表达，不另占光标行。独立的
+  completed Thought 默认不占历史行，显式展开后显示正文与 header；空白正文的
+  completed Thought 不显示。用户手动展开后，后续事件
+  不自动收起。原始文本、duration、事件、持久化与 provider replay 保持不变。
+  Ctrl+O 展开最新工具组；没有工具时打开最新 Thought。探索回执展开时
+  不显示已完成的 Thought header 或正文，原始思考仍保留在 transcript。
+  状态栏继续根据当前 streaming 事实显示思考，完成后清除该状态。
+- **探索回执逐层独立折叠**：默认关闭 parent；打开回执只恢复按真实 chronology
+  排列的工具 header，不显示已完成的 Thought，也不连带打开工具正文。每个工具复用自身 `expanded`
+  展示状态，可独立打开 / 收起。关闭 parent 隐藏全部
+  子项，同时保留读者明确选择，重开时恢复；新子项默认收起。独立 Thought 与单个
+  探索工具仍有自己的入口；失败摘要、running 反馈与已确认 Edit diff 的契约不变。
 - **探索回执是 view-time fold，不是聚合覆盖**：连续 Read / Search / List，以及
   它们之间已完成的默认折叠 Thought，只改变折叠态的呈现；原始 Thought / Tool
-  entry 始终保留，展开必须按真实 chronology 恢复每个 Thought 与成员。Run / Edit
+  entry 始终保留，展开按真实 chronology 恢复工具成员，已完成的 Thought 不参与展示。Run / Edit
   / MCP / 权限 / 失败 / Narration / Final 是 breaker。聚合标签只统计工具，不发明
   执行阶段名（如“后端验证”），Thought 不计入标签；失败的探索目标永远直接可见。
 - **工具详细内容默认折叠**：Read / Search / List / Run 默认只画 header 与结果；
-  失败摘要与 running 的极短 live tail 是唯一未经请求就显示的 body。running
-  Thinking、Narration、Final 与已确认 Edit diff 是永远显示正文的例外。
+  失败摘要与 running 的极短 live tail 是唯一未经请求就显示的 body。
+  Thought 由上述思考详情契约控制；Narration、Final 与已确认 Edit diff 始终显示正文。
+- **命令详情保持可达**：普通命令在对话中原地展开，显示来自原始参数的完整命令并按终端宽度换行；底部运行状态不重复长命令。后台任务页保留上方列表、下方详情，任务身份与停止操作固定，仅详情内容滚动。完整命令和长日志按宽度换行；鼠标点击选择任务，滚轮按所在区域选择任务或滚动详情。每个任务独立保存滚动和跟随状态，取消结果仍由 Runtime 确认。
+- **真实对话从视口顶部开始**：内容未满一屏时，剩余空行留在对话下方，流式增长与 Thought 折叠不会移动首句；仅空会话 splash 保持居中。绘制与鼠标 / 选择映射共用 Conversation 几何规则；超过一屏后沿用正常滚动与 follow-tail。
 - **折叠不得移动阅读位置**：折叠以上/以内的条目时，视口顶边锚定的那一行必须保持
-  不变；follow-tail 时不需要锚定。
+  不变；runtime 完成或中断导致自动折叠、探索回执重组时沿用同一锚点。若被阅读的
+  正文被折叠，则保留在相应入口附近；follow-tail 时继续贴底，无需锚定。
+- **剪贴板送达证据**：复制路由由 TUI 的终端环境与剪贴板模块负责，不改变 Runtime 权限。仅本机、非 tmux 的原生剪贴板写入后读回一致才标记为已验证；SSH 跳过远程主机原生剪贴板，tmux 即使没有 SSH 环境变量也跳过原生路径，因为服务器继承环境不能证明当前 attached client 位于本机。tmux buffer 写入与 OSC 52 发送均只表示已发送、送达未经验证；DCS passthrough 支持未知，不能静默修改 tmux 配置。终端诊断仅报告观察与未知能力，不读写剪贴板。
 - **性能基线**：`leveler-tui` 的 `perf_bench` 是 deterministic 性能回归基线，
   `ux_experiment` 是 80×24 的 UX 回归 fixture；两者都以 `--ignored` 手动运行。
 

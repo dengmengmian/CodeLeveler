@@ -234,15 +234,24 @@ fn build_conversation(
         // A view-time exploration run paints as ONE unit: the aggregate
         // receipt, plus whatever its current fold state reveals. Nothing is
         // merged — the run's items stay in the transcript and opening the fold
-        // restores them in their real order.
+        // restores only its tools, in their real order.
         if let Some(run) = folds.owner[idx] {
             let fold = &folds.runs[run];
             debug_assert_eq!(fold.start, idx, "a run is entered at its start");
-            if idx > 0 && items_need_gap(&items[idx - 1], item) {
+            if idx > 0 && !out.is_empty() && items_need_gap(&items[idx - 1], item) {
                 out.push(Line::from(""));
             }
             let before_item = out.len();
-            render_exploration_fold(state, fold, &mut out, &mut hits, width, theme, t);
+            render_exploration_fold(
+                state,
+                fold,
+                &mut out,
+                &mut hits,
+                &mut commands,
+                width,
+                theme,
+                t,
+            );
             // The memo is positional over cacheable items: consume one stale
             // unit per cacheable item the fold covers and push a
             // never-matching placeholder, so items AFTER the fold keep their
@@ -273,10 +282,11 @@ fn build_conversation(
         // would leave a blank gap with no content — the reader sees a hole
         // between their prompt and the answer. The gap is undone below if the
         // item turned out to be invisible.
-        let gap_at = (idx > 0 && items_need_gap(&items[idx - 1], item)).then(|| {
-            out.push(Line::from(""));
-            out.len() - 1
-        });
+        let gap_at =
+            (idx > 0 && !out.is_empty() && items_need_gap(&items[idx - 1], item)).then(|| {
+                out.push(Line::from(""));
+                out.len() - 1
+            });
         let first_item = idx;
         let before_item = out.len();
         if let TranscriptItem::Assistant(block) = item
@@ -400,14 +410,14 @@ fn build_conversation(
         }
         // The item produced nothing (an all-Silent tool group): take the
         // separator back so no hole is left behind.
-        if out.len() == before_item
-            && let Some(at) = gap_at
-        {
+        let invisible = out.len() == before_item;
+        if invisible && let Some(at) = gap_at {
             out.remove(at);
         }
         // One span per consumed item. A sub-agent run (or any future multi-item
         // unit) renders several items as one block, so they all share it.
-        item_spans[first_item..=idx].fill((before_item, out.len()));
+        item_spans[first_item..=idx]
+            .fill((if invisible { out.len() } else { before_item }, out.len()));
         idx += 1;
     }
 
@@ -422,50 +432,24 @@ fn build_conversation(
 // A provider that reasons between tool calls makes the transcript alternate
 // `Thought / ToolGroup / Thought / ToolGroup`, which paints a wall of `◆`
 // headers over one-row reads. The fix is PRESENTATION ONLY: a chronological run
-// of finished collapsed Thoughts and settled non-destructive exploration groups
+// of finished Thoughts and settled non-destructive exploration groups
 // is painted as ONE aggregate receipt until the reader opens it. Nothing is
 // merged or reordered — the same semantic items stay in the transcript, and
 // opening the fold restores them in their real order.
 //
-// The Thought contract inside such a run (the one place a Thought and a fold
-// interact) is exactly:
-//
-//   - a finished Thought is folded away by the receipt only while it is
-//     `Collapsed` — it is hidden like any member, it never counts toward the
-//     receipt's label, and its semantic item is kept in the transcript;
-//   - a Thought the reader opened is PINNED: the run never folds it back, so
-//     its body stays on screen whether the run is collapsed or open;
-//   - opening the run restores every folded Thought and member in real
-//     chronology, and a Thought restored that way can then be opened itself.
-//
-// A finished Thought OUTSIDE any run has no fold over it at all: it is its own
-// collapsed header and is not governed by the receipt.
+// A closed parent hides every child while preserving each child's own display
+// selection. Opening it reveals child headers, never opens their bodies.
 
-/// How one item behaves inside a view-time exploration run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotKind {
-    /// A settled exploration group the collapsed receipt speaks for.
     MemberGroup,
-    /// A finished, default-collapsed Thought the receipt folds over.
-    FoldedThought,
-    /// A finished Thought the reader opened. It is pinned, so no run state
-    /// hides it: the collapsed receipt never speaks for an open Thought.
-    OpenThought,
-}
-
-impl SlotKind {
-    /// Whether the collapsed receipt speaks for this slot, i.e. whether the
-    /// run hides it while collapsed. Only an open (pinned) Thought is exempt.
-    const fn hidden_while_collapsed(self) -> bool {
-        !matches!(self, Self::OpenThought)
-    }
+    Thought,
 }
 
 /// One item inside a view-time exploration run.
 #[derive(Debug)]
 struct FoldSlot {
     item: usize,
-    kind: SlotKind,
 }
 
 /// One derived exploration run. `end` is exclusive.
@@ -490,16 +474,10 @@ struct ExplorationFolds {
 
 /// Classify one transcript item for a run, or `None` when it ends the run.
 ///
-/// The only Thought that participates as a `FoldedThought` is a finished,
-/// still-`Collapsed` one. A Thought the reader opened is `OpenThought`: it
-/// does not split the run, but the receipt may not hide it either.
+/// Completed Thoughts participate regardless of their own display choice.
 fn classify_fold_item(item: &TranscriptItem) -> Option<SlotKind> {
     match item {
-        TranscriptItem::Thought(block) if block.done => Some(if block.display.is_collapsed() {
-            SlotKind::FoldedThought
-        } else {
-            SlotKind::OpenThought
-        }),
+        TranscriptItem::Thought(block) if block.done => Some(SlotKind::Thought),
         // A live Thought is the tail itself; a run never folds around it.
         TranscriptItem::Thought(_) => None,
         TranscriptItem::ToolGroup(group)
@@ -547,7 +525,7 @@ fn plan_exploration_folds(items: &[TranscriptItem]) -> ExplorationFolds {
                 }
                 anchor.get_or_insert(j);
             }
-            slots.push(FoldSlot { item: j, kind });
+            slots.push(FoldSlot { item: j });
             j += 1;
         }
         match anchor {
@@ -616,8 +594,8 @@ pub(crate) fn keyboard_expand_target(state: &AppState) -> Option<usize> {
 /// anchor.
 ///
 /// Only the run's ANCHOR (its first exploration group) opens or closes the
-/// fold. A Thought or member row inside an open fold keeps its own fold: a
-/// click there must reveal reasoning, never collapse the run around it.
+/// fold. A member row inside an open fold keeps its own fold: a
+/// click there must reveal tool details, never collapse the run around it.
 ///
 /// Kept beside the planner so the run the reader clicked is resolved by the
 /// same derivation that painted it — the hit can never describe another run.
@@ -655,6 +633,7 @@ fn render_exploration_fold(
     fold: &ExplorationFold,
     out: &mut Vec<Line<'static>>,
     hits: &mut Vec<(usize, usize)>,
+    commands: &mut Vec<super::view::CommandHit>,
     width: usize,
     theme: &crate::theme::Theme,
     t: &crate::i18n::UiText,
@@ -680,21 +659,22 @@ fn render_exploration_fold(
         .saturating_sub(crate::activity_stream::GROUP_BODY_INDENT.len())
         .max(1);
     for slot in &fold.slots {
-        // The collapsed receipt speaks for every folded slot, so a collapsed
-        // run paints none of them. An OPEN (pinned) Thought is never folded:
-        // the reader already asked for it to stay, so it shows at both states.
-        if !expanded && slot.kind.hidden_while_collapsed() {
+        if !expanded {
             continue;
         }
-        match items.get(slot.item) {
-            Some(TranscriptItem::Thought(block)) => {
-                hits.push((out.len(), slot.item));
-                out.extend(crate::render::thought_lines(block, theme, child_width, t));
-            }
-            Some(TranscriptItem::ToolGroup(group)) => {
-                let calls = crate::activity_stream::group_exploration_fold_calls(group);
+        if let Some(TranscriptItem::ToolGroup(group)) = items.get(slot.item) {
+            for (call_index, call) in group.calls.iter().enumerate() {
+                if !crate::activity_stream::is_exploration_fold_call(call) {
+                    continue;
+                }
+                commands.push(super::view::CommandHit {
+                    line: out.len(),
+                    item: slot.item,
+                    call: call_index,
+                    stoppable: false,
+                });
                 out.extend(crate::activity_stream::exploration_fold_member_lines(
-                    &calls,
+                    call,
                     theme,
                     child_width,
                     state.locale,
@@ -703,7 +683,6 @@ fn render_exploration_fold(
                     state.approval_gated_call(),
                 ));
             }
-            _ => {}
         }
     }
     // Children step in one level under the receipt, exactly like every other
@@ -765,14 +744,15 @@ fn render_cacheable_unit(
             out.extend(item_render(item, theme, width, state.tools_expanded, t));
         }
         TranscriptItem::Thought(block) => {
-            // A Thought's header is its disclosure row, exactly like a tool
-            // group's first row: click folds or opens the reasoning body.
-            // A provider that returned no text owns nothing to reveal, so its
-            // header stays a plain row rather than a fold that does nothing.
-            if !block.text.is_empty() {
-                hits.push((0, 0));
+            // Completed standalone reasoning stays in the transcript but
+            // contributes no history row until its details are opened.
+            if !block.done || !block.display.is_collapsed() {
+                let lines = item_render(item, theme, width, state.tools_expanded, t);
+                if !lines.is_empty() && !block.text.trim().is_empty() {
+                    hits.push((0, 0));
+                }
+                out.extend(lines);
             }
-            out.extend(item_render(item, theme, width, state.tools_expanded, t));
         }
         other => out.extend(item_render(other, theme, width, state.tools_expanded, t)),
     }
@@ -1073,6 +1053,118 @@ mod exploration_fold_tests {
             .collect()
     }
 
+    #[test]
+    fn live_thought_updates_then_hides_history_rows_and_hits() {
+        let mut s = boot();
+        thought(&mut s, "first reasoning");
+        thought(&mut s, "second reasoning");
+        s.transcript.append_thought("live reasoning");
+        s.transcript.append_thought(" continues");
+        assert!(
+            render(&s)
+                .iter()
+                .any(|line| line.contains("live reasoning continues"))
+        );
+        for item in 1..3 {
+            let (start, end) = s.item_span(item, 80).unwrap();
+            assert_eq!(end - start, 0, "settled reasoning has no history row");
+        }
+        s.transcript.finish_thought(Some(900));
+        assert!(s.conversation_lines_and_hits(80).1.is_empty());
+        assert!(
+            !render(&s)
+                .iter()
+                .any(|line| line.contains("live reasoning"))
+        );
+        assert_eq!(
+            s.transcript.items().len(),
+            4,
+            "semantic entries remain intact"
+        );
+        s.transcript.append_thought("next live segment");
+        let next = render(&s);
+        assert_eq!(
+            next.iter().filter(|line| line.contains("思考中")).count(),
+            1
+        );
+        assert!(next.iter().any(|line| line.contains("next live segment")));
+    }
+
+    #[test]
+    fn ctrl_o_keeps_standalone_thought_hidden_beside_tools() {
+        let mut s = boot();
+        read(&mut s, "r", "README.md", 0);
+        thought(&mut s, "reasoning after the read");
+        assert!(!render(&s).iter().any(|line| line.contains("思考 ·")));
+        let toggle = crate::action::Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        crate::reducer::reduce(&mut s, toggle.clone());
+        assert!(!render(&s).iter().any(|line| line.contains("思考 ·")));
+        crate::reducer::reduce(&mut s, toggle.clone());
+        assert!(!render(&s).iter().any(|line| line.contains("思考 ·")));
+        crate::reducer::reduce(&mut s, toggle.clone());
+        let item = s
+            .transcript
+            .items()
+            .iter()
+            .position(|item| matches!(item, TranscriptItem::Thought(_)))
+            .expect("reasoning remains in the transcript");
+        crate::conversation::interaction::toggle_fold(&mut s, item);
+        assert!(
+            render(&s)
+                .iter()
+                .any(|line| line.contains("reasoning after the read"))
+        );
+        crate::reducer::reduce(&mut s, toggle);
+        assert!(
+            render(&s)
+                .iter()
+                .any(|line| line.contains("reasoning after the read")),
+            "pinned reasoning survives closing tool details"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_can_open_reasoning_without_tools() {
+        let mut s = boot();
+        thought(&mut s, "standalone reasoning");
+        crate::reducer::reduce(
+            &mut s,
+            crate::action::Action::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('o'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+        );
+        assert!(
+            render(&s)
+                .iter()
+                .any(|line| line.contains("standalone reasoning"))
+        );
+    }
+
+    #[test]
+    fn hidden_thoughts_preserve_mouse_tool_details() {
+        let mut s = boot();
+        thought(&mut s, "before read");
+        read(&mut s, "r", "README.md", 0);
+        thought(&mut s, "before answer");
+        narration(&mut s, "answer");
+        let group = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, group);
+        assert!(!s.tools_expanded, "mouse opens only its target");
+        assert_eq!(
+            render(&s)
+                .iter()
+                .filter(|line| line.contains("思考 ·"))
+                .count(),
+            0
+        );
+        assert!(!render(&s).iter().any(|line| line.contains("before read")));
+        assert!(!render(&s).iter().any(|line| line.contains("before answer")));
+    }
+
     fn receipts(lines: &[String]) -> Vec<&String> {
         lines
             .iter()
@@ -1089,10 +1181,9 @@ mod exploration_fold_tests {
             .expect("a tool group")
     }
 
-    /// THOUGHT-IA-4/8: a click on a Thought row inside an OPEN fold opens its
-    /// reasoning body; it never collapses the run around it.
+    /// A stored Thought display choice cannot reveal tool details in a receipt.
     #[test]
-    fn clicking_a_thought_inside_an_open_fold_opens_its_body() {
+    fn a_thought_display_choice_does_not_reveal_receipt_reasoning() {
         let mut s = boot();
         thought(&mut s, "first");
         read(&mut s, "r1", "a.rs", 0);
@@ -1111,8 +1202,10 @@ mod exploration_fold_tests {
             "the fold stays open: {after:#?}"
         );
         assert!(
-            after.iter().any(|l| l.contains("open this body")),
-            "the reasoning body opened: {after:#?}"
+            !after
+                .iter()
+                .any(|l| l.contains("open this body") || l.contains("思考")),
+            "the receipt reveals tools only: {after:#?}"
         );
     }
 
@@ -1193,11 +1286,9 @@ mod exploration_fold_tests {
         );
     }
 
-    /// THOUGHT-IA-7 / SEMANTIC-IA-3 / TOOL-IA-5: opening the receipt restores
-    /// the REAL chronology — each Thought and each member row in its original
-    /// order. Nothing was merged away.
+    /// Opening the receipt restores tool chronology without reasoning rows.
     #[test]
-    fn expanding_a_run_restores_the_real_chronology() {
+    fn expanding_a_run_restores_tool_chronology_without_thoughts() {
         let mut s = boot();
         thought(&mut s, "first thought");
         read(&mut s, "r1", "a.rs", 0);
@@ -1219,27 +1310,89 @@ mod exploration_fold_tests {
             "the receipt stays and opens: {open:#?}"
         );
         let receipt = position(&open, "\u{25be}");
-        let thoughts: Vec<usize> = open
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.contains("思考 ·"))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(thoughts.len(), 2, "both Thoughts are restored: {open:#?}");
-        let (t1, t2) = (thoughts[0], thoughts[1]);
+        assert!(!open.iter().any(|line| line.contains("思考")));
+        assert_eq!(
+            s.transcript
+                .items()
+                .iter()
+                .filter(|item| matches!(item, TranscriptItem::Thought(_)))
+                .count(),
+            2
+        );
         let a = position(&open, "a.rs");
         let b = position(&open, "b.rs");
         let g = position(&open, "missing model");
         assert!(
-            receipt < t1 && t1 < a && a < t2 && t2 < b && b < g,
+            receipt < a && a < b && b < g,
             "chronology restored: {open:#?}"
         );
     }
 
-    /// THOUGHT-IA-8: a Thought the reader opened keeps its body and is never
-    /// absorbed back into the fold.
     #[test]
-    fn an_opened_thought_stays_visible_inside_the_fold() {
+    fn nested_exploration_detail_keeps_long_output_reachable() {
+        let mut s = boot();
+        read(&mut s, "r1", "long.rs", 0);
+        read(&mut s, "r2", "b.rs", 0);
+        seal(&mut s);
+        let body = (0..60)
+            .map(|i| format!("unique line {i}\n"))
+            .collect::<String>();
+        s.transcript
+            .complete_tool(&ToolCallId::new("r1"), true, body, 10, None);
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let rows = render(&s);
+        let hit = s.command_hit_at(80, position(&rows, "long.rs")).unwrap();
+        s.transcript.toggle_call_at(hit.item, hit.call);
+        let rows = render(&s);
+        assert!(rows.iter().any(|r| r.contains("unique line 0")));
+        assert!(rows.iter().any(|r| r.contains("unique line 30")));
+        assert!(rows.iter().any(|r| r.contains("unique line 59")));
+        assert!(!rows.iter().any(|r| r.contains("beta")));
+    }
+
+    #[test]
+    fn nested_exploration_opens_only_requested_call_and_parent_hides_children() {
+        let mut s = boot();
+        thought(&mut s, "reasoning body");
+        read(&mut s, "r1", "a.rs", 0);
+        read(&mut s, "r2", "b.rs", 0);
+        seal(&mut s);
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let rows = render(&s);
+        assert!(
+            !rows.iter().any(|r| r.contains("alpha")),
+            "headers only: {rows:#?}"
+        );
+        let row = position(&rows, "a.rs");
+        let hit = s
+            .command_hit_at(80, row)
+            .expect("each child has its own call hit");
+        s.transcript.toggle_call_at(hit.item, hit.call);
+        let rows = render(&s);
+        assert_eq!(rows.iter().filter(|r| r.contains("alpha")).count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.contains("beta")).count(), 1);
+        crate::conversation::interaction::toggle_fold(&mut s, 1);
+        assert!(!render(&s).iter().any(|r| r.contains("reasoning body")));
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let rows = render(&s);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("reasoning body") || r.contains("a.rs") || r.contains("alpha"))
+        );
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let rows = render(&s);
+        assert!(!rows.iter().any(|r| r.contains("reasoning body")));
+        assert_eq!(rows.iter().filter(|r| r.contains("beta")).count(), 1);
+        s.transcript.toggle_call_at(hit.item, hit.call);
+        assert!(!render(&s).iter().any(|r| r.contains("beta")));
+    }
+
+    /// A receipt always hides Thought rows while retaining stored choices.
+    #[test]
+    fn an_opened_thought_stays_hidden_when_parent_reopens() {
         let mut s = boot();
         thought(&mut s, "first");
         read(&mut s, "r1", "a.rs", 0);
@@ -1252,10 +1405,22 @@ mod exploration_fold_tests {
 
         let lines = render(&s);
         assert!(
-            lines.iter().any(|l| l.contains("keep me visible")),
-            "the opened reasoning body stays on screen: {lines:#?}"
+            !lines.iter().any(|l| l.contains("keep me visible")),
+            "the closed parent hides every child: {lines:#?}"
         );
         assert_eq!(receipts(&lines).len(), 1, "the fold still forms");
+        let anchor = first_group_index(&s);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        assert!(
+            !render(&s)
+                .iter()
+                .any(|l| l.contains("keep me visible") || l.contains("思考"))
+        );
+        let Some(TranscriptItem::Thought(block)) = s.transcript.items().get(3) else {
+            panic!("stored thought")
+        };
+        assert_eq!(block.display, crate::fold::DisplayMode::Expanded);
+        assert_eq!(block.text, "keep me visible");
     }
 
     /// TOOL-IA-6: a Run is its own block and breaks the exploration fold.

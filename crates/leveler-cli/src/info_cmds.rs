@@ -36,6 +36,12 @@ pub(crate) fn cmd_doctor(layout: Layout) -> anyhow::Result<std::process::ExitCod
     for r in &results {
         print_check(r);
     }
+    println!();
+    println!("{}", Line::heading("Terminal observations"));
+    println!(
+        "{}",
+        leveler_tui::terminal_diagnostics::TerminalDiagnostics::detect().describe()
+    );
 
     // Crashes are otherwise invisible: the TUI tears the screen down and the
     // message scrolls away. Point at the records rather than reprinting them.

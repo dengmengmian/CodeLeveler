@@ -17,7 +17,7 @@
     "fold_state": null,
     "provider_actual": 42000,
     "render": {
-      "tui_footer": "上下文 42k/128k",
+      "tui_footer": "32%/128k",
       "web_label": "窗口 42.0k / 128.0k",
       "web_axis_word": "模型窗口占用",
       "web_unavailable_note": true

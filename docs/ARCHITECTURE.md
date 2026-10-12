@@ -1351,6 +1351,7 @@ The local connection entry negotiates `optional_workspace`. Legacy clients enter
 The TUI presents Runtime facts; it does not create them. These contracts are
 verified by deterministic tests and real dogfood — do not regress them:
 
+- **The footer context bar is presentation only**: use runtime projected input / full model context window for the percentage, denominator, bar length and color. Provider usage is only the no-snapshot fallback; a snapshot with unknown window has no gauge. Show percentage and model-window size without a repeated Context label. The existing `/context` inspector explicitly names input capacity, model window and output reservation; compaction policy and thresholds remain on the input-capacity axis. The inspector derives the grid and breakdown free remainder from its selected axis; the runtime snapshot's `free_tokens` remains model-window free. The eight-cell bar uses info below 70%, warning at 70–89%, and error at 90% or above, with no animation. Narrow rows drop the bar, cache, then capacity; the clock and permission / collaboration controls retain priority. Missing usage is never fabricated; cache retains the existing provider-usage basis.
 - **Projection rebuild is decoupled from paint cadence**: a streaming delta only
   accumulates semantic input; the conversation projection rebuilds once per
   painted frame, never once per delta.
@@ -1399,34 +1400,49 @@ verified by deterministic tests and real dogfood — do not regress them:
   narration deduplication: folding repeated closeout prose must retain the
   Thought body and duration in both live delivery and replay, without repeating
   reasoning already emitted by the stream.
-- **A Thought's relation to an exploration fold has exactly three, mutually
-  exclusive states**: a finished Thought that is NOT part of a run is its own
-  collapsed header and no receipt speaks for it; a finished Thought that is
-  still `Collapsed` inside a run is a participant — a collapsed run hides it
-  with the members and it never counts toward the aggregate label, but its
-  semantic item is kept and opening the run restores its header with every tool
-  member in real chronology; a Thought the reader opened is PINNED, so no run
-  state hides it. The word "hidden" never applies to an open Thought. Only a
-  Thought restored (or standing) on screen is itself clickable, and opening it
-  paints its full reasoning body.
+- **Thoughts use bounded previews and completion summaries**: a live Thought at
+  the conversation tail shows its header and at most the latest three wrapped
+  body rows. The header reports streaming without an extra cursor row. A completed
+  standalone Thought occupies no history row until explicitly opened; settled
+  Thoughts with blank bodies remain hidden. Manually expanded Thoughts stay open
+  through later events. Raw text, duration, events, persistence,
+  and provider replay remain unchanged. Ctrl+O opens the latest tool group;
+  without tools it opens the latest Thought. Opening an exploration receipt
+  shows neither completed Thought headers nor their bodies; raw reasoning remains
+  in the transcript. The status
+  strip reports the current streaming fact and clears it at completion.
+- **Exploration receipts fold independently at each level**: parents start closed;
+  opening a receipt restores tool headers in real chronology without displaying
+  completed Thoughts or opening tool bodies. Each tool reuses its own `expanded`
+  presentation state. Closing a parent hides every child while
+  retaining explicit reader choices for reopening; new children start collapsed.
+  Standalone Thoughts and single exploration calls keep their own disclosure.
+  Failure summaries, running feedback, and confirmed Edit diffs retain their contracts.
+
 - **An exploration receipt is a view-time fold, not an aggregate overlay**:
   consecutive Read / Search / List calls, plus the finished default-collapsed
   Thoughts between them, only change how the collapsed run is painted; every
-  original Thought / tool entry is kept, and expanding MUST restore each Thought
-  and member in real chronology. A run, an edit, an MCP dispatch, a permission
+  original Thought / tool entry is kept, and expanding restores tool members
+  in real chronology while completed Thoughts stay hidden. A run, an edit, an MCP dispatch, a permission
   hold, a failure, narration and the Final are breakers. The aggregate label
   counts tools only and never invents an execution-stage name; Thoughts never
   count, and a failed exploration target is always directly visible.
+- **Command details remain accessible**: ordinary commands expand in place in the conversation, showing the full command from the original arguments wrapped to terminal width; the running status does not repeat long commands. The background-task page retains a task list above its detail pane, with task identity and stop controls fixed while only detail content scrolls. Full commands and long logs wrap to width; mouse clicks select tasks, and the wheel selects tasks or scrolls details according to its region. Each task retains its own scroll and follow state, and cancellation results still come from Runtime.
 - **Tool detail is collapsed by default**: Read / Search / List / Run paint only a
   header and outcome unless asked; a failure summary and a running command's
-  short live tail are the only bodies shown unasked. Running Thinking,
-  narration, the Final and a confirmed Edit diff are the exceptions that always
-  show their body.
+  short live tail are the only bodies shown unasked. Thoughts follow the
+  reasoning-details contract above; narration, the Final and a confirmed Edit
+  diff always show their body.
+- **Real transcripts start at the viewport top**: until content fills the viewport, unused rows stay below the transcript so streaming and Thought folding do not move the first message. Only the empty-session splash is centered. Painting and mouse/selection mapping use the same Conversation geometry policy; overflowing content retains normal scrolling and live-tail following.
 - **Folding must not move the reading position**: the line anchored at the
   viewport's top edge keeps its place when an entry above or inside the viewport
-  is folded; while following the live tail there is no position to anchor.
+  is folded. Runtime completion or interruption that auto-folds a Thought or
+  regroups exploration receipts uses the same anchor. If the anchored body is
+  removed, stay near its disclosure header; following the live tail stays at the
+  bottom without an anchor.
 - **Ctrl+G jumps to the Final answer**: the anchor reuses the same memoized
   projection; with no Final it only notifies and never moves the viewport.
+- **Clipboard delivery evidence**: TUI terminal-environment and clipboard modules own copy routing without changing Runtime permissions. Only a native write followed by matching readback on a local, non-tmux host is verified. SSH skips the remote native clipboard; tmux also skips native writes even without SSH environment variables, because inherited server environment cannot establish the current attached client's location. A tmux buffer write or OSC 52 send reports unverified delivery; DCS passthrough support remains unknown and tmux configuration is never silently changed. Terminal diagnostics only report observations and unknown capabilities without reading or writing the clipboard.
 - **Performance baseline**: `leveler-tui`'s `perf_bench` is the deterministic
   performance regression baseline and `ux_experiment` the 80×24 UX regression
   fixture; both run manually with `--ignored`.

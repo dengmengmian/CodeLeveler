@@ -114,6 +114,9 @@ fn format_thought_duration(ms: u64) -> String {
     }
 }
 
+/// Display rows retained in a live reasoning preview (header excluded).
+const THOUGHT_PREVIEW_LINES: usize = 3;
+
 /// Render one reasoning segment as a Thought.
 ///
 /// The header states the segment's real state — `Thinking…` while streaming,
@@ -126,7 +129,7 @@ fn format_thought_duration(ms: u64) -> String {
 /// while running), and `Expanded` paints all of it. The body is the provider's
 /// own reasoning text under a `│` gutter; the gutter never extends past the
 /// body, so the Thought can never look like it owns the entry after it.
-/// A provider that returned no text gets a header and no invented prose.
+/// A live segment without text gets a header; a settled empty segment is hidden.
 /// Reasoning is not markdown, so the body is wrapped verbatim rather than
 /// parsed.
 ///
@@ -141,6 +144,9 @@ pub fn thought_lines(
     wrap_width: usize,
     t: &crate::i18n::UiText,
 ) -> Vec<Line<'static>> {
+    if block.done && block.text.trim().is_empty() {
+        return Vec::new();
+    }
     let header_style = Style::default()
         .fg(thinking_ink(block.done, theme))
         .add_modifier(Modifier::ITALIC);
@@ -171,19 +177,14 @@ pub fn thought_lines(
             Span::styled(text, body_style),
         ])
     };
-    // A provider that returned no reasoning gets a header and nothing else.
+    // A live segment without reasoning gets a header and nothing else.
     if !block.display.is_collapsed() && !block.text.is_empty() {
         let mut body: Vec<Line<'static>> = wrap(&block.text, inner).into_iter().map(rail).collect();
         if block.display != DisplayMode::Expanded {
-            crate::fold::truncate_to_tail(&mut body, rail("…".to_string()));
+            let omitted = body.len().saturating_sub(THOUGHT_PREVIEW_LINES);
+            body.drain(..omitted);
         }
         out.extend(body);
-    }
-    if !block.done {
-        out.push(Line::from(Span::styled(
-            "▌",
-            Style::default().fg(theme.text.secondary),
-        )));
     }
     out
 }
@@ -1578,16 +1579,17 @@ mod tests {
         );
     }
 
-    /// REASONING-8: a provider that returned no reasoning text gets a header
-    /// and NO body — the harness never invents a Thought.
+    /// A settled empty segment has no detail to reveal or history row to paint.
     #[test]
-    fn a_thought_without_provider_text_has_no_invented_body() {
-        let lines = thought_rows(&thought("", true, Some(1200), false), 60);
-        assert!(lines[0].contains("思考 ·"), "{lines:?}");
-        assert!(
-            !lines.iter().any(|l| l.contains('│')),
-            "no body without provider text: {lines:?}"
-        );
+    fn a_settled_thought_without_provider_text_is_hidden() {
+        for text in ["", " \n\t"] {
+            for interrupted in [false, true] {
+                assert!(thought_rows(&thought(text, true, Some(1200), interrupted), 60).is_empty());
+            }
+        }
+        let live = thought_rows(&thought("", false, None, false), 60);
+        assert_eq!(live.len(), 1);
+        assert!(live[0].contains("思考中"));
     }
 
     /// A segment too short to round to a tenth says `<0.1s`, not `0.0s`: a
@@ -1643,7 +1645,6 @@ mod tests {
             12,
         );
         assert!(lines[0].contains("思考中"), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains('▌')), "{lines:?}");
     }
 
     /// THOUGHT-IA-1: while the model reasons, its body is on screen. The

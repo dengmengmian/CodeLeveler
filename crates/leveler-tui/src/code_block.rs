@@ -412,7 +412,11 @@ pub(crate) mod visibility_fixtures {
                     "{label} scroll/repaint must reuse the same full projection"
                 );
                 let buffer = terminal.backend().buffer();
-                let top_pad = (content.height as usize).saturating_sub(expected.len());
+                let top_pad = crate::conversation::geometry::painted_top_padding(
+                    state,
+                    expected.len(),
+                    content.height as usize,
+                );
                 for (row, expected_row) in expected
                     .iter()
                     .enumerate()

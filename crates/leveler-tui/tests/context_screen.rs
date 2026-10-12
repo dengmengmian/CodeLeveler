@@ -215,8 +215,9 @@ fn the_screen_separates_the_compaction_axis_from_the_model_window() {
     assert!(joined.contains("54.7%"), "{joined}");
 }
 
-/// Without a resolved capacity the screen must not invent one: the window is
-/// the only total and the fold thresholds are simply not shown.
+/// Without a resolved capacity the screen must not invent one: the model window
+/// is the only total left, so it is named and the fold thresholds are simply
+/// not shown.
 #[test]
 fn no_resolved_capacity_shows_no_compaction_denominator() {
     let mut accounting = snapshot();
@@ -230,5 +231,9 @@ fn no_resolved_capacity_shows_no_compaction_denominator() {
     let joined = screen_text(&mut state, 100, 40);
     assert!(!joined.contains("Hard capacity"), "{joined}");
     assert!(!joined.contains("Soft threshold"), "{joined}");
-    assert!(!joined.contains("Model window"), "{joined}");
+    assert!(!joined.contains("Output reservation"), "{joined}");
+    // The window is a runtime fact, not a compaction axis: it stays named as
+    // the only total, and no denominator is derived from it.
+    assert!(joined.contains("Model window"), "{joined}");
+    assert!(joined.contains("65.1k / 128k"), "{joined}");
 }

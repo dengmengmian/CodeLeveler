@@ -30,6 +30,8 @@ pub enum Screen {
     /// Full active objective, opened from the bounded header summary.
     Goal,
     Help,
+    /// Local terminal capability diagnostics; never a runtime health claim.
+    Doctor,
     /// Durable runtime observatory (`/trace`).
     Trace,
     /// Context Inspector (`/context`): what the next model request is made of.
@@ -318,6 +320,13 @@ pub const SLASH_DEFS: &[SlashDef] = &[
         SlashVisibility::Quick,
         BusyPolicy::Always,
     ),
+    slash(
+        "/doctor",
+        &[],
+        SlashCategory::System,
+        SlashVisibility::Searchable,
+        BusyPolicy::Always,
+    ),
     // Reclaim CodeLeveler's own local storage. Safe while a turn runs: the scan
     // and cleanup happen off-thread, and only provably-safe items are removed.
     slash(
@@ -427,6 +436,7 @@ fn slash_copy(name: &str, s: &crate::i18n::SlashText) -> &'static str {
         "/theme" => s.theme,
         "/new" => s.new,
         "/help" => s.help,
+        "/doctor" => s.doctor,
         "/clean" => s.clean,
         "/update" | "/upgrade" => s.update,
         _ => "",
@@ -712,6 +722,7 @@ mod surface_tests {
                 "/remote",
                 "/remote-loc",
                 "/help",
+                "/doctor",
                 "/clean",
                 "/update",
             ]
@@ -1217,6 +1228,7 @@ mod reachability_tests {
             Screen::Plan => Some("Enter or click on the plan summary — reducer/mod.rs"),
             Screen::Goal => Some("Enter or click on the header goal — reducer/mod.rs"),
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
+            Screen::Doctor => Some("`/doctor` — toggle_screen"),
             Screen::Trace => Some("`/trace` — screen_nav::open_trace"),
             Screen::Clean => Some("`/clean` — screen_nav::open_clean"),
             Screen::Context => Some("`/context` — screen_nav::open_context"),
@@ -1237,6 +1249,7 @@ mod reachability_tests {
             Screen::Plan,
             Screen::Goal,
             Screen::Help,
+            Screen::Doctor,
             Screen::Trace,
             Screen::Context,
         ];

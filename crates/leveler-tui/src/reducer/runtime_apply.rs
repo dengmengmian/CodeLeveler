@@ -194,15 +194,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.activity = Some(label);
             state.activity_elapsed_secs = None;
         }
-        RuntimeEvent::CommandProgress { label, elapsed_ms } => {
-            // Long-command heartbeat: name the running command with a live
-            // elapsed so the status line reads "运行 cargo test · 02:31" instead
-            // of a bare "等待模型". Reuses the activity slot (single source).
+        RuntimeEvent::CommandProgress { elapsed_ms, .. } => {
             mark_turn_busy(state);
-            // The command owns this elapsed. The status line shows it INSTEAD
-            // of the turn's, so a running command reads as one duration rather
-            // than two adjacent unlabelled ones.
-            state.activity = Some(state.t().running_command.replace("{}", &label));
+            state.activity = Some(state.t().command_activity_running.to_string());
             state.activity_elapsed_secs = Some(elapsed_ms / 1000);
         }
         RuntimeEvent::ModelRetrying {
@@ -246,8 +240,8 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // arrived. A clean completion already froze it; an interrupted one
             // is marked, not claimed as finished.
             state.transcript.finish_thought(None);
-            // Status line shows what the tool is DOING ("运行 cargo check -p x"),
-            // not the internal tool name ("运行 run_command").
+            // Commands have their full identity in the conversation row;
+            // the footer reports their running state and clock once.
             let verb = crate::tool_taxonomy::presentation_label(&name, state.locale);
             let target = crate::render::tool_summary_for(&name, &arguments, state.t());
             // A command owns its own clock from the moment it starts. Leaving
@@ -259,11 +253,17 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.activity_elapsed_secs = (crate::tool_taxonomy::activity_class(&name)
                 == crate::tool_taxonomy::ActivityClass::Shell)
                 .then_some(0);
-            state.activity = Some(if target.is_empty() || target == "{}" {
-                verb
-            } else {
-                format!("{verb} {target}")
-            });
+            state.activity = Some(
+                if crate::tool_taxonomy::activity_class(&name)
+                    == crate::tool_taxonomy::ActivityClass::Shell
+                {
+                    state.t().command_activity_running.to_string()
+                } else if target.is_empty() || target == "{}" {
+                    verb
+                } else {
+                    format!("{verb} {target}")
+                },
+            );
             let started = state.elapsed_secs;
             state.transcript.push_tool_started(
                 id,
@@ -948,16 +948,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             // One lifecycle, one human label. The id stays as the projection
             // key (stable identity, never text matching); what the user reads
             // is the command it is running.
-            let label = crate::render::tool_summary_for(
+            let label = crate::tool_cell::command_detail(
                 "run_command",
                 &serde_json::json!({ "program": program, "args": args }).to_string(),
-                state.t(),
-            );
-            let label = if label.is_empty() {
-                program.clone()
-            } else {
-                label
-            };
+            )
+            .unwrap_or_else(|| program.clone());
             state.background_task_labels.insert(
                 task_id.clone(),
                 crate::state::BackgroundTaskChrome {
@@ -1009,6 +1004,12 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             stopped,
             output,
         } => {
+            // The command row reads the starter preview. Activity chrome is
+            // session-local and replay keeps only the transcript, so the exit
+            // has to land on the call the row already shows.
+            state
+                .transcript
+                .note_background_exit(&task_id, ok, stopped, exit_code, duration_ms);
             let t = state.t();
             // Terminal is history, but the TUI keeps the entry so the Activity
             // row and its detail stay reopenable. The registry record is the
@@ -1062,6 +1063,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             if let Some(chrome) = state.background_task_labels.get_mut(&task_id) {
                 let clean = leveler_core::sanitize_terminal_output(&chunk);
                 if !clean.is_empty() {
+                    // Unread is event evidence, independent of retained log
+                    // length (which stops growing at the byte cap) or wrapping.
+                    if let Some(view) = state.background_task_views.get_mut(&task_id)
+                        && !view.follow
+                    {
+                        view.unread = view.unread.saturating_add(clean.lines().count());
+                    }
                     chrome.output.push_str(&clean);
                     cap_background_output(&mut chrome.output);
                     chrome.last_output_at = Some(std::time::Instant::now());
@@ -1441,16 +1449,11 @@ fn replace_active_background_tasks(
         .background_task_labels
         .retain(|id, chrome| !chrome.is_running() || still_active(id));
     for task in tasks {
-        let label = crate::render::tool_summary_for(
+        let label = crate::tool_cell::command_detail(
             "run_command",
             &serde_json::json!({ "program": task.program, "args": task.args }).to_string(),
-            state.t(),
-        );
-        let label = if label.is_empty() {
-            task.program.clone()
-        } else {
-            label
-        };
+        )
+        .unwrap_or_else(|| task.program.clone());
         // Carry the already-retained output across a reconcile: the runtime's
         // snapshot names the task, not its log, and re-inserting a blank entry
         // would silently drop everything the detail page had shown.
@@ -1767,6 +1770,7 @@ fn apply_session_with(
         state.turn_tool_calls = 0;
         state.screen_scroll = 0;
         state.pending_attachments.clear();
+        state.history_search = None;
         state.command_selected = None;
         // Another session's children are not this session's.
         state.team = crate::multi_agent::TaskTeamView::default();
@@ -1782,6 +1786,10 @@ fn apply_session_with(
         if state.surface == crate::btw::SurfaceFocus::Btw {
             super::leave_btw(state);
         }
+        // Clear the main draft only after it has been swapped back. Neither
+        // surface may restore another session's attachment identities.
+        state.composer.clear_edit_history();
+        state.composer.set_edit_attachments(&[]);
         state.btw = crate::btw::BtwThread::default();
         state.btw.draft.set_image_token_template(&template);
         // The Active Goal belongs to one session's task; another session never

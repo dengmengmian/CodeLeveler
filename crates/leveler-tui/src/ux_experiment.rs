@@ -826,6 +826,82 @@ mod tests {
             .expect("a tool group")
     }
 
+    #[test]
+    fn default_thought_frames() {
+        let mut state = opened("看下当前项目是干什么的？");
+        say(&mut state, "p", "我先读项目说明。");
+        reasoning(&mut state, "private fixture reasoning", None);
+        let live = visible_window(&mut state, 80, 24);
+        assert!(
+            live.contains("思考"),
+            "the status strip reports streaming: {live}"
+        );
+        assert!(
+            live.contains("◆ 思考中") && live.contains("private fixture reasoning"),
+            "{live}"
+        );
+        write_dump("thinking-default-live", &live);
+        reasoning(&mut state, " continues", None);
+        let updated = visible_window(&mut state, 80, 24);
+        assert!(updated.contains("private fixture reasoning continues"));
+        assert_eq!(updated.matches("◆ 思考中").count(), 1);
+        write_dump("thinking-default-updated", &updated);
+        reasoning(&mut state, "", Some(400));
+        read(&mut state, "r", "README.md", 33);
+        reasoning(&mut state, "completed fixture reasoning", Some(900));
+        say(&mut state, "answer", "这是一个 AI 服务撮合平台。");
+        turn_end(&mut state);
+        let done = visible_window(&mut state, 80, 24);
+        assert!(!done.contains("◆ 思考") && !done.contains("fixture reasoning"));
+        assert!(done.contains("README.md") && done.contains("AI 服务撮合平台"));
+        write_dump("thinking-default-done", &done);
+    }
+
+    #[test]
+    #[ignore = "ux experiment harness"]
+    fn nested_exploration_frames() {
+        let mut s = opened("这是什么项目？");
+        reasoning(&mut s, "先读 README。", Some(800));
+        read(&mut s, "r1", "README.md", 40);
+        reasoning(&mut s, "再读架构。", Some(500));
+        read(&mut s, "r2", "docs/ARCHITECTURE.md", 30);
+        s.transcript.complete_tool(
+            &leveler_client_protocol::ToolCallId::new("r1"),
+            true,
+            "# README\n项目介绍\n环境要求\n开发步骤\n测试说明\n最后一行".into(),
+            10,
+            None,
+        );
+        say(&mut s, "answer", "这是当前项目的介绍。");
+        turn_end(&mut s);
+        let anchor = first_group(&s);
+        let frame = visible_window(&mut s, 80, 24);
+        assert!(!frame.contains("README.md"));
+        write_dump("nested-default", &frame);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let frame = visible_window(&mut s, 80, 24);
+        assert!(frame.contains("README.md") && frame.contains("docs/ARCHITECTURE.md"));
+        write_dump("nested-parent-open", &frame);
+        let item = s
+            .transcript
+            .items()
+            .iter()
+            .position(|i| matches!(i, crate::transcript::TranscriptItem::ToolGroup(_)))
+            .unwrap();
+        s.transcript.toggle_call_at(item, 0);
+        let frame = visible_window(&mut s, 80, 24);
+        assert!(frame.contains("最后一行"));
+        assert!(frame.contains("▸ 读取 docs/ARCHITECTURE.md"));
+        write_dump("nested-one-child-open", &frame);
+        s.transcript.toggle_call_at(item, 0);
+        let frame = visible_window(&mut s, 80, 24);
+        write_dump("nested-child-closed", &frame);
+        crate::conversation::interaction::toggle_fold(&mut s, anchor);
+        let frame = visible_window(&mut s, 80, 24);
+        assert!(!frame.contains("README.md"));
+        write_dump("nested-parent-closed", &frame);
+    }
+
     /// A–M: the Conversation IA frames, rendered through the REAL paint path
     /// (the same `frame_text` the workbench uses) on fixture events. These are
     /// deterministic frames, not a real-model session.
@@ -839,7 +915,7 @@ mod tests {
             let _ = writeln!(out, "\n===== {tag} =====\n{frame}");
         };
 
-        // A — running Thinking shows its body.
+        // A — running Thinking shows its live body at the conversation tail.
         let mut a = opened("检查 catalog fallback");
         say(&mut a, "p", "先看一下 pricing 的 fallback。");
         reasoning(
@@ -849,7 +925,7 @@ mod tests {
         );
         print(&mut out, "A-running-thinking", a);
 
-        // B — completed Thought is a bare header.
+        // B — completed standalone Thought retains one disclosure header.
         let mut b = opened("检查 catalog fallback");
         say(&mut b, "p", "先看一下 pricing 的 fallback。");
         reasoning(&mut b, "查过了，fallback 指的是旧模型。", Some(4100));
@@ -1083,4 +1159,55 @@ mod tests {
         assert!(failures >= 1, "the failed command keeps a `✗` row");
         assert!(first_error, "the compiler's first error line stays visible");
     }
+}
+
+/// Inspect the full-window footer against the separate input-budget details.
+#[test]
+#[ignore = "headless context-window presentation acceptance"]
+fn context_window_footer_and_inspector_frames() {
+    let mut state = opened("上下文显示");
+    let projection = leveler_model::RequestProjection::project(
+        &[leveler_model::Message::text(
+            leveler_model::Role::User,
+            "x".repeat(52_544),
+        )],
+        &[],
+        leveler_model::ReasoningReplayContract::NONE,
+        leveler_model::ReasoningRetention::All,
+    );
+    let acc = leveler_model::ContextAccounting::compute(
+        leveler_model::ModelRef::new("deepseek", "deepseek-flash"),
+        &projection,
+        Some(1_048_576),
+        Some(557_056),
+        None,
+    )
+    .with_input_budget(Some(655_360), Some(393_216), Some(0));
+    assert_eq!(acc.used_tokens, 13_136);
+    assert_eq!(acc.free_tokens, Some(1_048_576 - acc.used_tokens));
+    state.context.loaded = Some(acc);
+    state.token_input = 1000;
+    state.token_cached = 970;
+    let frame = frame_text(&mut state, 100, 24);
+    assert!(frame.contains("1%/1M"), "{frame}");
+    assert!(frame.contains("缓存 97%"), "{frame}");
+    write_dump("context-window-footer-100x24", &frame);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::context::render_context_screen(frame, frame.area(), &state))
+        .unwrap();
+    let mut detail = String::new();
+    for y in 0..24 {
+        let mut x = 0;
+        while x < 100 {
+            let symbol = terminal.backend().buffer().cell((x, y)).unwrap().symbol();
+            detail.push_str(symbol);
+            x += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+        }
+        detail.push('\n');
+    }
+    assert!(detail.contains("输入容量"), "{detail}");
+    assert!(detail.contains("模型窗口"), "{detail}");
+    assert!(detail.contains("输出预留"), "{detail}");
+    write_dump("context-window-inspector-100x24", &detail);
 }

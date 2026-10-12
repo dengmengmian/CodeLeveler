@@ -747,7 +747,13 @@ pub(crate) fn sync_background_task_view(
     height: usize,
 ) -> bool {
     let view = background_task_view_mut(state, id);
-    sync_view_inner(view, total, height)
+    let unread = view.unread;
+    let changed = sync_view_inner(view, total, height);
+    // Output events own unread increments; reflow never represents new output.
+    if !view.follow {
+        view.unread = unread;
+    }
+    changed
 }
 
 /// Scroll the selected background task's output. Only valid while the Output

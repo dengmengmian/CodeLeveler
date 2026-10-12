@@ -5,6 +5,8 @@
 //! marks edit and cursor correctly . Display columns are computed with
 //! Unicode width, so full-width characters occupy two cells.
 
+use leveler_client_protocol::AttachmentRef;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -57,6 +59,13 @@ const DEFAULT_FILE_TOKEN: &str = "[file #{}]";
 #[derive(Debug, Clone)]
 pub struct Composer {
     buffer: String,
+    undo: Vec<EditSnapshot>,
+    edit_group_depth: usize,
+    edit_group_recorded: bool,
+    redo: Vec<EditSnapshot>,
+    killed: String,
+    edit_attachments: Vec<AttachmentRef>,
+    restored_attachments: Option<Vec<AttachmentRef>>,
     /// Cursor position as a grapheme index in `[0, len]`.
     cursor: usize,
     history: Vec<String>,
@@ -80,6 +89,13 @@ impl Default for Composer {
     fn default() -> Self {
         Self {
             buffer: String::new(),
+            undo: Vec::new(),
+            edit_group_depth: 0,
+            edit_group_recorded: false,
+            redo: Vec::new(),
+            killed: String::new(),
+            edit_attachments: Vec::new(),
+            restored_attachments: None,
             cursor: 0,
             history: Vec::new(),
             history_index: None,
@@ -129,17 +145,57 @@ fn scan_image_tokens(s: &str, template: &str) -> Vec<(std::ops::Range<usize>, us
     found
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct PendingPaste {
     placeholder: String,
     content: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct FileReference {
     placeholder: String,
     content: String,
     name: String,
+}
+
+const EDIT_HISTORY_LIMIT: usize = 100;
+const EDIT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct EditSnapshot {
+    buffer: String,
+    cursor: usize,
+    pastes: Vec<PendingPaste>,
+    files: Vec<FileReference>,
+    attachments: Vec<AttachmentRef>,
+}
+impl EditSnapshot {
+    fn bytes(&self) -> usize {
+        self.buffer.len()
+            + self
+                .pastes
+                .iter()
+                .map(|p| p.placeholder.len() + p.content.len())
+                .sum::<usize>()
+            + self
+                .files
+                .iter()
+                .map(|f| f.placeholder.len() + f.content.len() + f.name.len())
+                .sum::<usize>()
+            + self
+                .attachments
+                .iter()
+                .map(|a| a.name.len() + a.mime_type.len() + a.sha256.len() + 128)
+                .sum::<usize>()
+    }
+}
+fn push_edit_snapshot(stack: &mut Vec<EditSnapshot>, snapshot: EditSnapshot) {
+    stack.push(snapshot);
+    while stack.len() > EDIT_HISTORY_LIMIT
+        || stack.iter().map(EditSnapshot::bytes).sum::<usize>() > EDIT_HISTORY_BYTES
+    {
+        stack.remove(0);
+    }
 }
 
 impl Composer {
@@ -213,7 +269,14 @@ impl Composer {
     /// Insert text at the cursor. Normalizes `\r\n` / `\r` to `\n` so pasted
     /// content keeps a single line convention .
     pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
         self.begin_edit();
+        self.insert_unrecorded(s);
+    }
+
+    fn insert_unrecorded(&mut self, s: &str) {
         let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
         let at = byte_of_grapheme(&self.buffer, self.cursor);
         self.buffer.insert_str(at, &normalized);
@@ -231,6 +294,7 @@ impl Composer {
             return;
         }
 
+        self.begin_edit();
         let id = self.pending_pastes.len() + 1;
         // Match common agent TUIs: short chip, unique when multiple pastes stack.
         let placeholder = if id == 1 {
@@ -242,12 +306,13 @@ impl Composer {
             placeholder: placeholder.clone(),
             content: normalized,
         });
-        self.insert_str(&placeholder);
+        self.insert_unrecorded(&placeholder);
     }
 
     /// Insert a compact local-file reference while retaining the exact pasted
     /// path for submission. This is presentation, not an uploaded attachment.
     pub fn insert_file_reference(&mut self, content: &str, name: &str) {
+        self.begin_edit();
         self.reconcile_file_references();
         let number = self.file_references.len() + 1;
         let placeholder = self.file_token.replace("{}", &number.to_string());
@@ -256,7 +321,7 @@ impl Composer {
             content: content.to_string(),
             name: name.to_string(),
         });
-        self.insert_str(&placeholder);
+        self.insert_unrecorded(&placeholder);
     }
 
     /// Names of file references whose tokens are still present in the draft.
@@ -341,6 +406,20 @@ impl Composer {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            KeyCode::Char('z' | 'Z')
+                if ctrl
+                    && (key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.code == KeyCode::Char('Z')) =>
+            {
+                self.redo();
+            }
+            KeyCode::Char('z') if alt => {
+                self.redo();
+            }
+            KeyCode::Char('z') if ctrl => {
+                self.undo();
+            }
+            KeyCode::Char('y') if ctrl => self.yank(),
             KeyCode::Char('a') if ctrl => self.move_to_line_start(),
             KeyCode::Char('\u{1}') => self.move_to_line_start(),
             KeyCode::Char('e') if ctrl => self.move_to_line_end(),
@@ -389,10 +468,10 @@ impl Composer {
     /// Delete the grapheme before the cursor — or, when that grapheme is part
     /// of an image token, the whole token. Half a token names nothing.
     pub fn backspace(&mut self) {
-        self.begin_edit();
         if self.cursor == 0 {
             return;
         }
+        self.begin_edit();
         if let Some(range) = self.token_across(true) {
             self.cut_token(range);
             return;
@@ -405,10 +484,10 @@ impl Composer {
 
     /// Delete the grapheme at the cursor, or the whole image token it is in.
     pub fn delete(&mut self) {
-        self.begin_edit();
         if self.cursor >= self.len() {
             return;
         }
+        self.begin_edit();
         if let Some(range) = self.token_across(false) {
             self.cut_token(range);
             return;
@@ -436,6 +515,9 @@ impl Composer {
     /// into one would leave `[图片 ` behind — a name for nothing. The token is
     /// one word.
     pub fn delete_word_back(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
         self.begin_edit();
         if let Some(range) = self.token_across(true) {
             self.cut_token(range);
@@ -453,6 +535,7 @@ impl Composer {
         }
         let from = byte_of_grapheme(&self.buffer, start);
         let to = byte_of_grapheme(&self.buffer, self.cursor);
+        self.remember_kill(from, to);
         self.buffer.replace_range(from..to, "");
         self.cursor = start;
     }
@@ -571,19 +654,27 @@ impl Composer {
 
     /// Delete from the cursor to the end of the line (`Ctrl+K`).
     pub fn kill_to_line_end(&mut self) {
-        self.begin_edit();
         let (_, end) = self.line_bounds();
+        if self.cursor == end {
+            return;
+        }
+        self.begin_edit();
         let from = byte_of_grapheme(&self.buffer, self.cursor);
         let to = byte_of_grapheme(&self.buffer, end);
+        self.remember_kill(from, to);
         self.buffer.replace_range(from..to, "");
     }
 
     /// Delete from the start of the line to the cursor (`Ctrl+U`).
     pub fn kill_to_line_start(&mut self) {
-        self.begin_edit();
         let (start, _) = self.line_bounds();
+        if self.cursor == start {
+            return;
+        }
+        self.begin_edit();
         let from = byte_of_grapheme(&self.buffer, start);
         let to = byte_of_grapheme(&self.buffer, self.cursor);
+        self.remember_kill(from, to);
         self.buffer.replace_range(from..to, "");
         self.cursor = start;
     }
@@ -654,6 +745,7 @@ impl Composer {
     /// (skipping empty and consecutive-duplicate entries, ).
     pub fn take(&mut self) -> String {
         let text = self.canonical_text();
+        self.clear_edit_history();
         self.buffer.clear();
         self.pending_pastes.clear();
         self.file_references.clear();
@@ -705,11 +797,143 @@ impl Composer {
     }
 
     /// Start editing the live buffer.
+    /// Group one host input action's mutations into a single undo step.
+    /// Opening an empty group does not change either history stack.
+    pub fn begin_edit_group(&mut self) {
+        if self.edit_group_depth == 0 {
+            self.edit_group_recorded = false;
+        }
+        self.edit_group_depth += 1;
+    }
+
+    pub fn end_edit_group(&mut self) {
+        self.edit_group_depth = self.edit_group_depth.saturating_sub(1);
+        if self.edit_group_depth == 0 {
+            self.edit_group_recorded = false;
+        }
+    }
+
     fn begin_edit(&mut self) {
         self.commit_history_browse();
+        if self.edit_group_depth > 0 && self.edit_group_recorded {
+            return;
+        }
+        self.edit_group_recorded = self.edit_group_depth > 0;
+        let snapshot = self.edit_snapshot();
+        push_edit_snapshot(&mut self.undo, snapshot);
+        self.redo.clear();
+    }
+
+    fn edit_snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            buffer: self.buffer.clone(),
+            cursor: self.cursor,
+            pastes: self.pending_pastes.clone(),
+            files: self.file_references.clone(),
+            attachments: self.edit_attachments.clone(),
+        }
+    }
+
+    fn restore_edit(&mut self, snapshot: EditSnapshot) {
+        self.commit_history_browse();
+        self.buffer = snapshot.buffer;
+        self.cursor = snapshot.cursor;
+        self.pending_pastes = snapshot.pastes;
+        self.file_references = snapshot.files;
+        self.edit_attachments = snapshot.attachments;
+        self.restored_attachments = Some(self.edit_attachments.clone());
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.undo.iter().any(|snapshot| {
+            snapshot.buffer != self.buffer
+                || snapshot.pastes != self.pending_pastes
+                || snapshot.files != self.file_references
+                || snapshot.attachments != self.edit_attachments
+        })
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        while let Some(snapshot) = self.undo.pop() {
+            if snapshot.buffer == self.buffer
+                && snapshot.pastes == self.pending_pastes
+                && snapshot.files == self.file_references
+                && snapshot.attachments == self.edit_attachments
+            {
+                continue;
+            }
+            let current = self.edit_snapshot();
+            push_edit_snapshot(&mut self.redo, current);
+            self.restore_edit(snapshot);
+            return true;
+        }
+        false
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(snapshot) = self.redo.pop() else {
+            return false;
+        };
+        let current = self.edit_snapshot();
+        push_edit_snapshot(&mut self.undo, current);
+        self.restore_edit(snapshot);
+        true
+    }
+
+    /// Supply the host-owned attachment binding before editing or undo/redo.
+    pub fn set_edit_attachments(&mut self, attachments: &[AttachmentRef]) {
+        self.edit_attachments = attachments.to_vec();
+        self.restored_attachments = None;
+    }
+
+    /// A history restoration carries its original binding back to the host.
+    pub fn take_restored_attachments(&mut self) -> Option<Vec<AttachmentRef>> {
+        self.restored_attachments.take()
+    }
+
+    /// Submission and session boundaries end the current draft's edit history.
+    pub fn clear_edit_history(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.edit_group_recorded = false;
+        self.killed.clear();
+        self.restored_attachments = None;
+    }
+
+    fn remember_kill(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        let mut killed = self.buffer[from..to].to_string();
+        for paste in &self.pending_pastes {
+            killed = killed.replacen(&paste.placeholder, &paste.content, 1);
+        }
+        for file in &self.file_references {
+            killed = killed.replacen(&file.placeholder, &file.content, 1);
+        }
+        // Images belong to the host, so yank must never create an orphan token.
+        for (range, _) in scan_image_tokens(&killed, &self.image_token)
+            .into_iter()
+            .rev()
+        {
+            killed.replace_range(range, "");
+        }
+        self.killed = killed;
+    }
+
+    pub fn yank(&mut self) {
+        if !self.killed.is_empty() {
+            let text = self.killed.clone();
+            self.insert_paste(&text);
+        }
     }
 
     fn set_buffer(&mut self, s: String) {
+        self.clear_edit_history();
         self.cursor = grapheme_count(&s);
         self.buffer = s;
     }
@@ -727,10 +951,16 @@ impl Composer {
     /// Replace the buffer wholesale, placing the cursor at the end (used by
     /// autocompletion). Does not touch history.
     pub fn replace(&mut self, text: impl Into<String>) {
-        self.commit_history_browse();
+        let text = text.into();
+        if text == self.buffer && self.pending_pastes.is_empty() && self.file_references.is_empty()
+        {
+            self.cursor = grapheme_count(&self.buffer);
+            return;
+        }
+        self.begin_edit();
         self.pending_pastes.clear();
         self.file_references.clear();
-        self.buffer = text.into();
+        self.buffer = text;
         self.cursor = grapheme_count(&self.buffer);
     }
 
@@ -777,10 +1007,10 @@ impl Composer {
     /// Remove the `ordinal`-th token (1-based) and the space it brought with
     /// it, then renumber what is left.
     pub fn remove_image_token(&mut self, ordinal: usize) {
-        self.begin_edit();
         let Some((range, _)) = self.image_tokens().get(ordinal.wrapping_sub(1)).cloned() else {
             return;
         };
+        self.begin_edit();
         let mut end = range.end;
         if self.buffer[end..].starts_with(' ') {
             end += 1;
@@ -1254,5 +1484,174 @@ mod history_tests {
         // One grapheme is one display column, so the caret is after it.
         assert_eq!(c.cursor_row_col_display(), (0, 1));
         assert_eq!(c.text_before_cursor(), "e\u{301}");
+    }
+}
+
+#[cfg(test)]
+mod edit_history_tests {
+    use super::*;
+    fn undo(c: &mut Composer) -> bool {
+        let before = c.text().to_string();
+        c.apply_editing_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        before != c.text()
+    }
+    fn redo(c: &mut Composer) -> bool {
+        let before = c.text().to_string();
+        c.apply_editing_key(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        before != c.text()
+    }
+
+    #[test]
+    fn noop_deletions_and_empty_insert_preserve_redo() {
+        let mut c = Composer::new();
+        c.insert_str("中文");
+        assert!(c.undo());
+        c.backspace();
+        c.delete();
+        c.kill_to_line_start();
+        c.kill_to_line_end();
+        c.delete_word_back();
+        c.insert_str("");
+        assert!(c.redo());
+        assert_eq!(c.text(), "中文");
+        c.insert_str("新");
+        assert!(c.undo());
+        c.move_to_line_start();
+        c.backspace();
+        c.kill_to_line_start();
+        assert!(c.redo());
+        assert_eq!(c.text(), "中文新");
+        assert!(c.undo());
+        c.move_to_line_end();
+        c.delete();
+        c.kill_to_line_end();
+        assert!(c.redo());
+        assert_eq!(c.text(), "中文新");
+    }
+    #[test]
+    fn edit_group_restores_entire_mixed_file_paste_in_one_step() {
+        let mut c = Composer::new();
+        c.insert_str("原草稿");
+        c.begin_edit_group();
+        c.insert_str(" 前 ");
+        c.insert_file_reference("/tmp/文件", "文件");
+        c.insert_str(" 后");
+        c.end_edit_group();
+        let text = c.canonical_text();
+        assert!(c.undo());
+        assert_eq!(c.text(), "原草稿");
+        assert!(c.redo());
+        assert_eq!(c.canonical_text(), text);
+        assert!(c.undo());
+        c.begin_edit_group();
+        c.insert_str("");
+        c.end_edit_group();
+        assert!(c.redo());
+    }
+    #[test]
+    fn editing_history_restores_image_bindings_with_tokens() {
+        use leveler_client_protocol::{AttachmentId, AttachmentKind};
+        let image = AttachmentRef {
+            id: AttachmentId::new("image-a"),
+            kind: AttachmentKind::Image,
+            name: "a.png".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 1,
+            sha256: "hash".into(),
+            width: Some(1),
+            height: Some(1),
+        };
+        let mut c = Composer::new();
+        c.set_edit_attachments(&[]);
+        c.insert_image_token();
+        c.set_edit_attachments(std::slice::from_ref(&image));
+        c.move_left();
+        c.backspace();
+        c.set_edit_attachments(&[]);
+        assert!(c.undo());
+        assert_eq!(c.image_token_count(), 1);
+        assert_eq!(c.take_restored_attachments(), Some(vec![image]));
+        assert!(c.redo());
+        assert_eq!(c.image_token_count(), 0);
+        assert_eq!(c.take_restored_attachments(), Some(vec![]));
+    }
+    #[test]
+    fn editing_history_is_bounded_and_yank_restores_canonical_payload() {
+        let mut c = Composer::new();
+        for _ in 0..150 {
+            c.insert_char('中');
+        }
+        assert!(c.undo.len() <= EDIT_HISTORY_LIMIT);
+        let paste = "内容\n".repeat(8);
+        c.replace("");
+        c.insert_paste(&paste);
+        c.kill_to_line_start();
+        c.yank();
+        assert_eq!(c.canonical_text(), paste);
+        c.replace("");
+        c.insert_file_reference("/tmp/真实路径", "路径");
+        c.kill_to_line_start();
+        c.yank();
+        assert_eq!(c.canonical_text(), "/tmp/真实路径");
+    }
+    #[test]
+    fn editing_history_restores_graphemes_and_invalidates_redo() {
+        let mut c = Composer::new();
+        c.insert_str("中文👩‍💻");
+        c.backspace();
+        assert!(undo(&mut c));
+        assert_eq!(c.text(), "中文👩‍💻");
+        assert!(redo(&mut c));
+        assert_eq!(c.text(), "中文");
+        assert!(undo(&mut c));
+        c.insert_str("新");
+        assert!(!redo(&mut c));
+    }
+    #[test]
+    fn editing_history_preserves_paste_and_file_payloads() {
+        let mut c = Composer::new();
+        let paste = "长内容\n".repeat(8);
+        c.insert_paste(&paste);
+        assert!(undo(&mut c));
+        assert!(c.is_empty());
+        assert!(redo(&mut c));
+        assert_eq!(c.canonical_text(), paste);
+        c.insert_file_reference("/tmp/中文.txt", "中文.txt");
+        let text = c.canonical_text();
+        assert!(undo(&mut c));
+        assert_eq!(c.canonical_text(), paste);
+        assert!(redo(&mut c));
+        assert_eq!(c.canonical_text(), text);
+    }
+    #[test]
+    fn editing_history_kill_yank_and_submission_boundary() {
+        let mut c = Composer::new();
+        c.insert_str("第一行\n第二行");
+        c.kill_to_line_start();
+        assert_eq!(c.text(), "第一行\n");
+        assert!(undo(&mut c));
+        assert_eq!(c.text(), "第一行\n第二行");
+        c.kill_to_line_start();
+        c.apply_editing_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "第一行\n第二行");
+        c.take();
+        assert!(!undo(&mut c));
+        c.apply_editing_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(c.is_empty());
+    }
+    #[test]
+    fn editing_history_detaches_browse_and_restores_edited_entry() {
+        let mut c = Composer::new();
+        c.set_history(vec!["旧输入".into()]);
+        c.insert_str("草稿");
+        c.history_prev();
+        c.insert_str("编辑");
+        assert!(!c.is_browsing_history());
+        assert!(undo(&mut c));
+        assert_eq!(c.text(), "旧输入");
+        assert!(!c.is_browsing_history());
     }
 }

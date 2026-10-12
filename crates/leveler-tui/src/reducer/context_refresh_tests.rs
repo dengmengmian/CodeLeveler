@@ -131,8 +131,8 @@ fn opening_a_session_asks_the_runtime_for_the_context() {
     );
 }
 
-/// The runtime's answer reaches the gauge: projected input over the effective
-/// input capacity, the runtime's own numbers.
+/// The runtime's answer reaches the gauge: projected input over the full
+/// model window, independently of the effective input capacity.
 #[test]
 fn the_runtime_answer_becomes_the_footer_gauge() {
     let mut s = state();
@@ -147,8 +147,8 @@ fn the_runtime_answer_becomes_the_footer_gauge() {
         s.context.loaded.as_ref().map(|a| a.used_tokens),
         Some(10_000)
     );
-    let chip = crate::status_line::footer_ctx_chip(&s).expect("a resolved capacity is a gauge");
-    assert!(chip.contains("10k/96k"), "compaction axis: {chip}");
+    let chip = crate::status_line::footer_ctx_chip(&s).expect("a known model window is a gauge");
+    assert!(chip.contains("7%/128k"), "model-window axis: {chip}");
 }
 
 /// A model switch changes the resolved policy, so the previous accounting's

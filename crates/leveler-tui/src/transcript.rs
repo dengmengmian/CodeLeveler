@@ -1091,6 +1091,61 @@ impl TranscriptState {
         }
     }
 
+    /// Record how a detached process ended on the shell call that started it.
+    ///
+    /// The call stays [`ToolStatus::Ok`]: detaching succeeded, and the call's
+    /// own `duration_ms` / `exit_code` belong to the spawn. The process outcome
+    /// is written into the preview the runtime already returned (`task_id:` /
+    /// `status:`), which is what the command row reads — live and on replay.
+    /// The match is one whole `task_id:` line, so `t-ab` cannot settle `t-abc`,
+    /// and only a `background: true` shell call is eligible. `wait_task` mentions
+    /// the same id and must keep its own text.
+    pub fn note_background_exit(
+        &mut self,
+        task_id: &str,
+        ok: bool,
+        stopped: bool,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+    ) {
+        if task_id.is_empty() || task_id.contains(['\n', '\r']) {
+            return;
+        }
+        let task_line = format!("task_id: {task_id}");
+        let status = if stopped {
+            "stopped"
+        } else if ok {
+            "exited"
+        } else {
+            "failed"
+        };
+        let mut changed = false;
+        for item in &mut self.items {
+            let TranscriptItem::ToolGroup(group) = item else {
+                continue;
+            };
+            for call in &mut group.calls {
+                if call.status != ToolStatus::Ok || !shell_detached(call) {
+                    continue;
+                }
+                let Some(preview) = call.preview.as_mut() else {
+                    continue;
+                };
+                if !preview.lines().any(|line| line.trim() == task_line) {
+                    continue;
+                }
+                let stamped = rewrite_detached_preview(preview, status, exit_code, duration_ms);
+                if stamped != *preview {
+                    *preview = stamped;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.bump();
+        }
+    }
+
     /// Append live output to a running command call (bounded tail).
     pub fn append_tool_output(&mut self, id: &ToolCallId, chunk: &str) {
         self.bump();
@@ -1620,6 +1675,56 @@ impl TranscriptState {
             _ => None,
         })
     }
+}
+
+/// A shell call that returned as soon as its process detached.
+fn shell_detached(call: &ToolCallBlock) -> bool {
+    matches!(call.name.as_str(), "run_command" | "shell_command")
+        && serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .and_then(|value| value.get("background").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false)
+}
+
+/// Replace the runtime's `status: running` line and record the process facts
+/// beside it. Other preview lines stay as the runtime wrote them.
+fn rewrite_detached_preview(
+    preview: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+) -> String {
+    let mut saw_status = false;
+    let mut saw_duration = false;
+    let mut saw_exit = false;
+    let mut lines = Vec::new();
+    for line in preview.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("status:") {
+            lines.push(format!("status: {status}"));
+            saw_status = true;
+        } else if trimmed.starts_with("duration_ms:") {
+            lines.push(format!("duration_ms: {duration_ms}"));
+            saw_duration = true;
+        } else if trimmed.starts_with("exit_code:") {
+            if let Some(code) = exit_code {
+                lines.push(format!("exit_code: {code}"));
+            }
+            saw_exit = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !saw_status {
+        lines.push(format!("status: {status}"));
+    }
+    if !saw_duration {
+        lines.push(format!("duration_ms: {duration_ms}"));
+    }
+    if !saw_exit && let Some(code) = exit_code {
+        lines.push(format!("exit_code: {code}"));
+    }
+    lines.join("\n")
 }
 
 fn compact_summary(text: String, max_chars: usize) -> Option<String> {

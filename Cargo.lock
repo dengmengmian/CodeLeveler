@@ -2309,6 +2309,7 @@ version = "1.0.13"
 dependencies = [
  "arboard",
  "async-trait",
+ "base64",
  "chrono",
  "crossterm",
  "futures",
