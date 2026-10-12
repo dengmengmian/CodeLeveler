@@ -1411,7 +1411,7 @@ verified by deterministic tests and real dogfood — do not regress them:
   events. Raw text, duration, events, persistence,
   and provider replay remain unchanged. The status
   strip reports the current streaming fact and clears it at completion.
-- **Exploration receipts fold independently at each level**: parents start closed.
+- **Tool processes fold independently at each level**: parents start closed.
   Opening a receipt restores its member rows in real chronology: every exploration
   call with its own body disclosure, and a header for each finished Thought that
   sat between them — so the aggregate never hides reasoning the transcript still
@@ -1424,19 +1424,26 @@ verified by deterministic tests and real dogfood — do not regress them:
   Standalone Thoughts and single exploration calls keep their own disclosure.
   Failure summaries, running feedback, and confirmed Edit diffs retain their contracts.
 
-- **An exploration receipt is a view-time fold, not an aggregate overlay**:
-  consecutive Read / Search / List calls, plus the finished default-collapsed
+- **A process receipt is a view-time fold, not an aggregate overlay**:
+  consecutive settled ordinary tools (Read / Search / List / Run / MCP), plus the finished default-collapsed
   Thoughts between them, only change how the collapsed run is painted; every
   original Thought / tool entry is kept, and expanding restores every tool member
-  and every finished Thought header in real chronology. A run, an edit, an MCP dispatch, a permission
-  hold, a failure, narration and the Final are breakers. The aggregate label
-  counts tools only and never invents an execution-stage name; Thoughts never
-  count, and a failed exploration target is always directly visible.
+  and every finished Thought header in real chronology. Edits, permission holds,
+  user decisions, plan/goal management, live work, narration and the Final are breakers.
+  A returned background starter cannot fold a still-running process into settled history.
+  Labels count real tool kinds and calls without inventing stage names; Thoughts do not count.
+  Failed calls remain in their kind buckets with a separate failure count; expanding restores
+  their targets and original output. A lone settled command keeps its own description or
+  command and outcome without a redundant group title. Background terminal events update
+  the starter matched by its real task_id, without a duplicate transcript notice when that
+  starter exists; unmatched outcomes still retain their notice. Transient notifications and
+  background details remain accessible.
 - **Command details remain accessible**: ordinary commands expand in place in the conversation, showing the full command from the original arguments wrapped to terminal width; the running status does not repeat long commands. The background-task page retains a task list above its detail pane, with task identity and stop controls fixed while only detail content scrolls. Full commands and long logs wrap to width; mouse clicks select tasks, and the wheel selects tasks or scrolls details according to its region. Each task retains its own scroll and follow state, and cancellation results still come from Runtime.
 - **Tool detail is collapsed by default**: Read / Search / List / Run paint only a
-  header and outcome unless asked; a failure summary and a running command's
+  header and outcome unless asked; a lone tool's failure summary and a running command's
   short live tail are the only bodies shown unasked. Thoughts follow the
-  reasoning-details contract above; narration, the Final and a confirmed Edit
+  reasoning-details contract above. Background wait wire receipts stay hidden until expanded.
+  Narration, the Final and a confirmed Edit
   diff always show their body.
 - **Real transcripts start at the viewport top**: until content fills the viewport, unused rows stay below the transcript so streaming and Thought folding do not move the first message. Only the empty-session splash is centered. Painting and mouse/selection mapping use the same Conversation geometry policy; overflowing content retains normal scrolling and live-tail following.
 - **Folding must not move the reading position**: the line anchored at the

@@ -204,6 +204,29 @@ fn round_head_rows(lines: &[String]) -> Vec<usize> {
         .collect()
 }
 
+fn recorded_rounds(s: &AppState) -> Vec<(Option<u32>, usize)> {
+    s.transcript
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            leveler_tui::transcript::TranscriptItem::ToolGroup(group) => {
+                Some((group.round, group.calls.len()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn open_latest(s: &mut AppState) {
+    reduce(
+        s,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+}
+
 /// A — a homogeneous shell round keeps the tool's own name (`执行命令`), and
 /// never falls back to an abstract count. The same rule covers every
 /// same-tool round: reads name reads, searches name searches.
@@ -287,15 +310,16 @@ fn a_mixed_round_still_reads_as_one_node() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("完成 2 项操作"))
+        .find(|l| l.contains("读取 1 次") && l.contains("1 个命令"))
         .unwrap_or_else(|| panic!("the mixed round counts its operations: {t:?}"));
     assert!(
         !head.contains("多个工具"),
         "the abstract 'multiple tools' label is gone: {head:?}"
     );
     assert!(
-        !head.contains("执行了"),
-        "the mixed round is not a stage sentence: {head:?}"
+        !t.iter()
+            .any(|l| l.contains("src/lib.rs") || l.contains("cargo check")),
+        "member targets start folded: {head:?}"
     );
 }
 
@@ -315,7 +339,7 @@ fn a_mixed_round_with_a_failure_counts_every_operation() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("完成 3 项操作"))
+        .find(|l| l.contains("读取 1 次") && l.contains("搜索 1 次") && l.contains("1 个命令"))
         .unwrap_or_else(|| panic!("the mixed round counts every operation: {t:?}"));
     assert!(
         head.contains("1 个失败"),
@@ -325,9 +349,11 @@ fn a_mixed_round_with_a_failure_counts_every_operation() {
         !head.contains("多个工具"),
         "the abstract label is gone: {head:?}"
     );
+    assert!(!t.iter().any(|l| l.contains("src/lib.rs")));
+    open_latest(&mut s);
     assert!(
-        t.iter().any(|l| l.contains("src/lib.rs")),
-        "the failed call keeps its own row: {t:?}"
+        lines(&s).iter().any(|l| l.contains("src/lib.rs")),
+        "the failed target is reachable by expanding"
     );
 }
 
@@ -378,10 +404,11 @@ fn a_round_head_states_failures_and_never_claims_a_false_success() {
     next_assistant(&mut s, "a3");
 
     let t = lines(&s);
-    let heads = round_head_rows(&t);
-    assert_eq!(heads.len(), 2, "two rounds, two heads: {t:?}");
-
-    let first = &t[heads[0]];
+    assert_eq!(recorded_rounds(&s), vec![(Some(1), 2), (Some(2), 2)]);
+    let first = t
+        .iter()
+        .find(|l| l.contains("个失败"))
+        .expect("failed process receipt");
     assert!(
         first.contains("个失败"),
         "the failed round says so: {first:?}"
@@ -391,7 +418,10 @@ fn a_round_head_states_failures_and_never_claims_a_false_success() {
         "a round with a failure is never all-ok: {first:?}"
     );
 
-    let second = &t[heads[1]];
+    let second = t
+        .iter()
+        .find(|l| l.contains("⊘") || l.contains("4 个命令"))
+        .expect("cancelled outcome or combined process");
     assert!(
         !second.contains("全部成功"),
         "a cancelled call is not a success: {second:?}"
@@ -435,24 +465,21 @@ fn a_round_keeps_its_geometry_from_first_call_to_close() {
     let closed = lines(&s);
     let h_closed = closed
         .iter()
-        .position(|l| l.contains("完成"))
+        .position(|l| l.contains("▸") && l.contains("2 个命令"))
         .expect("the head states the outcome once closed");
     assert_eq!(
         h_run2, h_closed,
         "closing rewrote the head in place instead of inserting a row"
     );
     assert!(
-        closed[h_closed + 1].contains("\u{251c}\u{2500}"),
-        "the first child did not jump: {closed:?}"
+        !closed
+            .iter()
+            .any(|l| l.contains("cargo check") || l.contains("cargo test")),
+        "settled children fold into the same parent position: {closed:?}"
     );
-
-    // The column the children start at does not change across the close.
-    let column = |line: &str| line.chars().take_while(|c| *c == ' ').count();
-    assert_eq!(
-        column(&running_two[h_run2 + 1]),
-        column(&closed[h_closed + 1]),
-        "the children keep their column across the close"
-    );
+    open_latest(&mut s);
+    assert!(lines(&s).iter().any(|l| l.contains("cargo check")));
+    assert!(lines(&s).iter().any(|l| l.contains("cargo test")));
 }
 
 /// The reported Dogfood shape: many prose-free model rounds, each a handful of
@@ -499,22 +526,27 @@ fn a_prose_free_dogfood_run_is_one_group_per_round() {
     }
 
     let t = lines(&s);
-    let heads = round_head_rows(&t);
     assert_eq!(
-        heads.len(),
-        rounds.len(),
-        "each prose-free model response is its own round: {t:?}"
+        recorded_rounds(&s),
+        vec![(Some(1), 4), (Some(2), 3), (Some(3), 3)]
     );
     let text = t.join("\n");
     assert!(
         !text.contains("执行了 10 个命令"),
-        "the rounds must not collapse into one group: {text}"
+        "the last round is still live: {text}"
     );
-    // Every command keeps its own row.
+    next_assistant(&mut s, "done");
+    let t = lines(&s);
+    assert!(
+        t.iter().any(|l| l.contains("执行了 10 个命令")),
+        "settled rounds share one presentation receipt: {t:?}"
+    );
+    assert!(!t.iter().any(|l| l.contains("$ ")));
+    open_latest(&mut s);
     assert_eq!(
-        t.iter().filter(|l| l.contains("$ ")).count(),
-        4 + 3 + 3,
-        "every call keeps a row: {t:?}"
+        lines(&s).iter().filter(|l| l.contains("$ ")).count(),
+        20,
+        "the keyboard reveals each header and full command"
     );
 }
 
@@ -547,13 +579,14 @@ fn replaying_the_recorded_rounds_groups_identically() {
         start(&mut replay, id, program, args, *round);
     }
 
-    let live_heads = round_head_rows(&lines(&live));
-    let replay_heads = round_head_rows(&lines(&replay));
-    assert_eq!(live_heads.len(), 3, "live: three rounds");
     assert_eq!(
-        replay_heads.len(),
-        live_heads.len(),
-        "a replay regroups exactly as the live session did"
+        recorded_rounds(&live),
+        vec![(Some(1), 2), (Some(2), 1), (Some(3), 2)]
+    );
+    assert_eq!(
+        recorded_rounds(&replay),
+        recorded_rounds(&live),
+        "round membership is independent of the collapsed projection"
     );
 
     // A legacy transcript with no identity keeps the pre-round shape: the

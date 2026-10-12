@@ -1782,9 +1782,7 @@ fn toggle_current_expand(state: &mut AppState) {
     {
         state.tools_expanded = expanded;
         for item in crate::conversation::build::keyboard_detail_items(state, index) {
-            state
-                .transcript
-                .set_exploration_calls_expanded(item, expanded);
+            state.transcript.set_process_calls_expanded(item, expanded);
         }
         state.conv.plain.clear();
         state.conv.plain_width = 0;

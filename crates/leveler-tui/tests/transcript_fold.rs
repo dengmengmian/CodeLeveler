@@ -748,7 +748,7 @@ fn tool_group_4_collapsing_returns_to_one_row() {
 
 /// TOOL-GROUP-5: a run or an edit is a breaker, not a member.
 #[test]
-fn tool_group_5_a_run_breaks_the_exploration_group() {
+fn tool_group_5_a_settled_run_joins_the_process_receipt() {
     let mut s = opened();
     read(&mut s, "t1", "a.rs");
     read(&mut s, "t2", "b.rs");
@@ -766,17 +766,27 @@ fn tool_group_5_a_run_breaks_the_exploration_group() {
         .iter()
         .position(|l| l.contains("读取 2 次"))
         .expect("the exploration receipt");
+    assert!(rows[receipt].contains("1 个命令"));
+    assert!(!rows.iter().any(|l| l.contains("cargo test")));
+    reduce(
+        &mut s,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    let rows = lines(&s);
     let run = rows
         .iter()
         .position(|l| l.contains("cargo test"))
-        .expect("the run keeps its own row");
+        .expect("the command is reachable by expanding");
     assert!(run > receipt, "the run follows the receipt: {rows:?}");
 }
 
 /// TOOL-GROUP-6: a failed member is never folded away — its target stays on
 /// screen with its reason.
 #[test]
-fn tool_group_6_a_failed_member_keeps_its_target() {
+fn tool_group_6_a_failed_member_is_counted_and_reachable() {
     let mut s = opened();
     read(&mut s, "t1", "a.rs");
     read(&mut s, "t2", "b.rs");
@@ -795,8 +805,20 @@ fn tool_group_6_a_failed_member_keeps_its_target() {
     );
     settle_group(&mut s);
     let rendered = text(&s);
-    assert!(rendered.contains("missing.rs"), "{rendered}");
-    assert!(rendered.contains("no such file"), "{rendered}");
+    assert!(rendered.contains("1 个失败"), "{rendered}");
+    assert!(!rendered.contains("missing.rs"), "{rendered}");
+    reduce(
+        &mut s,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    let rendered = text(&s);
+    assert!(
+        rendered.contains("missing.rs") && rendered.contains("no such file"),
+        "{rendered}"
+    );
 }
 
 // ── RUN-THOUGHT ──────────────────────────────────────────────────────────────

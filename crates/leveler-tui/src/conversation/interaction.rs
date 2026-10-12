@@ -145,10 +145,10 @@ pub fn jump_to_live_edge(state: &mut AppState) {
 pub fn toggle_fold(state: &mut AppState, item: usize) -> Option<bool> {
     let anchor = reading_anchor(state);
 
-    // A view-time exploration run is folded by its own presentation state; a
+    // A view-time process run is folded by its own presentation state; a
     // single entry folds through its block. Both resolve the SAME item index,
     // so a click on a receipt can never describe a different entry.
-    let expanded = match super::build::toggle_exploration_fold(state, item) {
+    let expanded = match super::build::toggle_process_fold(state, item) {
         Some(expanded) => expanded,
         None => state.transcript.toggle_item_display(item)?.is_expanded(),
     };

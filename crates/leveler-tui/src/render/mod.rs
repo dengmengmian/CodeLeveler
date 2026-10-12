@@ -3767,12 +3767,12 @@ mod tests {
             "collapsed group must not leak tool output: {auto}"
         );
 
-        // Opened, both calls and the error come back. (The assistant item that
-        // closed the group sits after it, so find the group by type.)
-        for item in s.transcript.items_mut() {
-            if let TranscriptItem::ToolGroup(group) = item {
-                group.display = crate::fold::DisplayMode::Expanded;
-            }
+        // The parent restores headers; the keyboard explicitly requests each
+        // member's output through that member's own display state.
+        let target = crate::conversation::build::keyboard_expand_target(&s).unwrap();
+        crate::conversation::interaction::toggle_fold(&mut s, target);
+        for item in crate::conversation::build::keyboard_detail_items(&s, target) {
+            s.transcript.set_process_calls_expanded(item, true);
         }
         let open: String = crate::conversation::build::build_conversation_lines(&s, 100)
             .iter()

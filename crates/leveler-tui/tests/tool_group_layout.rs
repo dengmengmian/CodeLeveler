@@ -238,18 +238,10 @@ fn a_running_stage_keeps_its_geometry_from_first_call_to_close() {
         child_column(&t1, p1),
         "t0:{t0:?}\nt1:{t1:?}"
     );
-    assert_eq!(
-        child_column(&t1, p1),
-        child_column(&t2, p2),
-        "t1:{t1:?}\nt2:{t2:?}"
-    );
+    assert_eq!(p1, p2, "completion keeps the parent in place");
 
     // Closing neither adds nor removes a row; growing only appends.
-    assert_eq!(
-        group_rows(&t1, p1),
-        group_rows(&t2, p2),
-        "t1:{t1:?}\nt2:{t2:?}"
-    );
+    assert_eq!(1, group_rows(&t2, p2), "t1:{t1:?}\nt2:{t2:?}");
     assert_eq!(
         group_rows(&t0, p0) + 1,
         group_rows(&t1, p1),
@@ -259,7 +251,7 @@ fn a_running_stage_keeps_its_geometry_from_first_call_to_close() {
     // Only the wording changed.
     assert!(t1[p1].contains("正在执行 · 2 个命令"), "t1: {t1:?}");
     assert!(
-        t2[p2].contains("执行了 2 个命令") && t2[p2].contains("全部成功"),
+        t2[p2].contains("执行了 2 个命令") && !t2.iter().any(|l| l.contains("$ cargo")),
         "t2: {t2:?}"
     );
 }
@@ -285,7 +277,12 @@ fn a_burst_of_instant_commands_keeps_the_same_geometry_at_every_step() {
     next_assistant(&mut s, "a2");
     let closed = lines(&s);
     let p = parent_row(&closed);
-    seen.push((p, child_column(&closed, p), group_rows(&closed, p)));
+    assert_eq!(p, seen[0].0);
+    assert_eq!(
+        group_rows(&closed, p),
+        1,
+        "instant commands also fold once closed"
+    );
 
     for (i, (row, col, rows)) in seen.iter().enumerate() {
         assert_eq!(*row, seen[0].0, "step {i} moved the parent: {seen:?}");
@@ -343,35 +340,23 @@ fn the_painted_screen_does_not_shift_when_the_group_closes() {
         "t0 frame:\n{}",
         f0.join("\n")
     );
-    let gap = |f: &[String]| screen_row(f, "› ✓ $ cargo check") - screen_row(f, "● ▌");
-    let col = |f: &[String]| {
-        f[screen_row(f, "› ✓ $ cargo check")]
-            .find("› ✓ $ cargo check")
-            .unwrap()
-    };
+    let gap = |f: &[String], needle: &str| screen_row(f, needle) - screen_row(f, "● ▌");
     assert_eq!(
-        gap(&f1),
-        gap(&f2),
+        gap(&f1, "⋮ 正在执行 · 2 个命令"),
+        gap(&f2, "▸ 执行了 2 个命令"),
         "the group gained a row at close:\nt1:\n{}\nt2:\n{}",
         f1.join("\n"),
         f2.join("\n")
     );
-    assert_eq!(
-        col(&f1),
-        col(&f2),
-        "the child jumped columns at close:\nt1:\n{}\nt2:\n{}",
-        f1.join("\n"),
-        f2.join("\n")
+    assert!(
+        !f2.iter().any(|l| l.contains("$ cargo")),
+        "the painted settled process is collapsed"
     );
     // Parent and first child are adjacent in both forms: the parent row never
     // floats away from the children it owns.
     assert_eq!(
         screen_row(&f1, "⋮ 正在执行 · 2 个命令") + 1,
         screen_row(&f1, "› ✓ $ cargo check")
-    );
-    assert_eq!(
-        screen_row(&f2, "▸ 执行了 2 个命令") + 1,
-        screen_row(&f2, "› ✓ $ cargo check")
     );
 }
 
@@ -408,12 +393,19 @@ fn a_stopped_command_never_lets_the_stage_claim_all_ok() {
         !t[p].contains("全部成功") && !t[p].contains("all ok"),
         "a stopped call is not a success: {t:?}"
     );
-    // The stage and both its rows are still there — the fix withholds a claim,
-    // it does not hide the work.
+    // The work is counted without claiming success; full outcomes are still
+    // reachable through the keyboard.
     assert!(t[p].contains("执行了 2 个命令"), "{t:?}");
-    assert_eq!(
-        t.iter().filter(|l| l.contains('\u{203a}')).count(),
-        2,
-        "both commands keep a row: {t:?}"
+    reduce(
+        &mut s,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    assert!(
+        lines(&s)
+            .iter()
+            .any(|l| l.contains("⊘") && l.contains("sleep 120"))
     );
 }

@@ -1100,6 +1100,8 @@ impl TranscriptState {
     /// The match is one whole `task_id:` line, so `t-ab` cannot settle `t-abc`,
     /// and only a `background: true` shell call is eligible. `wait_task` mentions
     /// the same id and must keep its own text.
+    /// Returns whether a real starter was found, even on a repeated exit, so
+    /// callers can avoid writing a second transcript announcement.
     pub fn note_background_exit(
         &mut self,
         task_id: &str,
@@ -1107,9 +1109,9 @@ impl TranscriptState {
         stopped: bool,
         exit_code: Option<i32>,
         duration_ms: u64,
-    ) {
+    ) -> bool {
         if task_id.is_empty() || task_id.contains(['\n', '\r']) {
-            return;
+            return false;
         }
         let task_line = format!("task_id: {task_id}");
         let status = if stopped {
@@ -1120,6 +1122,7 @@ impl TranscriptState {
             "failed"
         };
         let mut changed = false;
+        let mut matched = false;
         for item in &mut self.items {
             let TranscriptItem::ToolGroup(group) = item else {
                 continue;
@@ -1134,6 +1137,7 @@ impl TranscriptState {
                 if !preview.lines().any(|line| line.trim() == task_line) {
                     continue;
                 }
+                matched = true;
                 let stamped = rewrite_detached_preview(preview, status, exit_code, duration_ms);
                 if stamped != *preview {
                     *preview = stamped;
@@ -1144,6 +1148,7 @@ impl TranscriptState {
         if changed {
             self.bump();
         }
+        matched
     }
 
     /// Append live output to a running command call (bounded tail).
@@ -1186,17 +1191,17 @@ impl TranscriptState {
         Some(expanded)
     }
 
-    /// Set every exploration call's own detail disclosure in one group. The
+    /// Set every process member's own detail disclosure in one group. The
     /// keyboard's Ctrl+O asks for the latest command's details, and a receipt
     /// owns those details per call — so it writes each member's own state
     /// instead of inventing a second, group-level one.
-    pub fn set_exploration_calls_expanded(&mut self, item: usize, expanded: bool) -> bool {
+    pub fn set_process_calls_expanded(&mut self, item: usize, expanded: bool) -> bool {
         let Some(TranscriptItem::ToolGroup(group)) = self.items.get_mut(item) else {
             return false;
         };
         let mut changed = false;
         for call in &mut group.calls {
-            if crate::activity_stream::is_exploration_fold_call(call) && call.expanded != expanded {
+            if crate::activity_stream::is_process_fold_call(call) && call.expanded != expanded {
                 call.expanded = expanded;
                 changed = true;
             }

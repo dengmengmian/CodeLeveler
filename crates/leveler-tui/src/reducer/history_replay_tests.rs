@@ -856,6 +856,16 @@ fn a_browser_run_reads_the_same_live_and_replayed() {
     };
     let live_lines = shape(&live);
     let replayed_lines = shape(&replayed);
+    assert_eq!(
+        replayed_lines, live_lines,
+        "the default folded history matches live state"
+    );
+    for s in [&mut live, &mut replayed] {
+        let target = crate::conversation::build::keyboard_expand_target(s).unwrap();
+        crate::conversation::interaction::toggle_fold(s, target);
+    }
+    let live_lines = shape(&live);
+    let replayed_lines = shape(&replayed);
     assert!(
         live_lines
             .iter()
@@ -1289,4 +1299,54 @@ fn background_sleep_events(name: &str) -> Vec<RuntimeEvent> {
         },
         RuntimeEvent::TurnAnswered,
     ]
+}
+
+#[test]
+fn background_completion_updates_the_starter_without_a_duplicate_transcript_notice() {
+    let mut s = state();
+    for event in background_sleep_events("receipt") {
+        reduce(&mut s, Action::Runtime(event));
+    }
+    let exit = RuntimeEvent::BackgroundTaskExited {
+        task_id: "t-receipt".into(),
+        exit_code: Some(0),
+        duration_ms: 25_000,
+        ok: true,
+        stopped: false,
+        output: "finished".into(),
+    };
+    reduce(&mut s, Action::Runtime(exit.clone()));
+    reduce(&mut s, Action::Runtime(exit));
+    let rows = conversation_rows(&s);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("sleep 25") && r.contains("25.0s")),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("后台任务已完成")),
+        "the starter already owns the outcome: {rows:#?}"
+    );
+    assert!(
+        s.notification.is_some(),
+        "the transient notification remains available"
+    );
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+            task_id: "unseen".into(),
+            exit_code: Some(2),
+            duration_ms: 10,
+            ok: false,
+            stopped: false,
+            output: String::new(),
+        }),
+    );
+    assert!(
+        conversation_rows(&s)
+            .iter()
+            .any(|r| r.contains("后台任务失败")),
+        "an outcome with no starter must remain visible"
+    );
 }
