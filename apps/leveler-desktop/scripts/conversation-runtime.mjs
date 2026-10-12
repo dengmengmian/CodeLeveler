@@ -114,7 +114,7 @@ async function assertPresentation(id, name) {
   const bodies = await thoughts(); assert.deepEqual(bodies.filter(body => markers.includes(body)), markers);
   const diffs = page.locator('.confirmed-diff'); assert.ok(await diffs.first().isVisible(), name + ' canonical diff hidden');
   const patch = await diffs.allTextContents(); for (const marker of ['--- a/src/models.rs', '+++ b/src/models.rs', 'gpt-5.6', 'gpt-6']) assert.ok(patch.join('').includes(marker), marker);
-  const labels = await page.locator(client === 'web' ? '.exploration-label' : '.exploration > summary').allTextContents(); assert.equal(labels.length, 1); assert.ok(labels[0].includes('读取 2 个文件 · 搜索 2 次'));
+  const labels = await page.locator(client === 'web' ? '.exploration-label' : '.exploration > summary').allTextContents(); assert.equal(labels.length, 1); assert.ok(labels[0].includes('读取 2 次 · 搜索 2 次'));
   assert.equal((await snapshot(id)).collaboration, 'chat');
   await page.screenshot({ path: path.join(out, name + '.png'), fullPage: true });
   return { thought_bodies: bodies, receipt_labels: labels, confirmed_diff_text: patch, full_diff_visible: true };

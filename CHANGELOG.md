@@ -26,8 +26,8 @@ the conversation already shows.
 - The footer context bar is presentation only: percentage, denominator, bar length and color come from the runtime projection, provider usage is only the no-snapshot fallback, and a snapshot with an unknown window has no gauge. Narrow rows drop the bar, then the cache, then the capacity chips; the clock and the permission / collaboration controls retain priority
 - `/context` names input capacity, model window and output reservation separately; the compaction policy and thresholds stay on the input-capacity axis while the runtime snapshot's `free_tokens` remains model-window free
 - A running command's status reports the phase and the command's own elapsed instead of repeating the command name the conversation row already shows
-- Thoughts use bounded previews: a live Thought shows its header and at most the latest three wrapped body rows, a completed standalone Thought occupies no history row until it is opened, and `Ctrl+O` opens the latest tool group or, without tools, the latest Thought
-- Exploration receipts fold independently at each level: opening a receipt restores tool headers in real chronology without showing completed Thoughts
+- Thoughts use bounded previews: a live Thought shows its header and at most the latest three wrapped body rows, a completed standalone Thought occupies no history row until it is asked for, and `Ctrl+O` reveals the header of every such Thought at once while opening the latest command's details (so a 40-read receipt's file content stays reachable); a header's own click opens that one body
+- Exploration receipts fold independently at each level: opening a receipt restores its member rows in real chronology, every exploration call with its own body disclosure and a header for each finished Thought that sat between them
 - Real transcripts start at the viewport top; only the empty-session splash is centered. Manual folding and a runtime completion or interruption that folds a Thought keep the line at the viewport's top edge in place
 
 ### Fixed

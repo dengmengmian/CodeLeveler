@@ -259,7 +259,7 @@ fn thought_index(s: &AppState) -> usize {
 }
 
 #[test]
-fn exploration_receipt_mouse_and_keyboard_never_restore_completed_thought_rows() {
+fn exploration_receipt_mouse_opens_members_and_ctrl_o_reveals_thought_headers() {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -291,11 +291,18 @@ fn exploration_receipt_mouse_and_keyboard_never_restore_completed_thought_rows()
             modifiers: KeyModifiers::empty(),
         }),
     );
+    // An open receipt restores its member rows: the tool targets in real
+    // chronology and, between them, a header for every finished Thought. The
+    // bodies stay folded — that is what makes each header its own disclosure.
     let assert_open = |s: &AppState| {
         let rows = lines(s);
         let painted = rows.join("\n");
-        assert!(!painted.contains("思考"), "{painted}");
-        assert!(!painted.contains("private"), "{painted}");
+        assert_eq!(
+            painted.matches("思考 ·").count(),
+            3,
+            "every member Thought keeps a header: {painted}"
+        );
+        assert!(!painted.contains("private"), "no body is opened: {painted}");
         let first = rows.iter().position(|r| r.contains("README.md")).unwrap();
         let second = rows
             .iter()
@@ -305,7 +312,8 @@ fn exploration_receipt_mouse_and_keyboard_never_restore_completed_thought_rows()
         let (_, hits) = build_conversation_lines_with_hits(s, W);
         assert!(
             hits.iter()
-                .all(|(_, i)| !matches!(s.transcript.items()[*i], TranscriptItem::Thought(_)))
+                .any(|(_, i)| matches!(s.transcript.items()[*i], TranscriptItem::Thought(_))),
+            "each restored header is its own disclosure row"
         );
     };
     assert_open(&s);
@@ -320,13 +328,21 @@ fn exploration_receipt_mouse_and_keyboard_never_restore_completed_thought_rows()
             modifiers: KeyModifiers::empty(),
         }),
     );
-    assert_eq!(lines(&s).iter().filter(|r| r.contains("└ ok")).count(), 1);
+    assert_eq!(
+        lines(&s).iter().filter(|r| r.contains("└ ok")).count(),
+        1,
+        "the clicked call alone opened its body"
+    );
     let key = Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
     reduce(&mut s, key.clone());
     assert!(!text(&s).contains("README.md"));
     reduce(&mut s, key);
     assert_open(&s);
-    assert_eq!(lines(&s).iter().filter(|r| r.contains("└ ok")).count(), 1);
+    assert_eq!(
+        lines(&s).iter().filter(|r| r.contains("└ ok")).count(),
+        2,
+        "Ctrl+O asks for the whole run's details, not one row"
+    );
     assert_eq!(
         thoughts(&s)
             .iter()
@@ -824,9 +840,10 @@ fn run_thought_1_a_folded_thought_is_a_participant_of_the_run() {
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Collapsed);
 }
 
-/// RUN-THOUGHT-2: opening restores tools in chronology without Thought rows.
+/// RUN-THOUGHT-2: opening restores the member tools in chronology, each with
+/// the header of the Thought that sat between them; bodies stay folded.
 #[test]
-fn run_thought_2_opening_the_run_restores_only_members_in_order() {
+fn run_thought_2_opening_the_run_restores_members_in_order() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先读 pricing。");
@@ -844,7 +861,15 @@ fn run_thought_2_opening_the_run_restores_only_members_in_order() {
     toggle_fold(&mut s, anchor);
 
     let rows = lines(&s);
-    assert!(!rows.iter().any(|line| line.contains("思考")));
+    assert_eq!(
+        rows.iter().filter(|line| line.contains("思考 ·")).count(),
+        1,
+        "the folded Thought keeps its header: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|line| line.contains("先读 pricing。")),
+        "a header is not a body: {rows:?}"
+    );
     let first = rows
         .iter()
         .position(|l| l.contains("pricing.rs"))
@@ -856,9 +881,10 @@ fn run_thought_2_opening_the_run_restores_only_members_in_order() {
     assert!(first < second, "real chronology: {rows:?}");
 }
 
-/// RUN-THOUGHT-3: stored Thought expansion does not expose receipt reasoning.
+/// RUN-THOUGHT-3: a Thought the reader opens shows exactly its own body inside
+/// the receipt; the other member rows are unaffected.
 #[test]
-fn run_thought_3_stored_expansion_keeps_receipt_reasoning_hidden() {
+fn run_thought_3_stored_expansion_shows_that_body_only() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先读 pricing。");
@@ -874,21 +900,27 @@ fn run_thought_3_stored_expansion_keeps_receipt_reasoning_hidden() {
         .position(|i| matches!(i, TranscriptItem::ToolGroup(_)))
         .expect("the run anchor group");
     toggle_fold(&mut s, anchor);
-    // A stored display change must not invent a disclosure row in the receipt.
     let thought = thought_index(&s);
     toggle_fold(&mut s, thought);
     let body = text(&s);
-    assert!(
-        !body.contains("先读 pricing。") && !body.contains("思考"),
-        "{body}"
+    assert_eq!(
+        body.matches("先读 pricing。").count(),
+        1,
+        "the opened Thought states its body once: {body}"
+    );
+    assert_eq!(
+        body.matches("思考 ·").count(),
+        1,
+        "and keeps exactly its own header: {body}"
     );
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Expanded);
 }
 
-/// RUN-THOUGHT-4: a Thought the reader opened is pinned. The run still folds
-/// all its children, and reopening still reveals only tool detail.
+/// RUN-THOUGHT-4: a Thought the reader opened is pinned, so neither the run's
+/// own fold nor reopening it folds that body away; the tool members still
+/// follow the receipt.
 #[test]
-fn run_thought_4_parent_hides_open_thought_and_preserves_choice() {
+fn run_thought_4_pinned_thought_survives_its_parent_folding() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先读 pricing。");
@@ -910,15 +942,21 @@ fn run_thought_4_parent_hides_open_thought_and_preserves_choice() {
         "tool members are folded: {rows:?}"
     );
     assert!(
-        !text(&s).contains("先读 pricing。"),
-        "parent hides its children"
+        text(&s).contains("先读 pricing。"),
+        "a pinned Thought is never folded away: {rows:?}"
     );
     let anchor = s.transcript.last_tool_group_index().unwrap();
     // This fixture's calls share one group, which is also the receipt anchor.
     toggle_fold(&mut s, anchor);
+    let rows = lines(&s);
     assert!(
-        !text(&s).contains("先读 pricing。") && !text(&s).contains("思考"),
-        "receipt never exposes reasoning"
+        rows.iter().any(|l| l.contains("catalog.rs")),
+        "opening the receipt restores its members: {rows:?}"
+    );
+    assert_eq!(
+        text(&s).matches("先读 pricing。").count(),
+        1,
+        "the pinned body is still stated once: {rows:?}"
     );
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Expanded);
     assert!(thoughts(&s)[0].display_pinned);
@@ -1314,8 +1352,8 @@ fn single_explore_5_expanded_members_use_direct_rows() {
     toggle_fold(&mut s, group);
     let text = text(&s);
     assert!(text.contains("▾ 读取 1 次 · 搜索 1 次"), "{text}");
-    assert!(text.contains("▸ 读取 a.rs"), "{text}");
-    assert!(text.contains("▸ 搜索 \"missing model\""), "{text}");
+    assert!(text.contains("› 读取 a.rs"), "{text}");
+    assert!(text.contains("› 搜索 \"missing model\""), "{text}");
 }
 
 /// NARROW-EXPLORE-1: a long target shortens by DISPLAY width — CJK included —
@@ -2000,9 +2038,10 @@ fn conversation_c10_durable_history_replay_preserves_full_tree_and_hidden_receip
         .unwrap();
     toggle_fold(&mut state, parent);
     toggle_fold(&mut state, thought);
-    assert!(
-        !text(&state).contains("先看入口。") && !text(&state).contains("思考"),
-        "the replayed receipt reveals only tools"
+    assert_eq!(
+        text(&state).matches("先看入口。").count(),
+        1,
+        "the replayed Thought the reader opened states its body once"
     );
     assert_eq!(thoughts(&state)[0].text, "先看入口。");
     assert_eq!(thoughts(&state)[0].duration_ms, Some(1600));

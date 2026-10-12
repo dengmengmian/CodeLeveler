@@ -1186,6 +1186,27 @@ impl TranscriptState {
         Some(expanded)
     }
 
+    /// Set every exploration call's own detail disclosure in one group. The
+    /// keyboard's Ctrl+O asks for the latest command's details, and a receipt
+    /// owns those details per call — so it writes each member's own state
+    /// instead of inventing a second, group-level one.
+    pub fn set_exploration_calls_expanded(&mut self, item: usize, expanded: bool) -> bool {
+        let Some(TranscriptItem::ToolGroup(group)) = self.items.get_mut(item) else {
+            return false;
+        };
+        let mut changed = false;
+        for call in &mut group.calls {
+            if crate::activity_stream::is_exploration_fold_call(call) && call.expanded != expanded {
+                call.expanded = expanded;
+                changed = true;
+            }
+        }
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
     fn tool_call_mut(&mut self, id: &ToolCallId) -> Option<&mut ToolCallBlock> {
         self.items.iter_mut().rev().find_map(|item| match item {
             TranscriptItem::ToolGroup(group) => {

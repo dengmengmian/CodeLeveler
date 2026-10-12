@@ -748,11 +748,6 @@ pub(crate) fn exploration_fold_member_lines(
             }
         }
     }
-    if let Some(header) = lines.first_mut()
-        && let Some(disclosure) = header.spans.first_mut()
-    {
-        disclosure.content = if call.expanded { "▾ " } else { "▸ " }.into();
-    }
     lines
 }
 
