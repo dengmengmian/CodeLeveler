@@ -4,6 +4,38 @@ Chinese version: [`CHANGELOG.zh-CN.md`](CHANGELOG.zh-CN.md)
 
 Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
+## [1.0.14] - 2026-10-12
+
+Turns the terminal into a primitives-first editor surface — input editing,
+history and help search, local terminal diagnostics, and an evidence-bearing
+clipboard route — and reworks transcript presentation so it stops repeating what
+the conversation already shows.
+
+### Added
+
+- Bounded composer edit history: `Ctrl+Z` undoes, `Ctrl+Shift+Z` / `Alt+Z` redoes, and `Ctrl+Y` restores recently killed text. A mixed paste, its file references and its image attachment bindings are restored together; submitting or changing sessions ends the draft's history (100 entries and 8 MiB per stack)
+- `Ctrl+R` searches submitted input history: `Enter` puts the selected entry back in the draft for editing without sending it, `Esc` / `Ctrl+C` closes the search and keeps the draft
+- Searchable `/help`: typing filters commands, shortcuts and descriptions, and the selected row stays reachable at narrow widths
+- `/doctor`, a local terminal diagnostics screen, and the same observations in `leveler doctor`: terminal, SSH/tmux, color hints, newline keys and clipboard route. Diagnostics neither read nor write the clipboard, and a capability without evidence stays unknown
+- Terminal-aware clipboard routing with a delivery receipt. Only a native write followed by matching readback on a local, non-tmux host is verified; SSH and tmux skip the native clipboard, a tmux buffer write and an OSC 52 send are reported as sent with local delivery unverified, and OSC 52 payloads are capped at 64 KiB
+- Commands keep their full identity in the conversation, expanding to the complete argument text wrapped to terminal width, and a command waiting without output says so
+- The Background Tasks page selects tasks with the mouse, routes the wheel by region, and keeps each task's own scroll and follow state; identity and stop controls stay fixed while only detail content scrolls
+
+### Changed
+
+- The footer context bar is presentation only: percentage, denominator, bar length and color come from the runtime projection, provider usage is only the no-snapshot fallback, and a snapshot with an unknown window has no gauge. Narrow rows drop the bar, then the cache, then the capacity chips; the clock and the permission / collaboration controls retain priority
+- `/context` names input capacity, model window and output reservation separately; the compaction policy and thresholds stay on the input-capacity axis while the runtime snapshot's `free_tokens` remains model-window free
+- A running command's status reports the phase and the command's own elapsed instead of repeating the command name the conversation row already shows
+- Thoughts use bounded previews: a live Thought shows its header and at most the latest three wrapped body rows, a completed standalone Thought occupies no history row until it is opened, and `Ctrl+O` opens the latest tool group or, without tools, the latest Thought
+- Exploration receipts fold independently at each level: opening a receipt restores tool headers in real chronology without showing completed Thoughts
+- Real transcripts start at the viewport top; only the empty-session splash is centered. Manual folding and a runtime completion or interruption that folds a Thought keep the line at the viewport's top edge in place
+
+### Fixed
+
+- A composer slot shorter than the box dropped its closing border and painted the footer through an open frame; the tail of the box is kept instead
+- A background detail pane could collapse or overdraw its rule row in a short pane
+- Unpainted filler rows below a short transcript were click targets
+
 ## [1.0.12] - 2026-10-07
 
 Makes the terminal's execution presentation a frozen contract with one
