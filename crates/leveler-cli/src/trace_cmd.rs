@@ -106,6 +106,12 @@ pub(crate) async fn cmd_trace(
                     .unwrap_or_else(|| "—".into()),
                 r.finish_reason.as_deref().or(r.error_kind.as_deref())
             );
+            // A failed request keeps what the transport saw of the response it
+            // could not read: the difference between a damaged answer and no
+            // answer at all, which the class name alone cannot tell.
+            if let Some(detail) = r.error_detail.as_deref() {
+                println!("       {detail}");
+            }
         }
     }
     if !loaded.tools.is_empty() {

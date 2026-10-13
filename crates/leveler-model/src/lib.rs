@@ -41,6 +41,7 @@ pub use context_accounting::{
 };
 pub use error::{
     DeliveryState, ModelError, ModelErrorKind, Retryability, StreamProgress, TransportFault,
+    TransportObservation,
 };
 pub use estimate::{
     IMAGE_BYTE_EQUIV, TokenEstimate, estimate_message, estimate_text, estimate_tokens,

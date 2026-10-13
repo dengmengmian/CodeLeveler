@@ -284,7 +284,10 @@ impl ModelRuntime for ProviderRegistry {
             let encoded = provider
                 .adapter
                 .encode_request(&request, &context, false)
-                .map_err(|e| ModelError::new(ModelErrorKind::InvalidRequest, e.to_string()).with_delivery_state(leveler_model::DeliveryState::NotSent))?;
+                .map_err(|e| {
+                    ModelError::new(ModelErrorKind::InvalidRequest, e.to_string())
+                        .with_delivery_state(leveler_model::DeliveryState::NotSent)
+                })?;
             // Apply protocol-supplied headers (see `stream`); the transport only
             // reads `context.extra_headers`.
             context
@@ -313,10 +316,17 @@ impl ModelRuntime for ProviderRegistry {
             )
             .await?;
 
+            // Read the head's facts before `bytes()` consumes the response: a
+            // body that cannot be read still leaves the status and the declared
+            // encodings behind. Diagnostic only; `None` bytes read because the
+            // non-streaming read exposes no progress.
+            let head = crate::transport::response_head(&response);
             let body = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(ModelError::cancelled()),
-                result = response.bytes() => result.map_err(|e| crate::transport::map_reqwest_error(&e))?,
+                result = response.bytes() => result.map_err(|e| {
+                    crate::transport::map_reqwest_error(&e).with_transport_observation(head)
+                })?,
             };
 
             let mut decoded = provider

@@ -176,6 +176,10 @@ pub struct ModelRequestRecord {
     /// The reasoning effort the call requested, as sent on the wire. `None`
     /// for a request that named none and for rows older than migration 0026.
     pub reasoning_effort: Option<String>,
+    /// JSON observation of the response whose body could not be read, when a
+    /// body failure carried one (see `leveler_model::TransportObservation`).
+    /// Diagnostic only; never an input to delivery, retry or settlement.
+    pub error_detail: Option<String>,
 }
 
 /// One `model_requests` row as the loader reads it.
@@ -210,6 +214,7 @@ struct ModelRequestRow {
     reasoning_tokens: Option<i64>,
     projected_input_tokens: Option<i64>,
     projected_reasoning_tokens: Option<i64>,
+    error_detail: Option<String>,
 }
 
 /// Read/write access to the `model_requests` table, borrowed from a [`Database`].
@@ -237,8 +242,8 @@ impl<'a> ModelRequestRepository<'a> {
               error_kind, latency_ms, retry_count, created_at, kind, \
               provider_request_id, cached_input_tokens, cost_usd_micros, agent_id, \
               reasoning_effort, reasoning_tokens, attempt_ms, connect_ms, ttft_ms, \
-              max_event_gap_ms, projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+              max_event_gap_ms, projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens, error_detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         )
         .bind(&record.id)
         .bind(record.session_id.as_str())
@@ -294,6 +299,7 @@ impl<'a> ModelRequestRepository<'a> {
         )
         .bind(&record.budget_scope)
         .bind(record.estimated_tokens.map(|value| value.min(i64::MAX as u64) as i64))
+        .bind(&record.error_detail)
         .execute(self.db.pool())
         .await?;
         Ok(())
@@ -315,7 +321,8 @@ impl<'a> ModelRequestRepository<'a> {
                     latency_ms, retry_count, created_at, kind, provider_request_id, \
                     cached_input_tokens, cost_usd_micros, agent_id, reasoning_effort, \
                     reasoning_tokens, attempt_ms, connect_ms, ttft_ms, max_event_gap_ms, \
-                    projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens \
+                    projected_input_tokens, projected_reasoning_tokens, budget_scope, estimated_tokens, \
+                    error_detail \
              FROM model_requests WHERE session_id = ?1 ORDER BY created_at, rowid",
         )
         .bind(session_id.as_str())
@@ -350,6 +357,7 @@ impl<'a> ModelRequestRepository<'a> {
                     reasoning_tokens,
                     projected_input_tokens,
                     projected_reasoning_tokens,
+                    error_detail,
                 } = row;
                 {
                     Ok(ModelRequestRecord {
@@ -383,6 +391,7 @@ impl<'a> ModelRequestRepository<'a> {
                             .map(|value| value.max(0) as u64),
                         projected_reasoning_tokens: projected_reasoning_tokens
                             .map(|value| value.max(0) as u64),
+                        error_detail,
                     })
                 }
             })
@@ -550,6 +559,7 @@ mod tests {
             output_tokens: 100,
             finish_reason: Some("stop".to_string()),
             error_kind: None,
+            error_detail: None,
             latency_ms: Some(10),
             attempt_ms: Some(9),
             connect_ms: Some(4),
@@ -575,6 +585,38 @@ mod tests {
         SessionRepository::new(&db).create(&session).await.unwrap();
         let id = SessionId::new(session.id);
         (db, id)
+    }
+
+    /// What the transport observed of a body it could not read is durable and
+    /// read back verbatim. Without this the observation would be recomputed on
+    /// every reader or, worse, never leave the failing process at all.
+    #[tokio::test]
+    async fn a_transport_observation_round_trips() {
+        let (db, session) = seeded().await;
+        let repo = ModelRequestRepository::new(&db);
+        let mut failing = record("r-obs", &session);
+        failing.error_kind = Some("transport".into());
+        failing.finish_reason = None;
+        failing.error_detail = Some(
+            serde_json::json!({
+                "status": 200,
+                "content_type": "text/event-stream",
+                "body_bytes": 42,
+                "body_tail": "data: {\"choices\"",
+            })
+            .to_string(),
+        );
+        repo.insert(&failing).await.unwrap();
+
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].error_kind.as_deref(), Some("transport"));
+        assert_eq!(loaded[0].error_detail, failing.error_detail);
+        // A successful row keeps the column empty rather than filling it with
+        // an absence.
+        repo.insert(&record("r-ok", &session)).await.unwrap();
+        let loaded = repo.load_for_session(&session).await.unwrap();
+        assert_eq!(loaded[1].error_detail, None);
     }
 
     /// T1/T2. What the provider reported is what comes back out — including
@@ -908,6 +950,7 @@ mod tests {
             output_tokens: 20,
             finish_reason: Some("length".to_string()),
             error_kind: None,
+            error_detail: None,
             latency_ms: Some(42),
             attempt_ms: Some(40),
             connect_ms: Some(5),
@@ -971,6 +1014,7 @@ mod tests {
                 output_tokens: 2,
                 finish_reason: Some("stop".to_string()),
                 error_kind: None,
+                error_detail: None,
                 latency_ms: Some(1),
                 attempt_ms: None,
                 connect_ms: None,
@@ -1028,6 +1072,7 @@ mod tests {
                 output_tokens: 1,
                 finish_reason: Some("stop".to_string()),
                 error_kind: None,
+                error_detail: None,
                 latency_ms: Some(1),
                 attempt_ms: None,
                 connect_ms: None,

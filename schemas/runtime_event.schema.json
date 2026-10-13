@@ -7200,6 +7200,13 @@
         "created_at": {
           "type": "string"
         },
+        "error_detail": {
+          "description": "What the transport observed of a response whose body could not be read, as JSON. Diagnostic: it distinguishes a damaged answer from no answer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "error_kind": {
           "type": [
             "string",

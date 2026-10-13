@@ -45,7 +45,7 @@ pub(crate) async fn record_auxiliary_call(
     budget_scope: Option<&str>,
     estimated_tokens: Option<u64>,
 ) -> Result<(), leveler_storage::StorageError> {
-    let (usage, finish_reason, provider_request_id, error_kind) = match outcome {
+    let (usage, finish_reason, provider_request_id, error_kind, error_detail) = match outcome {
         Ok(response) => (
             response.usage,
             serde_json::to_value(response.finish_reason)
@@ -53,12 +53,14 @@ pub(crate) async fn record_auxiliary_call(
                 .and_then(|value| value.as_str().map(ToOwned::to_owned)),
             Some(response.request_id.to_string()),
             None,
+            None,
         ),
         Err(error) => (
             leveler_model::TokenUsage::default(),
             None,
             None,
             Some(auxiliary_error_kind(error)),
+            error.transport_observation_json(),
         ),
     };
     use leveler_model::ModelRuntime;
@@ -115,6 +117,7 @@ pub(crate) async fn record_auxiliary_call(
         agent_id: None,
         finish_reason,
         error_kind,
+        error_detail,
         latency_ms: Some(latency_ms),
         attempt_ms: None,
         connect_ms: None,
@@ -892,6 +895,7 @@ fn request_view(r: &leveler_storage::ModelRequestRecord) -> UiRequestObservation
         output_tokens: r.output_tokens,
         finish_reason: r.finish_reason.clone(),
         error_kind: r.error_kind.clone(),
+        error_detail: r.error_detail.clone(),
         latency_ms: r.latency_ms,
         retry_count: r.retry_count,
         cached_input_tokens: r.cached_input_tokens,
@@ -1098,6 +1102,7 @@ mod tests {
         .await;
         db.insert(&ModelRequestRecord {
             budget_scope: None,
+            error_detail: None,
             estimated_tokens: None,
             id: "req-1".into(),
             provider_request_id: None,
@@ -1756,6 +1761,7 @@ mod accounting_tests {
     ) -> ModelRequestRecord {
         ModelRequestRecord {
             budget_scope: None,
+            error_detail: None,
             estimated_tokens: None,
             id: id.into(),
             provider_request_id: None,

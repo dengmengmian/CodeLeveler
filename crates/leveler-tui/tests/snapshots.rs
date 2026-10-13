@@ -411,7 +411,7 @@ fn conversation_messages_use_prompt_and_bullet_without_role_labels() {
 
     let text = render_at(100, 24, &mut state);
     assert!(text.contains("▌ 请检查项目"), "{text}");
-    assert!(text.contains("● 开始检查"), "{text}");
+    assert!(text.contains("开始检查"), "{text}");
     assert!(!text.lines().any(|line| line.trim() == "User"), "{text}");
     assert!(
         !text.lines().any(|line| line.trim() == "Agent Message"),
@@ -490,15 +490,16 @@ fn renders_failed_tool_inline_and_tools_screen() {
             message_id: MessageId::new("close-group"),
         }),
     );
-    // A lone failed shell is its own evidence row: ✗, the command, the error.
+    // A failed call stays inside its receipt: the closed header reports the
+    // failure and its count, and the failed target appears only when asked for.
     let conv = render_at(100, 24, &mut state);
     assert!(
-        conv.contains('✗') && conv.contains("cargo test"),
-        "the failure row must name the command that failed: {conv}"
+        conv.contains('✗'),
+        "the closed receipt must report the failure: {conv}"
     );
     assert!(
-        conv.contains("exit") && conv.contains("101"),
-        "collapsed failed tool should keep the first error line: {conv}"
+        !conv.contains("cargo test"),
+        "the closed receipt hides the failed target: {conv}"
     );
     assert!(
         !conv.contains("compiler error"),
@@ -507,6 +508,24 @@ fn renders_failed_tool_inline_and_tools_screen() {
     assert!(
         !conv.contains("工具调用"),
         "group summary should not replace the activity stream: {conv}"
+    );
+
+    // Ctrl+O opens the failed call's own details.
+    reduce(
+        &mut state,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    let opened = render_at(100, 24, &mut state);
+    assert!(
+        opened.contains("cargo test"),
+        "the opened receipt must name the command that failed: {opened}"
+    );
+    assert!(
+        opened.contains("compiler error"),
+        "the opened receipt must show the failure detail: {opened}"
     );
 
     // Open the Tools screen.
@@ -567,11 +586,12 @@ fn ok_tool_output_folds_then_expands_with_ctrl_o() {
             message_id: MessageId::new("close-group"),
         }),
     );
-    // Folded by default: the call's own row, with its OUTPUT still hidden.
+    // Closed by default: the receipt reports the run and its members stay off
+    // screen until the reader asks for them.
     let folded = render_at(100, 24, &mut state);
     assert!(
-        folded.contains("$ cargo test"),
-        "the evidence row must name the command: {folded}"
+        !folded.contains("$ cargo test"),
+        "the closed receipt hides the command: {folded}"
     );
     assert!(!folded.contains("line-one"), "collapsed output leaked");
     assert!(
@@ -664,8 +684,12 @@ fn command_result_renders_as_important_activity_not_file_list() {
     assert!(!collapsed.contains("工具输出"), "{collapsed}");
     assert!(!collapsed.contains("摘要:"), "{collapsed}");
     assert!(
-        collapsed.contains("$ cargo test"),
-        "the finished run keeps a row naming what it ran: {collapsed}"
+        collapsed.contains("执行了 1 个命令"),
+        "the finished run keeps a receipt naming what it ran: {collapsed}"
+    );
+    assert!(
+        !collapsed.contains("$ cargo test"),
+        "the closed receipt does not inline the assembled command: {collapsed}"
     );
     assert!(
         !collapsed.contains("raw-shell-output"),
@@ -701,8 +725,8 @@ fn running_command_renders_as_progress_activity() {
 
     let text = render_at(100, 24, &mut state);
     assert!(
-        text.contains('◌') && text.contains("执行") && text.contains("cargo"),
-        "running important tool must show progress: {text}"
+        text.contains("正在执行") && text.contains("执行了 1 个命令"),
+        "a running call must report real progress in its receipt header: {text}"
     );
     assert!(!text.contains("工具活动"), "{text}");
     // Internal exploration noise must not appear as a path dump.
@@ -1723,6 +1747,7 @@ fn trace_state(locale: leveler_tui::Locale, tab: char) -> String {
             output_tokens: 40,
             finish_reason: Some("stop".into()),
             error_kind: None,
+            error_detail: None,
             latency_ms: Some(1800),
             retry_count: 0,
             cached_input_tokens: None,

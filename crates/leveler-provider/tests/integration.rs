@@ -70,6 +70,19 @@ fn registry(server: &MockServer) -> ProviderRegistry {
     .expect("build registry")
 }
 
+/// The same registry with the read-idle budget the test itself controls.
+/// A stalled gateway is only observable through this budget, so a regression
+/// test must own it rather than inherit a two-minute default.
+fn registry_with_idle(server: &MockServer, idle_stream_seconds: u64) -> ProviderRegistry {
+    let mut config = provider_config(server.base_url());
+    config.timeouts.idle_stream_seconds = idle_stream_seconds;
+    ProviderRegistry::build(RegistryInputs {
+        providers: vec![(config, None)],
+        models: vec![model_config()],
+    })
+    .expect("build registry")
+}
+
 fn request() -> ModelRequest {
     ModelRequest::new(
         ModelRef::new("mock", "m"),
@@ -318,6 +331,81 @@ async fn transient_gateway_failure_is_reported_before_any_retry() {
     );
     assert!(error.is_safe_to_retry());
     assert_eq!(server.request_count(), 1);
+}
+
+/// A response whose body cannot be read is not "no response": the head was
+/// received, and the transport must record what it carried so a gateway that
+/// answers 200 with a broken stream can be told apart from one that never
+/// answered at all.
+///
+/// The observation is diagnostic. Delivery state and retry stay exactly what
+/// they were: this change adds facts, not policy.
+#[tokio::test]
+async fn a_body_that_cannot_be_decoded_reports_what_the_response_head_carried() {
+    let server = MockServer::start_one(MockResponse::StallAfterPartialBody {
+        // Deliberately an *unfinished* SSE frame: the decoder is still waiting
+        // for the rest when the gateway stalls, which is what makes the failure
+        // a body read rather than a clean end of stream.
+        chunk: "data: {\"choices\":[{\"delta\":{\"content\":\"cu".into(),
+        content_type: "text/event-stream".into(),
+    })
+    .await;
+    let reg = registry_with_idle(&server, 1);
+    let mut stream = reg
+        .stream(request(), CancellationToken::new())
+        .await
+        .expect("the response head itself is valid");
+    let mut error = None;
+    let mut items = 0usize;
+    while let Some(item) = stream.next().await {
+        items += 1;
+        match item {
+            // The protocol layer reports a transport failure mid-stream as an
+            // `Error` event carrying the transport's own error.
+            Ok(ModelEvent::Error { error: item_error }) => {
+                error = Some(item_error);
+                break;
+            }
+            Ok(_) => {}
+            Err(item_error) => {
+                error = Some(item_error);
+                break;
+            }
+        }
+    }
+    let error = error.unwrap_or_else(|| {
+        panic!("a stalled body must fail the stream; it ended cleanly after {items} items")
+    });
+    assert!(
+        error.message.contains("body"),
+        "the failure must be the body read itself: {}",
+        error.message
+    );
+    let observed = error
+        .transport_observation
+        .expect("a body decode failure must carry what the head carried");
+    assert_eq!(observed.status, Some(200));
+    assert_eq!(observed.content_type.as_deref(), Some("text/event-stream"));
+    assert!(
+        observed.content_encoding.is_none(),
+        "an unencoded response must report no encoding: {observed:?}"
+    );
+    assert!(
+        observed.body_bytes.unwrap_or(0) > 0,
+        "bytes read before the failure must be recorded: {observed:?}"
+    );
+    assert!(
+        observed
+            .body_tail
+            .as_deref()
+            .is_some_and(|tail| tail.contains("content")),
+        "the tail of what arrived is the evidence a gateway problem needs: {observed:?}"
+    );
+    // Diagnostics do not decide delivery or retry.
+    assert_eq!(
+        error.delivery_state,
+        leveler_model::DeliveryState::SentNoResponse
+    );
 }
 
 /// A 504 may mean the upstream started: not a safe replay, so no auto retry.

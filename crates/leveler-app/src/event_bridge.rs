@@ -143,7 +143,12 @@ pub fn ui_failure_from_model(error: &leveler_model::ModelError) -> UiFailure {
             FailureCategory::LocalConfiguration => "本地模型配置无效，请求未发送。",
             FailureCategory::RateLimit => "模型服务繁忙，请稍后重试。",
             FailureCategory::Provider => "模型服务暂时不可用。",
-            FailureCategory::Network => "无法连接模型服务。",
+            FailureCategory::Network => match error.delivery_state {
+                DeliveryState::NotSent => "无法连接模型服务。",
+                DeliveryState::SentNoResponse | DeliveryState::Responded => "接收模型响应失败。",
+                DeliveryState::StreamInterrupted { .. } => "模型响应接收中断。",
+                DeliveryState::Unknown => "与模型服务通信失败。",
+            },
             FailureCategory::Timeout => "模型服务未及时响应。",
             FailureCategory::Cancelled => "请求已取消。",
             _ if error.kind == ModelErrorKind::ConversationProtocol => {
@@ -1412,6 +1417,32 @@ mod bridge_tests {
             failure.delivery,
             leveler_client_protocol::FailureDelivery::NotSent
         );
+    }
+
+    #[test]
+    fn network_failure_summary_follows_delivery_evidence() {
+        use leveler_model::{DeliveryState, ModelError, ModelErrorKind, StreamProgress};
+        for (delivery, expected) in [
+            (DeliveryState::NotSent, "无法连接模型服务。"),
+            (DeliveryState::SentNoResponse, "接收模型响应失败。"),
+            (DeliveryState::Responded, "接收模型响应失败。"),
+            (
+                DeliveryState::StreamInterrupted {
+                    progress: StreamProgress {
+                        reasoning: true,
+                        ..StreamProgress::default()
+                    },
+                },
+                "模型响应接收中断。",
+            ),
+            (DeliveryState::Unknown, "与模型服务通信失败。"),
+        ] {
+            let error = ModelError::new(ModelErrorKind::Transport, "error decoding response body")
+                .with_delivery_state(delivery);
+            let failure = ui_failure_from_model(&error);
+            assert_eq!(failure.summary, expected, "delivery: {delivery:?}");
+            assert_eq!(failure.detail, "error decoding response body");
+        }
     }
 
     /// A completion status maps to auth/timeout semantics without string work.

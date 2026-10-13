@@ -192,6 +192,7 @@ mod tests {
     async fn usage(db: &Database, sid: &SessionId, agent: &str, input: u64, cost: Option<u64>) {
         db.insert(&ModelRequestRecord {
             budget_scope: None,
+            error_detail: None,
             estimated_tokens: None,
             id: leveler_core::new_uuid_string(),
             provider_request_id: None,

@@ -189,12 +189,13 @@ impl RetryPolicy {
 /// The rule itself lives with the delivery truth, in
 /// [`ModelError::is_retryable_by_lifecycle`]: this lifecycle owns recovery for
 /// a whole model request, so it may re-send any transient failure that received
-/// no response content. An upstream that swallowed the
-/// request and never returned response headers is exactly such a failure, and
+/// no answer text or tool-call data. Reasoning-only interruptions may also
+/// recover, with their failed attempt settled before retrying. An upstream
+/// that swallowed the request and never returned response headers is such a failure, and
 /// it must not take the task down.
 ///
-/// Nothing that produced output slips through: [`stream_round`] rewrites every
-/// failure seen inside a stream to `StreamInterrupted` with its progress
+/// Nothing that produced answer text or tool-call data slips through:
+/// [`stream_round`] rewrites every failure seen inside a stream to `StreamInterrupted` with its progress
 /// attached, and a stream that produced text or tool-call arguments is never
 /// replayed.
 fn should_retry_round(error: &ModelError) -> bool {
@@ -391,10 +392,10 @@ async fn run_model_round_observed_with<O: ModelRoundObserver>(
             Err(AgentCoreError::Model(e)) => e,
             Err(e) => return Err(e.into()),
         };
-        // Safe delivery failures and the narrow pre-stream/send transport
-        // exception are retried. A `Caution` error (the provider may already
-        // have generated/billed output, e.g. a stream cut after partial text)
-        // is never blind-replayed: there is no protocol-level stream resume.
+        // Safe delivery failures, pre-stream/send transport failures, and
+        // reasoning-only interruptions may use bounded recovery. Answer text
+        // or tool-call data prevents replay: no stream-resume protocol exists.
+        // Reasoning-only recovery remains `Caution` and settles failed spend.
         if !should_retry_round(&error) {
             // The decision is half the evidence here. When the round *does*
             // retry, `model round retrying` records the same fields; without a
@@ -1071,7 +1072,7 @@ mod retry_decision_tests {
             match self.produced {
                 Produced::Nothing => {}
                 Produced::Reasoning => events.push(Ok(ModelEvent::ReasoningDelta {
-                    delta: "thinking".into(),
+                    delta: if n == 1 { "thinking" } else { "retry thinking" }.into(),
                 })),
                 Produced::Text => events.push(Ok(ModelEvent::TextDelta {
                     delta: "half".into(),
@@ -1338,23 +1339,39 @@ mod retry_decision_tests {
     }
 
     #[tokio::test]
-    async fn reasoning_only_failure_is_not_replayed() {
+    async fn reasoning_only_failure_is_retried_without_merging_attempts() {
         let calls = Arc::new(Mutex::new(0));
         let runtime = BrokenStreamRuntime {
-            error: no_output_cut(),
+            error: ModelError::new(ModelErrorKind::Transport, "error decoding response body"),
             produced: Produced::Reasoning,
             calls: calls.clone(),
         };
-        let result = run_model_round_with(
+        let mut events = Vec::new();
+        let round = run_model_round_with(
             &runtime,
             request(),
             &CancellationToken::new(),
-            &mut |_| {},
+            &mut |event| events.push(event),
             instant_policy(),
         )
-        .await;
-        assert!(result.is_err(), "captured reasoning is real output");
-        assert_eq!(*calls.lock().unwrap(), 1);
+        .await
+        .expect("reasoning-only interruption should recover");
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(round.retry_count, 1);
+        assert_eq!(round.reasoning_segments.len(), 1);
+        assert_eq!(round.reasoning_segments[0].text, "retry thinking");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::StreamAttemptStarted))
+                .count(),
+            2
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelRetrying { .. }))
+        );
     }
 
     /// A failure seen *inside* a stream is re-classified from what the stream
@@ -2720,14 +2737,25 @@ mod attempt_contract_tests {
         assert_eq!(observer.attempts[0].ttft_ms, None);
     }
     #[tokio::test]
-    async fn empty_signed_thinking_is_progress_and_cannot_be_replayed() {
+    async fn empty_signed_thinking_is_settled_before_reasoning_only_retry() {
         let order = Arc::new(Mutex::new(vec![]));
         let runtime = Runtime {
-            scripts: Mutex::new(vec![vec![
-                ModelEvent::ReasoningMetadata { bytes: 30 },
-                usage(7, 2),
-                error(),
-            ]]),
+            scripts: Mutex::new(vec![
+                vec![
+                    ModelEvent::ReasoningMetadata { bytes: 30 },
+                    usage(7, 2),
+                    error(),
+                ],
+                vec![
+                    ModelEvent::TextDelta {
+                        delta: "recovered".into(),
+                    },
+                    usage(8, 3),
+                    ModelEvent::MessageCompleted {
+                        finish_reason: FinishReason::Stop,
+                    },
+                ],
+            ]),
             order: order.clone(),
         };
         let mut observer = Observer {
@@ -2735,20 +2763,29 @@ mod attempt_contract_tests {
             order: order.clone(),
             reject: false,
         };
-        assert!(
-            run_model_round_observed(
-                &runtime,
-                request(),
-                &CancellationToken::new(),
-                &mut observer
-            )
-            .await
-            .is_err()
+        let round = run_model_round_observed_with(
+            &runtime,
+            request(),
+            &CancellationToken::new(),
+            &mut observer,
+            RetryPolicy {
+                max_retries: 1,
+                delay_scale: 0.0,
+            },
+        )
+        .await
+        .expect("reasoning metadata without text or tools may recover");
+        assert_eq!(round.retry_count, 1);
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["send", "persist", "send", "persist"]
         );
-        assert_eq!(*order.lock().unwrap(), vec!["send", "persist"]);
+        assert_eq!(observer.attempts.len(), 2);
         assert!(observer.attempts[0].ttft_ms.is_some());
+        assert_eq!(observer.attempts[0].usage.unwrap().output_tokens, 2);
+        assert_eq!(round.usage.output_tokens, 3);
         assert!(
-            matches!(observer.attempts[0].error.as_ref().unwrap().delivery_state, DeliveryState::StreamInterrupted { progress } if progress.reasoning)
+            matches!(observer.attempts[0].error.as_ref().unwrap().delivery_state, DeliveryState::StreamInterrupted { progress } if progress.reasoning && !progress.text && !progress.tool_args)
         );
     }
 }

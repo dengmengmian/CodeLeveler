@@ -22,6 +22,14 @@ pub enum MockResponse {
     /// 200 with a body shorter than its declared Content-Length, then close.
     /// Unlike a clean SSE EOF, this produces an actual HTTP body read error.
     TruncatedBody { body: String, content_type: String },
+    /// A 200 that sends a response head and the first bytes of a body, then goes
+    /// silent without closing or terminating the message.
+    ///
+    /// This is what a stalled gateway looks like from the client: the read-idle
+    /// timeout is the only thing that ends it, and reqwest reports that as
+    /// "error decoding response body". It is the shape the transport observation
+    /// exists for.
+    StallAfterPartialBody { chunk: String, content_type: String },
     /// A 200 JSON body preceded by `silent_ms` of complete silence — no
     /// headers, no bytes — the shape of a non-streaming provider whose model
     /// is still thinking.
@@ -210,6 +218,23 @@ async fn serve(mut stream: TcpStream, response: MockResponse) -> std::io::Result
             stream.write_all(header.as_bytes()).await?;
             stream.write_all(body.as_bytes()).await?;
             stream.flush().await?;
+        }
+        MockResponse::StallAfterPartialBody {
+            chunk,
+            content_type,
+        } => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes()).await?;
+            let framed = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+            stream.write_all(framed.as_bytes()).await?;
+            stream.flush().await?;
+            // Hold the connection open exactly like a gateway that stopped
+            // forwarding: no terminator, no close, no further bytes. The client's
+            // own read-idle budget is what ends the request.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
         MockResponse::Sse { body } => {
             let header = "HTTP/1.1 200 OK\r\n\

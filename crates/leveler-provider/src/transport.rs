@@ -235,12 +235,82 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .map(|secs| secs.saturating_mul(1000))
 }
 
+/// How much of a failed response body is kept for diagnosis: enough to
+/// recognize an HTML error page or a truncated JSON envelope, small enough that
+/// a hostile body cannot bloat a record.
+const BODY_TAIL_BYTES: usize = 256;
+
+/// Facts the response head already carries, read *before* the body is consumed.
+///
+/// A body-level failure happens after the head arrived, so recording these costs
+/// nothing and is the only evidence that separates "the gateway answered 200 and
+/// then broke" from "nothing was ever answered".
+pub(crate) fn response_head(response: &reqwest::Response) -> leveler_model::TransportObservation {
+    let header = |name: reqwest::header::HeaderName| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    leveler_model::TransportObservation {
+        status: Some(response.status().as_u16()),
+        content_type: header(reqwest::header::CONTENT_TYPE),
+        content_encoding: header(reqwest::header::CONTENT_ENCODING),
+        body_bytes: None,
+        body_tail: None,
+    }
+}
+
+/// Keep only the last [`BODY_TAIL_BYTES`] of a body for diagnosis.
+fn remember_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    if tail.len() > BODY_TAIL_BYTES {
+        tail.drain(..tail.len() - BODY_TAIL_BYTES);
+    }
+}
+
+/// The printable part of a body tail, sanitized exactly like any other
+/// provider-originated text (redacted secrets, bounded length).
+fn printable_tail(tail: &[u8]) -> Option<String> {
+    let text: String = tail
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\n' || *byte == b'\t' {
+                *byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| leveler_model::error::sanitize_provider_text(text))
+}
+
 /// Convert a successful streaming response into a raw byte stream with
 /// normalized errors.
+///
+/// A failure mid-body is recorded with what the head and the partial body
+/// already showed. The delivery state and retry verdict come from the transport
+/// error alone and are deliberately unchanged by this observation.
 pub(crate) fn response_to_byte_stream(response: reqwest::Response) -> RawByteStream {
-    let stream = response
-        .bytes_stream()
-        .map(|item| item.map_err(|e| map_reqwest_error(&e)));
+    let head = response_head(&response);
+    let mut bytes_read: u64 = 0;
+    let mut tail: Vec<u8> = Vec::new();
+    let stream = response.bytes_stream().map(move |item| match item {
+        Ok(chunk) => {
+            bytes_read = bytes_read.saturating_add(chunk.len() as u64);
+            remember_tail(&mut tail, &chunk);
+            Ok(chunk)
+        }
+        Err(error) => Err(map_reqwest_error(&error).with_transport_observation(
+            leveler_model::TransportObservation {
+                body_bytes: Some(bytes_read),
+                body_tail: printable_tail(&tail),
+                ..head.clone()
+            },
+        )),
+    });
     Box::pin(stream)
 }
 

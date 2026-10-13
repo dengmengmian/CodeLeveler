@@ -337,6 +337,7 @@ mod usage_tests {
     fn req(model: &str, input: u64, output: u64) -> ModelRequestRecord {
         ModelRequestRecord {
             budget_scope: None,
+            error_detail: None,
             estimated_tokens: None,
             id: "r".into(),
             provider_request_id: None,

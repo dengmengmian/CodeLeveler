@@ -557,6 +557,9 @@ impl MemoryConsolidator {
                 .error
                 .as_deref()
                 .map(|_| "memory_extraction_failed".to_string()),
+            // The consolidator keeps the failure class only; it holds no
+            // transport error to observe.
+            error_detail: None,
             latency_ms: Some(call.latency_ms),
             attempt_ms: None,
             connect_ms: None,
