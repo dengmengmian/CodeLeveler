@@ -2,34 +2,36 @@
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
-This patch turns the terminal into a primitives-first editor surface — input
-editing, history and help search, local terminal diagnostics and an
-evidence-bearing clipboard route — and reworks transcript presentation so it
-stops repeating what the conversation already shows.
+This release makes a stalled provider answer diagnosable and recoverable, and
+settles how the conversation presents work: tool activity accumulates into one
+receipt per visible stage, reasoning stays in the status strip, and details open
+only when asked for.
 Web and Desktop are outside this release's qualification scope.
 
-## Terminal
+## Model responses
 
-- The composer has a bounded edit history. Ctrl+Z undoes, Ctrl+Shift+Z / Alt+Z redoes, and Ctrl+Y restores recently killed text. A mixed paste, its file references and its image attachment bindings are restored together, and submitting or changing sessions ends the draft's history. Each stack holds at most 100 entries and 8 MiB.
-- Ctrl+R searches submitted input history. Enter puts the selected entry back in the draft for editing without sending it; Esc or Ctrl+C closes the search and keeps the original draft.
-- `/help` is searchable. Typing filters commands, shortcuts and descriptions, ↑/↓ select, and the selected row stays reachable at narrow widths.
-- `/doctor` opens local terminal diagnostics, and `leveler doctor` prints the same observations: terminal, SSH/tmux, color hints, newline keys and clipboard route. Diagnostics neither read nor write the clipboard and never change terminal settings; a capability without evidence stays unknown.
-- Copying selected conversation text prefers the native clipboard with readback verification, only on a local host outside tmux. SSH skips the remote native clipboard, and tmux skips native writes as well because an inherited server environment cannot establish the current attached client; both write the tmux paste buffer and send OSC 52 instead. A buffer write or forwarded sequence is reported as sent with local delivery unverified, and an OSC 52 payload above 64 KiB is refused explicitly.
-- A command keeps its full identity in the conversation, where it expands to the complete argument text wrapped to terminal width; the status strip reports the phase and the command's own elapsed instead of repeating the command. A command waiting without output says so.
-- The Background Tasks page keeps its task list above the detail pane: identity and stop controls stay fixed while only command/log content scrolls, mouse clicks select tasks, the wheel follows the region under the pointer, and each task retains its own scroll and follow state.
+- A response body that cannot be read records what the transport had already seen — HTTP status, declared content type and encoding, bytes received, and a redacted tail of them — under the failed request, and `leveler trace` prints it. A `200` that broke mid-body is no longer indistinguishable from an upstream that never answered.
+- Failure wording follows the delivery evidence: "cannot reach the service" only when nothing was sent, "receiving the response failed" once headers arrived, "response interrupted" for a stream cut mid-flight, and "communication failed" when the transport cannot say.
+- A transient reasoning-only interruption may use the bounded retry lifecycle when no answer text or tool-call data was received. Reasoning is still generated (and possibly billed) content, so the failure stays `Caution` rather than blindly safe; each failed attempt is settled before the retry and the new attempt never merges abandoned reasoning. Answer text or a started tool call is still never replayed.
+
+## Execution
+
+- A host that died leaves its ready file behind. Liveness is now decided by the host's own lifecycle lock rather than the file's existence, so a dead host's residue is cleared and the runtime starts instead of failing with `Connection refused`.
+- The execution host shuts down cleanly on SIGTERM, removing its ready file on the same path as an idle exit.
+- A semantic write reservation the host never admitted is released on the next start, but only when the archive holds no fact for it and no spawn intent is outstanding. `leveler background journal list` and `leveler background journal abandon <task-id>` inspect and release them by hand.
 
 ## Presentation
 
-- The footer context bar is presentation only. Percentage, denominator, bar length and color come from the runtime projection; provider usage is only the no-snapshot fallback, and a snapshot whose window is unknown has no gauge. The eight-cell bar uses info below 70%, warning at 70–89% and error at 90% or above. Narrow rows drop the bar, then the cache, then the capacity chips, while the clock and the permission / collaboration controls retain priority.
-- `/context` names input capacity, model window and output reservation separately. Compaction policy and thresholds stay on the input-capacity axis, while the runtime snapshot's `free_tokens` remains model-window free; the inspector derives its grid and its free remainder from the axis it selected.
-- A running command's status reports the phase and the command's own elapsed, so the command name is stated once, in its conversation row.
-- Thoughts use bounded previews. A live Thought shows its header and at most the latest three wrapped body rows; a completed standalone Thought occupies no history row until it is explicitly opened, and settled Thoughts with blank bodies stay hidden. Manually expanded Thoughts stay open through later events, and Ctrl+O opens the latest tool group or, without tools, the latest Thought.
-- Exploration receipts fold independently at each level: opening a receipt restores tool headers in real chronology without showing completed Thoughts, closing a parent hides every child while retaining explicit reader choices, and each tool reuses its own expanded state.
-- Real transcripts start at the viewport top, so streaming and Thought folding never move the first message; only the empty-session splash is centered. Manual folding, and a runtime completion or interruption that folds a Thought or regroups receipts, keep the line at the viewport's top edge in place.
-- Command details remain reachable in place, and background commands settle their row when the process exits.
+- Consecutive ordinary tools accumulate into one receipt per visible stage, including a lone tool. The closed header reports real kinds and counts, marks failures separately, and states a running call's own state and count; folding never shows busy or cancelled work as finished.
+- Reasoning no longer appears in the conversation. The status strip reports the streaming fact and clears it at completion, and Ctrl+O opens the latest tool group's details without substituting a thought.
+- Tool and failure details start collapsed and open through their own header.
+- A confirmed edit diff is shown in full by default, and progress prose and the Final are shown as written, without a per-paragraph prefix symbol.
 
-## Validation and limits
+## Fixes
 
-The editing, search, diagnostics and clipboard paths carry deterministic coverage, including bounded history, grapheme-safe restore and the routing receipt. Transcript presentation is covered across resize, history replay and PTY-driven dogfood fixtures, and the context-statistics fixture corpus pins the new footer axis.
+- A permission-settings edit no longer treats answer progress since the observed snapshot as a settings conflict.
+- Agent progress updates connect observed work to the goal instead of restating each tool call.
 
-Clipboard route evidence is deliberately narrow: only a native write followed by matching readback on a local, non-tmux host is verified, tmux configuration is never silently changed, and DCS passthrough support remains unknown. Physical terminal compositor flicker and real remote-terminal clipboard delivery are not qualified by these tests.
+## Documentation
+
+- The Chinese architecture document is rewritten as a usage guide arranged by what a user does, with the technical constraints kept in the same file.

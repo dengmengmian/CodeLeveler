@@ -6,10 +6,34 @@ Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
 ## [Unreleased]
 
+## [1.0.15] - 2026-10-13
+
+Makes a stalled provider answer diagnosable and recoverable, and settles how the
+conversation presents work: one receipt per visible stage, reasoning only in the
+status strip, and details on demand.
+
+### Added
+
+- A response body that cannot be read records what the transport had already seen — HTTP status, declared content type and encoding, bytes received, and a redacted tail of them — in `model_requests.error_detail`, and `leveler trace` prints it under the failed request. A `200` that broke mid-body is no longer indistinguishable from an upstream that never answered, and a first attempt at the same finding is not thrown away with the consumed response
+- `leveler background journal list` and `leveler background journal abandon <task-id>` inspect and release semantic write reservations, naming the fact that decides each one
+
 ### Changed
 
-- Settled TUI tool processes fold across model rounds into one clickable receipt with counts by tool kind and explicit failure, stopped, and unknown outcomes. Opening the receipt restores member headers in order; each member retains its own details. Confirmed edit diffs remain fully visible.
-- Lone commands no longer repeat a group title; background wait receipts stay inside their drawer, and background completion updates the matching starter without a duplicate transcript notice.
+- Settled TUI tool processes fold across model rounds into one clickable receipt with counts by tool kind and explicit failure, stopped, and unknown outcomes. Opening the receipt restores member headers in order; each member retains its own details. Confirmed edit diffs remain fully visible
+- Lone commands no longer repeat a group title; background wait receipts stay inside their drawer, and background completion updates the matching starter without a duplicate transcript notice
+- Consecutive ordinary tools accumulate into one receipt per visible stage, including a lone tool. The closed header reports real kinds and counts and marks failures separately; running work states its own state and count, and folding never shows busy or cancelled work as finished
+- Reasoning no longer appears in the conversation. The status strip reports the streaming fact and clears it at completion; Ctrl+O opens the latest tool group's details and never substitutes a thought
+- Tool and failure details start collapsed and open through their own header, which keeps a running call's real state visible either way
+- Progress prose and the Final are shown as written, without a per-paragraph prefix symbol, and model text is no longer restated by the interface
+- Model-failure wording follows delivery evidence: "cannot reach the service" only when nothing was sent, "receiving the response failed" once headers arrived, "response interrupted" for a stream cut mid-flight, and "communication failed" when the transport cannot say
+- Agent progress updates connect observed work to the user's goal — an opening statement, updates at findings, blockers and direction changes — instead of restating each tool call
+
+### Fixed
+
+- A response body that failed mid-read no longer ends the whole task when the identical transient condition one phase later was recoverable: a reasoning-only interruption with no answer text or tool-call data may use the bounded retry lifecycle. Each failed attempt is settled before the retry and abandoned reasoning is never merged; answer text or a started tool call is still never replayed
+- A permission-settings edit no longer treats answer progress since the observed snapshot as a settings conflict
+- A stopped execution host no longer blocks the next runtime start: liveness is decided by the host's lifecycle lock rather than the existence of its ready file, so a dead host's residue is cleared and SIGTERM removes it cleanly
+- A semantic write reservation the host never admitted no longer blocks every future start; it is released when the archive holds no fact for it and no spawn intent is outstanding, and everything else keeps its reservation
 
 ## [1.0.14] - 2026-10-12
 
