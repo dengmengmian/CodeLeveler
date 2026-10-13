@@ -106,6 +106,49 @@ fn start(s: &mut AppState, id: &str) {
             answer_effect: None,
         }),
     );
+    // Member status and output assertions explicitly open the default receipt.
+    open_groups(s);
+}
+
+fn open_groups(s: &mut AppState) {
+    let groups: Vec<(usize, ToolCallId)> = s
+        .transcript
+        .items()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            TranscriptItem::ToolGroup(g) => g.calls.first().map(|c| (i, c.id.clone())),
+            _ => None,
+        })
+        .collect();
+    for (item, id) in groups {
+        if !s.conv.process_fold_expanded(&id) {
+            crate::conversation::interaction::toggle_fold(s, item);
+        }
+    }
+}
+
+fn open_body(s: &mut AppState, id: &str) {
+    open_groups(s);
+    let target = s
+        .transcript
+        .items()
+        .iter()
+        .enumerate()
+        .find_map(|(i, item)| {
+            if let TranscriptItem::ToolGroup(g) = item {
+                g.calls
+                    .iter()
+                    .position(|c| c.id.as_str() == id)
+                    .map(|c| (i, c, g.calls[c].expanded))
+            } else {
+                None
+            }
+        })
+        .expect("member");
+    if !target.2 {
+        crate::conversation::interaction::toggle_call(s, target.0, target.1);
+    }
 }
 
 fn complete(
@@ -329,6 +372,7 @@ fn a_network_denied_command_reads_as_needing_network_permission() {
             stop: None,
         }),
     );
+    open_body(&mut s, "net");
     let rows = plain(&s);
     assert!(
         row_with(&s, "⚠ $ certbot renew --dry-run · 需要网络权限").is_some(),
@@ -377,6 +421,7 @@ fn a_backgrounded_command_says_it_started_not_that_it_finished() {
             stop: None,
         }),
     );
+    open_body(&mut s, "bg");
     let rows = plain(&s);
     assert!(
         rows.iter().any(|r| r.contains("后台运行")),
@@ -406,13 +451,14 @@ fn a_failed_command_summarizes_its_error_not_its_exit_code() {
             stop: None,
         }),
     );
+    open_body(&mut s, "t");
     let rows = plain(&s);
     assert!(
         rows.iter()
-            .any(|r| r.contains("└ test cli::tests::rollback ... FAILED")),
+            .any(|r| r.contains("test cli::tests::rollback ... FAILED")),
         "the first line reporting a failure: {rows:?}"
     );
-    assert!(!rows.iter().any(|r| r.contains("└ exit: 101")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("exit 101")), "{rows:?}");
 
     // A multi-binary `cargo test`: the first suite passed, and its summary
     // says "0 failed". Reading that as the reason left "失败 · exit 101" over
@@ -431,10 +477,11 @@ fn a_failed_command_summarizes_its_error_not_its_exit_code() {
             stop: None,
         }),
     );
+    open_body(&mut s, "u");
     let rows = plain(&s);
     assert!(
         rows.iter()
-            .any(|r| r.contains("└ test default_outputs_all_stats ... FAILED")),
+            .any(|r| r.contains("test default_outputs_all_stats ... FAILED")),
         "a zero count is not a failure report: {rows:?}"
     );
 
@@ -453,10 +500,11 @@ fn a_failed_command_summarizes_its_error_not_its_exit_code() {
             stop: None,
         }),
     );
+    open_body(&mut s, "v");
     let rows = plain(&s);
     assert!(
         rows.iter()
-            .any(|r| r.contains("└ ✗ B 第三笔触顶 cap，cut=80")),
+            .any(|r| r.contains("✗ B 第三笔触顶 cap，cut=80")),
         "{rows:?}"
     );
 
@@ -474,10 +522,11 @@ fn a_failed_command_summarizes_its_error_not_its_exit_code() {
             stop: None,
         }),
     );
+    open_body(&mut s, "u");
     let rows = plain(&s);
     assert!(
         rows.iter()
-            .any(|r| r.contains("└ ls: nope: No such file or directory")),
+            .any(|r| r.contains("ls: nope: No such file or directory")),
         "without an error line, the first thing it printed: {rows:?}"
     );
 }
@@ -581,6 +630,7 @@ fn a_sandbox_policy_note_is_not_rendered_as_a_failure_reason() {
             stop: None,
         }),
     );
+    open_body(&mut s, "g1");
     let rendered = plain(&s).join("\n");
     assert!(
         rendered.contains("git grep ZZZ_NOT_FOUND_ZZZ_9f3a") && rendered.contains("exit 1"),
@@ -707,6 +757,69 @@ fn x_among_several_running_commands_stops_only_the_focused_one() {
     assert_eq!(call(&s, "c3").stop, StopRequest::None, "C keeps running");
 }
 
+/// Explicit keyboard command focus reveals the selected execution before the
+/// stop key can act on it; automatic tool events keep the receipt folded.
+#[test]
+fn keyboard_focus_reveals_the_selected_command_before_stopping_it() {
+    let mut s = state();
+    s.transcript.push_user("run two commands".into());
+    for (id, arg) in [("first", "first-visible"), ("second", "second-visible")] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: "run_command".into(),
+                arguments: serde_json::json!({"program":"echo", "args":[arg]}).to_string(),
+                parallel: true,
+                model_step: Some(0),
+                answer_effect: None,
+            }),
+        );
+    }
+    assert!(row_with(&s, "first-visible").is_none());
+    assert!(row_with(&s, "second-visible").is_none());
+    assert!(plain(&s).iter().any(|l| l.contains("执行了 2 个命令")));
+    focus_command(&mut s);
+    assert_eq!(s.command_selected, Some(ToolCallId::new("first")));
+    assert!(
+        row_with(&s, "→ ◌ $ echo first-visible").is_some(),
+        "keyboard focus reveals the actual selected command: {:?}",
+        plain(&s)
+    );
+    let (_, selected_row) = cell_of(&s, "→ ◌ $ echo first-visible");
+    let (_, top, _, height) = s.conv.rect.unwrap();
+    assert!(
+        (top..top + height).contains(&selected_row),
+        "selected row is on screen"
+    );
+    assert!(
+        !call(&s, "first").expanded,
+        "focus does not change the output drawer"
+    );
+    key(&mut s, KeyCode::Down);
+    assert_eq!(s.command_selected, Some(ToolCallId::new("second")));
+    assert!(
+        row_with(&s, "→ ◌ $ echo second-visible").is_some(),
+        "moving selection reveals the next command: {:?}",
+        plain(&s)
+    );
+    let (_, selected_row) = cell_of(&s, "→ ◌ $ echo second-visible");
+    assert!(
+        (top..top + height).contains(&selected_row),
+        "next selected row is on screen"
+    );
+    let effects = key(&mut s, KeyCode::Char('x'));
+    assert_eq!(
+        effects,
+        vec![Effect::Send(ClientCommand::CancelToolCall {
+            session_id: SessionId::new("s1"),
+            call_id: ToolCallId::new("second"),
+        })]
+    );
+    assert_eq!(call(&s, "first").stop, StopRequest::None);
+    assert_eq!(call(&s, "second").stop, StopRequest::Sent);
+}
+
 /// The contextual hint names the stop only while a running command holds the
 /// focus, and gives the row back when the focus leaves.
 #[test]
@@ -815,10 +928,10 @@ fn a_refused_stop_returns_the_row_to_running() {
     assert!(!head.contains("正在停止"), "{head:?}");
 }
 
-/// A command that stays running shows the tail of what it prints without being
-/// asked; a click opens its whole output, a second click returns to the tail.
+/// A live command keeps output behind its drawer until clicked; closing the
+/// drawer restores the compact header without exposing output.
 #[test]
-fn a_running_command_shows_its_tail_and_a_click_opens_all_of_it() {
+fn a_running_command_keeps_output_folded_until_clicked() {
     let mut s = state();
     start(&mut s, "c1");
     s.elapsed_secs = 1;
@@ -827,16 +940,9 @@ fn a_running_command_shows_its_tail_and_a_click_opens_all_of_it() {
         output(&mut s, "c1", &format!("Waiting for DNS {i}\n"));
     }
     assert!(
-        row_with(&s, "Waiting for DNS 10").is_some(),
-        "live tail: {:?}",
-        plain(&s)
+        row_with(&s, "Waiting for DNS 10").is_none(),
+        "live output stays folded until the member is clicked"
     );
-    assert!(
-        row_with(&s, "Processing /etc/letsencrypt").is_none(),
-        "only the tail: {:?}",
-        plain(&s)
-    );
-
     let (_, row) = cell_of(&s, "$ certbot");
     click(&mut s, 6, row);
     assert!(call(&s, "c1").expanded);
@@ -850,7 +956,7 @@ fn a_running_command_shows_its_tail_and_a_click_opens_all_of_it() {
     click(&mut s, 6, row);
     assert!(!call(&s, "c1").expanded);
     assert!(row_with(&s, "Processing /etc/letsencrypt").is_none());
-    assert!(row_with(&s, "Waiting for DNS 10").is_some());
+    assert!(row_with(&s, "Waiting for DNS 10").is_none());
 }
 
 /// The same logical block settles in place: the tail leaves, the row stays,
@@ -861,7 +967,7 @@ fn a_command_settles_in_place_without_a_duplicate_row() {
     start(&mut s, "c1");
     s.elapsed_secs = 1;
     output(&mut s, "c1", "Congratulations, all renewals succeeded\n");
-    assert!(row_with(&s, "Congratulations").is_some());
+    assert!(row_with(&s, "Congratulations").is_none());
     complete(&mut s, "c1", true, 14_200, Some(0), None);
     let rows = plain(&s);
     let command_rows = rows.iter().filter(|r| r.contains("$ certbot")).count();
@@ -876,11 +982,10 @@ fn a_command_settles_in_place_without_a_duplicate_row() {
     );
 }
 
-/// A failed command's row IS a one-line summary — so it must say how much it is
-/// not showing. Without the count a 60-line compiler report reads as a
-/// one-line result, and the fold that hides the rest is never discoverable.
+/// A failed member preserves its diagnostic when the user opens its bounded
+/// output, even when the diagnostic arrived separately from streamed stdout.
 #[test]
-fn a_failed_command_declares_the_output_its_one_row_hides() {
+fn a_failed_command_restores_diagnostic_and_omitted_output_on_click() {
     let mut s = state();
     start(&mut s, "c1");
     let chunk: String = (1..=60).map(|i| format!("line {i}\n")).collect();
@@ -897,26 +1002,22 @@ fn a_failed_command_declares_the_output_its_one_row_hides() {
             stop: None,
         }),
     );
-    let rows = plain(&s);
-    let summary = rows
-        .iter()
-        .find(|l| l.contains("cannot add"))
-        .unwrap_or_else(|| panic!("{rows:?}"));
     assert!(
-        summary.contains("(+59"),
-        "the summary must name what it hides (60 lines - 1 shown): {summary:?}"
+        !plain(&s).iter().any(|l| l.contains("cannot add")),
+        "the member error is hidden before disclosure"
+    );
+    let (_, row) = cell_of(&s, "$ certbot");
+    click(&mut s, 6, row);
+    assert!(
+        plain(&s).iter().any(|l| l.contains("cannot add")),
+        "click restores the actual diagnostic"
     );
     assert!(
-        rows.len() < 20,
-        "and it stays a summary, not a dump: {}",
-        rows.len()
+        plain(&s).iter().any(|l| l.contains("行未显示")),
+        "bounded output discloses omitted lines"
     );
 }
 
-/// A chatty command cannot grow the conversation without bound — and it keeps
-/// BOTH ends of its output: a compiler report states the diagnostic and its
-/// `--> file:line` at the top and the summary at the bottom, so a tail-only
-/// window made the one line the user needed unreachable.
 #[test]
 fn expanded_output_is_bounded_and_says_what_it_hid() {
     let mut s = state();
@@ -969,6 +1070,7 @@ fn parallel_commands_keep_independent_identity() {
             }),
         );
     }
+    open_groups(&mut s);
     output(&mut s, "a", "from a\n");
     complete(&mut s, "b", true, 2_000, Some(0), None);
     let lines = plain(&s);
@@ -1034,6 +1136,7 @@ fn a_reconnect_restores_the_running_clock_and_output() {
         &mut s,
         Action::Runtime(RuntimeEvent::SessionOpened { session: snap }),
     );
+    open_groups(&mut s);
     let call = call(&s, "c1");
     assert_eq!(call.output, "Processing renewal\n");
     assert!(
@@ -1299,4 +1402,40 @@ fn paused_background_unread_grows_after_log_cap() {
         }),
     );
     assert!(s.background_task_views.is_empty());
+}
+
+#[test]
+fn long_edits_remain_complete_without_disclosure_or_ctrl_o() {
+    let mut s = state();
+    for (id, path) in [("first", "first.rs"), ("second", "second.rs")] {
+        s.transcript.push_tool_started(
+            ToolCallId::new(id),
+            "apply_patch".into(),
+            serde_json::json!({"path":path}).to_string(),
+            false,
+            0,
+            Some(0),
+            None,
+        );
+        let diff = format!(
+            "--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,80 @@\n{}",
+            (0..80).map(|n| format!("+{id}_{n}\n")).collect::<String>()
+        );
+        s.transcript
+            .complete_tool(&ToolCallId::new(id), true, "applied".into(), 1, Some(diff));
+    }
+    s.transcript.push_note("Done.".into());
+    assert!(plain(&s).iter().any(|l| l.contains("first_79")));
+    assert!(plain(&s).iter().any(|l| l.contains("second_79")));
+    let first_header = row_with(&s, "first.rs").unwrap().0;
+    assert!(
+        s.command_hit_at(100, first_header).is_none(),
+        "complete diffs have no per-edit disclosure"
+    );
+    let before = plain(&s);
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+    );
+    assert_eq!(plain(&s), before, "Ctrl+O cannot hide canonical diffs");
 }

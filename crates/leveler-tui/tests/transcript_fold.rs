@@ -1,19 +1,10 @@
 //! The Reasoning / Thought and execution-fold presentation contract.
 //!
-//! These tests drive the REAL reducer and the REAL conversation builder, so
-//! every assertion is about the lines the terminal paints. The contract:
-//!
-//! - A Thought is a SIBLING of the tool activity that follows it, never its
-//!   parent. Its `│` rail covers its own body and nothing else.
-//! - Live Thoughts show the latest three display rows; standalone completed
-//!   Thoughts stay hidden until explicitly opened. Opened bodies stay visible.
-//! - A run of Search / Read / List is ONE view-time fold whose collapsed row is
-//!   an aggregate receipt — and expanding restores every real member row.
-//! - A finished collapsed Thought inside such a run is a participant: the
-//!   collapsed receipt hides it and counts tools only, while its semantic item
-//!   is kept, while expanding reveals only tools in real chronology. A Thought's
-//!   stored display choice cannot reveal it through the parent receipt.
-//! - Folding never moves the reader's viewport.
+//! These tests drive the real reducer and conversation builder.
+//! Reasoning facts are retained but never paint conversation rows or hits.
+//! Tools in each prose-delimited phase accumulate in one collapsed receipt;
+//! opening restores real member chronology. Failures remain folded too.
+//! Confirmed diffs stay visible in full and folds preserve the viewport.
 
 use leveler_client_protocol::{MessageId, RuntimeEvent, SessionId, ToolCallId, UiSessionSnapshot};
 use leveler_tui::action::Action;
@@ -259,7 +250,7 @@ fn thought_index(s: &AppState) -> usize {
 }
 
 #[test]
-fn exploration_receipt_mouse_opens_members_and_ctrl_o_reveals_thought_headers() {
+fn exploration_receipt_mouse_and_ctrl_o_preserve_tools_without_reasoning_rows() {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -268,7 +259,7 @@ fn exploration_receipt_mouse_opens_members_and_ctrl_o_reveals_thought_headers() 
         reasoning_start(&mut s);
         reasoning(&mut s, &format!("private reasoning {index}"));
         reasoning_done(&mut s, 400 + index as u64);
-        read_in_round(&mut s, &format!("read-{index}"), path, index as u32);
+        read_in_round(&mut s, &format!("read-{index}"), path, 0);
     }
     reasoning_start(&mut s);
     reasoning(&mut s, "private final reasoning");
@@ -291,16 +282,15 @@ fn exploration_receipt_mouse_opens_members_and_ctrl_o_reveals_thought_headers() 
             modifiers: KeyModifiers::empty(),
         }),
     );
-    // An open receipt restores its member rows: the tool targets in real
-    // chronology and, between them, a header for every finished Thought. The
-    // bodies stay folded — that is what makes each header its own disclosure.
+    // Opening restores tool targets in real chronology, with no reasoning
+    // headers, bodies or disclosure hits.
     let assert_open = |s: &AppState| {
         let rows = lines(s);
         let painted = rows.join("\n");
         assert_eq!(
             painted.matches("思考 ·").count(),
-            3,
-            "every member Thought keeps a header: {painted}"
+            0,
+            "reasoning has no header even when the receipt opens: {painted}"
         );
         assert!(!painted.contains("private"), "no body is opened: {painted}");
         let first = rows.iter().position(|r| r.contains("README.md")).unwrap();
@@ -311,9 +301,10 @@ fn exploration_receipt_mouse_opens_members_and_ctrl_o_reveals_thought_headers() 
         assert!(first < second, "{painted}");
         let (_, hits) = build_conversation_lines_with_hits(s, W);
         assert!(
-            hits.iter()
+            !hits
+                .iter()
                 .any(|(_, i)| matches!(s.transcript.items()[*i], TranscriptItem::Thought(_))),
-            "each restored header is its own disclosure row"
+            "reasoning never owns disclosure rows"
         );
     };
     assert_open(&s);
@@ -355,16 +346,16 @@ fn exploration_receipt_mouse_opens_members_and_ctrl_o_reveals_thought_headers() 
 
 // ── THOUGHT-FOLD ─────────────────────────────────────────────────────────────
 
-/// THOUGHT-FOLD-1: live reasoning shows its updating body by default.
+/// Live reasoning updates its semantic fact without painting conversation rows.
 #[test]
-fn thought_fold_1_live_reasoning_shows_its_body_by_default() {
+fn thought_fold_1_live_reasoning_is_kept_without_conversation_rows() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先看工作区和近期变更。");
     assert_eq!(thoughts(&s)[0].text, "先看工作区和近期变更。");
     let text = text(&s);
-    assert!(text.contains("思考中"), "{text}");
-    assert!(text.contains("先看工作区和近期变更。"), "{text}");
+    assert!(!text.contains("思考中"), "{text}");
+    assert!(!text.contains("先看工作区和近期变更。"), "{text}");
 }
 
 /// THOUGHT-FOLD-2: `ReasoningCompleted` folds the body away on its own.
@@ -380,57 +371,34 @@ fn thought_fold_2_completion_auto_folds() {
 }
 
 #[test]
-fn thought_preview_keeps_latest_three_display_rows() {
+fn multiline_reasoning_preserves_raw_text_without_display_rows() {
     let mut s = opened();
     reasoning_start(&mut s);
-    reasoning(&mut s, "first\nsecond\nthird\nfourth\nfifth");
-    let rows = lines(&s);
-    let body: Vec<_> = rows.iter().filter(|line| line.starts_with('│')).collect();
-    assert_eq!(body.len(), 3, "{rows:?}");
-    assert!(body[0].contains("third"));
-    assert!(body[2].contains("fifth"));
-    assert!(!rows.iter().any(|line| line == "▌"));
+    let raw = "first\nsecond\nthird\nfourth\nfifth";
+    reasoning(&mut s, raw);
+    assert_eq!(thoughts(&s)[0].text, raw);
+    assert_eq!(lines(&s).len(), 1, "live reasoning adds no rows");
     reasoning_done(&mut s, 16000);
-    let rows = lines(&s);
-    assert!(
-        !rows.iter().any(|line| line.contains("思考 · 16.0s")),
-        "{rows:?}"
-    );
-    assert!(!rows.iter().any(|line| line.starts_with('│')));
+    assert_eq!(thoughts(&s)[0].duration_ms, Some(16000));
+    assert_eq!(lines(&s).len(), 1, "completion adds no rows");
     let (_, hits) = build_conversation_lines_with_hits(&s, W);
     assert!(!hits.iter().any(|(_, item)| *item == thought_index(&s)));
 }
 
 #[test]
-fn thought_preview_bounds_wrapped_rows_and_keeps_manual_expansion() {
+fn long_reasoning_stays_hidden_despite_stored_expansion() {
     let mut s = opened();
     reasoning_start(&mut s);
-    reasoning(&mut s, &"long reasoning ".repeat(70));
-    assert_eq!(
-        lines(&s)
-            .iter()
-            .filter(|line| line.starts_with('│'))
-            .count(),
-        3
-    );
+    let raw = "long reasoning ".repeat(70);
+    reasoning(&mut s, &raw);
+    let before = lines(&s);
     let item = thought_index(&s);
     toggle_fold(&mut s, item);
-    assert!(
-        lines(&s)
-            .iter()
-            .filter(|line| line.starts_with('│'))
-            .count()
-            > 3
-    );
+    assert_eq!(lines(&s), before, "display choices cannot reveal reasoning");
     reasoning_done(&mut s, 1000);
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Expanded);
-    assert!(
-        lines(&s)
-            .iter()
-            .filter(|line| line.starts_with('│'))
-            .count()
-            > 3
-    );
+    assert_eq!(thoughts(&s)[0].text, raw);
+    assert_eq!(lines(&s), before);
 }
 
 #[test]
@@ -478,17 +446,21 @@ fn thought_completion_keeps_follow_tail_at_bottom() {
 }
 
 #[test]
-fn thought_preview_is_bounded_at_narrow_cjk_width() {
+fn reasoning_is_hidden_at_narrow_cjk_widths() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, &"正在逐项核对配置与错误路径。".repeat(20));
+    assert_eq!(
+        thoughts(&s)[0].text,
+        "正在逐项核对配置与错误路径。".repeat(20)
+    );
     for width in [4, 8, 20, 40] {
         let rows = build_conversation_lines_with_hits(&s, width).0;
         assert_eq!(
             rows.iter()
                 .filter(|line| line.spans.first().is_some_and(|span| span.content == "│ "))
                 .count(),
-            3
+            0
         );
         assert!(
             rows.iter()
@@ -549,9 +521,9 @@ fn thought_fold_3_collapsed_thought_is_hidden() {
     );
 }
 
-/// THOUGHT-FOLD-4 / -5: the body comes back on expand and goes away again.
+/// Stored reasoning display choices cannot change conversation visibility.
 #[test]
-fn thought_fold_4_and_5_expand_and_collapse_again() {
+fn thought_fold_4_and_5_display_choices_do_not_reveal_reasoning() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先看工作区和近期变更。\n再检查测试和错误路径。");
@@ -560,8 +532,8 @@ fn thought_fold_4_and_5_expand_and_collapse_again() {
 
     s.transcript.set_item_display(item, DisplayMode::Expanded);
     let opened = text(&s);
-    assert!(opened.contains("先看工作区和近期变更。"), "{opened}");
-    assert!(opened.contains("再检查测试和错误路径。"), "{opened}");
+    assert!(!opened.contains("先看工作区和近期变更。"), "{opened}");
+    assert!(!opened.contains("再检查测试和错误路径。"), "{opened}");
 
     s.transcript.set_item_display(item, DisplayMode::Collapsed);
     let folded = text(&s);
@@ -596,7 +568,7 @@ fn thought_fold_6_a_pinned_history_thought_survives_later_events() {
     assert_eq!(thoughts(&s)[0].text, "第一段推理。");
     assert_eq!(thoughts(&s)[0].duration_ms, Some(1000));
     let rendered = text(&s);
-    assert!(rendered.contains("第一段推理。"), "{rendered}");
+    assert!(!rendered.contains("第一段推理。"), "{rendered}");
 }
 
 /// THOUGHT-FOLD-7: a new reasoning segment is the transcript's last item, and
@@ -622,44 +594,32 @@ fn thought_fold_7_a_new_thought_is_the_tail() {
     assert!(!thoughts(&s)[1].done);
 }
 
-/// THOUGHT-FOLD-8: a tool row is a SIBLING of the Thought, not its child —
-/// the same first column, and the Thought's `│` rail never reaches it. A lone
-/// read outside any run is the clean case: nothing is folded, so the Thought
-/// header and the tool row are both drawn at the entry column.
+/// Tools remain siblings in event chronology; hidden reasoning owns no rail
+/// or hit, and cannot wrap visible tool rows.
 #[test]
 fn thought_fold_8_a_tool_is_a_sibling_not_a_thought_child() {
     let mut s = opened();
-    s.tools_expanded = true; // The reader requested reasoning details.
     reasoning_start(&mut s);
     reasoning(&mut s, "先看工作区。");
     reasoning_done(&mut s, 4100);
     read(&mut s, "t1", "a.rs");
     settle_group(&mut s);
-
-    let item = thought_index(&s);
-    toggle_fold(&mut s, item);
-
+    let thought = thought_index(&s);
+    toggle_fold(&mut s, thought);
+    let group = s.transcript.last_tool_group_index().unwrap();
+    toggle_fold(&mut s, group);
     let rows = lines(&s);
-    let header = rows
-        .iter()
-        .position(|l| l.contains("思考 · 4.1s"))
-        .expect("the Thought header");
-    let tool = rows
-        .iter()
-        .position(|l| l.contains("a.rs"))
-        .expect("the tool row");
-    assert!(header < tool, "the tool follows its Thought: {rows:?}");
-    assert_eq!(
-        rows[header].chars().take_while(|c| *c == ' ').count(),
-        rows[tool].chars().take_while(|c| *c == ' ').count(),
-        "the tool row sits at the same column as the Thought: {rows:?}"
-    );
+    assert!(rows.iter().any(|line| line.contains("a.rs")));
     assert!(
-        rows[tool..]
+        !rows
             .iter()
-            .all(|l| !l.starts_with('│') && !l.trim_start().starts_with('│')),
-        "no rail carries into the tool: {rows:?}"
+            .any(|line| line.contains("思考") || line.starts_with('│'))
     );
+    let items = s.transcript.items();
+    assert!(thought < group, "tools remain siblings in event chronology");
+    assert!(matches!(&items[thought], TranscriptItem::Thought(b) if b.text == "先看工作区。"));
+    let (_, hits) = build_conversation_lines_with_hits(&s, W);
+    assert!(!hits.iter().any(|(_, item)| *item == thought));
 }
 
 // ── TOOL-GROUP ───────────────────────────────────────────────────────────────
@@ -862,8 +822,7 @@ fn run_thought_1_a_folded_thought_is_a_participant_of_the_run() {
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Collapsed);
 }
 
-/// RUN-THOUGHT-2: opening restores the member tools in chronology, each with
-/// the header of the Thought that sat between them; bodies stay folded.
+/// Opening restores member tools in chronology without reasoning rows.
 #[test]
 fn run_thought_2_opening_the_run_restores_members_in_order() {
     let mut s = opened();
@@ -885,8 +844,8 @@ fn run_thought_2_opening_the_run_restores_members_in_order() {
     let rows = lines(&s);
     assert_eq!(
         rows.iter().filter(|line| line.contains("思考 ·")).count(),
-        1,
-        "the folded Thought keeps its header: {rows:?}"
+        0,
+        "reasoning contributes no header: {rows:?}"
     );
     assert!(
         !rows.iter().any(|line| line.contains("先读 pricing。")),
@@ -903,10 +862,9 @@ fn run_thought_2_opening_the_run_restores_members_in_order() {
     assert!(first < second, "real chronology: {rows:?}");
 }
 
-/// RUN-THOUGHT-3: a Thought the reader opens shows exactly its own body inside
-/// the receipt; the other member rows are unaffected.
+/// Stored reasoning expansion cannot reveal a body inside an open receipt.
 #[test]
-fn run_thought_3_stored_expansion_shows_that_body_only() {
+fn run_thought_3_stored_expansion_cannot_reveal_reasoning() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先读 pricing。");
@@ -927,22 +885,21 @@ fn run_thought_3_stored_expansion_shows_that_body_only() {
     let body = text(&s);
     assert_eq!(
         body.matches("先读 pricing。").count(),
-        1,
-        "the opened Thought states its body once: {body}"
+        0,
+        "stored expansion cannot reveal reasoning: {body}"
     );
     assert_eq!(
         body.matches("思考 ·").count(),
-        1,
-        "and keeps exactly its own header: {body}"
+        0,
+        "reasoning has no header: {body}"
     );
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Expanded);
 }
 
-/// RUN-THOUGHT-4: a Thought the reader opened is pinned, so neither the run's
-/// own fold nor reopening it folds that body away; the tool members still
-/// follow the receipt.
+/// Legacy reasoning pinning preserves semantic facts without exposing a body;
+/// the tool receipt still controls its own member visibility.
 #[test]
-fn run_thought_4_pinned_thought_survives_its_parent_folding() {
+fn run_thought_4_stored_pinning_preserves_facts_without_revealing_reasoning() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先读 pricing。");
@@ -964,8 +921,8 @@ fn run_thought_4_pinned_thought_survives_its_parent_folding() {
         "tool members are folded: {rows:?}"
     );
     assert!(
-        text(&s).contains("先读 pricing。"),
-        "a pinned Thought is never folded away: {rows:?}"
+        !text(&s).contains("先读 pricing。"),
+        "stored pinning cannot reveal reasoning: {rows:?}"
     );
     let anchor = s.transcript.last_tool_group_index().unwrap();
     // This fixture's calls share one group, which is also the receipt anchor.
@@ -977,15 +934,14 @@ fn run_thought_4_pinned_thought_survives_its_parent_folding() {
     );
     assert_eq!(
         text(&s).matches("先读 pricing。").count(),
-        1,
-        "the pinned body is still stated once: {rows:?}"
+        0,
+        "the pinned body stays hidden: {rows:?}"
     );
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Expanded);
     assert!(thoughts(&s)[0].display_pinned);
 }
 
-/// RUN-THOUGHT-5: a standalone completed Thought hides its collapsed row, and
-/// the lone read beside it keeps its own row — no receipt is invented.
+/// Standalone reasoning is hidden and a lone read retains its own receipt.
 #[test]
 fn run_thought_5_standalone_thought_hides_its_collapsed_row() {
     let mut s = opened();
@@ -1003,12 +959,12 @@ fn run_thought_5_standalone_thought_hides_its_collapsed_row() {
         "its collapsed header stays hidden: {rows:?}"
     );
     assert!(
-        rows.iter().any(|l| l.contains("README.md")),
-        "a lone read keeps its own row: {rows:?}"
+        !rows.iter().any(|l| l.contains("README.md")),
+        "a lone read defaults to a collapsed receipt: {rows:?}"
     );
     assert!(
-        !rows.iter().any(|l| l.contains("读取 1 次")),
-        "no receipt for a single read: {rows:?}"
+        rows.iter().any(|l| l.contains("读取 1 次")),
+        "single reads retain a receipt: {rows:?}"
     );
 }
 
@@ -1018,7 +974,7 @@ fn completed_thought_disappears_without_a_disclosure_hit_or_blank_gap() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先检查。 ");
-    assert!(text(&s).contains("思考中"));
+    assert!(!text(&s).contains("思考中"));
     reasoning_done(&mut s, 500);
     let hidden_item = thought_index(&s);
     let (painted, hits) = build_conversation_lines_with_hits(&s, W);
@@ -1031,17 +987,17 @@ fn completed_thought_disappears_without_a_disclosure_hit_or_blank_gap() {
     assert!(
         painted
             .iter()
-            .any(|line| line.to_string().contains("README.md"))
+            .any(|line| line.to_string().contains("读取 1 次"))
     );
     toggle_fold(&mut s, hidden_item);
-    assert!(text(&s).contains("先检查。"));
+    assert!(!text(&s).contains("先检查。"));
     toggle_fold(&mut s, hidden_item);
     assert!(!text(&s).contains("思考 ·"));
 }
 
-/// The keyboard can still open completed reasoning when there is no tool group.
+/// Ctrl+O has no reasoning fallback when there is no tool group.
 #[test]
-fn ctrl_o_reveals_hidden_completed_reasoning_without_tools() {
+fn ctrl_o_does_not_reveal_completed_reasoning_without_tools() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "保留的分析。 ");
@@ -1052,7 +1008,7 @@ fn ctrl_o_reveals_hidden_completed_reasoning_without_tools() {
         crossterm::event::KeyModifiers::CONTROL,
     );
     reduce(&mut s, Action::Key(key));
-    assert!(text(&s).contains("保留的分析。"));
+    assert!(!text(&s).contains("保留的分析。"));
     reduce(&mut s, Action::Key(key));
     assert!(!text(&s).contains("思考 ·"));
 }
@@ -1118,10 +1074,7 @@ fn run_fold_1_and_2_a_command_folds_and_reveals() {
     );
     settle_group(&mut s);
     let folded = text(&s);
-    assert!(
-        folded.contains("执行命令") || folded.contains("echo"),
-        "{folded}"
-    );
+    assert!(folded.contains("执行了 1 个命令"), "{folded}");
 
     let group = s
         .transcript
@@ -1207,7 +1160,7 @@ fn viewport_anchor(s: &AppState) -> (usize, i64) {
 /// RESUME-FOLD-1: replayed reasoning restores its body and duration, and comes
 /// back folded — a resumed session is history, not a live segment.
 #[test]
-fn resume_fold_1_replayed_thought_is_collapsed_but_openable() {
+fn resume_fold_1_replayed_reasoning_facts_survive_without_display_rows() {
     let mut s = opened();
     // The replay path is the same event sequence the durable projection emits.
     reasoning_start(&mut s);
@@ -1227,20 +1180,19 @@ fn resume_fold_1_replayed_thought_is_collapsed_but_openable() {
     let item = thought_index(&s);
     toggle_fold(&mut s, item);
     assert!(
-        text(&s).contains("先检查工作区和近期变更。"),
-        "and it opens back up"
+        !text(&s).contains("先检查工作区和近期变更。"),
+        "display toggles leave replayed reasoning hidden"
     );
 }
 
 // ── THOUGHT-LABEL ────────────────────────────────────────────────────────────
 //
-// The Thought header is wording only. A completed segment reads `思考 · 0.9s`
-// (bare verb + measurement), a streaming one keeps `思考中…`, and a cut one
-// stays explicit. The lifecycle, `DisplayMode` and persistence are untouched.
+// Reasoning lifecycle, duration and interruption remain recorded facts, while
+// conversation headers and bodies stay absent in every lifecycle state.
 
-/// THOUGHT-LABEL-1: a completed Thought's Chinese header is `思考 · {duration}`.
+/// Completed reasoning retains its duration but paints no header.
 #[test]
-fn thought_label_1_completed_header_is_verb_dot_duration() {
+fn completed_reasoning_retains_duration_without_a_header() {
     let mut s = opened();
     s.tools_expanded = true; // The reader requested reasoning details.
     reasoning_start(&mut s);
@@ -1249,23 +1201,24 @@ fn thought_label_1_completed_header_is_verb_dot_duration() {
     let item = thought_index(&s);
     toggle_fold(&mut s, item);
     let text = text(&s);
-    assert!(text.contains("◆ 思考 · 0.9s"), "{text}");
+    assert!(!text.contains("◆ 思考 · 0.9s"), "{text}");
+    assert_eq!(thoughts(&s)[0].duration_ms, Some(900));
     assert!(!text.contains("已思考"), "{text}");
 }
 
-/// THOUGHT-LABEL-2: a streaming Thought still reads `思考中…`.
+/// Streaming reasoning remains active without a conversation header.
 #[test]
-fn thought_label_2_running_header_is_unchanged() {
+fn live_reasoning_fact_has_no_conversation_header() {
     let mut s = opened();
     reasoning_start(&mut s);
     let text = text(&s);
-    assert!(text.contains("◆ 思考中…"), "{text}");
+    assert!(!text.contains("◆ 思考中…"), "{text}");
+    assert!(s.transcript.is_thinking());
 }
 
-/// THOUGHT-LABEL-3: a segment that never reached a clean boundary says so, and
-/// never wears the completed form.
+/// Interrupted reasoning is a retained fact without a conversation header.
 #[test]
-fn thought_label_3_interrupted_header_stays_explicit() {
+fn interrupted_reasoning_retains_interruption_without_a_header() {
     let mut s = opened();
     s.tools_expanded = true; // The reader requested reasoning details.
     reasoning_start(&mut s);
@@ -1276,19 +1229,19 @@ fn thought_label_3_interrupted_header_stays_explicit() {
     let item = thought_index(&s);
     toggle_fold(&mut s, item);
     let text = text(&s);
-    assert!(text.contains("◆ 思考中断"), "{text}");
+    assert!(!text.contains("◆ 思考中断"), "{text}");
+    assert!(thoughts(&s)[0].interrupted);
     assert!(!text.contains("思考 ·"), "{text}");
 }
 
 // ── SINGLE-EXPLORE ───────────────────────────────────────────────────────────
 //
-// One Read/Search/List is not a stretch: it shows its own target under the same
-// verb the aggregate receipt counts in. Two or more still fold into one receipt.
+// One Read/Search/List retains a collapsed receipt, just like multiple calls.
+// Opening restores its actual target and result.
 
-/// SINGLE-EXPLORE-1: one Read in a round is its own row — verb, real target,
-/// result — with no `完成 1 项` parent and no tree child under it.
+/// A single read restores its actual target through parent disclosure.
 #[test]
-fn single_explore_1_a_lone_read_shows_its_target() {
+fn single_explore_1_a_lone_read_restores_target_on_disclosure() {
     let mut s = opened();
     read_in_round(
         &mut s,
@@ -1297,6 +1250,8 @@ fn single_explore_1_a_lone_read_shows_its_target() {
         1,
     );
     settle_group(&mut s);
+    let group = s.transcript.last_tool_group_index().unwrap();
+    toggle_fold(&mut s, group);
     let text = text(&s);
     assert!(
         text.contains("› 读取 backend/internal/modules/sourcing/handler/rfq.go"),
@@ -1309,10 +1264,12 @@ fn single_explore_1_a_lone_read_shows_its_target() {
 /// SINGLE-EXPLORE-2: one Search in a round shows the query it ran and its
 /// result summary directly.
 #[test]
-fn single_explore_2_a_lone_search_shows_query_and_result() {
+fn single_explore_2_a_lone_search_restores_query_and_result_on_disclosure() {
     let mut s = opened();
     search_in_round(&mut s, "g1", "missing model", 1);
     settle_group(&mut s);
+    let group = s.transcript.last_tool_group_index().unwrap();
+    toggle_fold(&mut s, group);
     let text = text(&s);
     assert!(text.contains("› 搜索 \"missing model\""), "{text}");
     assert!(text.contains("· 1 行"), "the result summary: {text}");
@@ -1325,7 +1282,7 @@ fn single_explore_2_a_lone_search_shows_query_and_result() {
 /// Conversation at all — so the visible instance is a failed scan, whose target
 /// is exactly what the reader needs.
 #[test]
-fn single_explore_3_a_lone_list_shows_its_target() {
+fn single_explore_3_a_failed_list_restores_target_on_disclosure() {
     let mut s = opened();
     tool_started_in_round(
         &mut s,
@@ -1336,6 +1293,8 @@ fn single_explore_3_a_lone_list_shows_its_target() {
     );
     tool_failed(&mut s, "l1", "permission denied");
     settle_group(&mut s);
+    let group = s.transcript.last_tool_group_index().unwrap();
+    toggle_fold(&mut s, group);
     let text = text(&s);
     assert!(
         text.contains("› ✗ 列出 backend/internal/modules/sourcing"),
@@ -1390,6 +1349,8 @@ fn narrow_explore_1_a_long_target_does_not_break_the_layout() {
         1,
     );
     settle_group(&mut s);
+    let group = s.transcript.last_tool_group_index().unwrap();
+    toggle_fold(&mut s, group);
     let width = 40usize;
     let rows: Vec<String> = build_conversation_lines_with_hits(&s, width)
         .0
@@ -1565,18 +1526,17 @@ fn conversation_c3_a_completed_thought_is_folded() {
     assert_eq!(expected["state"], "completed");
 }
 
-/// CONV-C4: a failed Run is collapsed AND readable — the command's own failure
-/// line is on screen before anything is expanded.
+/// Failure markers are visible while diagnostics require disclosure.
 #[test]
-fn conversation_c4_a_failed_run_shows_its_failure_collapsed() {
-    let (s, doc) = drive_corpus("C4");
+fn conversation_c4_failed_run_marks_failure_and_folds_diagnostic() {
+    let (mut s, doc) = drive_corpus("C4");
     let expected = expected_item(&doc, "run_receipt");
     assert_eq!(expected["folded"], true);
     assert_eq!(expected["failure_visible"], true);
     let painted = text(&s);
     assert!(
-        painted.contains("test mapping::recommended ... FAILED"),
-        "the first line reporting the failure is on the collapsed row: {painted}"
+        !painted.contains("test mapping::recommended ... FAILED"),
+        "failure details stay hidden before disclosure: {painted}"
     );
     assert!(
         !painted.contains("exit: 101"),
@@ -1585,6 +1545,18 @@ fn conversation_c4_a_failed_run_shows_its_failure_collapsed() {
     assert!(
         painted.contains("✗") || painted.contains("失败"),
         "the row states it failed: {painted}"
+    );
+
+    reduce(
+        &mut s,
+        Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )),
+    );
+    assert!(
+        text(&s).contains("test mapping::recommended ... FAILED"),
+        "the actual diagnostic is reachable"
     );
 }
 
@@ -2062,8 +2034,8 @@ fn conversation_c10_durable_history_replay_preserves_full_tree_and_hidden_receip
     toggle_fold(&mut state, thought);
     assert_eq!(
         text(&state).matches("先看入口。").count(),
-        1,
-        "the replayed Thought the reader opened states its body once"
+        0,
+        "display choices never restore replayed reasoning to conversation"
     );
     assert_eq!(thoughts(&state)[0].text, "先看入口。");
     assert_eq!(thoughts(&state)[0].duration_ms, Some(1600));

@@ -101,10 +101,6 @@ pub struct UiText {
     pub send: &'static str,
     pub newline: &'static str,
     pub composer_placeholder: &'static str,
-    /// Ghost-text hint in front of a contextual next-step suggestion.
-    /// The key name itself is universal; it still lives here so no
-    /// renderer hardcodes UI chrome.
-    pub suggestion_tab: &'static str,
     /// Fallback suggestion for an Incomplete turn with no structured
     /// next step. Structured `next_step` text is never translated.
     pub suggestion_continue: &'static str,
@@ -816,11 +812,9 @@ pub struct UiText {
     pub final_cancelled: &'static str,
     /// Title of the single terminal-failure block.
     pub failure_title: &'static str,
-    /// Label before an expanded failure's raw technical detail.
+    /// Label before the always-visible safe technical failure detail.
     pub failure_detail_label: &'static str,
-    /// Hint shown when a failure's raw detail is collapsed.
-    pub failure_detail_hint: &'static str,
-    /// Field labels inside the failure disclosure. One per machine fact so a
+    /// Field labels inside the failure detail. One per machine fact so a
     /// user report reads the same facts a maintainer needs (provider, model,
     /// category, HTTP status, provider code, request id, reason).
     pub failure_provider_label: &'static str,
@@ -1174,7 +1168,6 @@ static ZH: UiText = UiText {
     send: "发送",
     newline: "换行",
     composer_placeholder: "输入消息，/ 查看命令",
-    suggestion_tab: "Tab: ",
     suggestion_continue: "继续",
     cancel: "取消",
     quit: "退出",
@@ -1408,7 +1401,7 @@ static ZH: UiText = UiText {
     key_newline: "换行",
     key_cancel_quit: "取消 / 退出",
     key_screens: "Diff/工具/会话",
-    key_expand: "展开/收起最新工具组及思考详情",
+    key_expand: "展开/收起最新工具组",
     key_turn_nav: "跳转用户轮次",
     key_final_nav: "跳到最终回答",
     key_model: "切换模型",
@@ -1797,7 +1790,6 @@ static ZH: UiText = UiText {
     final_cancelled: "已取消",
     failure_title: "请求失败",
     failure_detail_label: "技术详情",
-    failure_detail_hint: "Ctrl+O 查看详情",
     failure_provider_label: "服务商",
     failure_model_label: "模型",
     failure_category_label: "类别",
@@ -1965,7 +1957,6 @@ static EN: UiText = UiText {
     send: "send",
     newline: "newline",
     composer_placeholder: "Type a message, / for commands",
-    suggestion_tab: "Tab: ",
     suggestion_continue: "Continue",
     cancel: "cancel",
     quit: "quit",
@@ -2199,7 +2190,7 @@ static EN: UiText = UiText {
     key_newline: "newline",
     key_cancel_quit: "cancel / quit",
     key_screens: "diff/tools/sessions",
-    key_expand: "expand/collapse latest tool group and reasoning details",
+    key_expand: "expand/collapse latest tool group",
     key_turn_nav: "jump user turns",
     key_final_nav: "jump to the final answer",
     key_model: "switch model",
@@ -2588,7 +2579,6 @@ static EN: UiText = UiText {
     final_cancelled: "Cancelled",
     failure_title: "Request failed",
     failure_detail_label: "Technical detail",
-    failure_detail_hint: "Ctrl+O for details",
     failure_provider_label: "Provider",
     failure_model_label: "Model",
     failure_category_label: "Category",

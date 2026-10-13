@@ -868,6 +868,12 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 // on a URL opens on release when the selection stayed empty
                 // (see Up); anything else begins a selection.
                 match interaction::hit_test(state, mouse.column, mouse.row) {
+                    Hit::Receipt { item, call } => {
+                        crate::conversation::build::toggle_span_receipt(state, item, call);
+                        interaction::clear_selection_drag(state);
+                        state.conv.selection.clear();
+                        return Vec::new();
+                    }
                     Hit::Command { item, call } => {
                         // Clicking a command row toggles its output. Stopping
                         // is the contextual `x` on the keyboard-focused row.
@@ -1686,6 +1692,7 @@ fn ensure_command_selection(state: &mut AppState) {
     {
         state.command_selected = Some(candidates[0].2.clone());
     }
+    reveal_selected_command(state);
 }
 
 /// Move the Command focus by one command, clamped to the candidate list.
@@ -1706,6 +1713,36 @@ fn select_command_delta(state: &mut AppState, delta: isize) {
         (current + delta as usize).min(candidates.len() - 1)
     };
     state.command_selected = Some(candidates[next].2.clone());
+    reveal_selected_command(state);
+}
+
+/// Keep the selected command visible before any keyboard action can stop it.
+fn reveal_selected_command(state: &mut AppState) {
+    let Some(id) = state.command_selected.clone() else {
+        return;
+    };
+    let Some((item, call)) = state.command_location(&id) else {
+        return;
+    };
+    crate::conversation::build::reveal_command_receipt(state, item, call);
+    let width = crate::conversation::geometry::content_width(state);
+    let (_, _, commands, _, _, _) = state.conversation_build(width);
+    if let Some(hit) = commands
+        .iter()
+        .find(|hit| hit.item == item && hit.call == call && !hit.receipt)
+    {
+        let height = crate::conversation::geometry::viewport_height(state);
+        let top = crate::conversation::geometry::effective_scroll(
+            state.conv.scroll,
+            state.conv.auto_scroll,
+            state.conversation_lines(width).len(),
+            height,
+        );
+        if hit.line < top || hit.line >= top + height {
+            state.conv.scroll = hit.line.saturating_sub(height / 2);
+            state.conv.auto_scroll = false;
+        }
+    }
 }
 
 /// Toggle the focused command's output. Clicking its row does the same.
@@ -1757,40 +1794,19 @@ fn stop_selected_command(state: &mut AppState) -> Vec<Effect> {
     })]
 }
 
-/// Ctrl+O (keyboard fold): the latest command's details, and the reasoning the
-/// reader cannot otherwise see.
-///
-/// The product's help names this binding "展开/收起最新工具组及思考详情", so its
-/// target is the newest execution group — never "whatever entry folded last". A live
-/// Thought always sits after the tool group of the round it belongs to, so a
-/// latest-foldable target sent every Ctrl+O to the Thought and left the tool
-/// body reachable only by mouse. A transcript with no tool group at all still
-/// falls back to the newest foldable, so the key is never dead.
-///
-/// "Details" has two owners and both are asked: the receipt's own fold (its
-/// member rows) and each member call's own disclosure (their bodies). The
-/// second is what keeps a 40-read receipt's file content reachable from the
-/// keyboard. On top of that, Ctrl+O reveals the header of every completed
-/// Thought that is hidden by default, so reasoning the transcript still holds
-/// is never unreachable; each body stays folded until its own header is opened.
-///
-/// The mouse path is unchanged: a click targets exactly the row it lands on and
-/// opens one level.
+/// Ctrl+O opens or closes the latest tool receipt and its member details.
+/// Reasoning is never projected into conversation history by this action.
 fn toggle_current_expand(state: &mut AppState) {
     if let Some(index) = crate::conversation::build::keyboard_expand_target(state)
         && let Some(expanded) = crate::conversation::interaction::toggle_fold(state, index)
     {
         state.tools_expanded = expanded;
-        for item in crate::conversation::build::keyboard_detail_items(state, index) {
-            state.transcript.set_process_calls_expanded(item, expanded);
+        for (item, call) in crate::conversation::build::keyboard_detail_calls(state, index) {
+            state.transcript.set_call_expanded(item, call, expanded);
         }
         state.conv.plain.clear();
         state.conv.plain_width = 0;
     }
-    // Independent of which command is newest: the reasoning headers follow the
-    // key too, so a transcript whose only hidden entry is a Thought still
-    // answers Ctrl+O.
-    state.conv.reasoning_headers = !state.conv.reasoning_headers;
     state.conv.fold_version = state.conv.fold_version.wrapping_add(1);
     state.conv.plain.clear();
     state.conv.plain_width = 0;
@@ -2183,7 +2199,12 @@ mod disclosure_tests {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| match item {
-                TranscriptItem::ToolGroup(g) => Some((i, g.expanded())),
+                TranscriptItem::ToolGroup(g) => Some((
+                    i,
+                    g.calls
+                        .first()
+                        .is_some_and(|c| s.conv.process_fold_expanded(&c.id)),
+                )),
                 _ => None,
             })
             .collect()
@@ -2224,10 +2245,13 @@ mod disclosure_tests {
             .map(crate::selection::line_to_plain)
             .collect();
         assert!(
-            plain.contains("先看 catalog。"),
+            !plain.contains("先看 catalog。"),
             "reasoning renders: {plain}"
         );
-        assert!(plain.contains("再补测试。"), "reasoning renders: {plain}");
+        assert!(
+            !plain.contains("再补测试。"),
+            "reasoning is footer-only: {plain}"
+        );
 
         // The runtime reports the boundary: the Thought freezes with its own
         // measured duration and stops being the live block.
@@ -2608,7 +2632,10 @@ mod disclosure_tests {
             "a live reasoning update must not resume auto-follow"
         );
         assert_eq!(s.conv.scroll, 5, "the pinned viewport must not move");
-        assert!(s.conv.unread > 0, "the growth is counted, not painted");
+        assert_eq!(
+            s.conv.unread, 0,
+            "hidden reasoning creates no unread conversation rows"
+        );
     }
 
     /// DF-TUI-REASONING-11: a runtime-authored notice rides the user transport
@@ -2740,7 +2767,7 @@ mod disclosure_tests {
     }
 
     #[test]
-    fn running_group_has_no_disclosure_until_it_finishes() {
+    fn running_group_has_disclosure_before_and_after_it_finishes() {
         let mut s = test_state();
         s.transcript.push_user("q".into());
         s.transcript.push_tool_started(
@@ -2755,8 +2782,8 @@ mod disclosure_tests {
         let running_idx = s.transcript.items().len() - 1;
         let hits = s.conversation_lines_and_hits(80).1;
         assert!(
-            hits.iter().all(|(_, i)| *i != running_idx),
-            "a running group is not clickable: {hits:?}"
+            hits.iter().any(|(_, i)| *i == running_idx),
+            "a running receipt is clickable: {hits:?}"
         );
         s.transcript
             .complete_tool(&ToolCallId::new("r1"), true, "ok".into(), 10, None);
@@ -2764,8 +2791,8 @@ mod disclosure_tests {
         // (the model may stream another call). No disclosure yet.
         let hits = s.conversation_lines_and_hits(80).1;
         assert!(
-            hits.iter().all(|(_, i)| *i != running_idx),
-            "an open group stays live even with all members settled: {hits:?}"
+            hits.iter().any(|(_, i)| *i == running_idx),
+            "an open receipt remains clickable after member completion: {hits:?}"
         );
         // The group closing (next conversation item) is what commits it.
         s.transcript.push_user("next".into());

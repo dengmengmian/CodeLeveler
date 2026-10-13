@@ -471,6 +471,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 let t = state.t();
                 match &failure {
                     Some(f) => crate::transcript::FailureBlock {
+                        display: crate::fold::DisplayMode::Collapsed,
                         title: t.failure_title.to_string(),
                         summary: failure_summary(f, t),
                         subtitle: failure_subtitle(
@@ -478,16 +479,15 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                             state.resumable_task.then_some(t.resumable_hint),
                         ),
                         detail: failure_detail_text(f, t),
-                        expanded: false,
                     },
                     // A failure the runtime could not type (legacy event, or a
                     // non-provider failure): show the string as the summary.
                     None => crate::transcript::FailureBlock {
+                        display: crate::fold::DisplayMode::Collapsed,
                         title: t.failure_title.to_string(),
                         summary: error.clone(),
                         subtitle: None,
                         detail: String::new(),
-                        expanded: false,
                     },
                 }
             };
@@ -1334,8 +1334,9 @@ fn failure_is_resumable(failure: &leveler_client_protocol::UiFailure) -> bool {
     )
 }
 
-/// The failure's disclosure text: every machine fact the runtime proved, one
-/// per line, then the provider's own (already sanitized) reason.
+/// The failure's inline detail: every machine fact the runtime proved, one
+/// per line, then the provider's own reason. Values use the existing bounded
+/// provider-text sanitizer before they become visible.
 ///
 /// Built here from the typed failure so the renderer never parses a provider
 /// payload and raw request/response bodies are never dumped. Absent facts are
@@ -1349,6 +1350,7 @@ fn failure_detail_text(
     let mut field = |label: &str, value: &str| {
         let value = value.trim();
         if !value.is_empty() {
+            let value = leveler_model::error::sanitize_provider_text(value);
             lines.push(format!(
                 "{}  {value}",
                 crate::render::pad_display(label, LABEL_WIDTH)

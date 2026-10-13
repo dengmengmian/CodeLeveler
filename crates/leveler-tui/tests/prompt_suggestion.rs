@@ -186,7 +186,7 @@ fn restored_history_requests_one_prediction_even_when_entries_are_empty() {
                 text: "PR 链接发一下".into(),
             }),
         );
-        assert!(composer_row(&frame(&mut s, 100, 24)).contains("Tab: PR 链接发一下"));
+        assert!(composer_row(&frame(&mut s, 100, 24)).contains("› PR 链接发一下"));
         assert!(reduce(&mut s, key(KeyCode::Tab)).is_empty());
         assert_eq!(s.composer.canonical_text(), "PR 链接发一下");
     }
@@ -1075,7 +1075,7 @@ fn c8_staging_a_clipboard_image_dismisses_the_ghost() {
     let row = composer_row(&frame(&mut s, 100, 24));
     assert!(row.contains("图片 #1"), "the chip is painted: {row:?}");
     assert!(
-        !row.contains("Tab: ") && !row.contains(NEXT_STEP),
+        !row.contains(NEXT_STEP),
         "the ghost must not sit behind an attachment chip: {row:?}"
     );
 }
@@ -1088,7 +1088,7 @@ fn c9_a_staged_attachment_hides_the_ghost_even_if_one_is_held() {
     s.pending_attachments.push(image_attachment());
 
     assert!(!suggestion::is_visible(&s));
-    assert!(!composer_row(&frame(&mut s, 100, 24)).contains("Tab: "));
+    assert!(!composer_row(&frame(&mut s, 100, 24)).contains(NEXT_STEP));
 
     // Peeling the chip back off with Backspace leaves a clean empty composer
     // and does not resurrect the ghost.
@@ -1101,17 +1101,19 @@ fn c9_a_staged_attachment_hides_the_ghost_even_if_one_is_held() {
 // ---- D. what the terminal actually paints ----------------------------------
 
 #[test]
-fn d1_the_ghost_frame_shows_the_tab_hint_over_an_empty_buffer() {
-    let mut s = with_suggestion();
-    let row = composer_row(&frame(&mut s, 100, 24));
+fn d1_the_ghost_frame_shows_only_the_suggestion_over_an_empty_buffer() {
+    for text in ["跑", NEXT_STEP] {
+        let mut s = opened();
+        goal_turn(&mut s, "complete", Some(text));
+        let row = composer_row(&frame(&mut s, 100, 24));
 
-    assert!(row.contains("Tab: "), "missing Tab hint: {row:?}");
-    assert!(row.contains(NEXT_STEP), "missing next step: {row:?}");
-    assert!(s.composer.is_empty(), "buffer is still empty");
-    assert!(
-        row.starts_with("╭") || row.contains("› "),
-        "the prompt survives: {row:?}"
-    );
+        assert!(!row.contains("Tab: "), "unexpected Tab label: {row:?}");
+        assert!(
+            row.contains(&format!("› {text}")),
+            "missing next step: {row:?}"
+        );
+        assert!(s.composer.is_empty(), "buffer is still empty");
+    }
 }
 
 #[test]
@@ -1123,7 +1125,7 @@ fn d2_the_ghost_adds_no_composer_row_and_moves_no_caret() {
     let mut ghosted = opened();
     goal_turn(&mut ghosted, "complete", Some(NEXT_STEP));
     let (ghost_screen, ghost_caret) = draw(&mut ghosted, 100, 24);
-    assert!(composer_row(&ghost_screen).contains("Tab: "));
+    assert!(composer_row(&ghost_screen).contains(NEXT_STEP));
 
     assert_eq!(
         plain_screen
@@ -1163,7 +1165,7 @@ fn d3_double_width_and_emoji_suggestions_truncate_without_panicking() {
 }
 
 #[test]
-fn d4_a_narrow_terminal_keeps_the_tab_label_and_shortens_the_body() {
+fn d4_a_narrow_terminal_shows_the_suggestion_without_a_label() {
     let mut s = with_suggestion();
 
     // 8 columns leaves the composer no content room at all — degrade, never
@@ -1171,13 +1173,12 @@ fn d4_a_narrow_terminal_keeps_the_tab_label_and_shortens_the_body() {
     let row = composer_row(&frame(&mut s, 8, 12));
     assert!(!row.contains(NEXT_STEP), "impossibly narrow row: {row:?}");
 
-    // From the first column of real room upward, the label comes first and the
-    // body is what gives way.
+    // Available room goes directly to the suggestion text.
     for width in [10u16, 14, 18, 24] {
         let row = composer_row(&frame(&mut s, width, 12));
         assert!(
-            row.contains("Ta"),
-            "width {width} dropped the Tab label: {row:?}"
+            row.contains("查"),
+            "width {width} dropped the suggestion text: {row:?}"
         );
         assert!(
             !row.contains(NEXT_STEP),
@@ -1185,9 +1186,9 @@ fn d4_a_narrow_terminal_keeps_the_tab_label_and_shortens_the_body() {
         );
     }
 
-    // Wide enough: label and body both fit in full.
+    // Wide enough: the suggestion fits in full.
     let row = composer_row(&frame(&mut s, 80, 24));
-    assert!(row.contains("Tab: "), "{row:?}");
+    assert!(!row.contains("Tab: "), "unexpected Tab label: {row:?}");
     assert!(row.contains(NEXT_STEP), "{row:?}");
 }
 
@@ -1198,7 +1199,6 @@ fn d5_real_input_replaces_the_ghost_in_the_painted_row() {
     let row = composer_row(&frame(&mut s, 100, 24));
 
     assert!(row.contains("这个订单"));
-    assert!(!row.contains("Tab: "), "ghost still painted: {row:?}");
     assert!(!row.contains(NEXT_STEP), "ghost still painted: {row:?}");
 }
 
@@ -1208,12 +1208,15 @@ fn d6_the_ghost_hides_while_input_does_not_own_focus() {
     s.workbench_focus = WorkbenchFocus::Conversation;
     assert!(!suggestion::is_visible(&s));
     let row = composer_row(&frame(&mut s, 100, 24));
-    assert!(!row.contains("Tab: "), "shown without Input focus: {row:?}");
+    assert!(
+        !row.contains(NEXT_STEP),
+        "shown without Input focus: {row:?}"
+    );
 
     // Clicking back into the input shows it again: leaving the box only hides.
     s.workbench_focus = WorkbenchFocus::Input;
     assert!(suggestion::is_visible(&s));
-    assert!(composer_row(&frame(&mut s, 100, 24)).contains("Tab: "));
+    assert!(composer_row(&frame(&mut s, 100, 24)).contains(NEXT_STEP));
 }
 
 #[test]
@@ -1323,7 +1326,7 @@ fn acceptance_ghost_frame_then_accepted_frame_then_one_send() {
 
     // Frame A — offered, not accepted.
     let frame_a = composer_row(&frame(&mut s, 80, 24));
-    assert!(frame_a.contains("Tab: "), "frame A: {frame_a:?}");
+    assert!(!frame_a.contains("Tab: "), "frame A: {frame_a:?}");
     assert!(frame_a.contains(NEXT_STEP), "frame A: {frame_a:?}");
     assert_eq!(s.composer.canonical_text(), "", "frame A buffer is empty");
 
@@ -1345,7 +1348,7 @@ fn acceptance_ghost_frame_then_accepted_frame_then_one_send() {
     let frame_b = composer_row(&frame(&mut s, 80, 24));
     assert!(frame_b.contains(NEXT_STEP), "frame B: {frame_b:?}");
     assert!(
-        !frame_b.contains("Tab: "),
+        !suggestion::is_visible(&s),
         "frame B still ghosted: {frame_b:?}"
     );
     assert_eq!(s.composer.canonical_text(), NEXT_STEP);

@@ -1148,19 +1148,7 @@ fn hunk_start(header: &str, side: char) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// Shared edit body for Tools screen / Conversation: file header, line gutter,
-/// green/red code (no raw `+/-` clutter).
-/// Render an applied patch in full.
-///
-/// Deliberately uncapped (spec §6). Tool OUTPUT — a log, a help dump, a file
-/// read — is a step toward the result and may be summarized behind a
-/// disclosure. A patch that reached the user's tree IS the result, and this
-/// row sequence is the only record of its shape: an abridged diff leaves the
-/// reader unable to answer what the agent actually changed, and no later
-/// Changes view repairs that (it shows the CUMULATIVE tree, not this step).
-/// Long diffs stay affordable because the conversation caches its built lines
-/// per transcript version and the viewport paints only the rows on screen —
-/// the cost is bounded by edits made, not by frames drawn.
+/// Render the canonical applied patch; presentation can preview these rows.
 fn push_edit_diff_body(
     patch: &str,
     theme: &Theme,
@@ -1269,7 +1257,7 @@ pub(crate) fn patch_stats_from_text(patch: &str) -> PatchStats {
 
 /// Combined inline diff rows for one or more same-file patches (merged edit
 /// node in the activity stream). File-marker rows are skipped — the unit's
-/// argument line already shows the file. Complete: see [`push_edit_diff_body`].
+/// argument line already shows the file.
 pub(crate) fn merged_diff_rows(
     calls: &[&ToolCallBlock],
     theme: &Theme,
@@ -1432,10 +1420,8 @@ mod m1_tests {
 
     fn diff_text(patch: &str, width: usize, expanded: bool) -> String {
         let mut out = Vec::new();
-        // `expanded` is accepted so the callers' matrix still exercises both,
-        // but an applied diff renders the same either way — that is the point.
-        let _ = expanded;
         push_edit_diff_body(patch, &Theme::no_color(), width, &mut out, true);
+        let _ = expanded;
         out.iter()
             .map(|line| {
                 line.spans
@@ -1843,12 +1829,7 @@ mod m1_tests {
         );
     }
 
-    // ── §6: an applied edit's diff is evidence, so it is never abridged ─────
-    //
-    // Read/search/command output may be summarized: it is a step toward the
-    // result. A patch that landed in the user's tree IS the result, and the
-    // transcript is the only place its shape is recorded. Folding it away
-    // leaves the user unable to answer "what did the agent actually change".
+    // Canonical applied data is retained while the default preview stays short.
 
     /// A synthetic applied diff of `adds` added lines against one hunk.
     fn wide_applied_diff(adds: usize) -> String {
@@ -1861,42 +1842,33 @@ mod m1_tests {
         patch
     }
 
-    /// D1: every added line of a 500-line patch reaches the rows, collapsed.
     #[test]
-    fn a_long_applied_diff_keeps_every_line_without_being_expanded() {
+    fn fixed_contract_long_applied_diff_defaults_to_complete_content() {
         let patch = wide_applied_diff(500);
         let text = diff_text(&patch, 90, false);
-        for i in [0usize, 1, 17, 250, 498, 499] {
+        assert!(text.contains("let line_0 = 0;"), "{text}");
+        assert!(text.contains("let line_499 = 499;"), "{text}");
+        assert!(!text.contains("还有"), "{text}");
+    }
+
+    #[test]
+    fn expanding_an_applied_diff_restores_every_line() {
+        let patch = wide_applied_diff(500);
+        let text = diff_text(&patch, 90, true);
+        for i in 0..500 {
             assert!(
                 text.contains(&format!("let line_{i} = {i};")),
-                "line {i} was dropped from the diff body"
+                "missing line {i}"
             );
         }
+        assert!(!text.contains("还有"), "{text}");
     }
 
-    /// D2: nothing claims lines are hidden, because none are.
     #[test]
-    fn a_long_applied_diff_carries_no_truncation_notice() {
-        let patch = wide_applied_diff(500);
-        for expanded in [false, true] {
-            let text = diff_text(&patch, 90, expanded);
-            assert!(
-                !text.contains("完整 Diff") && !text.contains("full diff"),
-                "a complete diff must not offer to show itself: {expanded}"
-            );
-            assert!(
-                !text.contains("还有") && !text.contains("more lines"),
-                "a complete diff must not count hidden lines: {expanded}"
-            );
-        }
-    }
-
-    /// D3: expanding changes nothing about an applied diff — there is no
-    /// hidden half to reveal. (The disclosure still governs tool OUTPUT.)
-    #[test]
-    fn expanding_does_not_change_an_applied_diff() {
-        let patch = wide_applied_diff(120);
+    fn a_short_diff_does_not_offer_expansion() {
+        let patch = wide_applied_diff(3);
         assert_eq!(diff_text(&patch, 90, false), diff_text(&patch, 90, true));
+        assert!(!diff_text(&patch, 90, false).contains("还有"));
     }
 
     /// D4: the gutter column is sized from the whole patch, so a 4-digit line
@@ -1908,7 +1880,7 @@ mod m1_tests {
         for i in 0..20 {
             patch.push_str(&format!("+    let line_{i} = {i};\n"));
         }
-        let text = diff_text(&patch, 90, false);
+        let text = diff_text(&patch, 90, true);
         let code_rows: Vec<&str> = text
             .lines()
             .filter(|l| l.contains("let line_") || l.contains("fn anchor"))

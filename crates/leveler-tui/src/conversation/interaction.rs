@@ -19,6 +19,8 @@ pub enum Hit {
     /// A tool call's row → that call. Clicking toggles its output; stopping
     /// is the contextual `x` on the focused row.
     Command { item: usize, call: usize },
+    /// A receipt spanning calls inside one mixed semantic group.
+    Receipt { item: usize, call: usize },
     /// A tool-disclosure header row → the transcript item to toggle.
     Disclosure { item: usize },
     /// A row containing an http(s) URL under the pointer. Carries the content
@@ -44,6 +46,12 @@ pub fn hit_test(state: &AppState, col: u16, row: u16) -> Hit {
     };
     // A command row owns its own disclosure, ahead of its group's.
     if let Some(hit) = state.command_hit_at(geometry::content_width(state), pos.row) {
+        if hit.receipt {
+            return Hit::Receipt {
+                item: hit.item,
+                call: hit.call,
+            };
+        }
         return Hit::Command {
             item: hit.item,
             call: hit.call,
@@ -170,9 +178,18 @@ pub fn toggle_call(state: &mut AppState, item: usize, call: usize) -> Option<boo
     Some(expanded)
 }
 
+/// A painted source identity and its row offset, independent of neighboring folds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadingAnchor {
+    item: usize,
+    call: Option<leveler_client_protocol::ToolCallId>,
+    receipt: bool,
+    offset: usize,
+}
+
 /// Capture the visible item before a presentation boundary changes its height.
 /// Streaming deltas do not use this: projection still follows painted frames.
-pub(crate) fn reading_anchor(state: &AppState) -> Option<(usize, usize)> {
+pub(crate) fn reading_anchor(state: &AppState) -> Option<ReadingAnchor> {
     if state.conv.auto_scroll {
         None
     } else {
@@ -181,30 +198,60 @@ pub(crate) fn reading_anchor(state: &AppState) -> Option<(usize, usize)> {
 }
 
 /// Keep the same item and row at the top after a fold or runtime boundary.
-pub(crate) fn restore_reading_anchor(state: &mut AppState, anchor: Option<(usize, usize)>) {
-    if let Some((item, offset)) = anchor
-        && let Some((start, end)) = state.item_span(item, geometry::content_width(state))
-    {
-        // A removed body offset stays within the surviving item or on its
-        // following separator, matching manual fold anchoring.
+pub(crate) fn restore_reading_anchor(state: &mut AppState, anchor: Option<ReadingAnchor>) {
+    let Some(ReadingAnchor {
+        item,
+        call,
+        receipt,
+        offset,
+    }) = anchor
+    else {
+        return;
+    };
+    let width = geometry::content_width(state);
+    if let Some(call) = call {
+        let sources = state.conversation_build(width).5;
+        if let Some(source) = sources.iter().find(|source| {
+            source.call.as_ref() == Some(&call)
+                && source.receipt == receipt
+                && source.end > source.start + offset
+        }) {
+            state.conv.scroll = source.start + offset;
+            return;
+        }
+    }
+    if let Some((start, end)) = state.item_span(item, width) {
         state.conv.scroll = start + offset.min(end.saturating_sub(start));
     }
 }
 
-/// The transcript item and intra-item offset painted at the viewport's top
-/// edge, as the reader is currently looking at it.
-fn top_of_viewport(state: &AppState, width: usize) -> Option<(usize, usize)> {
+/// Capture the exact painted source, so expanding an earlier call in the same
+/// semantic group does not move the diff or command currently being read.
+fn top_of_viewport(state: &AppState, width: usize) -> Option<ReadingAnchor> {
     let height = geometry::viewport_height(state);
-    let total = crate::conversation::build::conversation_line_count(state, width);
-    let painted = geometry::effective_scroll(state.conv.scroll, false, total, height);
-    let count = state.transcript.len();
-    let anchor = (0..count).rev().find(|&i| {
-        state
-            .item_span(i, width)
-            .is_some_and(|(start, end)| start < end && start <= painted)
-    })?;
-    let start = state.item_start_line(anchor, width)?;
-    Some((anchor, painted - start))
+    let (lines, _, _, _, spans, sources) = state.conversation_build(width);
+    let painted = geometry::effective_scroll(state.conv.scroll, false, lines.len(), height);
+    if let Some(source) = sources
+        .iter()
+        .rev()
+        .find(|source| source.start <= painted && painted < source.end)
+    {
+        return Some(ReadingAnchor {
+            item: source.item,
+            call: source.call.clone(),
+            receipt: source.receipt,
+            offset: painted - source.start,
+        });
+    }
+    let item = spans
+        .iter()
+        .rposition(|(start, end)| start < end && *start <= painted)?;
+    Some(ReadingAnchor {
+        item,
+        call: None,
+        receipt: false,
+        offset: painted - spans[item].0,
+    })
 }
 
 /// Accelerate scroll while the pointer stays in an edge hot zone.
@@ -267,7 +314,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicitly_opened_completed_thought_can_anchor_the_viewport() {
+    fn completed_thought_toggle_preserves_the_visible_viewport_anchor() {
         let mut state = AppState::new(
             crate::theme::Theme::no_color(),
             crate::state::Boot {
@@ -292,11 +339,19 @@ mod tests {
         state.transcript.push_note("tail\n".repeat(40));
         let (start, end) = state.item_span(1, 80).unwrap();
         assert_eq!(end - start, 0, "collapsed completed reasoning has no row");
-        toggle_fold(&mut state, 1);
-        let (start, end) = state.item_span(1, 80).unwrap();
-        assert_eq!(end - start, 2, "explicit details show the header and body");
         state.conv.auto_scroll = false;
         state.conv.scroll = start;
-        assert_eq!(top_of_viewport(&state, 80), Some((1, 0)));
+        let anchor = top_of_viewport(&state, 80);
+        assert!(anchor.is_some());
+        let before = crate::conversation::build::conversation_line_count(&state, 80);
+        toggle_fold(&mut state, 1);
+        let (start_after, end_after) = state.item_span(1, 80).unwrap();
+        assert_eq!(end_after - start_after, 0, "reasoning remains zero-height");
+        assert_eq!(
+            crate::conversation::build::conversation_line_count(&state, 80),
+            before
+        );
+        assert_eq!(state.conv.scroll, start);
+        assert_eq!(top_of_viewport(&state, 80), anchor);
     }
 }

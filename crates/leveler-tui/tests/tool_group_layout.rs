@@ -162,13 +162,6 @@ fn parent_row(lines: &[String]) -> usize {
 }
 
 /// The starting column of the group's first child row.
-fn child_column(lines: &[String], from: usize) -> usize {
-    let child = lines[from..]
-        .iter()
-        .find(|l| l.trim_start().starts_with('\u{203a}'))
-        .unwrap_or_else(|| panic!("no child row after {from}: {lines:?}"));
-    child.chars().take_while(|c| *c == ' ').count()
-}
 
 /// The number of rows the group occupies, parent included.
 ///
@@ -218,38 +211,21 @@ fn a_running_stage_keeps_its_geometry_from_first_call_to_close() {
     let p1 = parent_row(&t1);
     let p2 = parent_row(&t2);
 
-    // The parent row is present in all three, and closing never inserts one.
-    assert!(
-        t0[p0].trim_start().starts_with('\u{22ee}'),
-        "t0 live: {t0:?}"
-    );
-    assert!(
-        t1[p1].trim_start().starts_with('\u{22ee}'),
-        "t1 live: {t1:?}"
-    );
-    assert!(
-        t2[p2].trim_start().starts_with('\u{25b8}'),
-        "t2 closed: {t2:?}"
-    );
+    // The receipt header is present in all three, and closing never inserts one.
+    assert!(t0[p0].contains("正在执行"), "t0 live: {t0:?}");
+    assert!(t1[p1].contains("正在执行"), "t1 live: {t1:?}");
+    assert!(t2[p2].contains("执行了 2 个命令"), "t2 closed: {t2:?}");
+    assert_eq!(p1, p2, "completion keeps the receipt in place");
 
-    // The child's starting column is identical while running and after close.
-    assert_eq!(
-        child_column(&t0, p0),
-        child_column(&t1, p1),
-        "t0:{t0:?}\nt1:{t1:?}"
-    );
-    assert_eq!(p1, p2, "completion keeps the parent in place");
+    // A receipt is one row whether it runs or settles: its members are
+    // reachable by opening it, never by growing the conversation.
+    assert_eq!(1, group_rows(&t0, p0), "t0:{t0:?}");
+    assert_eq!(1, group_rows(&t1, p1), "t1:{t1:?}");
+    assert_eq!(1, group_rows(&t2, p2), "t2:{t2:?}");
 
-    // Closing neither adds nor removes a row; growing only appends.
-    assert_eq!(1, group_rows(&t2, p2), "t1:{t1:?}\nt2:{t2:?}");
-    assert_eq!(
-        group_rows(&t0, p0) + 1,
-        group_rows(&t1, p1),
-        "t0:{t0:?}\nt1:{t1:?}"
-    );
-
-    // Only the wording changed.
-    assert!(t1[p1].contains("正在执行 · 2 个命令"), "t1: {t1:?}");
+    // Only the wording changed, and the settled receipt names what it ran
+    // without inlining the assembled command.
+    assert!(t1[p1].contains("正在执行 1 项"), "t1: {t1:?}");
     assert!(
         t2[p2].contains("执行了 2 个命令") && !t2.iter().any(|l| l.contains("$ cargo")),
         "t2: {t2:?}"
@@ -262,7 +238,7 @@ fn a_running_stage_keeps_its_geometry_from_first_call_to_close() {
 fn a_burst_of_instant_commands_keeps_the_same_geometry_at_every_step() {
     let mut s = opened();
     next_assistant(&mut s, "a1");
-    let mut seen: Vec<(usize, usize, usize)> = Vec::new();
+    let mut seen: Vec<(usize, usize)> = Vec::new();
     for (i, id) in ["c1", "c2", "c3"].into_iter().enumerate() {
         start(
             &mut s,
@@ -271,7 +247,7 @@ fn a_burst_of_instant_commands_keeps_the_same_geometry_at_every_step() {
         );
         let snap = lines(&s);
         let p = parent_row(&snap);
-        seen.push((p, child_column(&snap, p), group_rows(&snap, p)));
+        seen.push((p, group_rows(&snap, p)));
         finish(&mut s, id, 0);
     }
     next_assistant(&mut s, "a2");
@@ -284,11 +260,9 @@ fn a_burst_of_instant_commands_keeps_the_same_geometry_at_every_step() {
         "instant commands also fold once closed"
     );
 
-    for (i, (row, col, rows)) in seen.iter().enumerate() {
-        assert_eq!(*row, seen[0].0, "step {i} moved the parent: {seen:?}");
-        assert_eq!(*col, seen[0].1, "step {i} moved the children: {seen:?}");
-        let expected = if i < 3 { i + 2 } else { 4 };
-        assert_eq!(*rows, expected, "step {i} row count: {seen:?}");
+    for (i, (row, rows)) in seen.iter().enumerate() {
+        assert_eq!(*row, seen[0].0, "step {i} moved the receipt: {seen:?}");
+        assert_eq!(*rows, 1, "step {i} row count: {seen:?}");
     }
 }
 
@@ -334,15 +308,22 @@ fn the_painted_screen_does_not_shift_when_the_group_closes() {
     // content arriving below the group is not the group reflowing.)
     // The parent row exists on the painted screen from the group's first
     // second, adjacent to the child it owns.
+    // The receipt is one row from its first second, so the painted frame is
+    // stable: settling changes the wording, never the geometry around it.
+    let receipt = |f: &[String]| screen_row(f, "▸ 正在执行 1 项 · 执行了 1 个命令");
     assert_eq!(
-        screen_row(&f0, "⋮ 正在执行 · 1 个命令") + 1,
-        screen_row(&f0, "› ◌ $ cargo check"),
-        "t0 frame:\n{}",
-        f0.join("\n")
+        receipt(&f0),
+        screen_row(&f1, "▸ 正在执行 1 项 · 执行了 2 个命令"),
+        "t0 frame:\n{}\nt1 frame:\n{}",
+        f0.join("\n"),
+        f1.join("\n")
     );
-    let gap = |f: &[String], needle: &str| screen_row(f, needle) - screen_row(f, "● ▌");
+    // The prose above the group is the anchor: the distance from it is what a
+    // reader perceives as "nothing moved".
+    let gap =
+        |f: &[String], needle: &str| screen_row(f, needle) - screen_row(f, "▌ 先 check，再 test");
     assert_eq!(
-        gap(&f1, "⋮ 正在执行 · 2 个命令"),
+        gap(&f1, "▸ 正在执行 1 项 · 执行了 2 个命令"),
         gap(&f2, "▸ 执行了 2 个命令"),
         "the group gained a row at close:\nt1:\n{}\nt2:\n{}",
         f1.join("\n"),
@@ -351,12 +332,6 @@ fn the_painted_screen_does_not_shift_when_the_group_closes() {
     assert!(
         !f2.iter().any(|l| l.contains("$ cargo")),
         "the painted settled process is collapsed"
-    );
-    // Parent and first child are adjacent in both forms: the parent row never
-    // floats away from the children it owns.
-    assert_eq!(
-        screen_row(&f1, "⋮ 正在执行 · 2 个命令") + 1,
-        screen_row(&f1, "› ✓ $ cargo check")
     );
 }
 

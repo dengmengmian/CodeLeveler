@@ -1220,19 +1220,24 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
     );
-    let groups: Vec<_> = s
-        .transcript
-        .items()
-        .iter()
-        .filter_map(|i| match i {
-            TranscriptItem::ToolGroup(g) => Some(g.expanded()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        groups.iter().filter(|e| **e).count(),
-        1,
-        "Ctrl+O opens the TOOL GROUP even with a live Thought after it: {groups:?}"
+    // The receipt is the fold the keyboard owns: opening it must put the member
+    // back on screen, and a second press must take it away again. A live Thought
+    // is not a transcript row under the current contract, so it can never be the
+    // keyboard's substitute target.
+    // The receipt is the fold the keyboard owns: Ctrl+O must change whether its
+    // member is on screen, whichever way it started, and a live Thought must
+    // never take over as the target.
+    let before = rendered(&mut s, 120, 40);
+    let was_open = before.contains("a.rs");
+    reduce(
+        &mut s,
+        Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+    );
+    let after = rendered(&mut s, 120, 40);
+    assert_ne!(
+        after.contains("a.rs"),
+        was_open,
+        "Ctrl+O toggles the TOOL GROUP even with a live Thought after it: {after}"
     );
     let open_thought = s.transcript.items().iter().any(|i| {
         matches!(i, TranscriptItem::Thought(b) if b.display == leveler_tui::fold::DisplayMode::Expanded)
@@ -1242,30 +1247,26 @@ fn ctrl_o_toggles_the_latest_tool_group_even_while_analysis_streams() {
         "the Thought stays as it was; the tool group is the keyboard target: {:?}",
         s.transcript.items()
     );
-    // A second Ctrl+O closes it again (a toggle, not a one-way expand).
+    // A second Ctrl+O returns it to where it started (a toggle, not a one-way
+    // expand).
     reduce(
         &mut s,
         Action::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
     );
-    let closed: Vec<_> = s
-        .transcript
-        .items()
-        .iter()
-        .filter_map(|i| match i {
-            TranscriptItem::ToolGroup(g) => Some(g.expanded()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        closed.iter().all(|e| !*e),
-        "Ctrl+O toggles the tool group: {closed:?}"
+    let again = rendered(&mut s, 120, 40);
+    assert_eq!(
+        again.contains("a.rs"),
+        was_open,
+        "Ctrl+O toggles the tool group back: {again}"
     );
 }
 
-/// With no tool group at all the key is not dead: it reaches the newest
-/// foldable entry (a Thought), which is what the same key did before.
+/// Without a tool group the key must not invent a target. Reasoning is not a
+/// transcript entry under the current contract — it lives in the status strip —
+/// so Ctrl+O does nothing rather than opening something the conversation never
+/// shows.
 #[test]
-fn ctrl_o_still_reaches_the_newest_foldable_without_a_tool_group() {
+fn ctrl_o_does_not_open_a_thought_without_a_tool_group() {
     let mut s = opened();
     reduce(
         &mut s,
@@ -1281,8 +1282,8 @@ fn ctrl_o_still_reaches_the_newest_foldable_without_a_tool_group() {
         matches!(i, TranscriptItem::Thought(b) if b.display == leveler_tui::fold::DisplayMode::Expanded)
     });
     assert!(
-        open_thought,
-        "no tool group: the newest foldable is still reachable: {:?}",
+        !open_thought,
+        "no tool group: the key must not substitute a Thought: {:?}",
         s.transcript.items()
     );
 }
@@ -1673,6 +1674,97 @@ fn turn_failed_records_error_and_status() {
 }
 
 #[test]
+fn terminal_failure_detail_uses_the_existing_safe_provider_text_projection() {
+    use leveler_client_protocol::{
+        FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
+    };
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "network".into(),
+            failure: Some(UiFailure {
+                category: FailureCategory::Network,
+                source: FailureSource::Provider,
+                provider: None,
+                model: None,
+                provider_code: None,
+                request_id: None,
+                status: None,
+                retries: None,
+                retryability: FailureRetryability::Safe,
+                delivery: FailureDelivery::NotSent,
+                summary: "无法连接模型服务。".into(),
+                detail: "connection closed sk-supersecret-value".into(),
+            }),
+        }),
+    );
+    let failure = s
+        .transcript
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Failure(f) => Some(f),
+            _ => None,
+        })
+        .expect("a failure block");
+    assert!(failure.detail.contains("connection closed"));
+    assert!(failure.detail.contains("[redacted]"));
+    assert!(!failure.detail.contains("sk-supersecret-value"));
+    let screen = rendered(&mut s, 100, 24);
+    assert!(screen.contains("▸ ✗ 请求失败"));
+    assert!(
+        !screen.contains("connection closed"),
+        "details start folded: {screen}"
+    );
+    assert!(!screen.contains("sk-supersecret-value"));
+    assert!(!screen.contains("Ctrl+O 查看详情"));
+    reduce(&mut s, ctrl('o'));
+    let unchanged = rendered(&mut s, 100, 24);
+    assert!(
+        !unchanged.contains("connection closed"),
+        "Ctrl+O targets tools, not failures"
+    );
+    let row = unchanged
+        .lines()
+        .position(|line| line.contains("▸ ✗ 请求失败"))
+        .unwrap() as u16;
+    reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    let opened = rendered(&mut s, 100, 24);
+    assert!(
+        opened.contains("connection closed"),
+        "click restores the safe diagnostic: {opened}"
+    );
+    assert!(opened.contains("[redacted]"));
+    assert!(!opened.contains("sk-supersecret-value"));
+    let row = opened
+        .lines()
+        .position(|line| line.contains("▾ ✗ 请求失败"))
+        .unwrap() as u16;
+    reduce(
+        &mut s,
+        Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(
+        !rendered(&mut s, 100, 24).contains("connection closed"),
+        "second click folds details again"
+    );
+}
+
+#[test]
 fn an_exhausted_failure_states_how_many_retries_were_spent() {
     use leveler_client_protocol::{
         FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
@@ -1803,10 +1895,12 @@ fn model_retrying_is_ephemeral_not_a_transcript_item() {
     );
 }
 
-/// §11 end to end: a real `ApprovalRequested` naming a running call makes that
-/// call's transcript row say it is waiting, not that it is running.
+/// §11 end to end: a real `ApprovalRequested` naming a running call surfaces the
+/// gated command in the approval prompt, and answering it takes that prompt away.
+/// The call itself stays inside its receipt, which keeps reporting real state:
+/// a permission hold does not make a running process look finished.
 #[test]
-fn an_approval_request_stops_its_call_reading_as_running() {
+fn an_approval_request_names_the_gated_command_in_its_prompt() {
     let mut s = opened();
     s.size = (120, 40);
     reduce(
@@ -1822,8 +1916,8 @@ fn an_approval_request_stops_its_call_reading_as_running() {
     );
     let running = rendered(&mut s, 120, 40);
     assert!(
-        running.contains('◌'),
-        "the call starts out running: {running}"
+        running.contains("正在执行"),
+        "the call reads as running inside its receipt: {running}"
     );
 
     reduce(
@@ -1844,8 +1938,8 @@ fn an_approval_request_stops_its_call_reading_as_running() {
     );
     let waiting = rendered(&mut s, 120, 40);
     assert!(
-        waiting.contains("等待批准"),
-        "the gated row must say what it is waiting for: {waiting}"
+        waiting.contains("等待审批"),
+        "the prompt must say what is being gated: {waiting}"
     );
     assert!(
         waiting.contains("rm -rf stale"),
@@ -1861,10 +1955,13 @@ fn an_approval_request_stops_its_call_reading_as_running() {
     );
     let allowed = rendered(&mut s, 120, 40);
     assert!(
-        !allowed.contains("等待批准"),
+        !allowed.contains("等待审批"),
         "nothing is waiting once it is answered: {allowed}"
     );
-    assert!(allowed.contains('◌'), "and the call is running: {allowed}");
+    assert!(
+        allowed.contains("正在执行"),
+        "and the call keeps reporting the state it is really in: {allowed}"
+    );
 }
 
 // ── §12: the completion footer is a claim, and it needs an answer behind it ──

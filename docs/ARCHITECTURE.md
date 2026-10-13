@@ -306,7 +306,7 @@ Model requests separate the Harness's `ControlContext` from the conversation tra
 
 The transcript holds actual user input, assistant output, tool calls and results, bounded protocol repairs and product-defined runtime notices. Control bodies are not persisted as conversation rows. A stored `role=user` is only the transport role. New user input and harness rows record `origin` on the message payload. Rows written before that field still load, and they are not rewritten. Discovered scoped-rule source paths live in the existing progress ledger; recovery reloads current files. Legacy sessions recover source paths from old System rows and discard their stale bodies without modifying the historical database. Unknown historical system text is not given contract or project-instruction authority. Unknown historical user text is not given user-intent authority. Memory retrieval and reasoning replay are unchanged. How each block may be interpreted is defined in §5.6.
 
-Every model attempt enters the existing request records and resource ledger before retry decisions, including failed attempts, reasoning-only interrupted streams, compaction summaries, and child calls. Missing usage or pricing does not mean free execution. Children, reviewers, and `/develop` stages consume the parent's residual budget; attempt records must not double-count retries. Cancellation and deadlines wake a silent model stream. Reasoning is generated content, so an interrupted reasoning-only stream is not eligible for a retry justified by no generation having started.
+Every model attempt enters the existing request records and resource ledger before retry decisions, including failed attempts, reasoning-only interrupted streams, compaction summaries, and child calls. Missing usage or pricing does not mean free execution. Children, reviewers, and `/develop` stages consume the parent's residual budget; attempt records must not double-count retries. Cancellation and deadlines wake a silent model stream. A transient reasoning-only stream interruption may use the bounded logical retry lifecycle when no answer text or tool-call data was received. Reasoning remains generated and potentially billed content, so the failure is not blindly safe to replay. Each failed attempt is settled before retry admission; the new attempt resets live reasoning and does not merge abandoned reasoning into its answer. Streams that received answer text or tool-call data are not automatically replayed.
 
 Shared budget admission checks durable request facts for the same scope before each model request and retry; background children do not keep spending against their launch-time snapshot. Concurrent requests already sent settle with their actual reported usage. Admission blocks subsequent calls; it cannot undo spend already incurred.
 
@@ -958,8 +958,11 @@ thinking level, and collaboration carry the snapshot `last_sequence` actually
 observed by the caller (0 for an empty log). Rust `SNAPSHOT_VERSIONED_COMMANDS`
 is the sole wire-tag policy; the schema exports it for generated Web/Desktop
 consumers, while TUI calls the Rust policy directly. One SQLite writer
-transaction compares the log version, replaces only the selected field, and
-appends `SessionMetadataChanged`. Metadata and its version are read in one
+transaction rejects negative or future observed log positions and any
+`SessionMetadataChanged` after the observed position, replaces only the selected
+field, and appends `SessionMetadataChanged`. Answer progress and other events
+that do not change settings may advance the log without causing a conflict.
+Metadata and its version are read in one
 snapshot transaction. A conflict changes neither metadata nor the log; clients
 refresh and show the error without automatically retrying an overwrite.
 Completed identical command identities retain receipt-based idempotency.
@@ -1380,76 +1383,68 @@ verified by deterministic tests and real dogfood — do not regress them:
   `Auth` (structured `error.code`) and `ConnectionRefused` (structured
   `io::ErrorKind`) are decided from facts; `message.contains(...)` string
   matching is forbidden.
-- **A confirmed Edit Diff is always fully visible**: a confirmed edit's result is
-  not "output" but the change the user is being shown; its canonical diff is
-  painted whole, whatever the viewport height or fold state. There is no preview
-  budget, no `… +N lines` substitution and no diffstat-only form. The
-  full-screen Diff page and the Conversation agree. The execution tool retains
-  the complete diff after a successful commit without a byte budget dropping
-  it. When the edit also moves a file, both diff paths identify the actual source
-  and committed destination.
-- **A transcript entry's fold is presentation state only**: `Collapsed` /
-  `Truncated` / `Expanded` belongs to the TUI and never enters the Runtime,
-  the event log or persistence. Thoughts and tool groups share ONE fold
-  vocabulary; a finished Thought folds itself, a running entry's floor is
-  `Truncated`, and a user-chosen mode is never overridden by a later event.
-- **A Thought is a first-level transcript entry**: its rail covers its own body
-  and nothing else, and the tool row that follows it is a SIBLING at the same
-  first column — never a child of the Thought. A new reasoning segment is always
-  the one mutable entry at the tail. Completed reasoning is independent of
-  narration deduplication: folding repeated closeout prose must retain the
-  Thought body and duration in both live delivery and replay, without repeating
-  reasoning already emitted by the stream.
-- **Thoughts use bounded previews and completion summaries**: a live Thought at
-  the conversation tail shows its header and at most the latest three wrapped
-  body rows. The header reports streaming without an extra cursor row. A completed
-  standalone Thought occupies no history row until it is asked for; settled
-  Thoughts with blank bodies remain hidden. Ctrl+O reveals every such header at
-  once — with or without a tool group — and a header's own click opens exactly
-  that body; without any tool group the key's fold target is the newest Thought,
-  so that one opens fully. Manually expanded Thoughts stay open through later
-  events. Raw text, duration, events, persistence,
-  and provider replay remain unchanged. The status
-  strip reports the current streaming fact and clears it at completion.
-- **Tool processes fold independently at each level**: parents start closed.
-  Opening a receipt restores its member rows in real chronology: every exploration
-  call with its own body disclosure, and a header for each finished Thought that
-  sat between them — so the aggregate never hides reasoning the transcript still
-  holds. Ctrl+O additionally reveals the member and standalone Thought headers
-  even while a receipt stays closed, and opens the run's tool details, so a
-  40-read receipt's file content is reachable from the keyboard. Each tool and
-  each Thought reuses its own `expanded` presentation state for its body.
-  Closing a parent hides every member row while
-  retaining explicit reader choices for reopening; new children start collapsed.
-  Standalone Thoughts and single exploration calls keep their own disclosure.
-  Failure summaries, running feedback, and confirmed Edit diffs retain their contracts.
-
-- **A process receipt is a view-time fold, not an aggregate overlay**:
-  consecutive settled ordinary tools (Read / Search / List / Run / MCP), plus the finished default-collapsed
-  Thoughts between them, only change how the collapsed run is painted; every
-  original Thought / tool entry is kept, and expanding restores every tool member
-  and every finished Thought header in real chronology. Edits, permission holds,
-  user decisions, plan/goal management, live work, narration and the Final are breakers.
-  A returned background starter cannot fold a still-running process into settled history.
-  Labels count real tool kinds and calls without inventing stage names; Thoughts do not count.
-  Failed calls remain in their kind buckets with a separate failure count; expanding restores
-  their targets and original output. A lone settled command keeps its own description or
-  command and outcome without a redundant group title. Background terminal events update
-  the starter matched by its real task_id, without a duplicate transcript notice when that
-  starter exists; unmatched outcomes still retain their notice. Transient notifications and
-  background details remain accessible.
+- **A confirmed Edit Diff is shown in full by default**: the Conversation keeps
+  edits separate from ordinary tool receipts, retains file/change statistics and
+  shows the complete diff without default folding or a 16-row preview. Existing
+  viewport scrolling keeps all content reachable; the full-screen Diff page also
+  retains complete content. The execution tool retains the complete diff after a
+  successful commit without a byte budget dropping it. When an edit moves a file,
+  both diff paths identify the actual source and committed destination.
+- **Failure details start collapsed with a reachable disclosure**: failed ordinary
+  tools remain inside their group; its closed header shows only a failure marker
+  and count. Clicking it exposes the failed targets and sanitized concrete errors.
+  Standalone terminal failures, including request failures, also start with closed
+  details and disclose them through their own clickable header. No detail hint may
+  lack a corresponding interaction. Error source, code, recoverability and raw
+  facts remain unchanged.
+- **A transcript entry's fold is presentation state only**: tool-group and failure
+  disclosure state belongs to the TUI, never the Runtime, event log or persistence.
+  Folding cannot portray running, cancelling, cancelled or unknown work as complete;
+  headers still report real state. Later events do not arbitrarily override a
+  reader's explicit disclosure choice.
+- **Thoughts appear only in the status strip**: the Conversation shows no live or
+  completed Thought header, body, duration or disclosure. Opening a tool group or
+  pressing Ctrl+O never restores them. The status strip reports the real streaming
+  fact and clears it at completion. Raw reasoning text, duration, events, persistence
+  and provider replay remain unchanged; narration deduplication cannot delete
+  reasoning or repeat reasoning already emitted by the stream.
+- **Process receipts accumulate within visible stages**: consecutive ordinary tools
+  (Read / Search / List / Run / MCP) in one segment accumulate in a receipt that
+  starts closed, including a lone tool. Neither `round` nor a hidden Thought is a
+  boundary. User messages, assistant progress prose, the Final and separately
+  displayed edits, permission/user decisions and plan/goal management entries
+  delimit real visible stages; the view never guesses or generates a stage.
+  Receipts are view-time folds; original tool and reasoning records remain intact.
+  Labels accumulate real tool kinds and call counts (for example, "Read 3 times ·
+  Searched 2 times · Ran 2 commands") without inventing action names. Failed calls
+  stay in their kind buckets, with a separate failure marker and count.
+  A live receipt's header explicitly reports running work and its real count;
+  folding does not hide busy or cancellation facts. A returned background starter
+  cannot portray its still-running process as settled. Background terminal events
+  update the starter matched by its real task_id, without a duplicate transcript
+  notice when that starter exists; unmatched outcomes retain their notice. Transient
+  notifications and background-task details remain accessible.
+- **Tool details start collapsed**: a closed receipt shows no successful output,
+  failure reason or live output. Clicking its header restores tool members and their
+  own disclosures in real chronology; error bodies appear only after expansion.
+  Closing a parent hides members while retaining explicit disclosure choices for
+  reopening; new members start closed. Successful silent internal tools neither
+  contribute to receipt counts nor delimit visible stages; their original records
+  and available output remain accessible through tool details. Ctrl+O retains its
+  existing scope of opening the latest tool group's details; it never substitutes
+  a Thought when no group exists or becomes a full-history toggle.
+- **Progress prose and the Final are shown in full**: model text uses natural
+  paragraphs without a `●` / `◆` prefix on every paragraph. The coding domain's
+  communication contract and the model own progress content; the TUI never generates
+  discoveries or next steps. These grouping, disclosure and diff rules change only
+  product presentation, not Runtime lifecycle, execution permissions, side-effect
+  ownership, event facts or persistence.
 - **Command details remain accessible**: ordinary commands expand in place in the conversation, showing the full command from the original arguments wrapped to terminal width; the running status does not repeat long commands. The background-task page retains a task list above its detail pane, with task identity and stop controls fixed while only detail content scrolls. Full commands and long logs wrap to width; mouse clicks select tasks, and the wheel selects tasks or scrolls details according to its region. Each task retains its own scroll and follow state, and cancellation results still come from Runtime.
-- **Tool detail is collapsed by default**: Read / Search / List / Run paint only a
-  header and outcome unless asked; a lone tool's failure summary and a running command's
-  short live tail are the only bodies shown unasked. Thoughts follow the
-  reasoning-details contract above. Background wait wire receipts stay hidden until expanded.
-  Narration, the Final and a confirmed Edit
-  diff always show their body.
-- **Real transcripts start at the viewport top**: until content fills the viewport, unused rows stay below the transcript so streaming and Thought folding do not move the first message. Only the empty-session splash is centered. Painting and mouse/selection mapping use the same Conversation geometry policy; overflowing content retains normal scrolling and live-tail following.
+- **Real transcripts start at the viewport top**: until content fills the viewport, unused rows stay below the transcript so streaming and tool-group folding do not move the first message. Only the empty-session splash is centered. Painting and mouse/selection mapping use the same Conversation geometry policy; overflowing content retains normal scrolling and live-tail following.
 - **Folding must not move the reading position**: the line anchored at the
   viewport's top edge keeps its place when an entry above or inside the viewport
-  is folded. Runtime completion or interruption that auto-folds a Thought or
-  regroups exploration receipts uses the same anchor. If the anchored body is
+  is folded. Runtime completion or interruption that regroups tool receipts uses the same
+  anchor. If the anchored body is
   removed, stay near its disclosure header; following the live tail stays at the
   bottom without an anchor.
 - **Ctrl+G jumps to the Final answer**: the anchor reuses the same memoized

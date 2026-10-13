@@ -380,7 +380,8 @@ fn a_replayed_session_hides_background_wait_polls() {
             .map(|l| l.trim_end().to_string())
             .collect()
     };
-    for (name, s) in [("live", &live), ("replayed", &replayed)] {
+    for (name, s) in [("live", &mut live), ("replayed", &mut replayed)] {
+        open_process_receipts(s);
         let lines = rows(s);
         assert!(
             lines
@@ -556,6 +557,24 @@ fn a_replayed_compaction_keeps_its_line() {
     );
 }
 
+fn open_process_receipts(s: &mut AppState) {
+    let groups: Vec<(usize, ToolCallId)> = s
+        .transcript
+        .items()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            TranscriptItem::ToolGroup(g) => g.calls.first().map(|c| (i, c.id.clone())),
+            _ => None,
+        })
+        .collect();
+    for (item, id) in groups {
+        if !s.conv.process_fold_expanded(&id) {
+            crate::conversation::interaction::toggle_fold(s, item);
+        }
+    }
+}
+
 fn tool_rows(s: &AppState) -> usize {
     s.transcript
         .items()
@@ -642,10 +661,8 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
         "the two consecutive reads are one compact receipt: {live_lines:#?}"
     );
     assert!(
-        live_lines
-            .iter()
-            .any(|l| l.contains("› 读取 ") && l.contains("doctor.rs")),
-        "a lone read after the narration keeps its own row: {live_lines:#?}"
+        live_lines.iter().any(|l| l.contains("▸ 读取 1 次")),
+        "a lone read after narration retains its own folded receipt: {live_lines:#?}"
     );
     assert_eq!(
         replayed_lines, live_lines,
@@ -1071,6 +1088,8 @@ fn a_settled_command_reads_as_one_row_live_and_replayed() {
             .filter(|l| !l.starts_with("\u{2500}\u{2500}"))
             .collect()
     };
+    open_process_receipts(&mut live);
+    open_process_receipts(&mut replayed);
     let live_lines = shape(&live);
     let rows: Vec<&String> = live_lines
         .iter()
@@ -1194,6 +1213,7 @@ fn a_background_command_row_settles_when_the_process_exits() {
         for event in background_sleep_events(name) {
             reduce(&mut live, Action::Runtime(event));
         }
+        open_process_receipts(&mut live);
         let running = conversation_rows(&live);
         let row = running
             .iter()
@@ -1256,6 +1276,7 @@ fn a_background_command_row_settles_when_the_process_exits() {
             omitted_turns: 0,
         }),
     );
+    open_process_receipts(&mut replayed);
     let row = conversation_rows(&replayed)
         .into_iter()
         .find(|line| line.contains("sleep 25"))
@@ -1317,6 +1338,7 @@ fn background_completion_updates_the_starter_without_a_duplicate_transcript_noti
     };
     reduce(&mut s, Action::Runtime(exit.clone()));
     reduce(&mut s, Action::Runtime(exit));
+    open_process_receipts(&mut s);
     let rows = conversation_rows(&s);
     assert!(
         rows.iter()

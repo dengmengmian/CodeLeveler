@@ -227,11 +227,86 @@ fn open_latest(s: &mut AppState) {
     );
 }
 
-/// A — a homogeneous shell round keeps the tool's own name (`执行命令`), and
-/// never falls back to an abstract count. The same rule covers every
-/// same-tool round: reads name reads, searches name searches.
 #[test]
-fn a_homogeneous_shell_round_names_the_tool() {
+fn prose_free_rounds_share_one_visible_receipt_without_losing_round_identity() {
+    let mut s = opened();
+    user(&mut s, "检查两个结果");
+    read_in_round(&mut s, "r1", "first.rs", 0);
+    search_in_round(&mut s, "g1", "first", 0);
+    start_read(&mut s, "r2", "next.rs", 1);
+    assert_eq!(recorded_rounds(&s), vec![(Some(0), 2), (Some(1), 1)]);
+    let live = lines(&s);
+    assert!(
+        live.iter().any(|line| line.contains("读取 2 次")
+            && line.contains("搜索 1 次")
+            && line.contains("正在执行 1 项")),
+        "{live:?}"
+    );
+    assert!(!live.iter().any(|line| line.contains("next.rs")));
+    finish(&mut s, "r2", true);
+    search_in_round(&mut s, "g2", "next", 1);
+    next_assistant(&mut s, "answer");
+    let settled = lines(&s);
+    assert_eq!(
+        settled
+            .iter()
+            .filter(|line| line.contains("读取 2 次") && line.contains("搜索 2 次"))
+            .count(),
+        1,
+        "{settled:?}"
+    );
+    assert_eq!(recorded_rounds(&s), vec![(Some(0), 2), (Some(1), 2)]);
+    open_latest(&mut s);
+    let expanded = lines(&s);
+    assert!(expanded.iter().any(|line| line.contains("next.rs")));
+    assert!(expanded.iter().any(|line| line.contains("first.rs")));
+    open_latest(&mut s);
+    assert_eq!(lines(&s), settled);
+}
+
+#[test]
+fn progress_prose_splits_visible_phases_and_ctrl_o_opens_only_the_latest() {
+    let mut s = opened();
+    read_in_round(&mut s, "before", "before.rs", 0);
+    let narration = MessageId::new("progress");
+    next_assistant(&mut s, "progress");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: narration.clone(),
+            delta: "发现了入口，接下来检查实现。".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted {
+            message_id: narration,
+        }),
+    );
+    read_in_round(&mut s, "after1", "after-one.rs", 1);
+    read_in_round(&mut s, "after2", "after-two.rs", 2);
+    let folded = lines(&s);
+    assert_eq!(
+        folded.iter().filter(|line| line.contains("▸ 读取")).count(),
+        2,
+        "{folded:?}"
+    );
+    assert!(folded.iter().any(|line| line.contains("读取 1 次")));
+    assert!(folded.iter().any(|line| line.contains("读取 2 次")));
+    assert_eq!(
+        recorded_rounds(&s),
+        vec![(Some(0), 1), (Some(1), 1), (Some(2), 1)]
+    );
+    open_latest(&mut s);
+    let expanded = lines(&s);
+    assert!(!expanded.iter().any(|line| line.contains("before.rs")));
+    assert!(expanded.iter().any(|line| line.contains("after-one.rs")));
+    assert!(expanded.iter().any(|line| line.contains("after-two.rs")));
+}
+
+/// Homogeneous shell work accumulates a command count in the phase receipt.
+#[test]
+fn a_homogeneous_shell_round_accumulates_command_count() {
     let mut s = opened();
     next_assistant(&mut s, "a1");
     start(&mut s, "c1", "cargo", r#""check""#, 1);
@@ -242,9 +317,9 @@ fn a_homogeneous_shell_round_names_the_tool() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("执行命令"))
+        .find(|l| l.contains("执行了 2 个命令"))
         .unwrap_or_else(|| panic!("the shell round names the tool: {t:?}"));
-    assert!(head.contains("完成 2 项"), "it counts both calls: {head:?}");
+    assert!(head.contains("2 个命令"), "it counts both calls: {head:?}");
     assert!(
         !head.contains("多个工具") && !head.contains("项操作"),
         "a same-tool round is not the mixed fallback: {head:?}"
@@ -369,10 +444,10 @@ fn a_running_mixed_round_counts_operations_without_an_outcome() {
     let t = lines(&s);
     let head = t
         .iter()
-        .find(|l| l.contains("正在执行 2 项操作"))
+        .find(|l| l.contains("正在执行 2 项"))
         .unwrap_or_else(|| panic!("the live mixed round counts operations: {t:?}"));
     assert!(
-        head.contains('\u{22ee}'),
+        head.contains('▸'),
         "a live row wears the running mark: {head:?}"
     );
     assert!(
@@ -443,8 +518,8 @@ fn a_round_keeps_its_geometry_from_first_call_to_close() {
         .position(|l| l.contains("正在执行"))
         .expect("the round head exists from the first call");
     assert!(
-        running[h_run + 1].contains("\u{2514}\u{2500}"),
-        "the sole child follows the head while running: {running:?}"
+        !running.iter().any(|line| line.contains("cargo check")),
+        "live member remains folded: {running:?}"
     );
 
     finish(&mut s, "c1", true);
@@ -456,8 +531,10 @@ fn a_round_keeps_its_geometry_from_first_call_to_close() {
         .expect("the head is still there with a second call");
     assert_eq!(h_run, h_run2, "adding a call does not move the head");
     assert!(
-        running_two[h_run2 + 1].contains("\u{251c}\u{2500}"),
-        "the first child follows the head while running: {running_two:?}"
+        !running_two
+            .iter()
+            .any(|line| line.contains("cargo check") || line.contains("cargo test")),
+        "both live members remain folded: {running_two:?}"
     );
 
     finish(&mut s, "c2", true);
@@ -482,10 +559,10 @@ fn a_round_keeps_its_geometry_from_first_call_to_close() {
     assert!(lines(&s).iter().any(|l| l.contains("cargo test")));
 }
 
-/// The reported Dogfood shape: many prose-free model rounds, each a handful of
-/// shell commands. They must be separate rounds, not one 25+ call group.
+/// Runtime rounds remain independent facts while prose-free work shares a
+/// single visible receipt with an accumulated command count.
 #[test]
-fn a_prose_free_dogfood_run_is_one_group_per_round() {
+fn a_prose_free_dogfood_run_has_one_receipt_and_retains_all_runtime_rounds() {
     let mut s = opened();
     user(&mut s, "是不是有一个工具在并行改这个项目？");
     next_assistant(&mut s, "a0");
@@ -532,21 +609,29 @@ fn a_prose_free_dogfood_run_is_one_group_per_round() {
     );
     let text = t.join("\n");
     assert!(
-        !text.contains("执行了 10 个命令"),
-        "the last round is still live: {text}"
+        text.contains("执行了 10 个命令"),
+        "prose-free rounds accumulate in one phase receipt: {text}"
     );
     next_assistant(&mut s, "done");
     let t = lines(&s);
     assert!(
-        t.iter().any(|l| l.contains("执行了 10 个命令")),
+        t.iter()
+            .filter(|l| l.contains("执行了") && l.contains("个命令"))
+            .count()
+            == 1,
         "settled rounds share one presentation receipt: {t:?}"
     );
+    assert!(t.iter().any(|l| l.contains("执行了 10 个命令")));
     assert!(!t.iter().any(|l| l.contains("$ ")));
     open_latest(&mut s);
     assert_eq!(
         lines(&s).iter().filter(|l| l.contains("$ ")).count(),
         20,
-        "the keyboard reveals each header and full command"
+        "the keyboard reveals every command header and drawer in the latest phase"
+    );
+    assert!(
+        lines(&s).iter().any(|line| line.contains("$ ps"))
+            && lines(&s).iter().any(|line| line.contains("$ git"))
     );
 }
 

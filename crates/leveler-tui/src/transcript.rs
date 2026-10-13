@@ -224,21 +224,21 @@ pub struct TurnEndBlock {
 /// One terminal failure, presented exactly once.
 ///
 /// The primary line carries product copy (`title` + `summary`) and a muted
-/// machine subtitle; the vendor's raw text lives in `detail` and is revealed
-/// only by disclosure. This is the single failure presentation — no separate
+/// machine subtitle; the safe technical projection in `detail` is visible
+/// only when the reader opens this disclosure. This is the single failure presentation — no separate
 /// error item repeats the same failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureBlock {
+    /// The reader's disclosure choice; failures begin collapsed.
+    pub display: DisplayMode,
     /// Short localized title, e.g. `请求失败`.
     pub title: String,
     /// One-line product explanation.
     pub summary: String,
     /// Muted machine subtitle, e.g. `moonshot · invalid_request`.
     pub subtitle: Option<String>,
-    /// The raw technical detail. Disclosure only.
+    /// Safe technical detail, shown inside this disclosure.
     pub detail: String,
-    /// Whether the detail is currently shown.
-    pub expanded: bool,
 }
 
 /// A trusted post-turn handoff supplied through structured runtime data.
@@ -1191,17 +1191,33 @@ impl TranscriptState {
         Some(expanded)
     }
 
-    /// Set every process member's own detail disclosure in one group. The
-    /// keyboard's Ctrl+O asks for the latest command's details, and a receipt
-    /// owns those details per call — so it writes each member's own state
-    /// instead of inventing a second, group-level one.
+    /// Set exactly one original call's drawer without changing siblings or its parent.
+    pub fn set_call_expanded(&mut self, item: usize, call: usize, expanded: bool) -> bool {
+        let Some(TranscriptItem::ToolGroup(group)) = self.items.get_mut(item) else {
+            return false;
+        };
+        let Some(member) = group.calls.get_mut(call) else {
+            return false;
+        };
+        if member.expanded == expanded {
+            return false;
+        }
+        member.expanded = expanded;
+        self.bump();
+        true
+    }
+
+    /// Set all ordinary tool and edit drawers in a semantic group.
     pub fn set_process_calls_expanded(&mut self, item: usize, expanded: bool) -> bool {
         let Some(TranscriptItem::ToolGroup(group)) = self.items.get_mut(item) else {
             return false;
         };
         let mut changed = false;
         for call in &mut group.calls {
-            if crate::activity_stream::is_process_fold_call(call) && call.expanded != expanded {
+            if (crate::activity_stream::is_process_fold_call(call)
+                || crate::activity_stream::is_edit_call(call))
+                && call.expanded != expanded
+            {
                 call.expanded = expanded;
                 changed = true;
             }
@@ -1330,7 +1346,7 @@ impl TranscriptState {
             TranscriptItem::UserShell(shell) => Some(two_state(shell.expanded)),
             TranscriptItem::GoalRecap(block) => Some(two_state(block.expanded)),
             TranscriptItem::MemoryList(block) => Some(two_state(block.expanded)),
-            TranscriptItem::Failure(block) => Some(two_state(block.expanded)),
+            TranscriptItem::Failure(block) => Some(block.display),
             _ => None,
         }
     }
@@ -1353,6 +1369,10 @@ impl TranscriptState {
     /// choice, so it is pinned and no later event may fold it back.
     pub fn set_item_display(&mut self, index: usize, mode: DisplayMode) -> bool {
         let wrote = match self.items.get_mut(index) {
+            Some(TranscriptItem::Failure(block)) => {
+                block.display = mode;
+                true
+            }
             Some(TranscriptItem::Thought(block)) => {
                 block.display = mode;
                 block.display_pinned = true;
@@ -1375,10 +1395,6 @@ impl TranscriptState {
                 true
             }
             Some(TranscriptItem::MemoryList(block)) => {
-                block.expanded = mode.is_expanded();
-                true
-            }
-            Some(TranscriptItem::Failure(block)) => {
                 block.expanded = mode.is_expanded();
                 true
             }
