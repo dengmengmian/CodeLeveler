@@ -195,6 +195,44 @@ async fn concurrent_title_changes_from_one_snapshot_have_only_one_winner() {
     );
 }
 
+#[tokio::test]
+async fn permission_switch_accepts_answer_progress_after_observed_snapshot() {
+    let (_tmp, app, client, session) = build_client().await;
+    let observed = client.snapshot(&session).await.unwrap();
+    let db = app.open_database().await.unwrap();
+    leveler_storage::EventRepository::new(&db)
+        .append(
+            &session,
+            None,
+            "token_usage",
+            r#"{"type":"token_usage","payload":{"input_tokens":10,"output_tokens":1,"cached_tokens":0,"cost_usd":0.0}}"#,
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+    let mut events = client.subscribe();
+    client
+        .deliver(CommandEnvelope {
+            command_id: CommandId::generate(),
+            session_id: session.clone(),
+            expected_version: Some(observed.last_sequence.unwrap_or(0)),
+            issued_at: leveler_core::now().to_rfc3339(),
+            command: ClientCommand::SetPermissionProfile {
+                session_id: session.clone(),
+                mode: WirePermissionProfile::FullAccess,
+            },
+        })
+        .await
+        .unwrap();
+    let updated = client.snapshot(&session).await.unwrap();
+    assert_eq!(updated.mode, WirePermissionProfile::FullAccess);
+    assert!(updated.last_sequence.unwrap_or(0) > observed.last_sequence.unwrap_or(0));
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        RuntimeEvent::SessionUpdated { session } if session.mode == WirePermissionProfile::FullAccess
+    ));
+}
+
 #[test]
 fn stale_expected_version_is_rejected() {
     leveler_test_support::bounded_test(
