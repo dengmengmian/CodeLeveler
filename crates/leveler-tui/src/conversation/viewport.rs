@@ -75,7 +75,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // viewport (splash is not cached on transcript version).
     state.conv.rect = Some((content.x, content.y, content.width, content.height));
 
-    let (all, _hits, _commands, _anchor, item_spans) = state.conversation_build(width);
+    let (all, _hits, _commands, _anchor, item_spans, _sources) = state.conversation_build(width);
     // Plain text only backs mouse selection / clipboard. Rebuild it from this
     // frame's lines while a selection is live; otherwise clear it (the mouse-down
     // path calls `ensure_conversation_plain`, which rebuilds against current
@@ -275,14 +275,6 @@ mod tests {
         out
     }
 
-    fn accented_rows(buffer: &Buffer, accent: Color) -> Vec<u16> {
-        rail_inks(buffer)
-            .into_iter()
-            .filter(|(_, fg)| *fg == accent)
-            .map(|(row, _)| row)
-            .collect()
-    }
-
     fn buffer_text(buffer: &Buffer) -> String {
         (0..buffer.area.height)
             .map(|y| {
@@ -294,62 +286,37 @@ mod tests {
             .join("\n")
     }
 
-    /// A running Thought's rail sweeps: the highlight is somewhere near the top
-    /// at one phase and further down at the next, and it wears the live accent
-    /// while the rest of the rail stays muted.
+    /// Reasoning facts remain live while conversation geometry stays unchanged.
     #[test]
-    fn a_running_thoughts_rail_highlight_sweeps_and_wears_the_live_accent() {
+    fn live_reasoning_has_no_conversation_rows_or_rail() {
         let mut state = state_with_live_thought();
-        let (accent, muted) = (state.theme.accent.secondary, state.theme.text.muted);
-
-        let top = accented_rows(&paint(&mut state, 0), accent);
-        let mid = accented_rows(&paint(&mut state, 750), accent);
-
-        assert_eq!(
-            top.len(),
-            crate::render::REASONING_RAIL_SEGMENT_ROWS,
-            "the highlight is one segment tall"
-        );
-        assert_eq!(top[1], top[0] + 1, "the segment is contiguous");
-        assert_ne!(top, mid, "a later frame moved the highlight");
-        assert!(
-            top[0] < mid[0],
-            "the sweep runs top to bottom: {top:?} {mid:?}"
-        );
-
-        let inks = rail_inks(&paint(&mut state, 0));
-        assert!(
-            inks.iter().filter(|(_, fg)| *fg == muted).count() > 0,
-            "the rail body keeps its muted ink: {inks:?}"
-        );
-        assert!(
-            inks.iter().all(|(_, fg)| *fg == accent || *fg == muted),
-            "only the rail is recoloured: {inks:?}"
-        );
+        assert!(state.transcript.is_thinking());
+        for ms in [0, 750, 1499] {
+            let buffer = paint(&mut state, ms);
+            assert!(
+                rail_inks(&buffer).is_empty(),
+                "reasoning has no conversation rail"
+            );
+            assert!(!buffer_text(&buffer).contains("◆"));
+        }
     }
 
-    /// A completed Thought has stopped: its expanded body paints a plain muted
-    /// rail at every phase.
+    /// Historical display flags cannot create a reasoning body or header.
     #[test]
     fn a_completed_thought_has_no_animated_rail() {
         let mut state = state_with_live_thought();
         state.transcript.finish_thought(Some(2800));
         let index = state.transcript.items().len() - 1;
-        assert!(
-            state
-                .transcript
-                .set_item_display(index, crate::fold::DisplayMode::Expanded)
-        );
-        let (accent, muted) = (state.theme.accent.secondary, state.theme.text.muted);
-
+        state
+            .transcript
+            .set_item_display(index, crate::fold::DisplayMode::Expanded);
         for ms in [0, 400, 750, 1499] {
-            let inks = rail_inks(&paint(&mut state, ms));
-            assert!(!inks.is_empty(), "the expanded body is painted at {ms}ms");
+            let buffer = paint(&mut state, ms);
             assert!(
-                inks.iter().all(|(_, fg)| *fg == muted),
-                "a settled rail never animates (at {ms}ms): {inks:?}"
+                rail_inks(&buffer).is_empty(),
+                "reasoning remains hidden after display toggles"
             );
-            assert!(accented_rows(&paint(&mut state, ms), accent).is_empty());
+            assert!(!buffer_text(&buffer).contains("◆"));
         }
     }
 
@@ -371,33 +338,22 @@ mod tests {
         }
     }
 
-    /// Reduced motion degrades the rail to a static muted one while the live
-    /// state stays visible in the header accent — the fact survives, the
-    /// motion does not.
+    /// Animation settings do not restore hidden reasoning to the conversation.
     #[test]
-    fn reduced_motion_leaves_a_static_live_rail() {
+    fn reduced_motion_keeps_reasoning_footer_only() {
         let mut state = state_with_live_thought();
         state.live_animation = false;
-        let (accent, muted) = (state.theme.accent.secondary, state.theme.text.muted);
-
-        let first = rail_inks(&paint(&mut state, 0));
-        let later = rail_inks(&paint(&mut state, 1200));
-        assert_eq!(first, later, "no motion is painted");
-        assert!(!first.is_empty());
-        assert!(
-            first.iter().all(|(_, fg)| *fg == muted),
-            "static rail: {first:?}"
-        );
-
-        let header = paint(&mut state, 0);
-        let bullet = (0..header.area.height)
-            .flat_map(|y| (0..header.area.width).map(move |x| (x, y)))
-            .find(|&(x, y)| header[(x, y)].symbol() == "◆")
-            .map(|(x, y)| header[(x, y)].fg);
+        let first = paint(&mut state, 0);
+        let later = paint(&mut state, 1200);
+        assert!(rail_inks(&first).is_empty());
         assert_eq!(
-            bullet,
-            Some(accent),
-            "the running Thought is still marked live"
+            buffer_text(&first),
+            buffer_text(&later),
+            "hidden reasoning has no animation"
+        );
+        assert!(
+            state.transcript.is_thinking(),
+            "runtime reasoning fact is preserved"
         );
     }
 
@@ -409,7 +365,7 @@ mod tests {
         let width = crate::conversation::geometry::content_rect(AREA).width as usize;
         let height = crate::conversation::geometry::content_rect(AREA).height as usize;
 
-        let (projection, _, _, _, _) = state.conversation_build(width);
+        let (projection, _, _, _, _, _) = state.conversation_build(width);
         let total = projection.len();
         let widths: Vec<usize> = projection.iter().map(Line::width).collect();
         let max_scroll = crate::conversation::geometry::max_scroll(total, height);
@@ -424,7 +380,7 @@ mod tests {
                 None => baseline = Some(text),
             }
 
-            let (again, _, _, _, _) = state.conversation_build(width);
+            let (again, _, _, _, _, _) = state.conversation_build(width);
             assert!(
                 std::rc::Rc::ptr_eq(&projection, &again),
                 "an animation frame must not invalidate the projection at {ms}ms"
@@ -447,45 +403,29 @@ mod tests {
         }
     }
 
-    /// The sweep is defined on the Thought's rail, not on the window: scrolling
-    /// the same Thought one row up moves the highlight's screen row with it
-    /// instead of moving the highlight along the rail.
+    /// Hidden reasoning never changes the geometry of a pinned history viewport.
     #[test]
-    fn the_highlight_keeps_its_rail_position_when_the_window_scrolls() {
+    fn hidden_reasoning_preserves_pinned_history_scroll() {
         let mut state = state_with_scrollable_history();
         let thought = state.transcript.items().len() - 1;
         state
             .transcript
             .set_item_display(thought, crate::fold::DisplayMode::Expanded);
-        let accent = state.theme.accent.secondary;
         let content = crate::conversation::geometry::content_rect(AREA);
-        let width = content.width as usize;
-        let height = content.height as usize;
-        let item = state.transcript.items().len() - 1;
-        let start = state
-            .item_start_line(item, width)
-            .expect("the Thought is placed");
-        let total = crate::conversation::build::conversation_line_count(&state, width);
-        let max_scroll = crate::conversation::geometry::max_scroll(total, height);
-        assert!(
-            start > max_scroll,
-            "history scrolls above the Thought: {start}"
-        );
-
-        // Where the accent sits within the visible rail, top row = 0.
-        let rail_positions = |state: &mut AppState, scroll: usize| -> Vec<usize> {
+        let total =
+            crate::conversation::build::conversation_line_count(&state, content.width as usize);
+        let max_scroll = crate::conversation::geometry::max_scroll(total, content.height as usize);
+        assert!(max_scroll > 0, "fixture must be scrollable");
+        for scroll in [max_scroll, max_scroll - 1] {
             state.conv.scroll = scroll;
-            rail_inks(&paint(state, 750))
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, ink))| *ink == accent)
-                .map(|(position, _)| position)
-                .collect()
-        };
-
-        let lower = rail_positions(&mut state, max_scroll);
-        let upper = rail_positions(&mut state, max_scroll - 1);
-        assert_eq!(lower.len(), crate::render::REASONING_RAIL_SEGMENT_ROWS);
-        assert_eq!(lower, upper, "the highlight did not move along the rail");
+            let before = paint(&mut state, 0);
+            let later = paint(&mut state, 750);
+            assert!(rail_inks(&later).is_empty());
+            assert_eq!(buffer_text(&before), buffer_text(&later));
+            assert_eq!(
+                state.conv.scroll, scroll,
+                "hidden reasoning never changes pinned scroll"
+            );
+        }
     }
 }

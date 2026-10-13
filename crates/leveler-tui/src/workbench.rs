@@ -1791,7 +1791,7 @@ mod tests {
                 .unwrap();
             let (_, top, _, _) = state.conv.rect.unwrap();
             if stage == "live" {
-                assert!(rows.iter().any(|row| row.contains("third reasoning line")));
+                assert!(!rows.iter().any(|row| row.contains("reasoning line")));
             } else if stage == "done" {
                 assert!(!rows.iter().any(|row| row.contains("reasoning line")));
             }
@@ -3285,7 +3285,7 @@ mod tests {
         let plain: Vec<String> = lines.iter().map(rule_plain).collect();
         let answer = plain
             .iter()
-            .position(|l| l.contains("● 最终回答"))
+            .position(|l| l.trim() == "最终回答")
             .unwrap_or_else(|| panic!("answer missing: {plain:?}"));
         assert!(answer >= 1, "tool group must precede the answer: {plain:?}");
         assert!(

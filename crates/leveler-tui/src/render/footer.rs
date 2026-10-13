@@ -285,7 +285,7 @@ struct ComposerVisRow {
     placeholder: bool,
     /// Slash-arg ghost after caret (visual only).
     ghost: Option<&'static str>,
-    /// Contextual next-step suggestion, rendered as `Tab: <step>` on the empty
+    /// Contextual next-step suggestion, rendered on the empty
     /// first row. DISPLAY ONLY — it is not in the composer, not in its
     /// canonical form, and adds no visual row.
     suggestion: Option<String>,
@@ -449,15 +449,7 @@ pub(crate) fn composer_box_lines(
             spans.push(Span::styled(hint, Style::default().fg(theme.text.muted)));
         }
 
-        // `Tab: <next step>` — muted label first so a very narrow terminal
-        // keeps the affordance and shortens the body instead.
         if let Some(suggestion) = &row.suggestion {
-            let room = content_w.saturating_sub(used);
-            if room > 0 {
-                let label = truncate_display(state.t().suggestion_tab, room);
-                used += UnicodeWidthStr::width(label.as_str());
-                spans.push(Span::styled(label, Style::default().fg(theme.text.muted)));
-            }
             let room = content_w.saturating_sub(used);
             if room > 0 {
                 let body = truncate_display(suggestion, room);

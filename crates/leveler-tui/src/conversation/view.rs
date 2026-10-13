@@ -19,12 +19,6 @@ pub struct ConvKey {
     pub(crate) monochrome: bool,
     pub(crate) locale: crate::i18n::Locale,
     pub(crate) tools_expanded: bool,
-    /// Whether every hidden completed Thought paints its header. Ctrl+O turns
-    /// it on: the reader asked for the reasoning it cannot otherwise see, so
-    /// every folded-away Thought offers its disclosure row. Bodies stay folded
-    /// until that row is opened, and the flag itself is presentation-only — it
-    /// never enters the transcript, the event log or resume.
-    pub(crate) reasoning_headers: bool,
     /// The call an open approval is holding. Part of the key because opening or
     /// answering an approval changes a transcript ROW (§11), and a cache that
     /// did not notice would keep painting `◌` over a command nobody has
@@ -56,13 +50,26 @@ pub type ConvCacheEntry = (
     std::rc::Rc<Vec<CommandHit>>,
     Option<usize>,
     std::rc::Rc<Vec<(usize, usize)>>,
+    std::rc::Rc<Vec<SourceSpan>>,
 );
+
+/// Painted source ranges share the line cache and preserve exact reading positions.
+#[derive(Debug, Clone)]
+pub struct SourceSpan {
+    pub receipt: bool,
+    pub item: usize,
+    pub call: Option<leveler_client_protocol::ToolCallId>,
+    pub start: usize,
+    pub end: usize,
+}
 
 /// A command call's clickable row in the built conversation: absolute line,
 /// transcript item, call index within its group, and whether the call is
 /// stoppable right now (running and not already stopped by this client).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandHit {
+    /// This row owns a view-time receipt instead of a call body.
+    pub receipt: bool,
     pub line: usize,
     pub item: usize,
     pub call: usize,
@@ -80,9 +87,6 @@ pub struct UnitEnv {
     pub monochrome: bool,
     pub locale: crate::i18n::Locale,
     pub tools_expanded: bool,
-    /// `Ctrl+O` reveals a completed Thought's header. Part of the env because
-    /// the memo must not reuse a unit wrapped while the headers were hidden.
-    pub reasoning_headers: bool,
 }
 
 /// A command row in unit-relative coordinates (resolved against the assembled
@@ -165,13 +169,6 @@ pub struct ConversationView {
     /// and an unopened run is simply collapsed.
     pub(crate) process_folds:
         std::cell::RefCell<std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
-    /// Ctrl+O asked for the reasoning that is folded away: every completed
-    /// Thought then paints its header, and a click opens that one body.
-    ///
-    /// PRESENTATION ONLY, like [`Self::process_folds`]: it never enters the
-    /// transcript, the event log or resume, so a reopened session starts with
-    /// the reasoning hidden again.
-    pub(crate) reasoning_headers: bool,
 }
 
 impl Default for ConversationView {
@@ -193,7 +190,6 @@ impl Default for ConversationView {
             cache: std::cell::RefCell::new(None),
             item_cache: std::cell::RefCell::new(ItemLineCache::default()),
             process_folds: std::cell::RefCell::new(std::collections::HashSet::new()),
-            reasoning_headers: false,
         }
     }
 }

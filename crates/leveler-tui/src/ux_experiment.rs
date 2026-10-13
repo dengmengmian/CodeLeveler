@@ -641,8 +641,7 @@ fn is_edit_head(text: &str) -> bool {
 }
 
 /// How many change rows the LAST confirmed edit's canonical patch contains.
-/// The Full Diff contract says the conversation paints exactly these — no
-/// preview budget may remove one.
+/// Opening each edit restores this complete canonical change-row count.
 fn expected_change_rows(state: &AppState, width: usize) -> usize {
     use crate::transcript::TranscriptItem;
     let items = state.transcript.items();
@@ -753,20 +752,17 @@ mod tests {
         }
     }
 
-    /// I-03: the confirmed edit diff is complete. This test used to sweep
-    /// preview-row budgets; the Full Diff contract removed the budget, so it
-    /// now pins the invariant that replaced it — every change row of the last
-    /// confirmed edit is painted into the conversation, at any viewport, and no
-    /// `… +N lines` marker stands in for a hunk.
+    /// I-03: long edits keep bounded previews at each viewport; clicking their
+    /// headers restores every canonical change row without losing short edits.
     #[test]
     #[ignore = "ux experiment harness"]
-    fn i03_full_diff_is_always_painted() {
+    fn i03_diff_preview_restores_the_complete_diff() {
         let mut out = report("i03");
         for (w, h) in [(80u16, 24u16), (100, 30), (120, 40)] {
             header(&mut out, &format!("I-03 T2 live / {w}x{h}"));
             let mut a = build_t2_live();
             let m = measure(&mut a, w, h);
-            write_dump(&format!("i03-full-{w}x{h}"), &full_text(&mut a, w, h));
+            write_dump(&format!("i03-preview-{w}x{h}"), &full_text(&mut a, w, h));
 
             let width = crate::conversation::geometry::content_width(&a);
             let lines = a.conversation_lines(width);
@@ -774,14 +770,40 @@ mod tests {
             let change_rows = painted.iter().filter(|t| is_diff_change_row(t)).count();
             let expected = expected_change_rows(&a, width);
             assert!(expected > 0, "the T2 transcript contains a confirmed edit");
-            assert_eq!(
-                change_rows, expected,
-                "width {w}: the conversation paints every confirmed change row"
+            assert!(
+                change_rows > 0 && change_rows < expected,
+                "width {w}: the default keeps visible changed lines but limits long edits"
             );
             assert!(
-                !painted.iter().any(|t| t.contains("还有")),
-                "width {w}: a `… +N lines` marker replaced a hunk"
+                painted.iter().any(|t| t.contains("还有")),
+                "width {w}: the preview states its omitted row count"
             );
+            for path in ["internal/billing/refund.go", "internal/api/handler.go"] {
+                let current = a.conversation_lines(width);
+                let header = current
+                    .iter()
+                    .position(|l| {
+                        let text = line_plain(l);
+                        text.contains("编辑文件") && text.contains(path)
+                    })
+                    .expect("the edit header remains visible");
+                let hit = a
+                    .command_hit_at(width, header)
+                    .expect("the edit header is clickable");
+                crate::conversation::interaction::toggle_call(&mut a, hit.item, hit.call);
+            }
+            let opened = a.conversation_lines(width);
+            let opened: Vec<String> = opened.iter().map(line_plain).collect();
+            assert_eq!(
+                opened.iter().filter(|t| is_diff_change_row(t)).count(),
+                expected,
+                "width {w}: opening the previews restores every change row"
+            );
+            assert!(
+                !opened.iter().any(|t| t.contains("还有")),
+                "width {w}: no omitted row count remains after opening"
+            );
+            write_dump(&format!("i03-opened-{w}x{h}"), &full_text(&mut a, w, h));
             let _ = writeln!(
                 out,
                 "total={} change_rows={change_rows} head_visible={}",
@@ -837,14 +859,14 @@ mod tests {
             "the status strip reports streaming: {live}"
         );
         assert!(
-            live.contains("◆ 思考中") && live.contains("private fixture reasoning"),
+            !live.contains("◆ 思考中") && !live.contains("private fixture reasoning"),
             "{live}"
         );
         write_dump("thinking-default-live", &live);
         reasoning(&mut state, " continues", None);
         let updated = visible_window(&mut state, 80, 24);
-        assert!(updated.contains("private fixture reasoning continues"));
-        assert_eq!(updated.matches("◆ 思考中").count(), 1);
+        assert!(!updated.contains("private fixture reasoning continues"));
+        assert_eq!(updated.matches("◆ 思考中").count(), 0);
         write_dump("thinking-default-updated", &updated);
         reasoning(&mut state, "", Some(400));
         read(&mut state, "r", "README.md", 33);
@@ -853,7 +875,7 @@ mod tests {
         turn_end(&mut state);
         let done = visible_window(&mut state, 80, 24);
         assert!(!done.contains("◆ 思考") && !done.contains("fixture reasoning"));
-        assert!(done.contains("README.md") && done.contains("AI 服务撮合平台"));
+        assert!(done.contains("读取 1 次") && done.contains("AI 服务撮合平台"));
         write_dump("thinking-default-done", &done);
     }
 

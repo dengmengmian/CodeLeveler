@@ -10,8 +10,8 @@
 //! are derived from observed overlap, never inferred from adjacency. A lone
 //! settled command needs no redundant group title above its own row.
 //!
-//! Confirmed edits are results rather than tool output: their complete
-//! canonical diffs are always visible, regardless of any fold state.
+//! Confirmed edits retain stats and their complete canonical diff outside
+//! process receipts. Each edit header can reveal its complete diff.
 //! Interaction and bookkeeping keep their own surfaces. No presentation fold
 //! merges, removes or changes the underlying calls or runtime facts.
 
@@ -55,6 +55,7 @@ pub(crate) fn render_group(
         awaiting_approval,
         None,
         &mut rows,
+        None,
     )
 }
 
@@ -65,6 +66,8 @@ pub(crate) fn render_group(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CommandRow {
     pub line: usize,
+    /// A derived mixed-span receipt targets its semantic group drawer.
+    pub disclosure: bool,
     /// Index of the call in its group's `calls`.
     pub call: usize,
     pub stoppable: bool,
@@ -82,6 +85,7 @@ pub(crate) fn render_group_rows(
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
     rows: &mut Vec<CommandRow>,
+    folds: Option<&std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let index_of = |call: &ToolCallBlock| {
@@ -96,6 +100,88 @@ pub(crate) fn render_group_rows(
         .iter()
         .filter(|c| is_conversation_visible(c))
         .collect();
+    // A semantic group may interleave exploration and edits in the same response.
+    // Derive consecutive ordinary spans without moving the authoritative calls.
+    if visible.iter().any(|c| is_process_fold_call(c))
+        && visible.iter().any(|c| !is_process_fold_call(c))
+    {
+        let mut cursor = 0;
+        while cursor < visible.len() {
+            let first = visible[cursor];
+            if is_process_fold_call(first) {
+                let mut end = cursor + 1;
+                while end < visible.len() && is_process_fold_call(visible[end]) {
+                    end += 1;
+                }
+                let members = &visible[cursor..end];
+                let at = out.len();
+                let expanded = folds.is_some_and(|f| f.contains(&first.id));
+                out.push(process_receipt_line(members, theme, width, t, expanded));
+                rows.push(CommandRow {
+                    disclosure: true,
+                    line: at,
+                    call: index_of(first),
+                    stoppable: false,
+                });
+                if expanded {
+                    for call in members {
+                        rows.push(CommandRow {
+                            disclosure: false,
+                            line: out.len(),
+                            call: index_of(call),
+                            stoppable: process_call_stoppable(
+                                call,
+                                theme,
+                                t,
+                                now_elapsed_secs,
+                                awaiting_approval,
+                            ),
+                        });
+                        let lines = process_member_lines_focused(
+                            call,
+                            theme,
+                            width.saturating_sub(2).max(1),
+                            locale,
+                            t,
+                            now_elapsed_secs,
+                            awaiting_approval,
+                            focused_command,
+                        );
+                        out.extend(lines.into_iter().map(|mut line| {
+                            line.spans.insert(0, Span::raw("  "));
+                            line
+                        }));
+                    }
+                }
+                cursor = end;
+            } else {
+                let mut child = group.clone();
+                child.calls = vec![first.clone()];
+                let mut child_rows = Vec::new();
+                let at = out.len();
+                out.extend(render_group_rows(
+                    &child,
+                    theme,
+                    width,
+                    locale,
+                    t,
+                    now_elapsed_secs,
+                    awaiting_approval,
+                    focused_command,
+                    &mut child_rows,
+                    folds,
+                ));
+                rows.extend(child_rows.into_iter().map(|row| CommandRow {
+                    disclosure: row.disclosure,
+                    line: at + row.line,
+                    call: index_of(first),
+                    stoppable: row.stoppable,
+                }));
+                cursor += 1;
+            }
+        }
+        return out;
+    }
     // A lone settled command needs no group title above its own drawer.
     // Multi-call history is folded by the conversation's cross-round planner.
     if !group.open
@@ -432,11 +518,25 @@ pub(crate) fn render_group_rows(
                 }
             }
             StreamUnit::EditMerge(calls) => {
-                // A confirmed edit's diff IS the result: every hunk and every
-                // changed line is painted, whatever the group's fold. Folding
-                // may hide a tool's OUTPUT; it may never hide the change the
-                // user was shown.
-                out.extend(edit_unit_lines(&calls, theme, width, locale, t));
+                let at = out.len();
+                let (lines, foldable) = edit_unit_lines(&calls, theme, width, locale, t);
+                if foldable {
+                    rows.push(CommandRow {
+                        disclosure: false,
+                        line: at,
+                        call: index_of(calls[0]),
+                        stoppable: false,
+                    });
+                    if !calls[0].expanded {
+                        rows.push(CommandRow {
+                            disclosure: false,
+                            line: at + lines.len() - 1,
+                            call: index_of(calls[0]),
+                            stoppable: false,
+                        });
+                    }
+                }
+                out.extend(lines);
             }
             StreamUnit::FailMerge(calls) => {
                 let total_ms: u64 = calls.iter().filter_map(|c| c.duration_ms).sum();
@@ -517,6 +617,7 @@ fn expanded_exploration_body(
     let mut body = Vec::new();
     for call in members {
         rows.push(CommandRow {
+            disclosure: false,
             line: offset + body.len(),
             call: index_of(call),
             stoppable: false,
@@ -671,34 +772,6 @@ pub(crate) fn is_process_fold_call(call: &ToolCallBlock) -> bool {
     is_conversation_visible(call) && disclosure_class(&call.name) != DisclosureClass::Excluded
 }
 
-/// A closed, settled work group can join a cross-round process receipt.
-/// Failures remain countable and inspectable. Live detached processes cannot
-/// join merely because their spawning tool call has already returned.
-pub(crate) fn group_is_process_fold_member(group: &ToolGroupBlock) -> bool {
-    if group.open || !group_is_finished(group) {
-        return false;
-    }
-    let visible: Vec<&ToolCallBlock> = group
-        .calls
-        .iter()
-        .filter(|c| is_conversation_visible(c))
-        .collect();
-    !visible.is_empty()
-        && group_is_disclosable(group)
-        && !visible.iter().any(|c| {
-            started_in_background(c) && matches!(detached_outcome(c), DetachedOutcome::Running)
-        })
-}
-
-/// The work calls one fold participant contributes, in order.
-pub(crate) fn group_process_fold_calls(group: &ToolGroupBlock) -> Vec<&ToolCallBlock> {
-    group
-        .calls
-        .iter()
-        .filter(|c| is_process_fold_call(c))
-        .collect()
-}
-
 /// The aggregate receipt row of a process fold spanning several groups and
 /// the finished Thoughts between them. Members retain chronology; Thoughts never
 /// count toward the label.
@@ -736,6 +809,30 @@ fn process_receipt_line(
         .count();
     if work > 0 {
         parts.push(t.disclosure_tools_many.replace("{}", &work.to_string()));
+    }
+    let running = members
+        .iter()
+        .filter(|c| {
+            c.status == ToolStatus::Running
+                || (started_in_background(c)
+                    && matches!(detached_outcome(c), DetachedOutcome::Running))
+        })
+        .count();
+    if running > 0 {
+        parts.insert(0, t.round_running.replace("{}", &running.to_string()));
+    }
+    if members
+        .iter()
+        .any(|c| c.stop == StopRequest::Uncertain && command_head(c, theme, t, 0, false).stoppable)
+    {
+        parts.insert(0, t.command_stop_unknown.to_string());
+    } else if members.iter().any(|c| {
+        c.stop == StopRequest::Sent
+            && (c.status == ToolStatus::Running
+                || (started_in_background(c)
+                    && matches!(detached_outcome(c), DetachedOutcome::Running)))
+    }) {
+        parts.insert(0, t.command_stopping.to_string());
     }
     let mut attention = Vec::new();
     let failed = members
@@ -812,6 +909,17 @@ fn process_receipt_line(
     clip_line(spans, width)
 }
 
+/// Preserve command cancellation using the same lifecycle projection as its own row.
+pub(crate) fn process_call_stoppable(
+    call: &ToolCallBlock,
+    theme: &Theme,
+    t: &UiText,
+    now: u64,
+    awaiting: Option<&leveler_client_protocol::ToolCallId>,
+) -> bool {
+    is_shell_call(call) && command_head(call, theme, t, now, awaits(call, awaiting)).stoppable
+}
+
 /// A parent opens only member headers. A child owns its command/output drawer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_member_lines(
@@ -822,6 +930,28 @@ pub(crate) fn process_member_lines(
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+) -> Vec<Line<'static>> {
+    process_member_lines_focused(
+        call,
+        theme,
+        width,
+        locale,
+        t,
+        now_elapsed_secs,
+        awaiting_approval,
+        None,
+    )
+}
+
+pub(crate) fn process_member_lines_focused(
+    call: &ToolCallBlock,
+    theme: &Theme,
+    width: usize,
+    locale: Locale,
+    t: &UiText,
+    now_elapsed_secs: u64,
+    awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    focused_command: Option<&leveler_client_protocol::ToolCallId>,
 ) -> Vec<Line<'static>> {
     if is_shell_call(call) {
         let (mut lines, _) = command_unit_lines(
@@ -834,7 +964,7 @@ pub(crate) fn process_member_lines(
             now_elapsed_secs,
             None,
             awaits(call, awaiting_approval),
-            None,
+            focused_command,
         );
         if !call.expanded {
             lines.truncate(1);
@@ -1058,7 +1188,7 @@ fn group_has_edits(group: &ToolGroupBlock) -> bool {
 /// Edits are the exception everywhere: a diff is not a step toward the
 /// result, it IS the result. (`write_file` kept by name so an out-of-taxonomy
 /// writer can never be folded away as generic work.)
-fn is_edit_call(c: &ToolCallBlock) -> bool {
+pub(crate) fn is_edit_call(c: &ToolCallBlock) -> bool {
     use crate::tool_taxonomy::ToolKind;
     c.name == "write_file"
         || matches!(
@@ -1933,12 +2063,14 @@ fn push_command_rows(
     lines: usize,
 ) {
     rows.push(CommandRow {
+        disclosure: false,
         line: at,
         call,
         stoppable,
     });
     if lines > 1 {
         rows.push(CommandRow {
+            disclosure: false,
             line: at + 1,
             call,
             stoppable,
@@ -2220,6 +2352,16 @@ fn command_unit_lines(
                     vec![Span::styled(format!("{body_indent}{line}"), body)],
                     width,
                 ));
+            }
+        }
+        if call.status == ToolStatus::Failed
+            && let Some(note) = failed_one_line_summary(call, t)
+        {
+            for row in crate::render::text::wrap_with_caret(&note, (0, 0), avail, 0, 0).0 {
+                out.push(Line::from(Span::styled(
+                    format!("{body_indent}{}", row.text),
+                    Style::default().fg(theme.status.error),
+                )));
             }
         }
         // Live output while it streamed; a call seen only finished (history,
@@ -2687,23 +2829,17 @@ fn strip_line_gutter(line: &str) -> &str {
     }
 }
 
-/// Merged same-file edit node: one head (glyph + action + inline files), one
-/// hunk-stats line, then the combined diff rows — always complete (§6).
-/// A confirmed edit node: head, stats, and the COMPLETE canonical diff.
-///
-/// Unlike every other tool, an edit's diff is not output to be folded away —
-/// it is the change the user is being shown, and it is painted in full. There
-/// is no preview budget, no `… +N lines` substitution, and no diffstat-only
-/// form: a fold may hide a run's stdout, never a line of the patch.
+/// A confirmed edit keeps its stats and complete canonical diff independent
+/// of every ordinary tool disclosure.
 fn edit_unit_lines(
     calls: &[&ToolCallBlock],
     theme: &Theme,
     width: usize,
     locale: Locale,
     t: &UiText,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, bool) {
     let Some(first) = calls.first() else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let (glyph, glyph_color) = status_glyph(first, theme);
     // The node's own tool names it: every member shares it (merge identity).
@@ -2775,11 +2911,8 @@ fn edit_unit_lines(
         ),
     ]));
 
-    // An edit is a durable result: its diff stays after the call settles, and
-    // it is never abbreviated. Every hunk, every changed line and every
-    // canonical context line is painted here.
     crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out);
-    out
+    (out, false)
 }
 
 /// Split a "{} …" i18n template around its placeholder.
@@ -3147,6 +3280,7 @@ pub(crate) fn render_activity(
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
     rows: &mut Vec<CommandRow>,
+    folds: Option<&std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
 ) -> Vec<Line<'static>> {
     let mut group_rows = Vec::new();
     let lines = render_group_rows(
@@ -3159,6 +3293,7 @@ pub(crate) fn render_activity(
         awaiting_approval,
         focused_command,
         &mut group_rows,
+        folds,
     );
     rows.extend(group_rows);
     lines
@@ -5295,6 +5430,7 @@ mod tests {
             None,
             None,
             &mut Vec::new(),
+            None,
         );
         let text: Vec<String> = lines
             .iter()
@@ -7365,40 +7501,31 @@ mod compact_command_tests {
         assert!(rows.iter().any(|r| r.contains("+ line 2")), "{rows:?}");
     }
 
-    /// The Full Diff contract: a confirmed edit's diff is NEVER abbreviated.
-    /// Every change row is painted, whatever the group's fold, and no
-    /// `… +N lines` marker ever replaces a hunk.
     #[test]
-    fn a_large_diff_is_painted_in_full() {
+    fn a_long_edit_defaults_to_complete_content() {
         let rows = rows(edit(200));
         assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("+ line 199")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("还有")), "{rows:?}");
         assert!(
-            !rows.last().unwrap().contains("还有"),
-            "no preview marker: {:?}",
-            rows.last()
+            rows.len() >= 200,
+            "complete diff rows must remain: {}",
+            rows.len()
         );
+    }
 
-        // The same complete diff, whatever the group's own fold.
-        let opened = text(&render_group(
-            &ToolGroupBlock {
-                calls: vec![edit(200)],
-                open: false,
-                display: crate::fold::DisplayMode::Expanded,
-                round: None,
-            },
-            &Theme::no_color(),
-            100,
-            Locale::Zh,
-            Locale::Zh.text(),
-            0,
-            None,
-        ));
-        assert!(
-            opened.iter().any(|r| r.contains("+ line 199")),
-            "{}",
-            opened.len()
-        );
+    #[test]
+    fn an_opened_long_edit_restores_the_complete_diff() {
+        let mut call = edit(200);
+        call.expanded = true;
+        let rows = rows(call);
+        for i in 0..200 {
+            assert!(
+                rows.iter().any(|r| r.contains(&format!("+ line {i}"))),
+                "missing line {i}"
+            );
+        }
+        assert!(!rows.iter().any(|r| r.contains("还有")), "{rows:?}");
     }
 
     // ── Luminance roles ─────────────────────────────────────────────────────
@@ -7443,14 +7570,15 @@ mod compact_command_tests {
         assert_eq!(fg_of(&lines, "\u{203a}"), Some(theme.ink(Ink::Subtle)));
     }
 
-    // ── Full Diff contract ───────────────────────────────────────────────
+    // ── Canonical diff expansion ─────────────────────────────────────────
 
-    /// DIFF-3 / DIFF-4: every changed line of a confirmed edit is painted at
-    /// every width. There is no preview row cap and no hunk is dropped.
+    /// Expansion restores every changed line at each supported width.
     #[test]
     fn every_changed_line_is_painted_at_any_width() {
         for width in [24usize, 40, 80, 200] {
-            let rows = body(text(&lines_at(edit(40), &Theme::no_color(), width, 0)));
+            let mut call = edit(40);
+            call.expanded = true;
+            let rows = body(text(&lines_at(call, &Theme::no_color(), width, 0)));
             for i in 0..40 {
                 assert!(
                     rows.iter().any(|r| r.contains(&format!("+ line {i}"))),
@@ -7460,18 +7588,13 @@ mod compact_command_tests {
         }
     }
 
-    /// DIFF-6: no diffstat-only substitution. The collapsed edit node paints
-    /// the complete patch, not a count of the lines it hid.
     #[test]
-    fn a_collapsed_edit_never_replaces_the_diff_with_a_count() {
+    fn a_collapsed_edit_keeps_stats_and_complete_content() {
         let rows = body(text(&lines_at(edit(120), &Theme::no_color(), 100, 0)));
+        assert!(rows.iter().any(|r| r.contains("+120 −0")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("+ line 119")), "{rows:?}");
-        assert!(
-            !rows
-                .iter()
-                .any(|r| r.contains("还有") || r.contains("more lines")),
-            "a preview marker replaced diff content: {rows:?}"
-        );
+        assert!(!rows.iter().any(|r| r.contains("还有")), "{rows:?}");
     }
 
     /// DIFF-7: an edit is never an exploration participant, so an eager

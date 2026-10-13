@@ -210,8 +210,16 @@ fn c1_a_running_calls_round_survives_the_reconnect() {
         "the reconnect restores the stated round, never a re-derived one"
     );
 
-    // The clock was back-dated, not restarted at zero.
-    assert!(row(&lines(&seen), "sleep 60 · 2s").1.contains("2s"));
+    // The clock was back-dated, not restarted at zero: the call keeps its own
+    // measured two seconds as the distance between the turn elapsed and its
+    // start, and the conversation shows a receipt header while it runs.
+    let running = seen.transcript.tool_calls();
+    assert_eq!(running.len(), 1);
+    assert_eq!(
+        seen.elapsed_secs as i64 - running[0].started_elapsed_secs,
+        2,
+        "the reconnect restores the measured duration instead of zeroing the clock"
+    );
 
     complete(&mut seen, "c1");
     assert_eq!(
@@ -220,7 +228,7 @@ fn c1_a_running_calls_round_survives_the_reconnect() {
         "the settled round is the same round"
     );
     assert!(
-        lines(&seen).iter().any(|l| l.contains("完成 1 项")),
+        lines(&seen).iter().any(|l| l.contains("执行了 1 个命令")),
         "{:?}",
         lines(&seen)
     );
@@ -254,7 +262,7 @@ fn c2_one_model_response_stays_one_round() {
         rounds(&seen)
     );
     assert!(
-        lines(&seen).iter().any(|l| l.contains("正在执行 3 项操作")),
+        lines(&seen).iter().any(|l| l.contains("正在执行 3 项")),
         "{:?}",
         lines(&seen)
     );
@@ -337,15 +345,19 @@ fn c5_reconnect_keeps_the_running_geometry_until_completion() {
     assert_eq!(live_head, seen_head, "same head text");
     assert_eq!(live_head_at, seen_head_at, "same head row");
     assert_eq!(
-        indent(&row(&lines(&live), "sleep 60").1),
-        indent(&row(&lines(&seen), "sleep 60").1),
-        "same child column"
+        live.transcript.tool_calls().len(),
+        1,
+        "the running call is one member, not a copy"
     );
-    assert_eq!(count_rows(&lines(&seen), "sleep 60"), 1, "one ToolRow");
+    assert_eq!(
+        seen.transcript.tool_calls().len(),
+        1,
+        "the reconnected call is the same member"
+    );
 
     // Completed: the SAME rows, rewritten.
     complete(&mut seen, "c1");
-    let (done_head_at, done_head) = row(&lines(&seen), "完成 1 项");
+    let (done_head_at, done_head) = row(&lines(&seen), "执行了 1 个命令");
     assert_eq!(
         done_head_at,
         seen_head_at,
@@ -354,14 +366,15 @@ fn c5_reconnect_keeps_the_running_geometry_until_completion() {
     );
     assert_eq!(indent(&done_head), indent(&seen_head), "head stays put");
     assert_eq!(
-        indent(&row(&lines(&seen), "sleep 60").1),
-        indent(&row(&lines(&live), "sleep 60").1),
-        "and the child column does not re-indent"
+        count_rows(&lines(&seen), "执行了 1 个命令"),
+        1,
+        "one receipt, not two: {:?}",
+        lines(&seen)
     );
     assert_eq!(
-        count_rows(&lines(&seen), "sleep 60"),
+        seen.transcript.tool_calls().len(),
         1,
-        "still one ToolRow"
+        "still one member, not a duplicate"
     );
     assert_eq!(
         rounds(&seen),
@@ -398,10 +411,10 @@ fn c6_a_legacy_snapshot_without_a_round_falls_back_safely() {
         vec![(None, vec!["shell_command".to_string()])],
         "an absent round stays absent instead of being invented"
     );
-    assert!(
-        lines(&s).iter().any(|l| l.contains("sleep 60 · 3s")),
-        "{:?}",
-        lines(&s)
+    assert_eq!(
+        s.elapsed_secs as i64 - s.transcript.tool_calls()[0].started_elapsed_secs,
+        3,
+        "a legacy snapshot keeps the call's own elapsed as its back-dated start"
     );
 
     // A later, modern snapshot states its own rounds and carries no fallback over.
@@ -438,10 +451,14 @@ fn r6_resume_after_completion_mints_no_orphan_round() {
         rounds(&live)
     );
     assert_eq!(
-        count_rows(&lines(&live), "sleep 60"),
+        live.transcript.tool_calls().len(),
         1,
         "one ToolRow, not two: {:?}",
-        lines(&live)
+        live.transcript
+            .tool_calls()
+            .iter()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>()
     );
 
     // Resume: a snapshot of the finished session. Active tools are empty, so no

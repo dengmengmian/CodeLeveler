@@ -14,7 +14,7 @@ use crate::transcript::{
 
 use super::text::wrap;
 
-/// Render a (possibly streaming) assistant message to bulleted lines, plus the
+/// Render a (possibly streaming) assistant message to full prose lines, plus the
 /// count of leading lines that belong to fully-received Markdown blocks and are
 /// therefore safe to commit to scrollback progressively. When the message is
 /// done, every line is stable. The live tail (last block + streaming "▌" cursor)
@@ -24,21 +24,7 @@ pub fn assistant_split(
     theme: &Theme,
     wrap_width: usize,
 ) -> (Vec<Line<'static>>, usize) {
-    let (lines, stable) = assistant_body(block, theme, wrap_width);
-    // Bulleting maps lines 1:1, so the stable boundary is preserved.
-    // A final answer is the turn's one primary statement: the accent marker
-    // draws the eye to it. Interim narration is process prose and takes a
-    // quieter marker, so a long turn's running commentary never competes with
-    // the answer for attention. The distinction is structural — nothing here
-    // reads the message text.
-    let (marker, marker_style) = match block.kind {
-        AssistantKind::Final => ("◆", Style::default().fg(theme.accent.primary)),
-        AssistantKind::Progress | AssistantKind::Pending => {
-            ("●", Style::default().fg(theme.text.secondary))
-        }
-    };
-    let bulleted = bulleted(lines, marker, marker_style);
-    (bulleted, stable)
+    assistant_body(block, theme, wrap_width)
 }
 
 /// The message's own wrapped rows, before the bullet gutter: every VISUAL line
@@ -51,8 +37,8 @@ fn assistant_body(
     theme: &Theme,
     wrap_width: usize,
 ) -> (Vec<Line<'static>>, usize) {
-    // Content is indented two columns under its Assistant marker.
-    let inner = wrap_width.saturating_sub(2).max(1);
+    // Prose uses the full conversation width without a role gutter.
+    let inner = wrap_width.max(1);
     // Use the cached parse when done, else parse the partial text this frame so
     // formatting appears as it streams (spec §62).
     let parsed;
@@ -350,6 +336,7 @@ pub fn item_render(
                 None,
                 None,
                 &mut Vec::new(),
+                None,
             ));
         }
         // Scrollback: the agent is finished, so no live elapsed is shown (0).
@@ -567,8 +554,7 @@ fn goal_recap_lines(
 }
 
 /// The single terminal-failure block. The primary lines carry product copy and
-/// a muted machine subtitle; the vendor's raw detail is shown only when
-/// disclosed, so a default view never leaks a payload.
+/// a muted machine subtitle; the safe technical projection is always visible.
 fn failure_lines(
     block: &crate::transcript::FailureBlock,
     theme: &Theme,
@@ -577,7 +563,14 @@ fn failure_lines(
     t: &crate::i18n::UiText,
 ) {
     out.push(Line::from(vec![
-        Span::styled("✗ ", Style::default().fg(theme.status.error)),
+        Span::styled(
+            if block.display.is_expanded() {
+                "▾ ✗ "
+            } else {
+                "▸ ✗ "
+            },
+            Style::default().fg(theme.status.error),
+        ),
         Span::styled(
             block.title.clone(),
             Style::default()
@@ -585,6 +578,9 @@ fn failure_lines(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    if !block.display.is_expanded() {
+        return;
+    }
     if !block.summary.trim().is_empty() {
         for line in wrap(&block.summary, width.saturating_sub(2).max(8)) {
             out.push(Line::from(Span::styled(
@@ -602,20 +598,13 @@ fn failure_lines(
         )));
     }
     if !block.detail.trim().is_empty() {
-        if block.expanded {
+        out.push(Line::from(Span::styled(
+            format!("  {}", t.failure_detail_label),
+            Style::default().fg(theme.text.secondary),
+        )));
+        for line in wrap(&block.detail, width.saturating_sub(4).max(8)) {
             out.push(Line::from(Span::styled(
-                format!("  {}", t.failure_detail_label),
-                Style::default().fg(theme.text.secondary),
-            )));
-            for line in wrap(&block.detail, width.saturating_sub(4).max(8)) {
-                out.push(Line::from(Span::styled(
-                    format!("  {line}"),
-                    Style::default().fg(theme.text.secondary),
-                )));
-            }
-        } else {
-            out.push(Line::from(Span::styled(
-                format!("  {}", t.failure_detail_hint),
+                format!("  {line}"),
                 Style::default().fg(theme.text.secondary),
             )));
         }
@@ -1177,26 +1166,6 @@ fn sub_agent_tree_child_status(
     }
 }
 
-/// Prefix a block of lines with a colored bullet on the first line and a
-/// two-column hanging indent on the remaining lines.
-fn bulleted(lines: Vec<Line<'static>>, bullet: &str, bullet_style: Style) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len().max(1));
-    for (i, line) in lines.into_iter().enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
-        if i == 0 {
-            spans.push(Span::styled(format!("{bullet} "), bullet_style));
-        } else {
-            spans.push(Span::raw("  "));
-        }
-        spans.extend(line.spans);
-        out.push(Line::from(spans));
-    }
-    if out.is_empty() {
-        out.push(Line::from(Span::styled(format!("{bullet} "), bullet_style)));
-    }
-    out
-}
-
 /// Whether a blank separator belongs between two adjacent transcript items.
 /// Consecutive tool calls form one visual group — a gap between each would
 /// stretch a burst of quick reads across half a screen of whitespace.
@@ -1370,6 +1339,33 @@ mod tests {
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn terminal_failure_displays_technical_error_without_disclosure() {
+        let mut block = crate::transcript::FailureBlock {
+            display: crate::fold::DisplayMode::Collapsed,
+            title: "请求失败".into(),
+            summary: "无法连接模型服务。".into(),
+            subtitle: Some("network · 可继续".into()),
+            detail: "原因        connection closed".into(),
+        };
+        let mut lines = Vec::new();
+        failure_lines(&block, &Theme::dark(), 80, &mut lines, Locale::Zh.text());
+        assert_eq!(lines.len(), 1);
+        assert!(!line_text(&lines[0]).contains("connection closed"));
+        block.display = crate::fold::DisplayMode::Expanded;
+        lines.clear();
+        failure_lines(&block, &Theme::dark(), 80, &mut lines, Locale::Zh.text());
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("connection closed"),
+            "the error must be immediately readable: {text}"
+        );
+        assert!(
+            !text.contains("Ctrl+O"),
+            "failure has no disclosure action: {text}"
+        );
     }
 
     /// A user shell whose stop could not be confirmed reads as unknown —
@@ -1708,12 +1704,12 @@ mod tests {
         let progress = assistant_render(&block("working", AssistantKind::Progress), &theme, 40);
         let final_answer = assistant_render(&block("done", AssistantKind::Final), &theme, 40);
 
-        assert!(line_text(&progress[0]).starts_with("● "));
-        assert!(line_text(&final_answer[0]).starts_with("◆ "));
+        assert_eq!(line_text(&progress[0]), "working");
+        assert_eq!(line_text(&final_answer[0]), "done");
         assert_eq!(progress[0].spans[0].style.fg, Some(theme.text.secondary));
         assert_eq!(
             final_answer[0].spans[0].style.fg,
-            Some(theme.accent.primary)
+            Some(theme.text.final_lead)
         );
         assert_ne!(
             progress[0].spans[0].style.fg,
@@ -1996,7 +1992,7 @@ mod tests {
             40,
         );
 
-        assert!(line_text(&lines[0]).starts_with("◆ "));
+        assert_eq!(line_text(&lines[0]), "final answer");
         assert!(
             lines
                 .iter()

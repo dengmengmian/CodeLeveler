@@ -1170,8 +1170,6 @@ mod transcript_lines;
 pub(crate) use footer::background_footer_spans;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
-#[cfg(test)]
-pub(crate) use transcript_lines::REASONING_RAIL_SEGMENT_ROWS;
 pub use transcript_lines::{
     assistant_render, assistant_split, item_is_final, item_render, items_need_gap,
     sub_agent_tree_lines,
@@ -3183,6 +3181,10 @@ mod tests {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         spawn_call_then(&mut state, false, "Unknown role `explorr`.");
+        let collapsed = render_text(&mut state, 100, 30);
+        assert!(collapsed.contains("1 个失败"), "{collapsed}");
+        let group = state.transcript.last_tool_group_index().unwrap();
+        crate::conversation::interaction::toggle_fold(&mut state, group);
         let text = render_text(&mut state, 100, 30);
         assert!(text.contains("子 Agent"), "{text}");
     }
@@ -3582,7 +3584,7 @@ mod tests {
     }
 
     #[test]
-    fn a_structured_failure_hides_the_raw_detail_until_disclosed() {
+    fn a_structured_failure_shows_the_reason_without_dumping_the_legacy_error() {
         use leveler_client_protocol::{
             FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
         };
@@ -3605,7 +3607,9 @@ mod tests {
                     retryability: FailureRetryability::Never,
                     delivery: FailureDelivery::Responded,
                     summary: "模型服务拒绝了当前请求。".into(),
-                    detail: raw.into(),
+                    detail:
+                        "tools.function.parameters is not a valid moonshot flavored json schema"
+                            .into(),
                 }),
             }),
         );
@@ -3617,6 +3621,28 @@ mod tests {
             .filter(|i| matches!(i, crate::transcript::TranscriptItem::Failure(_)))
             .count();
         assert_eq!(failures, 1, "one failure must be presented once");
+        let failure = s
+            .transcript
+            .items()
+            .iter()
+            .position(|it| matches!(it, TranscriptItem::Failure(_)))
+            .unwrap();
+        let collapsed = crate::conversation::build::build_conversation_lines(&s, 120)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed.contains("▸ ✗ 请求失败"));
+        assert!(!collapsed.contains("not a valid"));
+        let header = s
+            .conversation_lines_and_hits(120)
+            .1
+            .iter()
+            .find(|(_, item)| *item == failure)
+            .copied()
+            .expect("failure header is a real click target");
+        assert_eq!(header.1, failure);
+        crate::conversation::interaction::toggle_fold(&mut s, failure);
         let joined: String = crate::conversation::build::build_conversation_lines(&s, 120)
             .iter()
             .map(line_str)
@@ -3625,30 +3651,25 @@ mod tests {
         assert!(joined.contains("模型服务拒绝了当前请求。"), "{joined}");
         assert!(joined.contains("moonshot · invalid_request"), "{joined}");
         assert!(
-            !joined.contains("flavored json schema"),
-            "the raw detail must not leak into the default view:\n{joined}"
+            joined.contains("flavored json schema"),
+            "the specific reason must be immediately visible:\n{joined}"
         );
-        // Disclosure reveals the raw technical detail.
-        let _ = s
-            .transcript
-            .last_foldable_index()
-            .map(|i| s.transcript.toggle_item_display(i));
-        let expanded: String = crate::conversation::build::build_conversation_lines(&s, 120)
-            .iter()
-            .map(line_str)
-            .collect::<Vec<_>>()
-            .join("\n");
         assert!(
-            expanded.contains("flavored json schema"),
-            "the raw detail must be readable once disclosed:\n{expanded}"
+            !joined.contains("execution error:"),
+            "legacy error must not repeat: {joined}"
         );
+        assert!(
+            !joined.contains("{\"error\""),
+            "raw payload must not be dumped: {joined}"
+        );
+        assert!(!joined.contains("Ctrl+O 查看详情"));
     }
 
-    /// The disclosure names every machine fact the runtime proved, so a user
+    /// The inline detail names every machine fact the runtime proved, so a user
     /// report carries the provider, model, status, vendor code and request id
     /// without anyone parsing a payload.
     #[test]
-    fn a_failure_disclosure_names_the_provider_facts() {
+    fn a_failure_detail_names_the_provider_facts_without_disclosure() {
         use leveler_client_protocol::{
             FailureCategory, FailureDelivery, FailureRetryability, FailureSource, UiFailure,
         };
@@ -3674,6 +3695,28 @@ mod tests {
                 }),
             }),
         );
+        let failure = s
+            .transcript
+            .items()
+            .iter()
+            .position(|it| matches!(it, TranscriptItem::Failure(_)))
+            .unwrap();
+        let collapsed = crate::conversation::build::build_conversation_lines(&s, 120)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(collapsed.contains("▸ ✗ 请求失败"));
+        assert!(!collapsed.contains("not a valid"));
+        let header = s
+            .conversation_lines_and_hits(120)
+            .1
+            .iter()
+            .find(|(_, item)| *item == failure)
+            .copied()
+            .expect("failure header is a real click target");
+        assert_eq!(header.1, failure);
+        crate::conversation::interaction::toggle_fold(&mut s, failure);
         let default: String = crate::conversation::build::build_conversation_lines(&s, 120)
             .iter()
             .map(line_str)
@@ -3683,20 +3726,6 @@ mod tests {
             default.contains("kimi · invalid_request · HTTP 400"),
             "the status must ride the always-visible subtitle:\n{default}"
         );
-        assert!(
-            !default.contains("not a valid json schema"),
-            "the reason stays behind the disclosure:\n{default}"
-        );
-
-        let _ = s
-            .transcript
-            .last_foldable_index()
-            .map(|i| s.transcript.toggle_item_display(i));
-        let expanded: String = crate::conversation::build::build_conversation_lines(&s, 120)
-            .iter()
-            .map(line_str)
-            .collect::<Vec<_>>()
-            .join("\n");
         for needle in [
             "kimi",
             "k3",
@@ -3705,10 +3734,7 @@ mod tests {
             "req_live_1",
             "not a valid json schema",
         ] {
-            assert!(
-                expanded.contains(needle),
-                "missing {needle} in:\n{expanded}"
-            );
+            assert!(default.contains(needle), "missing {needle} in:\n{default}");
         }
     }
 
@@ -3771,8 +3797,8 @@ mod tests {
         // member's output through that member's own display state.
         let target = crate::conversation::build::keyboard_expand_target(&s).unwrap();
         crate::conversation::interaction::toggle_fold(&mut s, target);
-        for item in crate::conversation::build::keyboard_detail_items(&s, target) {
-            s.transcript.set_process_calls_expanded(item, true);
+        for (item, call) in crate::conversation::build::keyboard_detail_calls(&s, target) {
+            s.transcript.set_call_expanded(item, call, true);
         }
         let open: String = crate::conversation::build::build_conversation_lines(&s, 100)
             .iter()
