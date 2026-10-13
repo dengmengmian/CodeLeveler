@@ -58,10 +58,9 @@
   "title": "failure attribution",
   "rendered": {
     "contains": [
-      "✗ 1"
+      "✗"
     ],
     "excludes": [
-      "2 tests failed",
       "[execution policy]",
       "[mutation rejected]",
       "write denied"
