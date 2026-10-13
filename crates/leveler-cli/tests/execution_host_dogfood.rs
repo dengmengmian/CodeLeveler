@@ -734,3 +734,59 @@ fn execution_host_sigkill_reports_unknown_and_does_not_adopt_or_signal_services(
         },
     );
 }
+
+/// A supervisor's SIGTERM is a shutdown, not an abort. The host must remove its
+/// ready file on the way out, otherwise the next runtime start reads an endpoint
+/// no one is listening on and refuses to start.
+#[test]
+fn sigterm_shuts_the_host_down_without_leaving_a_ready_file() {
+    leveler_test_support::bounded_test(
+        "sigterm_shuts_the_host_down_without_leaving_a_ready_file",
+        Duration::from_secs(60),
+        || async {
+            let env = Environment::new("http://127.0.0.1:1");
+            let host_state = env.home.join("host-state");
+            let mut command = env.command();
+            command
+                .arg("execution-host")
+                .arg("--state-dir")
+                .arg(&host_state)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut host = ManagedChild::spawn(&mut command).unwrap();
+            let ready = host_state.join("ready.json");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "host never became ready at {}",
+                    ready.display()
+                );
+                assert!(
+                    host.try_wait().unwrap().is_none(),
+                    "host exited before it became ready"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let pid = host.id();
+            assert!(
+                Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "the test must actually signal the host"
+            );
+            let status = host.wait().unwrap();
+            assert!(
+                status.success(),
+                "SIGTERM must be a clean shutdown, got {status:?}"
+            );
+            assert!(
+                !ready.exists(),
+                "a stopped host must leave no ready file behind"
+            );
+            eprintln!("DOGFOOD PASS sigterm_pid={pid} clean_exit=true ready_removed=true");
+        },
+    );
+}

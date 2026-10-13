@@ -447,12 +447,7 @@ impl BackgroundTaskRegistry {
             return Ok(());
         };
         let Some(client) = crate::execution_host::ExecutionHostClient::probe(config).await? else {
-            if !self.journal()?.pending()?.is_empty() {
-                return Err(
-                    "Execution Host is absent with outstanding semantic reservations".into(),
-                );
-            }
-            return Ok(());
+            return self.reconcile_absent_host(config).await;
         };
         let journal = self.journal()?;
         for task in client.list().await? {
@@ -472,6 +467,45 @@ impl BackgroundTaskRegistry {
             }
         }
         Ok(())
+    }
+
+    /// The host is gone. A reservation whose spawn the host never admitted owns
+    /// no process: `intents.json` (persisted before any OS spawn) holds nothing
+    /// outstanding and the archive has no fact for it, so releasing the write
+    /// reservation loses nothing — while keeping it blocks every future start
+    /// forever, since no host will ever report that task's exit.
+    ///
+    /// Every other case keeps its reservation, exactly as before: an unresolved
+    /// spawn intent, a fact the host did admit, or records that cannot be read as
+    /// truth are all ownership this code refuses to guess about.
+    async fn reconcile_absent_host(
+        &self,
+        config: &crate::execution_host::ExecutionHostConfig,
+    ) -> Result<(), String> {
+        let journal = self.journal()?;
+        let pending = journal.pending()?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let records = crate::execution_host::HostRecords::read(&config.state_dir)?;
+        if records.has_unmanaged_process() || records.intents_outstanding() {
+            return Err("Execution Host is absent with outstanding semantic reservations".into());
+        }
+        let mut retained = Vec::new();
+        for record in &pending {
+            if records.has_task(&record.task_id) {
+                retained.push(record.task_id.clone());
+            } else {
+                journal.abandon_prepared(&record.task_id)?;
+            }
+        }
+        if retained.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "Execution Host is absent with outstanding semantic reservations: {}",
+            retained.join(", ")
+        ))
     }
 
     pub async fn try_all_snapshots(&self) -> Result<Vec<BackgroundTaskSnapshot>, String> {
@@ -3463,6 +3497,7 @@ mod tests {
 /// as the foreground, so one policy yields one result in both.
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod unified_runner_tests {
+    use super::tests::host_registry;
     use super::*;
     use crate::WriteScope;
     use crate::command::ProcessRequest;
@@ -3654,5 +3689,107 @@ mod unified_runner_tests {
             settlement.modified.contains(&"late.txt".to_string()),
             "{settlement:?}"
         );
+    }
+
+    /// A reservation for a spawn the host never admitted owns no process: the
+    /// intent was never persisted to `intents.json` and the archive has no fact
+    /// for it. Releasing it loses nothing and unblocks the runtime; keeping it
+    /// forever blocks every future start.
+    #[tokio::test]
+    async fn reconcile_releases_reservations_the_host_never_admitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = crate::execution_host::ExecutionHostConfig {
+            state_dir: dir.path().join("host"),
+            repo_root: repo,
+            executable: PathBuf::from("unused-test-executable"),
+        };
+        let journal = crate::host_settlement::SettlementJournal::open(&config.semantic_dir())
+            .expect("journal");
+        journal
+            .prepare("host-never-admitted", "owner", "parent", None)
+            .await
+            .expect("admission");
+        let registry = host_registry().with_execution_host(config.clone());
+        registry
+            .reconcile_hosted()
+            .await
+            .expect("residue must not block the runtime forever");
+        assert!(
+            journal.pending().unwrap().is_empty(),
+            "the released reservation must be gone"
+        );
+    }
+
+    /// Everything that could still own a process keeps its reservation, exactly
+    /// as before: an unresolved spawn intent, a task fact the host did admit, and
+    /// an archive that still lists live work.
+    #[tokio::test]
+    async fn reconcile_keeps_reservations_that_may_still_own_something() {
+        for case in ["intent", "admitted", "live-task"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = dir.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let config = crate::execution_host::ExecutionHostConfig {
+                state_dir: dir.path().join("host"),
+                repo_root: repo,
+                executable: PathBuf::from("unused-test-executable"),
+            };
+            std::fs::create_dir_all(&config.state_dir).unwrap();
+            let journal = crate::host_settlement::SettlementJournal::open(&config.semantic_dir())
+                .expect("journal");
+            journal
+                .prepare("host-pending", "owner", "parent", None)
+                .await
+                .expect("admission");
+            match case {
+                "intent" => std::fs::write(
+                    config.state_dir.join("intents.json"),
+                    br#"[{"id":"host-pending","owner":"owner","program":"sh","args":[],"cwd":"/tmp","started_at_ms":0}]"#,
+                )
+                .unwrap(),
+                "admitted" => std::fs::write(
+                    config.state_dir.join("tasks.json"),
+                    task_archive("host-pending", "Exited", &config.repo_root),
+                )
+                .unwrap(),
+                "live-task" => std::fs::write(
+                    config.state_dir.join("tasks.json"),
+                    task_archive("host-other", "Running", &config.repo_root),
+                )
+                .unwrap(),
+                other => panic!("unknown case {other}"),
+            }
+            let registry = host_registry().with_execution_host(config.clone());
+            registry
+                .reconcile_hosted()
+                .await
+                .expect_err("an unprovable reservation must stay reserved");
+            assert_eq!(
+                journal.pending().unwrap().len(),
+                1,
+                "case {case} must retain its write reservation"
+            );
+        }
+    }
+
+    fn task_archive(id: &str, status: &str, root: &std::path::Path) -> Vec<u8> {
+        let task = serde_json::json!({
+            "snapshot": {
+                "id": id, "program": "sleep", "args": ["30"],
+                "cwd": root, "status": status, "exit_code": null,
+                "log": "", "duration_ms": 0, "pid": 4242, "owner_scope": "owner"
+            },
+            "lifetime": "Persistent",
+            "writer_scope": "parent",
+            "write_scope": "Unrestricted",
+            "process_id": 4242,
+            "started_at_ms": 0,
+            "finished_at_ms": null,
+            "log_end": 0,
+            "log_prefix_len": 0
+        });
+        serde_json::to_vec(&vec![task]).unwrap()
     }
 }

@@ -799,10 +799,47 @@ pub enum BackgroundCommand {
     Logs { task_id: String },
     /// Ask the runtime to stop one background task and its process group.
     Stop { task_id: String },
+    /// Inspect and release semantic write reservations the execution host left.
+    ///
+    /// A reservation exists from admission until the host reports the task's
+    /// exit and the runtime settles it. One the host never admitted owns no
+    /// process, and no host will ever report its exit — it would block every
+    /// future runtime start until it is released.
+    Journal {
+        #[command(subcommand)]
+        command: BackgroundJournalCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackgroundJournalCommand {
+    /// List reservations that are still pending, with the facts that decide them.
+    List {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release one reservation the host provably never admitted.
+    Abandon { task_id: String },
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_journal_subcommands_parse() {
+        let list =
+            super::Cli::try_parse_from(["leveler", "background", "journal", "list", "--json"]);
+        assert!(list.is_ok(), "journal list must parse: {list:?}");
+        let abandon = super::Cli::try_parse_from([
+            "leveler",
+            "background",
+            "journal",
+            "abandon",
+            "host-orphan",
+        ]);
+        assert!(abandon.is_ok(), "journal abandon must parse: {abandon:?}");
+    }
+
     #[test]
     fn execution_host_daemon_accepts_explicit_private_state_directory() {
         let parsed = super::Cli::try_parse_from([

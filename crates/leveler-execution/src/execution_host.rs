@@ -300,6 +300,103 @@ impl std::fmt::Display for SpawnError {
 }
 impl std::error::Error for SpawnError {}
 
+/// What the host's own durable records say about the processes it owned.
+///
+/// `tasks.json` archives every admitted task; `intents.json` holds the spawn
+/// intents persisted immediately before an OS spawn. They are the only
+/// authority on whether an unreachable host may still own something, so every
+/// caller that must decide between "residue" and "unknown" reads them here.
+pub struct HostRecords {
+    tasks: Vec<HostedTask>,
+    intents_outstanding: bool,
+}
+
+impl HostRecords {
+    /// `Err` means the records cannot be read as truth: an unreadable or
+    /// unparsable archive proves nothing and is never treated as empty.
+    pub fn read(state_dir: &Path) -> Result<Self, String> {
+        let tasks = match std::fs::read(state_dir.join("tasks.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("invalid Execution Host task archive: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(format!("could not read Execution Host task archive: {e}")),
+        };
+        let intents_outstanding = match std::fs::read(state_dir.join("intents.json")) {
+            Ok(bytes) => {
+                let intents: Vec<SpawnIntent> = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("invalid Execution Host spawn intents: {e}"))?;
+                !intents.is_empty()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(format!("could not read Execution Host spawn intents: {e}")),
+        };
+        Ok(Self {
+            tasks,
+            intents_outstanding,
+        })
+    }
+
+    /// A task the archive still holds as live is ownership, never residue.
+    pub fn has_unmanaged_process(&self) -> bool {
+        self.tasks.iter().any(|task| {
+            matches!(
+                task.snapshot.status,
+                BackgroundTaskStatus::Running | BackgroundTaskStatus::Killing
+            )
+        })
+    }
+
+    /// A spawn whose OS result was never recorded may still be running.
+    pub fn intents_outstanding(&self) -> bool {
+        self.intents_outstanding
+    }
+
+    /// Whether the host ever admitted this task as a process fact.
+    pub fn has_task(&self, task_id: &str) -> bool {
+        self.tasks.iter().any(|task| task.snapshot.id == task_id)
+    }
+}
+
+/// Why a client could not reach the endpoint a ready file records.
+#[derive(Debug)]
+enum ConnectFailure {
+    /// A host answered, or its own metadata spoke: never residue of a dead one.
+    Metadata(String),
+    /// Nothing accepted the connection the ready file points at.
+    Refused(String),
+}
+
+impl ConnectFailure {
+    fn message(self) -> String {
+        match self {
+            Self::Metadata(error) | Self::Refused(error) => error,
+        }
+    }
+}
+
+/// Remove the ready file of a host that is provably gone.
+///
+/// The lifecycle lock is the authority: `serve` holds it for the host's whole
+/// life and the kernel drops it when the holder dies, so a lock this process can
+/// take proves the owner is gone. The durable records must agree — an archive
+/// that still lists live work, an unresolved spawn intent, or records that
+/// cannot be read all mean the residue may still describe ownership, and
+/// ownership is never guessed at.
+fn clear_dead_host_residue(config: &ExecutionHostConfig) -> Result<(), String> {
+    if lock(&config.state_dir.join("host.lock")).is_err() {
+        return Err("the lifecycle lock is held".into());
+    }
+    let records = HostRecords::read(&config.state_dir)?;
+    if records.has_unmanaged_process() {
+        return Err("the archive still lists a running or killing task".into());
+    }
+    if records.intents_outstanding() {
+        return Err("a spawn intent is unresolved".into());
+    }
+    let path = config.state_dir.join("ready.json");
+    std::fs::remove_file(&path).map_err(|e| format!("could not remove {}: {e}", path.display()))
+}
+
 #[derive(Clone)]
 pub struct ExecutionHostClient {
     config: ExecutionHostConfig,
@@ -310,36 +407,62 @@ pub struct ExecutionHostClient {
     peer_major: u32,
 }
 impl ExecutionHostClient {
+    /// Read a live host, or `None` when none exists.
+    ///
+    /// A ready file is a derived fact, not an owner: its existence says nothing
+    /// by itself. When the recorded endpoint refuses the connection, the
+    /// lifecycle lock and the durable records decide whether this is a dead
+    /// host's residue (absent) or an owner whose state is still unknown
+    /// (error). Residue is removed; unknown state is preserved and reported.
     pub async fn probe(config: &ExecutionHostConfig) -> Result<Option<Self>, String> {
         if !config.state_dir.join("ready.json").exists() {
             return Ok(None);
         }
-        Self::connect(config.clone()).await.map(Some)
+        match Self::connect_classified(config.clone()).await {
+            Ok(client) => Ok(Some(client)),
+            Err(ConnectFailure::Metadata(error)) => Err(error),
+            Err(ConnectFailure::Refused(error)) => match clear_dead_host_residue(config) {
+                Ok(()) => Ok(None),
+                Err(reason) => Err(format!("{error}; residue kept: {reason}")),
+            },
+        }
     }
     pub async fn connect(config: ExecutionHostConfig) -> Result<Self, String> {
-        let r = ready(&config)?;
+        Self::connect_classified(config)
+            .await
+            .map_err(ConnectFailure::message)
+    }
+
+    async fn connect_classified(config: ExecutionHostConfig) -> Result<Self, ConnectFailure> {
+        let r = ready(&config).map_err(ConnectFailure::Metadata)?;
         let c = Self {
             peer_major: r.major,
             config,
             ready: r,
         };
-        match c.call(Request::Hello).await? {
+        match c.call_classified(Request::Hello).await? {
             Reply::Hello {
                 major,
                 capabilities,
                 instance,
                 ..
             } => {
-                check_compatibility(major, &capabilities)?;
+                check_compatibility(major, &capabilities).map_err(ConnectFailure::Metadata)?;
                 if instance != c.ready.instance {
-                    return Err("Execution Host instance changed".into());
+                    return Err(ConnectFailure::Metadata(
+                        "Execution Host instance changed".into(),
+                    ));
                 }
                 if major != c.peer_major {
-                    return Err("Execution Host major changed since readiness".into());
+                    return Err(ConnectFailure::Metadata(
+                        "Execution Host major changed since readiness".into(),
+                    ));
                 }
                 Ok(c)
             }
-            _ => Err("invalid Execution Host handshake".into()),
+            _ => Err(ConnectFailure::Metadata(
+                "invalid Execution Host handshake".into(),
+            )),
         }
     }
 
@@ -432,9 +555,18 @@ impl ExecutionHostClient {
         }
     }
     async fn call(&self, request: Request) -> Result<Reply, String> {
+        self.call_classified(request)
+            .await
+            .map_err(ConnectFailure::message)
+    }
+    async fn call_classified(&self, request: Request) -> Result<Reply, ConnectFailure> {
         tokio::time::timeout(Duration::from_secs(35), async {
             let mut s = TcpStream::connect(self.ready.address).await.map_err(|e| {
-                format!("Execution Host unavailable; service state is unknown: {e}")
+                ConnectFailure::Refused(format!(
+                    "Execution Host unavailable; service state is unknown: {e} \
+                     (recorded endpoint {}, pid {}, instance {})",
+                    self.ready.address, self.ready.pid, self.ready.instance
+                ))
             })?;
             write_frame(
                 &mut s,
@@ -444,16 +576,21 @@ impl ExecutionHostClient {
                     request,
                 },
             )
-            .await?;
-            let reply: Reply =
-                serde_json::from_slice(&read_frame(&mut s).await?).map_err(|e| e.to_string())?;
+            .await
+            .map_err(ConnectFailure::Metadata)?;
+            let reply: Reply = serde_json::from_slice(
+                &read_frame(&mut s).await.map_err(ConnectFailure::Metadata)?,
+            )
+            .map_err(|e| ConnectFailure::Metadata(e.to_string()))?;
             match reply {
-                Reply::Error(e) => Err(e),
+                Reply::Error(e) => Err(ConnectFailure::Metadata(e)),
                 v => Ok(v),
             }
         })
         .await
-        .map_err(|_| "Execution Host request timeout; outcome unknown".to_string())?
+        .map_err(|_| {
+            ConnectFailure::Metadata("Execution Host request timeout; outcome unknown".to_string())
+        })?
     }
     pub async fn list(&self) -> Result<Vec<HostedTask>, String> {
         match self.call(Request::List).await? {
@@ -1096,6 +1233,36 @@ pub async fn serve(config: ExecutionHostConfig) -> Result<(), String> {
         ready: ready.clone(),
         config,
     });
+    // A supervisor's SIGTERM is a shutdown, not an abort. Bridging it onto the
+    // same token as an idle exit means the ready file is removed on the way
+    // out, so a stopped host leaves no endpoint for a later probe to trust.
+    #[cfg(unix)]
+    {
+        let shutdown = host.shutdown.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (Ok(mut terminate), Ok(mut interrupt)) = (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+            ) else {
+                return;
+            };
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+            shutdown.cancel();
+        });
+    }
+    #[cfg(windows)]
+    {
+        let shutdown = host.shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                shutdown.cancel();
+            }
+        });
+    }
     // Subscribe before readiness permits the first client spawn.
     let mut events = host.registry.subscribe();
     host.persist().await?;
@@ -1936,5 +2103,137 @@ mod tests {
         );
         generation.kill_owned(&id, "session-1").await.unwrap();
         server.abort();
+    }
+
+    fn host_config(root: &Path) -> ExecutionHostConfig {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        ExecutionHostConfig {
+            state_dir: root.join("host"),
+            repo_root: repo,
+            executable: PathBuf::from("unused-test-executable"),
+        }
+    }
+
+    /// A ready file is a *derived* fact: it names an endpoint, never an owner.
+    /// Whether it still describes anything is decided by the lifecycle lock,
+    /// which the kernel releases when its holder dies.
+    fn write_ready_residue(config: &ExecutionHostConfig, address: &str, major: u32) {
+        secure_dir(&config.state_dir).unwrap();
+        let ready = Ready {
+            address: address.parse().unwrap(),
+            token: "0".repeat(64),
+            instance: "residue-instance".into(),
+            pid: 1,
+            repo: config.repo_root.clone(),
+            major,
+            minor: PROTOCOL_MINOR,
+            capabilities: REQUIRED_CAPABILITIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        atomic_json(&config.state_dir.join("ready.json"), &ready).unwrap();
+    }
+
+    fn write_archive(config: &ExecutionHostConfig, status: &str) {
+        let task = serde_json::json!({
+            "snapshot": {
+                "id": "host-recorded", "program": "sleep", "args": ["30"],
+                "cwd": config.repo_root.clone(), "status": status, "exit_code": null,
+                "log": "", "duration_ms": 0, "pid": 4242, "owner_scope": "session"
+            },
+            "lifetime": "Persistent",
+            "writer_scope": "parent",
+            "write_scope": "Unrestricted",
+            "process_id": 4242,
+            "started_at_ms": 0,
+            "finished_at_ms": null,
+            "log_end": 0,
+            "log_prefix_len": 0
+        });
+        std::fs::write(
+            config.state_dir.join("tasks.json"),
+            serde_json::to_vec(&vec![task]).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A refused endpoint plus a free lifecycle lock plus settled records is a
+    /// dead host's residue. Reading it as "no host" is what lets a runtime start
+    /// again; nothing here is an owner decision.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_clears_ready_residue_left_by_a_host_that_owns_no_work() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        let probed = ExecutionHostClient::probe(&config).await;
+        match probed {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("settled residue must read as an absent host"),
+            Err(error) => panic!("settled residue must not surface an error: {error}"),
+        }
+        assert!(
+            !config.state_dir.join("ready.json").exists(),
+            "residue of a provably dead host is not state"
+        );
+    }
+
+    /// Residue that may still own a process stays visible: the CLI answers with
+    /// an error rather than an empty inventory, and the record is preserved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_preserves_residue_that_may_still_own_a_process() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        write_archive(&config, "Running");
+        let error = match ExecutionHostClient::probe(&config).await {
+            Ok(_) => panic!("unmanaged work must stay visible"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unavailable"), "{error}");
+        assert!(
+            config.state_dir.join("ready.json").exists(),
+            "residue that may own live work is never cleaned"
+        );
+    }
+
+    /// An intent persisted before an OS spawn leaves the same uncertainty as a
+    /// live process: the host may have launched something it never recorded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_preserves_residue_while_a_spawn_intent_is_outstanding() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR);
+        std::fs::write(
+            config.state_dir.join("intents.json"),
+            br#"[{"id":"host-unresolved","owner":"session","program":"sh","args":["-c","true"],"cwd":"/tmp","started_at_ms":0}]"#,
+        )
+        .unwrap();
+        let error = match ExecutionHostClient::probe(&config).await {
+            Ok(_) => panic!("an unresolved spawn intent must stay visible"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unavailable"), "{error}");
+        assert!(config.state_dir.join("ready.json").exists());
+    }
+
+    /// An incompatible ready file is a live host's own metadata: the error the
+    /// product reports must survive untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_reports_an_incompatible_ready_file_without_cleaning_it() {
+        let root = tempfile::tempdir().unwrap();
+        let config = host_config(root.path());
+        write_ready_residue(&config, "127.0.0.1:1", PROTOCOL_MAJOR + 1);
+        let error = match ExecutionHostClient::probe(&config).await {
+            Ok(_) => panic!("an unknown major is refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("incompatible"), "{error}");
+        assert!(config.state_dir.join("ready.json").exists());
     }
 }

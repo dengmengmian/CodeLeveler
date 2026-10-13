@@ -11,7 +11,7 @@
 
 use leveler_project::Layout;
 
-use crate::cli::BackgroundCommand;
+use crate::cli::{BackgroundCommand, BackgroundJournalCommand};
 
 #[derive(serde::Serialize)]
 struct InventoryEntry {
@@ -49,6 +49,12 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
     use leveler_execution::BackgroundTaskStatus;
     use leveler_execution::execution_host::ExecutionHostClient;
 
+    // The journal is the runtime's own durable state, not the host's: it must be
+    // readable while nothing else is running, which is exactly when it matters.
+    if let BackgroundCommand::Journal { command } = &command {
+        return journal_command(&layout, command).await;
+    }
+
     let socket = layout.socket_path();
     let client = leveler_runtime_host::probe_default_runtime(&socket).await?;
     let blockers = match client.as_ref() {
@@ -67,7 +73,7 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
         BackgroundCommand::Logs { task_id } | BackgroundCommand::Stop { task_id } => {
             blockers.iter().find(|blocker| blocker.task_id == *task_id)
         }
-        BackgroundCommand::List { .. } => None,
+        BackgroundCommand::List { .. } | BackgroundCommand::Journal { .. } => None,
     };
     match (&command, runtime_task) {
         (BackgroundCommand::Logs { task_id }, Some(blocker)) => {
@@ -189,6 +195,127 @@ async fn run(layout: Layout, command: BackgroundCommand) -> anyhow::Result<std::
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             anyhow::bail!("no live background task `{task_id}`");
+        }
+        BackgroundCommand::Journal { .. } => {
+            unreachable!("the journal is read before runtime discovery")
+        }
+    }
+}
+
+/// How the execution host's liveness reads right now.
+enum HostLiveness {
+    Live,
+    Absent,
+    Unknown(String),
+}
+
+/// Why a pending reservation must not be released, or `None` when the host
+/// provably never admitted it and it may be released.
+///
+/// The bar is deliberately high: releasing a write reservation is an authority
+/// decision, so every path that could still own a process refuses.
+fn release_blocker(
+    host: &HostLiveness,
+    records: &leveler_execution::execution_host::HostRecords,
+    task_id: &str,
+) -> Option<String> {
+    match host {
+        HostLiveness::Live => {
+            Some("a live execution host owns this task; its exit settles it".into())
+        }
+        HostLiveness::Unknown(error) => {
+            Some(format!("the execution host's state is unknown: {error}"))
+        }
+        HostLiveness::Absent => {
+            if records.intents_outstanding() {
+                Some("a spawn intent is unresolved: this task may have been launched".into())
+            } else if records.has_task(task_id) {
+                Some("the host admitted this task and never reported its exit".into())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+async fn journal_command(
+    layout: &Layout,
+    command: &BackgroundJournalCommand,
+) -> anyhow::Result<std::process::ExitCode> {
+    use leveler_execution::execution_host::{ExecutionHostClient, HostRecords};
+    use leveler_execution::host_settlement::SettlementJournal;
+
+    let config = leveler_app::execution_host_config(layout)?;
+    let journal = SettlementJournal::open(&config.semantic_dir()).map_err(anyhow::Error::msg)?;
+    let records = HostRecords::read(&config.state_dir).map_err(anyhow::Error::msg)?;
+    let host = match ExecutionHostClient::probe(&config).await {
+        Ok(Some(_)) => HostLiveness::Live,
+        Ok(None) => HostLiveness::Absent,
+        Err(error) => HostLiveness::Unknown(error),
+    };
+    let pending = journal.pending().map_err(anyhow::Error::msg)?;
+
+    match command {
+        BackgroundJournalCommand::List { json } => {
+            let entries = pending
+                .iter()
+                .map(|record| {
+                    let blocker = release_blocker(&host, &records, &record.task_id);
+                    (record, blocker)
+                })
+                .collect::<Vec<_>>();
+            if *json {
+                let rows = entries
+                    .iter()
+                    .map(|(record, blocker)| {
+                        serde_json::json!({
+                            "task_id": record.task_id,
+                            "owner": record.owner,
+                            "writer": record.writer,
+                            "has_baseline": record.baseline.is_some(),
+                            "admitted_by_host": records.has_task(&record.task_id),
+                            "releasable": blocker.is_none(),
+                            "blocker": blocker,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            if entries.is_empty() {
+                println!("no pending write reservations");
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            for (record, blocker) in entries {
+                match blocker {
+                    None => println!(
+                        "{}  owner={} writer={} host=absent admitted=no releasable=yes",
+                        record.task_id, record.owner, record.writer
+                    ),
+                    Some(reason) => println!(
+                        "{}  owner={} writer={} releasable=no ({reason})",
+                        record.task_id, record.owner, record.writer
+                    ),
+                }
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        BackgroundJournalCommand::Abandon { task_id } => {
+            match journal.read(task_id) {
+                Ok(record) if record.settlement.is_some() => {
+                    anyhow::bail!("reservation {task_id} is already settled")
+                }
+                Ok(_) => {}
+                Err(error) => anyhow::bail!("no such write reservation: {error}"),
+            }
+            if let Some(reason) = release_blocker(&host, &records, task_id) {
+                anyhow::bail!("refusing to release {task_id}: {reason}");
+            }
+            journal
+                .abandon_prepared(task_id)
+                .map_err(anyhow::Error::msg)?;
+            println!("released write reservation {task_id}");
+            Ok(std::process::ExitCode::SUCCESS)
         }
     }
 }
@@ -371,5 +498,90 @@ mod tests {
                 assert!(commands.is_empty());
             }
         }
+    }
+
+    fn journal_layout(
+        root: &std::path::Path,
+    ) -> (
+        Layout,
+        leveler_execution::execution_host::ExecutionHostConfig,
+    ) {
+        let layout = Layout::from_parts(root.join("repo"), root.join("config"), root.join("state"));
+        std::fs::create_dir_all(layout.require_workspace().unwrap()).unwrap();
+        let config = leveler_app::execution_host_config(&layout).unwrap();
+        std::fs::create_dir_all(&config.state_dir).unwrap();
+        (layout, config)
+    }
+
+    /// A reservation whose spawn the host never admitted owns no process, so an
+    /// operator can release it while nothing is running.
+    #[tokio::test]
+    async fn journal_releases_a_reservation_the_host_never_admitted() {
+        let tmp = tempfile::Builder::new()
+            .prefix("bg-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (layout, config) = journal_layout(tmp.path());
+        let journal =
+            leveler_execution::host_settlement::SettlementJournal::open(&config.semantic_dir())
+                .unwrap();
+        journal
+            .prepare("host-orphan", "owner", "parent", None)
+            .await
+            .unwrap();
+        let listed = run(
+            layout.clone(),
+            BackgroundCommand::Journal {
+                command: BackgroundJournalCommand::List { json: true },
+            },
+        )
+        .await;
+        assert_eq!(listed.unwrap(), std::process::ExitCode::SUCCESS);
+        let released = run(
+            layout.clone(),
+            BackgroundCommand::Journal {
+                command: BackgroundJournalCommand::Abandon {
+                    task_id: "host-orphan".into(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(released.unwrap(), std::process::ExitCode::SUCCESS);
+        assert!(journal.pending().unwrap().is_empty());
+    }
+
+    /// An unresolved spawn intent is ownership: releasing the reservation would
+    /// drop a write reservation for a task the host may have launched.
+    #[tokio::test]
+    async fn journal_refuses_a_reservation_that_may_still_own_a_process() {
+        let tmp = tempfile::Builder::new()
+            .prefix("bg-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (layout, config) = journal_layout(tmp.path());
+        let journal =
+            leveler_execution::host_settlement::SettlementJournal::open(&config.semantic_dir())
+                .unwrap();
+        journal
+            .prepare("host-uncertain", "owner", "parent", None)
+            .await
+            .unwrap();
+        std::fs::write(
+            config.state_dir.join("intents.json"),
+            br#"[{"id":"host-uncertain","owner":"owner","program":"sh","args":[],"cwd":"/tmp","started_at_ms":0}]"#,
+        )
+        .unwrap();
+        let refused = run(
+            layout,
+            BackgroundCommand::Journal {
+                command: BackgroundJournalCommand::Abandon {
+                    task_id: "host-uncertain".into(),
+                },
+            },
+        )
+        .await;
+        let error = refused.expect_err("an uncertain reservation must not be released");
+        assert!(error.to_string().contains("refusing to release"), "{error}");
+        assert_eq!(journal.pending().unwrap().len(), 1);
     }
 }
