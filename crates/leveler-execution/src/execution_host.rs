@@ -2105,6 +2105,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(unix)]
     fn host_config(root: &Path) -> ExecutionHostConfig {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -2118,6 +2119,7 @@ mod tests {
     /// A ready file is a *derived* fact: it names an endpoint, never an owner.
     /// Whether it still describes anything is decided by the lifecycle lock,
     /// which the kernel releases when its holder dies.
+    #[cfg(unix)]
     fn write_ready_residue(config: &ExecutionHostConfig, address: &str, major: u32) {
         secure_dir(&config.state_dir).unwrap();
         let ready = Ready {
@@ -2136,6 +2138,7 @@ mod tests {
         atomic_json(&config.state_dir.join("ready.json"), &ready).unwrap();
     }
 
+    #[cfg(unix)]
     fn write_archive(config: &ExecutionHostConfig, status: &str) {
         let task = serde_json::json!({
             "snapshot": {
