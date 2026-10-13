@@ -1212,6 +1212,12 @@ pub(crate) fn model_attempt_record(
             .as_ref()
             .and_then(|error| serde_json::to_value(error.kind).ok())
             .and_then(|value| value.as_str().map(str::to_owned)),
+        // What the transport saw of the body it could not read. Diagnostic: it
+        // explains a failure the error text alone leaves ambiguous.
+        error_detail: attempt
+            .error
+            .as_ref()
+            .and_then(|error| error.transport_observation_json()),
         latency_ms: attempt.latency_ms,
         attempt_ms: Some(attempt.latency_ms),
         connect_ms: attempt.connect_ms,
@@ -4320,6 +4326,7 @@ mod child_accounting_tests {
     fn a_record() -> ModelRequestRecord {
         ModelRequestRecord {
             budget_scope: None,
+            error_detail: None,
             estimated_tokens: None,
             provider_request_id: Some("req-1".to_string()),
             provider: "deepseek".to_string(),

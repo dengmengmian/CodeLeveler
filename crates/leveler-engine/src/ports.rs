@@ -158,6 +158,10 @@ pub struct ModelRequestRecord {
     pub finish_reason: Option<FinishReason>,
     /// Stable failure class for attempts that did not finish normally.
     pub error_kind: Option<String>,
+    /// JSON observation of the response whose body could not be read, when the
+    /// failure carried one. Diagnostic only; never an input to delivery, retry
+    /// or settlement.
+    pub error_detail: Option<String>,
     pub latency_ms: u64,
     /// Wall-clock duration of this attempt. `None` on a path that never
     /// measured it — an absent measurement, never a zero.
@@ -474,6 +478,7 @@ mod priced_tests {
     fn record(usage: TokenUsage) -> ModelRequestRecord {
         ModelRequestRecord {
             budget_scope: None,
+            error_detail: None,
             estimated_tokens: None,
             provider_request_id: None,
             provider: "deepseek".to_string(),

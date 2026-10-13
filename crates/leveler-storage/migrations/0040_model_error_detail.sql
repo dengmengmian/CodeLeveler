@@ -1,0 +1,13 @@
+-- What the transport observed of a response whose body could not be read:
+-- HTTP status, declared content type and encoding, bytes received and a
+-- sanitized tail of them, stored as JSON.
+--
+-- Diagnostic only. Delivery state and retry policy are decided from what the
+-- transport could prove; this column exists because a body failure happens
+-- after the head arrived, so the facts that answer "did the gateway answer a
+-- 200 and then break, or never answer at all?" are already in hand and were
+-- previously discarded with the consumed response.
+--
+-- NULL for successful rows, for failures with nothing observed, and for rows
+-- written before this migration.
+ALTER TABLE model_requests ADD COLUMN error_detail TEXT;

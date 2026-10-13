@@ -65,11 +65,10 @@ pub enum TransportFault {
 
 /// How much output a stream produced before it was cut.
 ///
-/// Only meaningful for [`DeliveryState::StreamInterrupted`]. Both flags are
-/// recorded because they answer different questions: text already shown to a
-/// person, and a tool call the model had begun describing (which, unfinished,
-/// is never executable). Whether *any* output exists is what retry policy
-/// needs; the split is what presentation needs.
+/// Only meaningful for [`DeliveryState::StreamInterrupted`]. The flags preserve
+/// generated output for accounting and presentation. The bounded lifecycle may
+/// recover reasoning-only interruptions; answer text or a started tool call
+/// prevents automatic replay.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamProgress {
     /// Assistant text was received before the cut.
@@ -199,6 +198,14 @@ pub struct ModelError {
     /// "Moonshot"); never an authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// What the transport had already seen of the response when a body-level
+    /// failure ended the read. Diagnostic: it records facts that existed at the
+    /// failure and are otherwise discarded with the consumed response — the
+    /// difference between a gateway that never answered and one that answered
+    /// `200` and then broke its body. Delivery state and retry policy never
+    /// read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_observation: Option<Box<TransportObservation>>,
 }
 
 impl ModelError {
@@ -216,6 +223,7 @@ impl ModelError {
             delivery_state: DeliveryState::Unknown,
             transport_fault: None,
             provider: None,
+            transport_observation: None,
         }
     }
 
@@ -308,6 +316,24 @@ impl ModelError {
         self
     }
 
+    /// Attach what the transport saw of the response whose body failed.
+    /// Diagnostic only: it never changes delivery state, retryability or
+    /// settlement, all of which were already decided from what the transport
+    /// could prove.
+    pub fn with_transport_observation(mut self, observation: TransportObservation) -> Self {
+        self.transport_observation = Some(Box::new(observation));
+        self
+    }
+
+    /// The transport observation as JSON for durable diagnostics.
+    ///
+    /// `None` when the failure observed nothing, so a record is only given a
+    /// detail column when there is a fact to keep.
+    pub fn transport_observation_json(&self) -> Option<String> {
+        let observation = self.transport_observation.as_deref()?;
+        serde_json::to_string(observation).ok()
+    }
+
     pub fn cancelled() -> Self {
         Self::new(ModelErrorKind::Cancelled, "request cancelled")
     }
@@ -378,9 +404,10 @@ impl ModelError {
     /// Deliberately weaker than [`Self::retryability`], which the transport's
     /// cheap pre-delivery fast path also reads. The lifecycle owns recovery for
     /// a whole model request, and the one thing a re-send must never do is
-    /// duplicate output the caller already received — so it may also recover a
-    /// failure that received nothing at all, even when the provider may have
-    /// generated (and billed) an answer that never arrived. That cost is the
+    /// duplicate answer text or tool calls the caller already received. It may
+    /// recover a reasoning-only interruption or a failure that received nothing
+    /// at all, even when the provider may have generated (and billed) an answer
+    /// that never arrived. That cost is the
     /// accepted price of a *bounded* recovery, and it is exactly why such a
     /// failure is not `Safe` and must not be taken by the fast path.
     ///
@@ -389,8 +416,9 @@ impl ModelError {
     /// condition one phase earlier — request fully sent, no response headers
     /// ever returned — was terminal.
     ///
-    /// Everything else stays terminal: a failure that received output, a status
-    /// that is not safely retryable, and every non-transient kind whatever the
+    /// Everything else stays terminal: a failure that received answer text or
+    /// tool-call data, a status that is not safely retryable, and every
+    /// non-transient kind whatever the
     /// delivery truth says — cancellation included.
     pub fn is_retryable_by_lifecycle(&self) -> bool {
         match self.retryability() {
@@ -399,23 +427,25 @@ impl ModelError {
             // the same way, whatever delivery proved.
             Retryability::Never => false,
             // The provider may have done work. Recoverable only when the
-            // evidence says nothing was received back — which `Caution` never
-            // satisfies (a complete status, or a stream that produced output).
-            Retryability::Caution | Retryability::Unknown => self.received_no_content(),
+            // evidence says no answer text or tool-call data was received. A
+            // reasoning-only interruption is still billed generation, so it
+            // stays `Caution` rather than becoming blindly safe.
+            Retryability::Caution | Retryability::Unknown => self.received_no_answer_or_tool_data(),
         }
     }
 
-    /// Whether the failed attempt provably received no response content: no
-    /// headers, no text, no reasoning, no tool call arguments.
+    /// Whether the failed attempt received no answer text or tool-call data.
+    /// Reasoning alone may be discarded by the bounded lifecycle; a complete
+    /// HTTP status remains the provider's answer.
     ///
     /// A failure seen *inside* a stream is rewritten by the round to
     /// [`DeliveryState::StreamInterrupted`] with the progress it actually made,
     /// so a `SentNoResponse` reaching here can only mean the response never
     /// started.
-    fn received_no_content(&self) -> bool {
+    fn received_no_answer_or_tool_data(&self) -> bool {
         match self.delivery_state {
             DeliveryState::NotSent | DeliveryState::SentNoResponse => true,
-            DeliveryState::StreamInterrupted { progress } => !progress.any(),
+            DeliveryState::StreamInterrupted { progress } => !progress.text && !progress.tool_args,
             // A send-boundary transport fault: no response stream exists. A
             // mid-stream fault is never left as `Unknown`.
             DeliveryState::Unknown => self.kind == ModelErrorKind::Transport,
@@ -504,6 +534,34 @@ pub struct ProviderDiagnostics {
     /// The model id the request was addressed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+/// What the transport had observed of a response before a body-level failure.
+///
+/// A response head is received long before its body is read, so a body that
+/// cannot be read still leaves real facts behind: the status the gateway chose,
+/// the encodings it declared, how much arrived, and what the tail looked like.
+/// Reading them costs nothing at the failure and is the only way to tell a
+/// damaged `200` apart from an empty answer. Purely diagnostic: nothing in
+/// delivery, retry or settlement may consult it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportObservation {
+    /// HTTP status of the response whose body failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// `Content-Type` the response declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// `Content-Encoding` the response declared, which a body failure may
+    /// contradict (declared gzip over uncompressed bytes, or the reverse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+    /// Body bytes received before the failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<u64>,
+    /// Printable tail of those bytes, length-capped and secret-redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_tail: Option<String>,
 }
 
 /// Secret-shaped prefixes that must never leave the provider boundary inside a
@@ -769,6 +827,32 @@ mod tests {
         assert!(never_sent.is_retryable_by_lifecycle());
     }
 
+    #[test]
+    fn reasoning_only_interruptions_are_recoverable_but_not_blindly_safe() {
+        let progress = StreamProgress {
+            reasoning: true,
+            text: false,
+            tool_args: false,
+        };
+        assert!(progress.any(), "reasoning remains generated output");
+        for kind in [
+            ModelErrorKind::StreamInterrupted,
+            ModelErrorKind::Transport,
+            ModelErrorKind::Timeout,
+        ] {
+            let error = ModelError::new(kind, "response body interrupted")
+                .with_delivery_state(DeliveryState::StreamInterrupted { progress });
+            assert_eq!(error.retryability(), Retryability::Caution);
+            assert!(!error.is_safe_to_retry());
+            assert!(error.is_retryable_by_lifecycle(), "{kind:?}");
+        }
+        for kind in [ModelErrorKind::Decode, ModelErrorKind::Cancelled] {
+            let error = ModelError::new(kind, "terminal")
+                .with_delivery_state(DeliveryState::StreamInterrupted { progress });
+            assert!(!error.is_retryable_by_lifecycle(), "{kind:?}");
+        }
+    }
+
     /// The other half of the same contract: once output exists, no retry rule
     /// may replay it — there is no protocol-level stream resume, so a replay
     /// would duplicate generation, cost and tool calls.
@@ -776,12 +860,12 @@ mod tests {
     fn a_failure_that_received_output_is_never_recoverable_by_the_lifecycle() {
         for progress in [
             StreamProgress {
-                reasoning: false,
+                reasoning: true,
                 text: true,
                 tool_args: false,
             },
             StreamProgress {
-                reasoning: false,
+                reasoning: true,
                 text: false,
                 tool_args: true,
             },

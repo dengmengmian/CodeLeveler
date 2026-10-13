@@ -416,6 +416,7 @@ pub fn storage_model_request(
         agent_id: record.agent_id.clone(),
         finish_reason,
         error_kind: record.error_kind.clone(),
+        error_detail: record.error_detail.clone(),
         latency_ms: Some(record.latency_ms),
         attempt_ms: record.attempt_ms,
         connect_ms: record.connect_ms,

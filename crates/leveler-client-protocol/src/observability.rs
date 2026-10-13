@@ -189,6 +189,10 @@ pub struct UiRequestObservation {
     pub finish_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
+    /// What the transport observed of a response whose body could not be read,
+    /// as JSON. Diagnostic: it distinguishes a damaged answer from no answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     pub retry_count: u32,

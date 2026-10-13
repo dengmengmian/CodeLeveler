@@ -410,8 +410,89 @@ async fn body_read_partial_text_is_not_replayed() {
     assert_partial_body_is_not_replayed(PartialOutput::Text).await;
 }
 #[tokio::test]
-async fn body_read_partial_reasoning_is_not_replayed() {
-    assert_partial_body_is_not_replayed(PartialOutput::Reasoning).await;
+async fn body_read_reasoning_only_recovers_once_and_settles_both_attempts() {
+    let server = MockServer::start(vec![
+        broken_body(Some(PartialOutput::Reasoning.frame())),
+        completed_sse(),
+    ])
+    .await;
+    let reg = registry(&server);
+    let mut observer = AttemptObserver::default();
+    let round = leveler_agent_core::run_model_round_observed(
+        &reg,
+        request(),
+        &CancellationToken::new(),
+        &mut observer,
+    )
+    .await
+    .expect("reasoning without answer text or tool arguments must recover");
+    let requests = assert_physical_requests(&server, 2).await;
+    assert_eq!(requests[0], requests[1], "retry the same admitted request");
+    assert_eq!(round.retry_count, 1);
+    assert_eq!(observer.attempts.len(), 2);
+    let failed = &observer.attempts[0];
+    assert_eq!(failed.attempt, 1);
+    let error = failed.error.as_ref().unwrap();
+    assert_eq!(error.kind, ModelErrorKind::Transport);
+    assert_eq!(
+        error.delivery_state,
+        DeliveryState::StreamInterrupted {
+            progress: PartialOutput::Reasoning.progress()
+        }
+    );
+    assert!(error.is_retryable_by_lifecycle());
+    assert!(error.message.contains("body"));
+    assert!(failed.partial_text.is_none());
+    assert!(failed.usage.is_none());
+    assert!(
+        failed.cost_usd_micros.is_none(),
+        "unknown usage is not free"
+    );
+    assert!(failed.estimated_tokens.is_some());
+    assert_eq!(observer.attempts[1].attempt, 2);
+    assert!(observer.attempts[1].error.is_none());
+    assert_eq!(observer.attempts[1].usage.unwrap().total(), 7);
+    assert_eq!(
+        observer
+            .events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ModelRetrying { attempt: 1, .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observer
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::ReasoningDelta(text) if text == "partial thought"
+            ))
+            .count(),
+        1,
+        "the interrupted reasoning is observed once before retry"
+    );
+    let text: String = observer
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "recovered");
+    assert_eq!(
+        round.message.content,
+        vec![ContentPart::Text {
+            text: "recovered".into()
+        }]
+    );
+    assert!(
+        !observer
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+    );
 }
 #[tokio::test]
 async fn body_read_partial_tool_arguments_are_not_replayed() {
@@ -454,11 +535,7 @@ async fn executor_with_responses(
 
 #[tokio::test]
 async fn body_read_partial_outputs_do_not_inject_tool_json_repair() {
-    for partial in [
-        PartialOutput::Text,
-        PartialOutput::Reasoning,
-        PartialOutput::ToolArguments,
-    ] {
+    for partial in [PartialOutput::Text, PartialOutput::ToolArguments] {
         let (server, result, events) =
             executor_with_responses(vec![broken_body(Some(partial.frame())), completed_sse()])
                 .await;
@@ -480,6 +557,40 @@ async fn body_read_partial_outputs_do_not_inject_tool_json_repair() {
             leveler_agent::AgentEvent::Finished(_) | leveler_agent::AgentEvent::ToolCall { .. }
         )));
     }
+}
+
+#[tokio::test]
+async fn body_read_reasoning_only_retries_without_tool_json_repair() {
+    let (server, result, events) = executor_with_responses(vec![
+        broken_body(Some(PartialOutput::Reasoning.frame())),
+        completed_sse(),
+    ])
+    .await;
+    let bodies = assert_physical_requests(&server, 2).await;
+    assert_eq!(
+        bodies[0], bodies[1],
+        "no protocol repair injection on retry"
+    );
+    let outcome = result.expect("reasoning-only body failure recovers in its model round");
+    assert_eq!(outcome.stop_reason, leveler_agent::StopReason::Answered);
+    assert_eq!(outcome.model_steps, 1);
+    assert_eq!(outcome.final_text, "recovered");
+    assert!(!events.iter().any(|event| matches!(event, leveler_agent::AgentEvent::RuntimeInjection { kind, .. } if kind == "protocol_repair")));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, leveler_agent::AgentEvent::ToolCall { .. }))
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                leveler_agent::AgentEvent::ModelRetrying { attempt: 1, .. }
+            ))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
