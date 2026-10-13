@@ -161,13 +161,10 @@ fn parent_row(lines: &[String]) -> usize {
         .unwrap_or_else(|| panic!("no stage parent row: {lines:?}"))
 }
 
-/// The starting column of the group's first child row.
-
 /// The number of rows the group occupies, parent included.
 ///
-/// A group's own summary row sits at the transcript baseline (`›`/`⋮`/`▸`),
-/// exactly like `▌` for the user and `●` for the agent; only its children step
-/// in one level, so `GROUP_BODY_INDENT` (2 columns) is the tell.
+/// A receipt is one row whether it runs or settles: its members are reachable by
+/// opening it, so the conversation never grows just because a call was admitted.
 fn group_rows(lines: &[String], from: usize) -> usize {
     1 + lines[from + 1..]
         .iter()

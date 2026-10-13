@@ -1020,6 +1020,8 @@ export interface UiRequestObservation {
   cached_input_tokens?: number | null;
   cost_usd_micros?: number | null;
   created_at: string;
+  /** What the transport observed of a response whose body could not be read, as JSON. Diagnostic: it distinguishes a damaged answer from no answer. */
+  error_detail?: string | null;
   error_kind?: string | null;
   finish_reason?: string | null;
   id: string;

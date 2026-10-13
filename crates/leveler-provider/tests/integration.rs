@@ -382,7 +382,7 @@ async fn a_body_that_cannot_be_decoded_reports_what_the_response_head_carried() 
         error.message
     );
     let observed = error
-        .transport_observation
+        .transport_observation()
         .expect("a body decode failure must carry what the head carried");
     assert_eq!(observed.status, Some(200));
     assert_eq!(observed.content_type.as_deref(), Some("text/event-stream"));
