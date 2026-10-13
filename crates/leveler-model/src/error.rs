@@ -198,14 +198,6 @@ pub struct ModelError {
     /// "Moonshot"); never an authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// What the transport had already seen of the response when a body-level
-    /// failure ended the read. Diagnostic: it records facts that existed at the
-    /// failure and are otherwise discarded with the consumed response — the
-    /// difference between a gateway that never answered and one that answered
-    /// `200` and then broke its body. Delivery state and retry policy never
-    /// read it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport_observation: Option<Box<TransportObservation>>,
 }
 
 impl ModelError {
@@ -223,7 +215,6 @@ impl ModelError {
             delivery_state: DeliveryState::Unknown,
             transport_fault: None,
             provider: None,
-            transport_observation: None,
         }
     }
 
@@ -319,10 +310,16 @@ impl ModelError {
     /// Attach what the transport saw of the response whose body failed.
     /// Diagnostic only: it never changes delivery state, retryability or
     /// settlement, all of which were already decided from what the transport
-    /// could prove.
+    /// could prove. It rides in the diagnostics box so an error type that is the
+    /// `Err` of most of this crate's results does not grow.
     pub fn with_transport_observation(mut self, observation: TransportObservation) -> Self {
-        self.transport_observation = Some(Box::new(observation));
+        self.diagnostics_mut().observation = Some(observation);
         self
+    }
+
+    /// What the transport had already seen of the response whose body failed.
+    pub fn transport_observation(&self) -> Option<&TransportObservation> {
+        self.diagnostics.as_deref()?.observation.as_ref()
     }
 
     /// The transport observation as JSON for durable diagnostics.
@@ -330,7 +327,7 @@ impl ModelError {
     /// `None` when the failure observed nothing, so a record is only given a
     /// detail column when there is a fact to keep.
     pub fn transport_observation_json(&self) -> Option<String> {
-        let observation = self.transport_observation.as_deref()?;
+        let observation = self.transport_observation()?;
         serde_json::to_string(observation).ok()
     }
 
@@ -534,6 +531,12 @@ pub struct ProviderDiagnostics {
     /// The model id the request was addressed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// What the transport had already seen of a response whose body failed:
+    /// status, declared encodings, bytes received and a redacted tail. It lives
+    /// here rather than on [`ModelError`] itself because an error that is the
+    /// `Err` of most results in this crate must not grow for a diagnostic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<TransportObservation>,
 }
 
 /// What the transport had observed of a response before a body-level failure.
