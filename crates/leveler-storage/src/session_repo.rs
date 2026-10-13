@@ -217,8 +217,9 @@ impl<'a> SessionRepository<'a> {
         row.map(SessionRow::decode).transpose()
     }
 
-    /// Compare, replace the selected field, and advance the existing log in
-    /// one writer transaction. A conflict changes neither the row nor the log.
+    /// Reject settings changes since the observed log position, replace the
+    /// selected field, and advance the log in one writer transaction. Answer
+    /// progress alone is not a settings conflict. A conflict changes nothing.
     pub async fn edit_at_version(
         &self,
         id: &SessionId,
@@ -261,9 +262,19 @@ impl<'a> SessionRepository<'a> {
         .bind(id.as_str())
         .fetch_one(&mut *tx)
         .await?;
-        if expected.is_some_and(|expected| sequence != expected) {
-            tx.rollback().await?;
-            return Ok(SessionEditResult::Conflict(sequence));
+        if let Some(expected) = expected {
+            let settings_changed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 \
+                 AND sequence > ?2 AND type = 'session_metadata_changed')",
+            )
+            .bind(id.as_str())
+            .bind(expected)
+            .fetch_one(&mut *tx)
+            .await?;
+            if expected < 0 || expected > sequence || settings_changed {
+                tx.rollback().await?;
+                return Ok(SessionEditResult::Conflict(sequence));
+            }
         }
         let (sql, value, field) = match edit {
             SessionEdit::Title(value) => (
@@ -576,6 +587,74 @@ impl SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn permission_edit_from_observed_snapshot_survives_answer_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect(&tmp.path().join("answer-settings.db"))
+            .await
+            .unwrap();
+        let record = SessionRecord::without_workspace("original", "m", leveler_core::now());
+        let id = SessionId::new(record.id.clone());
+        let repo = SessionRepository::new(&db);
+        repo.create(&record).await.unwrap();
+        let observed = repo.settings_snapshot(&id).await.unwrap().unwrap();
+        let other = SessionRecord::without_workspace("other", "m", leveler_core::now());
+        let other_id = SessionId::new(other.id.clone());
+        repo.create(&other).await.unwrap();
+        repo.edit_at_version(
+            &other_id,
+            0,
+            &SessionEdit::Title("renamed".into()),
+            leveler_core::now(),
+        )
+        .await
+        .unwrap();
+        crate::EventRepository::new(&db)
+            .append(
+                &id,
+                None,
+                "token_usage",
+                r#"{"type":"token_usage","payload":{"input_tokens":10,"output_tokens":1,"cached_tokens":0,"cost_usd":0.0}}"#,
+                leveler_core::now(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.edit_at_version(
+                &id,
+                observed.sequence.unwrap_or(0),
+                &SessionEdit::Permission("full_access".into()),
+                leveler_core::now(),
+            )
+            .await
+            .unwrap(),
+            SessionEditResult::Applied(2),
+            "answer progress must not conflict with unchanged observed settings"
+        );
+        assert_eq!(
+            repo.settings_snapshot(&id).await.unwrap().unwrap().mode,
+            "full_access"
+        );
+        for expected in [-1, 3] {
+            assert_eq!(
+                repo.edit_at_version(
+                    &id,
+                    expected,
+                    &SessionEdit::Permission("assisted".into()),
+                    leveler_core::now(),
+                )
+                .await
+                .unwrap(),
+                SessionEditResult::Conflict(2),
+                "invalid observed log positions must not authorize a settings edit"
+            );
+        }
+        let unchanged = repo.settings_snapshot(&id).await.unwrap().unwrap();
+        assert_eq!(unchanged.mode, "full_access");
+        assert_eq!(unchanged.sequence, Some(2));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_replacements_compare_and_advance_the_log_atomically() {
