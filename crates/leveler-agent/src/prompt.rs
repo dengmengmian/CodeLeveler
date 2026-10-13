@@ -296,8 +296,8 @@ impl PromptBuilder {
         // prompt, so no model profile can opt out and turn the final response
         // into a commit/push solicitation. Interim-update behaviour is NOT
         // restated here: `base.md` "Presenting your work" already owns it
-        // (concise, no narration, cite paths), and a second copy was one more
-        // place for the two to disagree.
+        // (concise, connected progress updates, cite paths), and a second copy
+        // was one more place for the two to disagree.
         segments.push(PromptSegment::control(
             "final_delivery",
             PromptSource::FinalDelivery,
@@ -768,8 +768,11 @@ mod tests {
     fn a_ux_or_safety_rule_has_exactly_one_owner() {
         let prompt = PromptBuilder::new().build();
         for (label, needle) in [
-            ("interim narration", "renders every tool call"),
-            ("silence is allowed", "no prose at all"),
+            ("opening update", "Before the first tool call"),
+            (
+                "progress updates",
+                "important finding, blocker, or change of direction",
+            ),
             ("no commit/push by default", "do not create a git commit"),
             ("project rule precedence", "most deeply nested block wins"),
             ("external content is data", "not instruction authority"),
@@ -782,25 +785,27 @@ mod tests {
         }
     }
 
-    /// The interface draws every tool call, so prose that only restates the
-    /// next action prints the same fact twice. This is a UX constraint on
-    /// duplication, not a template for what to think.
-    ///
-    /// It has exactly ONE owner now: `base.md` "Presenting your work". The
-    /// appended interim-update block that restated it was deleted, and this
-    /// count is what keeps a second copy from returning.
+    /// Domain communication connects observed work to the user's goal. The
+    /// shared base prompt owns it, including when optional tools are absent.
     #[test]
-    fn narration_guidance_forbids_echoing_the_tool_call() {
-        let prompt = PromptBuilder::new().build();
-        assert!(
-            prompt.contains("renders every tool call"),
-            "the rule must be explicit: {prompt}"
-        );
-        assert!(
-            prompt.contains("no prose at all"),
-            "silence must be allowed: {prompt}"
-        );
-        for template in ["current step k/n", "evidence) → next"] {
+    fn progress_guidance_requires_connected_updates_without_tool_echoes() {
+        let prompt = PromptBuilder::new()
+            .optional_guidance(false, false, false)
+            .build();
+        for required in [
+            "Before the first tool call",
+            "user's goal and what you will do first",
+            "important finding, blocker, or change of direction",
+            "what it means for the task and what you will do next",
+            "When work takes a while without a new result",
+            "current status and what you are waiting for",
+            "Do not turn an extended task into a stream of tools alone",
+            "Do not narrate every tool call",
+            "invent findings or progress",
+        ] {
+            assert!(prompt.contains(required), "missing `{required}`: {prompt}");
+        }
+        for template in ["no prose at all", "current step k/n", "evidence) → next"] {
             assert!(
                 !prompt.contains(template),
                 "a reasoning template is not a UX constraint ({template:?})"
