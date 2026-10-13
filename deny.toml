@@ -31,6 +31,15 @@ ignore = [
     #   $ cargo tree --target all -i paste
     #   paste v1.0.15 (proc-macro) └── ratatui v0.29.0 └── leveler-tui └── leveler-cli
     "RUSTSEC-2024-0436",
+    # unsafe-libyaml — `informational = "unmaintained"`, not a vulnerability.
+    # Expires 2027-01-01. Reached at runtime: `serde_yaml_ng` (the renamed
+    # maintained fork) parses YAML through it. No safe direct upgrade exists —
+    # the crate repository is archived and its consumer pins it — so replacing
+    # it means replacing the YAML parser, which is why the advisory is ignored
+    # rather than worked around.
+    #   $ cargo tree --target all -i unsafe-libyaml
+    #   unsafe-libyaml v0.2.11 └── serde_yaml_ng v0.10.0 └── leveler-agent └── leveler-app └── leveler-cli
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
