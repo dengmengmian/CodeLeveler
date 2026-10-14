@@ -26,8 +26,8 @@
 #     default_model = "deepseek/deepseek-flash"
 #     thinking = "high"              # optional; defaults to high; auto | off | minimal | low | medium | high | max
 #     [assist]                      # idle UI affordances that spend a model call
-#     prompt_suggestions = true     #   predict the next user message while idle
-#     away_summary = true           #   one-line "welcome back" recap
+#     prompt_suggestions = true     #   ghost the likely next message after a turn
+#     away_summary = true           #   one-line recap after each successful turn
 #     [providers.deepseek]
 #     base_url = "https://api.deepseek.com"
 #     api_key_env = "DEEPSEEK_API_KEY"

@@ -284,11 +284,8 @@ pub struct AppState {
     /// current idle input window. Any user edit closes the window so a late
     /// model response cannot reappear after the user dismissed it.
     pub prompt_suggestion_allowed: bool,
-    /// One-shot deadline for an optional post-turn recap. User input clears
-    /// it; firing it consumes it. Presentation-only, never persisted.
-    pub away_summary_due_at: Option<std::time::Instant>,
-    /// A request has fired and its late response may still be displayed.
-    /// User activity closes this acceptance window.
+    /// A recap request has fired and its response may still be displayed.
+    /// A new turn closes this acceptance window. Typing does not.
     pub away_summary_pending: bool,
     pub theme: Theme,
     /// Terminal size (cols, rows).
@@ -347,8 +344,6 @@ pub struct AppState {
     /// Stored sessions and cursor for the Sessions screen (spec §52).
     pub sessions: Vec<UiSessionSummary>,
     pub sessions_selected: usize,
-    /// Context package info from the last run (spec §53).
-    pub context_files: Vec<String>,
     pub context_tokens: u32,
     /// Latest model-reported input/output tokens for the current conversation.
     pub token_input: u32,
@@ -446,6 +441,11 @@ pub struct AppState {
     pub activity_hits: Vec<(u16, crate::activity::ActivityId)>,
     /// Keyboard selection into the background-jobs list page, by task id.
     /// Stable across reordering; `None` selects the first row.
+    /// Selected child agent on the Team page, by runtime id. Selection only:
+    /// the page owns no scroll state, so a resize cannot strand the row.
+    pub team_selected: Option<String>,
+    /// Click targets for the Team page's rows.
+    pub team_hits: Vec<(ratatui::layout::Rect, String)>,
     pub background_list_selected: Option<String>,
     /// Task ids whose failure the user has already seen. Session-local: it
     /// suppresses the footer `×失败 N` reminder, never the task's terminal
@@ -606,7 +606,6 @@ impl AppState {
             help: crate::help::HelpSearch::default(),
             prompt_suggestion: None,
             prompt_suggestion_allowed: true,
-            away_summary_due_at: None,
             away_summary_pending: false,
             theme,
             size: (80, 24),
@@ -634,7 +633,6 @@ impl AppState {
             vision: false,
             sessions: Vec::new(),
             sessions_selected: 0,
-            context_files: Vec::new(),
             context_tokens: 0,
             token_input: 0,
             token_output: 0,
@@ -672,6 +670,8 @@ impl AppState {
             activity_selected: None,
             activity_view: crate::activity::ActivityView::default(),
             activity_hits: Vec::new(),
+            team_selected: None,
+            team_hits: Vec::new(),
             background_list_selected: None,
             background_failures_seen: std::collections::HashSet::new(),
             background_footer_hit: None,

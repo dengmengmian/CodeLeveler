@@ -84,7 +84,13 @@ impl Question {
             kind,
             selected: vec![false; q.options.len()],
             options: q.options.clone(),
-            allow_other: q.allow_other && kind == ClarificationQuestionKind::Single,
+            // Every single-choice question offers a way to answer in the
+            // user's own words, even when the request set `allow_other: false`.
+            // This is a deliberate product exception to "the client presents
+            // runtime facts rather than creating them": a list of picks is not
+            // a closed set, and the answer sent back is still the user's own
+            // string, so nothing is claimed about what the runtime will accept.
+            allow_other: kind == ClarificationQuestionKind::Single,
             min_choices: q.min_choices,
             max_choices: q.max_choices,
             cursor: 0,
@@ -162,9 +168,13 @@ impl Question {
 
     fn move_cursor(&mut self, delta: isize) {
         let rows = self.rows();
-        if rows == 0 || self.typing() {
+        if rows == 0 {
             return;
         }
+        // Arrows move the cursor even when the free-text row holds it: `typing`
+        // decides where a character goes, not whether the user may leave. The
+        // field keeps whatever was typed, and a row the arrows cannot leave is a
+        // dead end in a list the user is meant to scan.
         let rows = rows as isize;
         self.cursor = ((self.cursor as isize + delta).rem_euclid(rows)) as usize;
     }
@@ -530,6 +540,32 @@ mod tests {
         ])
     }
 
+    /// Every single-choice question offers a way to answer in the user's own
+    /// words, whether or not the runtime asked for it: a list of picks is never
+    /// a closed set. A multi question keeps its own shape — "other" beside
+    /// checkboxes is ambiguous about what the typed text would mean.
+    #[test]
+    fn a_single_choice_always_offers_the_free_text_row() {
+        let ov = multi_question(vec![question(
+            "数据策略",
+            ClarificationQuestionKind::Single,
+            &["保留 demo fallback", "删除全部 mock"],
+        )]);
+        assert!(ov.questions()[0].allow_other);
+        assert_eq!(
+            ov.questions()[0].rows(),
+            3,
+            "two options plus the free-text row"
+        );
+
+        let ov = multi_question(vec![question(
+            "验证范围",
+            ClarificationQuestionKind::Multi,
+            &["单元测试", "TUI 测试"],
+        )]);
+        assert!(!ov.questions()[0].allow_other);
+    }
+
     #[test]
     fn a_legacy_request_is_one_question_with_no_tab_strip() {
         let ov = legacy(vec!["A", "B"]);
@@ -612,7 +648,11 @@ mod tests {
         let mut ov = three();
         assert_eq!(ov.questions()[0].cursor, 0);
         ov.on_key(key(KeyCode::Up));
-        assert_eq!(ov.questions()[0].cursor, 1, "up wraps to the last row");
+        assert_eq!(
+            ov.questions()[0].cursor,
+            ov.questions()[0].rows() - 1,
+            "up wraps to the last row"
+        );
         ov.on_key(key(KeyCode::Down));
         assert_eq!(ov.questions()[0].cursor, 0);
         // The active question is the one that moved; the others did not.

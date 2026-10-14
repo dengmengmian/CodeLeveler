@@ -54,16 +54,12 @@ pub(crate) fn fmt_tokens(n: u32) -> String {
     out.chars().rev().collect()
 }
 
+/// One estimator for the whole product: the model crate's. A second formula
+/// here (CJK/1.6 + other/4) reported a different number for the same text than
+/// the estimate that drives compaction pressure, so the two could disagree in
+/// front of the user.
 fn estimate_tokens(text: &str) -> u32 {
-    let (mut cjk, mut other) = (0u32, 0u32);
-    for ch in text.chars() {
-        if ch as u32 >= 0x2E80 {
-            cjk += 1;
-        } else {
-            other += 1;
-        }
-    }
-    (cjk as f32 / 1.6 + other as f32 / 4.0).ceil() as u32
+    u32::try_from(leveler_model::estimate::estimate_text(text)).unwrap_or(u32::MAX)
 }
 
 /// Live output of the round currently streaming — visible answer text AND the
@@ -242,6 +238,10 @@ pub(crate) fn fmt_tokens_compact(n: u32) -> String {
 /// to the inspector and compaction policy, not this gauge. Provider usage is
 /// only the no-snapshot fallback; no fields are mixed across measurements.
 fn footer_context_usage(state: &AppState) -> Option<(u64, u64, u64)> {
+    // Two axes, never one number.
+    //
+    // With a snapshot this is the COMPACTION axis: the runtime's projection for
+    // the next request against its own capacity.
     if let Some(acc) = state.context.loaded.as_ref() {
         if acc.used_tokens == 0 {
             return None;
@@ -249,8 +249,14 @@ fn footer_context_usage(state: &AppState) -> Option<(u64, u64, u64)> {
         let total = acc.context_window_tokens.filter(|n| *n > 0)?;
         return Some((acc.used_tokens, total, acc.window_utilization_percent()?));
     }
+    // Without one it is the MODEL-WINDOW axis, and the only honest numerator is
+    // the provider's own reported prompt. Nothing here is estimated: the
+    // transcript is not a projection of the next request (no control context,
+    // no tool schema, tool results reduced to previews), so a number derived
+    // from it would look authoritative while understating real pressure. No
+    // provider number either, and the chip stays hidden.
     let total = u64::from(state.context_window());
-    let used = u64::from(state.context_tokens.max(state.token_input));
+    let used = u64::from(state.token_input);
     if used == 0 || total == 0 {
         return None;
     }
@@ -827,6 +833,37 @@ mod tests {
         assert_eq!(estimate_tokens("abcd"), 1);
     }
 
+    /// No snapshot and no provider reading: the chip is hidden. The gauge never
+    /// falls back to an estimate of the visible transcript, because that number
+    /// is not the next request's projection.
+    #[test]
+    fn the_context_gauge_is_hidden_until_a_reading_exists() {
+        let mut state = test_state();
+        state.token_input = 0;
+        state.context_window_tokens = 0;
+        assert!(
+            footer_ctx_chip(&state).is_none(),
+            "nothing to report means nothing is shown"
+        );
+        // A provider reading on its own is the model-window axis, not a guess.
+        state.token_input = 41_181;
+        state.context_window_tokens = 1_048_576;
+        assert_eq!(footer_ctx_chip(&state).as_deref(), Some("3%/1M"));
+    }
+
+    /// One estimator for the product: this module reports the same number for
+    /// the same text as the crate that drives compaction pressure.
+    #[test]
+    fn the_estimate_is_the_model_crates_estimate() {
+        for text in ["hello world", "介绍一下这个项目", "混合中文and ascii", ""] {
+            assert_eq!(
+                estimate_tokens(text),
+                u32::try_from(leveler_model::estimate::estimate_text(text)).unwrap(),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn header_is_branch_and_path_only() {
         let mut state = test_state();
@@ -852,7 +889,7 @@ mod tests {
         assert_eq!(fmt_tokens_compact(1_048_576), "1M");
         assert_eq!(fmt_tokens_compact(900), "900");
         let mut state = test_state();
-        state.context_tokens = 41_181;
+        state.token_input = 41_181;
         state.context_window_tokens = 1_048_576;
         assert_eq!(footer_ctx_chip(&state).as_deref(), Some("3%/1M"));
         assert_eq!(footer_cache_chip(&state), None);
@@ -865,11 +902,13 @@ mod tests {
         state.token_input = 1000;
         state.token_cached = 420;
         assert_eq!(footer_cache_chip(&state).as_deref(), Some("缓存 42%"));
+        // Both chips read the provider's own numbers: the window axis is the
+        // reported prompt, and the percentage follows it.
         assert_eq!(
             footer_usage_line(&state, 20)
                 .map(|line| line.to_string())
                 .as_deref(),
-            Some("3%/1M · 缓存 42%")
+            Some("0%/1M · 缓存 42%")
         );
     }
 
@@ -918,7 +957,7 @@ mod tests {
         state.context.loaded = Some(window_only);
         // The snapshot's projected input is the figure that shows; the state's
         // own usage fields are only the no-snapshot fallback.
-        state.context_tokens = 41_181;
+        state.token_input = 41_181;
         assert_eq!(footer_ctx_chip(&state).as_deref(), Some("7%/128k"));
     }
 
@@ -1026,7 +1065,7 @@ mod tests {
     #[test]
     fn footer_does_not_invent_a_window_for_a_loaded_snapshot() {
         let mut state = test_state();
-        state.context_tokens = 10_000;
+        state.token_input = 10_000;
         state.context_window_tokens = 128_000;
         let projection = leveler_model::RequestProjection::project(
             &[leveler_model::Message::text(
@@ -1064,10 +1103,11 @@ mod tests {
     #[test]
     fn footer_usage_line_reports_the_runtime_chips_only() {
         let mut state = test_state();
-        state.context_tokens = 254_000;
         state.context_window_tokens = 1_048_576;
-        state.token_input = 1000;
-        state.token_cached = 990;
+        state.token_input = 254_000;
+        // 99% of the prompt was served from cache. The cache chip and the
+        // window axis read the SAME provider reading; neither is estimated.
+        state.token_cached = 251_460;
         state.clock_label = "22:22".into();
         assert_eq!(
             footer_usage_line(&state, 20)

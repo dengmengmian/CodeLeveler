@@ -15,7 +15,7 @@ use crate::Application;
 const ASSIST_TIMEOUT: Duration = Duration::from_secs(12);
 const CONTEXT_CHAR_LIMIT: usize = 8_000;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AssistKind {
     PromptSuggestion,
     AwaySummary,
@@ -50,39 +50,17 @@ pub(crate) async fn generate(
             AssistKind::AwaySummary => return None,
         }
     } else {
-        if matches!(kind, AssistKind::AwaySummary)
-            && raw
-                .messages
-                .iter()
-                .filter(|message| message.role == Role::User && !message.text_content().is_empty())
-                .count()
-                < 2
-        {
-            return None;
-        }
         transcript_context(&raw.messages)?
     };
 
-    let (instruction, max_output_tokens, max_chars) = match kind {
-        AssistKind::PromptSuggestion => (
-            "Predict the single most likely next message the user would type. Use the user's language. Output only that message, with no quotes, label, explanation, or markdown. Base it only on the supplied context; do not invent completed work.",
-            64,
-            120,
-        ),
-        AssistKind::AwaySummary => (
-            "Write one concise recap sentence for a user returning after being idle. In the user's language, state where the work reached, the current blocker or status when known, and the likely next step. Output only the sentence, with no label, bullets, markdown, or invented facts.",
-            128,
-            240,
-        ),
-    };
-    let prompt = format!("{instruction}\n\nContext:\n{context}");
-    let mut request = ModelRequest::new(model.clone(), vec![Message::text(Role::User, prompt)]);
-    request.tool_choice = ToolChoice::None;
-    request.max_output_tokens = Some(max_output_tokens);
-    request.temperature = Some(0.2);
-    // An idle UI affordance is a small bounded task: it asks for the lowest
-    // useful effort rather than inheriting a coding model's configured Max.
-    request.reasoning_effort = Some(leveler_model::ReasoningEffort::Low);
+    let style = app
+        .registry
+        .profile(&model)
+        .await
+        .map(|profile| profile.reasoning.style)
+        .unwrap_or_default();
+    let request = assist_request(model.clone(), kind, &context, style);
+    let max_chars = assist_char_limit(kind);
 
     let started = std::time::Instant::now();
     let outcome =
@@ -129,6 +107,53 @@ pub(crate) async fn transcript_len(app: &Application, session_id: &SessionId) ->
         .await
         .ok()
         .map(|raw| raw.stored_len())
+}
+
+fn assist_char_limit(kind: AssistKind) -> usize {
+    match kind {
+        AssistKind::PromptSuggestion => 120,
+        AssistKind::AwaySummary => 240,
+    }
+}
+
+/// One short UI sentence. Thinking stays off when the route can say so:
+/// a 128-token cap spent entirely on reasoning cuts the sentence mid-way
+/// (`finish_reason = length`). Styles that cannot turn thinking off keep it,
+/// and get a budget large enough for a short think plus the sentence.
+fn assist_request(
+    model: ModelRef,
+    kind: AssistKind,
+    context: &str,
+    style: leveler_model::ReasoningStyle,
+) -> ModelRequest {
+    let (instruction, max_output_tokens) = match kind {
+        AssistKind::PromptSuggestion => (
+            "Predict the single most likely next message the user would type. Use the user's language. Output only that message, with no quotes, label, explanation, or markdown. Base it only on the supplied context; do not invent completed work.",
+            256,
+        ),
+        AssistKind::AwaySummary => (
+            "Write one concise recap sentence of where this conversation reached. In the user's language, state the outcome, the current blocker or status when known, and the likely next step. Output only the sentence, with no label, bullets, markdown, or invented facts.",
+            1024,
+        ),
+    };
+    let mut request = ModelRequest::new(
+        model,
+        vec![Message::text(
+            Role::User,
+            format!("{instruction}\n\nContext:\n{context}"),
+        )],
+    );
+    request.tool_choice = ToolChoice::None;
+    request.max_output_tokens = Some(max_output_tokens);
+    request.temperature = Some(0.2);
+    request.reasoning_effort = Some(leveler_model::ReasoningEffort::Low);
+    request.thinking_disabled = matches!(
+        style,
+        leveler_model::ReasoningStyle::None
+            | leveler_model::ReasoningStyle::OpenAiEffort
+            | leveler_model::ReasoningStyle::ThinkingFlag
+    );
+    request
 }
 
 fn repository_context(repo: &std::path::Path) -> Option<String> {
@@ -221,6 +246,29 @@ mod tests {
     fn blank_or_meta_prediction_is_rejected() {
         assert_eq!(normalize_prediction("   \n", 80), None);
         assert_eq!(normalize_prediction("没有合适的建议", 80), None);
+    }
+
+    #[test]
+    fn a_thinking_model_does_not_spend_the_recap_budget_on_reasoning() {
+        let request = assist_request(
+            ModelRef::parse("deepseek/deepseek-flash").expect("model ref"),
+            AssistKind::AwaySummary,
+            "已确认这是本地编程智能体",
+            leveler_model::ReasoningStyle::ThinkingFlag,
+        );
+        assert!(request.thinking_disabled);
+        assert!(request.max_output_tokens.unwrap() > 128);
+    }
+
+    #[test]
+    fn a_route_that_cannot_disable_thinking_is_left_able_to_encode() {
+        let request = assist_request(
+            ModelRef::parse("anthropic/claude").expect("model ref"),
+            AssistKind::AwaySummary,
+            "context",
+            leveler_model::ReasoningStyle::AdaptiveThinking,
+        );
+        assert!(!request.thinking_disabled);
     }
 
     #[test]

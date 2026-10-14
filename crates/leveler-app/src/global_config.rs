@@ -171,7 +171,7 @@ struct GlobalAssist {
     /// Predict the user's likely next message while they are idle.
     #[serde(default = "default_true")]
     prompt_suggestions: bool,
-    /// A one-line "welcome back" recap after an idle period.
+    /// A one-line recap after each successful turn.
     #[serde(default = "default_true")]
     away_summary: bool,
 }

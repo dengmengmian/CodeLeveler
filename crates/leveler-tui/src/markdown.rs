@@ -520,9 +520,10 @@ fn render_block(
                 // ordinary body. Explicit fg so a bare-URL accent always
                 // contrasts (never rely on the terminal default).
                 let style = if lead {
-                    Style::default()
-                        .fg(theme.text.final_lead)
-                        .add_modifier(Modifier::BOLD)
+                    // The conclusion keeps its own ink; headings, emphasis and
+                    // code carry the weight. Body text stays regular so a long
+                    // answer reads as prose rather than as one long highlight.
+                    Style::default().fg(theme.text.final_lead)
                 } else {
                     Style::default().fg(tone.body_ink(theme))
                 };

@@ -368,23 +368,23 @@ fn spawn_auxiliary_assist(
     if active.is_running(&session_id) {
         return;
     }
-    let (generation, cancellation) = assists.begin(&session_id);
+    let (generation, cancellation) = assists.begin(&session_id, kind);
     tokio::spawn(async move {
         let Some(generated) =
             prompt_assist::generate(&app, &session_id, model, kind, cancellation).await
         else {
-            assists.finish(&session_id, generation);
+            assists.finish(&session_id, kind, generation);
             return;
         };
-        if !assists.is_current(&session_id, generation)
+        if !assists.is_current(&session_id, kind, generation)
             || active.is_running(&session_id)
             || prompt_assist::transcript_len(&app, &session_id).await
                 != Some(generated.transcript_len)
         {
-            assists.finish(&session_id, generation);
+            assists.finish(&session_id, kind, generation);
             return;
         }
-        assists.finish(&session_id, generation);
+        assists.finish(&session_id, kind, generation);
         let event = match kind {
             AssistKind::PromptSuggestion => RuntimeEvent::PromptSuggestion {
                 text: generated.text,
@@ -640,16 +640,17 @@ pub struct InProcessRuntimeClient {
 
 type ChildCancels = Arc<Mutex<HashMap<SessionId, HashMap<String, CancellationToken>>>>;
 
-/// Per-session ownership of optional model chrome. A real user turn always
-/// preempts this work before it can compete for provider capacity.
+/// Per-session ownership of optional model chrome. A recap and a next-step
+/// suggestion are different calls and keep their own slots. A real user turn
+/// still preempts both before they can compete for provider capacity.
 #[derive(Default)]
 struct AuxiliaryAssists {
     next_generation: std::sync::atomic::AtomicU64,
-    active: Mutex<HashMap<SessionId, (u64, CancellationToken)>>,
+    active: Mutex<HashMap<(SessionId, AssistKind), (u64, CancellationToken)>>,
 }
 
 impl AuxiliaryAssists {
-    fn begin(&self, session_id: &SessionId) -> (u64, CancellationToken) {
+    fn begin(&self, session_id: &SessionId, kind: AssistKind) -> (u64, CancellationToken) {
         let generation = self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -659,7 +660,10 @@ impl AuxiliaryAssists {
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id.clone(), (generation, cancellation.clone()))
+            .insert(
+                (session_id.clone(), kind),
+                (generation, cancellation.clone()),
+            )
         {
             previous.cancel();
         }
@@ -667,35 +671,69 @@ impl AuxiliaryAssists {
     }
 
     fn cancel(&self, session_id: &SessionId) {
-        if let Some((_, cancellation)) = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id)
-        {
-            cancellation.cancel();
-        }
-    }
-
-    fn is_current(&self, session_id: &SessionId, generation: u64) -> bool {
-        self.active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .is_some_and(|(current, token)| *current == generation && !token.is_cancelled())
-    }
-
-    fn finish(&self, session_id: &SessionId, generation: u64) {
         let mut active = self
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.retain(|(id, _), (_, cancellation)| {
+            if id == session_id {
+                cancellation.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn is_current(&self, session_id: &SessionId, kind: AssistKind, generation: u64) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(session_id.clone(), kind))
+            .is_some_and(|(current, token)| *current == generation && !token.is_cancelled())
+    }
+
+    fn finish(&self, session_id: &SessionId, kind: AssistKind, generation: u64) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (session_id.clone(), kind);
         if active
-            .get(session_id)
+            .get(&key)
             .is_some_and(|(current, _)| *current == generation)
         {
-            active.remove(session_id);
+            active.remove(&key);
         }
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_assist_tests {
+    use super::{AssistKind, AuxiliaryAssists};
+    use leveler_core::SessionId;
+
+    #[test]
+    fn suggestion_and_recap_keep_separate_slots() {
+        let assists = AuxiliaryAssists::default();
+        let session = SessionId::new("s");
+        let (suggestion, suggestion_token) =
+            assists.begin(&session, AssistKind::PromptSuggestion);
+        let (recap, recap_token) = assists.begin(&session, AssistKind::AwaySummary);
+
+        assert!(assists.is_current(&session, AssistKind::PromptSuggestion, suggestion));
+        assert!(assists.is_current(&session, AssistKind::AwaySummary, recap));
+        assert!(!suggestion_token.is_cancelled());
+        assert!(!recap_token.is_cancelled());
+
+        assists.cancel(&session);
+        assert!(suggestion_token.is_cancelled());
+        assert!(recap_token.is_cancelled());
+        assert!(!assists.is_current(
+            &session,
+            AssistKind::PromptSuggestion,
+            suggestion
+        ));
     }
 }
 

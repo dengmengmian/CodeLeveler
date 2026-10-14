@@ -172,7 +172,7 @@ pub struct LoadedConfig {
     pub browser_default: Option<leveler_browser::BrowserProduct>,
     /// `[assist].prompt_suggestions`: the idle prompt-suggestion affordance.
     pub assist_prompt_suggestions: bool,
-    /// `[assist].away_summary`: the idle "welcome back" recap affordance.
+    /// `[assist].away_summary`: the one-line recap after each successful turn.
     pub assist_away_summary: bool,
     /// `[context].soft_percent`: the harness soft compaction percent for every
     /// model that does not override it. `None` → the product default.

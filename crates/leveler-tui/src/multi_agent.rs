@@ -641,7 +641,7 @@ mod tests {
     /// every one of them. A row nobody can identify cannot say whose command
     /// just failed.
     #[test]
-    fn the_roster_names_each_child_the_way_the_lane_does() {
+    fn the_roster_names_each_child_with_its_role_and_nickname() {
         let mut team = TaskTeamView::default();
         for (id, nickname) in [("c1", "Euclid"), ("c2", "Newton"), ("c3", "Curie")] {
             team.apply_update(ChildUpdate {
@@ -666,9 +666,18 @@ mod tests {
             .into_iter()
             .map(|r| r.label)
             .collect();
-        assert_eq!(labels, vec!["Euclid", "Newton", "Curie"], "{labels:?}");
-
-        // One child of a role needs no disambiguation.
+        // Every row says what the child is doing (its role), then which one it
+        // is — a bare nickname names nobody's job.
+        let role = t.sub_agent_default;
+        assert_eq!(
+            labels,
+            vec![
+                format!("{role} · Euclid"),
+                format!("{role} · Newton"),
+                format!("{role} · Curie")
+            ],
+            "{labels:?}"
+        );
         let mut single = TaskTeamView::default();
         single.apply_update(ChildUpdate {
             id: "only".into(),
@@ -690,7 +699,14 @@ mod tests {
             .into_iter()
             .map(|r| r.label)
             .collect();
-        assert_eq!(labels, vec!["Euclid"], "{labels:?}");
+        assert_eq!(
+            labels,
+            vec![format!(
+                "{} · Euclid",
+                crate::i18n::Locale::Zh.text().sub_agent_reviewer
+            )],
+            "{labels:?}"
+        );
     }
 
     /// A settled team that lost a child must not wear the success mark.
@@ -775,6 +791,33 @@ mod tests {
             restored.children[0].title.as_deref(),
             Some("audit the refund path")
         );
+    }
+
+    /// The roster caption is the short title. The prompt is the child's
+    /// instruction and must not fill the row.
+    #[test]
+    fn the_roster_leads_with_the_spawn_title_not_the_prompt() {
+        let t = crate::i18n::Locale::Zh.text();
+        let mut team = TaskTeamView::default();
+        team.apply_update(ChildUpdate {
+            id: "c1".into(),
+            nickname: "Euclid".into(),
+            role: "explorer".into(),
+            title: Some("摸清 GitCode 事件入口".into()),
+            done: false,
+            ok: false,
+            detail: "你是只读探查。目标仓库：/tmp/gitcode-npc".into(),
+            profile_id: None,
+            agent_name: None,
+            read_only: true,
+            contribution: None,
+            stop: None,
+            limit: None,
+            started_elapsed_secs: 0,
+        });
+        let rows = roster_rows(&team, 10, t);
+        assert_eq!(rows[0].activity, "摸清 GitCode 事件入口");
+        assert!(!rows[0].activity.contains("你是只读探查"));
     }
 
     fn recorded(
@@ -1236,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_explains_itself_with_the_purpose() {
+    fn waiting_child_is_not_reported_as_a_purpose_word() {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(
@@ -1246,8 +1289,11 @@ mod tests {
             "analyzing repository structure",
         );
         let line = running_line(&team.children[0], t);
-        assert_eq!(line, "analyzing repository structure");
-        assert_ne!(line, "waiting", "a bare status word explains nothing");
+        assert_eq!(
+            line, "analyzing repository structure",
+            "the purpose row states the brief the runtime recorded"
+        );
+        assert_ne!(line, t.sub_agent_waiting, "a status word is not a purpose");
     }
 
     #[test]
@@ -1281,6 +1327,47 @@ mod tests {
             findings,
             measured,
         }
+    }
+
+    /// The inspector's first row is labelled "purpose", so it must never be a
+    /// status word: `Purpose: waiting` claims the child is doing nothing when
+    /// the runtime recorded what it is doing. The spawn title wins; the brief
+    /// is the fallback.
+    #[test]
+    fn the_inspector_purpose_row_states_a_real_purpose_not_a_status_word() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff");
+        team.apply_detail(detail(true, vec![]));
+        let rows = inspector_rows(&team.children[0], t).expect("loaded");
+        let purpose = &rows[0].text;
+        assert!(
+            purpose.contains("review the diff"),
+            "the recorded purpose is what the row states: {purpose}"
+        );
+        assert!(
+            !purpose.contains("waiting") && !purpose.contains("running"),
+            "a status word is not a purpose: {purpose}"
+        );
+    }
+
+    /// A spawn title is the runtime's short name for the child; it outranks the
+    /// brief in the inspector, exactly as it does on the roster.
+    #[test]
+    fn the_inspector_purpose_row_prefers_the_spawn_title() {
+        let t = crate::i18n::Locale::En.text();
+        let mut team = TaskTeamView::default();
+        started(&mut team, "r1", "reviewer", "review the diff prompt text");
+        if let Some(child) = team.children.first_mut() {
+            child.title = Some("review the diff".into());
+        }
+        team.apply_detail(detail(true, vec![]));
+        let rows = inspector_rows(&team.children[0], t).expect("loaded");
+        assert_eq!(
+            rows[0].text,
+            format!("{}: review the diff", t.inspector_purpose),
+            "the spawn title is the short name, not the prompt"
+        );
     }
 
     #[test]
@@ -1393,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn a_working_child_shows_its_purpose_not_a_status_word() {
+    fn a_working_child_shows_its_role_and_state_not_its_brief() {
         let t = crate::i18n::Locale::En.text();
         let mut team = TaskTeamView::default();
         started(
@@ -1403,10 +1490,22 @@ mod tests {
             "analyzing repository structure",
         );
         started(&mut team, "w1", "worker", "implementing the change");
-        let lines = team_lines(&team, t);
-        assert_eq!(lines[0].glyph, "○");
-        assert_eq!(lines[0].detail, "analyzing repository structure");
-        assert_ne!(lines[0].detail, "waiting");
+        let rows = roster_rows(&team, 0, t);
+        // The role says what it is doing; the brief it was given is not a
+        // caption and never reaches the row.
+        assert!(
+            rows[0].label.starts_with(t.sub_agent_explorer),
+            "{:?}",
+            rows[0]
+        );
+        // `started` has not been marked active, so the state is waiting.
+        assert_eq!(rows[0].activity, t.sub_agent_waiting);
+        assert!(
+            !rows[0].activity.contains("analyzing repository structure"),
+            "the brief must not be printed: {:?}",
+            rows[0]
+        );
+        assert_eq!(rows[0].tone, RosterTone::Active);
     }
 
     #[test]
@@ -1416,9 +1515,9 @@ mod tests {
         started(&mut team, "a1", "explorer", "look");
         started(&mut team, "w1", "worker", "implement");
         finished(&mut team, "a1", true, Some(contribution(7)));
-        let lines = team_lines(&team, t);
-        assert_eq!(lines[0].glyph, "✓");
-        assert!(lines[0].detail.contains("7 findings"), "{:?}", lines[0]);
+        let rows = roster_rows(&team, 0, t);
+        assert_eq!(rows[0].tone, RosterTone::Done);
+        assert!(rows[0].activity.contains("7"), "{:?}", rows[0]);
     }
 
     #[test]
@@ -1428,12 +1527,16 @@ mod tests {
         started(&mut team, "w1", "worker", "implement");
         started(&mut team, "r1", "reviewer", "review");
         finished(&mut team, "r1", true, Some(contribution(0)));
-        let lines = team_lines(&team, t);
-        let reviewer = lines
-            .iter()
-            .find(|l| l.status == ChildStatus::Completed)
-            .unwrap();
-        assert!(reviewer.detail.contains("nothing to flag"), "{reviewer:?}");
+        let rows = roster_rows(&team, 0, t);
+        let reviewer = rows.iter().find(|r| r.tone == RosterTone::Done).unwrap();
+        assert!(
+            reviewer.label.starts_with(t.sub_agent_reviewer),
+            "{reviewer:?}"
+        );
+        assert!(
+            reviewer.activity.contains("nothing to flag"),
+            "{reviewer:?}"
+        );
     }
 
     #[test]
@@ -1443,13 +1546,9 @@ mod tests {
         started(&mut team, "w1", "worker", "implement");
         started(&mut team, "a1", "explorer", "look");
         finished(&mut team, "w1", false, None);
-        let lines = team_lines(&team, t);
-        let failed = lines
-            .iter()
-            .find(|l| l.status == ChildStatus::Failed)
-            .unwrap();
-        assert_eq!(failed.glyph, "✗");
-        assert!(!failed.detail.contains("not measured"), "{failed:?}");
+        let rows = roster_rows(&team, 0, t);
+        let failed = rows.iter().find(|r| r.tone == RosterTone::Failed).unwrap();
+        assert!(!failed.activity.contains("not measured"), "{failed:?}");
     }
 
     #[test]
@@ -1544,16 +1643,29 @@ pub fn contribution_line(view: &ChildAgentView, t: &crate::i18n::UiText) -> Opti
     }
 }
 
-/// Why this child is running, for the line the user watches. Falls back to the
-/// status word only when the runtime gave no purpose.
+/// What this child is doing, for the Contribution Inspector's purpose row.
+///
+/// The spawn title wins, then the brief, and the status word is only the last
+/// resort — a status word is not a purpose. This is deliberately NOT the
+/// roster's caption: the roster (`child_activity`) never falls back to the
+/// brief, because a spawn prompt is an instruction rather than a caption.
 pub fn running_line(view: &ChildAgentView, t: &crate::i18n::UiText) -> String {
-    if view.purpose.trim().is_empty() {
-        return match view.status {
-            ChildStatus::Running => t.sub_agent_running.to_string(),
-            _ => t.sub_agent_waiting.to_string(),
-        };
+    if let Some(title) = view
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return title.to_string();
     }
-    view.purpose.trim().to_string()
+    let purpose = view.purpose.trim();
+    if !purpose.is_empty() {
+        return purpose.to_string();
+    }
+    match view.status {
+        ChildStatus::Running => t.sub_agent_running.to_string(),
+        _ => t.sub_agent_waiting.to_string(),
+    }
 }
 
 /// Contribution line for a transcript block.
@@ -1590,6 +1702,28 @@ pub struct InspectorRow {
 /// Returns `None` when nothing has been loaded yet — the caller shows a
 /// loading state rather than an empty list, because an empty list is a claim
 /// and "not asked yet" is not one.
+/// Move the Team page's selection by `delta`, wrapping at both ends.
+///
+/// Selection only — the page derives its own offset from it, so there is no
+/// scroll state to keep in step.
+pub fn select_team_delta(state: &mut crate::state::AppState, delta: isize) {
+    let count = state.team.children.len();
+    if count == 0 {
+        state.team_selected = None;
+        return;
+    }
+    let current = state
+        .team_selected
+        .as_deref()
+        .and_then(|id| state.team.children.iter().position(|child| child.id == id));
+    let next = match current {
+        Some(index) => (index as isize + delta).rem_euclid(count as isize) as usize,
+        None if delta >= 0 => 0,
+        None => count - 1,
+    };
+    state.team_selected = state.team.children.get(next).map(|child| child.id.clone());
+}
+
 pub fn inspector_rows(view: &ChildAgentView, t: &crate::i18n::UiText) -> Option<Vec<InspectorRow>> {
     let detail = view.detail.as_ref()?;
     let mut rows = Vec::new();
@@ -1669,6 +1803,9 @@ pub enum RosterTone {
 pub struct AgentRosterRow {
     /// Localized identity: 主 Agent / 探索 Agent / …
     pub label: String,
+    /// The same identity for a narrow panel: the role alone. A label carrying
+    /// the nickname too can push ` · … ↗` past the panel edge.
+    pub narrow_label: String,
     /// Current human-readable activity — structured runtime facts only
     /// (tool/background labels, task text), never reasoning.
     pub activity: String,
@@ -1719,11 +1856,22 @@ fn child_meta(view: &ChildAgentView, now_elapsed: u64) -> Option<String> {
     Some(elapsed)
 }
 
-/// The child's assigned task. Transient tool/step labels stay in the detail
-/// page so this summary does not jump from the user's intent to implementation
-/// noise such as `list_files`.
+/// The child's assigned task. The short spawn title is the caption. Without
+/// one, the row says the state. `purpose` is the child's prompt and is not a
+/// caption.
 fn child_activity(view: &ChildAgentView, t: &crate::i18n::UiText) -> String {
-    running_line(view, t)
+    if let Some(title) = view
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return title.to_string();
+    }
+    match view.status {
+        ChildStatus::Running => t.sub_agent_running.to_string(),
+        _ => t.sub_agent_waiting.to_string(),
+    }
 }
 
 /// Build the active child roster. The aggregate header owns the coordinator
@@ -1754,14 +1902,21 @@ pub fn roster_rows(
             ChildStatus::Unreported => (RosterTone::Failed, t.sub_agent_unreported.to_string()),
         };
         rows.push(AgentRosterRow {
-            label: if child.nickname.trim().is_empty() {
-                child
-                    .agent_name
-                    .clone()
-                    .unwrap_or_else(|| display_role(&child.role, t))
-            } else {
-                child_label(child.nickname.trim(), child.agent_name.as_deref())
+            label: {
+                // The role says what the child is doing; the nickname or its
+                // ordinal says which one it is. A bare nickname leaves the reader
+                // with a name and no job — the panel exists to explain waiting.
+                let role = display_role(&child.role, t);
+                if child.nickname.trim().is_empty() {
+                    child.agent_name.clone().unwrap_or(role)
+                } else {
+                    format!(
+                        "{role} · {}",
+                        child_label(child.nickname.trim(), child.agent_name.as_deref())
+                    )
+                }
             },
+            narrow_label: display_role_short(&child.role, t),
             activity,
             meta: child_meta(child, now_elapsed),
             tone,
@@ -1799,17 +1954,6 @@ pub fn collaboration_runtime_line(
         crate::status_line::fmt_elapsed(now_elapsed.saturating_sub(started))
     ));
     line
-}
-
-/// One line of the Task Team header.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TeamLine {
-    pub glyph: &'static str,
-    pub role: String,
-    /// Purpose while working, contribution once finished. Never a bare status
-    /// word — the whole point of the panel is that waiting is explicable.
-    pub detail: String,
-    pub status: ChildStatus,
 }
 
 /// Should the Task Team panel appear at all?
@@ -1873,44 +2017,6 @@ pub fn collaboration_glyph(team: &TaskTeamView, terminal: bool) -> &'static str 
     if lost_one { "\u{26a0}" } else { "\u{2713}" }
 }
 
-/// Compact team summary for the header.
-///
-/// Deliberately not a dashboard: role, state and *why*. No token counts, no
-/// event stream, no agent graph. The task is the primary object; this is a
-/// caption on it.
-pub fn team_lines(team: &TaskTeamView, t: &crate::i18n::UiText) -> Vec<TeamLine> {
-    team.children
-        .iter()
-        .map(|c| {
-            let glyph = match c.status {
-                ChildStatus::Waiting => "○",
-                ChildStatus::Running => "⟳",
-                ChildStatus::Completed => "✓",
-                ChildStatus::Failed => "✗",
-                ChildStatus::Interrupted => "⏸",
-                ChildStatus::Unreported => "?",
-            };
-            let detail = match c.status {
-                ChildStatus::Waiting | ChildStatus::Running => running_line(c, t),
-                ChildStatus::Interrupted => t.sub_agent_interrupted.to_string(),
-                ChildStatus::Unreported => t.sub_agent_unreported.to_string(),
-                ChildStatus::Failed => child_stop_label(c.stop, c.limit, t)
-                    .unwrap_or(t.sub_agent_incomplete)
-                    .to_string(),
-                ChildStatus::Completed => {
-                    contribution_line(c, t).unwrap_or_else(|| t.sub_agent_completed.to_string())
-                }
-            };
-            TeamLine {
-                glyph,
-                role: display_role(&c.role, t),
-                detail,
-                status: c.status,
-            }
-        })
-        .collect()
-}
-
 /// Title for the team panel. Names what the team is doing, not how many of
 /// them there are — "3 agents" is the count the product deliberately does not
 /// lead with.
@@ -1936,6 +2042,17 @@ fn display_role(role: &str, t: &crate::i18n::UiText) -> String {
         "worker" => t.sub_agent_worker,
         "reviewer" => t.sub_agent_reviewer,
         _ => t.sub_agent_default,
+    }
+    .to_string()
+}
+
+/// The role alone, for a panel too narrow for `探索 Agent · Euclid · …`.
+fn display_role_short(role: &str, t: &crate::i18n::UiText) -> String {
+    match role {
+        "explorer" => t.sub_agent_explorer_short,
+        "worker" => t.sub_agent_worker_short,
+        "reviewer" => t.sub_agent_reviewer_short,
+        _ => t.sub_agent_default_short,
     }
     .to_string()
 }

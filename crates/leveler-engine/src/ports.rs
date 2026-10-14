@@ -249,7 +249,7 @@ pub enum ModelCallKind {
     MemoryExtraction,
     /// The idle "what would the user type next" prompt suggestion.
     PromptSuggestion,
-    /// The idle recap sentence shown when the user returns.
+    /// The one-line recap shown after a successful turn.
     AwaySummary,
     /// The bounded wording pass for a manually requested recap.
     SemanticRecap,

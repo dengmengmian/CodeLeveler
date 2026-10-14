@@ -472,17 +472,6 @@ pub fn checkpoint_created_event(record: &GoalCheckpointRecord) -> EngineEvent {
 /// `None` covers every case where the checkpoint path will not fire or its
 /// reach is unknown — no task, no goal, no checkpoint, no watermark — and the
 /// caller reads that as "impose no bound", never as "bound at zero".
-pub async fn checkpoint_transcript_ordinal(
-    stores: &leveler_storage::EngineStores,
-    session_id: &SessionId,
-    scope: &GoalCheckpointScope,
-) -> Result<Option<u64>, EngineError> {
-    let Some(checkpoint) = latest_checkpoint_for_scope(stores, session_id, scope).await? else {
-        return Ok(None);
-    };
-    Ok(checkpoint.payload.transcript_ordinal)
-}
-
 pub async fn resume_prior_from_checkpoint(
     stores: &leveler_storage::EngineStores,
     session_id: &SessionId,

@@ -287,10 +287,15 @@ pub struct SubAgentBlock {
     pub agent_name: Option<String>,
     pub role: String,
     pub status: ToolStatus,
-    /// The task fixed at spawn. Kept after settlement so the conversation can
-    /// retain what the delegated step did without replaying the live roster.
+    /// The instructions given to the child at spawn, kept with the record.
+    /// Nothing paints it: the conversation, the roster and the detail view all
+    /// show `title`, because a spawn prompt is an instruction rather than a
+    /// caption for a state.
     pub task: String,
-    /// The task while running; a short result summary once done.
+    /// Short display name fixed at spawn. `None` when the spawn recorded none.
+    /// This is the only task text the conversation shows.
+    pub title: Option<String>,
+    /// The prompt while running; a short result summary once done.
     pub detail: String,
     pub progress: SubAgentProgress,
     /// Latest tool/step from the runtime (real event; not invented stats).
@@ -459,16 +464,6 @@ pub struct TranscriptState {
 }
 
 impl TranscriptState {
-    /// Enough conversational substance to make an idle recap useful rather
-    /// than repeat a single greeting/answer.
-    pub fn has_away_summary_context(&self) -> bool {
-        self.items
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::User(text) if !text.trim().is_empty()))
-            .count()
-            >= 2
-    }
-
     pub fn new() -> Self {
         Self::default()
     }
@@ -1545,6 +1540,7 @@ impl TranscriptState {
             role,
             status: ToolStatus::Running,
             task: task.clone(),
+            title: None,
             detail: task,
             progress: SubAgentProgress::default(),
             recent_step: None,
@@ -1556,6 +1552,18 @@ impl TranscriptState {
             interrupted: false,
             unreported: false,
         }));
+    }
+
+    /// Remember the short display name. A later event that omits it (a
+    /// terminal does) must not erase the name fixed at spawn. An empty
+    /// string is not a name.
+    pub fn set_sub_agent_title(&mut self, id: &str, title: Option<String>) {
+        let Some(title) = title.filter(|t| !t.trim().is_empty()) else {
+            return;
+        };
+        if let Some(block) = self.sub_agent_mut(id) {
+            block.title = Some(title.trim().to_string());
+        }
     }
 
     /// Mark a sub-agent done, updating its status and result summary in place. If
@@ -1600,6 +1608,7 @@ impl TranscriptState {
             role: String::new(),
             status,
             task: String::new(),
+            title: None,
             detail: summary,
             progress: SubAgentProgress::default(),
             recent_step: None,
@@ -1641,6 +1650,7 @@ impl TranscriptState {
             role: String::new(),
             status,
             task: String::new(),
+            title: None,
             detail: summary,
             progress: SubAgentProgress::default(),
             recent_step: None,

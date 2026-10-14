@@ -6,8 +6,8 @@
 //! the rendered frame — not the internal field names.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::Terminal;
 
 use leveler_client_protocol::{
     AnswerEffect, ClientCommand, MessageId, PermissionProfile, RuntimeEvent, RuntimeStatus,
@@ -112,6 +112,7 @@ fn a0_opening_an_idle_session_requests_an_initial_prediction() {
         Effect::Send(ClientCommand::RequestPromptSuggestion { session_id })
             if session_id.as_str() == "s1"
     )));
+    assert_eq!(recap_requests(&effects), 0);
 }
 
 fn reopened_with_history() -> AppState {
@@ -174,11 +175,11 @@ fn restored_history_requests_one_prediction_even_when_entries_are_empty() {
         let response = history_response(&s, empty);
         let effects = reduce(&mut s, Action::Runtime(response.clone()));
         assert_eq!(prediction_requests(&effects), 1, "empty={empty}");
+        assert_eq!(recap_requests(&effects), 1, "empty={empty}");
         assert!(s.composer.is_empty());
-        assert_eq!(
-            prediction_requests(&reduce(&mut s, Action::Runtime(response))),
-            0
-        );
+        let again = reduce(&mut s, Action::Runtime(response));
+        assert_eq!(prediction_requests(&again), 0);
+        assert_eq!(recap_requests(&again), 0);
 
         reduce(
             &mut s,
@@ -218,11 +219,10 @@ fn restored_history_does_not_request_a_prediction_after_input_or_while_busy() {
             "error" => s.status = RuntimeStatus::Error,
             _ => unreachable!(),
         }
-        assert_eq!(
-            prediction_requests(&reduce(&mut s, Action::Runtime(response))),
-            0,
-            "{guard}"
-        );
+        let effects = reduce(&mut s, Action::Runtime(response));
+        assert_eq!(prediction_requests(&effects), 0, "{guard}");
+        let recap = matches!(guard, "draft" | "erased" | "attachment" | "suggestion");
+        assert_eq!(recap_requests(&effects), usize::from(recap), "{guard}");
     }
 }
 
@@ -386,50 +386,106 @@ fn prose_turn(s: &mut AppState, text: &str) {
     reduce(s, Action::Runtime(RuntimeEvent::TurnCompleted));
 }
 
-#[test]
-fn idle_recap_fires_once_only_after_a_substantial_conversation() {
-    let mut s = opened();
-    s.transcript.push_user("先定位问题".into());
-    s.transcript.push_user("继续修复".into());
-    let now = std::time::Instant::now();
-    leveler_tui::away_summary::arm(&mut s, now);
-
-    assert!(reduce(&mut s, Action::IdleTick(now)).is_empty());
-    let effects = reduce(
-        &mut s,
-        Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY),
-    );
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Send(ClientCommand::RequestAwaySummary { session_id })
-            if session_id.as_str() == "s1"
-    )));
-    assert!(
-        reduce(
-            &mut s,
-            Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY)
-        )
-        .is_empty()
-    );
+fn recap_requests(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::Send(ClientCommand::RequestAwaySummary { .. })
+            )
+        })
+        .count()
 }
 
 #[test]
-fn typing_cancels_the_pending_idle_recap() {
+fn a_finished_answer_requests_a_recap_and_a_suggestion_together() {
     let mut s = opened();
-    s.transcript.push_user("先定位问题".into());
-    s.transcript.push_user("继续修复".into());
-    let now = std::time::Instant::now();
-    leveler_tui::away_summary::arm(&mut s, now);
+    s.transcript.push_user("清理 .gitignore".into());
+    let id = MessageId::new("m-both");
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageStarted {
+            message_id: id.clone(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantTextDelta {
+            message_id: id.clone(),
+            delta: "忽略规则已经提交。".into(),
+        }),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AssistantMessageCompleted { message_id: id }),
+    );
 
-    typed(&mut s, "我有新想法");
+    let effects = reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
 
-    assert!(
+    assert_eq!(prediction_requests(&effects), 1);
+    assert_eq!(recap_requests(&effects), 1);
+    assert!(s.away_summary_pending);
+    assert!(s.composer.is_empty());
+}
+
+#[test]
+fn a_structured_goal_recap_is_not_followed_by_another_recap_request() {
+    let mut s = opened();
+    let effects = {
+        let args = serde_json::json!({
+            "status": "complete",
+            "summary": "阶段一已经完成。",
+            "next_step": NEXT_STEP,
+        });
+        let id = ToolCallId::new("goal");
         reduce(
             &mut s,
-            Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY)
-        )
-        .is_empty()
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: id.clone(),
+                name: "update_goal".into(),
+                arguments: args.to_string(),
+                parallel: false,
+                model_step: None,
+                answer_effect: Some(AnswerEffect::Bookkeeping),
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::ToolCallCompleted {
+                exit_code: None,
+                stop: None,
+                id,
+                ok: true,
+                preview: "目标已更新".into(),
+                duration_ms: 10,
+                applied_diff: None,
+            }),
+        );
+        reduce(&mut s, Action::Runtime(RuntimeEvent::TurnCompleted))
+    };
+
+    assert_eq!(recap_requests(&effects), 0);
+    assert_eq!(s.prompt_suggestion.as_deref(), Some(NEXT_STEP));
+    assert!(!s.away_summary_pending);
+}
+
+#[test]
+fn typing_does_not_drop_the_turn_recap() {
+    let mut s = opened();
+    s.away_summary_pending = true;
+    typed(&mut s, "处理吧");
+
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::AwaySummary {
+            text: "忽略规则已提交，下一步决定是否清理仍被跟踪的文件。".into(),
+        }),
     );
+
+    assert!(s.transcript.items().iter().any(|item| {
+        matches!(item, TranscriptItem::AwaySummary(text) if text.contains("忽略规则已提交"))
+    }));
 }
 
 #[test]
@@ -453,15 +509,8 @@ fn away_summary_is_rendered_as_muted_recap_chrome() {
 #[test]
 fn late_away_summary_does_not_interrupt_new_user_input() {
     let mut s = opened();
-    s.transcript.push_user("先定位问题".into());
-    s.transcript.push_user("继续修复".into());
-    let now = std::time::Instant::now();
-    leveler_tui::away_summary::arm(&mut s, now);
-    reduce(
-        &mut s,
-        Action::IdleTick(now + leveler_tui::away_summary::IDLE_DELAY),
-    );
-    typed(&mut s, "先等等");
+    s.away_summary_pending = true;
+    reduce(&mut s, Action::Runtime(busy()));
 
     reduce(
         &mut s,
@@ -557,12 +606,11 @@ fn recap_requires_nonempty_structured_content_and_a_successful_terminal_goal() {
     ] {
         let mut s = opened();
         goal_turn_with_args(&mut s, args, ok);
-        assert!(
-            !s.transcript
-                .items()
-                .iter()
-                .any(|item| matches!(item, TranscriptItem::Recap(_)))
-        );
+        assert!(!s
+            .transcript
+            .items()
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::Recap(_))));
         assert_eq!(s.prompt_suggestion, None);
         let text = frame(&mut s, 100, 24);
         assert!(!text.contains("回顾:"), "{text}");
@@ -1333,12 +1381,11 @@ fn acceptance_ghost_frame_then_accepted_frame_then_one_send() {
     // Enter here sends nothing.
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "frame A Enter sent: {effects:?}");
-    assert!(
-        s.transcript
-            .items()
-            .iter()
-            .all(|item| !matches!(item, TranscriptItem::User(_)))
-    );
+    assert!(s
+        .transcript
+        .items()
+        .iter()
+        .all(|item| !matches!(item, TranscriptItem::User(_))));
 
     // Tab.
     let effects = reduce(&mut s, key(KeyCode::Tab));

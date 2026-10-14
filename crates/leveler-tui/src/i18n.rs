@@ -205,6 +205,12 @@ pub struct UiText {
     pub sub_agent_explorer: &'static str,
     pub sub_agent_worker: &'static str,
     pub sub_agent_reviewer: &'static str,
+    /// The same roles for a narrow panel, where the long form would push the
+    /// detail affordance past the edge.
+    pub sub_agent_default_short: &'static str,
+    pub sub_agent_explorer_short: &'static str,
+    pub sub_agent_worker_short: &'static str,
+    pub sub_agent_reviewer_short: &'static str,
     pub sub_agent_waiting: &'static str,
     pub sub_agent_running: &'static str,
     pub sub_agent_completed: &'static str,
@@ -216,6 +222,14 @@ pub struct UiText {
     pub sub_agent_ended_incomplete: &'static str,
     /// Overflow row when the roster is taller than its cap: "还有 {n} 个 Agent…"
     pub agent_roster_more: &'static str,
+    /// The Team page: every child agent of the session.
+    pub team_page_title: &'static str,
+    /// The affordance on the roster's overflow row ("查看全部" / "view all").
+    pub team_page_open_hint: &'static str,
+    pub team_page_empty: &'static str,
+    pub team_page_hint: &'static str,
+    pub team_page_hint_empty: &'static str,
+    pub team_detail_pending: &'static str,
     pub sub_agent_incomplete: &'static str,
     pub sub_agent_interrupted: &'static str,
     pub sub_agent_unreported: &'static str,
@@ -665,7 +679,6 @@ pub struct UiText {
     pub active_plan: &'static str,
     pub active_rules: &'static str,
     pub estimated_tokens: &'static str,
-    pub candidate_files: &'static str,
 
     // Reasoning / queue footer
     pub thinking: &'static str,
@@ -843,8 +856,11 @@ pub struct UiText {
     pub completion_diff_hint: &'static str,
 
     // Fold hints
-    pub fold_more_lines: &'static str, // "… 还有 {} 行 · Ctrl+O 展开"
-    pub fold_more_lines_short: &'static str, // "(+{} 行 · Ctrl+O)"
+    // The fold marker states the count and nothing else. The folded row is
+    // itself clickable, so it does not advertise a key: the shortcut table
+    // already lists Ctrl+O, and repeating it on every folded row is noise.
+    pub fold_more_lines: &'static str, // "… 还有 {} 行"
+    pub fold_more_lines_short: &'static str, // "(+{} 行)"
 
     // Tool detail labels
     pub tool_label_args: &'static str,
@@ -1251,6 +1267,10 @@ static ZH: UiText = UiText {
     sub_agent_explorer: "探索 Agent",
     sub_agent_worker: "执行 Agent",
     sub_agent_reviewer: "审查 Agent",
+    sub_agent_default_short: "子",
+    sub_agent_explorer_short: "探索",
+    sub_agent_worker_short: "执行",
+    sub_agent_reviewer_short: "审查",
     sub_agent_waiting: "等待执行",
     sub_agent_running: "执行中",
     sub_agent_completed: "已完成",
@@ -1258,6 +1278,12 @@ static ZH: UiText = UiText {
     main_agent_working: "正在工作",
     sub_agent_ended_incomplete: "已结束 · 工作未完成",
     agent_roster_more: "还有 {n} 个 Agent…",
+    team_page_title: "子 Agent",
+    team_page_open_hint: "查看全部 ↗",
+    team_page_empty: "本次会话还没有子 Agent",
+    team_page_hint: "↑↓ 选择 · Enter 详情 · x 停止 · Esc 返回",
+    team_page_hint_empty: "Esc 返回",
+    team_detail_pending: "运行结束后显示贡献",
     sub_agent_incomplete: "未完成",
     sub_agent_interrupted: "已中断",
     sub_agent_unreported: "未收到结束状态",
@@ -1584,7 +1610,6 @@ static ZH: UiText = UiText {
     active_plan: "计划",
     active_rules: "行为约束",
     estimated_tokens: "估算 token：{}",
-    candidate_files: "候选文件（{}）",
     thinking: "思考",
     thinking_lines: " · {} 行",
     thought_live: "思考中…",
@@ -2040,6 +2065,10 @@ static EN: UiText = UiText {
     sub_agent_explorer: "Explorer agent",
     sub_agent_worker: "Worker agent",
     sub_agent_reviewer: "Reviewer agent",
+    sub_agent_default_short: "Sub",
+    sub_agent_explorer_short: "Explorer",
+    sub_agent_worker_short: "Worker",
+    sub_agent_reviewer_short: "Reviewer",
     sub_agent_waiting: "waiting",
     sub_agent_running: "running",
     sub_agent_completed: "completed",
@@ -2047,6 +2076,12 @@ static EN: UiText = UiText {
     main_agent_working: "Working",
     sub_agent_ended_incomplete: "ended · work incomplete",
     agent_roster_more: "{n} more…",
+    team_page_title: "Child agents",
+    team_page_open_hint: "view all ↗",
+    team_page_empty: "No child agents in this session",
+    team_page_hint: "↑↓ select · Enter detail · x stop · Esc back",
+    team_page_hint_empty: "Esc back",
+    team_detail_pending: "Contribution appears when it settles",
     sub_agent_incomplete: "incomplete",
     sub_agent_interrupted: "interrupted",
     sub_agent_unreported: "no terminal received",
@@ -2373,7 +2408,6 @@ static EN: UiText = UiText {
     active_plan: "plan",
     active_rules: "project rules",
     estimated_tokens: "Estimated tokens: {}",
-    candidate_files: "Candidate files ({})",
     thinking: "thinking",
     thinking_lines: " · {} lines",
     thought_live: "Thinking…",

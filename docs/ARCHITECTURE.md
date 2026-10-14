@@ -1377,19 +1377,31 @@ verified by deterministic tests and real dogfood — do not regress them:
 - **A decision overlay's focused row is always visible**: approval /
   clarification / every picker keeps the focused row and its decision block
   inside any drawable height, and a resize returns to the focus.
+- **A clarification never hides the conversation behind it**: the panel owns
+  Enter, Esc and the arrows, the page keys keep scrolling the conversation
+  above it, and every single-choice question offers a free-text answer even
+  when the model did not ask for one (a deliberate exception to the client
+  presenting runtime facts and nothing else: a list of picks is not a closed
+  set, and the answer is still the user's own string).
+  The agent roster names each child's role (explorer / worker / reviewer),
+  never the spawn brief it was given.
 - **`Diff Failed` is not Empty**: an unreadable workspace must be shown as a
   failure, never as "no changes".
 - **Error source and delivery are structured facts**: `LocalConfiguration`,
   `Auth` (structured `error.code`) and `ConnectionRefused` (structured
   `io::ErrorKind`) are decided from facts; `message.contains(...)` string
   matching is forbidden.
-- **A confirmed Edit Diff is shown in full by default**: the Conversation keeps
-  edits separate from ordinary tool receipts, retains file/change statistics and
-  shows the complete diff without default folding or a 16-row preview. Existing
-  viewport scrolling keeps all content reachable; the full-screen Diff page also
-  retains complete content. The execution tool retains the complete diff after a
-  successful commit without a byte budget dropping it. When an edit moves a file,
-  both diff paths identify the actual source and committed destination.
+- **A confirmed Edit Diff keeps its whole record one gesture away**: the
+  Conversation keeps edits separate from ordinary tool receipts and retains
+  file/change statistics. A patch long enough to flood the turn is summarized —
+  its structure, both ends of every change run, and the number of hidden rows —
+  because a three-hundred-line diff scrolled the rest of the turn off the screen;
+  opening the row (`Ctrl+O`, or a click) prints every row, so no change is ever
+  out of reach, and a patch short enough to read is shown whole. The full-screen
+  Diff page always retains complete content. The execution tool retains the
+  complete diff after a successful commit without a byte budget dropping it.
+  When an edit moves a file, both diff paths identify the actual source and
+  committed destination.
 - **Failure details start collapsed with a reachable disclosure**: failed ordinary
   tools remain inside their group; its closed header shows only a failure marker
   and count. Clicking it exposes the failed targets and sanitized concrete errors.

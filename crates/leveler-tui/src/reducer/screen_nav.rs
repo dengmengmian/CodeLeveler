@@ -202,6 +202,20 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             KeyCode::End | KeyCode::Char('G') => crate::activity::to_bottom(state),
             _ => {}
         },
+        Screen::Team => match key.code {
+            KeyCode::Esc => close_team(state),
+            KeyCode::Up | KeyCode::Char('k') => crate::multi_agent::select_team_delta(state, -1),
+            KeyCode::Down | KeyCode::Char('j') => crate::multi_agent::select_team_delta(state, 1),
+            KeyCode::Enter => open_selected_child(state),
+            // `x` stops exactly the selected running child, through the
+            // runtime's own cancellation — never a PID.
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                if let Some(command) = selected_child_cancel(state) {
+                    return vec![Effect::Send(command)];
+                }
+            }
+            _ => {}
+        },
         Screen::ActivityList => {
             use crate::activity::BackgroundPane;
             match key.code {
@@ -405,6 +419,57 @@ pub(super) fn open_goal_screen(state: &mut AppState) {
 }
 
 /// Return to the conversation, dropping the view's scroll offset.
+/// Open the Team page with the first child selected, so Enter has a subject.
+pub(super) fn open_team(state: &mut AppState) -> Vec<Effect> {
+    state.active_screen = crate::screen::Screen::Team;
+    state.team_selected = state
+        .team
+        .children
+        .first()
+        .map(|child| child.id.clone());
+    Vec::new()
+}
+
+/// Leave the Team page without cancelling anything.
+fn close_team(state: &mut AppState) {
+    state.active_screen = crate::screen::Screen::Conversation;
+    state.team_selected = None;
+    state.team_hits.clear();
+}
+
+/// The child the Team page has selected, if it still exists.
+fn selected_child(state: &AppState) -> Option<&crate::multi_agent::ChildAgentView> {
+    state
+        .team_selected
+        .as_deref()
+        .and_then(|id| state.team.children.iter().find(|child| child.id == id))
+}
+
+/// Open the selected child's Activity detail. Enter is observational: the work
+/// keeps running and Esc comes back.
+fn open_selected_child(state: &mut AppState) {
+    let Some(id) = selected_child(state).map(|child| child.id.clone()) else {
+        return;
+    };
+    state.activity_open = Some(crate::activity::ActivityId::Child(id));
+    state.active_screen = crate::screen::Screen::Activity;
+}
+
+/// Ask the runtime to stop the selected child, when it is still running.
+fn selected_child_cancel(state: &AppState) -> Option<leveler_client_protocol::ClientCommand> {
+    let child = selected_child(state)?;
+    if !matches!(
+        child.status,
+        crate::multi_agent::ChildStatus::Running | crate::multi_agent::ChildStatus::Waiting
+    ) {
+        return None;
+    }
+    Some(leveler_client_protocol::ClientCommand::CancelChild {
+        session_id: state.session_id.clone(),
+        child_id: child.id.clone(),
+    })
+}
+
 fn close_screen(state: &mut AppState) {
     state.active_screen = Screen::Conversation;
     state.screen_scroll = 0;

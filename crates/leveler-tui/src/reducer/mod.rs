@@ -11,6 +11,7 @@ use leveler_client_protocol::{
 use crate::action::{Action, Effect, EffectCompletion};
 use crate::btw::SurfaceFocus;
 use crate::conversation::interaction::{self, Hit};
+use crate::overlay::Overlay;
 use crate::screen::Screen;
 use crate::state::{AppState, Notification, PendingSubmission, WorkbenchFocus};
 
@@ -23,7 +24,7 @@ mod submit;
 
 use overlay_keys::{handle_overlay_key, open_model_picker};
 use runtime_apply::apply_runtime;
-use screen_nav::{handle_screen_key, open_diff_screen, open_sessions_screen, toggle_screen};
+use screen_nav::{handle_screen_key, open_diff_screen, open_sessions_screen, open_team, toggle_screen};
 use submit::{
     complete_file_mention, complete_skill_mention, complete_slash, drain_pending_input,
     request_file_candidates, submit, touch_slash_filter,
@@ -201,9 +202,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                     session_id: state.session_id.clone(),
                 }));
             }
-            if turn_ended
-                && state.composer.is_empty()
-                && state.prompt_suggestion.is_none()
+            let successful_turn = turn_ended
                 && state.transcript.last_turn_end().is_some_and(|turn| {
                     matches!(
                         turn.status,
@@ -211,11 +210,23 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                             | crate::transcript::TurnEndStatus::CompletedWithWarnings
                             | crate::transcript::TurnEndStatus::Answered
                     )
-                })
+                });
+            if successful_turn
+                && state.composer.is_empty()
+                && state.prompt_suggestion.is_none()
             {
                 effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
                     session_id: state.session_id.clone(),
                 }));
+            }
+            // The recap is a transcript row, not composer text, so a draft does
+            // not suppress it. A structured goal recap already occupies the row.
+            if (successful_turn || restored_history)
+                && state.status == RuntimeStatus::Idle
+                && !state.transcript.is_empty()
+                && let Some(effect) = crate::away_summary::request(state)
+            {
+                effects.push(effect);
             }
             if refresh {
                 let session_id = state
@@ -238,7 +249,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
             state.size = (cols, rows);
             Vec::new()
         }
-        Action::IdleTick(now) => crate::away_summary::poll(state, now).into_iter().collect(),
+        Action::IdleTick(_) => Vec::new(),
         Action::FileCandidatesLoaded(files) => {
             state.file_candidates = files;
             Vec::new()
@@ -825,6 +836,9 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 state.workbench_focus = WorkbenchFocus::Activity;
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
+                if matches!(id, crate::activity::ActivityId::Team) {
+                    return open_team(state);
+                }
                 return crate::activity::open(state, id);
             }
             if footer_hit {
@@ -1076,7 +1090,21 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // An open overlay captures all key input. On the side thread it does not:
     // a main approval belongs to the main surface and waits for the user to
     // return, shown there only as live status in the header.
-    if state.overlay.is_some() && state.surface == SurfaceFocus::Main {
+    // A modal surface owns the keys it answers with — not the ones the reader
+    // uses to look at what it is asking about. A clarification on the
+    // conversation screen leaves the page keys to that conversation, so a
+    // question never hides its own context.
+    //
+    // Scoped on purpose: on any other screen the overlay is painted over the
+    // whole surface, and letting a page key through would scroll rows the user
+    // cannot see (and, on the conversation, move the focus out of the composer).
+    let page_keys_reach_the_conversation = state.active_screen == Screen::Conversation
+        && matches!(state.overlay, Some(Overlay::Clarification(_)));
+    if state.overlay.is_some()
+        && state.surface == SurfaceFocus::Main
+        && !(page_keys_reach_the_conversation
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown))
+    {
         return handle_overlay_key(state, key);
     }
 

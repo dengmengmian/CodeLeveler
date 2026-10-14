@@ -356,7 +356,9 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             crate::suggestion::offer_generated(state, &text);
         }
         RuntimeEvent::AwaySummary { text } => {
-            if state.away_summary_pending && !state.is_busy() && state.composer.is_empty() {
+            // A draft in the composer is the next message, not a reason to
+            // hide the summary of the turn that just finished. A new turn is.
+            if state.away_summary_pending && !state.is_busy() {
                 state.transcript.push_away_summary(text);
             }
             state.away_summary_pending = false;
@@ -373,18 +375,11 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             }
             state.sessions = sessions;
         }
-        RuntimeEvent::ContextUpdated {
-            candidate_files,
-            estimated_tokens,
-        } => {
-            state.context_files = candidate_files;
-            // `estimated_tokens` is a pre-run guess (candidate files). Only use it
-            // as a placeholder until the model reports real usage — don't let it
-            // clobber a live TokenUsage reading and make the gauge jitter.
-            if state.token_input == 0 && state.token_output == 0 {
-                state.context_tokens = estimated_tokens;
-            }
-        }
+        // `RuntimeEvent::ContextUpdated` carried the old ContextCompiler's
+        // candidate files and token guess. Nothing produces it any more, and the
+        // gauge takes its number from the runtime's snapshot, so the variant is
+        // kept for wire compatibility while it is ignored here.
+        RuntimeEvent::ContextUpdated { .. } => {}
         RuntimeEvent::TokenUsage {
             input_tokens,
             output_tokens,
@@ -401,10 +396,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.token_input = input_tokens;
             state.token_output = output_tokens;
             state.token_cached = cached_input_tokens;
-            // `input_tokens` is the full prompt sent this round; adding the
-            // output gives the window occupied after the reply. The latest
-            // round is the largest, so replace rather than accumulate.
-            state.context_tokens = input_tokens.saturating_add(output_tokens);
+            // These describe the request that JUST finished (`↑` prompt, `↓`
+            // output). They are deliberately not copied into the window gauge:
+            // a finished request is not the next request's projection, and the
+            // gauge's own number comes from the runtime's snapshot.
         }
         RuntimeEvent::TurnProgress {
             phase,
@@ -569,6 +564,7 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         } => {
             let started = state.elapsed_secs;
             let agent_name = agent.as_ref().map(|a| a.name.clone());
+            let display_title = title.clone();
             state.team.apply_update(crate::multi_agent::ChildUpdate {
                 id: id.clone(),
                 nickname: nickname.clone(),
@@ -615,6 +611,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
                 );
             }
             state.transcript.set_sub_agent_agent_name(&id, agent_name);
+            // `detail` on a start event is the child's prompt. The conversation
+            // shows the short title, and a terminal (title = None) must not
+            // wipe the name recorded at spawn.
+            state.transcript.set_sub_agent_title(&id, display_title);
         }
         // No TUI action issues this query. A response on the shared stream is
         // therefore necessarily owned by another client.
@@ -1176,14 +1176,11 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     }
     state.cancel_armed = false;
     state.cancel_repeat_armed = false;
-    // If the provider never reported usage, still drive the context gauge from
-    // the visible transcript so it is not stuck at empty capacity forever.
-    if state.context_tokens == 0 && state.token_input == 0 {
-        let estimated = estimate_transcript_tokens(state);
-        if estimated > 0 {
-            state.context_tokens = estimated;
-        }
-    }
+    // No usage, no reading. The gauge is hidden until the provider reports one
+    // (`footer_context_usage` returns None for zero), because a number derived
+    // from the visible transcript is not the window's occupancy: it ignores the
+    // control context, the tool schema and reasoning, so it would understate the
+    // real compaction pressure while looking authoritative.
     // Read BEFORE `push_turn_end`: a TurnEnd marker is the scan boundary, so
     // the handoff has to be taken while this turn is still the latest one.
     let handoff = state.transcript.latest_turn_handoff();
@@ -1215,54 +1212,9 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
         None => crate::suggestion::clear(state),
     }
     seal_analysis_segment(state);
-    if matches!(
-        status,
-        TurnEndStatus::Completed | TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Answered
-    ) {
-        crate::away_summary::arm(state, std::time::Instant::now());
-    } else {
-        crate::away_summary::cancel(state);
-    }
-}
-
-/// Rough token estimate from transcript text (CJK-aware), used only when the
-/// model never reported real usage for the turn.
-fn estimate_transcript_tokens(state: &AppState) -> u32 {
-    use crate::transcript::TranscriptItem;
-    let mut total = 0u32;
-    for item in state.transcript.items() {
-        match item {
-            TranscriptItem::User(text) | TranscriptItem::Error(text) => {
-                total = total.saturating_add(estimate_text_tokens(text));
-            }
-            TranscriptItem::Assistant(b) => {
-                total = total.saturating_add(estimate_text_tokens(&b.text));
-            }
-            TranscriptItem::ToolGroup(g) => {
-                for call in &g.calls {
-                    total = total.saturating_add(estimate_text_tokens(&call.arguments));
-                    if let Some(p) = &call.preview {
-                        total = total.saturating_add(estimate_text_tokens(p));
-                    }
-                }
-            }
-            TranscriptItem::Recap(_) => {}
-            _ => {}
-        }
-    }
-    total
-}
-
-fn estimate_text_tokens(text: &str) -> u32 {
-    let (mut cjk, mut other) = (0u32, 0u32);
-    for ch in text.chars() {
-        if ch as u32 >= 0x2E80 {
-            cjk += 1;
-        } else {
-            other += 1;
-        }
-    }
-    (cjk as f32 / 1.6 + other as f32 / 4.0).ceil() as u32
+    // The reducer asks for a fresh recap after a successful turn. Clear any
+    // acceptance window left by the previous one first.
+    crate::away_summary::cancel(state);
 }
 
 /// Compact product summary for the turn-end marker.
@@ -1765,7 +1717,6 @@ fn apply_session_with(
         state.context.pending_query_id = None;
         state.context.loaded = None;
         state.trace.pending_query_id = None;
-        state.context_files.clear();
         state.context_tokens = 0;
         state.token_input = 0;
         state.token_output = 0;

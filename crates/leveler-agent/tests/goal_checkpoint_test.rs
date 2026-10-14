@@ -361,16 +361,6 @@ async fn a_checkpoint_is_not_consumed_by_another_lineage_of_the_same_goal() {
     .await
     .unwrap();
 
-    assert_eq!(
-        leveler_agent::coding::checkpoint::checkpoint_transcript_ordinal(
-            &fx.stores,
-            &fx.session,
-            &other_scope,
-        )
-        .await
-        .unwrap(),
-        None
-    );
     assert!(
         resume_prior_from_checkpoint(&fx.stores, &fx.session, &other_scope, &transcript)
             .await

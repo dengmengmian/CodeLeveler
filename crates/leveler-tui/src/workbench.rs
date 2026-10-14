@@ -616,8 +616,13 @@ fn render_team_panel(
     // content inside a bounded readable width — never to the terminal's
     // right edge, which turns each row into two disconnected islands.
     const ROSTER_MAX_WIDTH: usize = 96;
+    /// Below this the roster shows the role alone so that ` · … ↗` still fits.
+    const NARROW_ROSTER_WIDTH: usize = 56;
     const META_GAP: usize = 4;
     let bound = width.min(ROSTER_MAX_WIDTH);
+    // Below this the long label (`探索 Agent · Euclid · `) leaves no room for
+    // ` · … ↗`; the row keeps the detail affordance and shows the role alone.
+    let narrow = bound < NARROW_ROSTER_WIDTH;
     let visible: Vec<&crate::multi_agent::AgentRosterRow> =
         rows.iter().take(shown_children).collect();
     // Shared column width: the widest meta among the rows that carry one.
@@ -638,7 +643,8 @@ fn render_team_panel(
         } else {
             "├─"
         };
-        let head = format!("  {branch} {} · ", row.label);
+        let label = if narrow { &row.narrow_label } else { &row.label };
+        let head = format!("  {branch} {label} · ");
         let head_w = UnicodeWidthStr::width(head.as_str());
         let cap = if meta_col > 0 {
             bound
@@ -667,7 +673,14 @@ fn render_team_panel(
             Span::styled(activity, Style::default().fg(theme.text.secondary)),
         ];
         let meta = row.meta.as_deref().unwrap_or("");
-        let pad = meta_x.saturating_sub(head_w + activity_w);
+        // The meta column aligns across rows while there is room. When there is
+        // not, the row keeps its own meta reachable rather than letting the
+        // shared column push ` · … ↗` past the panel edge — a wider label (the
+        // role it now carries) must not cost the reader the detail affordance.
+        let meta_w = UnicodeWidthStr::width(format!(" · {meta} ↗").as_str());
+        let aligned = meta_x.saturating_sub(head_w + activity_w);
+        let reachable = bound.saturating_sub(head_w + activity_w + meta_w);
+        let pad = aligned.min(reachable);
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(
             format!(" · {meta} ↗"),
@@ -683,13 +696,28 @@ fn render_team_panel(
     }
     let hidden = child_rows - shown_children;
     if hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{MEMBER_INDENT}{}",
-                t.agent_roster_more.replace("{n}", &hidden.to_string())
+        // The overflow row is the roster's one way to the full list: the panel
+        // answers "what is running right now" and cannot grow, so the children
+        // it cannot paint must stay reachable from here.
+        let mut hit = hits.clone();
+        hit.push((
+            area.y + 1 + shown_children as u16,
+            crate::activity::ActivityId::Team,
+        ));
+        hits = hit;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "{MEMBER_INDENT}{}",
+                    t.agent_roster_more.replace("{n}", &hidden.to_string())
+                ),
+                Style::default().fg(theme.text.secondary),
             ),
-            Style::default().fg(theme.text.secondary),
-        )));
+            Span::styled(
+                format!(" {}", t.team_page_open_hint),
+                Style::default().fg(theme.accent.primary),
+            ),
+        ]));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -1123,7 +1151,7 @@ mod tests {
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.elapsed_secs = elapsed;
         // A used context so the `Context …` footer chip actually renders.
-        state.context_tokens = 59_000;
+        state.token_input = 59_000;
         state.team = team;
         if plan {
             state.plan = Some(sample_plan());
@@ -1230,7 +1258,7 @@ mod tests {
         );
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.elapsed_secs = 55;
-        state.context_tokens = 59_000;
+        state.token_input = 59_000;
         state.team = team_with_usage(&[("a1", "explorer", "read_file", 158_000)]);
         for i in 1..=9 {
             state
@@ -1295,7 +1323,7 @@ mod tests {
         );
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.elapsed_secs = 55;
-        state.context_tokens = 59_000;
+        state.token_input = 59_000;
         state.team = team_with_usage(&[("a1", "explorer", "read_file", 158_000)]);
         state.overlay = Some(crate::overlay::Overlay::Approval(Box::new(
             crate::overlay::ApprovalOverlay::new(UiApprovalRequest {
@@ -1413,15 +1441,17 @@ mod tests {
         }
     }
 
-    /// The agent ROSTER row for `activity`.
+    /// The agent ROSTER row whose caption is `caption`.
     ///
-    /// The Activity strip above the roster mentions the same tool with the
-    /// child nickname and task on the same clickable line.
-    fn roster_row<'a>(lines: &'a [String], activity: &str) -> &'a String {
+    /// The caption cell carries the child's spawn title (or its state), so the
+    /// caller names the row with the same text the panel paints. Matching on
+    /// "any row with a detail affordance" would silently assert against the
+    /// wrong child as soon as a team has more than one.
+    fn roster_row<'a>(lines: &'a [String], caption: &str) -> &'a String {
         lines
             .iter()
-            .find(|l| l.contains(activity) && l.contains('↗'))
-            .unwrap_or_else(|| panic!("no roster row for {activity}: {lines:#?}"))
+            .find(|l| l.contains(caption) && l.contains('↗'))
+            .unwrap_or_else(|| panic!("no roster row for {caption}: {lines:#?}"))
     }
 
     /// A row whose usage is genuinely zero shows elapsed only — the column
@@ -1436,7 +1466,7 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 0)]),
             false,
         );
-        let row = roster_row(&lines, "read_file");
+        let row = roster_row(&lines, "explorer task");
         assert!(row.contains("55s"), "elapsed still shown: {row:?}");
         assert!(!row.contains("tokens"), "no fake token value: {row:?}");
 
@@ -1450,7 +1480,7 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
             false,
         );
-        let row = roster_row(&reported, "read_file");
+        let row = roster_row(&reported, "explorer task");
         assert!(
             row.contains("55s ↗"),
             "elapsed and detail affordance stay: {row:?}"
@@ -1499,7 +1529,7 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
             false,
         );
-        let row = roster_row(&lines, "read_file");
+        let row = roster_row(&lines, "explorer task");
         assert!(
             row.contains("55s ↗"),
             "narrow width preserves the detail affordance: {row:?}"
@@ -1518,7 +1548,7 @@ mod tests {
             team_with_usage(&[("a1", "explorer", "read_file", 362_000)]),
             false,
         );
-        let row = roster_row(&wide, "read_file");
+        let row = roster_row(&wide, "explorer task");
         assert!(
             row.contains("55s"),
             "given room, the meta is shown: {row:?}"
@@ -1535,7 +1565,10 @@ mod tests {
                 done: false,
                 ok: false,
                 detail: (*purpose).into(),
-                title: None,
+                // The spawn title and the brief are DIFFERENT strings here on
+                // purpose: a fixture that sets both to the same text cannot
+                // tell which one the panel actually painted.
+                title: Some(format!("{role} task")),
                 profile_id: Some((*role).into()),
                 agent_name: None,
                 read_only: true,
@@ -1554,11 +1587,15 @@ mod tests {
             ("a1", "explorer", "analyzing repository structure"),
             ("w1", "worker", "implementing the change"),
         ]));
+        // The panel states the runtime's spawn title. It must NOT paint the
+        // brief: a spawn prompt is an instruction, not a caption for a state.
+        assert!(screen.contains("explorer task"), "{screen}");
+        assert!(screen.contains("worker task"), "{screen}");
         assert!(
-            screen.contains("analyzing repository structure"),
-            "{screen}"
+            !screen.contains("analyzing repository structure")
+                && !screen.contains("implementing the change"),
+            "a spawn prompt must never be painted as a caption: {screen}"
         );
-        assert!(screen.contains("implementing the change"), "{screen}");
     }
 
     #[test]
@@ -1853,7 +1890,7 @@ mod tests {
         state.collaboration = collaboration.into();
         state.goal_mode_active = collaboration == "goal";
         state.context_window_tokens = 1_000_000;
-        state.context_tokens = 11_000;
+        state.token_input = 11_000;
         state.token_input = 11_000;
         state.token_cached = 9_570;
         state.clock_label = "09:30".into();
@@ -1984,7 +2021,7 @@ mod tests {
         let mut state = test_state();
         state.theme = crate::theme::Theme::dark();
         state.context_window_tokens = 1_000_000;
-        state.context_tokens = 15_000;
+        state.token_input = 15_000;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| crate::render::render(frame, &mut state))
@@ -2033,9 +2070,8 @@ mod tests {
 
         let mut state = test_state();
         state.context_window_tokens = 1_048_576;
-        state.context_tokens = 254_000;
-        state.token_input = 1000;
-        state.token_cached = 990;
+        state.token_input = 254_000;
+        state.token_cached = 251_460;
         state.clock_label = "22:22".into();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
@@ -2100,7 +2136,7 @@ mod tests {
         );
         state.clock_label = clock.into();
         if usage {
-            state.context_tokens = 18_400;
+            state.token_input = 18_400;
             state.token_input = 18_400;
             state.token_cached = 2_000;
         }
@@ -2140,9 +2176,8 @@ mod tests {
             let mut state = test_state();
             state.theme = crate::theme::Theme::default();
             state.locale = crate::i18n::Locale::En;
-            state.context_tokens = used;
-            state.token_input = 1_000;
-            state.token_cached = 990;
+            state.token_input = used;
+            state.token_cached = used / 100 * 99;
             state.clock_label = "09:30".into();
             let color = match expected_color {
                 0 => state.theme.status.info,
@@ -2188,7 +2223,7 @@ mod tests {
         ] {
             let mut state = test_state();
             state.theme = crate::theme::Theme::default();
-            state.context_tokens = used;
+            state.token_input = used;
             state.token_input = 1_000;
             state.token_cached = 990;
             state.clock_label = "09:30".into();
@@ -2767,7 +2802,7 @@ mod tests {
             done: false,
             ok: false,
             detail: "审计生命周期与身份".into(),
-            title: None,
+            title: Some("审计生命周期与身份".into()),
             profile_id: None,
             agent_name: None,
             read_only: false,
@@ -2850,7 +2885,7 @@ mod tests {
             done: false,
             ok: false,
             detail: "audit c".into(),
-            title: None,
+            title: Some("audit c".into()),
             profile_id: None,
             agent_name: None,
             read_only: false,
@@ -2967,6 +3002,149 @@ mod tests {
         assert!(
             rows.replace(' ', "").contains("还有"),
             "overflow note: {rows}"
+        );
+        // 96 columns is the roster's own bounded width; the affordance must fit
+        // inside it rather than being cut off by the terminal.
+        let wide = {
+            use ratatui::Terminal;
+            use ratatui::backend::TestBackend;
+            let mut terminal = Terminal::new(TestBackend::new(96, height)).unwrap();
+            terminal
+                .draw(|f| {
+                    render_team_panel(
+                        f,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width: 96,
+                            height,
+                        },
+                        &state,
+                    );
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let wide_rows: String = (0..wide.area.height)
+            .map(|y| {
+                (0..wide.area.width)
+                    .map(|x| {
+                        wide.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            wide_rows.replace(' ', "").contains("查看全部"),
+            "the overflow row names its own affordance: {wide_rows}"
+        );
+        // And it is a real target: the children the panel cannot paint must stay
+        // reachable, which is the whole point of the row.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                hits = render_team_panel(
+                    f,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 70,
+                        height,
+                    },
+                    &state,
+                );
+            })
+            .unwrap();
+        let team_row = hits
+            .iter()
+            .find(|(_, id)| matches!(id, crate::activity::ActivityId::Team));
+        assert!(
+            team_row.is_some(),
+            "the overflow row is a click target: {hits:?}"
+        );
+    }
+
+    /// The Team page lists every child, not only the ones the roster had room
+    /// for, and Enter on it opens the selected child's detail.
+    #[test]
+    fn the_team_page_lists_every_child_and_enter_opens_its_detail() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.team = team_with(&[
+            ("c1", "explorer", "a"),
+            ("c2", "explorer", "b"),
+            ("c3", "worker", "c"),
+            ("c4", "reviewer", "d"),
+            ("c5", "explorer", "e"),
+            ("c6", "explorer", "f"),
+        ]);
+        // The page as its own entry point leaves it: open, first child selected.
+        // The click path into it is covered by the roster overflow test above.
+        state.active_screen = crate::screen::Screen::Team;
+        state.team_selected = state.team.children.first().map(|child| child.id.clone());
+        assert_eq!(state.active_screen, crate::screen::Screen::Team);
+        assert_eq!(
+            state.team_selected.as_deref(),
+            Some("c1"),
+            "the page opens on the first child so Enter has a subject"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| crate::render::render(f, &mut state))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .and_then(|c| c.symbol().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Every child is on the page, including the two the roster hid.
+        for id in ["c1", "c2", "c3", "c4", "c5", "c6"] {
+            assert!(
+                state.team.children.iter().any(|c| c.id == id),
+                "fixture sanity: {id}"
+            );
+        }
+        let listed = state.team_hits.len();
+        assert_eq!(listed, 6, "all six children are on the page: {screen}");
+
+        // Enter opens the selected child's Activity detail and keeps the work.
+        let action = crate::action::Action::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let effects = crate::reducer::reduce(&mut state, action);
+        assert_eq!(state.active_screen, crate::screen::Screen::Activity);
+        assert!(
+            matches!(
+                state.activity_open,
+                Some(crate::activity::ActivityId::Child(ref id)) if id == "c1"
+            ),
+            "Enter opens the selected child: {:?}",
+            state.activity_open
+        );
+        assert!(
+            effects.iter().all(|e| !matches!(
+                e,
+                crate::action::Effect::Send(leveler_client_protocol::ClientCommand::CancelChild { .. })
+            )),
+            "opening a detail never cancels the child: {effects:?}"
         );
     }
 
@@ -3244,20 +3422,25 @@ mod tests {
             "agent-1".into(),
             "Euclid".into(),
             "explorer".into(),
-            "task A".into(),
+            "你是只读探查。task A 的完整提示词".into(),
             0,
         );
+        s.transcript
+            .set_sub_agent_title("agent-1", Some("查事件入口".into()));
         s.transcript.push_sub_agent_started(
             "agent-2".into(),
             "Newton".into(),
             "explorer".into(),
-            "task B".into(),
+            "你是只读探查。task B 的完整提示词".into(),
             0,
         );
+        s.transcript
+            .set_sub_agent_title("agent-2", Some("查执行链".into()));
         let lines = crate::conversation::build::build_conversation_lines(&s, 100);
         let text = lines.iter().map(rule_plain).collect::<Vec<_>>().join("\n");
         assert!(text.contains("2 个 agents 正在运行"), "{text}");
-        assert!(text.contains("task A、task B"), "{text}");
+        assert!(text.contains("查事件入口、查执行链"), "{text}");
+        assert!(!text.contains("你是只读探查"), "{text}");
         assert!(
             !text.contains("├─ Euclid") && !text.contains("└─ Newton"),
             "{text}"
