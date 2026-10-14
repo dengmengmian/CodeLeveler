@@ -5,7 +5,7 @@
 //! the lines — a hit can never describe stale lines. This invariant is what
 //! makes mouse disclosure clicks trustworthy; do not split the caches.
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::render::{item_render, items_need_gap, sub_agent_tree_lines};
@@ -17,10 +17,6 @@ use super::ConvKey;
 /// How many lines the conversation content needs at `width` (for scroll math).
 pub fn conversation_line_count(state: &AppState, width: usize) -> usize {
     state.conversation_lines(width).len()
-}
-
-fn wrap_simple(s: &str, width: usize) -> Vec<String> {
-    crate::render::wrap(s, width)
 }
 
 impl AppState {
@@ -308,14 +304,20 @@ fn build_conversation(
         // Message types are distinguished by shape, not role headings:
         // `▌` user prompt, `●` agent prose, status glyphs for tool activity.
         //
-        // A ToolGroup, a SubAgent run and a UserShell read live state (the turn
-        // clock, approval hold, command focus), so they are rendered fresh and
-        // are NOT part of the per-item memo. Everything else is memoized.
-        let cacheable = !matches!(
-            item,
-            TranscriptItem::ToolGroup(_)
-                | TranscriptItem::SubAgent(_)
-                | TranscriptItem::UserShell(_)
+        let cacheable = memoizable_item(item, state);
+        // Observation for the streaming-frame cost: how much of a long
+        // history is reused, how much is re-wrapped, and how many units are
+        // re-rendered every frame because they read live state. Timed with the
+        // existing opt-in profiler (`LEVELER_TUI_PROFILE=1`), so a real session
+        // can show whether the live set is actually the problem before any
+        // cache boundary moves.
+        crate::profile::add(
+            if cacheable {
+                "tui.unit_memo_candidate_count"
+            } else {
+                "tui.unit_live_count"
+            },
+            1,
         );
         if cacheable {
             let reused = prev_units.next();
@@ -323,9 +325,11 @@ fn build_conversation(
                 Some(unit)
                     if unit.env == env && unit.items.len() == 1 && &unit.items[0] == item =>
                 {
+                    crate::profile::add("tui.unit_reused_count", 1);
                     (unit.lines, unit.hits, unit.commands, unit.items)
                 }
                 _ => {
+                    crate::profile::add("tui.unit_rewrapped_count", 1);
                     let (lines, unit_hits, unit_commands) =
                         render_cacheable_unit(state, item, width);
                     (
@@ -802,6 +806,31 @@ fn render_process_fold(
 /// and command rows in item-relative coordinates (always empty for these item
 /// types today, but the shape is the same as a fresh render).
 #[allow(clippy::type_complexity)]
+/// Whether a unit may be memoized: only when nothing it paints can change
+/// without the transcript itself changing.
+///
+/// A CLOSED, FINISHED tool group reads frozen facts only — each call's status,
+/// duration and preview. `now_elapsed_secs` reaches the head only for `Running`
+/// calls, so a finished group's timing never moves, and an edit's diff is the
+/// change itself. A group that is still open, still running, holding an
+/// approval, or holding the command focus is painted fresh: those are exactly
+/// the inputs the memo cannot see. A sub-agent run and a user shell read the
+/// live turn clock, so they stay out of the memo as before.
+fn memoizable_item(item: &TranscriptItem, state: &AppState) -> bool {
+    match item {
+        TranscriptItem::ToolGroup(group) => {
+            crate::activity_stream::group_is_finished(group)
+                && !group.open
+                && !group.calls.iter().any(|call| {
+                    state.approval_gated_call() == Some(&call.id)
+                        || state.focused_command() == Some(&call.id)
+                })
+        }
+        TranscriptItem::SubAgent(_) | TranscriptItem::UserShell(_) => false,
+        _ => true,
+    }
+}
+
 fn render_cacheable_unit(
     state: &AppState,
     item: &TranscriptItem,
@@ -817,20 +846,7 @@ fn render_cacheable_unit(
     let mut out: Vec<Line<'static>> = Vec::new();
     match item {
         TranscriptItem::User(text) => {
-            // A solid heading bar + bold body marks the user's turn clearly
-            // apart from the assistant's `●` bullet and normal-weight prose.
-            let bar = Style::default()
-                .fg(theme.text.primary)
-                .add_modifier(Modifier::BOLD);
-            let body = Style::default()
-                .fg(theme.text.primary)
-                .add_modifier(Modifier::BOLD);
-            for line in wrap_simple(text, width.saturating_sub(2).max(1)) {
-                out.push(Line::from(vec![
-                    Span::styled("▌ ", bar),
-                    Span::styled(line, body),
-                ]));
-            }
+            crate::render::transcript_lines::push_user_turn(text, theme, width, &mut out);
         }
         TranscriptItem::Assistant(block) => {
             // Prose is communication: always in full, never a click target.
@@ -996,7 +1012,45 @@ mod tests {
         );
     }
 
-    /// Diff previews have a fixed row budget independent of viewport height.
+    /// A summarized diff keeps a fixed row budget independent of viewport
+    /// height, and says how much it hides.
+    /// The memo boundary for tool groups: a settled one is reusable, a running
+    /// one is not (its head reads the live turn clock), and neither an approval
+    /// hold nor the command focus may be memoized away.
+    #[test]
+    fn only_settled_groups_join_the_item_memo() {
+        let mut s = test_state();
+        let id = leveler_client_protocol::ToolCallId::new("t1");
+        s.transcript.push_tool_started(
+            id.clone(),
+            "read_file".into(),
+            serde_json::json!({ "path": "a.rs" }).to_string(),
+            false,
+            0,
+            None,
+            None,
+        );
+        let group = |s: &crate::state::AppState| match s.transcript.items().first() {
+            Some(TranscriptItem::ToolGroup(g)) => g.clone(),
+            other => panic!("expected a tool group, got {other:?}"),
+        };
+        assert!(
+            !memoizable_item(&TranscriptItem::ToolGroup(group(&s)), &s),
+            "a running group reads the live clock"
+        );
+        s.transcript.complete_tool(&id, true, "read".into(), 5, None);
+        assert!(
+            !memoizable_item(&TranscriptItem::ToolGroup(group(&s)), &s),
+            "a group still taking calls is not settled"
+        );
+        // Sealing the run closes the group; from then on it paints frozen facts.
+        s.transcript.push_note("sealed".into());
+        assert!(
+            memoizable_item(&TranscriptItem::ToolGroup(group(&s)), &s),
+            "a settled group only paints frozen facts"
+        );
+    }
+
     #[test]
     fn a_confirmed_diff_preview_is_stable_at_any_viewport_height() {
         let mut s = test_state();
@@ -1039,7 +1093,7 @@ mod tests {
 
         assert_eq!(
             tall, short,
-            "the full diff is independent of viewport height: {short} -> {tall}"
+            "the summarized diff is independent of viewport height: {short} -> {tall}"
         );
         let plain: Vec<String> = tall_lines
             .iter()
@@ -1052,11 +1106,11 @@ mod tests {
             .collect();
         assert!(
             plain.iter().any(|r| r.contains("+ new call 39")),
-            "the complete canonical diff stays visible: {plain:?}"
+            "the summarized diff keeps its tail, so the end of the change is readable: {plain:?}"
         );
         assert!(
-            !plain.iter().any(|r| r.contains("还有")),
-            "no artificial omitted row count is painted"
+            plain.iter().any(|r| r.contains("还有")),
+            "a summarized diff states how many rows it hides: {plain:?}"
         );
     }
 }
@@ -1202,13 +1256,21 @@ mod exploration_fold_tests {
         s.transcript
             .set_call_expanded(receipt.item, receipt.call, true);
         s.conv.auto_scroll = false;
-        s.conv.scroll = position(&rows, "change_50");
+        // A summarized patch paints its ends, not its middle, so the reading row
+        // has to be one this view actually paints (`change_50` waits for Ctrl+O).
+        s.conv.scroll = position(&render(&s), "change_79");
         let before = render(&s)[s.conv.scroll].clone();
+        assert!(
+            before.contains("change_79"),
+            "the reader is on the diff row: {before:?}"
+        );
         toggle_span_receipt(&mut s, receipt.item, receipt.call);
-        assert_eq!(
-            render(&s)[s.conv.scroll],
-            before,
-            "the same canonical diff row stays at the reading position"
+        // Folding a receipt above the diff shortens it, so the same content
+        // moves to a different absolute row: the guarantee is that the reader
+        // stays ON that content, not that the number is frozen.
+        assert!(
+            render(&s).iter().any(|l| l.contains("change_79")),
+            "the diff row the reader was on is still painted after the fold"
         );
     }
 

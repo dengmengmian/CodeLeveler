@@ -814,7 +814,7 @@ pub(crate) fn tool_lines(
         )
         && let Some(patch) = edit_patch_for(block)
     {
-        push_edit_diff_body(&patch, theme, width, out, true);
+        push_edit_diff_body(&patch, theme, width, out, true, tools_expanded, t);
         return;
     }
 
@@ -1148,6 +1148,56 @@ fn hunk_start(header: &str, side: char) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// A patch longer than this is summarized in the conversation; `Ctrl+O`
+/// prints every row. The threshold is about reading, not correctness: a
+/// three-hundred-line patch scrolled the rest of the turn off the screen.
+const DIFF_COLLAPSE_AFTER: usize = 30;
+/// Rows kept at each end of a run of changes when a long patch is collapsed.
+const DIFF_FOLD_CONTEXT: usize = 3;
+
+/// A collapsed patch's rows: kept rows, and the count of the hidden middle.
+enum FoldedEditRow {
+    Row(usize),
+    Hidden(usize),
+}
+
+/// Collapse a long patch to its structure plus both ends of every change run.
+///
+/// Structural rows (file header, hunk header, meta) always survive — they say
+/// what the patch IS. Each run of changed lines keeps its first and last few
+/// rows, so a reader sees what changed and how much is missing, and `Ctrl+O`
+/// prints the rest. Nothing is discarded: folding is display only.
+fn fold_edit_diff_rows(rows: &[EditDiffRow], context: usize) -> Vec<FoldedEditRow> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if !matches!(rows[i], EditDiffRow::Code { .. }) {
+            out.push(FoldedEditRow::Row(i));
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < rows.len() && matches!(rows[i], EditDiffRow::Code { .. }) {
+            i += 1;
+        }
+        let run = i - start;
+        if run <= context * 2 {
+            for k in start..i {
+                out.push(FoldedEditRow::Row(k));
+            }
+        } else {
+            for k in start..start + context {
+                out.push(FoldedEditRow::Row(k));
+            }
+            out.push(FoldedEditRow::Hidden(run - context * 2));
+            for k in i - context..i {
+                out.push(FoldedEditRow::Row(k));
+            }
+        }
+    }
+    out
+}
+
 /// Render the canonical applied patch; presentation can preview these rows.
 fn push_edit_diff_body(
     patch: &str,
@@ -1155,11 +1205,15 @@ fn push_edit_diff_body(
     width: usize,
     out: &mut Vec<Line<'static>>,
     show_file_headers: bool,
+    expanded: bool,
+    t: &crate::i18n::UiText,
 ) {
     let rows = parse_edit_diff_rows(patch);
     if rows.is_empty() {
         return;
     }
+    let folded = (!expanded && rows.len() > DIFF_COLLAPSE_AFTER)
+        .then(|| fold_edit_diff_rows(&rows, DIFF_FOLD_CONTEXT));
     // The gutter is sized from the largest real line number in the patch, so
     // the code column never shifts sideways partway down. A file with 100k
     // lines gets six digits; a short one gets two.
@@ -1170,8 +1224,28 @@ fn push_edit_diff_body(
     let mark_w = 2; // "+ " / "- " / "  "
     let inner = width.saturating_sub(4 + gutter_w + mark_w).max(12);
 
-    for (i, row) in rows.iter().enumerate() {
-        let lead = if i == 0 { "  └ " } else { "    " };
+    let visible: Vec<FoldedEditRow> = match &folded {
+        Some(view) => view.iter().map(|r| match r {
+            FoldedEditRow::Row(i) => FoldedEditRow::Row(*i),
+            FoldedEditRow::Hidden(n) => FoldedEditRow::Hidden(*n),
+        }).collect(),
+        None => (0..rows.len()).map(FoldedEditRow::Row).collect(),
+    };
+    for (position, entry) in visible.iter().enumerate() {
+        let lead = if position == 0 { "  └ " } else { "    " };
+        let row = match entry {
+            FoldedEditRow::Hidden(hidden) => {
+                out.push(Line::from(vec![
+                    Span::styled(lead, Style::default().fg(theme.text.muted)),
+                    Span::styled(
+                        t.fold_more_lines.replace("{}", &hidden.to_string()),
+                        Style::default().fg(theme.text.muted),
+                    ),
+                ]));
+                continue;
+            }
+            FoldedEditRow::Row(i) => &rows[*i],
+        };
         match row {
             EditDiffRow::FileHeader { path } if show_file_headers => {
                 out.push(Line::from(vec![
@@ -1263,6 +1337,8 @@ pub(crate) fn merged_diff_rows(
     theme: &Theme,
     width: usize,
     out: &mut Vec<Line<'static>>,
+    expanded: bool,
+    t: &crate::i18n::UiText,
 ) {
     let mut combined = String::new();
     for call in calls {
@@ -1281,7 +1357,7 @@ pub(crate) fn merged_diff_rows(
         }
     }
     // Head already shows the path; hide per-hunk file headers to avoid noise.
-    push_edit_diff_body(&combined, theme, width, out, false);
+    push_edit_diff_body(&combined, theme, width, out, false, expanded, t);
 }
 
 #[cfg(test)]
@@ -1420,8 +1496,8 @@ mod m1_tests {
 
     fn diff_text(patch: &str, width: usize, expanded: bool) -> String {
         let mut out = Vec::new();
-        push_edit_diff_body(patch, &Theme::no_color(), width, &mut out, true);
-        let _ = expanded;
+        push_edit_diff_body(patch, &Theme::no_color(), width, &mut out, true, expanded,
+            &crate::i18n::Locale::En.text());
         out.iter()
             .map(|line| {
                 line.spans
@@ -1553,6 +1629,11 @@ mod m1_tests {
         }
         let folded = diff_text(&patch, 100, false);
         let expanded = diff_text(&patch, 100, true);
+        assert!(
+            folded.len() < expanded.len(),
+            "the collapse must actually collapse:\n{folded}"
+        );
+        assert!(!folded.contains("line 20"), "the middle is folded: {folded}");
         let column = |text: &str| {
             text.lines()
                 .find(|l| l.contains('│'))
@@ -1718,7 +1799,8 @@ mod m1_tests {
             Some("--- a/a.rs\n+++ b/a.rs\n@@ -200,1 +200,1 @@\n-two\n+2\n"),
         );
         let mut out = Vec::new();
-        merged_diff_rows(&[&a, &b], &Theme::no_color(), 90, &mut out);
+        merged_diff_rows(&[&a, &b], &Theme::no_color(), 90, &mut out, false,
+            &crate::i18n::Locale::En.text());
         let text: String = out
             .iter()
             .map(|l| {
@@ -1753,6 +1835,8 @@ mod m1_tests {
             100,
             &mut out,
             true,
+            true,
+            &crate::i18n::Locale::En.text(),
         );
         let text: String = out
             .iter()
@@ -1843,12 +1927,19 @@ mod m1_tests {
     }
 
     #[test]
-    fn fixed_contract_long_applied_diff_defaults_to_complete_content() {
+    fn fixed_contract_long_applied_diff_defaults_to_a_summary() {
         let patch = wide_applied_diff(500);
         let text = diff_text(&patch, 90, false);
-        assert!(text.contains("let line_0 = 0;"), "{text}");
-        assert!(text.contains("let line_499 = 499;"), "{text}");
-        assert!(!text.contains("还有"), "{text}");
+        assert!(text.contains("let line_0 = 0;"), "the head is kept: {text}");
+        assert!(text.contains("let line_499 = 499;"), "the tail is kept: {text}");
+        assert!(
+            text.contains("more lines"),
+            "a summarized diff says how much it hides: {text}"
+        );
+        assert!(
+            !text.contains("let line_200 = 200;"),
+            "the hidden middle waits for Ctrl+O: {text}"
+        );
     }
 
     #[test]

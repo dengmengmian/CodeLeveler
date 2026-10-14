@@ -22,7 +22,7 @@ pub enum ModelCallKind {
     MemoryExtraction,
     /// An idle prompt suggestion.
     PromptSuggestion,
-    /// An idle "welcome back" summary.
+    /// A one-line recap of where the conversation reached.
     AwaySummary,
     /// The bounded wording pass for a manual recap.
     SemanticRecap,

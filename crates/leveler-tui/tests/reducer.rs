@@ -2574,7 +2574,7 @@ fn mode_prefix_popup_allows_up_down_selection() {
 #[test]
 fn at_file_popup_filters_candidates_and_tab_inserts_the_selected_path() {
     let mut s = opened();
-    s.context_files = vec![
+    s.file_candidates = vec![
         "src/main.rs".into(),
         "src/model.rs".into(),
         "tests/main_test.rs".into(),
@@ -2589,7 +2589,7 @@ fn at_file_popup_filters_candidates_and_tab_inserts_the_selected_path() {
 #[test]
 fn at_file_popup_enter_completes_then_second_enter_submits_once() {
     let mut s = opened();
-    s.context_files = vec!["src/main.rs".into()];
+    s.file_candidates = vec!["src/main.rs".into()];
     typed(&mut s, "@src/mai");
 
     let effects = reduce(&mut s, key(KeyCode::Enter));
@@ -2623,7 +2623,7 @@ fn at_file_popup_enter_completes_then_second_enter_submits_once() {
 #[test]
 fn at_file_popup_tab_completes_then_second_tab_does_not_reinsert() {
     let mut s = opened();
-    s.context_files = vec!["src/main.rs".into()];
+    s.file_candidates = vec!["src/main.rs".into()];
     typed(&mut s, "@src/mai");
 
     reduce(&mut s, key(KeyCode::Tab));
@@ -2640,7 +2640,7 @@ fn at_file_popup_tab_completes_then_second_tab_does_not_reinsert() {
 #[test]
 fn completed_file_mention_hides_the_popup() {
     let mut s = opened();
-    s.context_files = vec!["src/main.rs".into()];
+    s.file_candidates = vec!["src/main.rs".into()];
     typed(&mut s, "@src/main.rs ");
 
     assert!(leveler_tui::screen::visible_file_popup(&s).is_empty());
@@ -2649,7 +2649,7 @@ fn completed_file_mention_hides_the_popup() {
 #[test]
 fn finished_file_mention_followed_by_prose_hides_the_popup() {
     let mut s = opened();
-    s.context_files = vec!["src/main.rs".into()];
+    s.file_candidates = vec!["src/main.rs".into()];
     typed(&mut s, "@src/main.rs some text");
 
     assert!(
@@ -2661,7 +2661,7 @@ fn finished_file_mention_followed_by_prose_hides_the_popup() {
 #[test]
 fn multi_mention_targets_only_the_token_before_the_cursor() {
     let mut s = opened();
-    s.context_files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+    s.file_candidates = vec!["src/main.rs".into(), "src/lib.rs".into()];
     typed(&mut s, "@src/main.rs @src/li");
 
     let popup = leveler_tui::screen::visible_file_popup(&s);
@@ -2675,7 +2675,7 @@ fn multi_mention_targets_only_the_token_before_the_cursor() {
 #[test]
 fn file_mention_popup_is_cursor_aware() {
     let mut s = opened();
-    s.context_files = vec!["src/main.rs".into()];
+    s.file_candidates = vec!["src/main.rs".into()];
     typed(&mut s, "@src/main.rs some text");
 
     // Cursor at the end (plain text): no active `@` token.
@@ -2695,7 +2695,7 @@ fn file_mention_popup_is_cursor_aware() {
 #[test]
 fn at_in_a_shell_escape_is_not_a_file_mention() {
     let mut s = opened();
-    s.context_files = vec!["src/main.rs".into()];
+    s.file_candidates = vec!["src/main.rs".into()];
     typed(&mut s, "!echo @src/main.rs");
 
     assert!(
@@ -3530,9 +3530,8 @@ fn cancel_arm_clears_on_turn_end_and_checkpoints_dedup() {
 }
 
 #[test]
-fn context_estimate_does_not_clobber_real_token_usage() {
+fn provider_usage_feeds_the_chips_and_not_the_window_gauge() {
     let mut s = opened();
-    // Real usage reported first.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::TokenUsage {
@@ -3542,23 +3541,15 @@ fn context_estimate_does_not_clobber_real_token_usage() {
             reasoning_tokens: None,
         }),
     );
-    assert_eq!(s.context_tokens, 5200);
-    // A later pre-run estimate must not overwrite the live gauge.
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::ContextUpdated {
-            candidate_files: vec!["a.rs".into()],
-            estimated_tokens: 99,
-        }),
-    );
+    // `↑`/`↓` describe the request that just finished.
+    assert_eq!(s.token_input, 5000);
+    assert_eq!(s.token_output, 200);
+    // The window gauge is a different question — how full is the NEXT request —
+    // and only the runtime's own accounting may answer it. A finished request's
+    // numbers are not that projection, so they never become the gauge.
     assert_eq!(
-        s.context_tokens, 5200,
-        "estimate must not clobber real usage"
-    );
-    assert_eq!(
-        s.context_files,
-        vec!["a.rs".to_string()],
-        "but files still update"
+        s.context_tokens, 0,
+        "provider usage is not the window gauge"
     );
 }
 
@@ -4091,9 +4082,13 @@ fn open_session_rebuilds_transcript() {
     );
 }
 
+/// `RuntimeEvent::ContextUpdated` carried the retired compiler's candidate
+/// files and token guess. Nothing sends it any more; the variant stays decodable
+/// and is ignored, so a replayed old log cannot move the gauge.
 #[test]
-fn context_updated_event_sets_state() {
+fn the_retired_context_updated_event_is_ignored() {
     let mut s = opened();
+    s.context_tokens = 700;
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::ContextUpdated {
@@ -4101,8 +4096,11 @@ fn context_updated_event_sets_state() {
             estimated_tokens: 5200,
         }),
     );
-    assert_eq!(s.context_tokens, 5200);
-    assert_eq!(s.context_files, vec!["src/a.rs".to_string()]);
+    assert_eq!(s.context_tokens, 700, "an old event must not move the gauge");
+    assert!(
+        s.file_candidates.is_empty(),
+        "and it does not fill the mention list"
+    );
 }
 
 #[test]

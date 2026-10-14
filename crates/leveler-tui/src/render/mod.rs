@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::screen::Screen;
 use crate::state::AppState;
@@ -291,6 +291,148 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
 /// from the same events the list is built from. The page owns no lifecycle:
 /// `x` stops the selected task through the runtime's cancellation command, and
 /// Esc never touches a process.
+/// The Team page: every child agent of the session, with the selected child's
+/// inspector beside it.
+///
+/// The bottom roster is a glance at what is running and cannot grow past a few
+/// rows; this page is where the full list lives, so six children stay reachable
+/// exactly like two. It is observational, like the roster: Enter opens a child's
+/// detail, `x` stops a running one, and nothing here cancels work by itself.
+fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let theme = &state.theme;
+    let t = state.t();
+    let hint = if state.team.children.is_empty() {
+        t.team_page_hint_empty
+    } else {
+        t.team_page_hint
+    };
+    let counts = state.team.children.len().to_string();
+    let page = crate::secondary::SecondaryPage {
+        title: t.team_page_title,
+        status: vec![Span::styled(counts, Style::default().fg(theme.text.muted))],
+        hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+
+    // One list, one detail, one rule between — the split the Diff page uses.
+    let list_width = ((body.width as usize) * 40 / 100).clamp(24, 64) as u16;
+    let list_area = Rect {
+        width: list_width,
+        ..body
+    };
+    let detail_area = Rect {
+        x: body.x + list_width + 1,
+        width: body.width.saturating_sub(list_width + 1),
+        ..body
+    };
+
+    state.team_hits.clear();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row_starts: Vec<(usize, String)> = Vec::new();
+    if state.team.children.is_empty() {
+        lines.push(Line::from(Span::styled(
+            t.team_page_empty.to_string(),
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    let selected = state.team_selected.clone();
+    let rows = crate::multi_agent::roster_rows(&state.team, state.elapsed_secs, t);
+    for (index, row) in rows.iter().enumerate() {
+        let Some(child) = state.team.children.get(index) else {
+            continue;
+        };
+        let on = selected.as_deref() == Some(child.id.as_str());
+        row_starts.push((lines.len(), child.id.clone()));
+        let marker = if on { "› " } else { "  " };
+        let mut head = vec![
+            Span::styled(marker, Style::default().fg(theme.accent.primary)),
+            Span::styled(
+                row.label.clone(),
+                Style::default().fg(theme.text.primary),
+            ),
+        ];
+        if let Some(meta) = row.meta.as_deref().filter(|m| !m.is_empty()) {
+            head.push(Span::styled(
+                format!("  · {meta}"),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        lines.push(Line::from(head));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                row.activity.clone(),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]));
+    }
+
+    // Keep the selection visible without a second scroll owner: the offset is
+    // derived from the selection, so a resize can never strand the row.
+    let visible = list_area.height as usize;
+    let selected_line = selected.as_deref().and_then(|id| {
+        row_starts
+            .iter()
+            .find(|(_, row_id)| row_id == id)
+            .map(|(line, _)| *line)
+    });
+    let max_offset = lines.len().saturating_sub(visible);
+    let offset = selected_line
+        .map(|line| line.saturating_sub(visible.saturating_sub(2)))
+        .unwrap_or(0)
+        .min(max_offset);
+    for (line, id) in &row_starts {
+        if *line >= offset && *line + 1 < offset + visible {
+            state.team_hits.push((
+                Rect {
+                    y: list_area.y + (*line - offset) as u16,
+                    height: 2,
+                    x: list_area.x,
+                    width: list_area.width,
+                },
+                id.clone(),
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).scroll((offset as u16, 0)),
+        list_area,
+    );
+
+    // The inspector for the selected child. `inspector_rows` is the one reader
+    // of a child's loaded contribution, and this page is where it belongs.
+    let detail = state
+        .team_selected
+        .as_deref()
+        .and_then(|id| state.team.children.iter().find(|child| child.id == id))
+        .and_then(|view| crate::multi_agent::inspector_rows(view, t));
+    let mut body_lines: Vec<Line<'static>> = Vec::new();
+    match detail {
+        Some(rows) => {
+            for row in rows {
+                body_lines.push(Line::from(Span::styled(
+                    row.text,
+                    Style::default().fg(theme.text.primary),
+                )));
+            }
+        }
+        None => body_lines.push(Line::from(Span::styled(
+            t.team_detail_pending.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))),
+    }
+    frame.render_widget(
+        Paragraph::new(body_lines).wrap(Wrap { trim: false }),
+        detail_area,
+    );
+}
+
 fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let theme = &state.theme;
     let t = state.t();
@@ -686,6 +828,8 @@ fn activity_footer_hint(
                 .background_task_labels
                 .get(task_id)
                 .is_some_and(|c| c.is_running()),
+            // Not an activity: the Team row is an entry, never a detail page.
+            ActivityId::Team => false,
         };
     let mut hint = t.activity_esc.to_string();
     if stoppable {
@@ -753,6 +897,8 @@ fn activity_screen_lines(
         ActivityId::Child(child_id) => {
             child_detail_body(state, child_id, summary, width, theme, t, &mut lines)
         }
+        // The Team row opens the Team page; it has no detail body of its own.
+        ActivityId::Team => {}
     }
     lines
 }
@@ -804,6 +950,7 @@ fn activity_status_text(
                 text.push_str(&format!(" · exit {code}"));
             }
         }
+        ActivityId::Team => {}
         // How it ended is the question the detail page exists to answer.
         ActivityId::Child(child_id) => {
             if let Some(reason) = state
@@ -1165,7 +1312,7 @@ mod footer;
 mod panes;
 mod screens;
 pub(crate) mod text;
-mod transcript_lines;
+pub(crate) mod transcript_lines;
 
 pub(crate) use footer::background_footer_spans;
 pub(crate) use footer::key_hint_line;
@@ -1236,6 +1383,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Shell => render_shell_screen(frame, area, state),
         Screen::Activity => render_activity_screen(frame, area, state),
         Screen::ActivityList => render_background_list_screen(frame, area, state),
+        Screen::Team => render_team_screen(frame, area, state),
         Screen::Plan => render_plan_screen(frame, area, state),
         Screen::Goal => render_goal_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
@@ -2854,6 +3002,7 @@ mod tests {
             role: String::new(),
             status: ToolStatus::Ok,
             task: String::new(),
+            title: None,
             detail: "done".into(),
             progress: Default::default(),
             recent_step: None,
@@ -2893,6 +3042,7 @@ mod tests {
             role: "explorer".into(),
             status: ToolStatus::Failed,
             task: "Explore model providers".into(),
+            title: None,
             detail:
                 "Reached the 6-round limit before finishing.\n\nLatest note: inspecting providers"
                     .into(),
@@ -2936,8 +3086,9 @@ mod tests {
             nickname: "Euclid".into(),
             role: "explorer".into(),
             status: ToolStatus::Running,
-            task: "Explore model provider architecture".into(),
-            detail: "Explore model provider architecture".into(),
+            task: "你是只读探查。目标仓库：/tmp/repo。这段是给 agent 的提示词。".into(),
+            title: Some("Explore model provider architecture".into()),
+            detail: "你是只读探查。目标仓库：/tmp/repo。这段是给 agent 的提示词。".into(),
             progress: crate::transcript::SubAgentProgress {
                 active: true,
                 ..Default::default()
@@ -2967,6 +3118,10 @@ mod tests {
         assert!(
             text.contains("Explore model provider architecture"),
             "{text}"
+        );
+        assert!(
+            !text.contains("你是只读探查") && !text.contains("目标仓库"),
+            "the agent prompt is not conversation text: {text}"
         );
         assert!(!text.contains("Euclid"), "{text}");
     }
@@ -3228,10 +3383,14 @@ mod tests {
         // the bottom runtime panel owns live identities and state.
         let waiting = render_text(&mut state, 100, 28);
         assert!(waiting.contains("2 个 agents 正在运行"), "{waiting}");
-        assert!(waiting.contains("检查 provider 架构"), "{waiting}");
-        assert!(waiting.contains("检查协议适配层"), "{waiting}");
+        // The brief a child was given is not conversation: the aggregate names
+        // the team, and the panel below owns the live identities.
         assert!(
-            waiting.contains("├─ Euclid"),
+            !waiting.contains("检查 provider 架构") && !waiting.contains("检查协议适配层"),
+            "a child's brief must not be printed: {waiting}"
+        );
+        assert!(
+            waiting.contains("Euclid"),
             "live identity stays in the bottom panel: {waiting}"
         );
 
@@ -4256,30 +4415,49 @@ mod tests {
     /// over it. This test used to assert the opposite — that a 40-line patch
     /// showed 16 rows and a "click for the full diff" hint — which left the
     /// only record of what the agent changed one interaction out of reach.
+    /// A long patch is summarized to its ends plus a count of what is hidden;
+    /// `Ctrl+O` is the one gesture that prints every row, and it prints all of
+    /// them. A three-hundred-line diff used to flood the turn instead.
     #[test]
-    fn a_long_inline_diff_is_complete_whether_folded_or_expanded() {
+    fn a_long_inline_diff_summarizes_and_ctrl_o_prints_it_all() {
         let body: String = (0..40).map(|i| format!("+line {i}\n")).collect();
         let patch = format!("*** Begin Patch\n*** Update File: src/a.rs\n@@\n{body}*** End Patch");
         let args = serde_json::json!({ "patch": patch }).to_string();
         let item = tool_item("apply_patch", &args, 5);
 
-        for expanded in [false, true] {
-            let text = tool_render(&item, expanded)
-                .iter()
-                .map(line_str)
-                .collect::<Vec<_>>()
-                .join("\n");
-            for i in [0usize, 15, 30, 39] {
-                assert!(
-                    text.contains(&format!("line {i}")),
-                    "expanded={expanded}: {text}"
-                );
-            }
+        let collapsed = tool_render(&item, false)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            collapsed.contains("line 0") && collapsed.contains("line 39"),
+            "a summarized diff keeps both ends: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("还有"),
+            "a summarized diff states how many rows it hides: {collapsed}"
+        );
+        assert!(
+            !collapsed.contains("line 20"),
+            "the hidden middle waits for Ctrl+O: {collapsed}"
+        );
+
+        let expanded = tool_render(&item, true)
+            .iter()
+            .map(line_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in [0usize, 15, 20, 30, 39] {
             assert!(
-                !text.contains("完整 Diff"),
-                "a complete diff offers nothing to reveal: {text}"
+                expanded.contains(&format!("line {i}")),
+                "Ctrl+O prints every row, missing line {i}: {expanded}"
             );
         }
+        assert!(
+            !expanded.contains("还有"),
+            "nothing is hidden once opened: {expanded}"
+        );
     }
 
     #[test]

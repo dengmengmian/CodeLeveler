@@ -281,6 +281,34 @@ pub fn paint_reasoning_rail(
     }
 }
 
+/// The user's own turn: a bold heading bar plus bold body, which marks it apart
+/// from the assistant's `●` bullet and normal-weight prose.
+///
+/// One implementation on purpose. The conversation paints this path, and
+/// `item_render` (driven by the presentation tests) paints it too; two copies
+/// would drift and the tests would keep passing on the copy nobody runs.
+pub(crate) fn push_user_turn(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    // The bar and the primary ink already separate the user's turn from the
+    // assistant's `●` prose. Weight is not doing that job, and bold body text
+    // costs legibility across a whole conversation.
+    let ink = Style::default().fg(theme.text.primary);
+    let mut wrapped = wrap(text, width.saturating_sub(2).max(1));
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    for line in wrapped {
+        out.push(Line::from(vec![
+            Span::styled("▌ ", ink),
+            Span::styled(line, ink),
+        ]));
+    }
+}
+
 /// Render one transcript item to styled lines (no leading separator).
 pub fn item_render(
     item: &TranscriptItem,
@@ -291,27 +319,7 @@ pub fn item_render(
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     match item {
-        TranscriptItem::User(text) => {
-            // A continuous heading left-bar + bold text marks a user turn clearly
-            // apart from the assistant's "●" bullet + normal-weight prose.
-            let bar = Style::default()
-                .fg(theme.text.primary)
-                .add_modifier(Modifier::BOLD);
-            let body = Style::default()
-                .fg(theme.text.primary)
-                .add_modifier(Modifier::BOLD);
-            let inner = wrap_width.saturating_sub(2).max(1);
-            let mut wrapped = wrap(text, inner);
-            if wrapped.is_empty() {
-                wrapped.push(String::new());
-            }
-            for line in wrapped {
-                out.push(Line::from(vec![
-                    Span::styled("▌ ", bar),
-                    Span::styled(line, body),
-                ]));
-            }
-        }
+        TranscriptItem::User(text) => push_user_turn(text, theme, wrap_width, &mut out),
         TranscriptItem::Assistant(block) => {
             out.extend(assistant_render(block, theme, wrap_width));
         }
@@ -806,9 +814,11 @@ pub(crate) fn sub_agent_display_name(
         "reviewer" => t.sub_agent_reviewer,
         _ => t.sub_agent_default,
     };
+    // The role says what the child is doing; the nickname or its ordinal says
+    // which one it is. A bare nickname leaves the reader with a name and no job.
     match block.id.strip_prefix("agent-").filter(|n| !n.is_empty()) {
         Some(number) => format!("{role} {number}"),
-        None => block.nickname.clone(),
+        None => format!("{role} · {}", block.nickname),
     }
 }
 
@@ -866,7 +876,8 @@ pub(crate) fn sub_agent_detail(detail: &str, t: &crate::i18n::UiText) -> String 
 }
 
 /// A spawned sub-agent block: a clear role/ordinal + execution state, then the
-/// task while running or its result summary once done.
+/// short title while running or its result summary once done. The prompt is
+/// not shown.
 fn sub_agent_lines(
     block: &crate::transcript::SubAgentBlock,
     theme: &Theme,
@@ -929,12 +940,25 @@ fn sub_agent_lines(
     }
     let head = Line::from(head_spans);
     out.push(head);
-    let detail_label = if block.status == ToolStatus::Running {
-        t.sub_agent_task
+    // While running, `detail` is still the prompt. Show the short title.
+    // After settlement, `detail` is the result summary the parent received.
+    let displayed_detail = if block.status == ToolStatus::Running {
+        block
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string()
     } else {
-        t.sub_agent_result
+        let summary = sub_agent_detail(block.detail.trim(), t);
+        let summary = summary.trim();
+        if summary.is_empty() {
+            String::new()
+        } else {
+            format!("{}{summary}", t.sub_agent_result)
+        }
     };
-    let displayed_detail = format!("{detail_label}{}", sub_agent_detail(block.detail.trim(), t));
     let detail = displayed_detail.trim();
     if !detail.is_empty() {
         let inner = wrap_width.saturating_sub(2).max(1);
@@ -966,10 +990,9 @@ fn sub_agent_lines(
 }
 
 /// Render a run of consecutive sub-agent blocks as one inline tree: an
-/// aggregate header (◌ running / ✓ all done / ⚠ ended with failures) plus one
-/// durable task summary. A lone agent keeps the classic single-block
-/// rendering. Only data the blocks actually carry is shown; details remain on
-/// the live roster and its drill-down page.
+/// aggregate header (◌ running / ✓ all done / ⚠ ended with failures) plus the
+/// short spawn titles. The child's prompt stays off this surface. A lone
+/// agent keeps the classic single-block rendering.
 pub fn sub_agent_tree_lines(
     blocks: &[&crate::transcript::SubAgentBlock],
     theme: &Theme,
@@ -1097,25 +1120,35 @@ fn sub_agent_tree_group_lines(
         Span::styled(stats, Style::default().fg(theme.text.muted)),
     ]));
 
-    let mut tasks: Vec<String> = Vec::new();
+    // `task` is the prompt the child runs on. The conversation shows the short
+    // titles fixed at spawn, never that prompt.
+    let mut titles: Vec<String> = Vec::new();
     for block in blocks {
-        let task = block.task.trim();
-        if !task.is_empty() && !tasks.iter().any(|seen| seen == task) {
-            tasks.push(task.to_string());
+        let Some(title) = block
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if titles.iter().all(|seen| seen != title) {
+            titles.push(title.to_string());
         }
     }
-    if !tasks.is_empty() {
-        let separator = if std::ptr::eq(t, crate::i18n::Locale::En.text()) {
-            " · "
-        } else {
-            "、"
-        };
-        for row in wrap(&tasks.join(separator), wrap_width.saturating_sub(2).max(1)) {
-            out.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(row, Style::default().fg(theme.text.secondary)),
-            ]));
-        }
+    if titles.is_empty() {
+        return;
+    }
+    let separator = if std::ptr::eq(t, crate::i18n::Locale::En.text()) {
+        " · "
+    } else {
+        "、"
+    };
+    for row in wrap(&titles.join(separator), wrap_width.saturating_sub(2).max(1)) {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(row, Style::default().fg(theme.text.secondary)),
+        ]));
     }
 }
 
@@ -1838,9 +1871,58 @@ mod tests {
             .expect("body span");
 
         assert_eq!(lead.style.fg, Some(theme.text.final_lead));
-        assert!(lead.style.add_modifier.contains(Modifier::BOLD));
+        // The conclusion is marked by its own ink, not by weight: body text is
+        // regular everywhere, so a long answer reads as prose.
+        assert!(!lead.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(body.style.fg, Some(theme.text.primary));
         assert_ne!(theme.text.final_lead, theme.text.primary);
+    }
+
+    /// Body text is regular, while the things that must stand out still do:
+    /// a heading keeps its weight, an emphasised phrase keeps its weight, and
+    /// code keeps its own ink. Bold prose is what costs legibility; a heading
+    /// that is not marked stops reading as a heading.
+    #[test]
+    fn headings_and_emphasis_stay_marked_while_body_text_is_regular() {
+        let theme = Theme::dark();
+        let lines = assistant_render(
+            &block(
+                "## 小节标题\n\n普通正文，其中 **强调短语** 要突出，还有 `inline_code`。",
+                AssistantKind::Final,
+            ),
+            &theme,
+            100,
+        );
+        let find = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not rendered"))
+                .clone()
+        };
+        let heading = find("小节标题");
+        assert!(
+            heading.style.add_modifier.contains(Modifier::BOLD),
+            "a heading stays a heading: {heading:?}"
+        );
+        let emphasis = find("强调短语");
+        assert!(
+            emphasis.style.add_modifier.contains(Modifier::BOLD),
+            "explicit emphasis stays emphasised: {emphasis:?}"
+        );
+        let code = find("inline_code");
+        assert_ne!(
+            code.style.fg,
+            Some(theme.text.primary),
+            "inline code keeps its own ink: {code:?}"
+        );
+        // And the plain prose between them is neither bold nor tinted.
+        let prose = find("普通正文");
+        assert!(
+            !prose.style.add_modifier.contains(Modifier::BOLD),
+            "body text is regular: {prose:?}"
+        );
     }
 
     /// A heading before the opening paragraph is NOT the lead: the heading keeps
@@ -2198,6 +2280,7 @@ mod tests {
             role: "explorer".into(),
             status,
             task: "task".into(),
+            title: None,
             detail: if status == ToolStatus::Failed {
                 "Reached the 6-round limit before finishing.".into()
             } else {
@@ -2308,18 +2391,26 @@ mod tests {
     }
 
     #[test]
-    fn sub_agent_tree_keeps_tasks_instead_of_live_tool_steps() {
+    fn sub_agent_tree_keeps_titles_instead_of_the_prompt_or_live_tool_steps() {
         let theme = Theme::default();
         let t = Locale::Zh.text();
         let mut a = sub_agent("agent-1", "Euclid", ToolStatus::Running);
         a.progress.active = true;
         a.recent_step = Some("list_files".into());
+        a.title = Some("摸清事件入口".into());
+        a.task = "你是只读探查。目标仓库：/tmp/repo\n1. HTTP 路由在哪里".into();
         let mut b = sub_agent("agent-2", "Newton", ToolStatus::Running);
         b.progress.active = true;
         b.recent_step = Some("grep ✓".into());
+        b.title = Some("摸清审查链路".into());
+        b.task = "你是只读探查。把完整提示词写进对话".into();
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("task"), "{text}");
+        assert!(text.contains("摸清事件入口、摸清审查链路"), "{text}");
+        assert!(
+            !text.contains("你是只读探查") && !text.contains("目标仓库"),
+            "the agent prompt is not conversation text: {text}"
+        );
         assert!(
             !text.contains("list_files") && !text.contains("grep ✓"),
             "{text}"
@@ -2334,14 +2425,18 @@ mod tests {
         a.progress.active = true;
         a.progress.input_tokens = 1_200;
         a.progress.output_tokens = 80;
+        a.title = Some("摸清事件入口".into());
+        a.task = "你是只读探查。不要把这段提示词画出来".into();
         let mut b = sub_agent("agent-2", "Newton", ToolStatus::Running);
         b.progress.input_tokens = 2_400;
         b.progress.output_tokens = 160;
+        b.title = Some("摸清审查链路".into());
         let lines = sub_agent_tree_lines(&[&a, &b], &theme, 100, t, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(text.contains("◌ 2 个 agents 正在运行"), "{text}");
         assert!(text.contains("3.8k tokens"), "{text}");
-        assert!(text.contains("task"), "{text}");
+        assert!(text.contains("摸清事件入口"), "{text}");
+        assert!(!text.contains("你是只读探查"), "{text}");
         assert!(
             !text.contains("├─ Euclid") && !text.contains("└─ Newton"),
             "conversation keeps one durable step summary, not the live roster: {text}"

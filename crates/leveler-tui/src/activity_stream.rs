@@ -155,8 +155,15 @@ pub(crate) fn render_group_rows(
                 }
                 cursor = end;
             } else {
-                let mut child = group.clone();
-                child.calls = vec![first.clone()];
+                // Build a one-call view instead of cloning the whole group and
+                // then discarding its calls. `open`, `display` and `round` are
+                // Copy, so only the single member is cloned.
+                let child = ToolGroupBlock {
+                    calls: vec![(*first).clone()],
+                    open: group.open,
+                    display: group.display,
+                    round: group.round,
+                };
                 let mut child_rows = Vec::new();
                 let at = out.len();
                 out.extend(render_group_rows(
@@ -1174,7 +1181,7 @@ fn group_is_disclosable(group: &ToolGroupBlock) -> bool {
             .all(|c| disclosure_class(&c.name) != DisclosureClass::Excluded)
 }
 
-fn group_is_finished(group: &ToolGroupBlock) -> bool {
+pub(crate) fn group_is_finished(group: &ToolGroupBlock) -> bool {
     !group.calls.is_empty() && group.calls.iter().all(|c| c.status != ToolStatus::Running)
 }
 
@@ -2911,7 +2918,7 @@ fn edit_unit_lines(
         ),
     ]));
 
-    crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out);
+    crate::tool_cell::merged_diff_rows(calls, theme, width, &mut out, first.expanded, t);
     (out, false)
 }
 
@@ -7501,15 +7508,22 @@ mod compact_command_tests {
         assert!(rows.iter().any(|r| r.contains("+ line 2")), "{rows:?}");
     }
 
+    /// A long patch is summarized: its ends and a count of what is hidden.
+    /// `an_opened_long_edit_restores_the_complete_diff` pins the other half —
+    /// Ctrl+O prints every row, so nothing is ever out of reach.
     #[test]
-    fn a_long_edit_defaults_to_complete_content() {
+    fn a_long_edit_is_summarized_in_the_conversation() {
         let rows = rows(edit(200));
         assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("+ line 2")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("+ line 199")), "{rows:?}");
-        assert!(!rows.iter().any(|r| r.contains("还有")), "{rows:?}");
         assert!(
-            rows.len() >= 200,
-            "complete diff rows must remain: {}",
+            rows.iter().any(|r| r.contains("还有")),
+            "a summarized diff says how many rows it hides: {rows:?}"
+        );
+        assert!(
+            rows.len() < 200,
+            "a three-hundred-line patch must not flood the turn: {}",
             rows.len()
         );
     }
@@ -7589,12 +7603,12 @@ mod compact_command_tests {
     }
 
     #[test]
-    fn a_collapsed_edit_keeps_stats_and_complete_content() {
+    fn a_collapsed_edit_keeps_stats_and_both_ends() {
         let rows = body(text(&lines_at(edit(120), &Theme::no_color(), 100, 0)));
         assert!(rows.iter().any(|r| r.contains("+120 −0")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("+ line 0")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("+ line 119")), "{rows:?}");
-        assert!(!rows.iter().any(|r| r.contains("还有")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("还有")), "{rows:?}");
     }
 
     /// DIFF-7: an edit is never an exploration participant, so an eager

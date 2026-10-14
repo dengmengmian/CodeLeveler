@@ -1,5 +1,8 @@
-//! A child spawned from a declared agent is named the same way everywhere it
-//! appears: the conversation's agent tree, the activity lane and the roster.
+//! A child spawned from a declared agent carries ONE identity everywhere it
+//! appears — the runtime's role, nickname and spawn title. Each surface formats
+//! that identity for its own width (the conversation's tree is the longest, the
+//! activity lane the shortest), so these tests pin the shared FACTS rather than
+//! a shared string.
 
 use leveler_client_protocol::{RuntimeEvent, RuntimeStatus, SessionId, UiChildAgentIdentity};
 
@@ -93,4 +96,64 @@ fn a_declared_agent_child_carries_its_agent_name_in_the_tree_and_the_activity_la
         "{rows:#?}"
     );
     assert!(rows.iter().any(|r| r.title == "Newton"), "{rows:#?}");
+}
+
+/// The text under the agent header is the child's prompt (`task`). The
+/// conversation shows the short spawn title and leaves the prompt out.
+#[test]
+fn the_conversation_shows_the_spawn_title_and_not_the_agent_prompt() {
+    let mut s = state();
+    reduce(
+        &mut s,
+        Action::Runtime(spawn_with(
+            "a1",
+            "Euclid",
+            Some("摸清 GitCode 事件入口"),
+            "你是只读探查。目标仓库：/tmp/gitcode-npc\n1. HTTP 路由在哪里注册",
+        )),
+    );
+    reduce(
+        &mut s,
+        Action::Runtime(spawn_with(
+            "a2",
+            "Newton",
+            Some("摸清审查任务执行链"),
+            "你是只读探查。目标仓库：/tmp/gitcode-npc\n1. 一次任务在数据库里怎么表示",
+        )),
+    );
+
+    let text = s
+        .conversation_lines(120)
+        .iter()
+        .map(crate::selection::line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("摸清 GitCode 事件入口"), "{text}");
+    assert!(text.contains("摸清审查任务执行链"), "{text}");
+    assert!(
+        !text.contains("你是只读探查") && !text.contains("目标仓库") && !text.contains("HTTP 路由"),
+        "the agent prompt is not conversation text: {text}"
+    );
+}
+
+fn spawn_with(id: &str, nickname: &str, title: Option<&str>, prompt: &str) -> RuntimeEvent {
+    RuntimeEvent::SubAgentUpdated {
+        id: id.into(),
+        nickname: nickname.into(),
+        role: "explorer".into(),
+        title: title.map(str::to_string),
+        done: false,
+        ok: false,
+        detail: prompt.into(),
+        profile_id: None,
+        profile_role: Some("explorer".into()),
+        read_only: true,
+        agent: None,
+        contribution: None,
+        outcome: None,
+        stop: None,
+        limit: None,
+        background: Some(true),
+        scope: Vec::new(),
+    }
 }

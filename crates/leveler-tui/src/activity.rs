@@ -25,12 +25,16 @@ pub(crate) const MAX_STATUS_ROWS: usize = 4;
 pub enum ActivityId {
     Background(String),
     Child(String),
+    /// The roster's own overflow row. It opens the Team page rather than one
+    /// activity, so it carries no id.
+    Team,
 }
 
 impl ActivityId {
     pub fn as_key(&self) -> &str {
         match self {
             ActivityId::Background(id) | ActivityId::Child(id) => id,
+            ActivityId::Team => "team",
         }
     }
 }
@@ -580,6 +584,8 @@ pub(crate) fn open(state: &mut AppState, id: ActivityId) -> Vec<crate::action::E
             acknowledge_failure(state, &task_id);
             Vec::new()
         }
+        // The Team row opens the Team page; it never reaches this detail view.
+        ActivityId::Team => Vec::new(),
     }
 }
 

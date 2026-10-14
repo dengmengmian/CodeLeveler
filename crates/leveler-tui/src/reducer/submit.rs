@@ -28,7 +28,6 @@ pub(super) fn touch_slash_filter(state: &mut AppState) {
     state.slash_selected = 0;
     state.slash_popup_dismissed = false;
     crate::suggestion::dismiss(state);
-    crate::away_summary::cancel(state);
     if crate::screen::skill_mention_query(state).is_some() {
         refresh_skill_catalog(state);
     }

@@ -25,6 +25,10 @@ pub enum Screen {
     /// Enter on the input footer's background summary; Enter on a row opens its
     /// [`Screen::Activity`] detail, `x` stops the selected running task.
     ActivityList,
+    /// Every child agent of the current session, opened from the roster's
+    /// overflow row. Enter on a row opens its [`Screen::Activity`] detail.
+    /// Observational like the roster itself: nothing here cancels work.
+    Team,
     /// Full active plan, opened from the workbench's one-line plan summary.
     Plan,
     /// Full active objective, opened from the bounded header summary.
@@ -475,16 +479,6 @@ pub fn slash_commands_grouped(
         .collect()
 }
 
-pub fn category_label(cat: SlashCategory, t: &UiText) -> &'static str {
-    match cat {
-        SlashCategory::Agent => t.help_group_agent,
-        SlashCategory::View => t.help_group_view,
-        SlashCategory::Session => t.help_group_session,
-        SlashCategory::Input => t.help_group_input,
-        SlashCategory::System => t.help_group_system,
-    }
-}
-
 /// Whether `def` belongs in the `/` popup for this typed `prefix`.
 pub(crate) fn include_in_slash_popup(def: &SlashDef, prefix: &str) -> bool {
     match def.visibility {
@@ -607,11 +601,10 @@ pub fn visible_file_popup(state: &crate::state::AppState) -> Vec<&str> {
         return Vec::new();
     };
     let query = query.to_ascii_lowercase();
-    let source = if state.file_candidates.is_empty() {
-        &state.context_files
-    } else {
-        &state.file_candidates
-    };
+    // One source: the paths the composer asked the runtime for. The old
+    // compiler's candidate list was never filled, so the fallback it backed was
+    // a branch that could not be taken.
+    let source = &state.file_candidates;
     let mut matches: Vec<&str> = source
         .iter()
         .map(String::as_str)
@@ -1225,6 +1218,7 @@ mod reachability_tests {
             Screen::Shell => Some("`!command` — reducer/submit.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
             Screen::ActivityList => Some("Enter on the footer background summary — reducer/mod.rs"),
+            Screen::Team => Some("the roster's overflow row — reducer/mod.rs"),
             Screen::Plan => Some("Enter or click on the plan summary — reducer/mod.rs"),
             Screen::Goal => Some("Enter or click on the header goal — reducer/mod.rs"),
             Screen::Help => Some("Ctrl+? / `/help` — toggle_screen"),
@@ -1246,6 +1240,7 @@ mod reachability_tests {
             Screen::Shell,
             Screen::Activity,
             Screen::ActivityList,
+            Screen::Team,
             Screen::Plan,
             Screen::Goal,
             Screen::Help,
