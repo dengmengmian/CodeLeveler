@@ -1791,7 +1791,10 @@ mod tests {
                 .unwrap();
             let (_, top, _, _) = state.conv.rect.unwrap();
             if stage == "live" {
-                assert!(!rows.iter().any(|row| row.contains("reasoning line")));
+                assert!(
+                    rows.iter().any(|row| row.contains("reasoning line")),
+                    "a live Thought paints while the turn runs: {rows:#?}"
+                );
             } else if stage == "done" {
                 assert!(!rows.iter().any(|row| row.contains("reasoning line")));
             }

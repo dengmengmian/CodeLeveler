@@ -2245,12 +2245,12 @@ mod disclosure_tests {
             .map(crate::selection::line_to_plain)
             .collect();
         assert!(
-            !plain.contains("先看 catalog。"),
-            "reasoning renders: {plain}"
+            plain.contains("先看 catalog。"),
+            "live reasoning renders as it streams: {plain}"
         );
         assert!(
-            !plain.contains("再补测试。"),
-            "reasoning is footer-only: {plain}"
+            plain.contains("再补测试。"),
+            "one live block carries the whole stream, not one per delta: {plain}"
         );
 
         // The runtime reports the boundary: the Thought freezes with its own
@@ -2633,8 +2633,8 @@ mod disclosure_tests {
         );
         assert_eq!(s.conv.scroll, 5, "the pinned viewport must not move");
         assert_eq!(
-            s.conv.unread, 0,
-            "hidden reasoning creates no unread conversation rows"
+            s.conv.unread, 1,
+            "a live reasoning row is unread while the reader is scrolled up"
         );
     }
 

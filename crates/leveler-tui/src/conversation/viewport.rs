@@ -286,18 +286,18 @@ mod tests {
             .join("\n")
     }
 
-    /// Reasoning facts remain live while conversation geometry stays unchanged.
+    /// Live reasoning paints in the conversation; a settled one leaves no row.
     #[test]
-    fn live_reasoning_has_no_conversation_rows_or_rail() {
+    fn live_reasoning_paints_its_rows_and_rail() {
         let mut state = state_with_live_thought();
         assert!(state.transcript.is_thinking());
         for ms in [0, 750, 1499] {
             let buffer = paint(&mut state, ms);
             assert!(
-                rail_inks(&buffer).is_empty(),
-                "reasoning has no conversation rail"
+                !rail_inks(&buffer).is_empty(),
+                "live reasoning paints its own rail"
             );
-            assert!(!buffer_text(&buffer).contains("◆"));
+            assert!(buffer_text(&buffer).contains("◆"));
         }
     }
 
@@ -338,14 +338,14 @@ mod tests {
         }
     }
 
-    /// Animation settings do not restore hidden reasoning to the conversation.
+    /// Animation settings change the rail's motion, not the rows themselves.
     #[test]
-    fn reduced_motion_keeps_reasoning_footer_only() {
+    fn reduced_motion_keeps_the_painted_reasoning_still() {
         let mut state = state_with_live_thought();
         state.live_animation = false;
         let first = paint(&mut state, 0);
         let later = paint(&mut state, 1200);
-        assert!(rail_inks(&first).is_empty());
+        assert!(!rail_inks(&first).is_empty());
         assert_eq!(
             buffer_text(&first),
             buffer_text(&later),
@@ -420,7 +420,7 @@ mod tests {
             state.conv.scroll = scroll;
             let before = paint(&mut state, 0);
             let later = paint(&mut state, 750);
-            assert!(rail_inks(&later).is_empty());
+            assert!(!rail_inks(&later).is_empty());
             assert_eq!(buffer_text(&before), buffer_text(&later));
             assert_eq!(
                 state.conv.scroll, scroll,

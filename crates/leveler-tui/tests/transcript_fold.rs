@@ -346,16 +346,16 @@ fn exploration_receipt_mouse_and_ctrl_o_preserve_tools_without_reasoning_rows() 
 
 // ── THOUGHT-FOLD ─────────────────────────────────────────────────────────────
 
-/// Live reasoning updates its semantic fact without painting conversation rows.
+/// Live reasoning paints its own header and body while the model works.
 #[test]
-fn thought_fold_1_live_reasoning_is_kept_without_conversation_rows() {
+fn thought_fold_1_live_reasoning_paints_its_header_and_body() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先看工作区和近期变更。");
     assert_eq!(thoughts(&s)[0].text, "先看工作区和近期变更。");
     let text = text(&s);
-    assert!(!text.contains("思考中"), "{text}");
-    assert!(!text.contains("先看工作区和近期变更。"), "{text}");
+    assert!(text.contains("思考中"), "{text}");
+    assert!(text.contains("先看工作区和近期变更。"), "{text}");
 }
 
 /// THOUGHT-FOLD-2: `ReasoningCompleted` folds the body away on its own.
@@ -371,34 +371,48 @@ fn thought_fold_2_completion_auto_folds() {
 }
 
 #[test]
-fn multiline_reasoning_preserves_raw_text_without_display_rows() {
+fn multiline_reasoning_paints_while_live_and_leaves_no_row_when_settled() {
     let mut s = opened();
     reasoning_start(&mut s);
     let raw = "first\nsecond\nthird\nfourth\nfifth";
     reasoning(&mut s, raw);
     assert_eq!(thoughts(&s)[0].text, raw);
-    assert_eq!(lines(&s).len(), 1, "live reasoning adds no rows");
+    assert!(
+        lines(&s).len() > 1,
+        "a live Thought paints its header and its body: {:?}",
+        lines(&s)
+    );
+    let (_, live_hits) = build_conversation_lines_with_hits(&s, W);
+    assert!(live_hits.iter().any(|(_, item)| *item == thought_index(&s)));
     reasoning_done(&mut s, 16000);
     assert_eq!(thoughts(&s)[0].duration_ms, Some(16000));
-    assert_eq!(lines(&s).len(), 1, "completion adds no rows");
+    assert_eq!(lines(&s).len(), 1, "a settled Thought leaves no row");
     let (_, hits) = build_conversation_lines_with_hits(&s, W);
     assert!(!hits.iter().any(|(_, item)| *item == thought_index(&s)));
 }
 
 #[test]
-fn long_reasoning_stays_hidden_despite_stored_expansion() {
+fn long_reasoning_toggles_while_live_and_leaves_no_row_when_settled() {
     let mut s = opened();
     reasoning_start(&mut s);
     let raw = "long reasoning ".repeat(70);
     reasoning(&mut s, &raw);
-    let before = lines(&s);
+    let before = lines(&s).len();
     let item = thought_index(&s);
     toggle_fold(&mut s, item);
-    assert_eq!(lines(&s), before, "display choices cannot reveal reasoning");
+    assert_ne!(
+        lines(&s).len(),
+        before,
+        "a live Thought answers its own disclosure"
+    );
     reasoning_done(&mut s, 1000);
     assert_eq!(thoughts(&s)[0].display, DisplayMode::Expanded);
     assert_eq!(thoughts(&s)[0].text, raw);
-    assert_eq!(lines(&s), before);
+    assert_eq!(
+        lines(&s).len(),
+        1,
+        "a settled Thought leaves no row, whatever the stored display was"
+    );
 }
 
 #[test]
@@ -446,7 +460,7 @@ fn thought_completion_keeps_follow_tail_at_bottom() {
 }
 
 #[test]
-fn reasoning_is_hidden_at_narrow_cjk_widths() {
+fn reasoning_paints_within_narrow_cjk_widths() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, &"正在逐项核对配置与错误路径。".repeat(20));
@@ -456,11 +470,11 @@ fn reasoning_is_hidden_at_narrow_cjk_widths() {
     );
     for width in [4, 8, 20, 40] {
         let rows = build_conversation_lines_with_hits(&s, width).0;
-        assert_eq!(
+        assert!(
             rows.iter()
                 .filter(|line| line.spans.first().is_some_and(|span| span.content == "│ "))
-                .count(),
-            0
+                .count()
+                > 0
         );
         assert!(
             rows.iter()
@@ -974,7 +988,7 @@ fn completed_thought_disappears_without_a_disclosure_hit_or_blank_gap() {
     let mut s = opened();
     reasoning_start(&mut s);
     reasoning(&mut s, "先检查。 ");
-    assert!(!text(&s).contains("思考中"));
+    assert!(text(&s).contains("思考中"));
     reasoning_done(&mut s, 500);
     let hidden_item = thought_index(&s);
     let (painted, hits) = build_conversation_lines_with_hits(&s, W);
@@ -1187,8 +1201,8 @@ fn resume_fold_1_replayed_reasoning_facts_survive_without_display_rows() {
 
 // ── THOUGHT-LABEL ────────────────────────────────────────────────────────────
 //
-// Reasoning lifecycle, duration and interruption remain recorded facts, while
-// conversation headers and bodies stay absent in every lifecycle state.
+// Reasoning lifecycle, duration and interruption remain recorded facts.
+// A live segment paints its header and body. A settled segment leaves no row.
 
 /// Completed reasoning retains its duration but paints no header.
 #[test]
@@ -1206,13 +1220,13 @@ fn completed_reasoning_retains_duration_without_a_header() {
     assert!(!text.contains("已思考"), "{text}");
 }
 
-/// Streaming reasoning remains active without a conversation header.
+/// Streaming reasoning paints its header before the first body token arrives.
 #[test]
-fn live_reasoning_fact_has_no_conversation_header() {
+fn live_reasoning_fact_paints_its_conversation_header() {
     let mut s = opened();
     reasoning_start(&mut s);
     let text = text(&s);
-    assert!(!text.contains("◆ 思考中…"), "{text}");
+    assert!(text.contains("◆ 思考中…"), "{text}");
     assert!(s.transcript.is_thinking());
 }
 
