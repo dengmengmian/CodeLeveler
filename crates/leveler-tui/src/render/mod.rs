@@ -352,10 +352,7 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let marker = if on { "› " } else { "  " };
         let mut head = vec![
             Span::styled(marker, Style::default().fg(theme.accent.primary)),
-            Span::styled(
-                row.label.clone(),
-                Style::default().fg(theme.text.primary),
-            ),
+            Span::styled(row.label.clone(), Style::default().fg(theme.text.primary)),
         ];
         if let Some(meta) = row.meta.as_deref().filter(|m| !m.is_empty()) {
             head.push(Span::styled(
@@ -400,10 +397,7 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ));
         }
     }
-    frame.render_widget(
-        Paragraph::new(lines).scroll((offset as u16, 0)),
-        list_area,
-    );
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), list_area);
 
     // The inspector for the selected child. `inspector_rows` is the one reader
     // of a child's loaded contribution, and this page is where it belongs.

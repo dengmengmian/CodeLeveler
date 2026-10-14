@@ -6,8 +6,8 @@
 //! the rendered frame — not the internal field names.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 use leveler_client_protocol::{
     AnswerEffect, ClientCommand, MessageId, PermissionProfile, RuntimeEvent, RuntimeStatus,
@@ -606,11 +606,12 @@ fn recap_requires_nonempty_structured_content_and_a_successful_terminal_goal() {
     ] {
         let mut s = opened();
         goal_turn_with_args(&mut s, args, ok);
-        assert!(!s
-            .transcript
-            .items()
-            .iter()
-            .any(|item| matches!(item, TranscriptItem::Recap(_))));
+        assert!(
+            !s.transcript
+                .items()
+                .iter()
+                .any(|item| matches!(item, TranscriptItem::Recap(_)))
+        );
         assert_eq!(s.prompt_suggestion, None);
         let text = frame(&mut s, 100, 24);
         assert!(!text.contains("回顾:"), "{text}");
@@ -1381,11 +1382,12 @@ fn acceptance_ghost_frame_then_accepted_frame_then_one_send() {
     // Enter here sends nothing.
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "frame A Enter sent: {effects:?}");
-    assert!(s
-        .transcript
-        .items()
-        .iter()
-        .all(|item| !matches!(item, TranscriptItem::User(_))));
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .all(|item| !matches!(item, TranscriptItem::User(_)))
+    );
 
     // Tab.
     let effects = reduce(&mut s, key(KeyCode::Tab));

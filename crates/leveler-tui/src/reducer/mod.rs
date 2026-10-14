@@ -24,7 +24,9 @@ mod submit;
 
 use overlay_keys::{handle_overlay_key, open_model_picker};
 use runtime_apply::apply_runtime;
-use screen_nav::{handle_screen_key, open_diff_screen, open_sessions_screen, open_team, toggle_screen};
+use screen_nav::{
+    handle_screen_key, open_diff_screen, open_sessions_screen, open_team, toggle_screen,
+};
 use submit::{
     complete_file_mention, complete_skill_mention, complete_slash, drain_pending_input,
     request_file_candidates, submit, touch_slash_filter,
@@ -211,10 +213,7 @@ fn reduce_action(state: &mut AppState, action: Action) -> Vec<Effect> {
                             | crate::transcript::TurnEndStatus::Answered
                     )
                 });
-            if successful_turn
-                && state.composer.is_empty()
-                && state.prompt_suggestion.is_none()
-            {
+            if successful_turn && state.composer.is_empty() && state.prompt_suggestion.is_none() {
                 effects.push(Effect::Send(ClientCommand::RequestPromptSuggestion {
                     session_id: state.session_id.clone(),
                 }));

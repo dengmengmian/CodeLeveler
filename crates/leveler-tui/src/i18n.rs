@@ -859,7 +859,7 @@ pub struct UiText {
     // The fold marker states the count and nothing else. The folded row is
     // itself clickable, so it does not advertise a key: the shortcut table
     // already lists Ctrl+O, and repeating it on every folded row is noise.
-    pub fold_more_lines: &'static str, // "… 还有 {} 行"
+    pub fold_more_lines: &'static str,       // "… 还有 {} 行"
     pub fold_more_lines_short: &'static str, // "(+{} 行)"
 
     // Tool detail labels

@@ -717,8 +717,7 @@ mod auxiliary_assist_tests {
     fn suggestion_and_recap_keep_separate_slots() {
         let assists = AuxiliaryAssists::default();
         let session = SessionId::new("s");
-        let (suggestion, suggestion_token) =
-            assists.begin(&session, AssistKind::PromptSuggestion);
+        let (suggestion, suggestion_token) = assists.begin(&session, AssistKind::PromptSuggestion);
         let (recap, recap_token) = assists.begin(&session, AssistKind::AwaySummary);
 
         assert!(assists.is_current(&session, AssistKind::PromptSuggestion, suggestion));
@@ -729,11 +728,7 @@ mod auxiliary_assist_tests {
         assists.cancel(&session);
         assert!(suggestion_token.is_cancelled());
         assert!(recap_token.is_cancelled());
-        assert!(!assists.is_current(
-            &session,
-            AssistKind::PromptSuggestion,
-            suggestion
-        ));
+        assert!(!assists.is_current(&session, AssistKind::PromptSuggestion, suggestion));
     }
 }
 

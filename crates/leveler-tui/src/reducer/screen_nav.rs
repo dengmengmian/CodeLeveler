@@ -422,11 +422,7 @@ pub(super) fn open_goal_screen(state: &mut AppState) {
 /// Open the Team page with the first child selected, so Enter has a subject.
 pub(super) fn open_team(state: &mut AppState) -> Vec<Effect> {
     state.active_screen = crate::screen::Screen::Team;
-    state.team_selected = state
-        .team
-        .children
-        .first()
-        .map(|child| child.id.clone());
+    state.team_selected = state.team.children.first().map(|child| child.id.clone());
     Vec::new()
 }
 
