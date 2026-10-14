@@ -643,7 +643,11 @@ fn render_team_panel(
         } else {
             "├─"
         };
-        let label = if narrow { &row.narrow_label } else { &row.label };
+        let label = if narrow {
+            &row.narrow_label
+        } else {
+            &row.label
+        };
         let head = format!("  {branch} {label} · ");
         let head_w = UnicodeWidthStr::width(head.as_str());
         let cap = if meta_col > 0 {
@@ -3142,7 +3146,9 @@ mod tests {
         assert!(
             effects.iter().all(|e| !matches!(
                 e,
-                crate::action::Effect::Send(leveler_client_protocol::ClientCommand::CancelChild { .. })
+                crate::action::Effect::Send(
+                    leveler_client_protocol::ClientCommand::CancelChild { .. }
+                )
             )),
             "opening a detail never cancels the child: {effects:?}"
         );

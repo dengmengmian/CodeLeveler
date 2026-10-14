@@ -4096,7 +4096,10 @@ fn the_retired_context_updated_event_is_ignored() {
             estimated_tokens: 5200,
         }),
     );
-    assert_eq!(s.context_tokens, 700, "an old event must not move the gauge");
+    assert_eq!(
+        s.context_tokens, 700,
+        "an old event must not move the gauge"
+    );
     assert!(
         s.file_candidates.is_empty(),
         "and it does not fill the mention list"

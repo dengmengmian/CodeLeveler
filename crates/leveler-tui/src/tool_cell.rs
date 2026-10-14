@@ -1225,10 +1225,13 @@ fn push_edit_diff_body(
     let inner = width.saturating_sub(4 + gutter_w + mark_w).max(12);
 
     let visible: Vec<FoldedEditRow> = match &folded {
-        Some(view) => view.iter().map(|r| match r {
-            FoldedEditRow::Row(i) => FoldedEditRow::Row(*i),
-            FoldedEditRow::Hidden(n) => FoldedEditRow::Hidden(*n),
-        }).collect(),
+        Some(view) => view
+            .iter()
+            .map(|r| match r {
+                FoldedEditRow::Row(i) => FoldedEditRow::Row(*i),
+                FoldedEditRow::Hidden(n) => FoldedEditRow::Hidden(*n),
+            })
+            .collect(),
         None => (0..rows.len()).map(FoldedEditRow::Row).collect(),
     };
     for (position, entry) in visible.iter().enumerate() {
@@ -1496,8 +1499,15 @@ mod m1_tests {
 
     fn diff_text(patch: &str, width: usize, expanded: bool) -> String {
         let mut out = Vec::new();
-        push_edit_diff_body(patch, &Theme::no_color(), width, &mut out, true, expanded,
-            &crate::i18n::Locale::En.text());
+        push_edit_diff_body(
+            patch,
+            &Theme::no_color(),
+            width,
+            &mut out,
+            true,
+            expanded,
+            crate::i18n::Locale::En.text(),
+        );
         out.iter()
             .map(|line| {
                 line.spans
@@ -1633,7 +1643,10 @@ mod m1_tests {
             folded.len() < expanded.len(),
             "the collapse must actually collapse:\n{folded}"
         );
-        assert!(!folded.contains("line 20"), "the middle is folded: {folded}");
+        assert!(
+            !folded.contains("line 20"),
+            "the middle is folded: {folded}"
+        );
         let column = |text: &str| {
             text.lines()
                 .find(|l| l.contains('│'))
@@ -1799,8 +1812,14 @@ mod m1_tests {
             Some("--- a/a.rs\n+++ b/a.rs\n@@ -200,1 +200,1 @@\n-two\n+2\n"),
         );
         let mut out = Vec::new();
-        merged_diff_rows(&[&a, &b], &Theme::no_color(), 90, &mut out, false,
-            &crate::i18n::Locale::En.text());
+        merged_diff_rows(
+            &[&a, &b],
+            &Theme::no_color(),
+            90,
+            &mut out,
+            false,
+            crate::i18n::Locale::En.text(),
+        );
         let text: String = out
             .iter()
             .map(|l| {
@@ -1836,7 +1855,7 @@ mod m1_tests {
             &mut out,
             true,
             true,
-            &crate::i18n::Locale::En.text(),
+            crate::i18n::Locale::En.text(),
         );
         let text: String = out
             .iter()
@@ -1931,7 +1950,10 @@ mod m1_tests {
         let patch = wide_applied_diff(500);
         let text = diff_text(&patch, 90, false);
         assert!(text.contains("let line_0 = 0;"), "the head is kept: {text}");
-        assert!(text.contains("let line_499 = 499;"), "the tail is kept: {text}");
+        assert!(
+            text.contains("let line_499 = 499;"),
+            "the tail is kept: {text}"
+        );
         assert!(
             text.contains("more lines"),
             "a summarized diff says how much it hides: {text}"

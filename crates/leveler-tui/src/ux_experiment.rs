@@ -668,8 +668,7 @@ fn expected_change_rows(state: &AppState, width: usize) -> usize {
         })
         .collect();
     let mut out = Vec::new();
-    crate::tool_cell::merged_diff_rows(&calls, &state.theme, width, &mut out, true,
-        &state.t());
+    crate::tool_cell::merged_diff_rows(&calls, &state.theme, width, &mut out, true, state.t());
     out.iter()
         .map(line_plain)
         .filter(|t| is_diff_change_row(t))

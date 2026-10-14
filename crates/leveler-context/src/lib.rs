@@ -20,10 +20,10 @@ pub use compaction::{
 };
 pub use guard::{ContentFingerprint, FileStateTracker};
 pub use repo_map::RepositoryMap;
-pub use symbols::{defines, extract_symbols};
 pub use rules::{
     MAX_RULE_BYTES, ProjectInstruction, READ_PROJECT_RULES_TOOL, RuleDelivery, RuleDeliveryPolicy,
     RuleSection, deliver_document, deliver_sections, deliver_sections_with_policy, load_rules,
     load_rules_for_delivery, load_rules_for_paths, load_scoped_rules, render_instructions,
     render_instructions_with, split_rule_sections,
 };
+pub use symbols::{defines, extract_symbols};

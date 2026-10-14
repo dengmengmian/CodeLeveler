@@ -1038,7 +1038,8 @@ mod tests {
             !memoizable_item(&TranscriptItem::ToolGroup(group(&s)), &s),
             "a running group reads the live clock"
         );
-        s.transcript.complete_tool(&id, true, "read".into(), 5, None);
+        s.transcript
+            .complete_tool(&id, true, "read".into(), 5, None);
         assert!(
             !memoizable_item(&TranscriptItem::ToolGroup(group(&s)), &s),
             "a group still taking calls is not settled"
