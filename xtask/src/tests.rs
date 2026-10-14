@@ -719,7 +719,10 @@ fn dogfood_reads_baseline_file_and_stops_when_sha_changes() {
         arg_after(&release[0], "--codeleveler-sha").as_deref(),
         Some(SHA_A)
     );
-    assert!(!release[0].args.iter().any(|arg| arg == "--force"));
+    // The dogfood stage is started with `--force` on purpose: its own L0-L2 run
+    // is what pushes the host's load past the busy threshold, so the preflight
+    // cannot be allowed to block the stage it follows.
+    assert!(release[0].args.iter().any(|arg| arg == "--force"));
     assert!(
         host.log()
             .iter()
