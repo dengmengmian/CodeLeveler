@@ -364,10 +364,15 @@ fn token_usage_updates_context_gauge() {
             reasoning_tokens: None,
         }),
     );
-    // Window in use = input + output; latest round replaces, not accumulates.
-    assert_eq!(s.context_tokens, 1500);
+    // These describe the request that just finished: the `↑`/`↓` chips. The
+    // window gauge answers a different question (how full is the NEXT request)
+    // and takes its number from the runtime's own accounting, never from here.
     assert_eq!(s.token_input, 1200);
     assert_eq!(s.token_output, 300);
+    assert_eq!(
+        s.context_tokens, 0,
+        "a finished request's usage is not the window gauge"
+    );
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::TokenUsage {
@@ -377,9 +382,12 @@ fn token_usage_updates_context_gauge() {
             reasoning_tokens: None,
         }),
     );
-    assert_eq!(s.context_tokens, 2500);
     assert_eq!(s.token_input, 2000);
     assert_eq!(s.token_output, 500);
+    assert_eq!(
+        s.context_tokens, 0,
+        "the gauge stays the runtime's to report"
+    );
 }
 
 #[test]
@@ -1340,21 +1348,28 @@ fn zero_token_usage_does_not_wipe_gauge() {
             reasoning_tokens: None,
         }),
     );
-    assert_eq!(s.context_tokens, 120);
+    // A zero report is still a report: the chips take it. The gauge is not a
+    // third consumer of these numbers, so it never held a reading to wipe.
     assert_eq!(s.token_input, 100);
+    assert_eq!(s.context_tokens, 0);
 }
 
+/// A turn end with no reported usage leaves the gauge empty rather than filling
+/// it from the visible transcript. That transcript is not a projection of the
+/// next request (no control context, no tool schema, tool results reduced to
+/// previews), so an estimate from it would look authoritative while understating
+/// real compaction pressure. The chip is hidden until a snapshot exists.
 #[test]
-fn turn_end_estimates_context_when_provider_reports_no_usage() {
+fn turn_end_without_usage_leaves_the_window_gauge_empty() {
     let mut s = opened();
     s.transcript
         .push_user("你好，这是一段用于估算上下文的测试文本。".into());
     s.context_window_tokens = 1_000_000;
     assert_eq!(s.context_tokens, 0);
     reduce(&mut s, Action::Runtime(RuntimeEvent::TurnAnswered));
-    assert!(
-        s.context_tokens > 0,
-        "finish without TokenUsage must still estimate from transcript"
+    assert_eq!(
+        s.context_tokens, 0,
+        "no reported usage means no gauge reading"
     );
 }
 

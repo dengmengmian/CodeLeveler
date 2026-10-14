@@ -184,11 +184,16 @@ fn renders_welcome_header_and_composer_at_standard_sizes() {
 #[test]
 fn context_chip_appears_on_footer_after_usage_update() {
     let mut state = opened_state();
+    // The chip's numerator is a real reading: with no runtime snapshot the
+    // model-window axis shows the provider's own reported prompt. The retired
+    // `ContextUpdated` event no longer fills anything.
     reduce(
         &mut state,
-        Action::Runtime(RuntimeEvent::ContextUpdated {
-            estimated_tokens: 24_000,
-            candidate_files: Vec::new(),
+        Action::Runtime(RuntimeEvent::TokenUsage {
+            input_tokens: 24_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            reasoning_tokens: None,
         }),
     );
 
