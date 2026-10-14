@@ -843,8 +843,19 @@ fn render_cacheable_unit(
             hits.push((0, 0));
             out.extend(item_render(item, theme, width, state.tools_expanded, t));
         }
-        // Reasoning remains in the semantic transcript; only the status bar presents it.
-        TranscriptItem::Thought(_) => {}
+        TranscriptItem::Thought(block) => {
+            // A live Thought is the reasoning arriving: it paints in place at the
+            // tail while the model works. Once it settles it leaves no
+            // conversation row — the transcript keeps it, the conversation does
+            // not, so a finished turn reads as its work and its answer.
+            if !block.done {
+                let lines = item_render(item, theme, width, state.tools_expanded, t);
+                if !lines.is_empty() && !block.text.trim().is_empty() {
+                    hits.push((0, 0));
+                }
+                out.extend(lines);
+            }
+        }
         TranscriptItem::Failure(_) => {
             hits.push((0, 0));
             out.extend(item_render(item, theme, width, state.tools_expanded, t));
@@ -1476,7 +1487,7 @@ mod exploration_fold_tests {
     }
 
     #[test]
-    fn fixed_contract_single_live_tool_is_collapsed_and_thought_never_paints() {
+    fn fixed_contract_single_live_tool_is_collapsed_and_the_live_thought_paints() {
         let mut s = boot();
         s.transcript.push_tool_started(
             ToolCallId::new("live"),
@@ -1491,10 +1502,10 @@ mod exploration_fold_tests {
         let rows = render(&s);
         assert_eq!(receipts(&rows).len(), 1, "{rows:#?}");
         assert!(
-            !rows
-                .iter()
-                .any(|r| r.contains("hidden.rs") || r.contains("hidden live reasoning"))
+            rows.iter().any(|r| r.contains("hidden live reasoning")),
+            "a live Thought paints its body beside the receipt: {rows:#?}"
         );
+        assert!(!rows.iter().any(|r| r.contains("hidden.rs")));
         assert!(rows.iter().any(|r| r.contains("正在执行")));
     }
 
@@ -1805,16 +1816,20 @@ mod exploration_fold_tests {
     }
 
     #[test]
-    fn live_thought_updates_then_leaves_no_history_rows_or_hits() {
+    fn live_thought_paints_then_leaves_no_history_row_when_it_settles() {
         let mut s = boot();
         thought(&mut s, "first reasoning");
         s.transcript.append_thought("live reasoning continues");
+        let rows = render(&s);
         assert!(
-            !render(&s)
-                .iter()
-                .any(|r| r.contains("reasoning") || r.contains("思考"))
+            rows.iter().any(|r| r.contains("live reasoning continues")),
+            "a live Thought paints its body: {rows:#?}"
         );
-        assert!(s.conversation_lines_and_hits(80).1.is_empty());
+        assert!(
+            rows.iter().any(|r| r.contains("思考")),
+            "and its own header: {rows:#?}"
+        );
+        assert_eq!(s.conversation_lines_and_hits(80).1.len(), 1);
         s.transcript.finish_thought(Some(900));
         assert_eq!(s.transcript.items().len(), 3);
         for item in 1..3 {
@@ -1822,7 +1837,15 @@ mod exploration_fold_tests {
             assert_eq!(start, end);
         }
         s.transcript.append_thought("next reasoning");
-        assert!(!render(&s).iter().any(|r| r.contains("reasoning")));
+        let rows = render(&s);
+        assert!(
+            !rows.iter().any(|r| r.contains("live reasoning continues")),
+            "a settled Thought leaves no row: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("next reasoning")),
+            "the next live Thought paints: {rows:#?}"
+        );
         assert!(s.transcript.items().iter().any(
             |it| matches!(it, TranscriptItem::Thought(b) if !b.done && b.text == "next reasoning")
         ));

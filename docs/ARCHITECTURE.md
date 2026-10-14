@@ -1402,16 +1402,18 @@ verified by deterministic tests and real dogfood — do not regress them:
   Folding cannot portray running, cancelling, cancelled or unknown work as complete;
   headers still report real state. Later events do not arbitrarily override a
   reader's explicit disclosure choice.
-- **Thoughts appear only in the status strip**: the Conversation shows no live or
-  completed Thought header, body, duration or disclosure. Opening a tool group or
-  pressing Ctrl+O never restores them. The status strip reports the real streaming
-  fact and clears it at completion. Raw reasoning text, duration, events, persistence
-  and provider replay remain unchanged; narration deduplication cannot delete
-  reasoning or repeat reasoning already emitted by the stream.
+- **A live Thought paints beside the work; a settled Thought leaves**: while
+  reasoning is arriving, the Conversation shows `◆ Thinking…` and the streaming
+  body on its own rail, as its own row. That row is not a member of the process
+  receipt. When the segment settles, the row leaves; opening the receipt or
+  pressing Ctrl+O does not restore it. The status strip still reports the real
+  streaming fact and clears it at completion. Raw reasoning text, duration, events,
+  persistence and provider replay remain unchanged; narration deduplication cannot
+  delete reasoning or repeat reasoning already emitted by the stream.
 - **Process receipts accumulate within visible stages**: consecutive ordinary tools
   (Read / Search / List / Run / MCP) in one segment accumulate in a receipt that
-  starts closed, including a lone tool. Neither `round` nor a hidden Thought is a
-  boundary. User messages, assistant progress prose, the Final and separately
+  starts closed, including a lone tool. Neither a model round nor a Thought is a
+  receipt boundary. User messages, assistant progress prose, the Final and separately
   displayed edits, permission/user decisions and plan/goal management entries
   delimit real visible stages; the view never guesses or generates a stage.
   Receipts are view-time folds; original tool and reasoning records remain intact.

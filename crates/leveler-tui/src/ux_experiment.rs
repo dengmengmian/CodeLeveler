@@ -859,14 +859,14 @@ mod tests {
             "the status strip reports streaming: {live}"
         );
         assert!(
-            !live.contains("◆ 思考中") && !live.contains("private fixture reasoning"),
-            "{live}"
+            live.contains("◆ 思考中") && live.contains("private fixture reasoning"),
+            "a live Thought paints its header and body: {live}"
         );
         write_dump("thinking-default-live", &live);
         reasoning(&mut state, " continues", None);
         let updated = visible_window(&mut state, 80, 24);
-        assert!(!updated.contains("private fixture reasoning continues"));
-        assert_eq!(updated.matches("◆ 思考中").count(), 0);
+        assert!(updated.contains("private fixture reasoning continues"));
+        assert_eq!(updated.matches("◆ 思考中").count(), 1);
         write_dump("thinking-default-updated", &updated);
         reasoning(&mut state, "", Some(400));
         read(&mut state, "r", "README.md", 33);
