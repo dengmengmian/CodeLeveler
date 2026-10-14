@@ -311,6 +311,13 @@ fn release_cmd(lab: &Lab, sha: &str, baseline: &str, layers: Option<&str>) -> Co
         args.push("--layers".to_string());
         args.push(layers.to_string());
     }
+    // The machine-busy preflight exists so a loaded HOST cannot be read as a
+    // product failure (`MACHINE_BUSY` is NOT_STARTED, never FAIL). Passing it
+    // here would make the check unusable in its own pipeline: the L0-L2 run
+    // that precedes dogfood is itself what pushes the one-minute average past
+    // 90% of the CPU count, so without this the dogfood stage could never start
+    // on a machine that had just finished its own pre-release.
+    args.push("--force".to_string());
     CommandSpec::new("python3", args, &lab.root).env("DOGFOOD_ROOT", lab.root.display().to_string())
 }
 
