@@ -261,17 +261,119 @@ pub fn repo_from_url(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-/// The HTTP client used for releases and downloads.
+/// The HTTP client used to fetch a release ASSET.
+///
+/// `.timeout()` in reqwest budgets the WHOLE request including the body, so a
+/// metadata-sized 60 s limit truncated real downloads: a ~20 MB tarball on a
+/// slow link died partway with "error decoding response body". An asset is a
+/// large, already-validated transfer, so it gets a budget measured in minutes —
+/// while `read_timeout` still fails fast when the stream genuinely stalls, so a
+/// hung connection cannot hold the updater forever.
+pub fn download_client() -> Result<reqwest::Client, UpdateError> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(format!("leveler/{}", crate::version::current_version()))
+        .timeout(std::time::Duration::from_secs(20 * 60))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15));
+    let builder = apply_auth_and_proxy(builder)?;
+    builder
+        .build()
+        .map_err(|e| UpdateError::Network(e.to_string()))
+}
+
+/// Mirror prefixes tried after the direct URL, in order.
+///
+/// `LEVELER_UPDATE_MIRRORS` is a comma-separated list of prefixes (a GitHub
+/// proxy such as `https://ghproxy.example/`), and the canonical asset URL is
+/// appended to each. Empty entries are ignored, so a trailing comma is safe.
+/// The direct URL is always tried first.
+pub fn mirror_prefixes() -> Vec<String> {
+    let Ok(raw) = std::env::var("LEVELER_UPDATE_MIRRORS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| if p.ends_with('/') { p.to_string() } else { format!("{p}/") })
+        .collect()
+}
+
+/// Every URL to try for `direct`, in order: the canonical one, then mirrors.
+///
+/// `asset_name` lets a host with a different directory layout offer the same
+/// artifact through [`asset_bases`]; the GitHub URL is still tried first.
+pub fn download_candidates(direct: &str, asset_name: &str) -> Vec<String> {
+    candidate_urls_with(direct, &mirror_prefixes(), &asset_bases(), asset_name)
+}
+
+/// The ordering rule with both mirror kinds passed in, for tests.
+///
+/// Prefix mirrors take the whole canonical URL; asset bases take only the file
+/// name, for a host whose directory layout differs from GitHub's.
+pub fn candidate_urls_with(
+    direct: &str,
+    mirrors: &[String],
+    bases: &[String],
+    asset_name: &str,
+) -> Vec<String> {
+    let mut urls = vec![direct.to_string()];
+    urls.extend(mirrors.iter().map(|p| format!("{p}{direct}")));
+    urls.extend(bases.iter().map(|base| format!("{base}{asset_name}")));
+    urls
+}
+
+/// Hosts that hold our artifacts under their own layout.
+///
+/// `LEVELER_UPDATE_ASSET_BASE` is a comma-separated list of directories that
+/// take the bare asset file name (optionally with `{version}` substituted), for
+/// a mirror whose paths do not match GitHub's — AtomGit, for example:
+///
+/// ```text
+/// LEVELER_UPDATE_ASSET_BASE=https://atomgit.com/o/r/releases/download/v{version}/
+/// ```
+///
+/// A mirror only ever ADDS a candidate: the canonical URL is still tried first,
+/// and the checksum is what decides whether what arrived is authentic.
+pub fn asset_bases() -> Vec<String> {
+    let Ok(raw) = std::env::var("LEVELER_UPDATE_ASSET_BASE") else {
+        return Vec::new();
+    };
+    let version = crate::version::current_version().to_string();
+    raw.split(',')
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            let b = b.replace("{version}", &version);
+            if b.ends_with('/') { b } else { format!("{b}/") }
+        })
+        .collect()
+}
+
+/// The HTTP client used for release METADATA.
 ///
 /// Reuses the process proxy settings (reqwest reads `HTTPS_PROXY` etc.) and
 /// sets a finite timeout: a startup check must never hang the product.
+///
+/// Downloads do NOT use this budget — see [`download_client`].
 pub fn http_client() -> Result<reqwest::Client, UpdateError> {
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("leveler/{}", crate::version::current_version()))
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(15));
 
-    // Optional token raises the unauthenticated rate limit. Never required.
+    let builder = apply_auth_and_proxy(builder)?;
+    builder
+        .build()
+        .map_err(|e| UpdateError::Network(format!("build HTTP client: {e}")))
+}
+
+/// The optional authentication shared by both clients.
+///
+/// A token raises the unauthenticated rate limit; it is never required, and a
+/// malformed value is a validation error rather than a silent downgrade.
+fn apply_auth_and_proxy(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::ClientBuilder, UpdateError> {
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
         && !token.is_empty()
     {
@@ -287,12 +389,71 @@ pub fn http_client() -> Result<reqwest::Client, UpdateError> {
                 .parse()
                 .expect("static header"),
         );
-        builder = builder.default_headers(headers);
+        return Ok(builder.default_headers(headers));
+    }
+    Ok(builder)
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::{candidate_urls_with, mirror_prefixes};
+
+    /// The canonical URL is always first: a mirror is a rescue, not a replacement.
+    #[test]
+    fn the_canonical_url_comes_first_and_mirrors_follow() {
+        let mirrors = vec!["https://ghproxy.example/".to_string()];
+        assert_eq!(
+            candidate_urls_with(
+                "https://github.com/o/r/releases/download/v1/a.tgz",
+                &mirrors,
+                &[],
+                "a.tgz",
+            ),
+            vec![
+                "https://github.com/o/r/releases/download/v1/a.tgz".to_string(),
+                "https://ghproxy.example/https://github.com/o/r/releases/download/v1/a.tgz".to_string(),
+            ]
+        );
     }
 
-    builder
-        .build()
-        .map_err(|e| UpdateError::Network(format!("build HTTP client: {e}")))
+    /// An asset base adds a candidate that takes the bare file name, so a host
+    /// whose directory layout differs from GitHub can still serve the artifact.
+    #[test]
+    fn asset_bases_are_appended_after_the_canonical_url() {
+        let bases = vec!["https://atomgit.com/o/r/releases/download/v1/".to_string()];
+        let urls = candidate_urls_with(
+            "https://github.com/o/r/releases/download/v1/a.tgz",
+            &[],
+            &bases,
+            "a.tgz",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/r/releases/download/v1/a.tgz".to_string(),
+                "https://atomgit.com/o/r/releases/download/v1/a.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_mirrors_means_exactly_one_candidate() {
+        let urls = candidate_urls_with("https://example.com/a.tgz", &[], &[], "a.tgz");
+        assert_eq!(urls, vec!["https://example.com/a.tgz".to_string()]);
+    }
+
+    /// Empty entries (a trailing comma, blank lines) are not candidates.
+    #[test]
+    fn mirror_prefixes_ignore_blank_entries_and_normalise_slashes() {
+        // SAFETY: a single-threaded test process for this variable.
+        unsafe { std::env::set_var("LEVELER_UPDATE_MIRRORS", " https://a.example , ,https://b.example/ ") };
+        let prefixes = mirror_prefixes();
+        unsafe { std::env::remove_var("LEVELER_UPDATE_MIRRORS") };
+        assert_eq!(
+            prefixes,
+            vec!["https://a.example/".to_string(), "https://b.example/".to_string()]
+        );
+    }
 }
 
 #[cfg(test)]

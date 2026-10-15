@@ -14,6 +14,29 @@ use crate::error::UpdateError;
 use crate::target::{archive_extension, binary_name};
 use crate::version::Version;
 
+/// Try each candidate URL in order, returning the first body that arrives.
+///
+/// A mirror exists to rescue a transfer, not to be trusted: every returned body
+/// still has to pass the caller's checksum, so a mirror that serves something
+/// wrong fails verification rather than being installed. The failing URL's own
+/// error is reported only when every candidate fails.
+pub async fn download_candidates(
+    client: &reqwest::Client,
+    urls: &[String],
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, UpdateError> {
+    let mut last: Option<UpdateError> = None;
+    for url in urls {
+        match download(client, url, &mut on_progress).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        UpdateError::Validation("no download source was configured".into())
+    }))
+}
+
 /// Stream a URL, reporting `(received_bytes, total_bytes)` as it arrives.
 pub async fn download(
     client: &reqwest::Client,
