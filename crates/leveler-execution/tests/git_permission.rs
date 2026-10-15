@@ -73,7 +73,6 @@ fn a_git_verdict_never_masks_the_rest_of_the_call() {
         "git status; open /tmp/file",
         "git status; rm -rf /tmp/other",
         "git fetch origin && sudo true",
-        "git status; git clean $FLAGS",
         "git status; git fetch $REMOTE",
         "git status > /etc/git-status",
     ] {
@@ -84,11 +83,15 @@ fn a_git_verdict_never_masks_the_rest_of_the_call() {
         );
     }
 
-    // The converse: a gated Git command is not laundered by harmless siblings.
-    assert_eq!(
-        classify("sh", &["-c", "ls && git push origin main"]),
-        CommandClass::Dangerous
-    );
+    // An unreadable Git flag and a push are Git operations. They do not ask
+    // just because another safe command shares the script.
+    for script in ["git status; git clean $FLAGS", "ls && git push origin main"] {
+        assert_eq!(
+            classify("sh", &["-c", script]),
+            CommandClass::Safe,
+            "{script}"
+        );
+    }
 
     // And an all-harmless script stays harmless.
     for script in [
@@ -327,7 +330,14 @@ fn fetch_is_granted_by_effect_while_mutations_are_gated() {
 
     // Local history recording writes metadata and changes neither the
     // checkout's state nor a remote, so it rides the same decision as a fetch.
-    for args in [vec!["add", "-A"], vec!["commit", "-m", "x"]] {
+    // Ordinary branch checkout and merge are the same class: reversible.
+    for args in [
+        vec!["add", "-A"],
+        vec!["commit", "-m", "x"],
+        vec!["merge", "origin/main"],
+        vec!["checkout", "main"],
+        vec!["switch", "-c", "feat"],
+    ] {
         let (granted, gated, caps) = caps("git", &args);
         assert!(granted, "git {args:?} writes metadata: {caps:?}");
         assert!(!gated, "git {args:?} must not prompt: {caps:?}");
@@ -336,13 +346,12 @@ fn fetch_is_granted_by_effect_while_mutations_are_gated() {
     // Workspace mutation is a different permission from a sync.
     for args in [
         vec!["pull"],
-        vec!["merge", "origin/main"],
         vec!["rebase", "main"],
-        vec!["checkout", "main"],
-        vec!["switch", "-c", "feat"],
         vec!["stash"],
         vec!["stash", "pop"],
         vec!["clone", "https://example.com/x.git"],
+        vec!["checkout", "--", "."],
+        vec!["switch", "--force", "main"],
     ] {
         let (_, gated, _) = caps("git", &args);
         assert!(gated, "git {args:?} must be asked for");
@@ -553,18 +562,20 @@ fn push_never_rides_on_the_fetch_decision() {
     );
 }
 
-/// P0-1: a remote Git transfer laundered through a shell wrapper cannot be bound
-/// to an approved remote and credential, so it keeps exact-call approval under
-/// Assisted instead of inheriting the direct `git fetch` auto-run. Full still
-/// never asks.
+/// Shell-wrapped Git is the same decision as the direct command. A stored
+/// credential still asks at grant resolution, which this policy layer does
+/// not see.
 #[test]
-fn assisted_asks_for_a_wrapper_remote_git_transfer() {
+fn assisted_treats_wrapper_git_as_the_direct_command() {
     use leveler_execution::{ApprovalPolicy, PermissionProfile, Requirement, RiskLevel};
     let policy = ApprovalPolicy::default();
     for script in [
         "git fetch origin",
         "git ls-remote origin",
         "git status && git fetch origin",
+        "git fetch origin && echo extra",
+        "git fetch https://unknown.example/repo.git",
+        "git push origin main",
     ] {
         let args = vec!["-c".to_string(), script.to_string()];
         let view = CommandView {
@@ -578,8 +589,8 @@ fn assisted_asks_for_a_wrapper_remote_git_transfer() {
                 RiskLevel::WorkspaceWrite,
                 Some(view),
             ),
-            Requirement::NeedApproval,
-            "Assisted must ask: {script}"
+            Requirement::Auto,
+            "Assisted must allow: {script}"
         );
         assert_eq!(
             policy.evaluate(

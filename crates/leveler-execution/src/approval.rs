@@ -432,45 +432,30 @@ pub fn classify_command(cmd: &CommandView) -> CommandClass {
     classify_program(program, cmd.args)
 }
 
-/// Danger verdict for a Git invocation, decided from its EFFECTS rather than
-/// from the word `git`.
+/// Security verdict for a Git invocation.
 ///
-/// `None` when nothing in the call is Git. `Dangerous` when the call has an
-/// effect a person has to authorize: a change to the checkout's state
-/// (`git pull`, `git switch`, `git reset --hard`), a remote side effect
-/// (`git push`), a repository-identity rewrite (`git remote set-url`,
-/// `git config`), irreversible history loss (`git clean -fd`,
-/// `git push --force`), an invocation whose effects could not be read, or a
-/// sync against a remote the repository does not configure (`git fetch
-/// https://…`) — that last one is what stops a sync command from being turned
-/// into an arbitrary fetch target.
+/// `None` when nothing in the call is Git. Auto allows every Git operation,
+/// including push, rebase, reset, and clean. `Dangerous` only when Git would
+/// execute a local program, or when a remote target cannot be bound to one
+/// configured remote or one explicit URL (the credential cannot be brokered).
+/// A stored credential on a brokered destination still asks later, at grant
+/// resolution, not here.
 ///
-/// Everything else — including `git fetch origin`, which writes repository
-/// metadata but neither the checkout's state, repository identity, nor a
-/// remote — stays Safe. Its metadata write is a mechanical PRECONDITION,
-/// granted from the effects in [`crate::git_effects`], not an authority
-/// question in itself.
+/// Git does not mask the rest of the script. A mixed invocation falls through
+/// so the shell classifier can still catch `rm`, `sudo`, `open`, and a
+/// redirect outside the workspace.
 fn git_command_class(program: &str, args: &[String]) -> Option<CommandClass> {
     let executed = crate::shell_ast::executed_commands(program, args);
     let effects = executed.git_effects();
     if !effects.any_git {
         return None;
     }
-    if effects.gated() {
+    if executed.commands.iter().any(|command| {
+        crate::git_effects::git_argv_executes_local_program(command)
+            || crate::git_effects::git_remote_credential_unbrokered(command)
+    }) {
         return Some(CommandClass::Dangerous);
     }
-    // A remote transfer that runs through anything other than a direct `git`
-    // invocation cannot be bound to an approved remote and credential: the
-    // frozen-target execution path reproduces a directly invoked `git` only.
-    // Classified Safe, the wrapper would run against the user's live Git
-    // credential store with no approval — the ambient-credential use the broker
-    // exists to prevent. It keeps exact-call approval instead.
-    if basename(program) != "git" && (effects.effects.remote_read || effects.effects.remote_write) {
-        return Some(CommandClass::Dangerous);
-    }
-    // Git owns its own effects, not the verdict of other commands in the
-    // same script. Let the shell classifier aggregate those commands and
-    // redirections before declaring a mixed invocation safe.
     effects.fully_git.then_some(CommandClass::Safe)
 }
 
@@ -580,12 +565,16 @@ fn is_remote_publish_program(program: &str, first_arg: Option<&str>) -> bool {
 /// and the tree-sitter AST classifier (`shell_ast`) feed every resolved
 /// command here.
 ///
-/// Policy is sandbox-first for Assisted: only irreversible destruction,
-/// privilege escalation, and host escape prompt. Network, shell builds/tests,
-/// and publish/push (`git push`, `cargo publish`, …) auto-run under Assisted —
-/// the OS workspace sandbox still confines writes. Users who want a prompt on
-/// every network/shell action should use RequestApproval.
-/// Irreversible / host-wide destructive tools — the main Assisted prompt gate.
+/// Policy is sandbox-first for Assisted: privilege escalation, host escape,
+/// and deletion whose target is not a literal path in the working directory
+/// prompt. `rm` / `rmdir` of a literal relative path auto-run; the workspace
+/// sandbox still confines that directory. Network, shell builds/tests, and
+/// publish/push (`git push`, `cargo publish`, …) auto-run under Assisted.
+/// Users who want a prompt on every network/shell action should use
+/// RequestApproval.
+/// Irreversible / host-wide destructive tools. `rm` and `rmdir` stay here so
+/// the prompt can name a deletion, and they ask unless every target is a
+/// literal path inside the working directory.
 const DESTRUCTIVE: &[&str] = &[
     "rm", "rmdir", "dd", "mkfs", "shutdown", "reboot", "halt", "poweroff",
 ];
@@ -631,9 +620,9 @@ fn script_is_destructive(script: &str) -> bool {
 }
 
 pub(crate) fn classify_program(program: &str, args: &[String]) -> CommandClass {
-    // Git is a single owner (`git_effects`) even on the fallback path, so a
-    // `git push` inside an unparseable script cannot read as harmless. As in
-    // [`classify_command`], Git only ever escalates the verdict.
+    // Git only ever escalates the verdict, and only for security: a local
+    // program or a remote whose credential cannot be brokered. Push, reset,
+    // and clean do not.
     if git_command_class(program, args) == Some(CommandClass::Dangerous) {
         return CommandClass::Dangerous;
     }
@@ -641,6 +630,9 @@ pub(crate) fn classify_program(program: &str, args: &[String]) -> CommandClass {
     const PRIVILEGED: &[&str] = &["sudo", "su", "doas"];
 
     if DESTRUCTIVE.contains(&program) || PRIVILEGED.contains(&program) {
+        if deletion_targets_stay_in_workdir(program, args) {
+            return CommandClass::Safe;
+        }
         return CommandClass::Dangerous;
     }
 
@@ -674,6 +666,47 @@ pub(crate) fn classify_program(program: &str, args: &[String]) -> CommandClass {
         return CommandClass::Dangerous;
     }
     CommandClass::Safe
+}
+
+/// `rm` / `rmdir` auto-run only when every target is a literal path inside the
+/// working directory. No operand, an absolute path, `..`, `~`, a glob, or an
+/// expansion stays an ask: the classifier cannot prove the deletion stays in
+/// the workspace. The working directory itself is confined by the sandbox and
+/// by the command cwd check.
+fn deletion_targets_stay_in_workdir(program: &str, args: &[String]) -> bool {
+    if !matches!(program, "rm" | "rmdir") {
+        return false;
+    }
+    let mut operands = Vec::new();
+    let mut options_ended = false;
+    for arg in args {
+        if !options_ended && arg == "--" {
+            options_ended = true;
+            continue;
+        }
+        if !options_ended && arg.starts_with('-') && arg != "-" {
+            continue;
+        }
+        operands.push(arg.as_str());
+    }
+    !operands.is_empty() && operands.iter().copied().all(workdir_literal_path)
+}
+
+/// A path the shell will not expand into somewhere outside the working directory.
+fn workdir_literal_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.starts_with('~')
+        || path.contains(['$', '`', '*', '?', '[', '{', '\n', '\r'])
+    {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    !path.split(['/', '\\']).any(|segment| segment == "..")
 }
 
 /// Whether this call reads a credential store's raw value (`security
@@ -740,6 +773,9 @@ fn classify_shell_script_fallback(script: &str, windows_cmd: bool) -> CommandCla
                 return CommandClass::Dangerous;
             }
             continue;
+        }
+        if segment_changes_git_authority(&tokens) {
+            return CommandClass::Dangerous;
         }
         if let Some((prog, rest)) = tokens.split_first()
             && classify_program(basename(prog), rest) == CommandClass::Dangerous
@@ -877,6 +913,28 @@ fn split_shell_segments(script: &str) -> Vec<String> {
     segments
 }
 
+/// `GIT_SSH_COMMAND=… git …` in the string fallback. The assignment is its
+/// own token; it must not ride through as an unknown program name.
+fn segment_changes_git_authority(tokens: &[String]) -> bool {
+    let mut changes = false;
+    let mut runs_git_or_shell = false;
+    for token in tokens {
+        if let Some((name, _)) = token.split_once('=')
+            && !name.is_empty()
+            && !name.contains('/')
+            && crate::git_isolation::git_env_changes_authority(name)
+        {
+            changes = true;
+            continue;
+        }
+        let base = basename(token);
+        if base == "git" || is_shell_wrapper_program(base) {
+            runs_git_or_shell = true;
+        }
+    }
+    changes && runs_git_or_shell
+}
+
 /// Tokenize one command segment on whitespace, stripping surrounding quotes.
 /// Good enough to recover the program name and its first argument.
 fn shell_tokens(segment: &str) -> Vec<String> {
@@ -961,10 +1019,12 @@ impl ApprovalPolicy {
             };
         }
 
-        // 替我审批 (default / "auto"): sandbox-first — only destruction,
-        // privilege escalation, and host escape prompt. Network + ordinary
-        // shell auto-run; Git remote mutation still asks through effects. OS sandbox confines
-        // workspace writes. RequestApproval is the "ask more" profile.
+        // 替我审批 (default / "auto"): sandbox-first. Asks for deletion whose
+        // target is not a literal path in the working directory, privilege,
+        // host escape, and Git that executes a local program or whose remote
+        // credential cannot be brokered. Literal `rm` / `rmdir` and other Git
+        // operations, including push, auto-run. A stored credential still asks
+        // at grant resolution. RequestApproval is the "ask more" profile.
         if is_command_tool(tool) {
             return match command.map(|c| classify_command(&c)) {
                 Some(CommandClass::Dangerous) => Requirement::NeedApproval,
@@ -1365,15 +1425,10 @@ mod tests {
             classify_command(&view("/usr/bin/sudo", &[])),
             CommandClass::Dangerous
         );
-        // Git automation is decided by EFFECT, not by the program name: a
-        // remote write, an identity rewrite, or irreversible history loss is
-        // Dangerous whatever the profile; a repository metadata write that
-        // touches neither is not (see the git effect matrix below).
+        // Git operations, including push, are not a danger class. Deletion,
+        // privilege, and program-executing Git config still are.
         let push = ["push".to_string(), "origin".to_string()];
-        assert_eq!(
-            classify_command(&view("git", &push)),
-            CommandClass::Dangerous
-        );
+        assert_eq!(classify_command(&view("git", &push)), CommandClass::Safe);
         let status = ["status".to_string()];
         assert_eq!(classify_command(&view("git", &status)), CommandClass::Safe);
         assert_eq!(
@@ -1475,7 +1530,7 @@ mod tests {
             CommandClass::Dangerous
         );
         // Nested shell inside the script body (acceptance-shaped payloads).
-        let nested = ["-c".to_string(), "bash -c 'rm -rf x'".to_string()];
+        let nested = ["-c".to_string(), "bash -c 'rm -rf /tmp/x'".to_string()];
         assert_eq!(
             classify_command(&view("sh", &nested)),
             CommandClass::Dangerous,
@@ -1510,7 +1565,7 @@ mod tests {
             CommandClass::Safe,
             "network-only substitution does not force approval"
         );
-        let bt = ["-c".to_string(), "echo `rm -rf x`".to_string()];
+        let bt = ["-c".to_string(), "echo `rm -rf /tmp/x`".to_string()];
         assert_eq!(classify_command(&view("sh", &bt)), CommandClass::Dangerous);
     }
 
@@ -1530,16 +1585,12 @@ mod tests {
 
     /// Two claims at once, and they are different claims:
     ///
-    /// - `git push` is a REMOTE side effect. It must never ride on the fetch
-    ///   decision, whatever the profile.
-    /// - A remote fetch that only writes repository metadata is not an
-    ///   authority question under a profile that already grants the network
-    ///   and workspace writes.
-    ///
-    /// `cargo publish` is not Git and keeps its long-standing sandbox-first
-    /// verdict.
+    /// Push is a Git operation. Auto does not ask for it at this layer. A
+    /// stored credential still asks when grant resolution emits
+    /// `CredentialUse`, which this policy evaluation does not see. A Git
+    /// config key that names a local program still asks.
     #[test]
-    fn git_remote_write_prompts_while_a_repository_sync_does_not() {
+    fn git_operations_do_not_ask_but_program_execution_does() {
         let policy = ApprovalPolicy::default();
         let evaluate = |tool: &str, program: &str, args: &[&str]| {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -1550,18 +1601,25 @@ mod tests {
                 Some(view(program, &args)),
             )
         };
-        assert_eq!(
-            evaluate("run_command", "git", &["push"]),
-            Requirement::NeedApproval,
-            "git push changes a remote and must be authorized"
-        );
+        assert_eq!(evaluate("run_command", "git", &["push"]), Requirement::Auto);
         assert_eq!(
             evaluate("shell_command", "sh", &["-c", "git push"]),
-            Requirement::NeedApproval,
-            "a shell wrapper must not launder the push verdict"
+            Requirement::Auto
         );
         assert_eq!(
             evaluate("run_command", "git", &["push", "--force"]),
+            Requirement::Auto
+        );
+        assert_eq!(
+            evaluate("run_command", "git", &["reset", "--hard"]),
+            Requirement::Auto
+        );
+        assert_eq!(
+            evaluate(
+                "run_command",
+                "git",
+                &["-c", "core.hooksPath=/tmp/evil", "status"]
+            ),
             Requirement::NeedApproval
         );
         assert_eq!(
@@ -1658,7 +1716,7 @@ mod tests {
     #[test]
     fn assisted_shell_command_rm_needs_approval() {
         let policy = ApprovalPolicy::default();
-        let args = ["-c".to_string(), "rm -rf x".to_string()];
+        let args = ["-c".to_string(), "rm -rf /tmp/x".to_string()];
         assert_eq!(
             policy.evaluate(
                 PermissionProfile::Assisted,
@@ -1676,7 +1734,7 @@ mod tests {
         // Windows shell_command maps to `cmd /C <script>` — classify must unwrap
         // the script body the same way as Unix `sh -c`.
         let policy = ApprovalPolicy::default();
-        let args = ["/C".to_string(), "rm -rf x".to_string()];
+        let args = ["/C".to_string(), "rm -rf /tmp/x".to_string()];
         assert_eq!(
             classify_command(&view("cmd", &args)),
             CommandClass::Dangerous
@@ -1759,9 +1817,9 @@ mod tests {
     #[test]
     fn request_approval_shell_command_parity_with_run_command() {
         let policy = ApprovalPolicy::default();
-        let dangerous = ["-c".to_string(), "rm -rf x".to_string()];
+        let dangerous = ["-c".to_string(), "rm -rf /tmp/x".to_string()];
         let safe = ["-c".to_string(), "cargo test".to_string()];
-        let win_dangerous = ["/C".to_string(), "rm -rf x".to_string()];
+        let win_dangerous = ["/C".to_string(), "rm -rf /tmp/x".to_string()];
         for tool in ["run_command", "shell_command"] {
             assert_eq!(
                 policy.evaluate(

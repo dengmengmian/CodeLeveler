@@ -2819,6 +2819,146 @@ fn approval_request_opens_overlay() {
     assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
 }
 
+/// An approval sits in the composer slot. The conversation above it is what
+/// the reader is judging, so page keys and a wheel over that viewport still
+/// move it. The approval keeps Enter / Esc / arrows.
+fn conversation_parked_under_approval() -> AppState {
+    let mut s = opened();
+    s.size = (100, 40);
+    for i in 0..40 {
+        s.transcript.push_user(format!("上文 {i}"));
+    }
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ApprovalRequested {
+            request: approval_req(),
+        }),
+    );
+    s.conv.rect = Some((1, 3, 96, 12));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 30;
+    s
+}
+
+#[test]
+fn page_up_scrolls_while_approval_is_open() {
+    let mut s = conversation_parked_under_approval();
+    let effects = reduce(&mut s, key(KeyCode::PageUp));
+    assert!(
+        effects.is_empty(),
+        "a page key must not decide: {effects:?}"
+    );
+    assert!(s.conv.scroll < 30, "PageUp must leave the parked offset");
+    assert!(!s.conv.auto_scroll);
+    assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+    // The page key must not also move the approval cursor off Deny.
+    let decided = reduce(&mut s, key(KeyCode::Enter));
+    assert_send_interaction(
+        &decided,
+        ClientCommand::ApprovalDecision {
+            request_id: ApprovalId::new("r1"),
+            decision: ApprovalDecision::Deny,
+        },
+        PendingInteraction::Approval(approval_req()),
+    );
+}
+
+#[test]
+fn wheel_scrolls_while_approval_is_open() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let mut s = conversation_parked_under_approval();
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 8,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(
+        s.conv.scroll < 30,
+        "a wheel over the conversation must scroll it"
+    );
+    assert!(!s.conv.auto_scroll);
+    assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+}
+
+#[test]
+fn wheel_on_the_approval_stays_put_while_approval_is_open() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let mut s = conversation_parked_under_approval();
+    // Below the published conversation rect: this is the approval card.
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 30,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert_eq!(s.conv.scroll, 30);
+    assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+}
+
+#[test]
+fn page_up_still_scrolls_while_clarification_is_open() {
+    let mut s = clarification_open();
+    s.size = (100, 40);
+    for i in 0..40 {
+        s.transcript.push_user(format!("上文 {i}"));
+    }
+    s.conv.rect = Some((1, 3, 96, 12));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 30;
+    reduce(&mut s, key(KeyCode::PageUp));
+    assert!(
+        s.conv.scroll < 30,
+        "PageUp must keep reaching the conversation"
+    );
+    assert!(matches!(s.overlay, Some(Overlay::Clarification(_))));
+}
+
+#[test]
+fn wheel_scrolls_while_clarification_is_open() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let mut s = clarification_open();
+    s.conv.rect = Some((1, 3, 96, 12));
+    s.conv.auto_scroll = false;
+    s.conv.scroll = 30;
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 8,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert!(
+        s.conv.scroll < 30,
+        "a wheel over the conversation must scroll it"
+    );
+    assert!(matches!(s.overlay, Some(Overlay::Clarification(_))));
+}
+
+#[test]
+fn arrows_still_choose_while_approval_is_open() {
+    let mut s = conversation_parked_under_approval();
+    reduce(&mut s, key(KeyCode::Up));
+    assert_eq!(s.conv.scroll, 30, "↑ chooses a row, it does not scroll");
+    let decided = reduce(&mut s, key(KeyCode::Enter));
+    assert_send_interaction(
+        &decided,
+        ClientCommand::ApprovalDecision {
+            request_id: ApprovalId::new("r1"),
+            decision: ApprovalDecision::ApproveAlways,
+        },
+        PendingInteraction::Approval(approval_req()),
+    );
+}
+
 #[test]
 fn reconnect_snapshot_restores_live_pending_interactions() {
     let mut s = state();
