@@ -131,7 +131,7 @@ CodeLeveler 让 AI 模型在真实工作环境里完成任务。你可以提出�
 | 模式 | 用户会遇到的行为 |
 | --- | --- |
 | Full（`FullAccess`） | 已实现能力完全放开，CodeLeveler 不因权限或操作系统隔离询问、拒绝或限制，审批次数为 0 |
-| Auto（`Assisted`） | 普通开发默认允许；危险删除、push、破坏性 Git、敏感凭据和控制其他任务等在执行准入时要求批准 |
+| Auto（`Assisted`） | 普通开发默认允许，包括全部 Git 操作，以及工作区内字面路径的 `rm` / `rmdir`；只在工作区外或看不清目标的删除、提权，以及凭据、工作区外写入、会执行本地程序的 Git 配置上要求批准 |
 | Restricted（`RequestApproval`） | 按目的地和资源边界执行，无法可靠约束的范围明确询问、拒绝或标记不支持（Unsupported） |
 
 Full 下能力缺失、参数错误、操作系统或外部服务失败仍会如实报错；取消、超时和资源回收照常有效。Auto 的批准只覆盖当前明确动作。执行时沿用同一批准，不再次拒绝，也不扩大之后未批准的调用。操作系统隔离不能比已允许的权限更严。
@@ -382,7 +382,7 @@ provider 可见的请求随后由**唯一一个 projection owner** 产出。语�
 
 `FullAccess`（Full）由宿主在 admission 之前选择 unrestricted 执行路径，绕过 CodeLeveler 权限规则、审批、sandbox、资源范围、凭据过滤和任务所有权限制。Full 下的文件、HOME、凭据、任意 Git remote、loopback / LAN / Internet、进程控制及已实现的未来能力均不产生权限 ASK / DENY。实际能力缺失、无效工具参数、OS / 程序或外部服务失败仍是失败；进程取消、超时、日志持久化和资源回收仍是运行时职责。
 
-`Assisted`（Auto）默认允许普通读写、构建、测试、正常 commit / fetch、localhost 及 owned task 操作；危险删除、push、破坏性 Git、敏感凭据和控制其他任务在 admission 请求批准。普通系统诊断（`ps`、`top`、`sysctl` 读取）、明确只读的 Git（`status` / `log` / `diff` / `rev-parse` / `show` / `branch --show-current`，包括 `git -C <dir> …` 这类只移动目标的写法）以及普通临时文件读写（工作区、`$TMPDIR`、系统 `/tmp`）都是普通开发动作，因而 Auto **ALLOW、不 ASK**。Full 和明确批准动作的执行 authority 冻结在本次 `ResolvedExecutionPolicy`，`ProcessRequest`、文件工具、HTTP、MCP、任务控制统一消费；批准后的同一动作不再经第二套权限拒绝。单次批准不修改 session profile，也不扩大随后未批准的调用。
+`Assisted`（Auto）默认允许普通读写、构建、测试、localhost、owned task，以及全部 Git 操作（`commit`、`fetch`、`pull`、`push`、`rebase`、`reset`、`clean`、`checkout --`、`restore`）。Auto 只在三类边界上请求批准：删除（工作区外、绝对路径、`..`、`~`、变量或通配的 `rm` / `rmdir`，以及 `dd` / `mkfs` / 关机；工作区内的字面相对路径直接执行。不是 `git clean` 或 `git reset`）、提权（`sudo` / `su` / `doas`、打开宿主应用、MCP、跨会话任务、agent / skill / memory 定义），以及安全（凭据明文、目的地已有已存凭据的 Git remote、工作区外写入、会执行本地程序的 Git 配置或参数，例如 `core.hooksPath`、`core.fsmonitor`、`alias.*`、`--upload-pack`、`--exec-path`、`GIT_SSH_COMMAND`）。叫不出远端名字的传输（`git fetch $REMOTE`、`git fetch --all`）无法绑定凭据，仍要批准。普通系统诊断（`ps`、`top`、`sysctl` 读取）和普通临时文件读写（工作区、`$TMPDIR`、系统 `/tmp`）都是普通开发动作。已存凭据仍在准入时询问，公共远端没有 credential binding，也不弹窗。Full 和明确批准动作的执行 authority 冻结在本次 `ResolvedExecutionPolicy`，`ProcessRequest`、文件工具、HTTP、MCP、任务控制统一消费；批准后的同一动作不再经第二套权限拒绝。单次批准不修改 session profile，也不扩大随后未批准的调用。
 
 **Sandbox 不得比 permission policy 更严格。** 若 permission / risk 层判定 ALLOW，执行阶段的 OS sandbox 不得对同一 capability 静默返回 `EPERM`。因此 macOS seatbelt profile 必须显式携带 Auto 已允许的 capability。`sysctl` 名称到 OID 的翻译读取（`sysctlnametomib`，缺少它时连白名单中的 `kern.argmax` 都会被拒绝）、工作区之外的共享临时目录写入根、以及 `ps` / `top` 这两个 setuid 进程观察程序的 `process-exec (with no-sandbox)` 例外。最后一项是 OS 约束而非实现选择。内核禁止已沙箱化的进程 exec setuid/setgid 镜像，任何 SBPL 规则都无法放宽（`(allow default)` 同样失败），因此这两个只读观察者只能以沙箱外执行放行，且该放行按字面路径只对这两个镜像生效，`sudo`、`crontab`、`su`、`login`、`traceroute` 等其余 setuid 程序仍然 fail closed。若某 capability 确实无法安全进入 sandbox，必须在 permission 层 ASK 或给出明确结构化拒绝，而不是让上层看到裸的 `Operation not permitted`。
 
@@ -411,7 +411,7 @@ Once 仅用于当前调用，不落库；Session 绑定持久会话的真实 `Se
 
 capability 与 resource 分开匹配。远端读写、文件读写删除、后台任务观察和控制、凭据使用和原文读写彼此不隐含授权。资源授权不产生 unrestricted authority，也不扩大 `NetworkScope`。Full 在解析与存储查询前直接进入 unrestricted 分支；Auto 的普通已允许动作不查询授权存储，仅需要批准的动作尝试精确复用。旧 session/always 规则保留原有语义，但不迁移或冒充资源授权。
 
-无法证明真实资源或执行效果时，不提供可复用资源授权，回到现有 exact-call 审批。包括 SSH remote、未经归因的 credential helper、opaque shell 包装（包括 `sh -c "git …"`，Auto / Restricted 下保留 exact-call 审批而不是自动运行）、替代 PATH 和 Git 环境或命令配置 override。External PID 尚无可信进程出生证明，因此不生成持久授权。Phase 3 的 `CredentialUse` / raw capability 类型由下述 Phase 4 broker 实现。`ConfiguredRemote` 的网络层地址 pin 仍属 Phase 2。冻结 Git 执行目标证明的是实际网络目的地为获批 URL，不声称 redirect 已被网络层完全隔离。
+无法证明真实资源或执行效果时，不提供可复用资源授权，回到现有 exact-call 审批。包括 SSH remote、未经归因的 credential helper、叫不出名字的远端、替代 PATH，以及 Git 环境或命令配置 override。可解析的 `sh -c "git …"` 与直接 Git 命令一样在 Auto 下自动运行，并解析出同一份 remote grant；该目的地已有已存凭据时仍在准入时询问。Shell 本身不是冻结的 Git 目标，批准后的脚本按宿主 helper 执行。External PID 尚无可信进程出生证明，因此不生成持久授权。Phase 3 的 `CredentialUse` / raw capability 类型由下述 Phase 4 broker 实现。`ConfiguredRemote` 的网络层地址 pin 仍属 Phase 2。冻结 Git 执行目标证明的是实际网络目的地为获批 URL，不声称 redirect 已被网络层完全隔离。
 
 #### Phase 4 凭据隔离（Credential Broker）
 
@@ -646,7 +646,7 @@ Session、TaskEngine 和 Runtime 只有一套实现。Session 的 `repository` �
 - 编辑成功提交后生成的完整 diff 不按字节预算丢弃。Markdown 长行按终端宽度换行，缩放与历史重放后开头、中间、末尾及邻接消息仍可达。
 - 绘制、鼠标和选择映射共用 Conversation 几何规则。Ctrl+G 复用同一 memoized 投影。
 - 工具组与失败条目展开状态仅属于 TUI，不进入 Runtime、事件或持久化；不能将 running、cancelling、cancelled、unknown 显示成完成。
-- 澄清浮层不遮住它自己要问的上下文：浮层拥有 Enter、Esc 和方向键，翻页键继续滚动上方会话；单选问题即使模型没有要求也提供自由文本答案（这是对"客户端只呈现运行时事实"的显式例外：选项列表不是封闭集合，回传的仍是用户自己输入的字符串）。Agent roster 显示每个子 Agent 的角色（探索 / 执行 / 审查），不显示它收到的 task brief。
+- 审批和澄清浮层不遮住它们要判断的会话：浮层拥有 Enter、Esc 和方向键；翻页键，以及落在会话视口上的滚轮，继续滚动上方会话。滚轮落在浮层上则不滚动会话。澄清的单选问题即使模型没有要求也提供自由文本答案（这是对"客户端只呈现运行时事实"的显式例外：选项列表不是封闭集合，回传的仍是用户自己输入的字符串）。Agent roster 显示每个子 Agent 的角色（探索 / 执行 / 审查），不显示它收到的 task brief。
 - 错误来源使用结构化事实，`LocalConfiguration`、`Auth` 的 `error.code` 和 `ConnectionRefused` 的 `io::ErrorKind` 不用 `message.contains(...)` 特判。
 - Footer 百分比、分母、条长与颜色使用同一 projected input / 完整窗口口径，不重复“上下文”标签。详情网格和分项剩余量按当前展示口径派生，快照 `free_tokens` 仍表示模型窗口剩余量，缓存使用 provider usage 口径。
 - narration 去重不删除 reasoning，已流式发布的 reasoning 不重复发布。分组是 view-time fold，不改原始工具和 reasoning 记录，也不改生命周期、权限或副作用 owner。

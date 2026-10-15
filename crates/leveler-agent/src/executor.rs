@@ -3676,49 +3676,53 @@ mod ownership_authority_tests {
             (false, sealed.clone())
         );
 
-        // A sync against the repository's own remote writes fetched metadata
-        // only. A DIRECT `git fetch` runs unsealed and asks nobody; the same
-        // command through a shell wrapper keeps exact-call approval, because the
-        // wrapper cannot be bound to a frozen approved target and would
-        // otherwise run against the user's live Git credential store unchecked.
+        // Git operations do not ask. A metadata write still unseals `.git`;
+        // a read does not. A stored credential is a separate admission ask
+        // and this temp workspace has no remote to broker.
         assert_eq!(
             resolve(&executor, &ctx, "git fetch origin").await,
-            (true, unsealed.clone())
+            (false, unsealed.clone())
         );
         assert_eq!(
             resolve(&executor, &ctx, "git fetch --prune origin").await,
-            (true, unsealed.clone())
+            (false, unsealed.clone())
         );
         assert_eq!(
             resolve(&executor, &ctx, "git ls-remote origin").await,
-            (true, sealed.clone())
+            (false, sealed.clone())
         );
-
-        // A remote the repository does not configure is asked for.
-        assert!(
-            resolve(&executor, &ctx, "git fetch https://unknown.example/x.git")
-                .await
-                .0
+        assert_eq!(
+            resolve(&executor, &ctx, "git fetch https://unknown.example/x.git").await,
+            (false, unsealed.clone())
         );
-
-        // Workspace mutation is a different permission from a sync, and it runs
-        // unsealed once approved so the refs it writes can actually land.
         assert_eq!(
             resolve(&executor, &ctx, "git pull").await,
-            (true, unsealed.clone())
+            (false, unsealed.clone())
         );
         assert_eq!(
             resolve(&executor, &ctx, "git switch -c feat").await.1,
             unsealed
         );
-
-        // Remote writes and irreversible history loss are never inherited from
-        // the fetch decision.
-        assert!(resolve(&executor, &ctx, "git push origin main").await.0);
-        assert!(resolve(&executor, &ctx, "git reset --hard").await.0);
-        assert!(resolve(&executor, &ctx, "git clean -fd").await.0);
+        assert_eq!(
+            resolve(&executor, &ctx, "git push origin main").await,
+            (false, unsealed.clone())
+        );
+        assert_eq!(
+            resolve(&executor, &ctx, "git reset --hard").await,
+            (false, unsealed.clone())
+        );
+        // `clean` rewrites the worktree, not repository metadata.
+        assert_eq!(
+            resolve(&executor, &ctx, "git clean -fd").await,
+            (false, sealed.clone())
+        );
+        assert_eq!(
+            resolve(&executor, &ctx, "git remote set-url origin x").await,
+            (false, unsealed.clone())
+        );
+        // A config key that names a program Git will execute still asks.
         assert!(
-            resolve(&executor, &ctx, "git remote set-url origin x")
+            resolve(&executor, &ctx, "git -c core.hooksPath=/tmp/evil status")
                 .await
                 .0
         );

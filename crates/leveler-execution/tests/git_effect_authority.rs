@@ -54,17 +54,26 @@ fn mixed_safe_commands_keep_their_actual_effect_verdict() {
 
 #[test]
 fn partially_readable_git_call_does_not_authorize_opaque_effects() {
-    for script in [
-        "git status; $COMMAND",
-        "git status; bash -c \"$SCRIPT\"",
-        "git status; git clean $FLAGS",
-        "git status; git fetch $REMOTE",
-    ] {
+    for script in ["git status; $COMMAND", "git status; bash -c \"$SCRIPT\""] {
         assert_eq!(
             classify("sh", &["-c", script]),
             CommandClass::Dangerous,
             "{script}"
         );
+    }
+    // An unreadable Git flag is still Git. An unreadable remote is not: the
+    // credential target cannot be named. Neither shape is complete, so neither
+    // receives a metadata capability.
+    for script in [
+        "git status; git clean $FLAGS",
+        "git status; git fetch $REMOTE",
+    ] {
+        let expected = if script.contains("$REMOTE") {
+            CommandClass::Dangerous
+        } else {
+            CommandClass::Safe
+        };
+        assert_eq!(classify("sh", &["-c", script]), expected, "{script}");
         let args = vec!["-c".into(), script.into()];
         let executed = executed_commands("sh", &args);
         assert!(!executed.complete, "{script}");
@@ -72,22 +81,23 @@ fn partially_readable_git_call_does_not_authorize_opaque_effects() {
     }
 }
 
-/// A remote Git transfer that a shell wrapper launders cannot be bound to a
-/// frozen approved remote and credential: only a directly invoked `git` can.
-/// It must keep exact-call approval instead of auto-running against the user's
-/// live Git credential store.
+/// Git inside a shell is the same decision as the direct command. Push, an
+/// explicit URL, and a remote query are Git operations.
 #[test]
-fn wrapper_remote_git_keeps_exact_call_approval() {
+fn wrapper_remote_git_matches_the_direct_read() {
     for script in [
         "git fetch origin",
         "git ls-remote origin",
         "git fetch origin && git status",
         "git remote show origin",
         "git archive --remote=origin HEAD",
+        "git fetch origin && echo extra",
+        "git fetch https://unknown.example/repo.git",
+        "git push origin main",
     ] {
         assert_eq!(
             classify("sh", &["-c", script]),
-            CommandClass::Dangerous,
+            CommandClass::Safe,
             "{script}"
         );
     }
@@ -140,7 +150,7 @@ fn remote_queries_report_transport_effects_and_targets() {
         assert!(git_effects(&words).explicit_remote, "{words:?}");
         assert_eq!(
             classify("git", &words[1..]),
-            CommandClass::Dangerous,
+            CommandClass::Safe,
             "{words:?}"
         );
     }
@@ -154,12 +164,24 @@ fn unsupported_git_global_options_cannot_grant_metadata_scope() {
         vec!["git", "--shallow-file", "/tmp/shallow", "fetch", "origin"],
     ] {
         assert!(!git_effects(&words).resolved, "{words:?}");
-        assert_eq!(
-            classify("git", &words[1..]),
-            CommandClass::Dangerous,
-            "{words:?}"
-        );
     }
+    assert_eq!(
+        classify("git", &["--bare", "add", "file"]),
+        CommandClass::Safe,
+        "a local Git option is not a program execution"
+    );
+    assert_eq!(
+        classify("git", &["--unknown-option", "fetch", "origin"]),
+        CommandClass::Dangerous,
+        "an unreadable remote option can hide the credential target"
+    );
+    assert_eq!(
+        classify(
+            "git",
+            &["--shallow-file", "/tmp/shallow", "fetch", "origin"]
+        ),
+        CommandClass::Dangerous
+    );
     assert_eq!(
         classify("git", &["--no-pager", "status"]),
         CommandClass::Safe
@@ -254,7 +276,6 @@ fn relocation_keeps_reads_allowed_and_writes_unbound() {
         vec!["git", "-c", "core.fsmonitor=/tmp/evil", "status"],
         vec!["git", "-ccore.fsmonitor=/tmp/evil", "status"],
         vec!["git", "--exec-path=/tmp/evil", "status"],
-        vec!["git", "--unknown-option", "status"],
     ] {
         assert!(!git_effects(&words).resolved, "{words:?}");
         assert_eq!(
@@ -263,4 +284,10 @@ fn relocation_keeps_reads_allowed_and_writes_unbound() {
             "{words:?}"
         );
     }
+    let unknown = vec!["git", "--unknown-option", "status"];
+    assert!(!git_effects(&unknown).resolved);
+    assert_eq!(
+        classify("git", &["--unknown-option", "status"]),
+        CommandClass::Safe
+    );
 }

@@ -684,6 +684,33 @@ fn snapshot_awaits_interaction(
 /// `Shift`+mouse is ignored so the terminal can offer native selection as a fallback
 /// when mouse capture is not fully exclusive.
 fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    // An approval or clarification sits in the composer slot and asks about the
+    // conversation above it. A wheel over that viewport still scrolls it. The
+    // wheel over the prompt itself, and every click, stay with the prompt.
+    if conversation_scroll_reaches_through(state)
+        && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        )
+    {
+        let over_conv = point_in_rect(mouse.column, mouse.row, state.conv.rect);
+        let over_jump = point_in_rect(mouse.column, mouse.row, state.conv.scroll_bottom_rect);
+        if over_conv || over_jump {
+            state.disarm_ctrlc();
+            clear_quit_confirm_notification(state);
+            state.workbench_focus = WorkbenchFocus::Conversation;
+            interaction::clear_selection_drag(state);
+            state.conv.selection.clear();
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -3
+            } else {
+                3
+            };
+            interaction::scroll_by(state, delta);
+        }
+        return Vec::new();
+    }
     if state.overlay.is_some()
         || (state.surface == SurfaceFocus::Main && state.history_search.is_some())
     {
@@ -1055,6 +1082,18 @@ fn clipboard_notice(
     message
 }
 
+/// Approval and clarification occupy the composer slot and leave the
+/// conversation visible above them. Page keys, and a wheel over that
+/// viewport, still scroll it. Every other overlay keeps the keys and the wheel.
+fn conversation_scroll_reaches_through(state: &AppState) -> bool {
+    state.surface == SurfaceFocus::Main
+        && state.active_screen == Screen::Conversation
+        && matches!(
+            state.overlay,
+            Some(Overlay::Approval(_) | Overlay::Clarification(_))
+        )
+}
+
 fn point_in_rect(x: u16, y: u16, rect: Option<(u16, u16, u16, u16)>) -> bool {
     let Some((rx, ry, rw, rh)) = rect else {
         return false;
@@ -1090,18 +1129,17 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     // a main approval belongs to the main surface and waits for the user to
     // return, shown there only as live status in the header.
     // A modal surface owns the keys it answers with — not the ones the reader
-    // uses to look at what it is asking about. A clarification on the
-    // conversation screen leaves the page keys to that conversation, so a
-    // question never hides its own context.
+    // uses to look at what it is asking about. An approval or a clarification
+    // on the conversation screen leaves the page keys to that conversation, so
+    // the prompt never hides the context it is asking about. Arrows stay with
+    // the prompt: they move its cursor.
     //
     // Scoped on purpose: on any other screen the overlay is painted over the
     // whole surface, and letting a page key through would scroll rows the user
-    // cannot see (and, on the conversation, move the focus out of the composer).
-    let page_keys_reach_the_conversation = state.active_screen == Screen::Conversation
-        && matches!(state.overlay, Some(Overlay::Clarification(_)));
+    // cannot see. Other overlays (pickers) keep the page keys too.
     if state.overlay.is_some()
         && state.surface == SurfaceFocus::Main
-        && !(page_keys_reach_the_conversation
+        && !(conversation_scroll_reaches_through(state)
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown))
     {
         return handle_overlay_key(state, key);

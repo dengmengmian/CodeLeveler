@@ -116,6 +116,49 @@ fn auto_allows_read_only_git_in_every_ordinary_spelling() {
         "git -C . log --oneline -3",
         "git -C /tmp/elsewhere status",
         "git --git-dir=/tmp/elsewhere log --oneline -1",
+        // A variable path or revision does not change a read into a write.
+        "git show \"$rev\"",
+        "git log -- \"*$f*\"",
+        "git diff HEAD -- \"$f\"",
+        "for f in 0016_model_config 0017_performance; do git show \"HEAD:$f\"; done",
+        "git status --porcelain && git show \"$f\"",
+        "git -C \"$dir\" status --porcelain",
+        // Reversible branch movement and merge are ordinary development.
+        "git switch main",
+        "git switch -c feat",
+        "git checkout main",
+        "git checkout -b feat",
+        "git merge origin/main",
+        // Configured-remote fetch inside a shell matches the direct command.
+        "git fetch origin",
+        "git ls-remote origin",
+        "git fetch origin && git status --porcelain",
+        // Git operations are ordinary development, including ones that rewrite
+        // history or publish. A stored credential still asks at admission,
+        // which this table does not see.
+        "git reset --hard",
+        "git clean -fd",
+        "git clean $FLAGS",
+        "git checkout -- .",
+        "git checkout -f main",
+        "git checkout \"$branch\"",
+        "git switch --force main",
+        "git restore --worktree .",
+        "git rebase main",
+        "git branch -D feature",
+        "git pull origin",
+        "git fetch https://unknown.example/repo.git",
+        "git push",
+        "git push --force origin main",
+        "git push origin main",
+        "git filter-branch --all",
+        "git remote set-url origin https://evil.example/x",
+        "git update-ref -d refs/heads/main",
+        "git -c user.email=a@b.com commit -m x",
+        "git fetch origin && echo extra",
+        "git status; git clean $FLAGS",
+        // A backup listing is a read plus an ordinary directory create.
+        "mkdir -p tmp/backup && ts=$(date +%Y%m%d-%H%M%S) && echo \"backup $ts\" && for db in a b; do echo \"$db\"; done",
     ] {
         assert_allowed(command_line);
     }
@@ -133,6 +176,15 @@ fn auto_allows_temporary_and_workspace_file_operations() {
         "echo hi > \"$TMPDIR/codeleveler-auto-test.txt\"",
         "echo hi > workspace-file.txt",
         "cat workspace-file.txt",
+        // A literal relative path is inside the working directory. The sandbox
+        // keeps that directory inside the workspace.
+        "rm -r build",
+        "rm -f workspace-file.txt",
+        "rm -rf -- build/obj",
+        "rm \"my file.txt\"",
+        "rmdir build",
+        "rmdir a/b",
+        "rm -rf build && echo done",
         "cargo test",
         "cargo build",
         "npm run build",
@@ -154,16 +206,19 @@ fn auto_allows_temporary_and_workspace_file_operations() {
 #[test]
 fn auto_still_asks_for_dangerous_operations() {
     for command_line in [
-        // Destructive local filesystem.
+        // Deletion whose target is not a literal path inside the working
+        // directory. Shared temp is writable, and still outside the workspace.
         "rm -rf /tmp/anything",
-        "rm -r build",
-        // `rm` is a destructive PROGRAM, so it is gated whatever its target —
-        // including cleanup of a file this task created in `/tmp`. The sandbox
-        // now permits that write (see the companion execution test); the
-        // decision to delete is still a human's.
         "rm -f /tmp/codeleveler-auto-test.txt",
-        "rm -f workspace-file.txt",
-        "rmdir build",
+        "rm -rf /",
+        "rm -rf ../outside",
+        "rm -rf a/../../etc",
+        "rm -rf ~/secret",
+        "rm -rf \"$dir\"",
+        "rm -rf *",
+        "rm build /etc/passwd",
+        "rm -rf",
+        "rmdir ../outside",
         "dd if=/dev/zero of=/dev/disk2",
         "mkfs /dev/disk3",
         "shutdown -h now",
@@ -173,24 +228,21 @@ fn auto_still_asks_for_dangerous_operations() {
         "echo x > /Users/someone/elsewhere/file",
         "echo x > /tmp/../etc/passwd",
         "echo x > ../../outside.txt",
-        // Destructive or history-rewriting Git.
-        "git reset --hard",
-        "git clean -fd",
-        "git checkout -- .",
-        "git restore --worktree .",
-        "git rebase main",
-        "git merge origin/main",
-        "git branch -D feature",
-        "git push",
-        "git push --force origin main",
-        "git filter-branch --all",
-        "git remote set-url origin https://evil.example/x",
+        // A remote we cannot name would use whatever credential the helper
+        // has. An unreadable config key might be hooksPath.
+        "git fetch $REMOTE",
+        "git push $REMOTE",
+        "git fetch --all",
         "git config core.hooksPath /tmp/evil",
-        "git update-ref -d refs/heads/main",
-        // Git configuration injection is not read-only Git whatever the
-        // subcommand is.
+        "git config $KEY value",
+        // Git that executes a local program.
         "git -c core.hooksPath=/tmp/evil status",
         "git -c core.fsmonitor=/tmp/evil diff",
+        "git -c alias.status='!echo pwnd' status",
+        "git fetch --upload-pack=/tmp/evil origin",
+        "git --exec-path=/tmp/evil status",
+        "GIT_SSH_COMMAND=/tmp/evil git fetch origin",
+        "GIT_CONFIG_GLOBAL=/tmp/evil git status",
         // Privilege escalation.
         "sudo rm -rf /",
         "su root",

@@ -86,6 +86,15 @@ fn classify_command_node(cmd: &Node, src: &[u8]) -> Option<CommandClass> {
 
     let args = literal_arguments(cmd, src);
 
+    // `GIT_SSH_COMMAND=… git fetch` and `GIT_CONFIG_GLOBAL=… bash -c 'git …'`
+    // change which program runs or which repository the credential grant was
+    // resolved against. The assignment is not visible in the Git argv.
+    if command_changes_git_authority(cmd, src)
+        && (basename(&program) == "git" || is_shell_wrapper_program(&program))
+    {
+        return Some(CommandClass::Dangerous);
+    }
+
     // Nested `sh -c '…'` (also bash/zsh/dash/…): classify the script body
     // recursively. Mirrors `shell_c_script` semantics on resolved literals.
     if is_shell_wrapper_program(&program)
@@ -113,17 +122,193 @@ fn classify_command_node(cmd: &Node, src: &[u8]) -> Option<CommandClass> {
         }
     }
 
-    // Git is classified from its EFFECTS (see [`crate::git_effects`]), which
-    // needs the whole argument vector. An argument we cannot read statically
-    // (`git clean $FLAGS`) drops out of that vector, so the verdict for Git
-    // fails closed rather than reading as the harmless no-flag form.
+    // Git is classified from its argv. An unreadable word stays a Git
+    // operation (`git clean $FLAGS`, `git checkout "$branch"`) unless that
+    // word can name a program Git executes or a remote whose credential
+    // cannot be bound (`git fetch $REMOTE`, `git -c $KEY`).
     let readable: Vec<String> = args.iter().flatten().cloned().collect();
     let opaque = args.iter().any(Option::is_none);
+    // An unreadable `rm` word can be the target (`rm -rf "$dir"`). Dropping it
+    // and judging the remaining literal paths would hide that deletion.
+    if opaque && matches!(basename(&program), "rm" | "rmdir") {
+        return Some(CommandClass::Dangerous);
+    }
     let verdict = classify_program(basename(&program), &readable);
-    if opaque && verdict == CommandClass::Safe && basename(&program) == "git" {
+    if opaque
+        && verdict == CommandClass::Safe
+        && basename(&program) == "git"
+        && opaque_git_security_ask(&args)
+    {
         return Some(CommandClass::Dangerous);
     }
     Some(verdict)
+}
+
+/// True when an unreadable Git word can execute a local program or hide the
+/// remote a stored credential would be sent to.
+fn opaque_git_security_ask(args: &[Option<String>]) -> bool {
+    if opaque_git_stays_read(args) {
+        return false;
+    }
+    let mut index = 0;
+    while index < args.len() {
+        let Some(arg) = args[index].as_deref() else {
+            return true;
+        };
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+        if let Some(separate_value) = relocation_option(arg) {
+            index += if separate_value { 2 } else { 1 };
+            continue;
+        }
+        if arg == "-c" || arg == "--config-env" {
+            index += 1;
+            match args.get(index).and_then(|word| word.as_deref()) {
+                Some(spec) if !crate::git_isolation::config_spec_executes_program(spec) => {
+                    index += 1;
+                    continue;
+                }
+                _ => return true,
+            }
+        }
+        if let Some(spec) = arg.strip_prefix("--config-env=") {
+            if crate::git_isolation::config_spec_executes_program(spec) {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        if arg.starts_with("-c") && !arg.starts_with("--") && arg.len() > 2 {
+            if crate::git_isolation::config_spec_executes_program(&arg[2..]) {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        if exec_override_arg(arg) || !harmless_git_global(arg) {
+            return true;
+        }
+        index += 1;
+    }
+    let Some(subcommand) = args.get(index).and_then(|word| word.as_deref()) else {
+        return true;
+    };
+    if matches!(
+        subcommand,
+        "fetch" | "pull" | "push" | "ls-remote" | "clone" | "archive" | "remote"
+    ) {
+        return args[index + 1..].iter().any(Option::is_none);
+    }
+    if subcommand == "config" {
+        return args[index + 1..].iter().any(Option::is_none)
+            || crate::git_effects::git_argv_executes_local_program(&literal_git_argv(args));
+    }
+    args.iter().flatten().any(|arg| exec_override_arg(arg))
+}
+
+fn literal_git_argv(args: &[Option<String>]) -> Vec<String> {
+    let mut argv = vec!["git".to_string()];
+    argv.extend(args.iter().flatten().cloned());
+    argv
+}
+
+fn exec_override_arg(arg: &str) -> bool {
+    const FLAGS: [&str; 4] = ["--upload-pack", "--receive-pack", "--exec", "--exec-path"];
+    FLAGS
+        .iter()
+        .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
+}
+
+fn command_changes_git_authority(cmd: &Node, src: &[u8]) -> bool {
+    let mut cursor = cmd.walk();
+    cmd.children(&mut cursor).any(|child| {
+        if child.kind() != "variable_assignment" {
+            return false;
+        }
+        let Some(name) = child.child_by_field_name("name") else {
+            return true;
+        };
+        name.utf8_text(src)
+            .is_ok_and(|text| crate::git_isolation::git_env_changes_authority(text))
+            || name.utf8_text(src).is_err()
+    })
+}
+
+/// True when every unreadable Git word is an operand of a subcommand whose
+/// effect is a read no matter what those words are.
+fn opaque_git_stays_read(args: &[Option<String>]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let Some(arg) = args[index].as_deref() else {
+            // An unreadable word before the subcommand can be `-c`,
+            // `--upload-pack`, or the subcommand itself.
+            return false;
+        };
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+        if let Some(separate_value) = relocation_option(arg) {
+            if separate_value {
+                index += 2;
+                if index > args.len() {
+                    return false;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        // Unknown or effect-changing globals (`-c`, `--upload-pack`) stay closed.
+        if !harmless_git_global(arg) {
+            return false;
+        }
+        index += 1;
+    }
+    args.get(index)
+        .and_then(|word| word.as_deref())
+        .is_some_and(crate::git_effects::git_read_ignores_arguments)
+}
+
+/// `Some(true)` when the relocation value is the next word. `Some(false)`
+/// when the value is attached (`--git-dir=PATH`, `-Cpath`).
+fn relocation_option(arg: &str) -> Option<bool> {
+    const NAMES: [&str; 4] = ["-C", "--git-dir", "--work-tree", "--namespace"];
+    for name in NAMES {
+        if arg == name {
+            return Some(true);
+        }
+        if name.starts_with("--") && arg.starts_with(&format!("{name}=")) {
+            return Some(false);
+        }
+    }
+    if arg.starts_with("-C") && !arg.starts_with("--") && arg.len() > 2 {
+        return Some(false);
+    }
+    None
+}
+
+fn harmless_git_global(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--no-pager"
+            | "--no-optional-locks"
+            | "--no-replace-objects"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-lazy-fetch"
+            | "--version"
+    )
 }
 
 /// Every command a program will run, with each argument resolved from the
@@ -142,6 +327,10 @@ pub struct ExecutedCommands {
     /// Shell redirections can write independently of the enumerated programs.
     /// Their authority must not inherit a Git program's metadata capability.
     pub shell_writes: bool,
+    /// An assignment on Git or a shell wrapper changes the repository or the
+    /// program (`GIT_DIR`, `GIT_SSH_COMMAND`). A credential grant resolved
+    /// from the plain argv must not cover that call.
+    pub env_prefixed: bool,
 }
 
 impl ExecutedCommands {
@@ -168,6 +357,7 @@ pub fn executed_commands(program: &str, args: &[String]) -> ExecutedCommands {
         commands: vec![command],
         complete: true,
         shell_writes: false,
+        env_prefixed: false,
     }
 }
 
@@ -190,6 +380,7 @@ fn executed_commands_in_script(script: &str) -> ExecutedCommands {
         commands: Vec::new(),
         complete: true,
         shell_writes: false,
+        env_prefixed: false,
     };
     // Redirections may live outside a command node (including redirected
     // groups), and command enumeration deliberately stops at resolved argv.
@@ -231,7 +422,23 @@ fn collect_executed(node: &Node, src: &[u8], out: &mut ExecutedCommands) {
             return;
         };
         let args = literal_arguments(node, src);
+        if command_changes_git_authority(node, src)
+            && (basename(&program) == "git" || is_shell_wrapper_program(&program))
+        {
+            out.env_prefixed = true;
+        }
         if args.iter().any(Option::is_none) {
+            // A fixed read stays that read when the missing words are only
+            // paths or revisions (`git show "$f"`). Dropping them must not
+            // make the rest of the script look unresolved. Any other
+            // unreadable Git word stays out of the granted argv.
+            if basename(&program) == "git" && opaque_git_stays_read(&args) {
+                let mut command = vec![program];
+                command.extend(args.into_iter().flatten());
+                out.commands.push(command);
+                out.complete &= !env_prefixed;
+                return;
+            }
             out.complete = false;
             return;
         }
@@ -246,6 +453,7 @@ fn collect_executed(node: &Node, src: &[u8], out: &mut ExecutedCommands) {
             let nested = executed_commands_in_script(body);
             out.complete &= nested.complete && !env_prefixed;
             out.shell_writes |= nested.shell_writes;
+            out.env_prefixed |= nested.env_prefixed;
             out.commands.extend(nested.commands);
             return;
         }
@@ -715,12 +923,20 @@ mod tests {
     fn decides_clean_scripts() {
         assert_eq!(classify_bash_script("echo hi"), Some(CommandClass::Safe));
         assert_eq!(
-            classify_bash_script("rm -rf x"),
+            classify_bash_script("rm -rf build"),
+            Some(CommandClass::Safe)
+        );
+        assert_eq!(
+            classify_bash_script("rm -rf /tmp/x"),
             Some(CommandClass::Dangerous)
         );
-        // Substitution walks inners: `rm` stays Dangerous; network-only is Safe.
         assert_eq!(
-            classify_bash_script("echo `rm x`"),
+            classify_bash_script("rm -rf \"$dir\""),
+            Some(CommandClass::Dangerous)
+        );
+        // Substitution walks inners: an outside `rm` stays Dangerous.
+        assert_eq!(
+            classify_bash_script("echo `rm /tmp/x`"),
             Some(CommandClass::Dangerous)
         );
         assert_eq!(
@@ -754,7 +970,7 @@ mod tests {
         assert_eq!(classify_bash_script("bash -c rm -rf x"), None);
         // Without trailing words the body is classified recursively.
         assert_eq!(
-            classify_bash_script("bash -c 'rm -rf x'"),
+            classify_bash_script("bash -c 'rm -rf /tmp/x'"),
             Some(CommandClass::Dangerous)
         );
         // A nested body that doesn't parse defers for the whole script.

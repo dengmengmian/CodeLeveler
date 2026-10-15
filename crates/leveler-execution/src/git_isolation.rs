@@ -111,6 +111,66 @@ pub(crate) fn effect_critical_config_key(key: &str, workspace_mutation: bool) ->
                 || key.ends_with(".vcs")))
 }
 
+/// Config or environment that makes Git run a local program, or that rebinds
+/// the repository a credential grant was resolved against.
+///
+/// Ordinary identity (`user.email`) is not in this set: it does not change
+/// which program runs or which remote is contacted.
+pub(crate) fn config_key_executes_program(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return true;
+    }
+    effect_critical_config_key(&key, true)
+        || key == "credential.helper"
+        || (key.starts_with("credential.") && key.ends_with(".helper"))
+        || key.starts_with("alias.")
+        || key == "core.editor"
+        || key == "core.pager"
+        || key == "sequence.editor"
+        || key == "core.askpass"
+        || key == "interactive.difffilter"
+        || ((key.starts_with("mergetool.") || key.starts_with("difftool."))
+            && key.ends_with(".cmd"))
+}
+
+/// `git -c <spec>` / `--config-env=<spec>`. The key is the text before the
+/// first `=`. A spec we cannot split still executes nothing we can name, so
+/// it stays closed.
+pub(crate) fn config_spec_executes_program(spec: &str) -> bool {
+    let key = spec.split_once('=').map(|(key, _)| key).unwrap_or(spec);
+    config_key_executes_program(key)
+}
+
+/// Environment assignments that change which program Git runs or which
+/// repository and config it reads. `GIT_AUTHOR_NAME` is not one of them.
+pub(crate) fn git_env_changes_authority(name: &str) -> bool {
+    matches!(
+        name,
+        "GIT_DIR"
+            | "GIT_WORK_TREE"
+            | "GIT_COMMON_DIR"
+            | "GIT_OBJECT_DIRECTORY"
+            | "GIT_NAMESPACE"
+            | "GIT_INDEX_FILE"
+            | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+            | "GIT_SSH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_SSH_VARIANT"
+            | "GIT_EXEC_PATH"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_EDITOR"
+            | "GIT_PAGER"
+            | "GIT_SEQUENCE_EDITOR"
+            | "GIT_CONFIG"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_SYSTEM"
+            | "GIT_CONFIG_COUNT"
+            | "GIT_CONFIG_PARAMETERS"
+    ) || name.starts_with("GIT_CONFIG_KEY_")
+        || name.starts_with("GIT_CONFIG_VALUE_")
+}
+
 /// Whether a parsed config activates any credential helper. An empty value
 /// resets the accumulated list, exactly as Git applies it.
 pub(crate) fn has_active_credential_helper(config: &[(&str, &str)]) -> bool {

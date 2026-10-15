@@ -57,9 +57,13 @@ fn config_display_modifiers_do_not_turn_writes_into_reads() {
     );
     assert!(
         effects.gated(),
-        "repository identity change needs authorization"
+        "repository identity change stays a config write"
     );
-    assert_eq!(classify(script), CommandClass::Dangerous);
+    assert_eq!(
+        classify(script),
+        CommandClass::Safe,
+        "setting a remote URL is a Git operation"
+    );
 }
 
 #[test]

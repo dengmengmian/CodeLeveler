@@ -232,7 +232,7 @@ In the TUI, click the footer's background summary (`↗`) to open the job list, 
 
 ## Permissions and isolation
 
-The default permission profile is `assisted`. Ordinary repository writes, builds, tests, network actions, and commands such as `git push` or package publishing may run automatically inside the available OS sandbox. Irreversible deletion, privilege escalation, and host-escape operations require approval. Use `request-approval` when you want a stricter approval boundary.
+The default permission profile is `assisted`. Ordinary repository writes, builds, tests, network actions, and commands such as `git push` or package publishing may run automatically inside the available OS sandbox. Deletion outside the workspace, a deletion whose target is not a literal relative path, privilege escalation, and host-escape operations require approval. `rm` and `rmdir` of a literal path inside the workspace run directly. Use `request-approval` when you want a stricter approval boundary.
 
 | Platform | Isolation for restricted commands |
 | --- | --- |

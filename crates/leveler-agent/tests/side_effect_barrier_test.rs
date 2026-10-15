@@ -195,6 +195,39 @@ fn chat_profile() -> leveler_agent::coding::TurnProfile {
     }
 }
 
+/// A deletion target Auto still asks about.
+///
+/// Auto runs a literal relative path inside the working directory directly, so
+/// the approval these tests exercise has to name something outside it. The
+/// harness builds its tool call before the sandbox directory exists, which is
+/// why this path is derived from the process rather than from `h.dir`.
+fn outside_scratch() -> std::path::PathBuf {
+    // A process-unique directory under the temp root, spelled ABSOLUTELY.
+    // Auto exempts the temp root for ordinary file I/O, but an explicit
+    // absolute deletion still asks — and unlike HOME this stays inside the
+    // sandbox, so the test does not depend on the host's real home directory.
+    std::env::temp_dir().join(format!("codeleveler-barrier-{}", std::process::id()))
+}
+
+/// `rm -rf <abs>`, spelled the way the host spells it.
+///
+/// The target is inside the workspace directory but spelled ABSOLUTELY: Auto
+/// exempts a literal relative path, and an absolute spelling of the same tree
+/// still asks without leaving the sandbox.
+fn remove_outside(path: &std::path::Path) -> serde_json::Value {
+    if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd",
+            "args": ["/C", "rmdir", "/s", "/q", path.to_string_lossy()],
+        })
+    } else {
+        serde_json::json!({
+            "program": "rm",
+            "args": ["-rf", path.to_string_lossy()],
+        })
+    }
+}
+
 async fn run_chat_turn(
     h: &Harness,
     log: &EventLog<'_>,
@@ -560,17 +593,12 @@ impl Approver for ApproveOnceHuman {
 async fn approval_resolution_is_durable_before_dispatch() {
     // Deleting a directory tree, spelled the way the host spells it. The
     // barrier under test is platform-neutral; `rm -rf` is not.
-    let remove_tree = if cfg!(windows) {
-        serde_json::json!({"program": "cmd", "args": ["/C", "rmdir", "/s", "/q", "scratch"]})
-    } else {
-        serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]})
-    };
+    let scratch = outside_scratch();
     let h = harness(vec![
-        tool_call("c1", "run_command", remove_tree),
+        tool_call("c1", "run_command", remove_outside(&scratch)),
         text("removed"),
     ])
     .await;
-    let scratch = h.dir.path().join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     std::fs::write(scratch.join("f.txt"), "x").unwrap();
 
@@ -612,12 +640,12 @@ async fn a_failed_approval_flush_writes_no_standing_permission() {
         tool_call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+            remove_outside(&outside_scratch()),
         ),
         text("done"),
     ])
     .await;
-    std::fs::create_dir_all(h.dir.path().join("scratch")).unwrap();
+    std::fs::create_dir_all(outside_scratch()).unwrap();
     let rules_path = leveler_execution::project_rules_path(h.dir.path());
 
     let store = FailingApprovalStore {
@@ -664,12 +692,12 @@ async fn the_log_records_each_call_s_risk_and_what_the_approval_gated() {
         tool_call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+            remove_outside(&outside_scratch()),
         ),
         text("removed"),
     ])
     .await;
-    std::fs::create_dir_all(h.dir.path().join("scratch")).unwrap();
+    std::fs::create_dir_all(outside_scratch()).unwrap();
     let log = EventLog::new(&h.db, h.session.clone());
 
     run_chat_turn(&h, &log, Arc::new(ApproveOnceHuman), "remove scratch")

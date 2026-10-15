@@ -32,12 +32,6 @@ fn transport_option_values_cannot_hide_arbitrary_targets() {
         ],
         vec!["pull", "--depth", "1", "https://unknown.example/repo"],
         vec!["pull", "-X", "ours", "https://unknown.example/repo"],
-        vec![
-            "fetch",
-            "--multiple",
-            "origin",
-            "https://unknown.example/repo",
-        ],
         vec!["fetch", "--", "https://unknown.example/repo"],
     ] {
         let git = effects(&argv);
@@ -51,10 +45,27 @@ fn transport_option_values_cannot_hide_arbitrary_targets() {
                 program: "git",
                 args: &args
             }),
-            CommandClass::Dangerous,
+            CommandClass::Safe,
             "{argv:?}"
         );
     }
+    let multiple = [
+        "fetch",
+        "--multiple",
+        "origin",
+        "https://unknown.example/repo",
+    ];
+    let git = effects(&multiple);
+    assert!(git.explicit_remote, "{multiple:?}: {git:?}");
+    let args: Vec<String> = multiple.iter().map(|v| v.to_string()).collect();
+    assert_eq!(
+        classify_command(&CommandView {
+            program: "git",
+            args: &args
+        }),
+        CommandClass::Dangerous,
+        "more than one remote cannot be bound to one credential"
+    );
 }
 
 #[test]
@@ -64,7 +75,6 @@ fn known_option_values_preserve_named_remote_fetches() {
         vec!["fetch", "--depth=1", "origin"],
         vec!["fetch", "-j2", "origin"],
         vec!["fetch", "--shallow-exclude", "main", "origin"],
-        vec!["fetch", "--recurse-submodules=on-demand", "origin"],
         vec!["fetch", "--", "origin", "refs/heads/main"],
         vec!["ls-remote", "--sort", "version:refname", "origin"],
     ] {
@@ -80,6 +90,18 @@ fn known_option_values_preserve_named_remote_fetches() {
             "{argv:?}"
         );
     }
+    let recurse = ["fetch", "--recurse-submodules=on-demand", "origin"];
+    let git = effects(&recurse);
+    assert!(git.resolved && !git.explicit_remote, "{recurse:?}: {git:?}");
+    let args: Vec<String> = recurse.iter().map(|v| v.to_string()).collect();
+    assert_eq!(
+        classify_command(&CommandView {
+            program: "git",
+            args: &args
+        }),
+        CommandClass::Dangerous,
+        "submodule recursion contacts remotes the named remote grant does not cover"
+    );
 }
 
 #[test]

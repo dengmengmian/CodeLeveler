@@ -19,9 +19,10 @@
 //! Fail-closed rules, because a permission verdict that guesses is worse than
 //! one that asks:
 //!
-//! - an unknown subcommand, or a global option that injects configuration or
-//!   relocates the program Git executes (`-c`, `--config-env`, `--exec-path`),
-//!   marks the invocation unresolved, so it is gated and never auto-widened;
+//! - an unknown subcommand, or a global option that injects a program Git
+//!   executes (`-c core.hooksPath=…`, `--exec-path`), marks the invocation
+//!   unresolved, so it is never auto-widened. A `-c` key that only sets
+//!   identity (`user.email`) stays resolved: it does not change the effect;
 //! - a global option that only moves the TARGET (`-C`, `--git-dir`,
 //!   `--work-tree`, `--namespace`) is tracked separately: the subcommand's
 //!   effects still hold, so a read stays allowed while a write can never be
@@ -187,16 +188,17 @@ impl CallGitEffects {
             && !self.effects.irreversible
     }
 
-    /// An effect that must be approved before it runs, whatever the profile:
-    /// a change to the checkout's state or to repository identity, a remote
-    /// side effect, irreversible history loss, an unreadable invocation, or a
-    /// sync against a remote the repository does not configure (the model
-    /// would otherwise pick the target).
+    /// An effect that is more than a pure repository-metadata write.
     ///
-    /// A pure repository-metadata write that changes neither (`git fetch`,
-    /// `git add`, `git commit`) is deliberately NOT gated: it is the shape
-    /// the profile already permits, and the metadata scope it runs with comes
-    /// from [`Self::needs_repository_write_scope`].
+    /// This is capability accounting, not the Auto ask. Auto allows every Git
+    /// operation and asks only for deletion, privilege, and security (a local
+    /// program, an unbrokered credential target, a write outside the
+    /// workspace). `gated` still stops an unresolved or relocated write from
+    /// being treated as an ordinary metadata update.
+    ///
+    /// A pure repository-metadata write (`git fetch`, `git add`, `git commit`)
+    /// is deliberately NOT gated. The metadata scope it runs with comes from
+    /// [`Self::needs_repository_write_scope`].
     ///
     /// Relocation is not a reason to ask by itself. `git -C <dir> status` and
     /// `git --git-dir=<dir> log` move the TARGET of a read that the profile
@@ -300,10 +302,10 @@ pub fn git_command_effects(args: &[String]) -> Option<GitCommandEffects> {
     };
     let mut effects = classify_subcommand(&parsed.subcommand, &parsed.args);
     if parsed.rule_override {
-        // `git -c key=value …` / `--config-env` / `--exec-path` changes the
-        // rules the invocation runs under — configuration that can name a
-        // program Git will execute. The effect is no longer readable, so never
-        // auto-widen on it.
+        // `--exec-path`, `--super-prefix`, or a `-c` key that names a program
+        // (`core.hooksPath`, `alias.*`, a credential helper). The effect is
+        // no longer the subcommand's effect. A benign `-c user.email=…` does
+        // not set this flag.
         effects.resolved = false;
     }
     if parsed.target_relocation {
@@ -345,7 +347,43 @@ pub fn git_grant_selection(args: &[String]) -> Option<GitGrantSelection> {
             remote_name: None,
         });
     }
-    if !matches!(parsed.subcommand.as_str(), "fetch" | "ls-remote" | "push") {
+    if parsed.subcommand == "archive" {
+        let transport = transport_arguments("archive", &parsed.args);
+        if !transport.resolved {
+            return None;
+        }
+        let target = transport.archive_remote?;
+        if target.is_empty() || remote_text_is_explicit(target) {
+            return None;
+        }
+        return Some(GitGrantSelection {
+            effects: effects.effects,
+            remote_name: Some(target.to_string()),
+        });
+    }
+    if parsed.subcommand == "remote" {
+        let mut rest = parsed
+            .args
+            .iter()
+            .filter(|arg| !matches!(arg.as_str(), "-v" | "--verbose"));
+        if rest.next().map(String::as_str) != Some("show")
+            || parsed.args.iter().any(|arg| arg == "-n")
+        {
+            return None;
+        }
+        let name = rest.next()?;
+        if name.starts_with('-') || names_explicit_remote(&[name]) {
+            return None;
+        }
+        return Some(GitGrantSelection {
+            effects: effects.effects,
+            remote_name: Some(name.clone()),
+        });
+    }
+    if !matches!(
+        parsed.subcommand.as_str(),
+        "fetch" | "ls-remote" | "push" | "pull"
+    ) {
         return None;
     }
     let transport = transport_arguments(&parsed.subcommand, &parsed.args);
@@ -365,6 +403,162 @@ pub fn git_grant_selection(args: &[String]) -> Option<GitGrantSelection> {
         effects: effects.effects,
         remote_name: Some((*name).clone()),
     })
+}
+
+/// The one explicit URL or path a transport command names, when that target
+/// is not a configured remote. `None` when the command has no single explicit
+/// target (`git fetch origin`, `git fetch --all`, a local Git command).
+pub(crate) fn single_explicit_remote_target(args: &[String]) -> Option<String> {
+    if args.first()?.as_str() != "git" {
+        return None;
+    }
+    let parsed = split_subcommand(&args[1..])?;
+    let target = match parsed.subcommand.as_str() {
+        "clone" => parsed
+            .args
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .map(String::as_str),
+        "fetch" | "ls-remote" | "push" | "pull" => {
+            let transport = transport_arguments(&parsed.subcommand, &parsed.args);
+            if !transport.resolved || transport.multiple || transport.positional.len() != 1 {
+                return None;
+            }
+            Some(transport.positional[0].as_str())
+        }
+        "archive" => {
+            let transport = transport_arguments("archive", &parsed.args);
+            if !transport.resolved {
+                return None;
+            }
+            transport.archive_remote
+        }
+        "remote" => {
+            let mut rest = parsed
+                .args
+                .iter()
+                .filter(|arg| !matches!(arg.as_str(), "-v" | "--verbose"));
+            if rest.next().map(String::as_str) != Some("show") {
+                return None;
+            }
+            rest.next().map(String::as_str)
+        }
+        _ => None,
+    }?;
+    remote_text_is_explicit(target).then(|| target.to_string())
+}
+
+/// Git will execute a local program: a transport override, `--exec-path`, a
+/// program-bearing `-c` key, or `git config` of such a key.
+pub(crate) fn git_argv_executes_local_program(argv: &[String]) -> bool {
+    if argv.first().map(String::as_str) != Some("git") {
+        return false;
+    }
+    let args = &argv[1..];
+    if args.iter().any(|arg| {
+        const FLAGS: [&str; 4] = ["--upload-pack", "--receive-pack", "--exec", "--exec-path"];
+        FLAGS
+            .iter()
+            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+    }) {
+        return true;
+    }
+    if config_overrides_execute_program(args) {
+        return true;
+    }
+    split_subcommand(args).is_some_and(|parsed| {
+        parsed.subcommand == "config" && config_command_executes_program(&parsed.args)
+    })
+}
+
+/// A remote Git command whose credential cannot be bound to one configured
+/// remote or one explicit URL. `--all`, an unreadable transport option, and
+/// a remote subcommand we cannot name stay here. A bare `git fetch` (default
+/// upstream) does not: that shape already ran without a credential binding.
+pub(crate) fn git_remote_credential_unbrokered(argv: &[String]) -> bool {
+    let Some(effects) = git_command_effects(argv) else {
+        return false;
+    };
+    if !effects.effects.remote_read && !effects.effects.remote_write {
+        return false;
+    }
+    if !effects.resolved {
+        return true;
+    }
+    if git_grant_selection(argv).is_some_and(|selection| selection.remote_name.is_some()) {
+        return false;
+    }
+    if single_explicit_remote_target(argv).is_some() {
+        return false;
+    }
+    let Some(parsed) = split_subcommand(&argv[1..]) else {
+        return true;
+    };
+    if matches!(
+        parsed.subcommand.as_str(),
+        "fetch" | "pull" | "push" | "ls-remote"
+    ) {
+        let special = parsed.args.iter().any(|arg| {
+            matches!(arg.as_str(), "--all" | "--stdin" | "--multiple" | "-m")
+                || arg.starts_with("--recurse-submodules")
+        });
+        if special {
+            return true;
+        }
+        let transport = transport_arguments(&parsed.subcommand, &parsed.args);
+        if transport.positional.is_empty() {
+            return false;
+        }
+    }
+    true
+}
+
+fn config_overrides_execute_program(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" || !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+        if arg == "-c" || arg == "--config-env" {
+            let spec = args.get(index + 1).map(String::as_str).unwrap_or("");
+            if crate::git_isolation::config_spec_executes_program(spec) {
+                return true;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(spec) = arg.strip_prefix("--config-env=") {
+            if crate::git_isolation::config_spec_executes_program(spec) {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        if arg.starts_with("-c") && !arg.starts_with("--") && arg.len() > 2 {
+            if crate::git_isolation::config_spec_executes_program(&arg[2..]) {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn config_command_executes_program(args: &[String]) -> bool {
+    let reads = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--get" | "--get-all" | "--get-regexp" | "--get-urlmatch" | "--list" | "-l"
+        )
+    });
+    if reads {
+        return false;
+    }
+    match args.iter().find(|arg| !arg.starts_with('-')) {
+        Some(key) => crate::git_isolation::config_key_executes_program(key),
+        None => true,
+    }
 }
 
 struct ParsedInvocation {
@@ -406,18 +600,37 @@ fn split_subcommand(args: &[String]) -> Option<ParsedInvocation> {
             i += if *name == arg { 2 } else { 1 };
             continue;
         }
-        // Options that inject configuration or change where Git looks for its
-        // own subcommands. They can name a program Git executes, so the effect
-        // is no longer readable: reported as overrides and never
-        // auto-widened. Both spellings (`--config-env X`, `--config-env=X`)
-        // count.
-        const OVERRIDES: [&str; 4] = ["-c", "--config-env", "--exec-path", "--super-prefix"];
-        if let Some(name) = OVERRIDES.iter().find(|name| {
-            arg == *name || name.starts_with("--") && arg.starts_with(&format!("{name}="))
-        }) {
+        // `-c` / `--config-env` inject configuration. Only a key that can name
+        // a program (hooks, alias, credential helper, transport) makes the
+        // effect unreadable. `user.email` does not.
+        if arg == "-c" || arg == "--config-env" {
+            let spec = args.get(i + 1).map(String::as_str).unwrap_or("");
+            if crate::git_isolation::config_spec_executes_program(spec) {
+                rule_override = true;
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(spec) = arg.strip_prefix("--config-env=") {
+            if crate::git_isolation::config_spec_executes_program(spec) {
+                rule_override = true;
+            }
+            i += 1;
+            continue;
+        }
+        // `--exec-path` replaces the Git binary. `--super-prefix` is an
+        // internal relocation of how subcommands are found.
+        if arg == "--exec-path"
+            || arg.starts_with("--exec-path=")
+            || arg == "--super-prefix"
+            || arg.starts_with("--super-prefix=")
+        {
             rule_override = true;
-            // A long option in `=` form carries its value in the same word.
-            i += if *name == arg { 2 } else { 1 };
+            i += if arg == "--exec-path" || arg == "--super-prefix" {
+                2
+            } else {
+                1
+            };
             continue;
         }
         if arg == "--shallow-file" || arg.starts_with("--shallow-file=") {
@@ -433,7 +646,9 @@ fn split_subcommand(args: &[String]) -> Option<ParsedInvocation> {
         }
         if arg.starts_with("-c") && !arg.starts_with("--") && arg.len() > 2 {
             // `-c<key>=<value>`: the short option with its value attached.
-            rule_override = true;
+            if crate::git_isolation::config_spec_executes_program(&arg[2..]) {
+                rule_override = true;
+            }
             i += 1;
             continue;
         }
@@ -463,6 +678,53 @@ fn split_subcommand(args: &[String]) -> Option<ParsedInvocation> {
     })
 }
 
+/// Subcommands whose effect stays a read no matter which path, revision, or
+/// display flag follows. An unreadable word in that position cannot turn the
+/// command into a write, so approval does not fail closed on it.
+pub(crate) fn git_read_ignores_arguments(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "status"
+            | "diff"
+            | "log"
+            | "show"
+            | "rev-parse"
+            | "rev-list"
+            | "ls-files"
+            | "ls-tree"
+            | "cat-file"
+            | "describe"
+            | "blame"
+            | "annotate"
+            | "shortlog"
+            | "whatchanged"
+            | "grep"
+            | "merge-base"
+            | "cherry"
+            | "name-rev"
+            | "show-ref"
+            | "for-each-ref"
+            | "verify-commit"
+            | "verify-tag"
+            | "check-ignore"
+            | "check-attr"
+            | "check-ref-format"
+            | "count-objects"
+            | "var"
+            | "version"
+            | "help"
+            | "range-diff"
+            | "diff-tree"
+            | "diff-index"
+            | "diff-files"
+            | "verify-pack"
+            | "merge-tree"
+            | "get-tar-commit-id"
+            | "fsck"
+            | "format-patch"
+    )
+}
+
 /// The one place Git's subcommand vocabulary is written down.
 fn classify_subcommand(subcommand: &str, args: &[String]) -> GitCommandEffects {
     let read = GitEffects {
@@ -489,14 +751,8 @@ fn classify_subcommand(subcommand: &str, args: &[String]) -> GitCommandEffects {
 
     match subcommand {
         // ---- reads --------------------------------------------------------
-        "status" | "diff" | "log" | "show" | "rev-parse" | "rev-list" | "ls-files" | "ls-tree"
-        | "cat-file" | "describe" | "blame" | "annotate" | "shortlog" | "whatchanged" | "grep"
-        | "merge-base" | "cherry" | "name-rev" | "show-ref" | "for-each-ref" | "verify-commit"
-        | "verify-tag" | "check-ignore" | "check-attr" | "check-ref-format" | "count-objects"
-        | "var" | "version" | "help" | "range-diff" | "diff-tree" | "diff-index" | "diff-files"
-        | "verify-pack" | "merge-tree" | "get-tar-commit-id" | "fsck" => {
-            GitCommandEffects::resolved(read)
-        }
+        // Effect does not depend on the operands. See [`git_read_ignores_arguments`].
+        sub if git_read_ignores_arguments(sub) => GitCommandEffects::resolved(read),
 
         // `reflog` reads; only its rewriting subcommands are writes.
         "reflog" => match args.first().map(String::as_str) {
@@ -671,9 +927,8 @@ fn classify_subcommand(subcommand: &str, args: &[String]) -> GitCommandEffects {
         // Changing the sparse cone rewrites which files are checked out.
         "sparse-checkout" => GitCommandEffects::resolved(workspace),
 
-        // `send-email` publishes outside this machine; `archive` and
-        // `format-patch` only write new files under the workspace the profile
-        // already permits.
+        // `send-email` publishes outside this machine. `archive` reads unless
+        // it names a remote; `format-patch` is a fixed read above.
         "send-email" => GitCommandEffects::resolved(GitEffects {
             metadata_read: true,
             remote_write: true,
@@ -692,8 +947,6 @@ fn classify_subcommand(subcommand: &str, args: &[String]) -> GitCommandEffects {
             }
             out
         }
-        "format-patch" => GitCommandEffects::resolved(read),
-
         // Object pruning deletes unreachable history outright.
         "prune" => GitCommandEffects::resolved(GitEffects {
             metadata_write: true,
@@ -807,15 +1060,23 @@ fn classify_subcommand(subcommand: &str, args: &[String]) -> GitCommandEffects {
         }
 
         // ---- working-tree mutations --------------------------------------
-        "merge" | "rebase" | "cherry-pick" | "revert" | "am" | "apply" | "bisect" => {
+        // `merge` and an ordinary branch checkout are reversible development.
+        // They record metadata the way `commit` does, and do not ask. Force,
+        // or `--` (discard the named paths), still destroys uncommitted work.
+        "merge" => GitCommandEffects::resolved(metadata),
+        "rebase" | "cherry-pick" | "revert" | "am" | "apply" | "bisect" => {
             GitCommandEffects::resolved(workspace)
         }
         "checkout" | "switch" => {
             let forced = has("-f") || has("--force") || args.iter().any(|a| a == "--");
-            GitCommandEffects::resolved(GitEffects {
-                irreversible: forced,
-                ..workspace
-            })
+            if forced {
+                GitCommandEffects::resolved(GitEffects {
+                    irreversible: true,
+                    ..workspace
+                })
+            } else {
+                GitCommandEffects::resolved(metadata)
+            }
         }
         // `reset` without `--hard` rewrites the index; `--hard` also discards
         // uncommitted working-tree changes.
@@ -1103,6 +1364,11 @@ fn transport_option(subcommand: &str, name: &str) -> Option<TransportOption> {
 /// This is the whole "trusted remote" test available to a sandbox: a name is
 /// resolved by Git from the repository's own configuration, while a URL or
 /// path is chosen by whoever wrote the command line.
+fn remote_text_is_explicit(value: &str) -> bool {
+    let owned = value.to_string();
+    names_explicit_remote(&[&owned])
+}
+
 fn names_explicit_remote(positional: &[&String]) -> bool {
     let Some(first) = positional.first() else {
         return false;
@@ -1158,7 +1424,8 @@ mod grant_selection_tests {
     fn unknown_targets_overrides_and_multiple_transports_are_not_reusable() {
         for command in [
             vec!["git", "fetch", "https://example.com/repo"],
-            vec!["git", "-c", "x=y", "fetch", "origin"],
+            vec!["git", "-c", "core.hooksPath=/tmp/evil", "fetch", "origin"],
+            vec!["git", "-c", "alias.fetch=!evil", "fetch", "origin"],
             vec!["git", "fetch", "--multiple", "origin", "other"],
             vec!["git", "fetch", "--recurse-submodules", "origin"],
             vec!["git", "push", "--receive-pack=evil", "origin"],
@@ -1166,5 +1433,10 @@ mod grant_selection_tests {
         ] {
             assert!(selection(&command).is_none(), "{command:?}");
         }
+        let benign = selection(&["git", "-c", "user.email=a@b", "fetch", "origin"]).unwrap();
+        assert_eq!(benign.remote_name.as_deref(), Some("origin"));
+        let pull = selection(&["git", "pull", "origin"]).unwrap();
+        assert_eq!(pull.remote_name.as_deref(), Some("origin"));
+        assert!(pull.effects.remote_read);
     }
 }

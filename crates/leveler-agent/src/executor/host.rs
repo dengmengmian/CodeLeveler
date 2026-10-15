@@ -1832,7 +1832,7 @@ mod authorize_tests {
         let exec = executor_sharing_any(dir.path(), &session, approver.clone());
         let action = call(
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/x"]}),
         );
         let mut session_approved = HashSet::new();
         let mut pending_always = None;
@@ -1873,7 +1873,7 @@ mod authorize_tests {
         let exec = executor_sharing_any(dir.path(), &session, approver.clone());
         let action = call(
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/x"]}),
         );
         let mut session_approved = HashSet::new();
         let mut pending_always = None;
@@ -2151,14 +2151,13 @@ mod authorize_tests {
         );
     }
 
-    /// `rm -rf …` classifies dangerous (irreversible destruction), so Assisted
-    /// always asks for it. (`git push`, `git reset --hard` and `git clean -fd`
-    /// ask too, through their own Git effects.)
+    /// Deletion outside the working directory still asks. A literal relative
+    /// `rm` does not, so approval-persistence tests use an absolute target.
     fn rm_rf_call() -> ToolCall {
         ToolCall {
             id: ToolCallId::new("c"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/scratch"]}),
         }
     }
 
@@ -2283,7 +2282,7 @@ mod authorize_tests {
         assert_eq!(set.rules().len(), 1);
         assert_eq!(
             set.rules()[0].match_.command_exact.as_deref(),
-            Some("rm -rf scratch")
+            Some("rm -rf /tmp/scratch")
         );
 
         // A fresh session set is auto-allowed by the live rule set — the
@@ -2296,7 +2295,7 @@ mod authorize_tests {
         assert_eq!(approver.asks(), 1);
 
         let mut changed = rm_rf_call();
-        changed.arguments["args"] = serde_json::json!(["-rf", "other"]);
+        changed.arguments["args"] = serde_json::json!(["-rf", "/tmp/other"]);
         executor
             .authorize(&changed, &mut fresh_session)
             .await
@@ -2383,7 +2382,7 @@ mod authorize_tests {
         let script = ToolCall {
             id: ToolCallId::new("c"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "sh", "args": ["-c", "rm -rf x"]}),
+            arguments: serde_json::json!({"program": "sh", "args": ["-c", "rm -rf /tmp/x"]}),
         };
         executor.authorize(&script, &mut session).await.unwrap();
         assert_eq!(approver.asks(), 1);
@@ -2415,7 +2414,7 @@ mod authorize_tests {
         let other = ToolCall {
             id: ToolCallId::new("c2"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "sh", "args": ["-c", "rm -rf y"]}),
+            arguments: serde_json::json!({"program": "sh", "args": ["-c", "rm -rf /tmp/y"]}),
         };
         executor.authorize(&other, &mut fresh).await.unwrap();
         assert_eq!(approver.asks(), 2, "a variant must not ride the exact rule");
@@ -2499,11 +2498,11 @@ mod authorize_tests {
         let call = ToolCall {
             id: ToolCallId::new("c"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "x"], "cwd": "src"}),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/x"], "cwd": "src"}),
         };
         executor.authorize(&call, &mut session).await.unwrap();
         let request = approver.last_request().unwrap();
-        assert_eq!(request.command.as_deref(), Some("rm -rf x"));
+        assert_eq!(request.command.as_deref(), Some("rm -rf /tmp/x"));
         assert_eq!(request.paths, vec![std::path::PathBuf::from("src")]);
     }
 
@@ -2540,7 +2539,7 @@ mod authorize_tests {
         let call = ToolCall {
             id: ToolCallId::new("c"),
             name: "shell_command".to_string(),
-            arguments: serde_json::json!({"cmd": "rm -rf src/main.rs && ls src/"}),
+            arguments: serde_json::json!({"cmd": "rm -rf /tmp/x && ls src/"}),
         };
         executor.authorize(&call, &mut session).await.unwrap();
         assert_eq!(
@@ -2551,9 +2550,8 @@ mod authorize_tests {
 
     #[tokio::test]
     async fn a_destructive_command_is_labelled_destructive() {
-        // The policy already classifies `rm -rf` as dangerous to decide that it
-        // needs asking. The prompt the user reads must say so too, otherwise a
-        // file deletion looks exactly as harmless as `ls`.
+        // A deletion outside the working directory still asks. The prompt the
+        // user reads must say it is destructive, otherwise it looks like `ls`.
         let dir = tempfile::tempdir().unwrap();
         let approver = Arc::new(FixedApprover::new(ApprovalDecision::ApproveOnce));
         let executor = executor_for(dir.path(), approver.clone());
@@ -2562,7 +2560,7 @@ mod authorize_tests {
         let call = ToolCall {
             id: ToolCallId::new("c"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/x"]}),
         };
         executor.authorize(&call, &mut session).await.unwrap();
         assert_eq!(
@@ -2603,7 +2601,7 @@ mod authorize_tests {
         let call = ToolCall {
             id: ToolCallId::new("c"),
             name: "run_command".to_string(),
-            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "x"]}),
+            arguments: serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/x"]}),
         };
         executor.authorize(&call, &mut session).await.unwrap();
         let summary = approver.last_request().unwrap().description;
@@ -2706,6 +2704,9 @@ mod authorize_tests {
             vec!["status"],
             vec!["fetch", "origin"],
             vec!["commit", "-m", "normal"],
+            vec!["push", "origin", "HEAD"],
+            vec!["reset", "--hard"],
+            vec!["clean", "-fd"],
         ] {
             let action = call(
                 "run_command",
@@ -2716,18 +2717,20 @@ mod authorize_tests {
                 "{args:?}"
             );
         }
-        for args in [
-            vec!["push", "origin", "HEAD"],
-            vec!["reset", "--hard"],
-            vec!["clean", "-fd"],
+        // Git no longer asks. Deletion outside the working directory, privilege,
+        // and Git that runs a local program still do.
+        for (program, args) in [
+            ("rm", vec!["-rf", "/tmp/outside"]),
+            ("sudo", vec!["true"]),
+            ("git", vec!["-c", "core.hooksPath=/tmp/evil", "status"]),
         ] {
             let action = call(
                 "run_command",
-                serde_json::json!({"program":"git","args":args}),
+                serde_json::json!({"program":program,"args":args}),
             );
             assert!(
                 matches!(resolve(&exec, &action).await, PolicyResolution::Ask(_)),
-                "{args:?}"
+                "{program} {args:?}"
             );
         }
         assert_eq!(approver.asks(), 0, "resolution does not invoke approval");
@@ -2988,31 +2991,58 @@ mod authorize_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn resource_shell_wrapped_git_keeps_exact_call_approval() {
+    async fn shell_wrapped_git_resolves_the_same_remote_grant() {
         let dir = tempfile::tempdir().unwrap();
         resource_repo(dir.path());
         let nested = dir.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
         resource_repo(&nested);
         let exec = resource_executor(dir.path(), PermissionProfile::Assisted, true);
-        // A shell command is opaque: it cannot consume a frozen Git target, so it
-        // never offers one, whatever workdir it names.
-        for arguments in [
-            serde_json::json!({"cmd":"git push origin main","workdir":"nested"}),
-            serde_json::json!({"cmd":"git push origin main"}),
+        // A resolvable shell script is the same remote as the direct command, so
+        // a stored credential still binds. The workdir selects which repository.
+        for (arguments, root) in [
+            (
+                serde_json::json!({"cmd":"git push origin main","workdir":"nested"}),
+                nested.as_path(),
+            ),
+            (
+                serde_json::json!({"cmd":"git push origin main"}),
+                dir.path(),
+            ),
         ] {
             let action = call("shell_command", arguments);
-            assert!(
-                exec.registry
-                    .get("shell_command")
-                    .unwrap()
-                    .command_grant_request(&action.arguments, &exec.tool_context)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "a shell-wrapped Git command must keep exact-call approval"
-            );
+            let grant = exec
+                .registry
+                .get("shell_command")
+                .unwrap()
+                .command_grant_request(&action.arguments, &exec.tool_context)
+                .await
+                .unwrap()
+                .expect("a named remote in a shell still resolves a grant");
+            let direct = leveler_execution::resolve_git_grant(
+                "git",
+                &["push".into(), "origin".into(), "main".into()],
+                root,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(grant, direct);
         }
+        let opaque = call(
+            "shell_command",
+            serde_json::json!({"cmd":"git fetch $REMOTE"}),
+        );
+        assert!(
+            exec.registry
+                .get("shell_command")
+                .unwrap()
+                .command_grant_request(&opaque.arguments, &exec.tool_context)
+                .await
+                .unwrap()
+                .is_none(),
+            "an unreadable remote cannot be bound to a grant"
+        );
         // The argv tool still resolves its target against the directory it runs in.
         let action = call(
             "run_command",
@@ -3056,6 +3086,9 @@ mod authorize_tests {
 
     /// Unix only: a reusable Git grant needs the object-incarnation proof the
     /// execution layer can only produce there; Windows keeps exact-call approval.
+    ///
+    /// A public push auto-runs. A stored credential for that host still asks,
+    /// and the offer is only the configured remote.
     #[cfg(unix)]
     #[tokio::test]
     async fn resource_git_consumers_offer_only_the_approved_remote() {
@@ -3070,26 +3103,53 @@ mod authorize_tests {
                 "run_command",
                 serde_json::json!({"program":"git","args":args}),
             );
-            match resolve(&exec, &action).await {
+            let grant = match resolve(&exec, &action).await {
+                PolicyResolution::Allow(_) => exec
+                    .registry
+                    .get("run_command")
+                    .unwrap()
+                    .command_grant_request(&action.arguments, &exec.tool_context)
+                    .await
+                    .unwrap()
+                    .expect("a named public remote still resolves a grant"),
                 PolicyResolution::Ask(pending) => {
-                    let grant = pending
-                        .request
-                        .grant
-                        .as_ref()
-                        .expect("a dangerous Git remote action offers its approved target");
-                    assert!(grant.bindings.iter().any(|binding| matches!(
-                        &binding.resource,
-                        leveler_core::ResourceIdentity::ConfiguredRemote { .. }
-                    )));
                     assert!(
                         pending
                             .request
                             .decisions()
-                            .contains(&ApprovalDecision::ApproveProject)
+                            .contains(&ApprovalDecision::ApproveProject),
+                        "a stored credential offers project reuse of this remote"
                     );
+                    pending
+                        .request
+                        .grant
+                        .expect("a stored credential offers the approved remote")
                 }
-                other => panic!("a dangerous Git push must ask: {other:?}"),
-            }
+                other => {
+                    panic!("a public Git push is allowed or asks for its credential: {other:?}")
+                }
+            };
+            assert!(
+                Executor::execution_bound_request(&grant),
+                "only an execution-bound remote can be reused"
+            );
+            let remotes: Vec<_> = grant
+                .bindings
+                .iter()
+                .filter_map(|binding| match &binding.resource {
+                    leveler_core::ResourceIdentity::ConfiguredRemote {
+                        remote_name,
+                        canonical_url,
+                        ..
+                    } => Some((remote_name.as_str(), canonical_url.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                remotes,
+                vec![("origin", "https://example.com/a.git")],
+                "{args:?}"
+            );
         }
     }
 
@@ -3597,9 +3657,11 @@ mod authorize_tests {
         assert_eq!(store.writes.load(Ordering::SeqCst), 0);
         assert_eq!(approver.asks(), 0);
         drop(admitted);
+        // A public push auto-runs. A deletion outside the working directory
+        // still asks, and a denial still refuses it without writing a grant.
         let dangerous = call(
             "run_command",
-            serde_json::json!({"program":"git","args":["push","origin","main"]}),
+            serde_json::json!({"program":"rm","args":["-rf","/tmp/leveler-poison-outside"]}),
         );
         let result = executor
             .admit(

@@ -146,8 +146,10 @@ pub(crate) async fn git_read(
     String::from_utf8(output.stdout).map_err(|_| "Git resource query returned non-UTF8 data".into())
 }
 
-/// Resolve reusable grants only for completely attributable Git-only calls.
-/// Opaque scripts and process-local configuration retain exact-call approval.
+/// Resolve reusable grants for Git commands whose remote can be named.
+/// A non-Git sibling or a shell redirect does not drop the binding. An
+/// environment prefix that rebinds the repository, or a remote we cannot
+/// name, keeps exact-call approval.
 pub async fn resolve_git_grant(
     program: &str,
     args: &[String],
@@ -163,23 +165,39 @@ pub async fn resolve_git_grant_with_environment(
     cwd: &Path,
     environment: &EnvSnapshot,
 ) -> Result<Option<GrantRequest>, String> {
-    // Only a directly invoked, effect-parseable remote command can consume a
-    // frozen target. Shell wrappers and opaque scripts keep exact-call approval.
-    if crate::git_isolation::git_remote_operation(program, args).is_none() {
-        return Ok(None);
-    }
+    // Shell redirects must not inherit Git's metadata scope; that is an
+    // effect decision. They also must not hide a resolvable remote from the
+    // credential broker. An authority-changing environment prefix
+    // (`GIT_DIR`, `GIT_SSH_COMMAND`) makes the resolved repository the wrong
+    // one, so it keeps exact-call approval.
     let commands = crate::executed_commands(program, args);
-    if !commands.complete || commands.shell_writes || commands.commands.is_empty() {
+    if commands.commands.is_empty() || commands.env_prefixed {
         return Ok(None);
     }
-    let Some(selections) = commands
-        .commands
-        .iter()
-        .map(|args| crate::git_effects::git_grant_selection(args))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let mut selections = Vec::new();
+    let mut explicit_urls = Vec::new();
+    let mut saw_remote = false;
+    for command in &commands.commands {
+        if command.first().map(String::as_str) != Some("git") {
+            continue;
+        }
+        let remote = crate::git_effects::git_command_effects(command)
+            .is_some_and(|effects| effects.effects.remote_read || effects.effects.remote_write);
+        if let Some(selection) = crate::git_effects::git_grant_selection(command) {
+            if selection.remote_name.is_some() {
+                saw_remote = true;
+            }
+            selections.push(selection);
+        } else if let Some(url) = crate::git_effects::single_explicit_remote_target(command) {
+            saw_remote = true;
+            explicit_urls.push(url);
+        } else if remote {
+            return Ok(None);
+        }
+    }
+    if !saw_remote {
         return Ok(None);
-    };
+    }
     // Inherited process overrides must not silently change Git's config or root.
     if inherited_git_overrides(environment) {
         return Ok(None);
@@ -365,6 +383,36 @@ pub async fn resolve_git_grant_with_environment(
             }
         }
     }
+    // An explicit https URL is not a configured remote, so it has no
+    // ConfiguredRemote binding. When that host has a stored credential, the
+    // use still has to be approved. A public URL adds nothing and does not ask.
+    for raw in explicit_urls {
+        let Some((canonical_url, transport)) = canonical_remote_url(&raw) else {
+            continue;
+        };
+        let Some(host) = url::Url::parse(&canonical_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+        else {
+            continue;
+        };
+        if let Ok(Some(material)) =
+            crate::credential::fill_http_credential(&host, &transport, environment).await
+        {
+            push_binding(
+                &mut bindings,
+                GrantBinding {
+                    capability: Capability::CredentialUse,
+                    resource: ResourceIdentity::Credential {
+                        project: project_identity.clone(),
+                        host,
+                        identity: material.identity(),
+                        transport,
+                    },
+                },
+            );
+        }
+    }
     if bindings.is_empty() {
         return Ok(None);
     }
@@ -508,22 +556,33 @@ mod tests {
         assert_ne!(push.bindings, force.bindings);
         for args in [
             vec!["fetch", "https://example.com/two.git"],
-            vec!["-c", "x=y", "fetch", "origin"],
+            vec!["-c", "core.hooksPath=/tmp/evil", "fetch", "origin"],
             vec!["fetch", "--all"],
             vec!["fetch", "missing"],
         ] {
             assert!(request(dir.path(), &args).await.is_none());
         }
-        assert!(
-            resolve_git_grant(
-                "sh",
-                &["-c".into(), "git fetch origin; echo extra".into()],
-                dir.path()
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
+        let mixed = resolve_git_grant(
+            "sh",
+            &["-c".into(), "git fetch origin; echo extra".into()],
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mixed, Some(read.clone()));
+        let wrapped_push = resolve_git_grant(
+            "sh",
+            &["-c".into(), "git push origin main".into()],
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrapped_push, Some(push.clone()));
+        let wrapped =
+            resolve_git_grant("sh", &["-c".into(), "git fetch origin".into()], dir.path())
+                .await
+                .unwrap();
+        assert_eq!(wrapped, Some(read.clone()));
         assert!(
             resolve_git_grant("sh", &["-c".into(), "git fetch $REMOTE".into()], dir.path())
                 .await

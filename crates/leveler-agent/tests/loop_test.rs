@@ -761,7 +761,7 @@ async fn auto_reviewer_can_deny_before_user_approval() {
         assistant_tool_call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/leveler-review-deny"]}),
         ),
         assistant_text("stopped"),
     ]));
@@ -1399,12 +1399,12 @@ async fn dangerous_command_denied_is_fed_back_not_executed() {
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
 
-    // The model tries `rm -rf` (dangerous); after the denial it gives up.
+    // The model tries to delete outside the workspace; after the denial it gives up.
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", "/tmp/scratch"]}),
         ),
         assistant_text("Understood, I will not delete it."),
     ]));
@@ -7108,8 +7108,10 @@ async fn minimal_policy_keeps_the_admission_boundary() {
         "leveler-agent-minimal-admit-{}",
         std::process::id() as u64 * 13 + 9
     ));
-    std::fs::create_dir_all(dir.join("scratch")).unwrap();
-    std::fs::write(dir.join("scratch/f.txt"), "x").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let outside =
+        std::env::temp_dir().join(format!("leveler-minimal-outside-{}", std::process::id()));
+    std::fs::write(&outside, "x").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
@@ -7118,7 +7120,7 @@ async fn minimal_policy_keeps_the_admission_boundary() {
         assistant_tool_call(
             "c1",
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["-rf", "scratch"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", outside.display().to_string()]}),
         ),
         assistant_text("understood"),
     ]));
@@ -7145,36 +7147,44 @@ async fn minimal_policy_keeps_the_admission_boundary() {
         .unwrap();
 
     assert!(
-        dir.join("scratch").exists(),
+        outside.exists(),
         "policy switches must never bypass approval: the deletion ran"
     );
 
     std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&outside).ok();
 }
 
-/// A real TUI run under the "auto" (Assisted) profile deleted a file with no
-/// approval prompt. The classifier and `ApprovalPolicy::evaluate` both say a
-/// deletion must be gated there, so this drives the REAL executor to find out
-/// which layer actually decides — and to keep it decided.
+/// Assisted runs `rm` of a literal path in the working directory, and still
+/// asks before a deletion it cannot place there. AutoDeny refuses only the
+/// second call, so the outside file must survive.
 #[tokio::test]
-async fn assisted_gates_a_shell_deletion_before_it_runs() {
+async fn assisted_runs_a_workdir_deletion_and_gates_one_outside_it() {
     let dir = std::env::temp_dir().join(format!(
         "leveler-agent-assisted-rm-{}",
         std::process::id() as u64 * 13 + 11
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let canary = dir.join("CANARY.txt");
-    std::fs::write(&canary, "must survive a denied deletion\n").unwrap();
+    std::fs::write(&canary, "removed by an allowed workspace rm\n").unwrap();
+    let outside =
+        std::env::temp_dir().join(format!("leveler-assisted-outside-{}", std::process::id()));
+    std::fs::write(&outside, "must survive\n").unwrap();
 
     let workspace = Workspace::new(&dir).unwrap();
-    // The profile the TUI shows as `auto`.
     let tool_context = ToolContext::new(workspace, PermissionProfile::Assisted);
     let registry = Arc::new(default_registry());
+    let outside_cmd = format!("rm -rf {}", outside.display());
     let runtime = Arc::new(MockRuntime::new(vec![
         assistant_tool_call(
             "c1",
             "shell_command",
-            serde_json::json!({"cmd": "rm CANARY.txt && ls -la"}),
+            serde_json::json!({"cmd": "rm CANARY.txt"}),
+        ),
+        assistant_tool_call(
+            "c2",
+            "shell_command",
+            serde_json::json!({"cmd": outside_cmd}),
         ),
         assistant_text("understood"),
     ]));
@@ -7200,11 +7210,16 @@ async fn assisted_gates_a_shell_deletion_before_it_runs() {
         .unwrap();
 
     assert!(
-        canary.exists(),
-        "assisted must ask before a deletion; a denied `rm` still removed the file"
+        !canary.exists(),
+        "a literal rm in the working directory must run without approval"
+    );
+    assert!(
+        outside.exists(),
+        "a deletion outside the working directory must stay behind approval"
     );
 
     std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(&outside).ok();
 }
 
 // ── R006 R6-P1: harness-policy refusals must not become a stagnation kill ───
