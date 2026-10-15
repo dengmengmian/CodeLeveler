@@ -218,7 +218,12 @@ impl Gate {
                     } else {
                         let frame = if asking.load(std::sync::atomic::Ordering::SeqCst) {
                             let arguments = serde_json::json!({
-                                "program": "rm", "args": ["scratch.txt"], "reason": "clean up"
+                                // Absolute: Auto and Restricted both run a literal
+                                // relative deletion inside the workspace directly, so only
+                                // a target outside it still produces an approval.
+                                "program": "rm",
+                                "args": ["-rf", outside_path()],
+                                "reason": "clean up"
                             });
                             serde_json::json!({"choices": [{
                                 "delta": {"tool_calls": [{
@@ -708,12 +713,17 @@ async fn a_failed_execution_releases_the_session() {
     assert_eq!(w.owner().await.boot, Some(w.b.boot()));
 }
 
+/// A deletion target that still requires an approval.
+fn outside_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("codeleveler-ownership-{}", std::process::id()))
+}
+
 /// Waiting on a human is still the execution: while A's turn waits for an
 /// approval, B is refused and nothing moves.
 #[tokio::test]
 async fn an_execution_awaiting_approval_keeps_the_session() {
     let w = windows_with(PermissionProfile::RequestApproval).await;
-    std::fs::write(w._tmp.path().join("scratch.txt"), "x").unwrap();
+    std::fs::create_dir_all(outside_path()).unwrap();
     w.gate.ask_for_approval();
     w.gate.release_turn();
     let mut events = w.a.client.subscribe();

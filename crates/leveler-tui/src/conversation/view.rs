@@ -36,6 +36,10 @@ pub struct ConvKey {
     /// focus is active. Part of the key because focus paints the row's opener
     /// (§11), and a cache that did not notice would keep two rows marked.
     pub(crate) focused_command: Option<leveler_client_protocol::ToolCallId>,
+    /// Whether an open clarification card owns the live question. Part of the
+    /// key because it paints a transcript ROW (§35): the running call's row
+    /// stops restating the question while the card is asking it.
+    pub(crate) question_card_open: bool,
 }
 
 /// One memoized conversation build: cache key, wrapped lines, the disclosure

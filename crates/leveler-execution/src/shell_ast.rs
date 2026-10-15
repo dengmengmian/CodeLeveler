@@ -234,8 +234,7 @@ fn command_changes_git_authority(cmd: &Node, src: &[u8]) -> bool {
             return true;
         };
         name.utf8_text(src)
-            .is_ok_and(|text| crate::git_isolation::git_env_changes_authority(text))
-            || name.utf8_text(src).is_err()
+            .map_or(true, crate::git_isolation::git_env_changes_authority)
     })
 }
 

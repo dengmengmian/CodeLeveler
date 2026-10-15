@@ -345,6 +345,8 @@ pub fn item_render(
                 None,
                 &mut Vec::new(),
                 None,
+                // Scrollback is a finished session: no card is open over it.
+                false,
             ));
         }
         // Scrollback: the agent is finished, so no live elapsed is shown (0).
@@ -631,9 +633,9 @@ pub(crate) fn turn_end_marker(
     match block.status {
         TurnEndStatus::Completed => (format!("✓ {}", t.turn_end_completed), theme.status.success),
         // A clean turn that ended with an answer, not with a completion
-        // declaration. Saying "任务已完成" here would assert a goal terminal the
-        // runtime never received — the model's own text may still say the work
-        // is unfinished.
+        // declaration. The status names the turn's own end state — the answer
+        // arrived — so it leads the receipt while still not claiming that the
+        // task is done.
         TurnEndStatus::Answered => (format!("✓ {}", t.turn_end_answered), theme.status.success),
         TurnEndStatus::CompletedWithWarnings | TurnEndStatus::Truncated => (
             format!("⚠ {}", t.final_completed_warnings),
@@ -652,6 +654,63 @@ pub(crate) fn turn_end_marker(
     }
 }
 
+/// This turn's own receipt, joined with ` · `.
+///
+/// Clock, duration, model steps, tool count, and the provider usage summed
+/// for this turn. Nothing here is the footer window gauge (`N%/1M`) or the
+/// latest-prompt cache chip. A zero count is omitted: it is not a measurement.
+///
+/// The tool-count string in the catalog already carries a leading separator,
+/// because other rows append it to a label. Here it may stand alone.
+fn turn_receipt_stats(block: &TurnEndBlock, t: &crate::i18n::UiText) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(hm) = &block.ended_hm {
+        let hm = hm.trim();
+        if !hm.is_empty() {
+            parts.push(hm.to_string());
+        }
+    }
+    if block.elapsed_secs > 0 {
+        parts.push(crate::status_line::fmt_elapsed(block.elapsed_secs));
+    }
+    if block.rounds > 0 {
+        parts.push(t.turn_rounds.replacen("{}", &block.rounds.to_string(), 1));
+    }
+    if block.tool_calls > 0 {
+        let raw = t
+            .tool_calls_n
+            .replacen("{}", &block.tool_calls.to_string(), 1);
+        let piece = raw.trim_start_matches([' ', '·']).trim();
+        if !piece.is_empty() {
+            parts.push(piece.to_string());
+        }
+    }
+    let tokens = block.input_tokens.saturating_add(block.output_tokens);
+    if tokens > 0 {
+        parts.push(t.turn_tokens.replacen(
+            "{}",
+            &crate::status_line::fmt_tokens_compact(tokens),
+            1,
+        ));
+    }
+    if block.input_tokens > 0 && block.cached_tokens > 0 {
+        let pct = (u64::from(block.cached_tokens) * 100 / u64::from(block.input_tokens)).min(100);
+        parts.push(t.turn_cache.replacen("{}", &pct.to_string(), 1));
+    }
+    if matches!(
+        block.status,
+        TurnEndStatus::Completed
+            | TurnEndStatus::CompletedWithWarnings
+            | TurnEndStatus::Answered
+            | TurnEndStatus::NoFinalAnswer
+    ) && let Some(summary) = &block.summary
+        && !summary.is_empty()
+    {
+        parts.push(summary.clone());
+    }
+    parts.join(" · ")
+}
+
 fn turn_end_lines(
     block: &TurnEndBlock,
     theme: &Theme,
@@ -659,71 +718,59 @@ fn turn_end_lines(
     out: &mut Vec<Line<'static>>,
     t: &crate::i18n::UiText,
 ) {
-    // The marker reads as `symbol + status word` (colored by outcome) followed
-    // by muted stats.
+    // A per-turn receipt, marked like the reference closer. Every terminal
+    // state leads with its own status word; an answered turn's word says only
+    // that the answer arrived, not that the task is done. Neither stretches a
+    // rule to the edge of the terminal.
     let (label, color) = turn_end_marker(block, theme, t);
-    let mut stats = String::new();
-    if matches!(
-        block.status,
-        TurnEndStatus::Completed
-            | TurnEndStatus::CompletedWithWarnings
-            | TurnEndStatus::Answered
-            | TurnEndStatus::NoFinalAnswer
-    ) {
-        if block.tool_calls > 0 {
-            stats.push_str(
-                &t.tool_calls_n
-                    .replacen("{}", &block.tool_calls.to_string(), 1),
-            );
-        }
-        if block.elapsed_secs > 0 {
-            stats.push_str(&format!(
-                " · {}",
-                crate::status_line::fmt_elapsed(block.elapsed_secs)
-            ));
-        }
-        if let Some(summary) = &block.summary {
-            stats.push_str(&format!(" · {summary}"));
-        }
-    }
-    // Incomplete reasons stay on the marker only while they fit there.
-    // The old rule compared the reason against the full width and so appended
-    // a medium one to a line already carrying the tool count and elapsed — the
-    // border then clipped it mid-word, with nothing under it to read.
-    let lead = "── ";
+    let mut stats = turn_receipt_stats(block, t);
+    let star = "* ";
     let mut detail_below = false;
     if let Some(detail) = &block.detail {
         let d = localized_turn_detail(detail, t);
         if !d.is_empty() {
-            // ` · ` plus the reason, and the marker still needs a rule after it.
-            let room = width
-                .saturating_sub(UnicodeWidthStr::width(lead))
-                .saturating_sub(UnicodeWidthStr::width(label.as_str()))
-                .saturating_sub(UnicodeWidthStr::width(stats.as_str()))
-                .saturating_sub(3 + 4);
+            let prefix = UnicodeWidthStr::width(star)
+                + if label.is_empty() {
+                    UnicodeWidthStr::width(stats.as_str())
+                } else if stats.is_empty() {
+                    UnicodeWidthStr::width(label.as_str())
+                } else {
+                    UnicodeWidthStr::width(label.as_str())
+                        + 3
+                        + UnicodeWidthStr::width(stats.as_str())
+                };
+            let room = width.saturating_sub(prefix).saturating_sub(3);
             if UnicodeWidthStr::width(d) <= room {
-                stats.push_str(" · ");
+                if !stats.is_empty() {
+                    stats.push_str(" · ");
+                }
                 stats.push_str(d);
             } else {
                 detail_below = true;
             }
         }
     }
-    let used = UnicodeWidthStr::width(lead)
-        + UnicodeWidthStr::width(label.as_str())
-        + UnicodeWidthStr::width(stats.as_str())
-        + 1;
-    let tail = "─".repeat(width.saturating_sub(used));
-    out.push(Line::from(vec![
-        Span::styled(lead, Style::default().fg(theme.border.normal)),
-        Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(stats, Style::default().fg(theme.text.secondary)),
-        Span::styled(format!(" {tail}"), Style::default().fg(theme.border.normal)),
-    ]));
-    // A reason the marker had no room for is readable under it, in full.
+    let secondary = Style::default().fg(theme.text.secondary);
+    if label.is_empty() {
+        if !stats.is_empty() {
+            out.push(Line::from(Span::styled(
+                format!("{star}{stats}"),
+                secondary,
+            )));
+        }
+    } else {
+        let mut spans = vec![
+            Span::styled(star.to_string(), secondary),
+            Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !stats.is_empty() {
+            spans.push(Span::styled(format!(" · {stats}"), secondary));
+        }
+        out.push(Line::from(spans));
+    }
     if detail_below && let Some(detail) = &block.detail {
         for line in wrap(
             localized_turn_detail(detail, t),
@@ -2187,6 +2234,11 @@ mod tests {
             elapsed_secs: 0,
             summary: None,
             detail: detail.map(str::to_string),
+            ended_hm: None,
+            rounds: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
         });
         item_render(&item, &theme, 120, false, t)
             .iter()
@@ -2213,6 +2265,11 @@ mod tests {
             elapsed_secs: 439,
             summary: Some("验证 ✓".into()),
             detail: Some(reason.to_string()),
+            ended_hm: None,
+            rounds: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
         });
         let lines: Vec<String> = item_render(&item, &theme, 120, false, t)
             .iter()
@@ -2238,9 +2295,16 @@ mod tests {
         let answered = turn_end_text(TurnEndStatus::Answered, None);
         assert!(
             answered.contains("✓ 回答结束"),
-            "an answered turn is not a completion claim: {answered}"
+            "an answered turn leads with its own status: {answered}"
         );
-        assert!(!answered.contains("任务已完成"), "{answered}");
+        assert!(
+            !answered.contains("任务已完成"),
+            "an answered turn names the turn's end, not a task verdict: {answered}"
+        );
+        assert!(
+            !answered.contains('─'),
+            "the receipt is not a section rule: {answered}"
+        );
         let truncated = turn_end_text(TurnEndStatus::Truncated, Some("context limit"));
         assert!(truncated.contains("⚠ 已完成，但有警告"), "{truncated}");
         // Budget/loop/stall incompletes read as "未完成", not the old "被阻塞".
@@ -2262,14 +2326,86 @@ mod tests {
             elapsed_secs: 5,
             summary: None,
             detail: Some("boom".into()),
+            ended_hm: None,
+            rounds: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
         });
         let lines = item_render(&item, &theme, 80, false, t);
         assert_eq!(lines.len(), 1);
-        // lead border / label / stats / tail: stats must not take the status color.
+        let text = line_text(&lines[0]);
+        assert!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()) < 80,
+            "the receipt does not fill the row: {text:?}"
+        );
+        assert!(!text.contains('─'), "{text}");
+        // Verdict keeps the status color. Stats, including the reason, do not.
         let stats = &lines[0].spans[2];
         assert!(stats.content.contains("boom"), "{stats:?}");
+        assert!(stats.content.contains("2 次工具"), "{stats:?}");
         assert_eq!(stats.style.fg, Some(theme.text.secondary), "{stats:?}");
         assert_eq!(lines[0].spans[1].style.fg, Some(theme.status.error));
+        assert_eq!(lines[0].spans[0].content.as_ref(), "* ");
+    }
+
+    #[test]
+    fn an_answered_turn_leads_with_its_status_and_then_the_stats() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let item = TranscriptItem::TurnEnd(TurnEndBlock {
+            status: TurnEndStatus::Answered,
+            tool_calls: 13,
+            elapsed_secs: 486,
+            summary: None,
+            detail: None,
+            ended_hm: Some("14:04".into()),
+            rounds: 2,
+            input_tokens: 3_000,
+            output_tokens: 530,
+            // 2970 / 3000 = 99%. This is the turn's own cache, not N%/1M.
+            cached_tokens: 2_970,
+        });
+        let lines = item_render(&item, &theme, 120, false, t);
+        assert_eq!(lines.len(), 1);
+        let text = line_text(&lines[0]);
+        assert_eq!(
+            text.trim(),
+            "* ✓ 回答结束 · 14:04 · 8m 06s · 2 轮 · 13 次工具 · 3.5k tokens · 本轮缓存 99%"
+        );
+        assert!(!text.contains("%/"), "not the window gauge: {text}");
+        // The status word takes the verdict accent; the receipt stays secondary.
+        assert_eq!(lines[0].spans[0].content.as_ref(), "* ");
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.text.secondary));
+        assert_eq!(lines[0].spans[1].content.as_ref(), "✓ 回答结束");
+        assert_eq!(lines[0].spans[1].style.fg, Some(theme.status.success));
+        assert_eq!(lines[0].spans[2].style.fg, Some(theme.text.secondary));
+        assert!(lines[0].spans[2].content.starts_with(" · "), "{text}");
+    }
+
+    /// A short chat still closes on this turn's clock, duration and steps.
+    /// A bare "1s" is not a separator, and a window percentage is not this turn.
+    #[test]
+    fn a_short_answer_closes_on_this_turn_not_the_window() {
+        let theme = Theme::default();
+        let t = Locale::Zh.text();
+        let item = TranscriptItem::TurnEnd(TurnEndBlock {
+            status: TurnEndStatus::Answered,
+            tool_calls: 0,
+            elapsed_secs: 1,
+            summary: None,
+            detail: None,
+            ended_hm: Some("14:24".into()),
+            rounds: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+        });
+        let lines = item_render(&item, &theme, 80, false, t);
+        let text = line_text(&lines[0]);
+        assert_eq!(text.trim(), "* ✓ 回答结束 · 14:24 · 1s · 1 轮");
+        assert!(!text.contains("缓存"), "{text}");
+        assert!(!text.contains("%/"), "{text}");
     }
 
     fn sub_agent(id: &str, nickname: &str, status: ToolStatus) -> crate::transcript::SubAgentBlock {

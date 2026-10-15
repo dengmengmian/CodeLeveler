@@ -396,6 +396,12 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.token_input = input_tokens;
             state.token_output = output_tokens;
             state.token_cached = cached_input_tokens;
+            // The fields above stay the last request (status line, footer).
+            // The receipt sums the whole turn, so a later request cannot
+            // replace an earlier one and a new turn cannot inherit this one.
+            state.turn_input_tokens = state.turn_input_tokens.saturating_add(input_tokens);
+            state.turn_output_tokens = state.turn_output_tokens.saturating_add(output_tokens);
+            state.turn_cached_tokens = state.turn_cached_tokens.saturating_add(cached_input_tokens);
             // These describe the request that JUST finished (`↑` prompt, `↓`
             // output). They are deliberately not copied into the window gauge:
             // a finished request is not the next request's projection, and the
@@ -489,12 +495,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             state.transcript.push_failure(block);
             let summary = turn_end_summary(state, TurnEndStatus::Failed);
             archive_active_plan(state);
-            state.transcript.push_turn_end(
+            state.transcript.push_turn_end_with_receipt(
                 TurnEndStatus::Failed,
                 state.turn_tool_calls,
                 state.elapsed_secs,
                 summary,
                 None,
+                turn_receipt(state),
             );
             state.turn_diff_files = None;
         }
@@ -516,12 +523,13 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             let summary = turn_end_summary(state, TurnEndStatus::Cancelled);
             archive_active_plan(state);
             state.turn_diff_files = None;
-            state.transcript.push_turn_end(
+            state.transcript.push_turn_end_with_receipt(
                 TurnEndStatus::Cancelled,
                 state.turn_tool_calls,
                 state.elapsed_secs,
                 summary,
                 None,
+                turn_receipt(state),
             );
             seal_analysis_segment(state);
             state.notification = Some(Notification {
@@ -1140,6 +1148,24 @@ fn dismiss_resolved_interaction(
         .retain(|pending| !matches_resolved(pending));
 }
 
+/// Snapshot of the turn that is about to close. Every number is this turn's
+/// own: the clock on screen, the steps and tools it ran, and the provider
+/// usage summed since the turn started. The footer window gauge is a
+/// different measurement and is not copied here.
+fn turn_receipt(state: &AppState) -> crate::transcript::TurnReceipt {
+    let ended_hm = {
+        let label = state.clock_label.trim();
+        (!label.is_empty()).then(|| label.to_string())
+    };
+    crate::transcript::TurnReceipt {
+        ended_hm,
+        rounds: state.transcript.current_turn_rounds(),
+        input_tokens: state.turn_input_tokens,
+        output_tokens: state.turn_output_tokens,
+        cached_tokens: state.turn_cached_tokens,
+    }
+}
+
 fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<String>) {
     state.status = RuntimeStatus::Idle;
     state.finalization_stage = None;
@@ -1193,12 +1219,13 @@ fn finish_turn(state: &mut AppState, status: TurnEndStatus, detail: Option<Strin
     let summary = turn_end_summary(state, status);
     archive_active_plan(state);
     state.turn_diff_files = None;
-    state.transcript.push_turn_end(
+    state.transcript.push_turn_end_with_receipt(
         status,
         state.turn_tool_calls,
         state.elapsed_secs,
         summary,
         detail,
+        turn_receipt(state),
     );
     if status != TurnEndStatus::Cancelled
         && let Some(handoff) = handoff
@@ -1468,6 +1495,9 @@ pub(super) fn start_turn(state: &mut AppState) {
     // "recently finished" window; the footer never shows them. A still-running
     // one (a dev server) stays reachable too.
     state.turn_tool_calls = 0;
+    state.turn_input_tokens = 0;
+    state.turn_output_tokens = 0;
+    state.turn_cached_tokens = 0;
     state.status = RuntimeStatus::Busy;
     state.resumable_task = false;
     state.finalization_stage = None;
@@ -1721,6 +1751,9 @@ fn apply_session_with(
         state.token_input = 0;
         state.token_output = 0;
         state.token_cached = 0;
+        state.turn_input_tokens = 0;
+        state.turn_output_tokens = 0;
+        state.turn_cached_tokens = 0;
         state.project_rule_sources.clear();
         state.background_task_labels.clear();
         seal_analysis_segment(state);

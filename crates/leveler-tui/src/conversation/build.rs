@@ -96,6 +96,7 @@ impl AppState {
             elapsed_secs: self.elapsed_secs,
             fold_version: self.conv.fold_version,
             focused_command: self.focused_command().cloned(),
+            question_card_open: self.question_card_open(),
         };
         if let Some((k, lines, hits, commands, anchor, starts, sources)) =
             self.conv.cache.borrow().as_ref()
@@ -384,6 +385,7 @@ fn build_conversation(
                         state.focused_command(),
                         &mut rows,
                         Some(&state.conv.process_folds.borrow()),
+                        state.question_card_open(),
                     ));
                     for row in rows {
                         commands.push(super::view::CommandHit {

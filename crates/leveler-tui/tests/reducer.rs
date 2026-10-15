@@ -1953,8 +1953,12 @@ fn an_approval_request_names_the_gated_command_in_its_prompt() {
     );
     let waiting = rendered(&mut s, 120, 40);
     assert!(
-        waiting.contains("等待审批"),
+        waiting.contains("仅允许本次") && waiting.contains("可能造成破坏性变更"),
         "the prompt must say what is being gated: {waiting}"
+    );
+    assert!(
+        !waiting.contains("等待审批"),
+        "the card is the wait: {waiting}"
     );
     assert!(
         waiting.contains("rm -rf stale"),
@@ -1970,7 +1974,7 @@ fn an_approval_request_names_the_gated_command_in_its_prompt() {
     );
     let allowed = rendered(&mut s, 120, 40);
     assert!(
-        !allowed.contains("等待审批"),
+        !allowed.contains("仅允许本次"),
         "nothing is waiting once it is answered: {allowed}"
     );
     assert!(
@@ -2397,9 +2401,8 @@ fn answer_end_is_distinct_from_verified_task_completion() {
 
 /// The bad-dogfood regression at the client: a turn that ended with the model's
 /// own text — which itself said the work was unfinished and left the plan open —
-/// must not render the completion verdict "✓ 任务已完成". The answer marker
-/// reports what happened (the model answered), not a goal terminal the runtime
-/// never received.
+/// must not render the completion verdict "✓ 任务已完成". The receipt leads with
+/// the turn's own end state ("✓ 回答结束"), never with a task verdict.
 #[test]
 fn an_answered_turn_with_an_open_plan_does_not_claim_task_completion() {
     let mut s = busy_state();
@@ -2415,7 +2418,7 @@ fn an_answered_turn_with_an_open_plan_does_not_claim_task_completion() {
     let zh = leveler_tui::Locale::Zh.text();
     assert!(
         screen.contains(zh.turn_end_answered),
-        "the marker must say the model answered: {screen}"
+        "the turn's own end state is named: {screen}"
     );
     assert!(
         !screen.contains(zh.turn_end_completed),

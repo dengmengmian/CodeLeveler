@@ -634,3 +634,188 @@ fn visual_stage_timeline() {
     println!("\n╔══════ stage timeline 88x30 ══════╗");
     print!("{}", screen_dump(&mut s, 88, 30));
 }
+
+/// Manual harness for the interaction cards: the approval prompt, a
+/// single-choice question (with the running call row above it), a
+/// multi-question clarification, and a free-text question. Rendered with a
+/// coloured theme, because the point is the visual weight of the rule, the
+/// cursor and the input lane.
+///   cargo test -p leveler-tui --test visual_dump visual_interaction_cards -- --ignored --nocapture
+#[test]
+#[ignore = "manual visual harness; run with --ignored --nocapture"]
+fn visual_interaction_cards() {
+    use leveler_client_protocol::{
+        ApprovalId, ClarificationId, ClarificationQuestionKind, ToolCallId, UiApprovalRequest,
+        UiClarificationQuestion, UiClarificationRequest, UiRole,
+    };
+    use leveler_tui::overlay::{ApprovalOverlay, ClarificationOverlay, Overlay};
+
+    fn colored() -> AppState {
+        let mut s = opened();
+        s.theme = Theme::dark();
+        s
+    }
+    fn ask(s: &mut AppState, id: &str, question: &str, options: &[&str]) {
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::ToolCallStarted {
+                id: ToolCallId::new(id),
+                name: "request_user_input".into(),
+                arguments: serde_json::json!({
+                    "question": question,
+                    "options": options,
+                })
+                .to_string(),
+                parallel: false,
+                model_step: None,
+                answer_effect: None,
+            }),
+        );
+    }
+    fn user(s: &mut AppState, text: &str) {
+        reduce(
+            s,
+            Action::Runtime(RuntimeEvent::UserMessageAdded {
+                message: leveler_client_protocol::UiMessage {
+                    id: MessageId::new("u1"),
+                    role: UiRole::User,
+                    text: text.into(),
+                    ordinal: None,
+                    kind: None,
+                    images: 0,
+                },
+            }),
+        );
+    }
+
+    // 1. Approval: the command is the thing being judged, so it is on screen.
+    let mut s = colored();
+    user(&mut s, "推送一下");
+    s.overlay = Some(Overlay::Approval(Box::new(ApprovalOverlay::new(
+        UiApprovalRequest {
+            grant: None,
+            requires_human_consent: false,
+            id: ApprovalId::new("r1"),
+            tool: "shell_command".into(),
+            summary: String::new(),
+            command: Some("git push origin main".into()),
+            risks: vec!["将访问网络".into(), "修改远端仓库 origin".into()],
+            call_id: None,
+            always_persists: true,
+        },
+    ))));
+    println!("\n╔══════ approval card 100x24 ══════╗");
+    print!("{}", screen_dump(&mut s, 100, 24));
+    assert!(s.overlay.is_some());
+
+    // 2. Single choice, with the running call row above the card.
+    let question = "选择框弹出来了——上一条「弹个窗户」你想让我开哪个？";
+    let options = [
+        "CodeLeveler Web UI（浏览器窗口）",
+        "新终端窗口，运行 TUI",
+        "本机目录（Finder 窗口）",
+        "只是测试，什么都不用开",
+    ];
+    let mut s = colored();
+    user(&mut s, "弹个窗户");
+    ask(&mut s, "t1", question, &options);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ClarificationRequested {
+            request: UiClarificationRequest::single(
+                ClarificationId::new("c1"),
+                question,
+                options.iter().map(|o| (*o).to_string()).collect(),
+            ),
+        }),
+    );
+    println!("\n╔══════ single choice, live 100x24 ══════╗");
+    print!("{}", screen_dump(&mut s, 100, 24));
+    assert!(s.overlay.is_some());
+
+    // 3. Multi question: the tab strip says where you are, the card asks the
+    //    question you are on.
+    let mut s = colored();
+    user(&mut s, "配置一下");
+    ask(&mut s, "t2", "需要你的选择", &[]);
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ClarificationRequested {
+            request: UiClarificationRequest {
+                id: ClarificationId::new("c2"),
+                question: "需要你的选择".into(),
+                options: Vec::new(),
+                questions: vec![
+                    UiClarificationQuestion {
+                        header: "数据策略".into(),
+                        question: "未配置时不回退，还是保留 demo fallback？".into(),
+                        kind: ClarificationQuestionKind::Multi,
+                        options: vec![
+                            "保留 demo fallback".into(),
+                            "删除全部 mock".into(),
+                            "保持现状".into(),
+                        ],
+                        allow_other: true,
+                        min_choices: 1,
+                        max_choices: None,
+                    },
+                    UiClarificationQuestion {
+                        header: "验证范围".into(),
+                        question: "要跑哪些测试？".into(),
+                        kind: ClarificationQuestionKind::Multi,
+                        options: vec!["单元测试".into(), "TUI 测试".into()],
+                        allow_other: false,
+                        min_choices: 0,
+                        max_choices: None,
+                    },
+                ],
+            },
+        }),
+    );
+    println!("\n╔══════ multi question, live 100x24 ══════╗");
+    print!("{}", screen_dump(&mut s, 100, 24));
+    assert!(s.overlay.is_some());
+
+    // 4. A picker the user opened themselves: the same rule, its own title.
+    let mut s = colored();
+    user(&mut s, "切一下模型");
+    s.overlay = Some(Overlay::ModelPicker(Box::new(
+        leveler_tui::overlay::SelectionModel::new(
+            "选择模型",
+            vec![
+                leveler_tui::overlay::SelectionOption::new("deepseek/v3", "deepseek/v3")
+                    .current(true),
+                leveler_tui::overlay::SelectionOption::new("glm/5", "glm/5").recommended(true),
+                leveler_tui::overlay::SelectionOption::new("kimi/k2", "kimi/k2"),
+            ],
+            false,
+        ),
+    )));
+    println!("\n╔══════ model picker 100x24 ══════╗");
+    print!("{}", screen_dump(&mut s, 100, 24));
+    assert!(s.overlay.is_some());
+
+    // 5. Free text: the answer's own plane, with the caret on it.
+    let mut s = colored();
+    user(&mut s, "补个信息");
+    ask(&mut s, "t3", "把日志发我", &[]);
+    let mut ov = ClarificationOverlay::new(UiClarificationRequest {
+        id: ClarificationId::new("c3"),
+        question: "把日志发我".into(),
+        options: Vec::new(),
+        questions: vec![UiClarificationQuestion {
+            header: "补充要求".into(),
+            question: "把日志发我".into(),
+            kind: ClarificationQuestionKind::Text,
+            options: Vec::new(),
+            allow_other: false,
+            min_choices: 0,
+            max_choices: None,
+        }],
+    });
+    ov.insert_text("runtime handover 之后");
+    s.overlay = Some(Overlay::Clarification(Box::new(ov)));
+    println!("\n╔══════ free text, live 100x24 ══════╗");
+    print!("{}", screen_dump(&mut s, 100, 24));
+    assert!(s.overlay.is_some());
+}

@@ -222,8 +222,24 @@ fn draw_rule(frame: &mut Frame, area: Rect, theme: &Theme) {
 pub(crate) fn main_status_spans(state: &AppState, width: usize) -> Vec<Span<'static>> {
     if (state.is_busy() || status_phase(state) == StatusPhase::AwaitingUser)
         && let Some(line) = status_lines(state, width).into_iter().next()
+        && !line.spans.is_empty()
     {
         return line.spans;
+    }
+    // An interrupting card lives on Main, and the strip is deliberately silent
+    // there because the card is the wait itself. This surface has no card, so
+    // it is the one that has to name the wait — otherwise a side thread would
+    // report the main task as idle while the runtime is blocked on the user.
+    if status_phase(state) == StatusPhase::AwaitingUser
+        && let Some(hint) = state
+            .overlay
+            .as_ref()
+            .and_then(|overlay| overlay.status_hint(state.t()))
+    {
+        return vec![Span::styled(
+            hint,
+            Style::default().fg(state.theme.status.warning),
+        )];
     }
     if state.status == leveler_client_protocol::RuntimeStatus::Error {
         return vec![Span::styled(
@@ -232,20 +248,28 @@ pub(crate) fn main_status_spans(state: &AppState, width: usize) -> Vec<Span<'sta
         )];
     }
     if let Some(block) = state.transcript.last_turn_end() {
-        // The compact verdict only: the transcript divider's rule decoration is
-        // not header material. Same wording mapping as the divider itself.
+        // Same wording as the transcript receipt: the status names the turn's
+        // own end state, so the header reads it too.
         let (label, color) = crate::render::turn_end_marker(block, &state.theme, state.t());
-        let mut text = label;
-        if block.elapsed_secs > 0 {
-            text.push_str(&format!(
-                " · {}",
-                crate::status_line::fmt_elapsed(block.elapsed_secs)
-            ));
+        let verdict = !label.is_empty();
+        let elapsed = if block.elapsed_secs > 0 {
+            crate::status_line::fmt_elapsed(block.elapsed_secs)
+        } else {
+            String::new()
+        };
+        let text = match (verdict, elapsed.is_empty()) {
+            (false, true) => String::new(),
+            (false, false) => elapsed,
+            (true, true) => label,
+            (true, false) => format!("{label} · {elapsed}"),
+        };
+        if !text.is_empty() {
+            let mut style = Style::default().fg(color);
+            if verdict {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            return vec![Span::styled(text, style)];
         }
-        return vec![Span::styled(
-            text,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )];
     }
     vec![Span::styled(
         state.t().btw_main_idle,

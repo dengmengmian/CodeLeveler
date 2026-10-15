@@ -171,11 +171,17 @@ fn a_multi_question_request_shows_tabs_with_current_and_pending_states() {
     let mut s = state();
     open(&mut s, three_questions());
     let frame = rendered(&mut s, 100, 30);
-    // One header, two ends: what is being asked, and that it is waiting on the
-    // user. Per-question progress is the tab marks below, not a second accent
-    // line above the field.
+    // The rule cuts the card off the conversation. The title says what is
+    // being asked. Per-question progress is the tab marks, not a "waiting" label.
     assert!(frame.contains("◇ 需要澄清"), "headline missing:\n{frame}");
-    assert!(frame.contains("等待选择"), "wait state missing:\n{frame}");
+    assert!(
+        frame.contains("────"),
+        "the decision needs a top rule:\n{frame}"
+    );
+    assert!(
+        !frame.contains("等待选择"),
+        "the card is the wait:\n{frame}"
+    );
     for header in ["数据策略", "验证范围", "未登录态"] {
         assert!(frame.contains(header), "tab {header} missing:\n{frame}");
     }
@@ -595,4 +601,118 @@ fn a_narrow_terminal_still_renders_numbered_options() {
             "the number survives at {w}x{h}:\n{frame}"
         );
     }
+}
+
+/// The live question is stated ONCE.
+///
+/// A running `询问 …` call row and the card below it both printed the same
+/// sentence — the reported duplication — and the status strip printed it a
+/// third time. The card owns the live question: it is pinned under the
+/// conversation and cannot scroll away, while the row above it is one line from
+/// the same question and the strip said it again.
+#[test]
+fn the_live_question_is_stated_once() {
+    let mut s = state();
+    let question = "选择框弹出来了——上一条「弹个窗户」你想让我开哪个？";
+    let options = [
+        "CodeLeveler Web UI（浏览器窗口）",
+        "新终端窗口，运行 TUI",
+        "本机目录（Finder 窗口）",
+        "只是测试，什么都不用开",
+    ];
+    let arguments = serde_json::json!({
+        "question": question,
+        "options": options,
+    })
+    .to_string();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "request_user_input".into(),
+            arguments,
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        }),
+    );
+    open(
+        &mut s,
+        UiClarificationRequest::single(
+            ClarificationId::new("c1"),
+            question,
+            options.iter().map(|o| (*o).to_string()).collect(),
+        ),
+    );
+
+    let frame = rendered(&mut s, 100, 30);
+    assert_eq!(
+        frame.matches(question).count(),
+        1,
+        "the question is asked once:\n{frame}"
+    );
+    assert!(
+        frame
+            .lines()
+            .any(|line| line.contains(&format!("◇ 需要澄清  {question}"))),
+        "the card's own row carries it:\n{frame}"
+    );
+    assert!(
+        !frame.contains(&format!("询问  {question}")),
+        "the running call's row restates the question:\n{frame}"
+    );
+    // The row still says what is running, and the card still lists the choices.
+    assert!(frame.contains("询问"), "{frame}");
+    for option in options {
+        assert!(frame.contains(option), "{option} is missing:\n{frame}");
+    }
+    assert!(
+        frame.contains('❯'),
+        "the focus cursor is on screen:\n{frame}"
+    );
+}
+
+/// History keeps the question: it is the row's, not the card's to own once the
+/// answer lands. A replayed session never reopens a card, so a row that dropped
+/// it would lose the model's question for good.
+#[test]
+fn a_settled_question_stays_on_its_row() {
+    let mut s = state();
+    let question = "上一条「弹个窗户」你想让我开哪个？";
+    for event in [
+        RuntimeEvent::ToolCallStarted {
+            id: ToolCallId::new("t1"),
+            name: "request_user_input".into(),
+            arguments: serde_json::json!({
+                "question": question,
+                "options": ["浏览器窗口", "新终端窗口"],
+            })
+            .to_string(),
+            parallel: false,
+            model_step: None,
+            answer_effect: None,
+        },
+        RuntimeEvent::ToolCallCompleted {
+            id: ToolCallId::new("t1"),
+            ok: true,
+            preview: "浏览器窗口".into(),
+            duration_ms: 10,
+            applied_diff: None,
+            exit_code: None,
+            stop: None,
+        },
+    ] {
+        reduce(&mut s, Action::Runtime(event));
+    }
+    assert!(
+        s.overlay.is_none(),
+        "a settled answer never leaves a live card"
+    );
+    let frame = rendered(&mut s, 100, 30);
+    assert_eq!(
+        frame.matches(question).count(),
+        1,
+        "the record states the question once:\n{frame}"
+    );
+    assert!(frame.contains("浏览器窗口"), "{frame}");
 }

@@ -201,12 +201,18 @@ fn chat_profile() -> leveler_agent::coding::TurnProfile {
 /// the approval these tests exercise has to name something outside it. The
 /// harness builds its tool call before the sandbox directory exists, which is
 /// why this path is derived from the process rather than from `h.dir`.
-fn outside_scratch() -> std::path::PathBuf {
-    // A process-unique directory under the temp root, spelled ABSOLUTELY.
-    // Auto exempts the temp root for ordinary file I/O, but an explicit
-    // absolute deletion still asks — and unlike HOME this stays inside the
-    // sandbox, so the test does not depend on the host's real home directory.
-    std::env::temp_dir().join(format!("codeleveler-barrier-{}", std::process::id()))
+fn outside_scratch(label: &str) -> std::path::PathBuf {
+    // An absolute spelling under the temp root: Auto exempts the temp root for
+    // ordinary file I/O, but an explicit absolute deletion still asks, and
+    // unlike HOME this stays inside the sandbox.
+    //
+    // The label is per TEST, not per process: these tests share one binary and
+    // run concurrently, so a process-wide path would let them delete each
+    // other's tree and fail for the wrong reason.
+    std::env::temp_dir().join(format!(
+        "codeleveler-barrier-{}-{label}",
+        std::process::id()
+    ))
 }
 
 /// `rm -rf <abs>`, spelled the way the host spells it.
@@ -593,7 +599,7 @@ impl Approver for ApproveOnceHuman {
 async fn approval_resolution_is_durable_before_dispatch() {
     // Deleting a directory tree, spelled the way the host spells it. The
     // barrier under test is platform-neutral; `rm -rf` is not.
-    let scratch = outside_scratch();
+    let scratch = outside_scratch("durable");
     let h = harness(vec![
         tool_call("c1", "run_command", remove_outside(&scratch)),
         text("removed"),
@@ -640,12 +646,12 @@ async fn a_failed_approval_flush_writes_no_standing_permission() {
         tool_call(
             "c1",
             "run_command",
-            remove_outside(&outside_scratch()),
+            remove_outside(&outside_scratch("failed-flush")),
         ),
         text("done"),
     ])
     .await;
-    std::fs::create_dir_all(outside_scratch()).unwrap();
+    std::fs::create_dir_all(outside_scratch("failed-flush")).unwrap();
     let rules_path = leveler_execution::project_rules_path(h.dir.path());
 
     let store = FailingApprovalStore {
@@ -692,12 +698,12 @@ async fn the_log_records_each_call_s_risk_and_what_the_approval_gated() {
         tool_call(
             "c1",
             "run_command",
-            remove_outside(&outside_scratch()),
+            remove_outside(&outside_scratch("risk-log")),
         ),
         text("removed"),
     ])
     .await;
-    std::fs::create_dir_all(outside_scratch()).unwrap();
+    std::fs::create_dir_all(outside_scratch("risk-log")).unwrap();
     let log = EventLog::new(&h.db, h.session.clone());
 
     run_chat_turn(&h, &log, Arc::new(ApproveOnceHuman), "remove scratch")

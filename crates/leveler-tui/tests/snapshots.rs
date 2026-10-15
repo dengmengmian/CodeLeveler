@@ -1432,9 +1432,11 @@ fn the_approval_overlay_sits_where_the_composer_was() {
         .iter()
         .position(|l| l.contains("推一下代码"))
         .expect("the prompt must stay visible while deciding");
+    // The card's own line: the tool the runtime is asking about, and why it is
+    // asking. ("允许" lives on the option rows; the headline does not repeat it.)
     let overlay = lines
         .iter()
-        .position(|l| l.contains("允许 执行命令"))
+        .position(|l| l.contains("执行命令") && l.contains("将访问网络"))
         .expect("the approval must be on screen");
     assert!(
         overlay > prompt,

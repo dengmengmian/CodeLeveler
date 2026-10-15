@@ -43,6 +43,7 @@ pub(crate) fn render_group(
     t: &UiText,
     now_elapsed_secs: u64,
     awaiting_approval: Option<&leveler_client_protocol::ToolCallId>,
+    question_card_open: bool,
 ) -> Vec<Line<'static>> {
     let mut rows = Vec::new();
     render_group_rows(
@@ -56,6 +57,7 @@ pub(crate) fn render_group(
         None,
         &mut rows,
         None,
+        question_card_open,
     )
 }
 
@@ -86,6 +88,7 @@ pub(crate) fn render_group_rows(
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
     rows: &mut Vec<CommandRow>,
     folds: Option<&std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
+    question_card_open: bool,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let index_of = |call: &ToolCallBlock| {
@@ -177,6 +180,7 @@ pub(crate) fn render_group_rows(
                     focused_command,
                     &mut child_rows,
                     folds,
+                    question_card_open,
                 ));
                 rows.extend(child_rows.into_iter().map(|row| CommandRow {
                     disclosure: row.disclosure,
@@ -299,6 +303,7 @@ pub(crate) fn render_group_rows(
             rows,
             &index_of,
             focused_command,
+            question_card_open,
             &mut out,
         );
         return out;
@@ -398,6 +403,7 @@ pub(crate) fn render_group_rows(
                     awaits(call, awaiting_approval),
                     true,
                     is_exploration_call(call),
+                    question_card_open,
                 ));
                 push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
             }
@@ -443,6 +449,7 @@ pub(crate) fn render_group_rows(
                     rows,
                     &index_of,
                     focused_command,
+                    question_card_open,
                     &mut out,
                 );
             }
@@ -465,6 +472,7 @@ pub(crate) fn render_group_rows(
                     rows,
                     &index_of,
                     focused_command,
+                    question_card_open,
                     &mut out,
                 );
             }
@@ -520,6 +528,7 @@ pub(crate) fn render_group_rows(
                         awaits(call, awaiting_approval),
                         true,
                         false,
+                        question_card_open,
                     ));
                     push_expanded_detail(call, group.expanded(), theme, width, locale, t, &mut out);
                 }
@@ -563,6 +572,7 @@ pub(crate) fn render_group_rows(
                     false,
                     true,
                     false,
+                    question_card_open,
                 ));
                 push_expanded_detail(
                     calls[0],
@@ -1019,6 +1029,9 @@ pub(crate) fn exploration_fold_member_lines(
         awaits(call, awaiting_approval),
         true,
         is_exploration_call(call),
+        // A fold member is an exploration call, and an interaction is never
+        // folded: no card can own this row's summary.
+        false,
     );
     // The parent only reveals target rows. Each call owns its full detail.
     if call.expanded {
@@ -1668,6 +1681,9 @@ fn unit_lines(
     // verb (读取/搜索/列出) rather than the tool's noun label, so a single Read
     // reads in the same vocabulary as the aggregate receipt above it.
     exploration_row: bool,
+    // True while an open clarification card owns the live question. This row
+    // must not state the question a second time while that card is on screen.
+    question_card_open: bool,
 ) -> Vec<Line<'static>> {
     // Plan/goal guard rejections carry internal English validation text for the
     // model — show a warning glyph and a localized note instead. Other failures
@@ -1733,6 +1749,15 @@ fn unit_lines(
     // The head carries the one-line target inline (text color; `$` highlighted
     // for shell). Width budget reserves the tail plus a small margin.
     let mut summary = strip_inline_md(&tool_summary_pub(&call.name, &call.arguments, t));
+    // An interaction's live question belongs to the card that is asking it, not
+    // to this row: the card is pinned under the conversation and cannot scroll
+    // away, while the row would print the same sentence one line above it. The
+    // question returns to the row the moment the call settles — history keeps
+    // the question and the answer, and a replayed session (no card open) is
+    // untouched.
+    if question_card_open && call.status == ToolStatus::Running && is_user_decision_call(call) {
+        summary.clear();
+    }
     // A failed patch whose arguments can't be parsed falls back to a generic
     // placeholder ("补丁"); recover the real target from the error preview.
     if call.status == ToolStatus::Failed
@@ -1871,6 +1896,7 @@ fn push_run(
     rows: &mut Vec<CommandRow>,
     index_of: &dyn Fn(&ToolCallBlock) -> usize,
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
+    question_card_open: bool,
     out: &mut Vec<Line<'static>>,
 ) {
     // A run is active while any of its calls is; once all are settled the head
@@ -1952,6 +1978,7 @@ fn push_run(
             now_elapsed_secs,
             branch,
             awaits(call, awaiting_approval),
+            question_card_open,
         ));
         let body = out.len();
         push_expanded_detail(call, group.expanded(), theme, width, locale, t, out);
@@ -2041,6 +2068,7 @@ fn run_child_lines(
     now_elapsed_secs: u64,
     branch: &str,
     awaiting_approval: bool,
+    question_card_open: bool,
 ) -> Vec<Line<'static>> {
     unit_lines(
         call,
@@ -2058,6 +2086,7 @@ fn run_child_lines(
         // A run child rides under a head that already named the tool; it keeps
         // the tool's own label and never borrows the exploration verb.
         false,
+        question_card_open,
     )
 }
 
@@ -3288,6 +3317,7 @@ pub(crate) fn render_activity(
     focused_command: Option<&leveler_client_protocol::ToolCallId>,
     rows: &mut Vec<CommandRow>,
     folds: Option<&std::collections::HashSet<leveler_client_protocol::ToolCallId>>,
+    question_card_open: bool,
 ) -> Vec<Line<'static>> {
     let mut group_rows = Vec::new();
     let lines = render_group_rows(
@@ -3301,6 +3331,7 @@ pub(crate) fn render_activity(
         focused_command,
         &mut group_rows,
         folds,
+        question_card_open,
     );
     rows.extend(group_rows);
     lines
@@ -3480,6 +3511,7 @@ pub(crate) fn render_group_text(
         locale.text(),
         0,
         None,
+        false,
     )
     .into_iter()
     .map(|line| {
@@ -3506,6 +3538,7 @@ mod tests {
             Locale::Zh.text(),
             0,
             awaiting,
+            false,
         )
         .into_iter()
         .map(|line| {
@@ -3608,6 +3641,7 @@ mod tests {
             Locale::Zh.text(),
             3,
             None,
+            false,
         )
     }
 
@@ -4839,7 +4873,16 @@ mod tests {
     /// (`  └ N 行`) ride under such a head and are exempt: their account is
     /// the head itself.
     fn assert_no_metadata_only_rows(group: &ToolGroupBlock, theme: &Theme) {
-        let lines = render_group(group, theme, 100, Locale::Zh, Locale::Zh.text(), 0, None);
+        let lines = render_group(
+            group,
+            theme,
+            100,
+            Locale::Zh,
+            Locale::Zh.text(),
+            0,
+            None,
+            false,
+        );
         for line in &lines {
             let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             let trimmed = raw.trim_start();
@@ -5438,6 +5481,7 @@ mod tests {
             None,
             &mut Vec::new(),
             None,
+            false,
         );
         let text: Vec<String> = lines
             .iter()
@@ -6652,6 +6696,7 @@ mod tests {
             Locale::Zh.text(),
             45,
             None,
+            false,
         )
         .into_iter()
         .map(|l| {
@@ -6875,6 +6920,7 @@ mod compact_command_tests {
             Locale::Zh.text(),
             now,
             None,
+            false,
         )
     }
 
@@ -7315,6 +7361,7 @@ mod compact_command_tests {
             Locale::Zh.text(),
             5,
             Some(&id),
+            false,
         )));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(
