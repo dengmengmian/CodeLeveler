@@ -4,6 +4,12 @@ name: Sync release to AtomGit
 # compiles artifacts, so both hosts serve the SAME bytes — a second build on a
 # different runner could differ, and then two download sources would disagree.
 #
+# The AtomGit repository is a PULL mirror of this one: its branches and tags are
+# synced by AtomGit itself, and it refuses manual pushes ("this operation is not
+# allowed because the repository is an image repository"). So this workflow
+# deliberately does NOT push the tag — it only creates the release and uploads
+# the assets, which the mirror does not carry.
+#
 # Runs after a successful Release. Requires an `ATOMGIT_TOKEN` repository secret
 # (a token with release + attachment write access on the AtomGit repo). Without
 # it the job fails loudly and the GitHub release is untouched.
@@ -35,7 +41,6 @@ jobs:
       ATOMGIT_OWNER: dengmengmian
       ATOMGIT_REPO: CodeLeveler
       ATOMGIT_API: https://api.atomgit.com/api/v5
-      ATOMGIT_GIT: https://atomgit.com/dengmengmian/CodeLeveler.git
       GH_OWNER: dengmengmian
       GH_REPO: CodeLeveler
     steps:
@@ -71,38 +76,6 @@ jobs:
           case "$tag" in v[0-9]*) ;; *) echo "::error::unexpected tag '$tag'"; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "mirroring $tag"
-
-      # The code is mirrored so the AtomGit release points at a commit that
-      # exists there. Only tags move: branches stay GitHub's business.
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Push the tag to AtomGit
-        env:
-          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # The token never appears in a remote URL or in the process list: it
-          # is handed to git through GIT_ASKPASS instead.
-          askpass="$(mktemp)"
-          printf '#!/bin/sh\ncase "$1" in *Username*) echo oauth2 ;; *) echo "$ATOMGIT_TOKEN" ;; esac\n' > "$askpass"
-          chmod +x "$askpass"
-          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
-          git push "$ATOMGIT_GIT" "refs/tags/$TAG:refs/tags/$TAG" || {
-            # An already-present tag at the same commit is the normal re-run
-            # case, not a failure. A different commit fails closed.
-            remote="$(git ls-remote "$ATOMGIT_GIT" "refs/tags/$TAG^{}" "refs/tags/$TAG" | head -1 | cut -f1)"
-            local_sha="$(git rev-parse "$TAG^{commit}")"
-            if [ "$remote" = "$local_sha" ]; then
-              echo "tag already mirrored at $local_sha"
-            else
-              echo "::error::AtomGit tag $TAG is at $remote, not $local_sha"
-              exit 1
-            fi
-          }
-          rm -f "$askpass"
 
       - name: Mirror the release notes
         id: notes
