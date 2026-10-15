@@ -103,8 +103,7 @@ jobs:
             --argjson prerelease "$(cat /tmp/prerelease.txt)" \
             '{tag_name: $tag, name: $name, body: $body, prerelease: $prerelease, target_commitish: "main"}')"
           code="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
-            -X POST "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases" \
-            -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN" \
+            -X POST "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases?access_token=$ATOMGIT_TOKEN" \
             -H 'Content-Type: application/json' \
             -d "$payload")"
           case "$code" in
@@ -112,8 +111,7 @@ jobs:
             400|409)
               # Already there (a re-run): refresh the notes instead of failing.
               curl -sS -o /dev/null -X PATCH \
-                "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG" \
-                -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN" \
+                "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG?access_token=$ATOMGIT_TOKEN" \
                 -H 'Content-Type: application/json' \
                 -d "$payload"
               echo "updated the existing AtomGit release" ;;
@@ -138,8 +136,8 @@ jobs:
           # Files already present on AtomGit are skipped, so a re-run resumes
           # instead of uploading duplicates or failing on conflict.
           existing="$(curl -sS \
-            "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG" \
-            -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN" | jq -r '[.assets[]?.name] | join("\n")' || true)"
+            "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG?access_token=$ATOMGIT_TOKEN" \
+            | jq -r '[.assets[]?.name] | join("\n")' || true)"
 
           for file in dist/*; do
             name="$(basename "$file")"
@@ -147,18 +145,23 @@ jobs:
               echo "skip $name (already on AtomGit)"
               continue
             fi
-            # Attachment upload is two steps: ask for a pre-signed address for
-            # this exact file name, then PUT the bytes to it.
+            # Attachment upload is two steps, and the second one is not "just
+            # PUT the URL": the address is pre-signed for object storage, so the
+            # exact headers it answers with (x-obs-*) have to be replayed.
             curl -sS -o /tmp/upload.json \
-              "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG/upload_url?file_name=$name" \
-              -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN"
+              "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG/upload_url?access_token=$ATOMGIT_TOKEN&file_name=$name"
             url="$(jq -r '.url // empty' /tmp/upload.json)"
             if [ -z "$url" ]; then
               echo "::error::no upload address for $name"
               cat /tmp/upload.json || true
               exit 1
             fi
-            # The pre-signed request carries its own auth, so no token here.
-            curl -sS -f -X PUT --upload-file "$file" "$url" >/dev/null
+            headers=()
+            while IFS= read -r header; do
+              [ -n "$header" ] && headers+=(-H "$header")
+            done < <(jq -r '.headers // {} | to_entries[] | "\(.key): \(.value)"' /tmp/upload.json)
+            # The pre-signed request carries its own signature, so the token is
+            # not sent here — only the headers the address asked for.
+            curl -sS -f -X PUT "${headers[@]}" --upload-file "$file" "$url" >/dev/null
             echo "uploaded $name"
           done
