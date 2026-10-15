@@ -1,7 +1,7 @@
 class Leveler < Formula
   desc "Local-first coding agent CLI: terminal UI, typed tools, resumable sessions"
   homepage "https://github.com/dengmengmian/CodeLeveler"
-  version "1.0.15"
+  version "1.0.16"
   license "Apache-2.0"
 
   livecheck do
@@ -12,17 +12,17 @@ class Leveler < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "fa4b11d5322281bc979a3484f07fa8ae97a14991623d4231ee7cd9c0f386a42d"
+      sha256 "650930363fd61925a16e0a58ebd5e1d3761b7b0d7486aa2600de02c96f0a9024"
     else
       url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "1714fad3be82fb80f7c6a4a3285b9ae36759c79fa9520cf68744525a01d9270a"
+      sha256 "4b30919b0cfdca24d2b87158ee090ec8b8f486f17d97cfcd83f46de5565ba645"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/dengmengmian/CodeLeveler/releases/download/v#{version}/leveler-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "dc3abd11c7cb844ccd4093c46d362cde8eca8ecc227cc96620729f0c6f48a14d"
+      sha256 "7ec84a7bc847752d14e6b8aa2c0f8168c86fc7c8161dcfe8a519a4b2c317b063"
     end
   end
 
