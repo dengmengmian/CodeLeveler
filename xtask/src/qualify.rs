@@ -332,6 +332,12 @@ fn rc_cmd(lab: &Lab, sha: &str, run: &str) -> CommandSpec {
             run,
             "--model",
             lab.model.as_str(),
+            // Same reason as the release stage: this gate runs immediately
+            // after a full build and its own L3 evaluation, so the host's load
+            // reflects the qualification itself. `MACHINE_BUSY` is a statement
+            // about the host, never a product verdict, so it must not stop the
+            // stage that just produced the load.
+            "--force",
         ],
         &lab.root,
     )

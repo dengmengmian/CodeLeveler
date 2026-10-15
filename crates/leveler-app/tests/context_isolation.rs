@@ -950,7 +950,15 @@ async fn context_inspection_is_local_and_never_enters_the_conversation() {
         .unwrap();
     wait_for_turn_end(&mut rx).await;
 
-    let bodies = server.request_bodies().await;
+    // One main request per turn. A successful turn additionally asks for its
+    // recap and its next-step suggestion; those are tool-less auxiliary calls
+    // and carry no conversation context to leak.
+    let bodies: Vec<String> = server
+        .request_bodies()
+        .await
+        .into_iter()
+        .filter(|body| body.contains("\"tools\""))
+        .collect();
     assert_eq!(bodies.len(), 2, "exactly one model request per turn");
     for body in &bodies {
         for marker in [
@@ -1608,7 +1616,15 @@ async fn btw_can_call_a_read_only_tool_without_touching_the_main_task() {
         .await
         .unwrap();
     wait_for_turn_end(&mut rx).await;
-    let bodies = server.request_bodies().await;
+    // Only main-turn requests carry tools. A successful turn also asks for its
+    // recap and its next-step suggestion, and those are tool-less auxiliary
+    // calls with no bearing on what the main task's context contains.
+    let bodies: Vec<String> = server
+        .request_bodies()
+        .await
+        .into_iter()
+        .filter(|body| body.contains("\"tools\""))
+        .collect();
     assert_eq!(
         bodies.len(),
         3,
