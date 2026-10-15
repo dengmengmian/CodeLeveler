@@ -430,13 +430,17 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
     match status_phase(state) {
         StatusPhase::AwaitingUser => {
             if let Some(overlay) = &state.overlay {
-                if matches!(overlay, crate::overlay::Overlay::Clarification(_)) {
-                    // The interaction card says what it is waiting for, with the
-                    // accent that goes with it, so the strip must not say it a
-                    // second time — not even quietly. What is left for the
-                    // strip here is the ordinary state it reports when nothing
-                    // it owns is moving.
-                    return idle_status_lines(state);
+                if matches!(
+                    overlay,
+                    crate::overlay::Overlay::Clarification(_)
+                        | crate::overlay::Overlay::Approval(_)
+                ) {
+                    // The card IS the wait: it names the question (or the
+                    // command) and the keys that resolve it. A "等待审批" or
+                    // `… 询问 <question>` above it repeats a fact the card
+                    // already shows — and, for an approval, the busy activity
+                    // under it is that same fact a third time.
+                    return vec![Line::from("")];
                 }
                 // Interrupting overlays: static waiting copy, no spinner.
                 // Pickers return None and fall through to the normal strip.
@@ -460,8 +464,7 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
 }
 
 /// The strip when this TUI is not driving a turn: the activity label if there
-/// is one, otherwise an empty row. Also the strip's content while a question is
-/// on screen, where the interaction card already carries the wait.
+/// is one, otherwise an empty row.
 fn idle_status_lines(state: &AppState) -> Vec<Line<'static>> {
     let theme = &state.theme;
     if state.team.active().next().is_some() {
@@ -1432,10 +1435,8 @@ mod tests {
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);
         let text = status_line_content(&state, 120).to_string();
         assert!(
-            text.contains(state.t().overlay_approval)
-                || text.contains("授权")
-                || text.contains("approval"),
-            "awaiting-user copy: {text}"
+            !text.contains(state.t().overlay_approval) && !text.contains("等待审批"),
+            "the approval card is the wait; the strip must not repeat it: {text}"
         );
         for frame in SPINNER {
             assert!(
@@ -1464,10 +1465,10 @@ mod tests {
         )));
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);
         let text = status_line_content(&state, 120).to_string();
-        // The interaction card carries the wait, with the accent to match. The
-        // strip must not say it a second time — which is why the copy it used
-        // to print is gone from the locale too — and it must not imply the
-        // model is still working while the turn is blocked on the user.
+        // The card carries the wait. The strip must not say it a second time —
+        // which is why the copy it used to print is gone from the locale too —
+        // and it must not imply the model is still working while the turn is
+        // blocked on the user.
         assert!(
             !text.contains("等待") && !text.contains("waiting"),
             "the strip repeats the card's wait: {text}"
@@ -1477,12 +1478,16 @@ mod tests {
         }
         assert_eq!(text.trim(), "", "otherwise an ordinary idle strip: {text}");
 
-        // What the strip still owns: an activity label, which says nothing
-        // about the pending question.
-        state.activity = Some("checking the lockfile".into());
+        // The strip owns no label here either: the activity of a pending
+        // question IS the question (`询问 …`, taken from the call's arguments),
+        // so printing it one row above the card is the reported duplication.
+        state.activity = Some("询问 上一条「弹个窗户」你想让我开哪个？".into());
         let text = status_line_content(&state, 120).to_string();
-        assert!(text.contains("checking the lockfile"), "{text}");
-        assert!(!text.contains("等待"), "{text}");
+        assert!(
+            !text.contains("询问") && !text.contains("弹个窗户"),
+            "the strip repeats the question: {text}"
+        );
+        assert_eq!(text.trim(), "", "{text}");
     }
 
     /// A reasoning model can spend 90+ seconds and thousands of tokens on a

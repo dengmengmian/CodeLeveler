@@ -276,7 +276,10 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
-    {
+    // The composer's own plane. An overlay takes this slot instead, and the
+    // decision sits on the conversation's background — so the input surface
+    // must not be painted underneath it.
+    if state.overlay.is_none() {
         let input_bg = state.theme.surface.input;
         state.theme.paint_surface(frame, input_slot, input_bg);
     }

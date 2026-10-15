@@ -1377,6 +1377,10 @@ verified by deterministic tests and real dogfood — do not regress them:
 - **A decision overlay's focused row is always visible**: approval /
   clarification / every picker keeps the focused row and its decision block
   inside any drawable height, and a resize returns to the focus.
+- **An interaction is not a panel**: an approval, a question or a picker opens
+  on the ordinary divider above the conversation, shares that conversation's
+  background and divider ink, and states its question once — while the card is
+  open, the running call's row and the status strip do not repeat it.
 - **An approval or a clarification never hides the conversation behind it**:
   the panel owns Enter, Esc and the arrows. Page keys, and a wheel over the
   conversation viewport, keep scrolling that conversation. A wheel over the

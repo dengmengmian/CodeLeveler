@@ -300,14 +300,14 @@ async fn switching_to_full_supersedes_the_pending_and_re_admits_under_full() {
     let server = MockServer::start(vec![
         tool_call_sse(
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["scratch.txt"], "reason": "cleanup"}),
+            serde_json::json!({"program": "rm", "args": ["-rf", outside_path("supersede").to_string_lossy()], "reason": "cleanup"}),
         ),
         text("done"),
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let victim = tmp.path().join("scratch.txt");
-    std::fs::write(&victim, "x").unwrap();
+    let victim = outside_path("supersede");
+    std::fs::create_dir_all(&victim).unwrap();
 
     let (_app, client, session_id, mut events) = session(
         tmp.path(),
@@ -366,14 +366,14 @@ async fn a_stale_deny_after_the_switch_cannot_reach_the_runtime() {
     let server = MockServer::start(vec![
         tool_call_sse(
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["scratch.txt"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", outside_path("stale-deny").to_string_lossy()]}),
         ),
         text("done"),
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let victim = tmp.path().join("scratch.txt");
-    std::fs::write(&victim, "x").unwrap();
+    let victim = outside_path("stale-deny");
+    std::fs::create_dir_all(&victim).unwrap();
 
     let (_app, client, session_id, mut events) = session(
         tmp.path(),
@@ -414,14 +414,14 @@ async fn a_reconnect_after_the_switch_restores_no_approval() {
     let server = MockServer::start(vec![
         tool_call_sse(
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["scratch.txt"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", outside_path("flapping").to_string_lossy()]}),
         ),
         text("done"),
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let victim = tmp.path().join("scratch.txt");
-    std::fs::write(&victim, "x").unwrap();
+    let victim = outside_path("flapping");
+    std::fs::create_dir_all(&victim).unwrap();
 
     let (_app, client, session_id, mut events) = session(
         tmp.path(),
@@ -450,14 +450,14 @@ async fn flapping_between_auto_and_full_leaves_no_orphan_waiter() {
     let server = MockServer::start(vec![
         tool_call_sse(
             "run_command",
-            serde_json::json!({"program": "rm", "args": ["scratch.txt"]}),
+            serde_json::json!({"program": "rm", "args": ["-rf", outside_path("reconnect").to_string_lossy()]}),
         ),
         text("done"),
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let victim = tmp.path().join("scratch.txt");
-    std::fs::write(&victim, "x").unwrap();
+    let victim = outside_path("reconnect");
+    std::fs::create_dir_all(&victim).unwrap();
 
     let (_app, client, session_id, mut events) = session(
         tmp.path(),
@@ -551,13 +551,26 @@ async fn switching_to_full_leaves_a_clarification_intact() {
     cancel(&client, &session_id).await;
 }
 
+/// A deletion target that still requires an approval.
+///
+/// Auto and Restricted both run a literal relative deletion inside the working
+/// directory directly, so only an absolute target outside it asks.
+fn outside_path(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "codeleveler-lifecycle-{}-{label}",
+        std::process::id()
+    ))
+}
+
 // ── TEST 6: Auto contract is not weakened by the Full fix ────────────────────
 
 #[tokio::test]
-async fn auto_still_asks_for_dangerous_git_push() {
+async fn auto_still_asks_for_privilege_escalation() {
+    // Git — including push — is ordinary development under Auto. The boundary
+    // that still asks is privilege escalation.
     let server = MockServer::start(vec![tool_call_sse(
         "run_command",
-        serde_json::json!({"program": "git", "args": ["push", "origin", "HEAD"]}),
+        serde_json::json!({"program": "sudo", "args": ["rm", "-rf", "/tmp/x"]}),
     )])
     .await;
     let tmp = tempfile::tempdir().unwrap();
@@ -576,8 +589,8 @@ async fn auto_still_asks_for_dangerous_git_push() {
             .command
             .as_deref()
             .unwrap_or_default()
-            .contains("push"),
-        "Auto must still ask before git push: {approval:?}"
+            .contains("sudo"),
+        "Auto must still ask before privilege escalation: {approval:?}"
     );
     // Deny it: Auto's refusal path still works.
     client

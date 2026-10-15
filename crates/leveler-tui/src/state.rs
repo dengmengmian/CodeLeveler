@@ -346,10 +346,17 @@ pub struct AppState {
     pub sessions_selected: usize,
     pub context_tokens: u32,
     /// Latest model-reported input/output tokens for the current conversation.
+    /// The status line and the footer read this last request. The turn receipt
+    /// does not: that one sums [`Self::turn_input_tokens`].
     pub token_input: u32,
     pub token_output: u32,
     /// Prefix-cache hits within `token_input`, from the last round.
     pub token_cached: u32,
+    /// Provider usage summed across the turn in progress. Copied onto the
+    /// turn receipt when the turn ends, then cleared. Not the window gauge.
+    pub turn_input_tokens: u32,
+    pub turn_output_tokens: u32,
+    pub turn_cached_tokens: u32,
     /// Conversation checkpoints (restore points, spec §68).
     pub checkpoints: Vec<UiCheckpoint>,
 
@@ -637,6 +644,9 @@ impl AppState {
             token_input: 0,
             token_output: 0,
             token_cached: 0,
+            turn_input_tokens: 0,
+            turn_output_tokens: 0,
+            turn_cached_tokens: 0,
             checkpoints: Vec::new(),
             overlay: None,
             pending_interactions: VecDeque::new(),
@@ -753,6 +763,17 @@ impl AppState {
             Overlay::Approval(overlay) => overlay.gated_call.as_ref(),
             _ => None,
         }
+    }
+
+    /// Whether an open clarification card owns the live question.
+    ///
+    /// The card is pinned under the conversation and cannot scroll away, so it
+    /// is the one place the question is stated while it is being asked; the
+    /// running call's row above it would otherwise print the same sentence a
+    /// second time. A settled call — and a replayed session, which never
+    /// reopens a card — keeps the question on the row as the record.
+    pub(crate) fn question_card_open(&self) -> bool {
+        matches!(self.overlay, Some(Overlay::Clarification(_)))
     }
 
     /// Localized UI strings for the active locale.

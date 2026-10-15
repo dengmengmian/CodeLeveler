@@ -219,6 +219,26 @@ pub struct TurnEndBlock {
     /// Runtime reason for incomplete / truncated / unverified / failed turns.
     /// Kept on the marker so it does not vanish with the status notification.
     pub detail: Option<String>,
+    /// Wall clock when this turn ended (`HH:MM`). Empty on rows that predate
+    /// the receipt, and on a replay that has no clock.
+    pub ended_hm: Option<String>,
+    /// Model steps in this turn. Zero means the turn recorded none.
+    pub rounds: u32,
+    /// This turn's provider usage, summed across its requests. Not the
+    /// session window and not the footer's next-request gauge.
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_tokens: u32,
+}
+
+/// Facts frozen onto a turn when it ends. Later requests must not rewrite it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnReceipt {
+    pub ended_hm: Option<String>,
+    pub rounds: u32,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_tokens: u32,
 }
 
 /// One terminal failure, presented exactly once.
@@ -566,9 +586,21 @@ impl TranscriptState {
     pub fn push_away_summary(&mut self, text: String) {
         self.bump();
         self.close_tool_group();
-        if !matches!(self.items.last(), Some(TranscriptItem::AwaySummary(_))) {
-            self.items.push(TranscriptItem::AwaySummary(text));
+        // One review for the turn that just closed. It follows the receipt,
+        // so the separator stays with the work and the review reads as what
+        // is next. A second review for the same turn is dropped.
+        if matches!(
+            self.items.as_slice(),
+            [.., TranscriptItem::AwaySummary(_)]
+                | [
+                    ..,
+                    TranscriptItem::AwaySummary(_),
+                    TranscriptItem::TurnEnd(_)
+                ]
+        ) {
+            return;
         }
+        self.items.push(TranscriptItem::AwaySummary(text));
     }
 
     pub fn push_completion(&mut self, report: UiCompletionReport) {
@@ -591,6 +623,25 @@ impl TranscriptState {
         summary: Option<String>,
         detail: Option<String>,
     ) {
+        self.push_turn_end_with_receipt(
+            status,
+            tool_calls,
+            elapsed_secs,
+            summary,
+            detail,
+            TurnReceipt::default(),
+        );
+    }
+
+    pub fn push_turn_end_with_receipt(
+        &mut self,
+        status: TurnEndStatus,
+        tool_calls: usize,
+        elapsed_secs: u64,
+        summary: Option<String>,
+        detail: Option<String>,
+        receipt: TurnReceipt,
+    ) {
         // The turn ended with nothing acting on the last prose: that prose is
         // the answer. Runs before the duplicate guard so a suppressed second
         // marker still cannot leave a block undecided.
@@ -610,7 +661,40 @@ impl TranscriptState {
             elapsed_secs,
             summary,
             detail,
+            ended_hm: receipt.ended_hm,
+            rounds: receipt.rounds,
+            input_tokens: receipt.input_tokens,
+            output_tokens: receipt.output_tokens,
+            cached_tokens: receipt.cached_tokens,
         }));
+    }
+
+    /// Model steps in the turn that has not been closed yet.
+    ///
+    /// Each tool group is one step that called tools. Prose after the last
+    /// group (or prose with no tools) is the step that answered. Narration
+    /// before a tool call is that call's own step, not another one.
+    pub fn current_turn_rounds(&self) -> u32 {
+        let start = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, TranscriptItem::TurnEnd(_)))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let slice = &self.items[start..];
+        let groups = slice
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::ToolGroup(_)))
+            .count() as u32;
+        let after_last_group = slice
+            .iter()
+            .rposition(|item| matches!(item, TranscriptItem::ToolGroup(_)))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let prose_after = slice.iter().skip(after_last_group).any(|item| {
+            matches!(item, TranscriptItem::Assistant(block) if !block.text.trim().is_empty())
+        });
+        groups + u32::from(prose_after)
     }
 
     pub fn push_recap(&mut self, recap: RecapBlock) {
@@ -2395,6 +2479,69 @@ mod tests {
         assert_eq!(
             kinds(&t),
             vec![AssistantKind::Progress, AssistantKind::Final]
+        );
+    }
+
+    /// Rounds are this turn's model steps. The previous turn's tools, and
+    /// narration that belongs to a tool step, do not add one.
+    #[test]
+    fn rounds_count_this_turn_only() {
+        let mut t = TranscriptState::new();
+        say(&mut t, "m0", "上一轮。");
+        t.push_turn_end(TurnEndStatus::Answered, 0, 1, None, None);
+        assert_eq!(t.current_turn_rounds(), 0);
+
+        say(&mut t, "m1", "先查。");
+        t.push_tool_started(
+            ToolCallId::new("a"),
+            "read_file".into(),
+            "{}".into(),
+            false,
+            0,
+            Some(1),
+            None,
+        );
+        t.complete_tool(&ToolCallId::new("a"), true, "ok".into(), 1, None);
+        t.push_tool_started(
+            ToolCallId::new("b"),
+            "read_file".into(),
+            "{}".into(),
+            false,
+            0,
+            Some(2),
+            None,
+        );
+        t.complete_tool(&ToolCallId::new("b"), true, "ok".into(), 1, None);
+        say(&mut t, "m2", "改完了。");
+        assert_eq!(t.current_turn_rounds(), 3);
+    }
+
+    /// The review arrives after the receipt. It follows that receipt, so the
+    /// separator stays with the turn and the review reads as what is next.
+    #[test]
+    fn an_away_summary_follows_the_turn_receipt() {
+        let mut t = TranscriptState::new();
+        t.push_turn_end(TurnEndStatus::Answered, 13, 486, None, None);
+        t.push_away_summary("本地 9 个库已重建".into());
+        let items = t.items();
+        assert!(
+            matches!(items[items.len() - 2], TranscriptItem::TurnEnd(_)),
+            "{items:?}"
+        );
+        assert!(
+            matches!(
+                items.last(),
+                Some(TranscriptItem::AwaySummary(text)) if text.contains("已重建")
+            ),
+            "{items:?}"
+        );
+        t.push_away_summary("第二条不应出现".into());
+        assert_eq!(
+            t.items()
+                .iter()
+                .filter(|item| matches!(item, TranscriptItem::AwaySummary(_)))
+                .count(),
+            1
         );
     }
 

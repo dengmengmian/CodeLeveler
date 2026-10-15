@@ -535,10 +535,12 @@ fn config_overrides_execute_program(args: &[String]) -> bool {
             index += 1;
             continue;
         }
-        if arg.starts_with("-c") && !arg.starts_with("--") && arg.len() > 2 {
-            if crate::git_isolation::config_spec_executes_program(&arg[2..]) {
-                return true;
-            }
+        if arg.starts_with("-c")
+            && !arg.starts_with("--")
+            && arg.len() > 2
+            && crate::git_isolation::config_spec_executes_program(&arg[2..])
+        {
+            return true;
         }
         index += 1;
     }

@@ -56,8 +56,6 @@ pub struct ApprovalOverlay {
     /// transcript row for that call say "waiting on you" instead of "running".
     pub(crate) gated_call: Option<leveler_client_protocol::ToolCallId>,
     cursor: usize,
-    /// Show the command in full instead of elided to one line.
-    expanded: bool,
 }
 
 impl ApprovalOverlay {
@@ -74,12 +72,7 @@ impl ApprovalOverlay {
             request,
             gated_call,
             cursor,
-            expanded: false,
         }
-    }
-
-    pub fn expanded(&self) -> bool {
-        self.expanded
     }
 
     /// Rows for rendering: `(label, is_cursor)`.
@@ -103,12 +96,9 @@ impl ApprovalOverlay {
 
     pub fn on_key(&mut self, key: KeyEvent) -> ApprovalOutcome {
         let choices = choices(&self.request);
+        // The command is drawn in full, so there is nothing to expand: a
+        // control chord decides nothing and stays consumed by this prompt.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            // The headline elides the command to keep the prompt one line;
-            // Ctrl+O is how you read the rest before deciding on it.
-            if matches!(key.code, KeyCode::Char('o')) {
-                self.expanded = !self.expanded;
-            }
             return ApprovalOutcome::None;
         }
         match key.code {
@@ -329,29 +319,18 @@ mod tests {
         }
     }
 
+    /// The command is on screen in full, so no chord expands anything — and a
+    /// control chord never decides in the user's place.
     #[test]
-    fn ctrl_o_toggles_the_full_command() {
-        // The headline elides so the prompt stays one line, which means there
-        // has to be a way to read the rest before approving it.
+    fn control_chords_decide_nothing() {
         let mut ov = ApprovalOverlay::new(request());
-        assert!(!ov.expanded());
-        assert_eq!(
-            ov.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            ApprovalOutcome::None
-        );
-        assert!(ov.expanded());
-        ov.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        assert!(!ov.expanded());
-    }
-
-    #[test]
-    fn other_ctrl_keys_still_decide_nothing() {
-        let mut ov = ApprovalOverlay::new(request());
-        assert_eq!(
-            ov.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
-            ApprovalOutcome::None
-        );
-        assert!(!ov.expanded());
+        for c in ['o', 'y', 's', 'd'] {
+            assert_eq!(
+                ov.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
+                ApprovalOutcome::None,
+                "ctrl+{c}"
+            );
+        }
     }
 
     #[test]

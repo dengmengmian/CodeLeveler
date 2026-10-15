@@ -139,15 +139,32 @@ async fn session_awaiting_approval(
     (app, client, session_id)
 }
 
+/// A deletion Auto still asks about.
+///
+/// Auto runs a literal relative path inside the working directory directly, so a
+/// prompt only appears when the target is spelled absolutely. The label keeps
+/// these tests from sharing one path.
+fn outside_target(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "codeleveler-restart-{}-{label}",
+        std::process::id()
+    ))
+}
+
+fn rm_outside(label: &str) -> serde_json::Value {
+    serde_json::json!({
+        "program": "rm",
+        "args": ["-rf", outside_target(label).to_string_lossy()],
+        "reason": "清理",
+    })
+}
+
 #[tokio::test]
 async fn an_unanswered_approval_does_not_survive_a_restart() {
-    let server = MockServer::start_one(tool_call_sse(
-        "run_command",
-        serde_json::json!({"program": "rm", "args": ["scratch.txt"], "reason": "清理"}),
-    ))
-    .await;
+    let server =
+        MockServer::start_one(tool_call_sse("run_command", rm_outside("unanswered"))).await;
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("scratch.txt"), "x").unwrap();
+    std::fs::create_dir_all(outside_target("unanswered")).unwrap();
 
     let (app, client, session_id) = session_awaiting_approval(tmp.path(), &server.base_url()).await;
 
@@ -209,20 +226,17 @@ async fn an_unanswered_approval_does_not_survive_a_restart() {
 
     // The command was never approved, so it must never have run.
     assert!(
-        tmp.path().join("scratch.txt").exists(),
+        outside_target("unanswered").exists(),
         "an approval that was never given must not have executed anything"
     );
 }
 
 #[tokio::test]
 async fn a_reconnected_client_restores_only_a_live_waiter_and_cancel_cleans_it_up() {
-    let server = MockServer::start_one(tool_call_sse(
-        "run_command",
-        serde_json::json!({"program":"rm","args":["scratch.txt"],"reason":"清理"}),
-    ))
-    .await;
+    let server =
+        MockServer::start_one(tool_call_sse("run_command", rm_outside("live-waiter"))).await;
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("scratch.txt"), "preserve").unwrap();
+    std::fs::create_dir_all(outside_target("live-waiter")).unwrap();
     let (app, client, id) = session_awaiting_approval(tmp.path(), &server.base_url()).await;
     // The subscriber that received ApprovalRequested has disconnected in the helper.
     // A new subscriber restores the interaction from the actual runtime waiter.
@@ -264,9 +278,10 @@ async fn a_reconnected_client_restores_only_a_live_waiter_and_cancel_cleans_it_u
         settled.task_status,
         Some(leveler_client_protocol::UiTaskStatus::Cancelled)
     );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("scratch.txt")).unwrap(),
-        "preserve"
+    // Cancelled, so the target is still there.
+    assert!(
+        outside_target("live-waiter").exists(),
+        "a cancelled approval must not have executed anything"
     );
     let db = app.open_database().await.unwrap();
     assert!(

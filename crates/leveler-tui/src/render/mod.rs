@@ -3515,7 +3515,14 @@ mod tests {
         // A user turn suppresses the splash card so only overlay chrome remains.
         s.transcript.push_user("推送一下".into());
         let text = render_text(&mut s, 80, 30);
-        assert!(text.contains("等待审批"), "{text}");
+        assert!(
+            text.contains("执行命令") && text.contains('─'),
+            "the decision is cut off by a rule: {text}"
+        );
+        assert!(
+            !text.contains("等待审批"),
+            "the strip repeats the card: {text}"
+        );
         assert!(text.contains("拒绝"), "{text}");
         assert!(text.contains("git push"), "{text}");
         // The overlay takes the composer's slot: no composer prompt on screen.
@@ -3523,6 +3530,108 @@ mod tests {
             !text.contains('›'),
             "composer must be hidden while an overlay is open: {text}"
         );
+    }
+
+    /// An open interaction adds no panel of its own.
+    ///
+    /// The cards used to raise an `elevated` block of their own over the
+    /// composer's `input` plane, which read as a dialog box in a conversation
+    /// that has none. Every row of the decision now sits on the conversation's
+    /// background, cut off from it by the ordinary divider above.
+    #[test]
+    fn an_open_interaction_paints_no_panel_of_its_own() {
+        use leveler_client_protocol::{ClarificationId, UiApprovalRequest, UiClarificationRequest};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::default();
+
+        let approval = crate::overlay::Overlay::Approval(Box::new(
+            crate::overlay::ApprovalOverlay::new(UiApprovalRequest {
+                grant: None,
+                requires_human_consent: false,
+                id: leveler_client_protocol::ApprovalId::new("r1"),
+                tool: "run_command".into(),
+                summary: "git push".into(),
+                command: Some("git push".into()),
+                risks: vec!["将访问网络".into()],
+                call_id: None,
+                always_persists: true,
+            }),
+        ));
+        let clarification = crate::overlay::Overlay::Clarification(Box::new(
+            crate::overlay::ClarificationOverlay::new(UiClarificationRequest::single(
+                ClarificationId::new("c1"),
+                "你想让我开哪个窗口？",
+                vec!["浏览器窗口".into(), "新终端窗口".into()],
+            )),
+        ));
+
+        // A picker is an interaction too: it opens on the same rule.
+        let picker =
+            crate::overlay::Overlay::ModelPicker(Box::new(crate::overlay::SelectionModel::new(
+                "选择模型",
+                vec![
+                    crate::overlay::SelectionOption::new("deepseek/v3", "deepseek/v3"),
+                    crate::overlay::SelectionOption::new("glm/5", "glm/5"),
+                ],
+                false,
+            )));
+
+        for (overlay, hint) in [
+            (approval, "Esc 拒绝"),
+            (clarification, "Esc 返回"),
+            (picker, "Esc 返回"),
+        ] {
+            let mut s = test_state();
+            s.theme = theme.clone();
+            s.overlay = Some(overlay);
+            s.transcript.push_user("推送一下".into());
+            let backend = TestBackend::new(80, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut s)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let width = buf.area.width;
+            let row_text = |y: u16| -> String {
+                let mut out = String::new();
+                let mut x = 0u16;
+                while x < width {
+                    let sym = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+                    out.push_str(sym);
+                    x += sym.width().max(1) as u16;
+                }
+                out
+            };
+            let hint_y = (0..buf.area.height)
+                .find(|y| row_text(*y).contains(hint))
+                .unwrap_or_else(|| panic!("no hint row for {hint:?}"));
+            let rule_y = (0..hint_y)
+                .rev()
+                .find(|y| {
+                    let text = row_text(*y);
+                    let trimmed = text.trim();
+                    trimmed.chars().count() > 3 && trimmed.chars().all(|c| c == '─')
+                })
+                .expect("the decision rule row");
+            for y in rule_y..=hint_y {
+                for x in 0..width {
+                    let cell = buf.cell((x, y)).expect("a painted cell");
+                    assert!(
+                        cell.bg != theme.surface.elevated && cell.bg != theme.surface.input,
+                        "a panel behind the decision at ({x},{y}): {:?}",
+                        cell.bg
+                    );
+                }
+            }
+            // And the rule itself is the divider, not a focus ring.
+            let first = (0..width)
+                .find(|x| buf.cell((*x, rule_y)).map(|c| c.symbol()) == Some("─"))
+                .expect("the rule's first cell");
+            assert_eq!(
+                buf.cell((first, rule_y)).map(|c| c.fg),
+                Some(theme.border.normal),
+                "the decision opens on the conversation's own divider"
+            );
+        }
     }
 
     /// A text question puts the terminal cursor in its input; a choice list

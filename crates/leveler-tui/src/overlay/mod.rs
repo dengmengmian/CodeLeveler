@@ -315,7 +315,7 @@ fn build_content(
     }
 }
 
-/// How many rows the overlay needs, including its border.
+/// How many rows the overlay needs, including its top rule.
 ///
 /// The workbench reserves this instead of drawing the overlay on top: a
 /// decision belongs where the input box was, and painting over the transcript
@@ -461,11 +461,11 @@ pub fn render_overlay(
         content.tail_pin,
     );
     let lines = visible_lines(&content.lines, total, height, window);
-    // An overlay opened from a full-screen page sits over that page's own
-    // footer; clear the slot first so its text cannot show through under the
-    // decision's last line.
-    frame.render_widget(ratatui::widgets::Clear, row);
-    theme.paint_surface(frame, row, theme.surface.elevated);
+    // The decision reads as part of the conversation, so it sits on the
+    // conversation's own background: no raised panel, no slab of a different
+    // colour behind the block. Painting the canvas is also what keeps the text
+    // of a full-screen page from showing through under the last line.
+    theme.paint_surface(frame, row, theme.surface.canvas);
     frame.render_widget(Paragraph::new(lines), row);
     // A text field in an overlay needs a visible insertion point. The
     // composer's cursor is suppressed while an overlay owns the slot, so if
@@ -787,42 +787,16 @@ fn clarification_content(
 ) -> RawContent {
     let t = locale.text();
     let mut lines: Vec<Line> = Vec::new();
-    // One header, two ends: what is being asked, and the fact that it is waiting
-    // on the user. The progress it replaced is already legible in the tab
-    // strip's marks, and a second accent line above the field only competed with
-    // the field for the eye.
-    let headline = format!("◇ {}", t.clarify_title);
-    let waiting = match ov.questions().get(ov.active()) {
-        Some(question) if question.typing() => t.clarify_waiting_input,
-        Some(_) => t.clarify_waiting_choice,
-        None => "",
-    };
-    let mut header = vec![Span::styled(
-        headline.clone(),
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD),
-    )];
-    let used = UnicodeWidthStr::width(headline.as_str());
-    if !waiting.is_empty() && used + UnicodeWidthStr::width(waiting) < width {
-        header.push(Span::styled(
-            format!(
-                "{}{waiting}",
-                " ".repeat(width - used - UnicodeWidthStr::width(waiting))
-            ),
-            Style::default().fg(theme.text.muted),
-        ));
-    }
-    lines.push(Line::from(header));
+    // The rule is the boundary between the conversation and the decision, so
+    // the block starts on the same line every other interaction starts on.
+    lines.push(decision_rule(theme, width));
     // A strip of one tab is chrome, not information: the legacy single-question
     // shape renders exactly as it always did.
     if !ov.legacy() {
-        lines.push(Line::from(""));
         let (tabs, underline) = clarification_tab_rows(ov, theme, width, t);
         lines.push(tabs);
         lines.push(underline);
     }
-    lines.push(Line::from(""));
 
     let questions = ov.questions();
     let Some(active) = questions.get(ov.active()) else {
@@ -837,10 +811,24 @@ fn clarification_content(
         };
     };
 
-    let mut prompt = vec![Span::styled(
-        active.prompt.clone(),
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
+    // One row carries the block's identity and the question it is asking. The
+    // live question is stated HERE and nowhere else: while this card owns it,
+    // the running call's row and the status strip stand down, so the text a
+    // user reads above the options is the one they are answering.
+    let mut prompt = vec![
+        Span::styled(
+            format!("◇ {}  ", t.clarify_title),
+            Style::default()
+                .fg(theme.accent.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            active.prompt.clone(),
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
     let mut badges: Vec<String> = Vec::new();
     if active.is_multi() {
         badges.push(t.clarify_multi_badge.to_string());
@@ -1066,8 +1054,10 @@ fn selection_content(
     let mut cursor = None;
     let mut cursor_row: Option<usize> = None;
     let mut focus_block: Option<(usize, usize)> = None;
-    // Without a border there is nowhere else for the title to live, and a list
-    // of choices with no question above it is a puzzle.
+    // Every interaction starts on the same boundary rule. Without a frame the
+    // title has nowhere else to sit, and a list of choices with no question
+    // above it is a puzzle.
+    lines.push(decision_rule(theme, width));
     lines.push(Line::from(Span::styled(
         model.title.clone(),
         Style::default()
@@ -1195,6 +1185,19 @@ fn selection_content(
     }
 }
 
+/// The top edge of every interaction: approval, clarification, and the pickers.
+/// It is the boundary between the conversation and the decision, so all of them
+/// draw the same rule.
+fn decision_rule(theme: &Theme, width: usize) -> Line<'static> {
+    // The ordinary conversation ink — the same one the transcript's own rules
+    // and the composer's frame wear. The focused border colour would read as a
+    // second frame around the block instead of the line it starts on.
+    Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(theme.border.normal),
+    ))
+}
+
 fn approval_content(
     ov: &ApprovalOverlay,
     theme: &Theme,
@@ -1203,53 +1206,48 @@ fn approval_content(
 ) -> RawContent {
     let req = &ov.request;
     let mut lines: Vec<Line> = Vec::new();
-    // The tool's name in the words the transcript already uses (the taxonomy's
-    // presentation label), so the prompt reads as part of the conversation
-    // rather than as an internal identifier.
     let t = locale.text();
+    // The tool's name in the words the transcript already uses. The risk sits
+    // on the same line, because that is why the prompt is open.
     let action = crate::tool_taxonomy::presentation_label(&req.tool, locale);
-    let head = t.approval_head.replace("{}", &action);
-    // The command shares the headline and is elided rather than wrapped: this
-    // prompt appears many times a session, and a growing block of shell text
-    // pushes the conversation off screen every time.
-    let detail = req.command.clone().unwrap_or_else(|| req.summary.clone());
+    let joined = req.risks.join(" · ");
+    let headline_fits = req.risks.len() <= 1
+        || UnicodeWidthStr::width(action.as_str()) + 3 + UnicodeWidthStr::width(joined.as_str())
+            <= width;
     let mut spans = vec![Span::styled(
-        head.clone(),
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD),
+        action,
+        Style::default().fg(theme.text.primary),
     )];
-    let budget = width.saturating_sub(UnicodeWidthStr::width(head.as_str()) + 4);
-    let elided = !detail.trim().is_empty()
-        && !ov.expanded()
-        && UnicodeWidthStr::width(detail.as_str()) > budget.max(8);
-    if !detail.trim().is_empty() && !ov.expanded() {
-        spans.push(Span::raw(format!(
-            "（{}）",
-            crate::render::text::truncate_display(&detail, budget.max(8))
-        )));
+    if headline_fits && !req.risks.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {joined}"),
+            Style::default().fg(theme.status.warning),
+        ));
     }
+    lines.push(decision_rule(theme, width));
     lines.push(Line::from(spans));
-    // Expanded: the command gets its own rows and `wrap_to_width` keeps every
-    // character on screen, because this is the state you enter to read it.
-    if ov.expanded() && !detail.trim().is_empty() {
-        // Pre-wrap with a hanging indent so continuation rows line up under the
-        // command instead of falling back to column 0, where they read as a
-        // separate command rather than the rest of this one.
+    // Several consequences do not share the headline: a wrap would split one
+    // of them mid-phrase. Each stays a whole line.
+    if !headline_fits {
+        for risk in &req.risks {
+            lines.push(Line::from(Span::styled(
+                format!("  {risk}"),
+                Style::default().fg(theme.status.warning),
+            )));
+        }
+    }
+    // The command is the thing being judged, so it is wrapped in full under
+    // the headline. A summary stands in when the tool has no command line.
+    let detail = req.command.clone().unwrap_or_else(|| req.summary.clone());
+    let mut body_from = None;
+    if !detail.trim().is_empty() {
+        lines.push(Line::from(""));
+        body_from = Some(lines.len());
         for piece in crate::render::text::wrap(&detail, width.saturating_sub(2).max(8)) {
             lines.push(Line::from(Span::raw(format!("  {piece}"))));
         }
     }
-    // The action's consequences are already bulleted: the runtime projects the
-    // bound capability/resource pairs into `risks` before they reach a client,
-    // because those pairs carry project, credential and object identity hashes
-    // that a prompt must never show.
-    for risk in &req.risks {
-        lines.push(Line::from(Span::styled(
-            format!("  ⚠ {risk}"),
-            Style::default().fg(theme.status.warning),
-        )));
-    }
+    lines.push(Line::from(""));
     let options = ov.options(t);
     let total = options.len();
     let mut option_rows: Vec<(usize, usize)> = Vec::new();
@@ -1258,42 +1256,34 @@ fn approval_content(
         let row = lines.len();
         let text = format!("{} {label}", option_number(i, total));
         if is_cursor {
-            // The focused row is reversed end to end, so the eye lands on the
-            // choice rather than hunting for a marker.
-            let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 2);
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} {text}{}",
-                    crate::presentation::tokens::FOCUS_CURSOR,
-                    " ".repeat(pad)
+            // The cursor is the focus. A full-row bar painted a gray slab
+            // behind one choice and fought the composer frame.
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", crate::presentation::tokens::FOCUS_CURSOR),
+                    Style::default().fg(theme.accent.primary),
                 ),
-                Style::default()
-                    .fg(theme.text.primary)
-                    .bg(theme.surface.selection),
-            )));
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(theme.text.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
             cursor_row = Some(row);
         } else {
             lines.push(Line::from(Span::raw(format!("  {text}"))));
         }
         option_rows.push((row, row));
     }
-    // The decision block is the whole set of options: when it fits, keep it
-    // together so the user sees every choice, not just the focused one.
+    // The command and the choices are one decision. When they fit, keep them
+    // together so the command does not scroll away from the row that runs it.
     let focus_block = option_rows
         .first()
         .zip(option_rows.last())
-        .map(|(first, last)| (first.0, last.1));
+        .map(|(first, last)| (body_from.unwrap_or(first.0), last.1));
     let tail_from = Some(lines.len());
-    lines.push(help_line(
-        theme,
-        if elided {
-            t.approval_hint_expand
-        } else if ov.expanded() {
-            t.approval_hint_collapse
-        } else {
-            t.approval_hint_plain
-        },
-    ));
+    lines.push(help_line(theme, t.approval_hint_plain));
     RawContent {
         title: t.overlay_approval.to_string(),
         lines,
@@ -1499,14 +1489,55 @@ mod layout_tests {
         assert!(screen.contains("1."), "options must be numbered:\n{screen}");
         // Left-aligned with the transcript, not centred in the terminal.
         let first = painted.first().unwrap();
-        let indent = first.len() - first.trim_start().len();
-        assert!(indent <= 2, "approval should be left-aligned: {first:?}");
+        assert!(
+            first.trim().chars().all(|c| c == '─') && first.contains('─'),
+            "the decision starts with a rule: {first:?}"
+        );
+        assert!(
+            screen.contains("执行命令") && screen.contains("可能造成破坏性变更"),
+            "headline names the tool and the risk:\n{screen}"
+        );
+        assert!(
+            !screen.contains("等待审批"),
+            "the card is the wait:\n{screen}"
+        );
+        assert!(
+            screen.contains("Esc 拒绝"),
+            "Esc denies, so the hint must say so:\n{screen}"
+        );
     }
 
     #[test]
-    fn a_framed_overlay_wraps_instead_of_clipping() {
-        // The approval is bare now, but pickers and clarifications still draw a
-        // box, and content must wrap inside it rather than be cut by it.
+    fn the_decision_rule_is_the_ordinary_divider_and_focus_has_no_bar() {
+        let theme = crate::theme::Theme::default();
+        let Overlay::Approval(ov) = overlay("git push") else {
+            panic!("approval");
+        };
+        let content = super::approval_content(&ov, &theme, 80, crate::i18n::Locale::Zh);
+        assert_eq!(
+            content.lines[0].spans[0].style.fg,
+            Some(theme.border.normal),
+            "the rule is the conversation's own divider, never the focus colour"
+        );
+        let focused = content
+            .lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("拒绝")))
+            .expect("deny row");
+        assert!(
+            focused.spans.iter().all(|span| span.style.bg.is_none()),
+            "no selection bar: {focused:?}"
+        );
+        assert!(
+            focused.spans.iter().any(|span| span.content.contains('❯')),
+            "the cursor still marks the row: {focused:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_question_wraps_instead_of_clipping() {
+        // Nothing draws a box any more; every card is still bounded by the
+        // terminal, and its content must wrap rather than be cut.
         let long = "请确认这一步该怎么做，".repeat(6);
         let ov = Overlay::Clarification(Box::new(crate::overlay::ClarificationOverlay::new(
             leveler_client_protocol::UiClarificationRequest::single(
@@ -1525,11 +1556,7 @@ mod layout_tests {
     }
 
     #[test]
-    fn a_long_command_is_elided_visibly_not_silently() {
-        // The prompt keeps the command on one line so it does not push the
-        // conversation off screen every time it appears. That trades full
-        // visibility for compactness, so the cut must be marked: a command that
-        // simply ends mid-path reads as the whole command.
+    fn a_long_command_is_wrapped_in_full() {
         let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(6) + "target";
         let ov = Overlay::Approval(Box::new(ApprovalOverlay::new(UiApprovalRequest {
             grant: None,
@@ -1537,28 +1564,23 @@ mod layout_tests {
             id: ApprovalId::new("r1"),
             tool: "shell_command".into(),
             summary: String::new(),
-            command: Some(long),
+            command: Some(long.clone()),
             risks: vec![],
             call_id: None,
             always_persists: true,
         })));
-        let lines = frame_of(&ov, 110, 40);
-        let head = lines
-            .iter()
-            .find(|l| l.contains("允许"))
-            .expect("headline must be on screen");
-        assert!(head.contains('…'), "elision is unmarked: {head}");
+        let lines = frame_of(&ov, 40, 40);
         let screen = lines.join("\n");
+        let flat: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        let want: String = long.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains(&want), "the command is cut:\n{screen}");
         assert!(
-            screen.contains("Ctrl+O"),
-            "an elided command must say how to read it in full:\n{screen}"
+            !screen.contains("Ctrl+O"),
+            "the command is already on screen:\n{screen}"
         );
-        // Still one row: the point of eliding is that it does not grow.
-        assert_eq!(
-            lines.iter().filter(|l| l.contains("rm -rf")).count(),
-            1,
-            "command must stay on one row:\n{}",
-            lines.join("\n")
+        assert!(
+            lines.iter().filter(|l| l.contains("a/very")).count() > 1,
+            "a long command wraps instead of staying on the headline:\n{screen}"
         );
     }
 
@@ -1572,9 +1594,9 @@ mod layout_tests {
     }
 
     #[test]
-    fn expanding_shows_the_whole_command() {
+    fn the_whole_command_is_on_screen_without_a_chord() {
         let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(6) + "target";
-        let mut ap = ApprovalOverlay::new(UiApprovalRequest {
+        let ap = ApprovalOverlay::new(UiApprovalRequest {
             grant: None,
             requires_human_consent: false,
             id: ApprovalId::new("r1"),
@@ -1585,14 +1607,10 @@ mod layout_tests {
             call_id: None,
             always_persists: true,
         });
-        ap.on_key(ratatui::crossterm::event::KeyEvent::new(
-            ratatui::crossterm::event::KeyCode::Char('o'),
-            ratatui::crossterm::event::KeyModifiers::CONTROL,
-        ));
         let screen = frame_of(&Overlay::Approval(Box::new(ap)), 110, 40).join("\n");
         let flat: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
         let want: String = long.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(flat.contains(&want), "expanded command is cut:\n{screen}");
+        assert!(flat.contains(&want), "command is cut:\n{screen}");
     }
 
     #[test]
@@ -1657,6 +1675,58 @@ mod layout_tests {
         assert!(rows.iter().any(|r| r.contains("  4. Rust")), "{rows:#?}");
         assert_eq!(label_col(&rows, "Go"), label_col(&rows, "Python"));
         assert_eq!(label_col(&rows, "Go"), label_col(&rows, "Rust"));
+    }
+
+    /// Colour is never the only signal. With no colour at all (a monochrome
+    /// terminal), the focused row is still the one carrying the cursor glyph,
+    /// and a multi-choice row still shows its own tick box: the focus and the
+    /// selection stay readable without a background or a hue.
+    #[test]
+    fn focus_and_selection_survive_without_colour() {
+        let theme = Theme::no_color();
+        let rows = |ov: &Overlay| -> Vec<String> {
+            content_lines(ov, &theme, 100, crate::i18n::Locale::Zh)
+                .1
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let one_focused = |rows: &[String]| -> String {
+            let focused: Vec<&String> = rows.iter().filter(|r| r.contains('❯')).collect();
+            assert_eq!(focused.len(), 1, "exactly one row is focused: {rows:#?}");
+            focused[0].clone()
+        };
+
+        let single = rows(&Overlay::Clarification(Box::new(single_choice(&[
+            "一", "二", "三",
+        ]))));
+        assert!(one_focused(&single).contains("❯ 1. 一"), "{single:#?}");
+
+        let multi = Overlay::Clarification(Box::new(ClarificationOverlay::new(
+            UiClarificationRequest {
+                id: ClarificationId::new("c-multi"),
+                question: "选几个".into(),
+                options: Vec::new(),
+                questions: vec![UiClarificationQuestion {
+                    header: "范围".into(),
+                    question: "选几个".into(),
+                    kind: leveler_client_protocol::ClarificationQuestionKind::Multi,
+                    options: vec!["甲".into(), "乙".into()],
+                    allow_other: false,
+                    min_choices: 0,
+                    max_choices: None,
+                }],
+            },
+        )));
+        let multi = rows(&multi);
+        assert!(one_focused(&multi).contains("❯ 1. [ ] 甲"), "{multi:#?}");
+        assert!(
+            multi.iter().any(|r| r.contains("  2. [ ] 乙")),
+            "the unfocused row keeps its own tick box: {multi:#?}"
+        );
+
+        let picker = rows(&mode_picker());
+        assert!(one_focused(&picker).contains("❯ 1. "), "{picker:#?}");
     }
 
     #[test]
@@ -1751,7 +1821,7 @@ mod layout_tests {
     #[test]
     fn a_tall_approval_keeps_its_decision_block_and_hint_visible() {
         let long = "rm -rf ".to_string() + &"a/very/deeply/nested/path/".repeat(20) + "target";
-        let mut ap = ApprovalOverlay::new(UiApprovalRequest {
+        let ap = ApprovalOverlay::new(UiApprovalRequest {
             grant: None,
             requires_human_consent: false,
             id: ApprovalId::new("r1"),
@@ -1762,7 +1832,6 @@ mod layout_tests {
             call_id: None,
             always_persists: true,
         });
-        ap.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         let screen = frame_of(&Overlay::Approval(Box::new(ap)), 80, 16);
         assert!(
             screen.iter().any(|l| l.contains("拒绝") && l.contains('❯')),
@@ -1770,7 +1839,7 @@ mod layout_tests {
             screen.join("\n")
         );
         assert!(
-            screen.iter().any(|l| l.contains("Ctrl+O")),
+            screen.iter().any(|l| l.contains("Esc 拒绝")),
             "the decision hint scrolled off:\n{}",
             screen.join("\n")
         );
@@ -1950,6 +2019,33 @@ mod layout_tests {
         Overlay::Clarification(Box::new(overlay))
     }
 
+    /// Rows that are a horizontal rule and nothing else, top to bottom.
+    fn rule_rows<'a>(lines: &'a [Line<'static>]) -> Vec<&'a Line<'static>> {
+        lines
+            .iter()
+            .filter(|line| {
+                !line.spans.is_empty()
+                    && line.spans.iter().all(|span| {
+                        !span.content.is_empty() && span.content.chars().all(|c| c == '─')
+                    })
+            })
+            .collect()
+    }
+
+    fn rule_indexes(lines: &[Line<'static>]) -> Vec<usize> {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                !line.spans.is_empty()
+                    && line.spans.iter().all(|span| {
+                        !span.content.is_empty() && span.content.chars().all(|c| c == '─')
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// The rows painted with the field's own surface: the answer's plane.
     fn field_rows(lines: &[Line<'static>], theme: &Theme) -> Vec<String> {
         lines
@@ -1978,7 +2074,8 @@ mod layout_tests {
     }
 
     /// The answer is typed into a surface of its own, between two separators,
-    /// and the prompt's internals are nowhere in it.
+    /// inside a block that opens on the boundary rule every interaction opens
+    /// on. The prompt's internals are nowhere in it.
     #[test]
     fn a_clarification_field_is_a_surface_of_its_own() {
         let theme = Theme::default();
@@ -1995,12 +2092,21 @@ mod layout_tests {
             "{}",
             field[0]
         );
+        // Top to bottom: the block's boundary rule, then the field's own two.
+        let rules = rule_indexes(&lines);
+        assert_eq!(rules.len(), 3, "block rule + field edges: {lines:?}");
+        let field_row = lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(theme.surface.input))
+            })
+            .expect("the field row");
+        assert_eq!(rules[0], 0, "the block opens on its rule: {lines:?}");
         assert_eq!(
-            lines
-                .iter()
-                .filter(|line| line.spans.iter().any(|span| span.content.contains('─')))
-                .count(),
-            2,
+            (rules[1], rules[2]),
+            (field_row - 1, field_row + 1),
             "the field is separated above and below: {lines:?}"
         );
         let screen = flat(&lines);
@@ -2064,31 +2170,27 @@ mod layout_tests {
         }
     }
 
-    /// The field is a region, not a focus ring. Its edges are the ordinary
-    /// border — a boundary on the same footing as every other in the TUI — and
-    /// the only thing in the accent is the prompt marker and the caret. Two
-    /// bright rules read as a selected button and out-shout the question.
+    /// No rule in the block is a focus signal: the boundary rule the block
+    /// opens on and the field's own two edges are all the ordinary divider ink
+    /// — a boundary on the same footing as every other in the TUI — and the
+    /// only thing in the accent is the prompt marker and the caret. Bright
+    /// rules read as a selected button and out-shout the question.
     #[test]
     fn the_field_s_edges_are_not_a_focus_signal() {
         let theme = Theme::default();
         let (_, lines, _) = content_lines(&text_overlay("hi"), &theme, 40, crate::i18n::Locale::Zh);
-        let edges: Vec<&Line> = lines
-            .iter()
-            .filter(|line| {
-                !line.spans.is_empty()
-                    && line
-                        .spans
-                        .iter()
-                        .all(|span| span.content.chars().all(|c| c == '─'))
-            })
-            .collect();
-        assert_eq!(edges.len(), 2, "top and bottom edge: {lines:?}");
-        for edge in edges {
-            for span in &edge.spans {
+        let rules = rule_rows(&lines);
+        assert_eq!(
+            rules.len(),
+            3,
+            "the block rule and the field's two edges: {lines:?}"
+        );
+        for rule in rules {
+            for span in &rule.spans {
                 assert_eq!(
                     span.style.fg,
                     Some(theme.border.normal),
-                    "the edge is an ordinary boundary: {edge:?}"
+                    "an ordinary divider: {rule:?}"
                 );
                 assert_ne!(span.style.fg, Some(theme.border.focus));
             }
@@ -2126,13 +2228,21 @@ mod layout_tests {
     fn a_search_box_places_the_caret_where_it_is() {
         let theme = Theme::default();
         let prefix_w = UnicodeWidthStr::width(crate::i18n::Locale::Zh.text().picker_search);
-        let (_, _, cursor) = content_lines(
+        let (_, lines, cursor) = content_lines(
             &searchable_picker("glm"),
             &theme,
             40,
             crate::i18n::Locale::Zh,
         );
-        assert_eq!(cursor, Some((1, prefix_w + 3)), "after the query text");
+        let lane = lines
+            .iter()
+            .position(|line| {
+                line.spans.iter().any(|span| {
+                    span.content.as_ref() == crate::i18n::Locale::Zh.text().picker_search
+                })
+            })
+            .expect("the search lane");
+        assert_eq!(cursor, Some((lane, prefix_w + 3)), "after the query text");
         // Each Chinese character is two columns, and the label is not eight
         // columns wide in this locale either.
         let (_, _, cursor) = content_lines(
@@ -2141,7 +2251,7 @@ mod layout_tests {
             40,
             crate::i18n::Locale::Zh,
         );
-        assert_eq!(cursor, Some((1, prefix_w + 4)));
+        assert_eq!(cursor, Some((lane, prefix_w + 4)));
         // The caret follows the caret, not the end of the text.
         let mut model = SelectionModel::new(
             "选择模型",
@@ -2153,13 +2263,21 @@ mod layout_tests {
             crossterm::event::KeyCode::Left,
             crossterm::event::KeyModifiers::empty(),
         ));
-        let (_, _, cursor) = content_lines(
+        let (_, lines, cursor) = content_lines(
             &Overlay::ModelPicker(Box::new(model)),
             &theme,
             40,
             crate::i18n::Locale::Zh,
         );
-        assert_eq!(cursor, Some((1, prefix_w + 1)), "between a and b");
+        let lane = lines
+            .iter()
+            .position(|line| {
+                line.spans.iter().any(|span| {
+                    span.content.as_ref() == crate::i18n::Locale::Zh.text().picker_search
+                })
+            })
+            .expect("the search lane");
+        assert_eq!(cursor, Some((lane, prefix_w + 1)), "between a and b");
     }
 
     /// A query longer than the card stays on one row, keeps its caret on
@@ -2182,7 +2300,15 @@ mod layout_tests {
             );
         }
         let (row, col) = cursor.expect("the search box always has a caret");
-        assert_eq!(row, 1, "the query is one row: {lines:?}");
+        let lane = lines
+            .iter()
+            .position(|line| {
+                line.spans.iter().any(|span| {
+                    span.content.as_ref() == crate::i18n::Locale::Zh.text().picker_search
+                })
+            })
+            .expect("the search lane");
+        assert_eq!(row, lane, "the query is one row: {lines:?}");
         assert!(col < width, "the caret stays on the card: col {col}");
     }
 
@@ -2197,7 +2323,14 @@ mod layout_tests {
             40,
             crate::i18n::Locale::Zh,
         );
-        let lane = &lines[1];
+        let lane = lines
+            .iter()
+            .find(|line| {
+                line.spans.iter().any(|span| {
+                    span.content.as_ref() == crate::i18n::Locale::Zh.text().picker_search
+                })
+            })
+            .expect("the search lane");
         assert!(
             lane.spans
                 .iter()

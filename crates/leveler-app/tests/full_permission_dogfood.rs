@@ -9,9 +9,9 @@
 //! The six-case acceptance matrix (`Full` × rm -rf / git reset --hard / kill /
 //! network, and `Auto` × dangerous / benign) is the Release Gate half here and
 //! the fast always-on half in `full_permission_acceptance.rs`.
-//! `rm_out_of_workspace`, `git_reset_hard`, `process_signal` and
-//! `network_public` are the Full cases; an `auto_asks` operation on the
-//! Auto→Full path is the Auto-positive case.
+//! `rm_out_of_workspace`, `process_signal` and `network_public` are the Full
+//! cases; an `auto_asks` operation on the Auto→Full path is the Auto-positive
+//! case (deletion outside the workspace, privilege escalation, credentials).
 //!
 //! WHAT IT PROVES (the long-term product invariant):
 //!
@@ -357,16 +357,25 @@ fn operations(workroot: &std::path::Path, home: &std::path::Path) -> Vec<Op> {
             arguments: serde_json::json!({"path": credential.display().to_string()}),
             auto_asks: true,
         },
+        // Git — including pushes and history rewrites — is ordinary development
+        // under Auto. The Full case still runs it and must produce no approval.
         Op {
             id: "git_push",
             tool: "run_command",
             arguments: serde_json::json!({"program": "git", "args": ["push", "origin", "HEAD"]}),
-            auto_asks: true,
+            auto_asks: false,
         },
         Op {
             id: "git_reset_hard",
             tool: "run_command",
             arguments: serde_json::json!({"program": "git", "args": ["reset", "--hard"]}),
+            auto_asks: false,
+        },
+        // The boundary Auto DOES hold: privilege escalation.
+        Op {
+            id: "privilege_escalation",
+            tool: "run_command",
+            arguments: serde_json::json!({"program": "sudo", "args": ["-n", "true"]}),
             auto_asks: true,
         },
         Op {

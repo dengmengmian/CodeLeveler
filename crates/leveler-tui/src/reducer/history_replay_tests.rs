@@ -651,7 +651,11 @@ fn a_tool_run_reads_the_same_live_and_replayed() {
             .iter()
             .map(crate::selection::line_to_plain)
             .map(|l| l.trim_end().to_string())
-            .filter(|l| !l.starts_with("\u{2500}\u{2500}"))
+            // The turn receipt is the terminal row: its wall clock and its
+            // elapsed are timed by the two paths differently (live reads the
+            // running clock, a replay reads the log). Everything above it is
+            // the presentation under test.
+            .filter(|l| !l.starts_with("* "))
             .collect()
     };
     let live_lines = shape(&live);

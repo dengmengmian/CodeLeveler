@@ -270,7 +270,7 @@ pub fn repo_from_url(url: &str) -> Option<String> {
 /// while `read_timeout` still fails fast when the stream genuinely stalls, so a
 /// hung connection cannot hold the updater forever.
 pub fn download_client() -> Result<reqwest::Client, UpdateError> {
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(format!("leveler/{}", crate::version::current_version()))
         .timeout(std::time::Duration::from_secs(20 * 60))
         .read_timeout(std::time::Duration::from_secs(60))
@@ -294,7 +294,13 @@ pub fn mirror_prefixes() -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| if p.ends_with('/') { p.to_string() } else { format!("{p}/") })
+        .map(|p| {
+            if p.ends_with('/') {
+                p.to_string()
+            } else {
+                format!("{p}/")
+            }
+        })
         .collect()
 }
 
@@ -356,7 +362,7 @@ pub fn asset_bases() -> Vec<String> {
 ///
 /// Downloads do NOT use this budget — see [`download_client`].
 pub fn http_client() -> Result<reqwest::Client, UpdateError> {
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(format!("leveler/{}", crate::version::current_version()))
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(15));
@@ -411,7 +417,8 @@ mod candidate_tests {
             ),
             vec![
                 "https://github.com/o/r/releases/download/v1/a.tgz".to_string(),
-                "https://ghproxy.example/https://github.com/o/r/releases/download/v1/a.tgz".to_string(),
+                "https://ghproxy.example/https://github.com/o/r/releases/download/v1/a.tgz"
+                    .to_string(),
             ]
         );
     }
@@ -446,12 +453,20 @@ mod candidate_tests {
     #[test]
     fn mirror_prefixes_ignore_blank_entries_and_normalise_slashes() {
         // SAFETY: a single-threaded test process for this variable.
-        unsafe { std::env::set_var("LEVELER_UPDATE_MIRRORS", " https://a.example , ,https://b.example/ ") };
+        unsafe {
+            std::env::set_var(
+                "LEVELER_UPDATE_MIRRORS",
+                " https://a.example , ,https://b.example/ ",
+            )
+        };
         let prefixes = mirror_prefixes();
         unsafe { std::env::remove_var("LEVELER_UPDATE_MIRRORS") };
         assert_eq!(
             prefixes,
-            vec!["https://a.example/".to_string(), "https://b.example/".to_string()]
+            vec![
+                "https://a.example/".to_string(),
+                "https://b.example/".to_string()
+            ]
         );
     }
 }

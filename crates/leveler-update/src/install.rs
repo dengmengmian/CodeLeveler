@@ -32,9 +32,7 @@ pub async fn download_candidates(
             Err(err) => last = Some(err),
         }
     }
-    Err(last.unwrap_or_else(|| {
-        UpdateError::Validation("no download source was configured".into())
-    }))
+    Err(last.unwrap_or_else(|| UpdateError::Validation("no download source was configured".into())))
 }
 
 /// Stream a URL, reporting `(received_bytes, total_bytes)` as it arrives.
