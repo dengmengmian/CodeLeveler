@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use crate::error::UpdateError;
-use crate::install::{download, download_text, install_from_archive, verify_sha256};
+use crate::install::{download_candidates, download_text, install_from_archive, verify_sha256};
 use crate::source::{GitHubReleaseSource, Release, ReleaseSource, select_asset};
 use crate::target::host_target_triple;
 use crate::version::{Version, current_version, should_upgrade};
@@ -52,7 +52,10 @@ impl UpdateOutcome {
 /// Drives one release source for one running version.
 pub struct UpdateService<S: ReleaseSource> {
     source: S,
+    /// Metadata calls (release listing): short budget, startup must not hang.
     client: reqwest::Client,
+    /// Asset transfer: minutes, because `.timeout()` covers the whole body.
+    download_client: reqwest::Client,
     current: Version,
     triple: Option<&'static str>,
 }
@@ -61,10 +64,12 @@ impl UpdateService<GitHubReleaseSource> {
     /// The production service: GitHub releases for the configured repo.
     pub fn production() -> Result<Self, UpdateError> {
         let client = crate::source::http_client()?;
+        let download_client = crate::source::download_client()?;
         let repo = crate::source::github_repo();
         Ok(Self {
             source: GitHubReleaseSource::new(repo, client.clone()),
             client,
+            download_client,
             current: current_version(),
             triple: host_target_triple(),
         })
@@ -75,7 +80,8 @@ impl<S: ReleaseSource> UpdateService<S> {
     pub fn new(source: S, client: reqwest::Client) -> Self {
         Self {
             source,
-            client,
+            client: client.clone(),
+            download_client: client,
             current: current_version(),
             triple: host_target_triple(),
         }
@@ -139,7 +145,11 @@ impl<S: ReleaseSource> UpdateService<S> {
         });
 
         let asset_name = assets.asset_name.clone();
-        let bytes = download(&self.client, &assets.download_url, |received, total| {
+        // The canonical URL, then any mirrors the environment names. A mirror
+        // only rescues the transfer; `verify_sha256` below still decides
+        // whether what arrived is the artifact that was published.
+        let urls = crate::source::download_candidates(&assets.download_url, &assets.asset_name);
+        let bytes = download_candidates(&self.download_client, &urls, |received, total| {
             on_step(UpdateStep::Downloading {
                 asset: asset_name.clone(),
                 received,

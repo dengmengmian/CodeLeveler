@@ -98,6 +98,27 @@ sudo apt install bubblewrap
 
 日常入口是 `./dev`。`./dev fmt` 只格式化本任务拥有的 Rust 文件，不会执行 `cargo fmt --all`。发布资格由外部实验室判定：先 `release_check.py`，再 `rc_check.py`。`./dev` 只调用这两支脚本，不另写一套门禁。命令列表见 `./dev help`。
 
+### 镜像源（AtomGit、GitHub 代理）
+
+每个稳定版也发布在 AtomGit（`atomgit.com/dengmengmian/CodeLeveler`），
+所以只要网络能到达其中一个主机，就有下载来源。
+
+`leveler update` 和 `install.sh` 优先使用 GitHub 地址，失败后回退到镜像，
+并且**始终由 SHA-256 校验决定**：镜像返回的内容只要不是发布的那份，就会
+校验失败，不会被安装。支持两种镜像，都是可选的逗号分隔列表：
+
+```sh
+# 代理式：把完整的原始 URL 拼在自己的路径后面（ghproxy 风格）
+# https://mirror.example/https://github.com/...
+LEVELER_UPDATE_MIRRORS="https://mirror.example/"
+
+# 托管式：文件放在自己的目录结构下，只接资产文件名；
+# `{version}` 会替换成正在获取的版本。
+LEVELER_UPDATE_ASSET_BASE="https://atomgit.com/dengmengmian/CodeLeveler/releases/download/v{version}/"
+```
+
+GitHub 原始地址始终排在第一位，镜像只是追加候选。
+
 ## 更新
 
 CodeLeveler 会自动保持在最新的**稳定版** GitHub Release。启动时最多每 `check_interval_hours` 检查一次；发现新版本后会下载、校验 SHA-256、替换当前二进制并重启。检查失败不会阻止启动：当前版本正常运行，失败原因写入日志。

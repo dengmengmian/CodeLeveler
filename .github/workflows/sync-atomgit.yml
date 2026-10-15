@@ -1,0 +1,191 @@
+name: Sync release to AtomGit
+
+# One build, two hosts. The GitHub Release workflow stays the only thing that
+# compiles artifacts, so both hosts serve the SAME bytes — a second build on a
+# different runner could differ, and then two download sources would disagree.
+#
+# Runs after a successful Release. Requires an `ATOMGIT_TOKEN` repository secret
+# (a token with release + attachment write access on the AtomGit repo). Without
+# it the job fails loudly and the GitHub release is untouched.
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to sync; empty syncs the tag of the last successful Release"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-atomgit
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: mirror tag, notes and assets
+    # Only after a successful build, or when a human asked for a specific tag.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      ATOMGIT_OWNER: dengmengmian
+      ATOMGIT_REPO: CodeLeveler
+      ATOMGIT_API: https://api.atomgit.com/api/v5
+      ATOMGIT_GIT: https://atomgit.com/dengmengmian/CodeLeveler.git
+      GH_OWNER: dengmengmian
+      GH_REPO: CodeLeveler
+    steps:
+      - name: Require the AtomGit token
+        env:
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ATOMGIT_TOKEN:-}" ]; then
+            echo "::error::ATOMGIT_TOKEN is not configured; the GitHub release is unaffected"
+            exit 1
+          fi
+
+      - name: Resolve the tag to mirror
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag || '' }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_branch || '' }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          # A workflow_dispatch from the Release workflow_run carries the tag in
+          # head_branch; otherwise ask GitHub for the newest release.
+          if [ -z "$tag" ] && [ -n "$RUN_HEAD" ]; then
+            if gh release view "$RUN_HEAD" --repo "$GH_OWNER/$GH_REPO" >/dev/null 2>&1; then
+              tag="$RUN_HEAD"
+            fi
+          fi
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GH_OWNER/$GH_REPO" --json tagName -q .tagName)"
+          fi
+          case "$tag" in v[0-9]*) ;; *) echo "::error::unexpected tag '$tag'"; exit 1 ;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "mirroring $tag"
+
+      # The code is mirrored so the AtomGit release points at a commit that
+      # exists there. Only tags move: branches stay GitHub's business.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Push the tag to AtomGit
+        env:
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The token never appears in a remote URL or in the process list: it
+          # is handed to git through GIT_ASKPASS instead.
+          askpass="$(mktemp)"
+          printf '#!/bin/sh\ncase "$1" in *Username*) echo oauth2 ;; *) echo "$ATOMGIT_TOKEN" ;; esac\n' > "$askpass"
+          chmod +x "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          git push "$ATOMGIT_GIT" "refs/tags/$TAG:refs/tags/$TAG" || {
+            # An already-present tag at the same commit is the normal re-run
+            # case, not a failure. A different commit fails closed.
+            remote="$(git ls-remote "$ATOMGIT_GIT" "refs/tags/$TAG^{}" "refs/tags/$TAG" | head -1 | cut -f1)"
+            local_sha="$(git rev-parse "$TAG^{commit}")"
+            if [ "$remote" = "$local_sha" ]; then
+              echo "tag already mirrored at $local_sha"
+            else
+              echo "::error::AtomGit tag $TAG is at $remote, not $local_sha"
+              exit 1
+            fi
+          }
+          rm -f "$askpass"
+
+      - name: Mirror the release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GH_OWNER/$GH_REPO" \
+            --json name,body,isPrerelease > /tmp/gh-release.json
+          jq -r .name /tmp/gh-release.json > /tmp/name.txt
+          jq -r .body /tmp/gh-release.json > /tmp/body.md
+          jq -r .isPrerelease /tmp/gh-release.json > /tmp/prerelease.txt
+
+      - name: Create or update the AtomGit release
+        env:
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -n \
+            --arg tag "$TAG" \
+            --arg name "$(cat /tmp/name.txt)" \
+            --arg body "$(cat /tmp/body.md)" \
+            --argjson prerelease "$(cat /tmp/prerelease.txt)" \
+            '{tag_name: $tag, name: $name, body: $body, prerelease: $prerelease, target_commitish: "main"}')"
+          code="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -X POST "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases" \
+            -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "$payload")"
+          case "$code" in
+            201|200) echo "created the AtomGit release" ;;
+            400|409)
+              # Already there (a re-run): refresh the notes instead of failing.
+              curl -sS -o /dev/null -X PATCH \
+                "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG" \
+                -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN" \
+                -H 'Content-Type: application/json' \
+                -d "$payload"
+              echo "updated the existing AtomGit release" ;;
+            *)
+              echo "::error::AtomGit release request failed with HTTP $code"
+              cat /tmp/release.json || true
+              exit 1 ;;
+          esac
+
+      - name: Upload every GitHub asset
+        env:
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # The published assets, not the workflow artifacts: what users can
+          # already download from GitHub is exactly what gets mirrored.
+          gh release download "$TAG" --repo "$GH_OWNER/$GH_REPO" --dir dist --clobber
+
+          # Files already present on AtomGit are skipped, so a re-run resumes
+          # instead of uploading duplicates or failing on conflict.
+          existing="$(curl -sS \
+            "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG" \
+            -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN" | jq -r '[.assets[]?.name] | join("\n")' || true)"
+
+          for file in dist/*; do
+            name="$(basename "$file")"
+            if printf '%s\n' "$existing" | grep -Fxq "$name"; then
+              echo "skip $name (already on AtomGit)"
+              continue
+            fi
+            # Attachment upload is two steps: ask for a pre-signed address for
+            # this exact file name, then PUT the bytes to it.
+            curl -sS -o /tmp/upload.json \
+              "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG/upload_url?file_name=$name" \
+              -H "PRIVATE-TOKEN: $ATOMGIT_TOKEN"
+            url="$(jq -r '.url // empty' /tmp/upload.json)"
+            if [ -z "$url" ]; then
+              echo "::error::no upload address for $name"
+              cat /tmp/upload.json || true
+              exit 1
+            fi
+            # The pre-signed request carries its own auth, so no token here.
+            curl -sS -f -X PUT --upload-file "$file" "$url" >/dev/null
+            echo "uploaded $name"
+          done

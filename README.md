@@ -98,6 +98,28 @@ CodeLeveler can start without it, but commands that require Linux isolation fail
 
 Daily commands are `./dev`. `./dev fmt` formats only the Rust files owned by the current task and does not run `cargo fmt --all`. Release eligibility is the external lab: `release_check.py`, then `rc_check.py`. `./dev` invokes those scripts and does not replace them. Run `./dev help` for the command list.
 
+### Mirrors (AtomGit, GitHub proxies)
+
+Every stable release is also published on AtomGit (`atomgit.com/dengmengmian/CodeLeveler`),
+so a network that reaches one host but not the other still has a source.
+
+`leveler update` and `install.sh` prefer the GitHub URL and fall back to mirrors,
+and **the SHA-256 checksum always decides**: a mirror that serves anything else
+fails verification instead of being installed. Two kinds of mirror are supported,
+both optional and both comma-separated:
+
+```sh
+# A proxy that takes the whole canonical URL appended to its own path
+# (ghproxy-style): https://mirror.example/https://github.com/...
+LEVELER_UPDATE_MIRRORS="https://mirror.example/"
+
+# A host that stores our files under its own layout and takes the bare asset
+# name. `{version}` is substituted with the release being fetched.
+LEVELER_UPDATE_ASSET_BASE="https://atomgit.com/dengmengmian/CodeLeveler/releases/download/v{version}/"
+```
+
+The canonical GitHub URL is always tried first; mirrors only add candidates.
+
 ## Updates
 
 CodeLeveler keeps itself on the latest **stable** GitHub release. At start-up it checks at most once per `check_interval_hours`, and when a newer release exists it downloads it, verifies its SHA-256, replaces the running binary, and restarts. A failed check never blocks start-up: the current version runs normally and the reason is logged.
