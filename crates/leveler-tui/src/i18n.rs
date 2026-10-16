@@ -657,15 +657,15 @@ pub struct UiText {
     pub no_context: &'static str,
     /// Label fragment for "step k of n" in sticky plan header (e.g. "步").
     pub plan_step_of: &'static str,
-    /// "第 {current}/{total} 步进行中" — the live activity line, only when the
-    /// plan declares a step in progress.
-    pub plan_running_chip: &'static str,
-    /// "进行中：{step}" — the step the plan declares in progress.
-    pub plan_running_item: &'static str,
-    /// "第 {step} 步失败：{description}" — the failed step that needs attention.
-    pub plan_failed_item: &'static str,
     /// "{n} 项待办" — open work when no step is declared running.
     pub plan_pending_count: &'static str,
+    /// The state word after the progress while the plan is declared complete.
+    pub plan_state_done: &'static str,
+    /// The state word after the progress when a step failed.
+    pub plan_state_failed: &'static str,
+    /// The state word outside a running turn: the last declaration, not work
+    /// under way.
+    pub plan_state_last: &'static str,
     /// Workbench footer while the one-line plan summary has keyboard focus.
     pub plan_focus_hint: &'static str,
     /// Full Plan page navigation.
@@ -1599,10 +1599,10 @@ static ZH: UiText = UiText {
     no_sessions: "暂无会话",
     no_context: "暂无上下文信息",
     plan_step_of: "当前",
-    plan_running_chip: "第 {current}/{total} 步进行中",
-    plan_running_item: "进行中：{step}",
-    plan_failed_item: "第 {step} 步失败：{description}",
     plan_pending_count: "{n} 项待办",
+    plan_state_done: "已完成",
+    plan_state_failed: "执行失败",
+    plan_state_last: "最后记录",
     plan_focus_hint: "Enter 查看完整计划",
     plan_detail_hint: "↑↓ 滚动 · PgUp/PgDn 翻页 · Esc 返回",
     plan_n_done: "已完成 {done}/{total}",
@@ -2397,10 +2397,10 @@ static EN: UiText = UiText {
     no_sessions: "No sessions",
     no_context: "No context yet",
     plan_step_of: "step",
-    plan_running_chip: "step {current}/{total} in progress",
-    plan_running_item: "in progress: {step}",
-    plan_failed_item: "step {step} failed: {description}",
     plan_pending_count: "{n} to do",
+    plan_state_done: "completed",
+    plan_state_failed: "failed",
+    plan_state_last: "last recorded",
     plan_focus_hint: "Enter view full plan",
     plan_detail_hint: "↑↓ scroll · PgUp/PgDn page · Esc back",
     plan_n_done: "{done}/{total} completed",

@@ -627,10 +627,9 @@ pub(crate) fn key_hint_line(state: &AppState, width: usize) -> Vec<Line<'static>
     {
         t.goal_focus_hint.to_string()
     } else if state.workbench_focus == crate::state::WorkbenchFocus::Plan
-        && state
-            .plan
-            .as_ref()
-            .is_some_and(crate::workbench::plan_panel_should_show)
+        && state.plan.as_ref().is_some_and(|plan| {
+            crate::workbench::plan_indicator_should_show(plan, state.is_busy())
+        })
     {
         t.plan_focus_hint.to_string()
     } else if state.is_busy() {

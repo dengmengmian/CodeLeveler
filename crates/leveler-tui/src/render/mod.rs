@@ -4144,14 +4144,18 @@ mod tests {
         });
 
         let text = render_text(&mut s, 100, 40);
-        assert!(text.contains("已完成 6/8"), "{text}");
-        assert!(text.contains("进行中：计划步骤7 ↗"), "{text}");
+        assert!(text.contains("计划 6/8"), "{text}");
+        assert!(text.contains("计划步骤7 ↗"), "{text}");
         for index in 1..=6 {
             assert!(!text.contains(&format!("计划步骤{index}")), "{text}");
         }
         assert!(
             !text.contains("计划步骤8"),
             "pending steps belong to the full plan page: {text}"
+        );
+        assert!(
+            !text.contains("已完成 6/8"),
+            "the fraction carries the done count, once: {text}"
         );
     }
 
@@ -4182,7 +4186,7 @@ mod tests {
             text.contains("↗"),
             "the full-plan affordance survives: {text}"
         );
-        assert!(text.contains("已完成 6/20"), "{text}");
+        assert!(text.contains("计划 6/20"), "{text}");
         for index in 1..=6 {
             assert!(
                 !text.contains(&format!("计划步骤{index:02}")),

@@ -425,6 +425,24 @@ pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'stati
 
 /// Status strip: one headline, then a compact disclosure of the wait target.
 pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    status_lines_with(state, width, true)
+}
+
+/// The runtime side of the merged state strip (see `workbench::render_state_strip`).
+///
+/// `stats` false keeps only the never-dropped live label — the plan indicator
+/// sizes its own claim against that first, and the secondary numbers (elapsed,
+/// tool count, tokens) are what refill whatever the plan leaves. A shape with
+/// no separate stats (idle label, blocked wait, awaiting-user hint) is the same
+/// line either way.
+pub(crate) fn status_strip_line(state: &AppState, width: usize, stats: bool) -> Line<'static> {
+    status_lines_with(state, width, stats)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Line::from(""))
+}
+
+fn status_lines_with(state: &AppState, width: usize, stats: bool) -> Vec<Line<'static>> {
     let theme = &state.theme;
     // Phase first: never paint a busy spinner while blocked on the user.
     match status_phase(state) {
@@ -458,7 +476,7 @@ pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>>
     // `workbench::render_notice`); never fold them into the status strip, so a
     // transient notice and persistent execution state stay separate rows.
     match state.status {
-        RuntimeStatus::Busy => busy_status_lines(state, width),
+        RuntimeStatus::Busy => vec![busy_status_line(state, width, stats)],
         RuntimeStatus::Error | RuntimeStatus::Idle => idle_status_lines(state),
     }
 }
@@ -482,29 +500,10 @@ fn idle_status_lines(state: &AppState) -> Vec<Line<'static>> {
 
 const WAIT_MARKER: &str = "◌";
 
-/// `第 2/4 步进行中` for the live activity line, from the declared plan only.
-///
-/// The step shown is the one the plan declares in progress — never "the next
-/// pending one", which would claim a step had started because the previous one
-/// finished. No plan, or no step in progress, means no chip.
-fn live_plan_step_chip(state: &AppState, t: &crate::i18n::UiText) -> Option<String> {
-    let plan = state.plan.as_ref()?;
-    let total = plan.steps.len();
-    if total == 0 {
-        return None;
-    }
-    let current = plan
-        .steps
-        .iter()
-        .find(|s| s.status == leveler_client_protocol::PlanStepStatus::Running)?;
-    Some(
-        t.plan_running_chip
-            .replace("{current}", &(current.index + 1).to_string())
-            .replace("{total}", &total.to_string()),
-    )
-}
-
-fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+/// The busy runtime line. Plan progress is NOT on it: the merged state strip's
+/// plan indicator owns the plan (progress, current step, entry arrow), and a
+/// second copy here read as two different authorities for one fact.
+fn busy_status_line(state: &AppState, width: usize, stats: bool) -> Line<'static> {
     let theme = &state.theme;
     let t = state.t();
     let wait = crate::wait_status::project(state);
@@ -516,7 +515,7 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
             )
         })
     {
-        return Vec::new();
+        return Line::from("");
     }
     if let Some(view) = wait.as_ref()
         && !matches!(
@@ -524,7 +523,10 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
             crate::wait_status::WaitKind::Model | crate::wait_status::WaitKind::Approval
         )
     {
-        return blocked_wait_lines(state, view, width);
+        return blocked_wait_lines(state, view, width)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Line::from(""));
     }
 
     let frame = SPINNER[(state.tick as usize) % SPINNER.len()];
@@ -583,11 +585,6 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     // own elapsed. Appending the turn's as well printed two adjacent durations
     // with nothing to tell them apart.
     let mut parts = vec![format!("{frame} {turn_mode}{label}")];
-    // Where in the plan, when there IS a plan. A turn with no plan gets no
-    // fraction: "步骤 1/1" invented to look purposeful is chrome, not progress.
-    if let Some(step) = live_plan_step_chip(state, t) {
-        parts.push(step);
-    }
     parts.push(fmt_elapsed(
         state.activity_elapsed_secs.unwrap_or(state.elapsed_secs),
     ));
@@ -617,7 +614,11 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
         parts.push(format!("↓~{}", fmt_tokens(est)));
     }
     let live_part = parts[0].clone();
-    let text = fit_status(&parts, width);
+    let text = if stats {
+        fit_status(&parts, width)
+    } else {
+        fit_status(&parts[..1], width)
+    };
     let rest = text.strip_prefix(frame).unwrap_or(&text);
     // The first part is the live state; everything appended after it is
     // evidence/metadata. Only the thing happening now takes the accent.
@@ -628,7 +629,7 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
         // At very narrow widths the first part itself is truncated.
         (rest, "")
     };
-    vec![Line::from(vec![
+    Line::from(vec![
         Span::styled(
             frame.to_string(),
             Style::default()
@@ -643,7 +644,7 @@ fn busy_status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
             metrics.to_string(),
             Style::default().fg(theme.text.secondary),
         ),
-    ])]
+    ])
 }
 
 fn blocked_wait_lines(
@@ -778,10 +779,12 @@ mod tests {
         }
     }
 
-    /// A1: with a real plan and real tool calls, the live line says where in
-    /// the plan the turn is and how much work it has done.
+    /// A1: the live line says WHAT is running and how much work the turn has
+    /// done. It never states plan progress — the merged strip's plan indicator
+    /// is the single owner of that fact, and a second copy on this line read as
+    /// two authorities for one number.
     #[test]
-    fn the_live_line_reports_the_plan_step_and_the_tool_count() {
+    fn the_live_line_reports_work_but_never_repeats_plan_progress() {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
         state.activity = Some("正在检查 WorkerConfig".into());
@@ -790,13 +793,14 @@ mod tests {
         state.elapsed_secs = 12;
         let line = busy_line(&state);
         assert!(line.contains("正在检查 WorkerConfig"), "{line}");
-        assert!(
-            line.contains("第 2/4 步进行中"),
-            "the step the plan declares in progress, 1-based: {line}"
-        );
-        assert!(!line.contains("当前"), "no runtime cursor: {line}");
         assert!(line.contains("3 次工具"), "{line}");
         assert!(line.contains("12s"), "{line}");
+        for duplicate in ["第 2/4 步进行中", "进行中", "2/4", "步骤"] {
+            assert!(
+                !line.contains(duplicate),
+                "plan progress belongs to the plan indicator alone: {line}"
+            );
+        }
     }
 
     /// A2: no plan, no step counter. A turn with no plan must not be given
