@@ -1606,7 +1606,14 @@ fn feature_coverage_line(context: &Context, run_id: &str, layer: &str) -> String
 fn required_checks(layer: &str) -> &'static [&'static str] {
     match layer {
         "L0" => &["fmt", "clippy", "release_build"],
-        "L1" => &["workspace_tests", "prefix_cache_stability"],
+        // `feature_coverage_inventory` is the preflight: it proves this stage
+        // checked that every feature is registered and mapped before the later
+        // stages have to produce the evidence.
+        "L1" => &[
+            "workspace_tests",
+            "prefix_cache_stability",
+            "feature_coverage_inventory",
+        ],
         "L2" => &["tui_tests"],
         _ => &[],
     }
