@@ -17,7 +17,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use crate::i18n::UiText;
 use crate::render::{
     COMPOSER_MAX_ROWS, composer_box_lines, composer_visible_rows, render_attachments,
     render_slash_popup,
@@ -48,12 +47,14 @@ fn is_plan_step_settled(status: PlanStepStatus) -> bool {
     matches!(status, PlanStepStatus::Done | PlanStepStatus::Skipped)
 }
 
-/// Whether the sticky plan chrome should stay on screen.
+/// Whether the plan has work the user should still see outside a running turn:
+/// anything Pending/Running, or a failure. A plan whose every step is
+/// Done/Skipped is finished history.
 ///
-/// Hide when every step is Done/Skipped (including a single 1/1 success) — the
-/// answer is already in the transcript and a finished checklist only steals
-/// space. Keep visible while anything is Pending/Running, or if any step Failed
-/// so the user can still see what broke.
+/// This is the ARCHIVE question (`reduce`: does a settled checklist still earn
+/// a transcript block, or was the answer it describes already written?). What
+/// the live strip shows is [`plan_indicator_should_show`], which is this plus
+/// the running turn.
 pub(crate) fn plan_panel_should_show(plan: &UiPlan) -> bool {
     if plan.steps.is_empty() {
         return false;
@@ -62,84 +63,105 @@ pub(crate) fn plan_panel_should_show(plan: &UiPlan) -> bool {
     !all_success
 }
 
-/// Summary after `计划`/`plan`. The plan is the agent's declared progress, so
-/// the summary says how much it declared done and, when available, the current
-/// running or failed step. It never invents a "next" step when none is active.
-pub(crate) fn plan_summary_label(plan: &UiPlan, live: bool, t: &UiText) -> String {
-    let (done, total) = plan_done_total(plan);
-    if total == 0 {
-        return t.active_plan.to_string();
-    }
-    let fill = |template: &str| {
-        template
-            .replace("{done}", &done.to_string())
-            .replace("{total}", &total.to_string())
-    };
-    if !live {
-        return fill(t.plan_last_recorded);
-    }
-    let progress = fill(t.plan_n_done);
-    if let Some(step) = plan
-        .steps
-        .iter()
-        .find(|s| s.status == PlanStepStatus::Failed)
-    {
-        return format!(
-            "{progress} · {}",
-            t.plan_failed_item
-                .replace("{step}", &(step.index + 1).to_string())
-                .replace("{description}", &step.description)
-        );
-    }
-    if let Some(step) = plan
-        .steps
-        .iter()
-        .find(|s| s.status == PlanStepStatus::Running)
-    {
-        return format!(
-            "{progress} · {}",
-            t.plan_running_item.replace("{step}", &step.description)
-        );
-    }
-    let pending = plan
-        .steps
-        .iter()
-        .filter(|s| s.status == PlanStepStatus::Pending)
-        .count();
-    if pending > 0 {
-        format!(
-            "{progress} · {}",
-            t.plan_pending_count.replace("{n}", &pending.to_string())
-        )
-    } else {
-        progress
-    }
+/// Whether the plan indicator joins the state strip.
+///
+/// While the turn runs, the plan is live state — including the moment it is
+/// declared complete (✓ before the answer forecloses it). Outside a running
+/// turn, only open or failed work stays: a finished checklist with nothing
+/// executing is history, and the conversation already has it.
+pub(crate) fn plan_indicator_should_show(plan: &UiPlan, live: bool) -> bool {
+    !plan.steps.is_empty() && (live || plan_panel_should_show(plan))
 }
 
-/// One-line plan summary. The arrow opens the full Plan page; there is no
-/// second inline expansion mode.
-pub(crate) fn plan_chrome_title(plan: &UiPlan, live: bool, t: &UiText) -> String {
-    let glyph = if plan
+/// The plan's half of the state strip, before fitting decides what survives.
+///
+/// One structured value so the glyph, the progress and the state word cannot
+/// drift apart between the widest and the narrowest terminal.
+struct PlanStrip {
+    glyph: &'static str,
+    glyph_color: ratatui::style::Color,
+    /// `计划 3/4` — the plan's name and its declared progress.
+    core: String,
+    /// The step declared in progress, or the plan's state word. Never a step
+    /// the plan has not declared.
+    detail: Option<String>,
+    detail_color: ratatui::style::Color,
+}
+
+/// Build the plan indicator from the live plan.
+///
+/// The state is read from the plan alone: a running step breathes, a completed
+/// plan is a green check, a failure is red, and a plan that is merely the last
+/// record says so. Nothing is inferred from the runtime (a tool count cannot
+/// make a step "done") and no step is promoted to "in progress" that the plan
+/// did not declare.
+fn plan_strip(state: &AppState, plan: &UiPlan, live: bool) -> PlanStrip {
+    let t = state.t();
+    let theme = &state.theme;
+    let (done, total) = plan_done_total(plan);
+    let core = format!("{} {}/{}", t.active_plan, done, total);
+    let failed = plan
         .steps
         .iter()
-        .any(|step| step.status == PlanStepStatus::Failed)
-    {
-        "!"
-    } else if live
-        && plan
+        .any(|step| step.status == PlanStepStatus::Failed);
+    let all_settled = plan.steps.iter().all(|s| is_plan_step_settled(s.status));
+    if failed {
+        return PlanStrip {
+            glyph: "✕",
+            glyph_color: theme.status.error,
+            core,
+            detail: Some(t.plan_state_failed.to_string()),
+            detail_color: theme.status.error,
+        };
+    }
+    if live && all_settled {
+        return PlanStrip {
+            glyph: "✓",
+            glyph_color: theme.status.success,
+            core,
+            detail: Some(t.plan_state_done.to_string()),
+            detail_color: theme.status.success,
+        };
+    }
+    if live {
+        // The breath is luminance only, and it reads elapsed time, never a
+        // frame counter: a burst of stream deltas must not speed it up.
+        let glyph_color = if state.live_animation {
+            theme.plan.breathe(crate::motion::breath_level(
+                state.motion_clock,
+                crate::motion::PLAN_BREATH_PERIOD,
+            ))
+        } else {
+            theme.plan.primary
+        };
+        let detail = plan
             .steps
             .iter()
-            .any(|step| step.status == PlanStepStatus::Running)
-    {
-        "●"
-    } else {
-        "○"
-    };
-    format!(
-        "{glyph} {} · {} ↗",
-        t.active_plan,
-        plan_summary_label(plan, live, t)
-    )
+            .find(|s| s.status == PlanStepStatus::Running)
+            .map(|step| step.description.clone())
+            .or_else(|| {
+                let pending = plan
+                    .steps
+                    .iter()
+                    .filter(|s| s.status == PlanStepStatus::Pending)
+                    .count();
+                (pending > 0).then(|| t.plan_pending_count.replace("{n}", &pending.to_string()))
+            });
+        return PlanStrip {
+            glyph: "●",
+            glyph_color,
+            core,
+            detail,
+            detail_color: theme.text.secondary,
+        };
+    }
+    PlanStrip {
+        glyph: "○",
+        glyph_color: theme.text.muted,
+        core,
+        detail: Some(t.plan_state_last.to_string()),
+        detail_color: theme.text.muted,
+    }
 }
 
 /// Paint the conversation workbench into `frame`.
@@ -188,30 +210,26 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // Conversation's bottom-right; with no notice it costs zero rows and the
     // transcript keeps its full height.
     let notice_rows: u16 = u16::from(state.notification.is_some());
-    // Runtime status (spinner / elapsed / tokens) is persistent execution
-    // state — a separate strip, never merged with the transient notice.
-    // Every strip of bottom chrome sits on the composer's grid: the same
-    // workspace gutter, applied through `chrome_slot` below. The status text
-    // is laid out for that inner width, not the terminal's.
+    // Runtime status (spinner / elapsed / tokens) and the plan indicator share
+    // ONE state strip: the runtime is the turn's state, the plan is its
+    // declared shape, and two rows for one moment of the turn spent a row of
+    // conversation on chrome. The strip is never merged with the transient
+    // notice above it. Every strip of bottom chrome sits on the composer's
+    // grid: the same workspace gutter, applied through `chrome_slot` below.
+    // The text is laid out for that inner width, not the terminal's.
     let status_block = status_lines(state, workspace_inner.width as usize);
-    let status_rows: u16 = if status_block
+    let status_has_content = status_block
         .iter()
-        .any(|line| line.spans.iter().any(|span| !span.content.is_empty()))
-    {
-        status_block
-            .len()
-            .min(1 + crate::activity::MAX_STATUS_ROWS * 2) as u16
-    } else {
-        0
-    };
+        .any(|line| line.spans.iter().any(|span| !span.content.is_empty()));
+    let plan_visible = state
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan_indicator_should_show(plan, state.is_busy()));
+    let strip_rows: u16 = u16::from(status_has_content || plan_visible);
     // Breathing room around the input box: blank above only when live chrome
-    // (status / plan / attachments) sits on top of it; blank below always so
-    // Context footer is not flush on the composer border.
-    // The plan dock's own height is not known yet (it depends on this gap via
-    // the row budget), but its VISIBILITY is — and that is all the gap needs.
-    let plan_visible = state.plan.as_ref().is_some_and(plan_panel_should_show);
-    let chrome_above = status_rows
-        .saturating_add(u16::from(plan_visible))
+    // (the state strip / attachments / 待发送) sits on top of it; blank below
+    // always so Context footer is not flush on the composer border.
+    let chrome_above = strip_rows
         .saturating_add(attach_rows)
         .saturating_add(pending_rows);
     let pre_composer_gap: u16 = if chrome_above > 0 { 1 } else { 0 };
@@ -220,31 +238,12 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     // process list reads as its own surface rather than a second footer.
     let team_gap: u16 = if team_rows > 0 { 1 } else { 0 };
 
-    // Everything the plan dock does NOT get: the fixed chrome plus the
-    // conversation's own floor. What is left is the dock's row budget, so a
-    // long plan grows into real space instead of being cut at a constant.
-    let reserved = header_rows
-        .saturating_add(MIN_CONVERSATION_ROWS)
-        .saturating_add(gap_rows)
-        .saturating_add(notice_rows)
-        .saturating_add(status_rows)
-        .saturating_add(attach_rows)
-        .saturating_add(pending_rows)
-        .saturating_add(pre_composer_gap)
-        .saturating_add(composer_rows)
-        .saturating_add(footer_rows)
-        .saturating_add(team_gap)
-        .saturating_add(team_rows)
-        .saturating_add(footer_bottom);
-    let plan_rows = plan_panel_height(state, area.height.saturating_sub(reserved));
-
     let chunks = Layout::vertical([
         Constraint::Length(header_rows),
         Constraint::Min(MIN_CONVERSATION_ROWS), // conversation viewport
         Constraint::Length(gap_rows),
         Constraint::Length(notice_rows), // Notice Surface (0 rows when idle)
-        Constraint::Length(status_rows),
-        Constraint::Length(plan_rows),
+        Constraint::Length(strip_rows),  // runtime status + plan indicator
         Constraint::Length(attach_rows),
         Constraint::Length(pending_rows),
         Constraint::Length(pre_composer_gap),
@@ -261,18 +260,18 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     ])
     .split(area);
 
-    // The one horizontal rule for the bottom chrome: notice, status,
+    // The one horizontal rule for the bottom chrome: notice, strip,
     // attachments, pending inputs, composer and footer all start on the
-    // composer's left edge. (The plan dock and the roster apply the same
-    // gutter inside their own renderers.)
+    // composer's left edge. (The roster applies the same gutter inside its own
+    // renderer.)
     let chrome_slot =
         |slot: Rect| crate::layout::horizontal_inset(slot, crate::layout::WORKSPACE_GUTTER_X);
     let notice_slot = chrome_slot(chunks[3]);
-    let status_slot = chrome_slot(chunks[4]);
-    let attach_slot = chrome_slot(chunks[6]);
-    let pending_slot = chrome_slot(chunks[7]);
-    let input_slot = chrome_slot(chunks[9]);
-    let footer_slot = chrome_slot(chunks[10]);
+    let strip_slot = chrome_slot(chunks[4]);
+    let attach_slot = chrome_slot(chunks[5]);
+    let pending_slot = chrome_slot(chunks[6]);
+    let input_slot = chrome_slot(chunks[8]);
+    let footer_slot = chrome_slot(chunks[9]);
 
     render_header(frame, chunks[0], state);
     crate::conversation::viewport::render(frame, chunks[1], state);
@@ -285,19 +284,10 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
     }
     // chunks[2] = gap (leave blank)
     render_notice(frame, notice_slot, state);
-    if status_rows > 0 {
-        frame.render_widget(Paragraph::new(status_block.clone()), status_slot);
-    }
-    let plan_area = crate::layout::horizontal_inset(chunks[5], crate::layout::WORKSPACE_GUTTER_X);
-    state.plan_hit = (plan_rows > 0 && plan_area.width > 0).then_some((
-        plan_area.y,
-        plan_area.x,
-        plan_area.x.saturating_add(plan_area.width),
-    ));
-    render_plan_panel(frame, chunks[5], state);
+    render_state_strip(frame, strip_slot, state);
     render_attachments(frame, attach_slot, state);
     crate::pending_inputs::render(frame, pending_slot, state, area.height);
-    // chunks[8] = pre_composer_gap (leave blank)
+    // chunks[7] = pre_composer_gap (leave blank)
     match &state.overlay {
         Some(overlay) => {
             crate::overlay::render_overlay(frame, input_slot, overlay, &state.theme, state.locale)
@@ -305,8 +295,8 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         None => render_input(frame, input_slot, state),
     }
     render_footer(frame, footer_slot, state);
-    // chunks[11] = breathing row; the roster docks under the footer.
-    state.activity_hits = render_team_panel(frame, chunks[12], state);
+    // chunks[10] = breathing row; the roster docks under the footer.
+    state.activity_hits = render_team_panel(frame, chunks[11], state);
 
     // /btw is its own surface (see `crate::btw`), not an overlay here.
 
@@ -494,19 +484,165 @@ fn repo_basename(repo: &str) -> String {
         .to_string()
 }
 
-// ── Plan panel ──────────────────────────────────────────────────────────────
+// ── State strip (runtime status + plan indicator, one row) ──────────────────
 
-/// Plan chrome only while the plan has open work (or failures). Empty /
-/// fully-succeeded plans (including 1/1 ✓) take no rows.
-/// `budget` is the rows the layout can actually spare for the dock (after the
-/// header, composer, footer and the conversation's own minimum). The body is
-/// the summary window: finished steps drop out and at most five unfinished
-/// steps remain, so a long plan no longer claims a row per completed step.
-fn plan_panel_height(state: &AppState, budget: u16) -> u16 {
-    match &state.plan {
-        Some(p) if plan_panel_should_show(p) && budget > 0 => 1,
-        _ => 0,
+/// Columns between the runtime status and the plan indicator.
+///
+/// Three cells either way: ` · ` when the runtime side has been squeezed to
+/// its bare label (a narrow row reads as one line better with a separator),
+/// and plain spacing when the runtime still carries its own metrics. The
+/// constant width keeps the plan's x position stable across the two forms.
+const STRIP_GAP: usize = 3;
+
+/// Between the plan's progress and its current step / state word.
+const STRIP_DETAIL_SEP: &str = " · ";
+
+/// The plan's entry to the full Plan page, including its leading space.
+const STRIP_ARROW: &str = " ↗";
+
+/// The merged state strip: `◉ 命令运行中 · 15s · 20 次工具   ● 计划 3/4 · 步骤 ↗`.
+///
+/// One row, one paint. The runtime keeps its own rendering and hit-free
+/// behaviour; the plan indicator is a separate value whose only interaction is
+/// the click/Enter target published into [`AppState::plan_hit`]. Sizing runs
+/// in priority order — runtime live state, plan progress, the plan's entry
+/// arrow, the current step, then the runtime's secondary numbers — so a narrow
+/// terminal drops the least important cell first and never wraps.
+fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    if area.height == 0 || area.width == 0 {
+        state.plan_hit = None;
+        return;
     }
+    let width = area.width as usize;
+    let live = state.is_busy();
+    let indicator = state
+        .plan
+        .as_ref()
+        .filter(|plan| plan_indicator_should_show(plan, live))
+        .map(|plan| plan_strip(state, plan, live));
+
+    // The runtime's live state is the row's floor: the plan sizes its claim
+    // against the fitted label, never against the label plus statistics.
+    let label = crate::status_line::status_strip_line(state, width, false);
+    let label_w = label.width();
+    let gap = if label_w > 0 { STRIP_GAP } else { 0 };
+    let plan_budget = width.saturating_sub(label_w + gap);
+    let plan = indicator
+        .as_ref()
+        .and_then(|ind| fit_plan_strip(state, ind, plan_budget));
+
+    // Statistics refill whatever the plan left. The label cannot shrink here:
+    // `plan` was fitted into `width - label_w - gap`, so the budget still
+    // holds the whole label and only the numbers are negotiable.
+    let plan_w = plan.as_ref().map(|(_, w)| *w).unwrap_or(0);
+    let gap = if label_w > 0 && plan_w > 0 { STRIP_GAP } else { 0 };
+    let runtime = crate::status_line::status_strip_line(
+        state,
+        width.saturating_sub(plan_w + gap),
+        true,
+    );
+
+    let runtime_w = runtime.width();
+    let mut spans = runtime.spans;
+    if gap > 0 {
+        let separator = if runtime_w > label_w {
+            " ".repeat(gap)
+        } else {
+            " · ".to_string()
+        };
+        spans.push(Span::raw(separator));
+    }
+    if let Some((line, _)) = &plan {
+        spans.extend(line.spans.iter().cloned());
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // The hit starts where the plan is actually PAINTED — after the whole
+    // runtime line, statistics included, plus the gap — never after the bare
+    // label: the two differ whenever a statistic fits, and a hit offset by
+    // that difference would open the plan from under the runtime's numbers.
+    state.plan_hit = plan.map(|(_, plan_w)| {
+        let x0 = area.x.saturating_add((runtime_w + gap) as u16);
+        (area.y, x0, x0.saturating_add(plan_w as u16))
+    });
+}
+
+/// Fit the plan indicator into `budget` columns, degrading in priority order:
+/// progress → arrow → step detail (which truncates before it drops).
+///
+/// `None` when not even `计划 k/n` fits: a clipped glyph would say nothing the
+/// reader can use, and the runtime's state outranks the plan outright.
+fn fit_plan_strip(
+    state: &AppState,
+    ind: &PlanStrip,
+    budget: usize,
+) -> Option<(Line<'static>, usize)> {
+    let focused = state.workbench_focus == crate::state::WorkbenchFocus::Plan;
+    let paint = |spans: Vec<Span<'static>>| -> Vec<Span<'static>> {
+        if focused {
+            spans
+                .into_iter()
+                .map(|span| {
+                    Span::styled(
+                        span.content.into_owned(),
+                        span.style.add_modifier(Modifier::REVERSED),
+                    )
+                })
+                .collect()
+        } else {
+            spans
+        }
+    };
+    let glyph = format!("{} ", ind.glyph);
+    let core_w =
+        UnicodeWidthStr::width(glyph.as_str()) + UnicodeWidthStr::width(ind.core.as_str());
+    if core_w > budget {
+        return None;
+    }
+    let core_spans = || {
+        vec![
+            Span::styled(glyph.clone(), Style::default().fg(ind.glyph_color)),
+            Span::styled(
+                ind.core.clone(),
+                Style::default()
+                    .fg(state.theme.plan.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]
+    };
+    let arrow_span = || {
+        Span::styled(
+            STRIP_ARROW,
+            Style::default().fg(state.theme.plan.primary),
+        )
+    };
+    let arrow_w = UnicodeWidthStr::width(STRIP_ARROW);
+    // Full form: detail + arrow, the detail truncated to what is left after
+    // the parts that outrank it. A sliver under two columns is not a step
+    // name, so the detail drops instead.
+    if let Some(detail) = ind.detail.as_deref() {
+        let fixed = core_w + UnicodeWidthStr::width(STRIP_DETAIL_SEP) + arrow_w;
+        let room = budget.saturating_sub(fixed);
+        if room >= 2 {
+            let text = crate::render::truncate_display(detail, room);
+            let used = fixed + UnicodeWidthStr::width(text.as_str());
+            let mut spans = core_spans();
+            spans.push(Span::styled(
+                format!("{STRIP_DETAIL_SEP}{text}"),
+                Style::default().fg(ind.detail_color),
+            ));
+            spans.push(arrow_span());
+            return Some((Line::from(paint(spans)), used));
+        }
+    }
+    // The arrow outranks the detail: the entry to the full plan survives a
+    // step name that does not.
+    if core_w + arrow_w <= budget {
+        let mut spans = core_spans();
+        spans.push(arrow_span());
+        return Some((Line::from(paint(spans)), core_w + arrow_w));
+    }
+    Some((Line::from(paint(core_spans())), core_w))
 }
 
 /// Rows the Task Team panel needs, or 0 when it should not appear.
@@ -729,45 +865,6 @@ fn render_team_panel(
 
     frame.render_widget(Paragraph::new(lines), area);
     hits
-}
-
-fn render_plan_panel(frame: &mut Frame, area: Rect, state: &AppState) {
-    if area.height == 0 {
-        return;
-    }
-    let Some(plan) = state.plan.as_ref().filter(|p| plan_panel_should_show(p)) else {
-        return;
-    };
-    let theme = &state.theme;
-    let t = state.t();
-    // Only a running turn can have a step under way; outside one, the step the
-    // plan declared in progress is part of the last record, not highlighted.
-    let live = state.is_busy();
-    // The plan is task-level state, a sibling of the conversation — so it
-    // starts at the same content baseline instead of hanging off the left
-    // edge, and its steps sit one level inside their own header.
-    let area = crate::layout::horizontal_inset(area, crate::layout::WORKSPACE_GUTTER_X);
-    if area.width == 0 {
-        return;
-    }
-    let width = area.width as usize;
-    let raw = plan_chrome_title(plan, live, t);
-    let title = if width > 2 {
-        let without_arrow = raw.strip_suffix(" ↗").unwrap_or(&raw);
-        format!("{} ↗", truncate(without_arrow, width - 2))
-    } else {
-        truncate(raw, width)
-    };
-    let style = if state.workbench_focus == crate::state::WorkbenchFocus::Plan {
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD)
-    };
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(title, style))), area);
 }
 
 // ── Notice Surface (global user-action feedback) ────────────────────────────
@@ -1207,6 +1304,89 @@ mod tests {
             .iter()
             .position(|l| l.contains(needle))
             .unwrap_or_else(|| panic!("`{needle}` not on screen:\n{}", lines.join("\n")))
+    }
+
+    /// The full workbench paints the runtime status and the plan indicator on
+    /// ONE row, and that row is the same row the runtime alone would use: the
+    /// plan rides the existing strip instead of costing the conversation
+    /// another line.
+    #[test]
+    fn the_full_workbench_paints_one_state_strip_row() {
+        let with = render_workbench(
+            100,
+            34,
+            crate::i18n::Locale::En,
+            15,
+            crate::multi_agent::TaskTeamView::default(),
+            true,
+        );
+        let without = render_workbench(
+            100,
+            34,
+            crate::i18n::Locale::En,
+            15,
+            crate::multi_agent::TaskTeamView::default(),
+            false,
+        );
+        let plan_row = row_of(&with, "plan 1/3");
+        assert_eq!(
+            with.iter().filter(|l| l.contains("plan 1/3")).count(),
+            1,
+            "plan progress appears exactly once:\n{}",
+            with.join("\n")
+        );
+        assert!(
+            with[plan_row].contains("waiting for model"),
+            "runtime status and plan indicator share the row: {:?}",
+            with[plan_row]
+        );
+        let runtime_only_row = row_of(&without, "waiting for model");
+        assert_eq!(
+            plan_row, runtime_only_row,
+            "the plan must not push the strip to another row"
+        );
+        // Composer and footer keep their rows with and without the plan.
+        assert_eq!(
+            row_of(&with, "Type a message"),
+            row_of(&without, "Type a message")
+        );
+        // And nothing else on screen repeats the fraction.
+        assert_eq!(
+            without.iter().filter(|l| l.contains("plan 1/3")).count(),
+            0
+        );
+    }
+
+    /// The merged strip survives a narrow terminal inside the FULL workbench:
+    /// both sides stay on one row and the composer keeps its full width.
+    #[test]
+    fn a_narrow_workbench_keeps_the_merged_strip_inside_the_row() {
+        let lines = render_workbench(
+            60,
+            24,
+            crate::i18n::Locale::En,
+            15,
+            crate::multi_agent::TaskTeamView::default(),
+            true,
+        );
+        let strip_row = row_of(&lines, "plan 1/3");
+        let strip = &lines[strip_row];
+        assert!(
+            strip.contains("waiting for model") || strip.contains('⠋'),
+            "runtime state survives: {strip:?}"
+        );
+        assert!(
+            UnicodeWidthStr::width(strip.trim_end()) <= 60,
+            "the strip never overflows the terminal: {strip:?}"
+        );
+        // The plan is above the composer, and the composer is intact.
+        let input_row = row_of(&lines, "Type a message");
+        assert!(strip_row < input_row);
+        assert!(
+            lines[input_row..].iter().take(3).any(|l| l.contains('╰')),
+            "the composer's closing border survives the narrow strip:\n{}",
+            lines.join("\n")
+        );
     }
 
     /// Final IA (placement closure): Plan, then the composer, then the
@@ -2669,24 +2849,18 @@ mod tests {
         }
     }
 
-    /// The plan is the agent's declared progress: the header says how much it
-    /// has declared done, and no "当前 2/3" cursor that reads as the runtime
-    /// tracking where execution is.
+    /// The plan is the agent's declared progress: the indicator says how much
+    /// it has declared done and names the running step — never the step's
+    /// ordinal as a cursor that reads as the runtime tracking execution.
     #[test]
-    fn a_live_plan_title_reports_declared_progress_without_a_cursor() {
-        let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&sample_plan(), true, t);
-        assert!(title.starts_with('●'), "{title}");
-        assert!(title.contains("已完成 1/3"), "{title}");
-        assert!(!title.contains("当前"), "no runtime cursor: {title}");
-        assert!(
-            title.contains("进行中：edit module"),
-            "the one-line summary names the running step: {title}"
-        );
-        assert!(
-            !title.contains("2."),
-            "the numbered list under the header already carries the index: {title}"
-        );
+    fn a_live_plan_indicator_reports_declared_progress_without_a_cursor() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let ind = plan_strip(&state, &sample_plan(), true);
+        assert_eq!(ind.glyph, "●");
+        assert_eq!(ind.core, "计划 1/3");
+        assert_eq!(ind.detail.as_deref(), Some("edit module"));
+        assert!(!ind.core.contains("当前"), "no runtime cursor");
     }
 
     fn active_team() -> crate::multi_agent::TaskTeamView {
@@ -3203,24 +3377,30 @@ mod tests {
         assert!(squash(&rows[0]).contains("未完成"), "{rows:?}");
     }
 
-    /// The one-line plan is a sibling of the conversation and starts at the
-    /// same content baseline.
+    /// The plan indicator is a sibling of the runtime status on ONE row and
+    /// starts at the same content baseline as every other workbench line.
     #[test]
-    fn plan_summary_uses_the_workspace_content_baseline() {
+    fn the_plan_indicator_shares_the_state_strip_row() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
         state.plan = Some(sample_plan());
         let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal
             .draw(|f| {
-                let area = Rect {
-                    x: 0,
-                    y: 0,
-                    width: 60,
-                    height: 6,
-                };
-                render_plan_panel(f, area, &state);
+                // The strip slot as the workbench hands it over: the full row,
+                // inset by the workspace gutter.
+                let area = crate::layout::horizontal_inset(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 60,
+                        height: 6,
+                    },
+                    crate::layout::WORKSPACE_GUTTER_X,
+                );
+                render_state_strip(f, area, &mut state);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -3231,51 +3411,53 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        let header = &rows[0];
-        let header_col = header.len() - header.trim_start().len();
+        let line = &rows[0];
+        let line_col = line.len() - line.trim_start().len();
         assert_eq!(
-            header_col,
+            line_col,
             crate::layout::WORKSPACE_GUTTER_X as usize,
-            "header sits on the content baseline: {header:?}"
+            "the strip sits on the content baseline: {line:?}"
         );
-        assert!(header.contains('↗'), "{header:?}");
+        assert!(line.contains('↗'), "{line:?}");
         assert!(
             rows.iter().skip(1).all(|row| row.trim().is_empty()),
-            "{rows:?}"
+            "runtime and plan share ONE row: {rows:?}"
         );
     }
 
-    /// The summary names the running step because the full list lives on its
-    /// own page.
+    /// The indicator names the running step because the full list lives on its
+    /// own page — and the arrow is the entry to it.
     #[test]
-    fn plan_chrome_title_keeps_progress_and_detail_affordance() {
-        let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&sample_plan(), true, t);
-        assert!(title.starts_with('●'), "{title}");
+    fn the_plan_indicator_keeps_progress_and_the_detail_affordance() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let rows = strip_rows(&mut state, Some(sample_plan()), 100);
+        let line = rows[0].trim_end();
+        assert!(line.contains("● 计划 1/3 · edit module ↗"), "{line}");
         assert!(
-            title.contains("已完成 1/3 · 进行中：edit module"),
-            "{title}"
+            !line.contains("已完成 1/3"),
+            "the fraction already carries the done count: {line}"
         );
-        assert!(title.ends_with('↗'), "{title}");
     }
 
     /// Outside a running turn the plan is the last record of what the agent
-    /// declared, not work under way: no "进行中" anywhere in the header.
+    /// declared, not work under way: no "进行中" anywhere on the strip.
     #[test]
     fn a_plan_outside_a_running_turn_reads_as_the_last_record() {
-        let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&sample_plan(), false, t);
-        assert!(title.contains("最后记录 1/3"), "{title}");
-        assert!(!title.contains("进行中"), "{title}");
-        let t = crate::i18n::Locale::En.text();
-        let title = plan_chrome_title(&sample_plan(), false, t);
-        assert!(title.contains("last recorded 1/3"), "{title}");
-        assert!(!title.contains("in progress"), "{title}");
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Idle;
+        let rows = strip_rows(&mut state, Some(sample_plan()), 100);
+        let line = rows[0].trim_end();
+        assert!(line.contains("○ 计划 1/3 · 最后记录 ↗"), "{line}");
+        assert!(!line.contains("进行中"), "{line}");
     }
 
+    /// A pending step is not work under way, and the next pending description
+    /// must never be promoted into the "current step" slot.
     #[test]
-    fn plan_chrome_does_not_fabricate_an_active_item() {
-        let t = crate::i18n::Locale::Zh.text();
+    fn the_plan_indicator_does_not_fabricate_an_active_item() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
         let plan = UiPlan {
             steps: vec![
                 UiPlanStep {
@@ -3300,77 +3482,279 @@ mod tests {
                 },
             ],
         };
-        let title = plan_chrome_title(&plan, true, t);
-        assert!(title.contains("已完成 0/4"), "{title}");
-        assert!(title.contains("4 项待办"), "{title}");
+        let rows = strip_rows(&mut state, Some(plan), 100);
+        let line = rows[0].trim_end();
+        assert!(line.contains("● 计划 0/4 · 4 项待办"), "{line}");
+        assert!(!line.contains("侦察仓库结构"), "{line}");
+        assert!(!line.contains("进行中"), "pending is not in-progress: {line}");
+    }
+
+    /// A plan the agent declared complete while the turn still runs reports
+    /// exactly that — a green check, no breathing, progress at n/n.
+    #[test]
+    fn a_completed_plan_reads_done_and_stops_breathing() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.theme = crate::theme::Theme::dark();
+        state.motion_clock = std::time::Duration::from_millis(600); // the dim end
+        let buf = strip_buffer(&mut state, Some(completed_plan()), 100);
+        let rows = strip_rows(&mut state, Some(completed_plan()), 100);
+        let line = rows[0].trim_end();
+        assert!(line.contains("✓ 计划 2/2 · 已完成 ↗"), "{line}");
+        let glyph = (0..buf.area.width)
+            .map(|x| buf[(x, 0)].clone())
+            .find(|cell| cell.symbol() == "✓")
+            .expect("completion glyph painted");
+        assert_eq!(
+            glyph.fg,
+            state.theme.status.success,
+            "a settled plan is static green, never a breathing purple"
+        );
+        assert_ne!(glyph.fg, state.theme.plan.breathe(0.0));
+    }
+
+    /// The running glyph breathes between the two purple shades on the UI's
+    /// motion clock, and the rest of the indicator does not move with it.
+    #[test]
+    fn a_running_plan_glyph_breathes_between_the_two_purples() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.theme = crate::theme::Theme::dark();
+        let ink = |state: &mut AppState, ms: u64| {
+            state.motion_clock = std::time::Duration::from_millis(ms);
+            let buf = strip_buffer(state, Some(running_plan(3, 1)), 100);
+            (0..buf.area.width)
+                .map(|x| buf[(x, 0)].clone())
+                .find(|cell| cell.symbol() == "●")
+                .expect("running glyph painted")
+                .fg
+        };
+        let bright = ink(&mut state, 0);
+        let dim = ink(&mut state, 600);
+        assert_eq!(bright, state.theme.plan.primary);
+        assert_eq!(dim, state.theme.plan.dim);
+        assert_ne!(bright, dim, "the breath has to move");
+        // The core ink stays the identity purple at both ends.
+        state.motion_clock = std::time::Duration::from_millis(600);
+        let buf = strip_buffer(&mut state, Some(running_plan(3, 1)), 100);
+        let counts = (0..buf.area.width)
+            .map(|x| buf[(x, 0)].clone())
+            .find(|cell| cell.symbol() == "计")
+            .expect("progress painted");
+        assert_eq!(counts.fg, state.theme.plan.primary);
+    }
+
+    /// Keyboard focus still lands on the plan half of the strip: the plan
+    /// spans reverse, the runtime's do not.
+    #[test]
+    fn plan_focus_reverses_only_the_plan_half() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.activity = Some("运行 cargo test".into());
+        state.workbench_focus = crate::state::WorkbenchFocus::Plan;
+        let buf = strip_buffer(&mut state, Some(sample_plan()), 100);
+        let cells = strip_buffer_cells(&buf);
+        let (_, x0, x1) = state.plan_hit.expect("plan hit published");
+        for (x, (symbol, _)) in cells.iter().enumerate() {
+            // A wide char owns two cells and only the first carries both the
+            // glyph and its style; the continuation cell is painted by it.
+            let continuation = x > 0
+                && UnicodeWidthStr::width(cells[x - 1].0.as_str()) == 2
+                && symbol == " ";
+            if continuation {
+                continue;
+            }
+            let reversed = buf[(x as u16, 0)]
+                .modifier
+                .contains(Modifier::REVERSED);
+            let in_plan = (x0 as usize..x1 as usize).contains(&x);
+            assert_eq!(
+                reversed, in_plan,
+                "x={x} ({symbol:?}): focus reverses exactly the plan half"
+            );
+        }
+    }
+
+    /// With motion off (reduced-motion preference), the glyph is a static
+    /// identity purple — same state, no animation.
+    #[test]
+    fn with_motion_off_the_plan_glyph_is_static() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.theme = crate::theme::Theme::dark();
+        state.live_animation = false;
+        let ink = |state: &mut AppState, ms: u64| {
+            state.motion_clock = std::time::Duration::from_millis(ms);
+            let buf = strip_buffer(state, Some(running_plan(3, 1)), 100);
+            (0..buf.area.width)
+                .map(|x| buf[(x, 0)].clone())
+                .find(|cell| cell.symbol() == "●")
+                .expect("running glyph painted")
+                .fg
+        };
+        assert_eq!(ink(&mut state, 0), state.theme.plan.primary);
+        assert_eq!(ink(&mut state, 600), state.theme.plan.primary);
+    }
+
+    /// The whole painted indicator — glyph through arrow — is the click/Enter
+    /// target, and nothing else on the row is.
+    #[test]
+    fn the_plan_hit_covers_the_whole_painted_indicator() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let buf = strip_buffer(&mut state, Some(sample_plan()), 100);
+        let line = strip_rows(&mut state, Some(sample_plan()), 100);
+        let line = line[0].trim_end();
+        let (row, x0, x1) = state.plan_hit.expect("plan hit published");
+        assert_eq!(row, 0);
+        let painted = painted_text(&buf, x0 as usize, x1 as usize);
+        assert_eq!(painted, "● 计划 1/3 · edit module ↗", "{line}");
+        let cells = strip_buffer_cells(&buf);
         assert!(
-            !title.contains("进行中"),
-            "pending is not in-progress: {title}"
+            cells[x1 as usize..].iter().all(|(c, _)| c == " "),
+            "nothing painted past the hit: {cells:?}"
+        );
+        let runtime = painted_text(&buf, 0, x0 as usize - STRIP_GAP);
+        assert!(
+            !runtime.contains('●') && !runtime.contains('↗'),
+            "the runtime side is outside the hit: {runtime:?}"
         );
     }
 
+    /// The hit region is the plan's exact painted x-range at any width, so a
+    /// click can never open the plan from the runtime side or miss the arrow.
     #[test]
-    fn plan_chrome_prefers_next_pending_when_none_running() {
-        let t = crate::i18n::Locale::En.text();
-        let plan = UiPlan {
+    fn the_plan_hit_follows_the_row_at_every_width() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let cases = [
+            (24u16, running_plan(4, 2)),
+            (40, running_plan(4, 2)),
+            (60, running_plan(4, 2)),
+            (100, running_plan(4, 2)),
+            (140, running_plan(4, 2)),
+        ];
+        for (width, plan) in cases {
+            let buf = strip_buffer(&mut state, Some(plan), width);
+            let Some((_, x0, x1)) = state.plan_hit else {
+                panic!("w={width}: plan indicator is visible, so it must be clickable");
+            };
+            let painted = painted_text(&buf, x0 as usize, x1 as usize);
+            assert!(
+                painted.starts_with('●') && painted.contains("计划 2/4"),
+                "w={width}: the hit starts at the glyph and holds the progress: {painted:?}"
+            );
+            assert!(
+                ["步骤 3 ↗", "2/4 ↗", "2/4"].iter().any(|end| painted.ends_with(end)),
+                "w={width}: the hit ends exactly where the painting ends: {painted:?}"
+            );
+            let cells = strip_buffer_cells(&buf);
+            assert!(
+                cells[x1 as usize..].iter().all(|(c, _)| c == " "),
+                "w={width}: nothing painted past the hit: {cells:?}"
+            );
+            assert!(
+                cells[..x0 as usize].iter().all(|(c, _)| !c.contains('●')),
+                "w={width}: the glyph belongs to the plan, not the runtime: {cells:?}"
+            );
+        }
+    }
+
+    /// At a width where the runtime's secondary numbers no longer fit, the
+    /// plan's progress, current step and arrow survive — statistics yield
+    /// before the plan's step does, and nothing wraps.
+    #[test]
+    fn the_plan_outranks_runtime_statistics_when_the_row_is_tight() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.activity = Some("正在检查 WorkerConfig 并对齐执行路径".into());
+        state.elapsed_secs = 15;
+        state.turn_tool_calls = 20;
+        state.token_input = 64_590;
+        state.token_output = 716;
+        let plan = running_plan(4, 2);
+        // A row wide enough for both sides in full.
+        let wide = strip_rows(&mut state, Some(plan.clone()), 120);
+        let wide = wide[0].trim_end();
+        assert!(wide.contains("20 次工具"), "{wide}");
+        assert!(wide.contains("● 计划 2/4 · 步骤 3 ↗"), "{wide}");
+        // A tighter row: the statistics are what yields, in their own order.
+        let tight = strip_rows(&mut state, Some(plan.clone()), 60);
+        let tight = tight[0].trim_end();
+        assert!(tight.contains("计划 2/4"), "{tight}");
+        assert!(tight.contains('↗'), "{tight}");
+        assert!(
+            !tight.contains("次工具"),
+            "tool count yields to the plan: {tight}"
+        );
+        // Every width from cramped to full: one row, never wider than the
+        // terminal, and never a bare animation glyph without a state word.
+        // A long runtime label may own the whole narrow row (priority 1) —
+        // what it may never do is crowd the plan into a meaningless stub.
+        for width in 18..80u16 {
+            let rows = strip_rows(&mut state, Some(plan.clone()), width);
+            assert_eq!(rows.len(), 1, "w={width}: one row, always");
+            let line = rows[0].trim_end();
+            assert!(
+                UnicodeWidthStr::width(line) <= width as usize,
+                "w={width}: the strip may never overflow: {line:?}"
+            );
+            assert!(
+                line.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "w={width}: the strip always carries a state word: {line:?}"
+            );
+            assert!(
+                !line.contains('●') || line.contains("计划"),
+                "w={width}: a plan glyph without its progress is a stub: {line:?}"
+            );
+        }
+        // With a short label there is room for both sides even on a narrow
+        // row — the narrow form the product targets. Whatever it keeps of the
+        // step name, the run's state, progress and entry stay on the row.
+        state.activity = Some("运行中".into());
+        let narrow = strip_rows(&mut state, Some(plan), 30);
+        let narrow = narrow[0].trim_end();
+        assert!(narrow.contains("⠋ 运行中"), "{narrow}");
+        assert!(narrow.contains("● 计划 2/4"), "{narrow}");
+        assert!(narrow.ends_with('↗'), "{narrow}");
+        // And with even less room the step name drops before the arrow does.
+        let cramped = strip_rows(&mut state, Some(running_plan(4, 2)), 25);
+        let cramped = cramped[0].trim_end();
+        assert!(cramped.contains("● 计划 2/4 ↗"), "{cramped}");
+        assert!(!cramped.contains('步'), "{cramped}");
+    }
+
+    fn completed_plan() -> UiPlan {
+        UiPlan {
             steps: vec![
                 UiPlanStep {
                     index: 0,
-                    description: "done step".into(),
+                    description: "read code".into(),
                     status: PlanStepStatus::Done,
                 },
                 UiPlanStep {
                     index: 1,
-                    description: "next work".into(),
-                    status: PlanStepStatus::Pending,
+                    description: "edit module".into(),
+                    status: PlanStepStatus::Done,
                 },
             ],
-        };
-        let title = plan_chrome_title(&plan, true, t);
-        assert!(title.contains("1/2 completed"), "{title}");
-        assert!(
-            !title.contains("in progress"),
-            "a pending step is not claimed as active: {title}"
-        );
-        assert!(
-            !title.contains("next work"),
-            "do not promote the next pending description to the title: {title}"
-        );
+        }
     }
 
     #[test]
-    fn plan_panel_hidden_until_steps_exist() {
-        let mut state = AppState::new(
-            crate::theme::Theme::no_color(),
-            crate::state::Boot {
-                session_id: SessionId::new("s1"),
-                user: "u".into(),
-                version: "0".into(),
-                show_welcome: false,
-                draft_path: None,
-                history_path: None,
-                context_window: 0,
-                locale: crate::i18n::Locale::Zh,
-                untrusted_config: Vec::new(),
-                model_notice: None,
-                thinking: None,
-            },
-        );
+    fn plan_indicator_hidden_until_steps_exist() {
         // Busy goal with no plan must not reserve chrome for "等待计划".
-        state.goal_mode_active = true;
-        state.status = leveler_client_protocol::RuntimeStatus::Busy;
-        state.plan = None;
-        assert_eq!(plan_panel_height(&state, 40), 0);
-
-        state.plan = Some(UiPlan { steps: vec![] });
-        assert_eq!(plan_panel_height(&state, 40), 0);
-
-        state.plan = Some(sample_plan());
-        assert_eq!(plan_panel_height(&state, 40), 1);
+        assert!(!plan_indicator_should_show(
+            &UiPlan { steps: vec![] },
+            true
+        ));
+        assert!(plan_indicator_should_show(&sample_plan(), true));
     }
 
+    /// The archive question is unchanged: a fully settled plan is history and
+    /// earns a transcript block only when it has open or failed work.
     #[test]
-    fn finished_plan_including_single_step_hides_panel() {
+    fn finished_plan_including_single_step_stays_out_of_history() {
         let one_done = UiPlan {
             steps: vec![UiPlanStep {
                 index: 0,
@@ -3489,34 +3873,86 @@ mod tests {
         );
     }
 
-    // ── One-line Plan summary ───────────────────────────────────────────────
+    // ── State strip: runtime status + plan indicator ────────────────────────
 
-    fn plan_panel_rows(state: &AppState, height: u16) -> Vec<String> {
+    /// Paint the state strip alone into a one-row test terminal with `plan`
+    /// installed, and hand back the painted buffer. One production call site,
+    /// so these tests see exactly what the workbench paints.
+    fn strip_buffer(
+        state: &mut AppState,
+        plan: Option<UiPlan>,
+        width: u16,
+    ) -> ratatui::buffer::Buffer {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let mut terminal = Terminal::new(TestBackend::new(70, height)).unwrap();
+        state.plan = plan;
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
         terminal
             .draw(|f| {
-                render_plan_panel(
-                    f,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: 70,
-                        height,
-                    },
-                    state,
-                );
+                let area = f.area();
+                render_state_strip(f, area, state);
             })
             .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        (0..height)
+        terminal.backend().buffer().clone()
+    }
+
+    /// The painted rows as logical text: each wide char owns two buffer cells
+    /// and only the first holds its symbol, so the reader steps over the
+    /// continuation cell by display width and keeps every real space.
+    fn strip_rows(state: &mut AppState, plan: Option<UiPlan>, width: u16) -> Vec<String> {
+        let buf = strip_buffer(state, plan, width);
+        (0..buf.area.height)
             .map(|y| {
-                (0..70)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect::<String>()
+                let mut out = String::new();
+                let mut skip = 0usize;
+                for x in 0..buf.area.width {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    let symbol = buf[(x, y)].symbol();
+                    out.push_str(symbol);
+                    skip = UnicodeWidthStr::width(symbol).saturating_sub(1);
+                }
+                out
             })
             .collect()
+    }
+
+    /// The buffer cells themselves, so hit ranges can be checked by column
+    /// (a string indexes bytes, and a wide char owns two cells).
+    fn strip_buffer_cells(
+        buf: &ratatui::buffer::Buffer,
+    ) -> Vec<(String, ratatui::style::Color)> {
+        (0..buf.area.width)
+            .map(|x| {
+                let cell = &buf[(x, 0)];
+                (cell.symbol().to_string(), cell.fg)
+            })
+            .collect()
+    }
+
+    /// The logical text painted in columns `x0..x1`, stepping over wide-char
+    /// continuation cells exactly as the row reader does.
+    fn painted_text(buf: &ratatui::buffer::Buffer, x0: usize, x1: usize) -> String {
+        let mut out = String::new();
+        let mut skip = 0usize;
+        for x in 0..buf.area.width {
+            let x = usize::from(x);
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let symbol = buf[(x as u16, 0)].symbol();
+            if (x0..x1).contains(&x) {
+                out.push_str(symbol);
+            }
+            if x >= x1 {
+                break;
+            }
+            skip = UnicodeWidthStr::width(symbol).saturating_sub(1);
+        }
+        out
     }
 
     /// A plan with `total` steps: `current` running, everything before it done.
@@ -3536,93 +3972,83 @@ mod tests {
         }
     }
 
-    /// The workbench always reserves exactly one row for an active plan. The
+    /// The strip is always exactly one row, whatever the plan's shape — the
     /// complete list belongs to the Plan page.
     #[test]
-    fn plan_summary_is_always_one_row() {
+    fn the_state_strip_is_always_one_row() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
-        state.plan = Some(running_plan(9, 5));
-        let rows = plan_panel_rows(&state, 10);
-        let visible: Vec<&String> = rows.iter().filter(|row| !row.trim().is_empty()).collect();
-        assert_eq!(visible.len(), 1, "{rows:?}");
-        let line = squash(visible[0]);
-        assert!(line.contains("已完成5/9"), "{line}");
-        assert!(line.contains("进行中：步骤6"), "{line}");
+        let rows = strip_rows(&mut state, Some(running_plan(9, 5)), 70);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let line = rows[0].trim_end();
+        assert!(line.contains("● 计划 5/9 · 步骤 6 ↗"), "{line}");
         assert!(line.ends_with('↗'), "{line}");
     }
 
-    /// The summary carries declared progress and never mistakes the running
+    /// The indicator carries declared progress and never mistakes the running
     /// ordinal for the done count.
     #[test]
-    fn the_plan_header_carries_declared_progress() {
-        let t = crate::i18n::Locale::Zh.text();
-        let title = plan_chrome_title(&running_plan(9, 5), true, t);
-        assert!(title.contains("已完成 5/9"), "{title}");
-        assert!(!title.contains("6/9"), "{title}");
-        let t = crate::i18n::Locale::En.text();
-        let title = plan_chrome_title(&running_plan(9, 5), true, t);
-        assert!(title.contains("5/9 completed"), "{title}");
-        assert!(!title.contains("6/9"), "{title}");
-    }
-
-    /// P9: one running glyph for both plan surfaces (`/plan` used ●, the dock
-    /// used →, so the same state read as two different things).
-    #[test]
-    fn both_plan_surfaces_use_the_same_running_glyph() {
+    fn the_plan_indicator_carries_declared_progress() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
-        state.plan = Some(running_plan(3, 1));
-        let rows = plan_panel_rows(&state, 5);
-        assert!(
-            rows.iter().any(|r| r.trim_start().starts_with('●')),
-            "{rows:?}"
-        );
-        assert!(
-            !rows.iter().any(|r| r.trim_start().starts_with('→')),
-            "{rows:?}"
-        );
+        let rows = strip_rows(&mut state, Some(running_plan(9, 5)), 70);
+        let line = rows[0].trim_end();
+        assert!(line.contains("计划 5/9"), "{line}");
+        assert!(!line.contains("6/9"), "{line}");
+        assert!(!line.contains("步骤 5"), "done steps drop out: {line}");
     }
 
-    /// A fully finished plan still leaves the workbench entirely.
+    /// A failed step owns the indicator: red, named as a failure, still
+    /// actionable through the arrow.
     #[test]
-    fn a_finished_plan_takes_no_rows_even_with_an_adaptive_viewport() {
-        let mut state = test_state();
-        state.plan = Some(UiPlan {
-            steps: (0..9)
-                .map(|i| UiPlanStep {
-                    index: i,
-                    description: format!("步骤 {}", i + 1),
-                    status: PlanStepStatus::Done,
-                })
-                .collect(),
-        });
-        assert_eq!(plan_panel_height(&state, 40), 0);
-    }
-
-    /// An active plan never takes more than one row, and no row is painted when
-    /// the layout has no room.
-    #[test]
-    fn plan_summary_height_is_fixed() {
-        let mut state = test_state();
-        state.plan = Some(running_plan(9, 5));
-        assert_eq!(plan_panel_height(&state, 40), 1);
-        assert_eq!(plan_panel_height(&state, 1), 1);
-        assert_eq!(plan_panel_height(&state, 0), 0);
-    }
-
-    /// A failed step owns the one-line status and stays visibly actionable.
-    #[test]
-    fn failed_plan_summary_names_the_failed_step() {
+    fn a_failed_plan_says_so_and_stays_reachable() {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.theme = crate::theme::Theme::dark();
         let mut plan = running_plan(4, 2);
         plan.steps[2].status = PlanStepStatus::Failed;
-        state.plan = Some(plan);
-        let line = squash(&plan_panel_rows(&state, 4).join("\n"));
-        assert!(line.starts_with("!计划"), "{line}");
-        assert!(line.contains("第3步失败：步骤3"), "{line}");
-        assert!(line.ends_with('↗'), "{line}");
+        let buf = strip_buffer(&mut state, Some(plan.clone()), 100);
+        let rows = strip_rows(&mut state, Some(plan), 100);
+        let line = rows[0].trim_end();
+        assert!(line.contains("✕ 计划 2/4 · 执行失败 ↗"), "{line}");
+        let glyph = (0..buf.area.width)
+            .map(|x| buf[(x, 0)].clone())
+            .find(|cell| cell.symbol() == "✕")
+            .expect("failure glyph painted");
+        assert_eq!(
+            glyph.fg,
+            state.theme.status.error,
+            "the failure ink is the error token"
+        );
+    }
+
+    /// A settled plan outside its turn is history, not chrome: the strip is
+    /// the runtime status alone and the plan publishes no hit region.
+    #[test]
+    fn a_settled_plan_outside_its_turn_leaves_no_strip() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Idle;
+        let rows = strip_rows(&mut state, Some(completed_plan()), 70);
+        assert!(rows[0].trim().is_empty(), "{rows:?}");
+        assert!(state.plan_hit.is_none(), "{:?}", state.plan_hit);
+        assert!(!plan_indicator_should_show(&completed_plan(), false));
+        assert!(
+            plan_indicator_should_show(&completed_plan(), true),
+            "while the turn still runs the completion is live state"
+        );
+    }
+
+    /// Without a plan the strip is exactly the runtime status line: the merge
+    /// added nothing when there is nothing to merge.
+    #[test]
+    fn without_any_plan_the_strip_is_the_runtime_line_verbatim() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.activity = Some("运行 cargo test".into());
+        let standalone = crate::status_line::status_strip_line(&state, 70, true).to_string();
+        let merged = strip_rows(&mut state, None, 70);
+        assert_eq!(merged[0].trim_end(), standalone);
+        assert!(state.plan_hit.is_none(), "{:?}", state.plan_hit);
     }
 
     // ── Notice Surface ─────────────────────────────────────────────────────

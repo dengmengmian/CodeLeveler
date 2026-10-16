@@ -15,9 +15,10 @@ use crate::state::{AppState, BackgroundTaskChrome};
 #[cfg(test)]
 use crate::status_line::fmt_elapsed;
 
-/// Compact status-strip cap: how many ACTIVITIES are shown. Remaining stay
-/// available on the Activity screen. A child occupies two physical lines, so
-/// the strip's own row cap is derived from this in the workbench layout.
+/// Cap on ACTIVITIES in the legacy status-strip projection (test-only since
+/// the state strip became one row): how many are listed before "还有 N 条".
+/// Remaining stay available on the Activity screen.
+#[cfg(test)]
 pub(crate) const MAX_STATUS_ROWS: usize = 4;
 
 /// Stable identity. Never derived from the display title.

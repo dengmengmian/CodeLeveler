@@ -851,16 +851,16 @@ fn a_plan_transition_repaints_on_the_same_frame() {
     );
     reduce(&mut state, plan(P::Running, P::Pending, P::Pending));
     let before = render_at(100, 30, &mut state);
-    assert!(before.contains("已完成 0/3"), "{before}");
+    assert!(before.contains("● 计划 0/3 · 骨架"), "{before}");
 
     reduce(&mut state, plan(P::Done, P::Running, P::Pending));
     let after = render_at(100, 30, &mut state);
     assert!(
-        after.contains("已完成 1/3"),
-        "the header follows the transition: {after}"
+        after.contains("● 计划 1/3 · 首页"),
+        "the indicator follows the transition: {after}"
     );
     assert!(
-        after.contains("进行中：首页") && !after.contains("验证"),
+        !after.contains("验证"),
         "the workbench keeps only the running step in its one-line summary: {after}"
     );
     assert!(
@@ -1582,11 +1582,11 @@ fn goal_recap_and_plan_dock_do_not_mix() {
         .expect("recap in history");
     let plan_line = text
         .lines()
-        .position(|l| l.contains("计划 ·"))
-        .expect("plan dock");
+        .position(|l| l.contains("计划 1/2"))
+        .expect("plan indicator on the state strip");
     assert!(
         recap_line < plan_line,
-        "recap belongs to the history above the docked plan: {text}"
+        "recap belongs to the history above the plan indicator: {text}"
     );
 }
 

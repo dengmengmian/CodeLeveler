@@ -151,6 +151,47 @@ pub struct AccentColors {
     pub subtle: Color,
 }
 
+/// The Plan indicator's ink: its own soft purple, plus the dim end of the
+/// breathing animation the running glyph moves between.
+///
+/// The Plan is a second object under the same task as the runtime status, so
+/// it needs to read as its own thing without becoming a second brand color —
+/// hence a token pair rather than a borrowed accent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanColors {
+    /// The indicator's identity ink: glyph, progress and the entry arrow.
+    pub primary: Color,
+    /// The dim end of the running glyph's breath.
+    pub dim: Color,
+}
+
+/// Discrete stops the breath moves through. One per busy tick at the 1.2 s
+/// period, so a smooth RGB interpolation never repaints faster than the
+/// terminal already does.
+const BREATH_STEPS: u8 = 8;
+
+impl PlanColors {
+    /// Ink for the running glyph at `level` (`1.0` = [`Self::primary`],
+    /// `0.0` = [`Self::dim`]).
+    ///
+    /// A terminal cell has no alpha, so the breath is a step between two shades
+    /// of one hue. RGB endpoints interpolate over [`BREATH_STEPS`] stops; a
+    /// palette with no RGB value for them (the 256-colour compatibility path,
+    /// `NO_COLOR`) switches between the two tokens instead of inventing an
+    /// in-between the profile cannot paint.
+    pub fn breathe(&self, level: f32) -> Color {
+        let (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) = (self.dim, self.primary) else {
+            return if level < 0.5 { self.dim } else { self.primary };
+        };
+        let step = (level.clamp(0.0, 1.0) * f32::from(BREATH_STEPS)).round();
+        let mix = |from: u8, to: u8| {
+            (f32::from(from) + (f32::from(to) - f32::from(from)) * (step / f32::from(BREATH_STEPS)))
+                .round() as u8
+        };
+        Color::Rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
+    }
+}
+
 /// Status semantics (icons and short labels — not whole blocks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusColors {
@@ -195,6 +236,8 @@ pub struct Theme {
     pub text: TextColors,
     pub border: BorderColors,
     pub accent: AccentColors,
+    /// Plan indicator ink (see [`PlanColors`]).
+    pub plan: PlanColors,
     pub status: StatusColors,
     pub diff: DiffColors,
     pub brand: BrandColors,
@@ -260,6 +303,10 @@ fn indexed_256_theme(theme: Theme) -> Theme {
             primary: indexed(theme.accent.primary),
             secondary: indexed(theme.accent.secondary),
             subtle: indexed(theme.accent.subtle),
+        },
+        plan: PlanColors {
+            primary: indexed(theme.plan.primary),
+            dim: indexed(theme.plan.dim),
         },
         status: StatusColors {
             success: indexed(theme.status.success),
@@ -390,6 +437,12 @@ impl Theme {
                 secondary: rgb(0x78B7FF),
                 subtle: rgb(0x1A3050),
             },
+            // Soft violet, distinct from the blue accent. The dim end stays a
+            // purple (not a grey) so the breath is luminance, not hue.
+            plan: PlanColors {
+                primary: rgb(0xA78BFA),
+                dim: rgb(0x6D5BC4),
+            },
             status: StatusColors {
                 success: rgb(0x56C271),
                 warning: rgb(0xE5B454),
@@ -451,6 +504,12 @@ impl Theme {
                 secondary: rgb(0x3B82D0),
                 subtle: rgb(0xDCEBFF),
             },
+            // Same violet family, darkened for the light canvas; the breath
+            // moves toward the lighter end because that reads as the fade.
+            plan: PlanColors {
+                primary: rgb(0x7C3AED),
+                dim: rgb(0xA78BFA),
+            },
             status: StatusColors {
                 success: rgb(0x1A7F37),
                 warning: rgb(0x9A6700),
@@ -509,6 +568,10 @@ impl Theme {
                 primary: rgb(0x66B3FF),
                 secondary: rgb(0x99CCFF),
                 subtle: rgb(0x003366),
+            },
+            plan: PlanColors {
+                primary: rgb(0xC9A8FF),
+                dim: rgb(0x8B62E8),
             },
             status: StatusColors {
                 success: rgb(0x3DDA6B),
@@ -588,6 +651,10 @@ impl Theme {
                 primary: Color::Reset,
                 secondary: Color::Reset,
                 subtle: Color::Reset,
+            },
+            plan: PlanColors {
+                primary: Color::Reset,
+                dim: Color::Reset,
             },
             status: StatusColors {
                 success: Color::Reset,
@@ -828,6 +895,7 @@ mod tests {
         assert_min(t.code, s.canvas, 4.5, "code/canvas");
         assert_min(t.muted, s.canvas, 4.5, "muted/canvas");
         assert_min(t.muted, s.input, 4.5, "muted/input");
+        assert_min(theme.plan.primary, s.canvas, 4.5, "plan.primary/canvas");
         assert_min(theme.status.success, s.canvas, 4.5, "success/canvas");
         assert_min(theme.status.warning, s.canvas, 4.5, "warning/canvas");
         assert_min(theme.status.error, s.canvas, 4.5, "error/canvas");
@@ -905,6 +973,69 @@ mod tests {
     #[test]
     fn high_contrast_gate() {
         assert_used_contrast_pairs(&Theme::high_contrast());
+    }
+
+    /// The Plan indicator owns its ink: a violet that is not the blue accent,
+    /// with a second shade to breathe toward, legible in every fixed palette.
+    #[test]
+    fn the_plan_indicator_owns_its_purple() {
+        for id in ThemeId::FIXED {
+            let t = Theme::named(id);
+            assert_ne!(t.plan.primary, t.accent.primary, "{id}: plan is its own ink");
+            assert_ne!(
+                t.plan.primary, t.plan.dim,
+                "{id}: the breath needs two shades"
+            );
+            assert_ne!(t.plan.dim, t.surface.canvas, "{id}: dim is still a purple");
+        }
+        let mono = Theme::no_color();
+        assert_eq!(mono.plan.primary, Color::Reset);
+        assert_eq!(mono.plan.dim, Color::Reset);
+    }
+
+    /// The breath interpolates between the two shades and touches both ends;
+    /// the stops are finite and monotone so consecutive frames change gently.
+    #[test]
+    fn the_breath_moves_between_the_two_purples() {
+        let plan = Theme::dark().plan;
+        assert_eq!(plan.breathe(1.0), plan.primary);
+        assert_eq!(plan.breathe(0.0), plan.dim);
+        assert_eq!(plan.breathe(2.0), plan.primary, "clamped");
+        let mut seen = Vec::new();
+        let mut shades = Vec::new();
+        for i in 0..=40 {
+            let color = plan.breathe(i as f32 / 40.0);
+            if shades.last() != Some(&color) {
+                shades.push(color);
+            }
+            if !seen.contains(&color) {
+                seen.push(color);
+            }
+        }
+        assert!(
+            (2..=BREATH_STEPS as usize + 1).contains(&seen.len()),
+            "the breath must use a finite set of stops: {}",
+            seen.len()
+        );
+        let (Color::Rgb(r0, _, b0), Color::Rgb(r1, _, b1)) = (plan.dim, plan.primary) else {
+            panic!("dark plan ink is RGB");
+        };
+        assert!(r0 < r1 && b0 < b1, "the breath only moves luminance");
+    }
+
+    /// A profile with no RGB for the two shades (256-colour compatibility,
+    /// NO_COLOR) still breathes, just between the two tokens it can paint.
+    #[test]
+    fn the_breath_degrades_to_the_two_tokens_without_rgb() {
+        let plan = indexed_256_theme(Theme::dark()).plan;
+        assert!(matches!(plan.primary, Color::Indexed(_)));
+        let low = plan.breathe(0.0);
+        let high = plan.breathe(1.0);
+        assert_ne!(low, high, "the two ends must still differ");
+        assert!(
+            [plan.primary, plan.dim].contains(&low) && [plan.primary, plan.dim].contains(&high),
+            "no invented in-between: {low:?} {high:?}"
+        );
     }
 
     #[test]

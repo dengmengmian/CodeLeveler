@@ -1472,11 +1472,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 WorkbenchFocus::Conversation => {
                     if crate::active_goal::has_visible_goal(state) {
                         WorkbenchFocus::Goal
-                    } else if state
-                        .plan
-                        .as_ref()
-                        .is_some_and(crate::workbench::plan_panel_should_show)
-                    {
+                    } else if plan_indicator_visible(state) {
                         WorkbenchFocus::Plan
                     } else if !state.stoppable_commands().is_empty() {
                         ensure_command_selection(state);
@@ -1486,11 +1482,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                     }
                 }
                 WorkbenchFocus::Goal => {
-                    if state
-                        .plan
-                        .as_ref()
-                        .is_some_and(crate::workbench::plan_panel_should_show)
-                    {
+                    if plan_indicator_visible(state) {
                         WorkbenchFocus::Plan
                     } else if !state.stoppable_commands().is_empty() {
                         ensure_command_selection(state);
@@ -1725,6 +1717,16 @@ fn forget_pending_input_row(state: &mut AppState) {
     if state.pending_inputs.is_empty() && state.workbench_focus == WorkbenchFocus::Pending {
         state.workbench_focus = WorkbenchFocus::Input;
     }
+}
+
+/// Whether the plan indicator currently occupies the state strip. Keyboard
+/// focus follows the same rule the renderer shows, so a focus stop can never
+/// point at a row that is not on screen.
+fn plan_indicator_visible(state: &AppState) -> bool {
+    state
+        .plan
+        .as_ref()
+        .is_some_and(|plan| crate::workbench::plan_indicator_should_show(plan, state.is_busy()))
 }
 
 /// Move the workbench focus to the activity strip, or back to the composer

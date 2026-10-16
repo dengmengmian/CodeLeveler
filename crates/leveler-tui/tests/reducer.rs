@@ -944,25 +944,15 @@ fn btw_header_tracks_the_live_main_status() {
         before.contains("返回主线程"),
         "side-thread header: {before}"
     );
-    // The main plan advances while the side thread holds the screen.
-    s.plan = Some(UiPlan {
-        steps: vec![
-            UiPlanStep {
-                index: 0,
-                description: "一".into(),
-                status: leveler_client_protocol::PlanStepStatus::Done,
-            },
-            UiPlanStep {
-                index: 1,
-                description: "二".into(),
-                status: leveler_client_protocol::PlanStepStatus::Running,
-            },
-        ],
-    });
+    // Main's live state advances while the side thread holds the screen. The
+    // plan indicator belongs to the main workbench strip — this header
+    // projects the runtime line — so liveness is read from the runtime's own
+    // live field.
+    s.activity = Some("正在检查 WorkerConfig".into());
     let after = rendered(&mut s, 100, 24);
     assert!(
-        after.contains("第 2/2 步"),
-        "header must project the live plan, not a snapshot: {after}"
+        after.contains("正在检查 WorkerConfig"),
+        "header must project the live status, not a snapshot: {after}"
     );
 }
 
@@ -4801,17 +4791,28 @@ fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
     let workbench = rendered(&mut s, 100, 24);
     let row = workbench
         .lines()
-        .position(|line| line.contains("计划 ·"))
-        .unwrap_or_else(|| panic!("plan summary missing:\n{workbench}")) as u16;
-    reduce(
-        &mut s,
+        .position(|line| line.contains("计划 0/20"))
+        .unwrap_or_else(|| panic!("plan indicator missing:\n{workbench}")) as u16;
+    let (hit_row, x0, x1) = s.plan_hit.expect("the plan paints a hit region");
+    assert_eq!(hit_row, row, "the hit tracks the painted row:\n{workbench}");
+    let click = |column: u16| {
         Action::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 4,
-            row,
+            column,
+            row: hit_row,
             modifiers: KeyModifiers::empty(),
-        }),
+        })
+    };
+    // The runtime side of the merged row is not the plan's target.
+    reduce(&mut s, click(x0 - 1));
+    assert_eq!(
+        format!("{:?}", s.active_screen),
+        "Conversation",
+        "the runtime half must not open the plan"
     );
+    // The plan's whole visible area is: glyph through arrow, including the
+    // arrow at the far end.
+    reduce(&mut s, click(x1 - 1));
     assert_eq!(format!("{:?}", s.active_screen), "Plan");
 
     let first = rendered(&mut s, 70, 10);

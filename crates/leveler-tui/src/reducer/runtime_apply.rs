@@ -310,9 +310,10 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
         }
         RuntimeEvent::PlanUpdated { plan } => {
             // This is the runtime's latest declaration for the active turn.
-            // Rendering may hide a fully-done plan, but the reducer keeps the
-            // exact value until the terminal transition archives it.
-            if !crate::workbench::plan_panel_should_show(&plan)
+            // Rendering may hide the indicator (a settled plan outside a
+            // running turn), but the reducer keeps the exact value until the
+            // terminal transition archives it.
+            if !crate::workbench::plan_indicator_should_show(&plan, state.is_busy())
                 && state.workbench_focus == crate::state::WorkbenchFocus::Plan
             {
                 state.workbench_focus = crate::state::WorkbenchFocus::Input;

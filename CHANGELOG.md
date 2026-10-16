@@ -6,6 +6,10 @@ Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
 ## [Unreleased]
 
+### Changed
+
+- The TUI's bottom chrome spends one row on the turn's state: the runtime status keeps the live label, elapsed time and tool/token counts on the left, and the plan indicator sits on the right of the same row — its own violet identity, a breathing dot while the turn runs, a static green ✓ when declared complete, red ✕ on failure, muted ○ for a last record. Plan progress is stated once (the runtime line no longer repeats the current step), and the whole indicator, arrow included, is the click/Enter target for the Plan page
+
 ## [1.0.15] - 2026-10-13
 
 Makes a stalled provider answer diagnosable and recoverable, and settles how the
