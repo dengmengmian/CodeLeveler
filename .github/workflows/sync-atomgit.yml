@@ -10,13 +10,24 @@ name: Sync release to AtomGit
 # deliberately does NOT push the tag — it only creates the release and uploads
 # the assets, which the mirror does not carry.
 #
-# Runs after a successful Release. Requires an `ATOMGIT_TOKEN` repository secret
-# (a token with release + attachment write access on the AtomGit repo). Without
-# it the job fails loudly and the GitHub release is untouched.
+# Runs after a successful Release, and hourly. AtomGit pulls on its own
+# schedule, so the tag this job must name reaches the mirror minutes or hours
+# after GitHub has it — measured on v1.0.17: fifty minutes after the release,
+# the mirror still served the previous commit and carried no v1.0.17 tag at
+# all. A release cannot be created before the mirror carries its tag, so the
+# release trigger only finishes when the mirror happens to be quick; the hourly
+# schedule is what makes an unhurried mirror converge with no human involved.
+# Every step is idempotent, so both paths can run on the same tag.
+#
+# Requires an `ATOMGIT_TOKEN` repository secret (a token with release +
+# attachment write access on the AtomGit repo). Without it the job fails loudly
+# and the GitHub release is untouched.
 on:
   workflow_run:
     workflows: [Release]
     types: [completed]
+  schedule:
+    - cron: '23 * * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -34,8 +45,11 @@ concurrency:
 jobs:
   sync:
     name: mirror tag, notes and assets
-    # Only after a successful build, or when a human asked for a specific tag.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # A successful build, the hourly retry, or a human asking for a tag.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     env:
       ATOMGIT_OWNER: dengmengmian
@@ -85,43 +99,105 @@ jobs:
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$GH_OWNER/$GH_REPO" \
-            --json name,body,isPrerelease > /tmp/gh-release.json
+            --json name,body,isPrerelease,publishedAt > /tmp/gh-release.json
           jq -r .name /tmp/gh-release.json > /tmp/name.txt
           jq -r .body /tmp/gh-release.json > /tmp/body.md
           jq -r .isPrerelease /tmp/gh-release.json > /tmp/prerelease.txt
+          # Epoch seconds, so the wait below can tell a slow mirror from a
+          # stalled one without parsing a date a second time.
+          date -d "$(jq -r .publishedAt /tmp/gh-release.json)" +%s > /tmp/published-epoch.txt
 
-      - name: Create or update the AtomGit release
+      # AtomGit mirrors on its own cadence, so the tag a release must name can
+      # arrive long after GitHub has it. Creating the release before that fails
+      # with a 4xx that means "no such tag" — which a previous version of this
+      # job read as "already there", reported success, and then 404'd on the
+      # first upload. Probe for the tag instead, and only then write.
+      - name: Wait for the mirror to carry the tag
+        id: ready
         env:
           ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
+          tags_url="$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/tags"
+          mirrored=false
+          for attempt in $(seq 1 20); do
+            if curl -sS "$tags_url" \
+              | jq -e --arg tag "$TAG" 'any(.[]; .name == $tag)' > /dev/null 2>&1; then
+              mirrored=true
+              break
+            fi
+            echo "the mirror does not carry $TAG yet (attempt $attempt of 20)"
+            sleep 30
+          done
+          echo "ready=$mirrored" >> "$GITHUB_OUTPUT"
+          if [ "$mirrored" = true ]; then
+            echo "$TAG is in the mirror"
+            exit 0
+          fi
+          # Past a day of hourly retries this is not a slow mirror: something is
+          # wrong with the mirror itself, and staying green would hide it.
+          age=$(( $(date +%s) - $(cat /tmp/published-epoch.txt) ))
+          if [ "$age" -gt 86400 ]; then
+            echo "::error::$TAG has not reached the AtomGit mirror in $((age / 3600))h; the mirror is stalled"
+            exit 1
+          fi
+          echo "::warning::$TAG is not in the AtomGit mirror yet ($((age / 60))m after the GitHub release); the hourly schedule retries until it is"
+
+      - name: Create or update the AtomGit release
+        if: steps.ready.outputs.ready == 'true'
+        env:
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          api="$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO"
           payload="$(jq -n \
             --arg tag "$TAG" \
             --arg name "$(cat /tmp/name.txt)" \
             --arg body "$(cat /tmp/body.md)" \
             --argjson prerelease "$(cat /tmp/prerelease.txt)" \
             '{tag_name: $tag, name: $name, body: $body, prerelease: $prerelease, target_commitish: "main"}')"
-          code="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
-            -X POST "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases?access_token=$ATOMGIT_TOKEN" \
-            -H 'Content-Type: application/json' \
-            -d "$payload")"
-          case "$code" in
-            201|200) echo "created the AtomGit release" ;;
-            400|409)
-              # Already there (a re-run): refresh the notes instead of failing.
-              curl -sS -o /dev/null -X PATCH \
-                "$ATOMGIT_API/repos/$ATOMGIT_OWNER/$ATOMGIT_REPO/releases/$TAG?access_token=$ATOMGIT_TOKEN" \
-                -H 'Content-Type: application/json' \
-                -d "$payload"
-              echo "updated the existing AtomGit release" ;;
+          # Read before writing: the only proof that a re-run has a release to
+          # refresh is a release that answers on this tag.
+          lookup="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            "$api/releases/$TAG?access_token=$ATOMGIT_TOKEN")"
+          case "$lookup" in
+            200)
+              curl -sS -f -X PATCH "$api/releases/$TAG?access_token=$ATOMGIT_TOKEN" \
+                -H 'Content-Type: application/json' -d "$payload" > /dev/null
+              echo "refreshed the notes of the existing AtomGit release"
+              exit 0 ;;
+            404) ;;
             *)
-              echo "::error::AtomGit release request failed with HTTP $code"
+              echo "::error::reading the AtomGit release failed with HTTP $lookup"
               cat /tmp/release.json || true
               exit 1 ;;
           esac
+          code="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -X POST "$api/releases?access_token=$ATOMGIT_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "$payload")"
+          case "$code" in
+            200|201) ;;
+            *)
+              echo "::error::creating the AtomGit release failed with HTTP $code, and the tag is in the mirror, so this is not a stale-mirror answer"
+              cat /tmp/release.json || true
+              exit 1 ;;
+          esac
+          # A 2xx is not the release. Read it back, so a create that quietly did
+          # nothing can never be reported as one.
+          verified="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            "$api/releases/$TAG?access_token=$ATOMGIT_TOKEN")"
+          if [ "$verified" != 200 ]; then
+            echo "::error::AtomGit answered $code but $TAG still reads as missing (HTTP $verified)"
+            cat /tmp/release.json || true
+            exit 1
+          fi
+          echo "created the AtomGit release"
 
       - name: Upload every GitHub asset
+        if: steps.ready.outputs.ready == 'true'
         env:
           ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
           GH_TOKEN: ${{ github.token }}
