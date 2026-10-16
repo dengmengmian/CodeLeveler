@@ -777,13 +777,69 @@ fn classify_shell_script_fallback(script: &str, windows_cmd: bool) -> CommandCla
         if segment_changes_git_authority(&tokens) {
             return CommandClass::Dangerous;
         }
-        if let Some((prog, rest)) = tokens.split_first()
-            && classify_program(basename(prog), rest) == CommandClass::Dangerous
+        let Some((program, rest)) = tokens.split_first() else {
+            continue;
+        };
+        // A word `cmd.exe` substitutes into is not a value anyone can vet: the
+        // program sees what the environment named, not the text. An unreadable
+        // program word fails closed, exactly as it does for the Bash AST.
+        if cmd_word(program, windows_cmd).is_none() {
+            return CommandClass::Dangerous;
+        }
+        let words: Vec<Option<String>> = rest
+            .iter()
+            .map(|word| cmd_word(word, windows_cmd))
+            .collect();
+        let opaque = words.iter().any(Option::is_none);
+        // An unreadable `rm` word can be the target itself, and dropping it
+        // would hide the deletion.
+        if opaque && matches!(basename(program), "rm" | "rmdir") {
+            return CommandClass::Dangerous;
+        }
+        let readable: Vec<String> = words.iter().flatten().cloned().collect();
+        if classify_program(basename(program), &readable) == CommandClass::Dangerous {
+            return CommandClass::Dangerous;
+        }
+        if opaque && basename(program) == "git" && crate::shell_ast::opaque_git_security_ask(&words)
         {
             return CommandClass::Dangerous;
         }
     }
     CommandClass::Safe
+}
+
+/// One shell word, as a value the classifier can vet.
+///
+/// `cmd.exe` substitutes `%NAME%` before the program sees the word, so
+/// `git fetch %REMOTE%` reaches Git as whatever remote the environment names —
+/// the same position the Bash AST is in for `$NAME`, and unreadable for the
+/// same reason. Under `sh` the same text is a literal word and stays readable.
+fn cmd_word(word: &str, windows_cmd: bool) -> Option<String> {
+    if windows_cmd && cmd_expands(word) {
+        return None;
+    }
+    Some(word.to_string())
+}
+
+/// True when `cmd.exe` would substitute something into this word: `%NAME%`,
+/// including the `%NAME:old=new%` form, where the substituted text can itself
+/// be another variable. `%%` is a literal percent, and the argument modifiers
+/// (`%~dp0`, `%1`) are batch-file features that never appear in the
+/// `cmd /C <script>` this product runs, so neither is read as an expansion.
+fn cmd_expands(word: &str) -> bool {
+    let mut rest = word;
+    while let Some(open) = rest.find('%') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('%') else {
+            return false;
+        };
+        let name = after[..close].split(':').next().unwrap_or("");
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return true;
+        }
+        rest = &after[close + 1..];
+    }
+    false
 }
 
 /// The fallback must inspect literal file redirects as well as program names.

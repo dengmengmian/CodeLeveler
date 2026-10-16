@@ -11,63 +11,91 @@
 //! `sandbox-exec` on macOS. A policy table that passes while the sandbox still
 //! answers EPERM is exactly the double-truth-source failure this pair exists
 //! to make impossible.
+//!
+//! One table, two shells. `sh -c` and `cmd /C` are different languages and the
+//! classifier decides each on its own terms — the Bash AST for the POSIX
+//! wrapper, the string classifier for `cmd` — so an entry is asserted for the
+//! shell it is written in, and the two spellings of the same intent live side
+//! by side (a variable remote is `$REMOTE` under `sh` and `%REMOTE%` under
+//! `cmd`). Entries that mean the same thing to both shells are asserted for
+//! both, on every platform: a verdict that only holds on the runner whose
+//! platform happens to execute it is not a contract.
 
 use leveler_execution::{
     ApprovalPolicy, CommandView, PermissionProfile, Requirement, RiskLevel, classify_command,
 };
 
-/// The requirement Auto (Assisted) produces for one shell command.
-fn auto(command_line: &str) -> Requirement {
-    let (program, args) = leveler_execution::shell_invocation(command_line);
+/// The shell a table entry is written in — and therefore the shell the entry
+/// only means anything about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shell {
+    /// `sh -c <line>`: the POSIX wrapper, classified on the Bash grammar.
+    Bash,
+    /// `cmd /C <line>`: what the product executes on Windows, classified as a
+    /// cmd script.
+    Cmd,
+}
+
+impl Shell {
+    fn invocation(self, command_line: &str) -> (&'static str, Vec<String>) {
+        let (program, flag) = match self {
+            Shell::Bash => ("sh", "-c"),
+            Shell::Cmd => ("cmd", "/C"),
+        };
+        (program, vec![flag.to_string(), command_line.to_string()])
+    }
+}
+
+/// The requirement one shell produces for one command line.
+fn requirement(shell: Shell, profile: PermissionProfile, command_line: &str) -> Requirement {
+    let (program, args) = shell.invocation(command_line);
     ApprovalPolicy::default().evaluate(
-        PermissionProfile::Assisted,
+        profile,
         "shell_command",
         RiskLevel::WorkspaceWrite,
         Some(CommandView {
-            program: &program,
+            program,
             args: &args,
         }),
     )
 }
 
-/// The requirement Full produces for one shell command.
-fn full(command_line: &str) -> Requirement {
-    let (program, args) = leveler_execution::shell_invocation(command_line);
-    ApprovalPolicy::default().evaluate(
-        PermissionProfile::FullAccess,
-        "shell_command",
-        RiskLevel::WorkspaceWrite,
-        Some(CommandView {
-            program: &program,
-            args: &args,
-        }),
-    )
-}
-
-fn assert_allowed(command_line: &str) {
+fn assert_allow(shell: Shell, command_line: &str) {
     assert_eq!(
-        auto(command_line),
+        requirement(shell, PermissionProfile::Assisted, command_line),
         Requirement::Auto,
-        "Auto must allow: {command_line}"
+        "Auto must allow under {shell:?}: {command_line}"
     );
     assert_eq!(
-        full(command_line),
+        requirement(shell, PermissionProfile::FullAccess, command_line),
         Requirement::Auto,
-        "Full must allow: {command_line}"
+        "Full must allow under {shell:?}: {command_line}"
     );
 }
 
-fn assert_asked(command_line: &str) {
+fn assert_ask(shell: Shell, command_line: &str) {
     assert_eq!(
-        auto(command_line),
+        requirement(shell, PermissionProfile::Assisted, command_line),
         Requirement::NeedApproval,
-        "Auto must ask for a dangerous operation: {command_line}"
+        "Auto must ask for a dangerous operation under {shell:?}: {command_line}"
     );
     assert_eq!(
-        full(command_line),
+        requirement(shell, PermissionProfile::FullAccess, command_line),
         Requirement::Auto,
         "Full bypasses the gate entirely"
     );
+}
+
+/// The line means the same thing to both shells, so every platform asserts both.
+fn assert_both_allow(command_line: &str) {
+    assert_allow(Shell::Bash, command_line);
+    assert_allow(Shell::Cmd, command_line);
+}
+
+/// The line means the same thing to both shells, so every platform asserts both.
+fn assert_both_ask(command_line: &str) {
+    assert_ask(Shell::Bash, command_line);
+    assert_ask(Shell::Cmd, command_line);
 }
 
 #[test]
@@ -84,7 +112,7 @@ fn auto_allows_process_and_system_inspection() {
         "df -h",
         "vm_stat",
     ] {
-        assert_allowed(command_line);
+        assert_both_allow(command_line);
     }
 }
 
@@ -157,11 +185,20 @@ fn auto_allows_read_only_git_in_every_ordinary_spelling() {
         "git -c user.email=a@b.com commit -m x",
         "git fetch origin && echo extra",
         "git status; git clean $FLAGS",
-        // A backup listing is a read plus an ordinary directory create.
-        "mkdir -p tmp/backup && ts=$(date +%Y%m%d-%H%M%S) && echo \"backup $ts\" && for db in a b; do echo \"$db\"; done",
     ] {
-        assert_allowed(command_line);
+        assert_both_allow(command_line);
     }
+    // A backup listing is a read plus an ordinary directory create.
+    //
+    // The POSIX spelling is written for `sh`, which walks the command
+    // substitution on the Bash grammar; `cmd` has no such construct, so the
+    // Windows spelling states the same intent in the language Windows runs —
+    // and both are ordinary development whichever platform executes them.
+    assert_allow(
+        Shell::Bash,
+        "mkdir -p tmp/backup && ts=$(date +%Y%m%d-%H%M%S) && echo \"backup $ts\" && for db in a b; do echo \"$db\"; done",
+    );
+    assert_both_allow("mkdir tmp\\backup && set ts=1 && for %d in (a b) do echo %d");
 }
 
 #[test]
@@ -189,15 +226,7 @@ fn auto_allows_temporary_and_workspace_file_operations() {
         "cargo build",
         "npm run build",
     ] {
-        // `shell_invocation` executes cmd on Windows: exercise native temporary
-        // destinations there instead of POSIX /tmp and $TMPDIR spellings.
-        #[cfg(windows)]
-        let native_command_line = command_line
-            .replace("/tmp/", "%TEMP%\\")
-            .replace("$TMPDIR/", "%TEMP%\\");
-        #[cfg(windows)]
-        let command_line = native_command_line.as_str();
-        assert_allowed(command_line);
+        assert_both_allow(command_line);
     }
 }
 
@@ -230,11 +259,8 @@ fn auto_still_asks_for_dangerous_operations() {
         "echo x > ../../outside.txt",
         // A remote we cannot name would use whatever credential the helper
         // has. An unreadable config key might be hooksPath.
-        "git fetch $REMOTE",
-        "git push $REMOTE",
         "git fetch --all",
         "git config core.hooksPath /tmp/evil",
-        "git config $KEY value",
         // Git that executes a local program.
         "git -c core.hooksPath=/tmp/evil status",
         "git -c core.fsmonitor=/tmp/evil diff",
@@ -249,8 +275,27 @@ fn auto_still_asks_for_dangerous_operations() {
         // Host escape.
         "open index.html",
     ] {
-        assert_asked(command_line);
+        assert_both_ask(command_line);
     }
+    // The unreadable word itself: `sh` reads `$REMOTE` as an expansion, `cmd`
+    // reads `%REMOTE%` as one. Whichever shell expands it, the destination is
+    // not one remote anyone can bind a credential to, so it asks — and only
+    // the shell that would expand the word asks for it. `$REMOTE` under `cmd`
+    // is the literal remote name `$REMOTE`, exactly as `%REMOTE%` under `sh`
+    // is the literal remote named `%REMOTE%`.
+    assert_ask(Shell::Bash, "git fetch $REMOTE");
+    assert_ask(Shell::Bash, "git push $REMOTE");
+    assert_ask(Shell::Bash, "git config $KEY value");
+    assert_ask(Shell::Cmd, "git fetch %REMOTE%");
+    assert_ask(Shell::Cmd, "git push %REMOTE%");
+    assert_ask(Shell::Cmd, "git config %KEY% value");
+    // Same rule for a deletion: an unreadable target cannot be proven to stay
+    // in the workspace.
+    assert_ask(Shell::Cmd, "rm -rf %dir%");
+    // And for the program word itself: `sh` reads `$CMD` as the program to
+    // run, `cmd` reads `%CMD%` as one, and neither can be vetted.
+    assert_ask(Shell::Bash, "$CMD --version");
+    assert_ask(Shell::Cmd, "%CMD% --version");
 }
 
 /// The declared-risk half of the same table: a tool that is destructive or
@@ -292,7 +337,9 @@ fn non_command_tools_follow_the_same_risk_table() {
 }
 
 /// A sanity check on the table itself: the classifier that feeds Auto must not
-/// have quietly started calling a read-only Git command dangerous.
+/// have quietly started calling a read-only Git command dangerous. This one
+/// runs through `shell_invocation`, so it stays tied to the wrapper the product
+/// really executes on this platform rather than to the table's own shapes.
 #[test]
 fn the_classifier_agrees_that_read_only_git_is_not_dangerous() {
     for command_line in [

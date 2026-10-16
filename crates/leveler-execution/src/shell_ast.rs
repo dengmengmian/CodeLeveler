@@ -146,7 +146,11 @@ fn classify_command_node(cmd: &Node, src: &[u8]) -> Option<CommandClass> {
 
 /// True when an unreadable Git word can execute a local program or hide the
 /// remote a stored credential would be sent to.
-fn opaque_git_security_ask(args: &[Option<String>]) -> bool {
+///
+/// Shared with the string fallback: a `cmd.exe` word carrying `%NAME%` is
+/// unreadable for the same reason a `$NAME` word is, and must reach the same
+/// verdict.
+pub(crate) fn opaque_git_security_ask(args: &[Option<String>]) -> bool {
     if opaque_git_stays_read(args) {
         return false;
     }
