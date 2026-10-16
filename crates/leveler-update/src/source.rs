@@ -125,9 +125,8 @@ impl GitHubReleaseSource {
 
     /// GET a URL and decode it as JSON, mapping transport and HTTP failures.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, UpdateError> {
-        let response = self
-            .client
-            .get(url)
+        let token = github_token()?;
+        let response = authorized(&self.client, url, token.as_ref())
             .send()
             .await
             .map_err(|e| UpdateError::Network(e.to_string()))?;
@@ -270,13 +269,11 @@ pub fn repo_from_url(url: &str) -> Option<String> {
 /// while `read_timeout` still fails fast when the stream genuinely stalls, so a
 /// hung connection cannot hold the updater forever.
 pub fn download_client() -> Result<reqwest::Client, UpdateError> {
-    let builder = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent(format!("leveler/{}", crate::version::current_version()))
         .timeout(std::time::Duration::from_secs(20 * 60))
         .read_timeout(std::time::Duration::from_secs(60))
-        .connect_timeout(std::time::Duration::from_secs(15));
-    let builder = apply_auth_and_proxy(builder)?;
-    builder
+        .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| UpdateError::Network(e.to_string()))
 }
@@ -307,9 +304,16 @@ pub fn mirror_prefixes() -> Vec<String> {
 /// Every URL to try for `direct`, in order: the canonical one, then mirrors.
 ///
 /// `asset_name` lets a host with a different directory layout offer the same
-/// artifact through [`asset_bases`]; the GitHub URL is still tried first.
-pub fn download_candidates(direct: &str, asset_name: &str) -> Vec<String> {
-    candidate_urls_with(direct, &mirror_prefixes(), &asset_bases(), asset_name)
+/// artifact through [`asset_bases`]; `version` is the release being fetched,
+/// which that base's `{version}` expands to. The GitHub URL is still tried
+/// first.
+pub fn download_candidates(direct: &str, asset_name: &str, version: &str) -> Vec<String> {
+    candidate_urls_with(
+        direct,
+        &mirror_prefixes(),
+        &asset_bases(version),
+        asset_name,
+    )
 }
 
 /// The ordering rule with both mirror kinds passed in, for tests.
@@ -338,18 +342,22 @@ pub fn candidate_urls_with(
 /// LEVELER_UPDATE_ASSET_BASE=https://atomgit.com/o/r/releases/download/v{version}/
 /// ```
 ///
+/// `{version}` expands to `version` — the release being FETCHED, never the
+/// running binary's own version. Those differ in every upgrade, and the mixed
+/// URL the running version would build (a v1.0.17 directory holding a v1.0.18
+/// file name) is a 404 on the mirror that exists to rescue exactly that fetch.
+///
 /// A mirror only ever ADDS a candidate: the canonical URL is still tried first,
 /// and the checksum is what decides whether what arrived is authentic.
-pub fn asset_bases() -> Vec<String> {
+pub fn asset_bases(version: &str) -> Vec<String> {
     let Ok(raw) = std::env::var("LEVELER_UPDATE_ASSET_BASE") else {
         return Vec::new();
     };
-    let version = crate::version::current_version().to_string();
     raw.split(',')
         .map(str::trim)
         .filter(|b| !b.is_empty())
         .map(|b| {
-            let b = b.replace("{version}", &version);
+            let b = b.replace("{version}", version);
             if b.ends_with('/') { b } else { format!("{b}/") }
         })
         .collect()
@@ -362,47 +370,68 @@ pub fn asset_bases() -> Vec<String> {
 ///
 /// Downloads do NOT use this budget — see [`download_client`].
 pub fn http_client() -> Result<reqwest::Client, UpdateError> {
-    let builder = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent(format!("leveler/{}", crate::version::current_version()))
         .timeout(std::time::Duration::from_secs(60))
-        .connect_timeout(std::time::Duration::from_secs(15));
-
-    let builder = apply_auth_and_proxy(builder)?;
-    builder
+        .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| UpdateError::Network(format!("build HTTP client: {e}")))
 }
 
-/// The optional authentication shared by both clients.
+/// The GITHUB_TOKEN as a header value, when one is configured.
 ///
 /// A token raises the unauthenticated rate limit; it is never required, and a
-/// malformed value is a validation error rather than a silent downgrade.
-fn apply_auth_and_proxy(
-    builder: reqwest::ClientBuilder,
-) -> Result<reqwest::ClientBuilder, UpdateError> {
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && !token.is_empty()
-    {
-        let mut headers = reqwest::header::HeaderMap::new();
-        let value = format!("Bearer {token}");
-        let parsed = value
-            .parse()
-            .map_err(|_| UpdateError::Validation("GITHUB_TOKEN is not a valid header".into()))?;
-        headers.insert(reqwest::header::AUTHORIZATION, parsed);
-        headers.insert(
-            reqwest::header::ACCEPT,
-            "application/vnd.github+json"
-                .parse()
-                .expect("static header"),
-        );
-        return Ok(builder.default_headers(headers));
+/// malformed value is a validation error rather than a silent downgrade. It is
+/// read at REQUEST time and attached per request ([`authorized`]): a client's
+/// default headers would follow every download, including the ones that go to
+/// a third-party mirror.
+pub(crate) fn github_token() -> Result<Option<reqwest::header::HeaderValue>, UpdateError> {
+    let Ok(token) = std::env::var("GITHUB_TOKEN") else {
+        return Ok(None);
+    };
+    if token.is_empty() {
+        return Ok(None);
     }
-    Ok(builder)
+    format!("Bearer {token}")
+        .parse()
+        .map(Some)
+        .map_err(|_| UpdateError::Validation("GITHUB_TOKEN is not a valid header".into()))
+}
+
+/// Whether `url` addresses GitHub itself. `api.github.com` and any other
+/// `*.github.com` host are GitHub's; a mirror that merely relays a GitHub URL
+/// (ghproxy-style) is not.
+pub(crate) fn is_github_host(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| host == "github.com" || host.ends_with(".github.com"))
+}
+
+/// A GET that carries the token only when it goes to GitHub.
+///
+/// GitHub asset URLs redirect to a CDN host; reqwest strips sensitive headers
+/// on cross-host redirects, so the token travels to github.com and no further.
+pub(crate) fn authorized(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&reqwest::header::HeaderValue>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    if !is_github_host(url) {
+        return request;
+    }
+    let Some(token) = token else {
+        return request;
+    };
+    request
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
 }
 
 #[cfg(test)]
 mod candidate_tests {
-    use super::{candidate_urls_with, mirror_prefixes};
+    use super::{asset_bases, candidate_urls_with, is_github_host, mirror_prefixes};
 
     /// The canonical URL is always first: a mirror is a rescue, not a replacement.
     #[test]
@@ -447,6 +476,48 @@ mod candidate_tests {
     fn no_mirrors_means_exactly_one_candidate() {
         let urls = candidate_urls_with("https://example.com/a.tgz", &[], &[], "a.tgz");
         assert_eq!(urls, vec!["https://example.com/a.tgz".to_string()]);
+    }
+
+    /// A `{version}` base expands to the release being FETCHED. Expanding the
+    /// running binary's own version instead builds mixed URLs whose directory
+    /// and file name disagree (`.../download/v1.0.17/leveler-v1.0.18-...`), and
+    /// no mirror serves those — the rescue path would 404 exactly when the
+    /// GitHub path is the broken one.
+    #[test]
+    fn asset_base_version_comes_from_the_release_being_fetched() {
+        // SAFETY: a single-threaded test process for this variable.
+        unsafe {
+            std::env::set_var(
+                "LEVELER_UPDATE_ASSET_BASE",
+                "https://atomgit.example/releases/download/v{version}/",
+            )
+        };
+        let bases = asset_bases("1.0.19");
+        unsafe { std::env::remove_var("LEVELER_UPDATE_ASSET_BASE") };
+        assert_eq!(
+            bases,
+            vec!["https://atomgit.example/releases/download/v1.0.19/".to_string()]
+        );
+        // The composed URL and the fetched asset's own name agree on a version.
+        let asset = "leveler-v1.0.19-aarch64-apple-darwin.tar.gz";
+        let urls = candidate_urls_with("https://github.com/o/r/x.tgz", &[], &bases, asset);
+        assert_eq!(
+            urls[1],
+            format!("https://atomgit.example/releases/download/v1.0.19/{asset}")
+        );
+    }
+
+    /// The token goes to GitHub's own hosts and nowhere else.
+    #[test]
+    fn github_hosts_are_exactly_githubs_own() {
+        assert!(is_github_host("https://github.com/o/r"));
+        assert!(is_github_host("https://api.github.com/repos/o/r"));
+        assert!(!is_github_host("https://notgithub.com/x"));
+        assert!(!is_github_host("https://github.com.evil.example/x"));
+        assert!(!is_github_host(
+            "https://ghproxy.example/https://github.com/x"
+        ));
+        assert!(!is_github_host("https://atomgit.com/o/r"));
     }
 
     /// Empty entries (a trailing comma, blank lines) are not candidates.
