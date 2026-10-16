@@ -61,6 +61,10 @@ struct Script {
     cases: Vec<(String, String)>,
     ci: String,
     release_run: String,
+    /// The retry attempt's own status once a second dispatch exists: one field
+    /// cannot both keep a superseded attempt's terminal state and describe the
+    /// run that replaced it.
+    release_run_after_retry: Option<String>,
     /// The remote tag exists at this commit (the workflow creates it last).
     tag_sha: Option<String>,
     /// The GitHub release exists.
@@ -74,6 +78,11 @@ struct Script {
     push_fails: bool,
     block_report: bool,
     dispatch_count: u32,
+    /// The test asks the NEXT dispatch's run to be invisible to the first
+    /// list that could see it (GitHub's list lags the dispatch).
+    release_run_hidden_once: bool,
+    /// Set by that dispatch, consumed by the first list that runs after it.
+    hide_newest_after_dispatch: bool,
     layer_invocations: u32,
     /// `ps` reports no such process, so a stale lock must be reclaimed.
     dead_owner: bool,
@@ -108,6 +117,7 @@ impl Script {
             ],
             ci: "success".to_string(),
             release_run: "success".to_string(),
+            release_run_after_retry: None,
             tag_sha: None,
             released: false,
             release_view: "published".to_string(),
@@ -118,6 +128,8 @@ impl Script {
             push_fails: false,
             block_report: false,
             dispatch_count: 0,
+            release_run_hidden_once: false,
+            hide_newest_after_dispatch: false,
             layer_invocations: 0,
             dead_owner: false,
             dirty: String::new(),
@@ -191,7 +203,21 @@ fn published_assets(version: &str) -> Vec<String> {
     names
 }
 
-fn run_list(script: &Script) -> String {
+/// The status the newest Release attempt reports. A retry attempt carries its
+/// own status when the test sets one: one field cannot also keep describing
+/// the superseded attempt it replaced.
+fn newest_attempt_status(script: &Script) -> &str {
+    if script.dispatch_count >= 2 {
+        script
+            .release_run_after_retry
+            .as_deref()
+            .unwrap_or(script.release_run.as_str())
+    } else {
+        script.release_run.as_str()
+    }
+}
+
+fn run_list(script: &mut Script) -> String {
     let ci = match script.ci.as_str() {
         "missing" => return "[]".to_string(),
         "in_progress" => ("in_progress", "null"),
@@ -204,16 +230,32 @@ fn run_list(script: &Script) -> String {
         ci.0, ci.1
     )];
     if script.dispatch_count > 0 {
-        let release = match script.release_run.as_str() {
-            "in_progress" => ("in_progress", "null"),
-            "failure" => ("completed", "\"failure\""),
-            "queued" => ("queued", "null"),
-            _ => ("completed", "\"success\""),
-        };
-        runs.push(format!(
-            "{{\"databaseId\":222,\"workflowName\":\"Release\",\"event\":\"workflow_dispatch\",\"headSha\":\"{CANDIDATE}\",\"status\":\"{}\",\"conclusion\":{},\"url\":\"https://example.invalid/release\",\"createdAt\":\"2026-01-01T00:01:00Z\"}}",
-            release.0, release.1
-        ));
+        // Every dispatch leaves its own run; earlier attempts keep their
+        // terminal state and only the newest carries the scripted live state.
+        let mut visible = script.dispatch_count;
+        if script.hide_newest_after_dispatch {
+            // GitHub's list lags the dispatch it was just asked for.
+            script.hide_newest_after_dispatch = false;
+            visible -= 1;
+        }
+        for attempt in 1..=visible {
+            let (status, conclusion) = if attempt == script.dispatch_count {
+                match newest_attempt_status(script) {
+                    "in_progress" => ("in_progress", "null"),
+                    "failure" => ("completed", "\"failure\""),
+                    "queued" => ("queued", "null"),
+                    _ => ("completed", "\"success\""),
+                }
+            } else {
+                ("completed", "\"failure\"")
+            };
+            runs.push(format!(
+                "{{\"databaseId\":{},\"workflowName\":\"Release\",\"event\":\"workflow_dispatch\",\"headSha\":\"{CANDIDATE}\",\"status\":\"{}\",\"conclusion\":{},\"url\":\"https://example.invalid/release\",\"createdAt\":\"2026-01-01T00:{attempt:02}:00Z\"}}",
+                222 + attempt - 1,
+                status,
+                conclusion
+            ));
+        }
     }
     format!("[{}]", runs.join(","))
 }
@@ -540,17 +582,27 @@ fn gh_response(
                     _ => ("completed", "\"success\"".to_string()),
                 }
             } else {
-                match script.release_run.as_str() {
-                    "in_progress" => ("in_progress", "null".to_string()),
-                    "queued" => ("queued", "null".to_string()),
-                    "failure" => ("completed", "\"failure\"".to_string()),
-                    _ => {
-                        // A successful release workflow is what creates the tag
-                        // and publishes the release.
-                        script.tag_sha = Some(CANDIDATE.to_string());
-                        script.released = true;
-                        script.release_view = "published".to_string();
-                        ("completed", "\"success\"".to_string())
+                let attempt = id
+                    .parse::<u32>()
+                    .map(|id| id.saturating_sub(222) + 1)
+                    .unwrap_or(script.dispatch_count);
+                if attempt < script.dispatch_count {
+                    // A superseded attempt keeps the terminal state it had.
+                    ("completed", "\"failure\"".to_string())
+                } else {
+                    let newest = newest_attempt_status(script).to_string();
+                    match newest.as_str() {
+                        "in_progress" => ("in_progress", "null".to_string()),
+                        "queued" => ("queued", "null".to_string()),
+                        "failure" => ("completed", "\"failure\"".to_string()),
+                        _ => {
+                            // A successful release workflow is what creates the
+                            // tag and publishes the release.
+                            script.tag_sha = Some(CANDIDATE.to_string());
+                            script.released = true;
+                            script.release_view = "published".to_string();
+                            ("completed", "\"success\"".to_string())
+                        }
                     }
                 }
             };
@@ -562,6 +614,10 @@ fn gh_response(
         }
         ("workflow", "run") => {
             script.dispatch_count += 1;
+            if script.release_run_hidden_once {
+                script.release_run_hidden_once = false;
+                script.hide_newest_after_dispatch = true;
+            }
             Ok(text(""))
         }
         other => panic!("unexpected gh invocation {other:?}"),
@@ -1033,6 +1089,48 @@ fn a_changed_gate_definition_invalidates_every_stage() {
 }
 
 #[test]
+fn a_changed_lab_input_off_the_nine_file_list_invalidates_every_stage() {
+    let world = World::new();
+    let (code, _) = world.publish_to_stage_3(&[]);
+    assert_eq!(code, 0);
+    // The PTY harness is a first-class input of the lab's own layer reuse
+    // keys (`pty_harness_hash`): a changed harness is a changed test even
+    // though it is not one of the files the gate list names.
+    std::fs::create_dir_all(world.lab.join("eval/pty")).unwrap();
+    std::fs::write(
+        world.lab.join("eval/pty/pty_acceptance.py"),
+        "# changed harness\n",
+    )
+    .unwrap();
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        !rendered.contains("stage 1 build-static: REUSED"),
+        "a changed PTY harness must invalidate stage 1: {rendered}"
+    );
+    assert!(
+        !rendered.contains("stage 2 automated-tests: REUSED"),
+        "{rendered}"
+    );
+
+    // Same for the lab config: it is the `config_hash` field of every layer
+    // reuse key. The previous resume re-earned stages 1/2, so a REUSED here
+    // would mean the config change went unseen.
+    std::fs::create_dir_all(world.lab.join("config/codeleveler")).unwrap();
+    std::fs::write(
+        world.lab.join("config/codeleveler/config.toml"),
+        "# changed lab config\n",
+    )
+    .unwrap();
+    let (code, rendered, _) = world.resume(&["--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(
+        !rendered.contains("stage 1 build-static: REUSED"),
+        "a changed lab config must invalidate stage 1: {rendered}"
+    );
+}
+
+#[test]
 fn a_crash_between_stages_is_recovered_by_resume() {
     let world = World::new();
     let (code, _) = world.publish_to_stage_3(&[]);
@@ -1175,6 +1273,69 @@ fn a_stage_fetches_the_frozen_commit_into_the_lab_before_the_gate_runs() {
     assert!(
         fetched.expect("fetch") < gate.expect("gate"),
         "the fetch must happen before the gate is asked to qualify the candidate"
+    );
+}
+
+#[test]
+fn rc_runs_before_the_final_verdict_and_after_the_pre_rc_one() {
+    // Several core features are proven by RC and nothing else, so the verdict
+    // taken before RC may not refuse to start RC. This locks the order:
+    // layers -> verdict(pre-RC) -> RC -> verdict(final).
+    let world = World::new();
+    let (code, rendered, log) = world.run(&["publish", "--stop-after", "3"]);
+    assert_eq!(code, 0, "{rendered}");
+    let order: Vec<&str> = log
+        .iter()
+        .filter(|spec| spec.program == "python3")
+        .map(|spec| {
+            let joined = spec.args.join(" ");
+            if joined.contains("rc_check.py") {
+                "rc"
+            } else if joined.contains("--from-artifacts") {
+                "verdict"
+            } else {
+                "layers"
+            }
+        })
+        .collect();
+    let first_verdict = order
+        .iter()
+        .position(|step| *step == "verdict")
+        .expect("pre-RC verdict");
+    let rc = order
+        .iter()
+        .position(|step| *step == "rc")
+        .expect("RC runs");
+    let last_verdict = order
+        .iter()
+        .rposition(|step| *step == "verdict")
+        .expect("final verdict");
+    assert!(
+        first_verdict < rc,
+        "the pre-RC verdict comes first: {order:?}"
+    );
+    assert!(
+        rc < last_verdict,
+        "the final verdict comes after RC: {order:?}"
+    );
+}
+
+#[test]
+fn a_pre_rc_verdict_that_fails_stops_before_rc() {
+    // A blocker that RC cannot fix must stop the stage before spending model
+    // budget on RC.
+    let world = World::new();
+    world.set(|script| {
+        script.gate_exit = 1;
+        script.gate_decision = "FAIL".into();
+    });
+    let (code, rendered, log) = world.run(&["publish", "--stop-after", "3"]);
+    assert_ne!(code, 0);
+    assert!(rendered.contains("RELEASE_GATE_FAILED"), "{rendered}");
+    assert!(
+        !log.iter()
+            .any(|spec| spec.args.join(" ").contains("rc_check.py")),
+        "RC must not start once the pre-RC verdict failed"
     );
 }
 
@@ -1424,6 +1585,34 @@ fn a_failed_release_run_is_not_silently_dispatched_again() {
         dispatched(&log),
         1,
         "--retry-remote asks for exactly one more attempt"
+    );
+}
+
+#[test]
+fn a_retry_adopts_the_new_attempt_not_the_superseded_failure() {
+    let world = World::new();
+    world.set(|script| {
+        script.release_run = "failure".into();
+        script.release_view = "missing".into();
+    });
+    let (code, _, _) = world.run(&["publish"]);
+    assert_ne!(code, 0, "the first attempt fails");
+    // The retry's new run is not listed yet when the first poll lands
+    // (GitHub's list lags the dispatch), and this attempt succeeds. The old
+    // failure stays terminal: only the retry's own attempt carries success.
+    world.set(|script| {
+        script.release_run_after_retry = Some("success".into());
+        script.release_run_hidden_once = true;
+    });
+    let (code, rendered, log) = world.resume(&["--retry-remote"]);
+    assert_eq!(
+        code, 0,
+        "the retry must adopt its own new run, not the failed one it replaced: {rendered}"
+    );
+    assert_eq!(dispatched(&log), 1);
+    assert!(
+        !rendered.contains("RELEASE_RUN_FAILED"),
+        "the superseded failure is not this attempt's outcome: {rendered}"
     );
 }
 

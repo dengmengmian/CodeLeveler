@@ -859,6 +859,12 @@ fn rustc_version(host: &dyn Host, repo: &Path) -> Result<String, Fail> {
 /// Hash of the lab's own gate harness. A changed gate definition is a changed
 /// test, so it invalidates every stage fingerprint, exactly as it invalidates
 /// the lab's own layer reuse keys.
+///
+/// The coverage must match what those layer keys hash, or a changed input
+/// leaves the lab re-running a layer while this pipeline happily REUSEs the
+/// stage: the named files below, the lab config (`config_hash`), the PTY
+/// harness (`pty_harness_hash`), a case's own yaml bytes, and the scripts the
+/// gate executes as contract steps.
 fn definition_hash(lab: &Path) -> Result<String, Fail> {
     let files = [
         "eval/scripts/release_check.py",
@@ -870,6 +876,7 @@ fn definition_hash(lab: &Path) -> Result<String, Fail> {
         "eval/rc_gate.yaml",
         "eval/scripts/feature_coverage.py",
         "eval/feature_inventory.yaml",
+        "config/codeleveler/config.toml",
     ];
     let mut digest = crate::hash::Sha256::new();
     for relative in files {
@@ -881,7 +888,47 @@ fn definition_hash(lab: &Path) -> Result<String, Fail> {
         }
         digest.update(b"\n");
     }
+    for relative in ["eval/pty", "eval/release_cases", "eval/scripts"] {
+        digest.update(relative.as_bytes());
+        digest.update(b"=");
+        hash_tree(&mut digest, &lab.join(relative));
+        digest.update(b"\n");
+    }
     Ok(digest.finish())
+}
+
+/// Hash every regular file under `root`, in sorted order: relative path,
+/// bytes. `__pycache__` is a run artifact, not an input.
+fn hash_tree(digest: &mut crate::hash::Sha256, root: &Path) {
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    files.sort();
+    for path in files {
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update(b"=");
+        match sha256_file(&path) {
+            Some(hash) => digest.update(hash.as_bytes()),
+            None => digest.update(b"MISSING"),
+        }
+        digest.update(b"\n");
+    }
+}
+
+fn collect_files(root: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == "__pycache__" {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => collect_files(&entry.path(), out),
+            Ok(file_type) if file_type.is_file() => out.push(entry.path()),
+            _ => {}
+        }
+    }
 }
 
 fn load_in_progress<'a>(
@@ -1711,8 +1758,14 @@ fn stage_dogfood(context: &Context, transaction: &mut Transaction) -> Result<Vec
             cases.total, cases.passed, cases.failed, cases.warn, cases.unproven, cases.unstable
         ));
     }
-    out.extend(final_dogfood_verdict(context, &run_id)?.lines);
+    // Order matters and is the whole point of the RC phase: the gate may not
+    // refuse to start RC for a reason RC is about to fix (several core features
+    // have RC evidence as their only end-to-end proof). So the verdict before
+    // RC only requires that nothing *already run* failed, RC then runs, and the
+    // final verdict is taken over the complete run.
+    out.extend(dogfood_verdict(context, &run_id, "pre-RC")?.lines);
     out.extend(run_rc(context, transaction, &run_id)?);
+    out.extend(dogfood_verdict(context, &run_id, "final")?.lines);
     let layout = evidence_layout(context, transaction, "L3,L4", true)?;
     transaction.stage_record_mut(STAGE_DOGFOOD).evidence_hash = Some(layout.hash);
     out.extend(layout.lines);
@@ -1723,7 +1776,10 @@ struct Verdict {
     lines: Vec<String>,
 }
 
-fn final_dogfood_verdict(context: &Context, run_id: &str) -> Result<Verdict, Fail> {
+/// Re-decide the run from its artifacts. `when` names the point in the run the
+/// verdict is taken, which is what decides how the coverage audit reads it:
+/// before RC, evidence RC will produce is pending; after RC, it is final.
+fn dogfood_verdict(context: &Context, run_id: &str, when: &str) -> Result<Verdict, Fail> {
     let run_dir = state::lab_run_dir(&context.lab.root, state::RELEASE_RUN_KIND, run_id);
     let out = context.host.run(&CommandSpec::new(
         "python3",
@@ -1762,7 +1818,7 @@ fn final_dogfood_verdict(context: &Context, run_id: &str) -> Result<Verdict, Fai
             .map(str::to_string)
             .unwrap_or_default();
         let mut detail = format!(
-            "the release gate decided {verdict} (exit {exit}){}",
+            "the release gate decided {verdict} (exit {exit}) at the {when} point{}",
             if reason.is_empty() {
                 String::new()
             } else {
@@ -1797,7 +1853,7 @@ fn final_dogfood_verdict(context: &Context, run_id: &str) -> Result<Verdict, Fai
         return Err(Fail::new("RELEASE_GATE_FAILED", detail));
     }
     let mut lines = vec![format!(
-        "release gate: {verdict} (exit {exit}, complete={complete})"
+        "release gate ({when}): {verdict} (exit {exit}, complete={complete})"
     )];
     if exit == 2 {
         lines.push(
@@ -2387,6 +2443,11 @@ fn ensure_release_run(
             format!("{tag} exists at {existing_tag}, not at the qualified commit {sha}"),
         ));
     }
+    // Runs that already existed for this commit before the dispatch: an old
+    // terminal run is not the attempt this dispatch just asked for, and the
+    // list can lag the dispatch by a poll or more.
+    let before: std::collections::HashSet<String> =
+        existing.iter().map(|run| run.id.clone()).collect();
     let version = transaction.version.clone();
     github::dispatch_release(
         context.host,
@@ -2407,7 +2468,11 @@ fn ensure_release_run(
         let runs = github::runs_for_commit(context.host, &context.repo, &context.slug, sha)?;
         let ours: Vec<&github::RunInfo> = runs
             .iter()
-            .filter(|run| run.workflow == workflow && run.event == "workflow_dispatch")
+            .filter(|run| {
+                run.workflow == workflow
+                    && run.event == "workflow_dispatch"
+                    && !before.contains(&run.id)
+            })
             .collect();
         if let Some(run) = ours.last() {
             return wait_for_run(context, transaction, &run.id.clone(), tag);
