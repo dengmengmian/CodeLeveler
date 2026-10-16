@@ -525,17 +525,28 @@ fn dogfood_background_jobs_footer_and_list() {
         },
     );
 
-    // The conversation body has no task rows: the aggregate is the only place
-    // background work appears, and it is exactly one footer row.
+    // The conversation body has no task rows: the state strip carries the
+    // running count and the failure as two separate cells, and neither names
+    // a task's raw command.
     let home = render_text(&mut s, 120, 30);
     println!("--- HOME (2 running, 1 failed) ---\n{home}");
     assert_eq!(
-        home.lines().filter(|l| l.contains('↗')).count(),
-        1,
-        "one aggregate footer block:\n{home}"
+        home.matches('↗').count(),
+        2,
+        "the background and issue cells each own their entry:\n{home}"
     );
-    assert!(home.contains("2 jobs"), "running count:\n{home}");
-    assert!(home.contains("1 failed"), "failure count:\n{home}");
+    let strip = home
+        .lines()
+        .find(|l| l.contains("jobs"))
+        .unwrap_or_else(|| panic!("strip row missing:\n{home}"));
+    assert!(strip.contains("2 jobs"), "running count:\n{home}");
+    assert!(strip.contains("background failed 1"), "failure count:\n{home}");
+    for raw in ["npm", "cargo", "make", "EADDRINUSE"] {
+        assert!(
+            !strip.contains(raw),
+            "a raw command is not chrome ({raw}):\n{home}"
+        );
+    }
     assert!(
         !home.contains("compiling"),
         "live output never leaks into the body:\n{home}"
@@ -577,15 +588,16 @@ fn dogfood_background_jobs_footer_and_list() {
     assert_eq!(s.active_screen, Screen::Conversation);
     let back = render_text(&mut s, 120, 30);
     println!("--- HOME (after ack) ---\n{back}");
-    let footer = back
+    let strip = back
         .lines()
-        .find(|l| l.contains('↗'))
-        .unwrap_or_else(|| panic!("no footer summary:\n{back}"));
+        .find(|l| l.contains("jobs"))
+        .unwrap_or_else(|| panic!("no strip row:\n{back}"));
+    assert!(strip.contains("2 jobs"), "{strip:?}");
     assert!(
-        !footer.contains("failed"),
-        "the acknowledged failure stops reminding: {footer:?}"
+        strip.contains("background failed 1"),
+        "a seen failure is still active — acknowledging marks it read, it \
+         does not solve the task: {strip:?}"
     );
-    assert!(footer.contains("2 jobs"), "{footer:?}");
     assert!(
         s.background_task_labels.contains_key("bg-fail"),
         "history survives acknowledgement"

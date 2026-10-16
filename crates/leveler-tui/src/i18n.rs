@@ -913,10 +913,16 @@ pub struct UiText {
     pub background_task_generic: &'static str,
     /// Footer aggregation: "后台 {}" (count) for two or more running tasks.
     pub background_running_count: &'static str,
-    /// Footer aggregation: "失败 {}" (unread failed count).
-    pub background_failed_count: &'static str,
-    /// Footer aggregation when only failures remain: "后台失败 {}".
+    /// Issue indicator when one kind is active: "后台失败 {}".
     pub background_failed_only: &'static str,
+    /// Issue page title.
+    pub issue_page_title: &'static str,
+    /// Issue page footer: select, open a task's detail, back.
+    pub issue_page_hint: &'static str,
+    /// Issue page with nothing active.
+    pub issue_page_empty: &'static str,
+    /// Marker on an issue the user has not looked at yet. Seen is not solved.
+    pub issue_row_new: &'static str,
     /// Background-jobs list page title.
     pub background_list_title: &'static str,
     /// List section: still-running tasks.
@@ -1864,8 +1870,11 @@ static ZH: UiText = UiText {
     background_task_stopped: "后台任务已停止:{}",
     background_task_generic: "后台任务",
     background_running_count: "后台 {}",
-    background_failed_count: "失败 {}",
     background_failed_only: "后台失败 {}",
+    issue_page_title: "问题",
+    issue_page_hint: "↑↓ 选择 · Enter 打开任务详情 · Esc 返回",
+    issue_page_empty: "当前没有需要关注的问题",
+    issue_row_new: "新",
     background_list_title: "后台任务",
     background_list_running: "运行中",
     background_list_finished: "最近结束",
@@ -2662,8 +2671,11 @@ static EN: UiText = UiText {
     background_task_stopped: "Background task stopped: {}",
     background_task_generic: "background task",
     background_running_count: "{} jobs",
-    background_failed_count: "{} failed",
-    background_failed_only: "{} background failed",
+    background_failed_only: "background failed {}",
+    issue_page_title: "Issues",
+    issue_page_hint: "↑↓ select · Enter open task detail · Esc back",
+    issue_page_empty: "Nothing needs attention right now",
+    issue_row_new: "new",
     background_list_title: "Background tasks",
     background_list_running: "Running",
     background_list_finished: "Recently finished",

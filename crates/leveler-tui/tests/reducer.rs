@@ -4824,6 +4824,129 @@ fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
     assert!(later.contains("完整计划步骤 20"), "{later}");
 }
 
+/// The strip's background and issue cells are real targets, each opening its
+/// own surface: the jobs list and the issue page. The runtime half opens
+/// nothing, and the issue page reaches a failed task's REAL detail.
+#[test]
+fn the_strip_cells_open_the_jobs_list_and_the_issue_page() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    s.activity = Some("运行 cargo test".into());
+    s.background_task_labels.insert(
+        "bg-run".into(),
+        leveler_tui::state::BackgroundTaskChrome::running("make up", 3),
+    );
+    s.background_task_labels.insert(
+        "bg-bad".into(),
+        leveler_tui::state::BackgroundTaskChrome {
+            ok: Some(false),
+            exit_code: Some(1),
+            duration_ms: Some(30_000),
+            output: "Error: listen EADDRINUSE\n".into(),
+            ..leveler_tui::state::BackgroundTaskChrome::running("npm start", 5)
+        },
+    );
+
+    let workbench = rendered(&mut s, 140, 30);
+    let (brow, bx0, bx1) = s.background_hit.expect("background cell hit");
+    let (irow, ix0, _) = s.issue_hit.expect("issue cell hit");
+    assert_eq!(brow, irow, "one strip row:\n{workbench}");
+    assert!(bx1 <= ix0, "cells do not overlap:\n{workbench}");
+    let click = |column: u16| {
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: brow,
+            modifiers: KeyModifiers::empty(),
+        })
+    };
+
+    // A click inside the issue cell is NOT the background's target.
+    reduce(&mut s, click(bx0));
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+
+    // The issue cell opens the issue page, and the page names the real task.
+    let workbench = rendered(&mut s, 140, 30);
+    let (_, _, ix1) = s.issue_hit.expect("issue cell hit");
+    assert!(workbench.contains("后台失败 1"), "{workbench}");
+    reduce(&mut s, click(ix1 - 1));
+    assert_eq!(s.active_screen, Screen::Issue);
+    let page = rendered(&mut s, 100, 24);
+    assert!(page.contains("npm start"), "the task label is real:\n{page}");
+    assert!(page.contains("exit 1"), "the exit code is real:\n{page}");
+
+    // Enter reaches that task's own detail — command, output and all.
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::Activity);
+    let detail = rendered(&mut s, 100, 30);
+    assert!(detail.contains("EADDRINUSE"), "{detail}");
+    assert!(
+        s.background_task_labels.contains_key("bg-bad"),
+        "opening a failure never deletes it"
+    );
+
+    // Esc back to the conversation; nothing was cancelled or cleared.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+    assert!(s.background_task_labels.contains_key("bg-run"));
+    assert!(s.background_task_labels.contains_key("bg-bad"));
+    let back = rendered(&mut s, 140, 30);
+    assert!(back.contains("后台 1") && back.contains("后台失败 1"), "{back}");
+}
+
+/// A failed turn is a blocking issue: the strip names it, the issue page
+/// carries its typed subtitle, and Enter returns to the conversation where the
+/// failure block (and its disclosure) lives.
+#[test]
+fn a_failed_turn_is_a_blocking_issue_with_a_way_back() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mut s = opened();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::TurnFailed {
+            error: "provider rejected the request".into(),
+            failure: None,
+        }),
+    );
+    let workbench = rendered(&mut s, 140, 30);
+    assert!(
+        workbench.contains('✕') && workbench.contains("provider rejected the request"),
+        "the blocking cell names the failure:\n{workbench}"
+    );
+    let (row, _, x1) = s.issue_hit.expect("issue cell hit");
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x1 - 1,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert_eq!(s.active_screen, Screen::Issue);
+    let page = rendered(&mut s, 110, 24);
+    assert!(page.contains("provider rejected the request"), "{page}");
+
+    reduce(&mut s, key(KeyCode::Enter));
+    assert!(
+        s.jump_to_bottom,
+        "Enter on the failed turn returns to its conversation block"
+    );
+    assert_eq!(s.active_screen, Screen::Conversation);
+
+    // The evidence survives: the failure block is still in the transcript.
+    assert!(
+        s.transcript
+            .items()
+            .iter()
+            .any(|item| format!("{item:?}").contains("provider rejected the request")),
+        "history keeps the failure"
+    );
+}
+
 #[test]
 fn ctrl_d_opens_diff_and_requests_it() {
     let mut s = opened();
@@ -6075,7 +6198,8 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
         "the terminal fact remains visible in transcript history"
     );
 
-    // Failure stays truthful and prominent, with the exit code.
+    // A failure is not a transient banner: it becomes an active issue on the
+    // state strip, and the task's terminal record keeps the exit code.
     reduce(
         &mut s,
         Action::Runtime(RuntimeEvent::BackgroundTaskExited {
@@ -6087,13 +6211,27 @@ fn background_task_lifecycle_is_named_not_id_addressed() {
             output: String::new(),
         }),
     );
-    let note = s.notification.as_ref().unwrap();
-    assert!(note.message.contains("npm run dev"), "{}", note.message);
-    assert!(note.message.contains("exit 1"), "{}", note.message);
-    assert!(matches!(
-        note.level,
-        leveler_client_protocol::NotificationLevel::Warning
-    ));
+    assert!(
+        s.notification
+            .as_ref()
+            .is_none_or(|note| !note.message.contains("后台任务失败")),
+        "no failure banner: the issue cell is the standing reminder"
+    );
+    let failed = s.background_task_labels.get("bg-91c2").expect("task");
+    assert!(failed.is_failed());
+    assert_eq!(failed.exit_code, Some(1), "the exit code is kept");
+    assert_eq!(failed.duration_ms, Some(900));
+    assert!(
+        s.background_task_labels
+            .get("bg-7f3a")
+            .is_some_and(|c| !c.is_running()),
+        "the settled task is still history"
+    );
+    let frame = rendered(&mut s, 120, 30);
+    assert!(
+        frame.contains("后台失败 1"),
+        "the failure is an active issue on the strip:\n{frame}"
+    );
 }
 
 /// An exit whose start was never seen (reconnect) must not invent a name.

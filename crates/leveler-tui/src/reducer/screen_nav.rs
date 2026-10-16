@@ -255,6 +255,18 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 _ => {}
             }
         }
+        Screen::Issue => match key.code {
+            KeyCode::Esc => close_screen(state),
+            KeyCode::Up | KeyCode::Char('k') => crate::issue::move_selection(state, -1),
+            KeyCode::Down | KeyCode::Char('j') => crate::issue::move_selection(state, 1),
+            // Enter reaches the selected issue's REAL detail: a failed task's
+            // output page, or the conversation where a failed turn's block
+            // and its disclosure live.
+            KeyCode::Enter => return open_selected_issue(state),
+            _ => {
+                scroll_screen_key(state, &key, false);
+            }
+        },
         Screen::Plan => {
             if key.code == KeyCode::Esc {
                 close_screen(state);
@@ -384,6 +396,29 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
     Vec::new()
 }
 
+/// Enter on the Issue page: the selected issue's own detail.
+///
+/// A failed background task opens the existing task page (`Screen::Activity`)
+/// where its command, exit code, output and stop control already live. A
+/// failed turn has no separate page of its own — its failure block, with the
+/// disclosure holding the typed machine facts, is in the conversation — so
+/// Enter returns there at the live edge.
+fn open_selected_issue(state: &mut AppState) -> Vec<Effect> {
+    let Some(issue) = crate::issue::selected_issue(state) else {
+        return Vec::new();
+    };
+    match issue.kind {
+        crate::issue::IssueKind::BackgroundFailure => {
+            crate::activity::open(state, crate::activity::ActivityId::Background(issue.key))
+        }
+        crate::issue::IssueKind::TurnFailure => {
+            close_screen(state);
+            state.jump_to_bottom = true;
+            Vec::new()
+        }
+    }
+}
+
 /// Keyboard and mouse share the same live-state check and runtime command.
 /// Sending the intent never manufactures a terminal state in the client.
 pub(super) fn cancel_background_task(state: &AppState, task_id: &str) -> Vec<Effect> {
@@ -398,6 +433,18 @@ pub(super) fn cancel_background_task(state: &AppState, task_id: &str) -> Vec<Eff
         session_id: state.session_id.clone(),
         task_id: task_id.to_string(),
     })]
+}
+
+/// Open the Issue page with its first active issue selected. Observational:
+/// nothing on this page cancels work, and closing it clears nothing — a
+/// failure stays active until its own source fact changes.
+pub(super) fn open_issue_screen(state: &mut AppState) {
+    if crate::issue::issue_summary(state).is_empty() {
+        return;
+    }
+    crate::issue::ensure_selection(state);
+    state.active_screen = crate::screen::Screen::Issue;
+    state.screen_scroll = 0;
 }
 
 pub(super) fn open_plan_screen(state: &mut AppState) {

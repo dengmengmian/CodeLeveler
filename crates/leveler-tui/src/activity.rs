@@ -293,70 +293,12 @@ pub(crate) fn has_status_activities(state: &AppState) -> bool {
         .any(|s| s.kind == ActivityKind::ChildAgent)
 }
 
-/// Aggregated background-job state for the input footer.
-///
-/// `None` when there is nothing to say: no running task and no unacknowledged
-/// failure. A completed or stopped task never earns a footer slot — its place
-/// is the list page's "recently finished" history. This is the whole reason
-/// background work no longer renders as rows in the conversation body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BackgroundFooterSummary {
-    pub running: usize,
-    /// The oldest running task's elapsed seconds, for the aggregate duration.
-    pub oldest_running_secs: u64,
-    /// The single running task's label, when exactly one is running.
-    pub single_label: Option<String>,
-    /// Failed tasks the user has not acknowledged yet.
-    pub unread_failed: usize,
-}
-
-impl BackgroundFooterSummary {
-    pub fn is_empty(&self) -> bool {
-        self.running == 0 && self.unread_failed == 0
-    }
-}
-
-pub(crate) fn footer_summary(state: &AppState) -> Option<BackgroundFooterSummary> {
-    let now = state.elapsed_secs;
-    let mut running = 0usize;
-    let mut oldest = 0u64;
-    let mut single: Option<String> = None;
-    let mut unread_failed = 0usize;
-    for (id, chrome) in &state.background_task_labels {
-        match chrome.outcome() {
-            crate::state::BackgroundOutcome::Running => {
-                running += 1;
-                let elapsed = now.saturating_sub(chrome.started_elapsed_secs);
-                if running == 1 || elapsed > oldest {
-                    oldest = elapsed;
-                }
-                single = Some(chrome.label.clone());
-            }
-            crate::state::BackgroundOutcome::Failed => {
-                if !state.background_failures_seen.contains(id) {
-                    unread_failed += 1;
-                }
-            }
-            crate::state::BackgroundOutcome::Completed
-            | crate::state::BackgroundOutcome::Stopped => {}
-        }
-    }
-    let summary = BackgroundFooterSummary {
-        running,
-        oldest_running_secs: oldest,
-        // A name is only shown when it is unambiguous; two tasks read as a
-        // count, never as a rotating carousel.
-        single_label: (running == 1).then_some(single).flatten(),
-        unread_failed,
-    };
-    (!summary.is_empty()).then_some(summary)
-}
-
 /// Mark every currently-failed task as seen.
 ///
-/// The footer badge is an attention signal, not durable data: acknowledging
-/// clears the reminder only. Terminal state, exit code, output and history are
-/// all untouched, so the list page still shows the failures.
+/// "New" is an attention signal, not durable data: acknowledging clears the
+/// marker only. The issue stays ACTIVE on the strip, and terminal state, exit
+/// code, output and history are all untouched — the jobs list still shows the
+/// failures, because looking at one solves nothing.
 pub(crate) fn acknowledge_failures(state: &mut AppState) {
     let failed: Vec<String> = state
         .background_task_labels
@@ -454,9 +396,9 @@ pub(crate) fn selected_list_task(state: &AppState) -> Option<String> {
     state.background_list_selected.clone()
 }
 
-/// Open the background-jobs list. Opening is what acknowledges the current
-/// failures, so returning to the conversation no longer shows the badge while
-/// the task history is unchanged.
+/// Open the background-jobs list. Opening marks the current failures as seen
+/// (the issue page's "new" marker clears); the issues themselves stay active
+/// while their task records do, and nothing here cancels or deletes work.
 pub(crate) fn open_background_list(state: &mut AppState) {
     acknowledge_failures(state);
     ensure_list_selection(state);
@@ -474,7 +416,7 @@ pub(crate) fn close_background_list(state: &mut AppState) {
 /// Status-strip activity lines and the summary index each line belongs to.
 ///
 /// Only child agents reach this strip. Background tasks are aggregated into
-/// the input footer ([`footer_summary`]) and listed on the background-jobs
+/// the state strip's background cell and listed on the background-jobs
 /// page, so a long-lived process never occupies a row in the conversation
 /// body. When the agent is actively waiting on a task, `wait_status` still
 /// names it — that is main execution state, not the background summary.
@@ -1715,13 +1657,13 @@ second line ignored"
         }
     }
 
-    /// Case A: nothing to say. A completed or stopped task alone earns no
-    /// footer slot.
+    /// Only RUNNING tasks count toward the strip's background cell. A
+    /// completed or stopped task is history (the jobs list keeps it).
     #[test]
-    fn footer_summary_is_none_without_running_or_unread_failures() {
+    fn only_running_tasks_count_toward_the_background_cell() {
         let mut state = test_state();
         state.elapsed_secs = 90;
-        assert!(footer_summary(&state).is_none());
+        assert_eq!(running_background_count(&state), 0);
         state.background_task_labels.insert(
             "bg-done".into(),
             finished("cargo check", true, false, 0, 18_000),
@@ -1730,33 +1672,11 @@ second line ignored"
             "bg-stopped".into(),
             finished("npm start", false, true, 0, 24_000),
         );
-        assert!(
-            footer_summary(&state).is_none(),
-            "completed and stopped tasks are not footer activity"
+        assert_eq!(
+            running_background_count(&state),
+            0,
+            "completed and stopped tasks are not running work"
         );
-    }
-
-    /// Case B: one running task is named.
-    #[test]
-    fn footer_summary_names_a_single_running_task() {
-        let mut state = test_state();
-        state.elapsed_secs = 90;
-        state
-            .background_task_labels
-            .insert("bg-1".into(), BackgroundTaskChrome::running("make up", 28));
-        let summary = footer_summary(&state).expect("summary");
-        assert_eq!(summary.running, 1);
-        assert_eq!(summary.single_label.as_deref(), Some("make up"));
-        assert_eq!(summary.oldest_running_secs, 62);
-        assert_eq!(summary.unread_failed, 0);
-    }
-
-    /// Case C: several running tasks aggregate to a count, and the duration is
-    /// the oldest running task's, never a carousel of names.
-    #[test]
-    fn footer_summary_aggregates_several_running_tasks() {
-        let mut state = test_state();
-        state.elapsed_secs = 90;
         state
             .background_task_labels
             .insert("bg-1".into(), BackgroundTaskChrome::running("make up", 10));
@@ -1764,31 +1684,11 @@ second line ignored"
             "bg-2".into(),
             BackgroundTaskChrome::running("cargo test", 30),
         );
-        let summary = footer_summary(&state).expect("summary");
-        assert_eq!(summary.running, 2);
-        assert!(summary.single_label.is_none(), "a name is ambiguous");
-        assert_eq!(summary.oldest_running_secs, 80);
-    }
-
-    /// Case D/E: running and failed are separate counts.
-    #[test]
-    fn footer_summary_keeps_running_and_failed_separate() {
-        let mut state = test_state();
-        state.elapsed_secs = 90;
-        state
-            .background_task_labels
-            .insert("bg-1".into(), BackgroundTaskChrome::running("make up", 10));
-        state.background_task_labels.insert(
-            "bg-2".into(),
-            BackgroundTaskChrome::running("cargo test", 20),
+        assert_eq!(running_background_count(&state), 2);
+        assert!(
+            crate::issue::issue_summary(&state).is_empty(),
+            "running work is not an issue"
         );
-        state.background_task_labels.insert(
-            "bg-3".into(),
-            finished("npm start", false, false, 0, 30_000),
-        );
-        let summary = footer_summary(&state).expect("summary");
-        assert_eq!(summary.running, 2);
-        assert_eq!(summary.unread_failed, 1);
     }
 
     /// The authoritative stop distinction: a killed task is not a failure.
@@ -1802,7 +1702,10 @@ second line ignored"
         let chrome = state.background_task_labels.get("bg-1").unwrap();
         assert_eq!(chrome.outcome(), crate::state::BackgroundOutcome::Stopped);
         assert!(!chrome.is_failed());
-        assert!(footer_summary(&state).is_none());
+        assert!(
+            crate::issue::issue_summary(&state).is_empty(),
+            "a user/agent cancel is not an issue"
+        );
         assert_eq!(
             summaries(&state)[0].status,
             ActivityStatus::Stopped,
@@ -1810,7 +1713,7 @@ second line ignored"
         );
     }
 
-    /// An unexpected non-zero exit IS a failure.
+    /// An unexpected non-zero exit IS a failure — and becomes an active issue.
     #[test]
     fn an_unexpected_nonzero_exit_is_a_failure() {
         let mut state = test_state();
@@ -1822,13 +1725,15 @@ second line ignored"
         let chrome = state.background_task_labels.get("bg-1").unwrap();
         assert_eq!(chrome.outcome(), crate::state::BackgroundOutcome::Failed);
         assert!(chrome.is_failed());
-        assert_eq!(footer_summary(&state).unwrap().unread_failed, 1);
+        let issues = crate::issue::active_issues(&state);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].unread);
     }
 
-    /// Acknowledging clears the reminder only: terminal state, exit code and
-    /// history are untouched.
+    /// Acknowledging marks read — it solves nothing: the issue stays active,
+    /// and terminal state, exit code and history are untouched.
     #[test]
-    fn acknowledging_failures_clears_the_badge_but_keeps_history() {
+    fn acknowledging_a_failure_marks_it_read_not_solved() {
         let mut state = test_state();
         state.elapsed_secs = 90;
         state.background_task_labels.insert(
@@ -1839,11 +1744,13 @@ second line ignored"
             "bg-2".into(),
             finished("cargo test", false, false, 0, 24_000),
         );
-        assert_eq!(footer_summary(&state).unwrap().unread_failed, 2);
+        assert!(crate::issue::active_issues(&state).iter().all(|i| i.unread));
         acknowledge_failures(&mut state);
+        let issues = crate::issue::active_issues(&state);
+        assert_eq!(issues.len(), 2, "a read issue is still an active issue");
         assert!(
-            footer_summary(&state).is_none(),
-            "nothing left to remind about"
+            issues.iter().all(|i| !i.unread),
+            "acknowledging clears the new marker only"
         );
         // History and terminal facts survive.
         assert!(state.background_task_labels.contains_key("bg-1"));

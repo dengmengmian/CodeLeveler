@@ -1308,7 +1308,6 @@ mod screens;
 pub(crate) mod text;
 pub(crate) mod transcript_lines;
 
-pub(crate) use footer::background_footer_spans;
 pub(crate) use footer::key_hint_line;
 pub(crate) use footer::user_turn_summaries;
 pub use transcript_lines::{
@@ -1378,6 +1377,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Screen::Activity => render_activity_screen(frame, area, state),
         Screen::ActivityList => render_background_list_screen(frame, area, state),
         Screen::Team => render_team_screen(frame, area, state),
+        Screen::Issue => render_issue_screen(frame, area, state),
         Screen::Plan => render_plan_screen(frame, area, state),
         Screen::Goal => render_goal_screen(frame, area, state),
         Screen::Help => render_help_screen(frame, area, state),
@@ -1455,6 +1455,91 @@ fn goal_detail_lines(
             .into_iter()
             .map(|row| Line::from(Span::styled(row, Style::default().fg(theme.text.primary)))),
     );
+    lines
+}
+
+/// The Issue page: the active issues the strip's issue cell counts, each with
+/// its own real detail behind it. Read-only; Enter on a task issue opens that
+/// task's page, Enter on a failed turn returns to the conversation where its
+/// failure block lives.
+fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let theme = &state.theme;
+    let t = state.t();
+    let page = crate::secondary::SecondaryPage {
+        title: t.issue_page_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.issue_page_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, &layout, &page, theme);
+    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    let body = layout.content;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    let issues = crate::issue::active_issues(state);
+    let selected = state.issue_selected.as_deref();
+    let lines = issue_page_lines(&issues, selected, body.width as usize, theme, t);
+    render_scrolled(frame, body, state, lines);
+}
+
+fn issue_page_lines(
+    issues: &[crate::issue::Issue],
+    selected: Option<&str>,
+    width: usize,
+    theme: &Theme,
+    t: &crate::i18n::UiText,
+) -> Vec<Line<'static>> {
+    if issues.is_empty() {
+        return vec![Line::from(Span::styled(
+            t.issue_page_empty.to_string(),
+            Style::default().fg(theme.text.muted),
+        ))];
+    }
+    let error = Style::default().fg(theme.status.error);
+    let warning = Style::default().fg(theme.status.warning);
+    let mut lines = Vec::new();
+    for issue in issues {
+        let (glyph, ink) = match issue.kind {
+            crate::issue::IssueKind::TurnFailure => ("✕", error),
+            crate::issue::IssueKind::BackgroundFailure => ("⚠", warning),
+        };
+        let marker = if selected == Some(issue.key.as_str()) {
+            Span::styled("▸ ", Style::default().fg(theme.text.secondary))
+        } else {
+            Span::raw("  ")
+        };
+        let mut spans = vec![
+            marker,
+            Span::styled(
+                format!("{glyph} {}  ", truncate_display(&issue.label, width.saturating_sub(4))),
+                ink,
+            ),
+        ];
+        if issue.unread {
+            spans.push(Span::styled(
+                format!("{}  ", t.issue_row_new),
+                Style::default().fg(theme.accent.primary),
+            ));
+        }
+        if let Some(meta) = &issue.meta {
+            spans.push(Span::styled(
+                meta.clone(),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        lines.push(Line::from(spans));
+        if let Some(detail) = &issue.detail {
+            // The failure block's own safe technical detail, line for line.
+            for row in detail.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("    {row}"),
+                    Style::default().fg(theme.text.muted),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+    }
     lines
 }
 

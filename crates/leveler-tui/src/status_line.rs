@@ -1747,10 +1747,9 @@ mod tests {
         assert!(!text.contains("cargo test --workspace"), "{text}");
         assert!(!text.contains('↗'), "{text}");
         assert!(!text.contains("等待后台任务"), "{text}");
-        // Still reachable: the footer summary reports the running task.
-        let summary = crate::activity::footer_summary(&state).expect("footer summary");
-        assert_eq!(summary.running, 1);
-        assert_eq!(summary.single_label.as_deref(), Some("npm run dev"));
+        // Still reachable: the strip's own background cell reports the count
+        // (the runtime line never names a task).
+        assert_eq!(crate::activity::running_background_count(&state), 1);
     }
 
     /// A live reconnect is the one fact that must survive the busy status line:
