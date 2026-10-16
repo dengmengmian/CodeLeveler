@@ -130,7 +130,13 @@ impl Script {
 fn layer_document(script: &Script, layer: &str) -> String {
     let required: &[&str] = match layer {
         "L0" => &["fmt", "clippy", "release_build"],
-        "L1" => &["workspace_tests", "prefix_cache_stability"],
+        // `feature_coverage_inventory` is the coverage preflight: a real L1 run
+        // always produces it, so the scripted one must too.
+        "L1" => &[
+            "workspace_tests",
+            "prefix_cache_stability",
+            "feature_coverage_inventory",
+        ],
         "L2" => &["tui_tests"],
         _ => &[],
     };
@@ -822,6 +828,23 @@ fn a_removed_layer_artifact_invalidates_the_stage_that_recorded_it() {
         "{rendered}"
     );
     assert!(world.lab.join(RELEASE_RUN).join("L2.json").is_file());
+}
+
+#[test]
+fn the_coverage_preflight_must_have_run_or_stage_two_fails() {
+    // The preflight is what proves every feature is registered and mapped
+    // before the later stages produce evidence. A layer that silently skipped it
+    // would let a release ship with an unchecked registry.
+    let world = World::new();
+    world.set(|script| script.drop_check = Some("feature_coverage_inventory".into()));
+    let (code, rendered, log) = world.run(&["publish"]);
+    assert_ne!(code, 0);
+    assert!(rendered.contains("REQUIRED_CHECK_MISSING"), "{rendered}");
+    assert!(
+        rendered.contains("feature_coverage_inventory"),
+        "{rendered}"
+    );
+    assert!(!pushed(&log));
 }
 
 #[test]
