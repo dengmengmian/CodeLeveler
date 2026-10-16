@@ -562,7 +562,15 @@ fn build_markdown(context: &Context, transaction: &Transaction, data: &Json) -> 
                 .or_else(|| case.at("lane").as_str())
                 .unwrap_or("unspecified")
                 .to_string();
-            let passed = case.at("status").as_str() == Some("PASS");
+            // L3 cases carry `passed` (the run's own verdict). `expect_passed`
+            // is the case's declared expectation, which is not the same thing:
+            // reading a field the document does not have reported 0 PASS for a
+            // 19/19 run.
+            let passed = case
+                .at("passed")
+                .as_bool()
+                .or_else(|| case.at("expect_passed").as_bool())
+                .unwrap_or(false);
             match suites.iter_mut().find(|(name, _, _)| name == &suite) {
                 Some((_, total, ok)) => {
                     *total += 1;
@@ -584,7 +592,7 @@ fn build_markdown(context: &Context, transaction: &Transaction, data: &Json) -> 
     match feature_coverage(context, transaction) {
         Some(coverage) => push_list(
             &mut out,
-            coverage.at("unverified").as_arr().unwrap_or(&[]),
+            coverage.at("unverified_list").as_arr().unwrap_or(&[]),
             "- `{}`\n",
             "- 无（coverage gate 未列出）。\n",
         ),
@@ -644,11 +652,28 @@ fn write_feature_coverage(out: &mut String, context: &Context, transaction: &Tra
         ("不支持 UNSUPPORTED", "unsupported"),
         ("核心功能总数", "core_total"),
         ("核心已覆盖", "core_covered"),
-        ("核心未覆盖", "core_uncovered"),
+        ("核心未覆盖", "core_gaps"),
     ] {
         out.push_str(&format!("| {label} | {} |\n", number(key)));
     }
     out.push('\n');
+    // Four denominators, stated so the numbers cannot be read as one another.
+    let percent = |key: &str| summary.at(key).as_f64().unwrap_or(0.0);
+    out.push_str(&format!(
+        "| 覆盖率口径 | 数值 | 定义 |\n| --- | --- | --- |\n\
+         | 核心功能覆盖率 | {:.1}% | 核心 COVERED / 核心总数（{}/{}）——**发布阻断指标** |\n\
+         | 本次候选有效证据覆盖率 | {:.1}% | 全部 COVERED / 全部功能（{}/{}），分母含 product/extended/out_of_scope |\n\
+         | 功能映射覆盖率 | {:.1}% | 有任意证据引用的功能 / 全部功能 |\n\
+         | 真实 E2E 覆盖率 | {:.1}% | 证据含 pty/eval/rc/l2 的功能 / 全部功能 |\n\n",
+        percent("coverage_core_percent"),
+        number("core_covered"),
+        number("core_total"),
+        percent("coverage_candidate_evidence_percent"),
+        number("covered"),
+        number("total"),
+        percent("coverage_mapping_percent"),
+        percent("coverage_e2e_percent"),
+    ));
     let list = |out: &mut String, title: &str, key: &str| {
         let items = coverage.at(key).as_arr().unwrap_or(&[]);
         out.push_str(&format!("### {title}（{}）\n\n", items.len()));
