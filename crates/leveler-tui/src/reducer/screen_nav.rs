@@ -91,7 +91,7 @@ pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
         // Everything else (Plan, Goal, Doctor, Shell, Remote) is a document
         // under a `screen_scroll` offset.
         _ => {
-            let lines = (notches * 3).unsigned_abs() as usize;
+            let lines = (notches * 3).unsigned_abs();
             state.screen_scroll = if notches < 0 {
                 state.screen_scroll.saturating_sub(lines)
             } else {
