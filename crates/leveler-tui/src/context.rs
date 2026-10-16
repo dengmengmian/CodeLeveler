@@ -22,9 +22,7 @@ use ratatui::text::{Line, Span};
 
 use crate::context_grid::{self, GridShape};
 use crate::i18n::UiText;
-use crate::render::{
-    pad_display, pad_line_to_width, render_scrolled, truncate_display,
-};
+use crate::render::{pad_display, pad_line_to_width, render_scrolled, truncate_display};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -435,7 +433,11 @@ fn compose_body(
     const GAP: usize = 3;
     // The breakdown's own row 0 is its heading, so category `i` is one line
     // below it — the same `1 + i` the focus has always used.
-    let row_lines = |start: usize| -> Vec<usize> { (0..breakdown.len().saturating_sub(1)).map(|i| start + 1 + i).collect() };
+    let row_lines = |start: usize| -> Vec<usize> {
+        (0..breakdown.len().saturating_sub(1))
+            .map(|i| start + 1 + i)
+            .collect()
+    };
 
     if side_by_side {
         let grid = grid.expect("side-by-side needs a map");

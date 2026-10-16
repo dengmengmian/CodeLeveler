@@ -630,7 +630,11 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
     });
     // 4. Background entry (running tasks only): an entry, not a report.
     if running > 0 {
-        claim(background_strip(state, running), &mut committed, &mut claimed);
+        claim(
+            background_strip(state, running),
+            &mut committed,
+            &mut claimed,
+        );
     }
 
     // The label takes what is left after every claim; the plan's detail then
@@ -658,11 +662,8 @@ fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // `label_budget` is the label's own pool (width minus the claimed cells):
     // the plan's detail and the runtime's statistics share only what the label
     // does not use, and the label is never squeezed below its own budget.
-    let runtime = crate::status_line::status_strip_line(
-        state,
-        label_budget.saturating_sub(plan_extra),
-        true,
-    );
+    let runtime =
+        crate::status_line::status_strip_line(state, label_budget.saturating_sub(plan_extra), true);
     let runtime_w = runtime.width();
 
     // Assemble in reading order: runtime, background, issues, plan.
@@ -757,10 +758,7 @@ fn issue_strip(state: &AppState, summary: &crate::issue::IssueSummary, labeled: 
     let width = UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(STRIP_ARROW);
     StripItem {
         target: StripTarget::Issue,
-        spans: vec![
-            Span::styled(text, ink),
-            Span::styled(STRIP_ARROW, ink),
-        ],
+        spans: vec![Span::styled(text, ink), Span::styled(STRIP_ARROW, ink)],
         width,
     }
 }
@@ -799,10 +797,7 @@ fn severe_strip(
         let width = UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(STRIP_ARROW);
         return Some(StripItem {
             target: StripTarget::Issue,
-            spans: vec![
-                Span::styled(text, ink),
-                Span::styled(STRIP_ARROW, ink),
-            ],
+            spans: vec![Span::styled(text, ink), Span::styled(STRIP_ARROW, ink)],
             width,
         });
     }
@@ -810,10 +805,7 @@ fn severe_strip(
     let width = UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(STRIP_ARROW);
     (width <= room).then(|| StripItem {
         target: StripTarget::Issue,
-        spans: vec![
-            Span::styled(text, ink),
-            Span::styled(STRIP_ARROW, ink),
-        ],
+        spans: vec![Span::styled(text, ink), Span::styled(STRIP_ARROW, ink)],
         width,
     })
 }
@@ -823,8 +815,8 @@ fn severe_strip(
 /// whether the entry exists.
 fn plan_floor_strip(state: &AppState, ind: &PlanStrip) -> StripItem {
     let budget = plan_core_width(ind) + UnicodeWidthStr::width(STRIP_ARROW);
-    let (line, width) = fit_plan_strip(state, ind, budget)
-        .expect("core + arrow always fits its own budget");
+    let (line, width) =
+        fit_plan_strip(state, ind, budget).expect("core + arrow always fits its own budget");
     StripItem {
         target: StripTarget::Plan,
         spans: line.spans,
@@ -863,8 +855,7 @@ fn fit_plan_strip(
         }
     };
     let glyph = format!("{} ", ind.glyph);
-    let core_w =
-        UnicodeWidthStr::width(glyph.as_str()) + UnicodeWidthStr::width(ind.core.as_str());
+    let core_w = UnicodeWidthStr::width(glyph.as_str()) + UnicodeWidthStr::width(ind.core.as_str());
     if core_w > budget {
         return None;
     }
@@ -879,12 +870,7 @@ fn fit_plan_strip(
             ),
         ]
     };
-    let arrow_span = || {
-        Span::styled(
-            STRIP_ARROW,
-            Style::default().fg(state.theme.plan.primary),
-        )
-    };
+    let arrow_span = || Span::styled(STRIP_ARROW, Style::default().fg(state.theme.plan.primary));
     let arrow_w = UnicodeWidthStr::width(STRIP_ARROW);
     // Full form: detail + arrow, the detail truncated to what is left after
     // the parts that outrank it. A sliver under two columns is not a step
@@ -1565,10 +1551,7 @@ mod tests {
             row_of(&without, "Type a message")
         );
         // And nothing else on screen repeats the fraction.
-        assert_eq!(
-            without.iter().filter(|l| l.contains("plan 1/3")).count(),
-            0
-        );
+        assert_eq!(without.iter().filter(|l| l.contains("plan 1/3")).count(), 0);
     }
 
     /// The merged strip survives a narrow terminal inside the FULL workbench:
@@ -3700,7 +3683,10 @@ mod tests {
         let line = rows[0].trim_end();
         assert!(line.contains("● 计划 0/4 · 4 项待办"), "{line}");
         assert!(!line.contains("侦察仓库结构"), "{line}");
-        assert!(!line.contains("进行中"), "pending is not in-progress: {line}");
+        assert!(
+            !line.contains("进行中"),
+            "pending is not in-progress: {line}"
+        );
     }
 
     /// A plan the agent declared complete while the turn still runs reports
@@ -3720,8 +3706,7 @@ mod tests {
             .find(|cell| cell.symbol() == "✓")
             .expect("completion glyph painted");
         assert_eq!(
-            glyph.fg,
-            state.theme.status.success,
+            glyph.fg, state.theme.status.success,
             "a settled plan is static green, never a breathing purple"
         );
         assert_ne!(glyph.fg, state.theme.plan.breathe(0.0));
@@ -3772,15 +3757,12 @@ mod tests {
         for (x, (symbol, _)) in cells.iter().enumerate() {
             // A wide char owns two cells and only the first carries both the
             // glyph and its style; the continuation cell is painted by it.
-            let continuation = x > 0
-                && UnicodeWidthStr::width(cells[x - 1].0.as_str()) == 2
-                && symbol == " ";
+            let continuation =
+                x > 0 && UnicodeWidthStr::width(cells[x - 1].0.as_str()) == 2 && symbol == " ";
             if continuation {
                 continue;
             }
-            let reversed = buf[(x as u16, 0)]
-                .modifier
-                .contains(Modifier::REVERSED);
+            let reversed = buf[(x as u16, 0)].modifier.contains(Modifier::REVERSED);
             let in_plan = (x0 as usize..x1 as usize).contains(&x);
             assert_eq!(
                 reversed, in_plan,
@@ -3859,7 +3841,9 @@ mod tests {
                 "w={width}: the hit starts at the glyph and holds the progress: {painted:?}"
             );
             assert!(
-                ["步骤 3 ↗", "2/4 ↗", "2/4"].iter().any(|end| painted.ends_with(end)),
+                ["步骤 3 ↗", "2/4 ↗", "2/4"]
+                    .iter()
+                    .any(|end| painted.ends_with(end)),
                 "w={width}: the hit ends exactly where the painting ends: {painted:?}"
             );
             let cells = strip_buffer_cells(&buf);
@@ -3958,10 +3942,7 @@ mod tests {
     #[test]
     fn plan_indicator_hidden_until_steps_exist() {
         // Busy goal with no plan must not reserve chrome for "等待计划".
-        assert!(!plan_indicator_should_show(
-            &UiPlan { steps: vec![] },
-            true
-        ));
+        assert!(!plan_indicator_should_show(&UiPlan { steps: vec![] }, true));
         assert!(plan_indicator_should_show(&sample_plan(), true));
     }
 
@@ -4135,9 +4116,7 @@ mod tests {
 
     /// The buffer cells themselves, so hit ranges can be checked by column
     /// (a string indexes bytes, and a wide char owns two cells).
-    fn strip_buffer_cells(
-        buf: &ratatui::buffer::Buffer,
-    ) -> Vec<(String, ratatui::style::Color)> {
+    fn strip_buffer_cells(buf: &ratatui::buffer::Buffer) -> Vec<(String, ratatui::style::Color)> {
         (0..buf.area.width)
             .map(|x| {
                 let cell = &buf[(x, 0)];
@@ -4230,8 +4209,7 @@ mod tests {
             .find(|cell| cell.symbol() == "✕")
             .expect("failure glyph painted");
         assert_eq!(
-            glyph.fg,
-            state.theme.status.error,
+            glyph.fg, state.theme.status.error,
             "the failure ink is the error token"
         );
     }
@@ -4240,7 +4218,11 @@ mod tests {
         crate::state::BackgroundTaskChrome::running(label, started)
     }
 
-    fn bg_failed_task(label: &str, started: u64, exit_code: i32) -> crate::state::BackgroundTaskChrome {
+    fn bg_failed_task(
+        label: &str,
+        started: u64,
+        exit_code: i32,
+    ) -> crate::state::BackgroundTaskChrome {
         crate::state::BackgroundTaskChrome {
             ok: Some(false),
             exit_code: Some(exit_code),
@@ -4284,8 +4266,14 @@ mod tests {
         let (irow, ix0, ix1) = state.issue_hit.expect("issue hit");
         let (prow, px0, px1) = state.plan_hit.expect("plan hit");
         assert!(brow == irow && irow == prow && brow == 0, "one row");
-        assert!(bx1 <= ix0, "cells do not overlap: b={bx0}..{bx1} i={ix0}..{ix1}");
-        assert!(ix1 <= px0, "cells do not overlap: i={ix0}..{ix1} p={px0}..{px1}");
+        assert!(
+            bx1 <= ix0,
+            "cells do not overlap: b={bx0}..{bx1} i={ix0}..{ix1}"
+        );
+        assert!(
+            ix1 <= px0,
+            "cells do not overlap: i={ix0}..{ix1} p={px0}..{px1}"
+        );
         assert_eq!(painted_text(&buf, bx0 as usize, bx1 as usize), "后台 2 ↗");
         assert_eq!(
             painted_text(&buf, ix0 as usize, ix1 as usize),
@@ -4304,18 +4292,23 @@ mod tests {
         let mut state = test_state();
         state.status = leveler_client_protocol::RuntimeStatus::Error;
         state.theme = crate::theme::Theme::dark();
-        state.transcript.push_failure(crate::transcript::FailureBlock {
-            display: crate::fold::DisplayMode::Collapsed,
-            title: "请求失败".into(),
-            summary: "模型认证失败".into(),
-            subtitle: Some("deepseek · authentication · HTTP 401".into()),
-            detail: String::new(),
-        });
+        state
+            .transcript
+            .push_failure(crate::transcript::FailureBlock {
+                display: crate::fold::DisplayMode::Collapsed,
+                title: "请求失败".into(),
+                summary: "模型认证失败".into(),
+                subtitle: Some("deepseek · authentication · HTTP 401".into()),
+                detail: String::new(),
+            });
         let buf = strip_buffer(&mut state, None, 120);
         let rows = strip_rows(&mut state, None, 120);
         let line = rows[0].trim_end();
         assert!(line.contains("✕ 模型认证失败 ↗"), "{line}");
-        assert!(!line.contains('⚠'), "blocking is not a warning glyph: {line}");
+        assert!(
+            !line.contains('⚠'),
+            "blocking is not a warning glyph: {line}"
+        );
         let glyph = (0..buf.area.width)
             .map(|x| buf[(x, 0)].clone())
             .find(|cell| cell.symbol() == "✕")
@@ -4944,7 +4937,10 @@ mod tests {
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
-        assert!(all.contains("后台失败 1"), "an unseen failure reminds: {all}");
+        assert!(
+            all.contains("后台失败 1"),
+            "an unseen failure reminds: {all}"
+        );
 
         let lines = render_background_case(
             120,
@@ -4992,7 +4988,10 @@ mod tests {
         let row = &lines[row_of(&lines, "09:30")];
         assert!(row.contains("09:30"), "the clock survives: {row:?}");
         assert!(row.chars().count() <= 60, "no overflow: {row:?}");
-        assert!(all.contains("后台 1"), "the task is still reachable as a count: {all}");
+        assert!(
+            all.contains("后台 1"),
+            "the task is still reachable as a count: {all}"
+        );
     }
 
     /// CJK labels are measured in display columns, not bytes, and never panic.

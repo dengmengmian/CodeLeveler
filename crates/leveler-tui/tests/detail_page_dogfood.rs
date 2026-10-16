@@ -552,7 +552,10 @@ fn dogfood_background_jobs_footer_and_list() {
         .find(|l| l.contains("jobs"))
         .unwrap_or_else(|| panic!("strip row missing:\n{home}"));
     assert!(strip.contains("2 jobs"), "running count:\n{home}");
-    assert!(strip.contains("background failed 1"), "failure count:\n{home}");
+    assert!(
+        strip.contains("background failed 1"),
+        "failure count:\n{home}"
+    );
     for raw in ["npm", "cargo", "make", "EADDRINUSE"] {
         assert!(
             !strip.contains(raw),

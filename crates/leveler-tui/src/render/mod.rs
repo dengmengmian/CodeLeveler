@@ -221,8 +221,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
                 .get(task_id)
                 .is_some_and(|task| task.is_running()) =>
         {
-            background_stop_rect(layout.footer, t)
-            .map(|rect| (rect, task_id.clone()))
+            background_stop_rect(layout.footer, t).map(|rect| (rect, task_id.clone()))
         }
         _ => None,
     };
@@ -1675,10 +1674,7 @@ fn issue_page_view(
                 let line = view.lines.len();
                 view.lines.push(Line::from(vec![
                     Span::raw(indent),
-                    Span::styled(
-                        entry.to_string(),
-                        Style::default().fg(theme.accent.primary),
-                    ),
+                    Span::styled(entry.to_string(), Style::default().fg(theme.accent.primary)),
                 ]));
                 view.details.push((line, x0, x1, issue.key.clone()));
             }

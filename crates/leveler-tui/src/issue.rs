@@ -112,11 +112,7 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
             // A failure the transcript never got a block for (a legacy event):
             // the status itself is still the fact, so it stays an issue with
             // the block's own title vocabulary.
-            None => (
-                state.t().failure_title.to_string(),
-                None,
-                None,
-            ),
+            None => (state.t().failure_title.to_string(), None, None),
         };
         issues.push(Issue {
             kind: IssueKind::TurnFailure,
@@ -227,7 +223,9 @@ pub(crate) fn collapse_selected(state: &mut AppState) -> bool {
 /// identity, so a failure that left the projection is never acted on.
 pub(crate) fn selected_issue(state: &AppState) -> Option<Issue> {
     let key = state.issue_selected.as_deref()?;
-    active_issues(state).into_iter().find(|issue| issue.key == key)
+    active_issues(state)
+        .into_iter()
+        .find(|issue| issue.key == key)
 }
 
 /// Move the page's selection over the active issues.
@@ -394,13 +392,15 @@ mod tests {
     fn a_failed_turn_is_the_severe_issue() {
         let mut state = state();
         state.status = RuntimeStatus::Error;
-        state.transcript.push_failure(crate::transcript::FailureBlock {
-            display: crate::fold::DisplayMode::Collapsed,
-            title: "请求失败".into(),
-            summary: "模型认证失败".into(),
-            subtitle: Some("deepseek · authentication · HTTP 401".into()),
-            detail: "status  401".into(),
-        });
+        state
+            .transcript
+            .push_failure(crate::transcript::FailureBlock {
+                display: crate::fold::DisplayMode::Collapsed,
+                title: "请求失败".into(),
+                summary: "模型认证失败".into(),
+                subtitle: Some("deepseek · authentication · HTTP 401".into()),
+                detail: "status  401".into(),
+            });
         let summary = issue_summary(&state);
         assert_eq!(summary.total, 1);
         assert!(summary.severe_active);
@@ -411,7 +411,12 @@ mod tests {
             issues[0].meta.as_deref(),
             Some("deepseek · authentication · HTTP 401")
         );
-        assert!(issues[0].detail.as_deref().is_some_and(|d| d.contains("401")));
+        assert!(
+            issues[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("401"))
+        );
     }
 
     /// A later turn clears the severe issue: the runtime's status is the fact
@@ -420,16 +425,21 @@ mod tests {
     fn a_later_turn_clears_the_severe_issue_but_not_its_history() {
         let mut state = state();
         state.status = RuntimeStatus::Error;
-        state.transcript.push_failure(crate::transcript::FailureBlock {
-            display: crate::fold::DisplayMode::Collapsed,
-            title: "请求失败".into(),
-            summary: "模型认证失败".into(),
-            subtitle: None,
-            detail: String::new(),
-        });
+        state
+            .transcript
+            .push_failure(crate::transcript::FailureBlock {
+                display: crate::fold::DisplayMode::Collapsed,
+                title: "请求失败".into(),
+                summary: "模型认证失败".into(),
+                subtitle: None,
+                detail: String::new(),
+            });
         assert!(issue_summary(&state).severe_active);
         state.status = RuntimeStatus::Busy;
-        assert!(issue_summary(&state).is_empty(), "the turn is running again");
+        assert!(
+            issue_summary(&state).is_empty(),
+            "the turn is running again"
+        );
         assert!(
             state.transcript.last_failure_block().is_some(),
             "history keeps the failure"

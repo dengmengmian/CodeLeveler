@@ -495,11 +495,18 @@ fn the_issue_page_keeps_its_cursor_on_screen() {
     let mut s = opened();
     seed(&mut s, Screen::Issue);
     let rows = s.background_task_labels.len();
-    assert!(rows >= 8, "the fixture needs a list taller than the viewport");
+    assert!(
+        rows >= 8,
+        "the fixture needs a list taller than the viewport"
+    );
     // The page's own opener picks the first issue; stand in for it here.
     s.issue_selected = Some("bg-0".into());
     // A window too short for the whole list, so the cursor has to move it.
-    let cursor_row = |page: &Page| page.lines.iter().position(|l| l.trim_start().starts_with("→"));
+    let cursor_row = |page: &Page| {
+        page.lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("→"))
+    };
     assert!(cursor_row(&Page::of(&mut s, 80, 10)).is_some(), "no cursor");
 
     for step in 0..rows {
@@ -596,7 +603,9 @@ fn seed(state: &mut AppState, screen: Screen) {
         }
         Screen::Sessions => {
             for i in 0..14 {
-                state.sessions.push(summary(&format!("s{i}"), "a session goal"));
+                state
+                    .sessions
+                    .push(summary(&format!("s{i}"), "a session goal"));
             }
         }
         Screen::Diff => {
@@ -623,7 +632,9 @@ fn seed(state: &mut AppState, screen: Screen) {
                     None,
                     None,
                 );
-                state.transcript.complete_tool(&call, true, "ok".into(), 3, None);
+                state
+                    .transcript
+                    .complete_tool(&call, true, "ok".into(), 3, None);
             }
         }
         _ => {}
