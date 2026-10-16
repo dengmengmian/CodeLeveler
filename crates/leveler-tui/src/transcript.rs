@@ -1549,6 +1549,16 @@ impl TranscriptState {
         })
     }
 
+    /// The most recent terminal-failure block. Read by the Issue read model,
+    /// which re-presents this one record's own summary instead of re-deriving
+    /// a second error description.
+    pub fn last_failure_block(&self) -> Option<&FailureBlock> {
+        self.items.iter().rev().find_map(|item| match item {
+            TranscriptItem::Failure(block) => Some(block),
+            _ => None,
+        })
+    }
+
     /// All tool-call blocks, in order (for the Tools screen).
     pub fn tool_calls(&self) -> Vec<&ToolCallBlock> {
         self.items

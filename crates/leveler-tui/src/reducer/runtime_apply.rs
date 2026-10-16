@@ -1047,29 +1047,34 @@ pub(super) fn apply_runtime(state: &mut AppState, event: RuntimeEvent) {
             };
             crate::activity::bound_terminal_background(state);
             // Stopped is its own terminal outcome: a cancel is not a failure.
-            // The wording and the notice level both follow the runtime fact.
             let (message, level) = if ok {
                 (
                     t.background_task_done.replace("{}", &label),
-                    NotificationLevel::Info,
+                    Some(NotificationLevel::Info),
                 )
             } else if stopped {
                 (
                     t.background_task_stopped.replace("{}", &label),
-                    NotificationLevel::Info,
+                    Some(NotificationLevel::Info),
                 )
             } else {
+                // A failure is not a transient notice: it becomes an ACTIVE
+                // issue (the strip's issue cell and its page) and the task's
+                // own row/output keep the evidence. A banner repeating the
+                // command and exit code was the third surface for one fact.
                 let failed = t.background_task_failed.replace("{}", &label);
                 let message = match exit_code {
                     Some(code) => format!("{failed} · exit {code}"),
                     None => failed,
                 };
-                (message, NotificationLevel::Warning)
+                (message, None)
             };
             if !has_starter {
                 state.transcript.push_note(message.clone());
             }
-            state.notification = Some(Notification { level, message });
+            if let Some(level) = level {
+                state.notification = Some(Notification { level, message });
+            }
         }
         RuntimeEvent::BackgroundTaskOutput { task_id, chunk } => {
             // Live tail from the runtime. Sanitize again (the client never

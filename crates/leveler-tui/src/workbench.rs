@@ -225,7 +225,14 @@ pub fn render_workbench(frame: &mut Frame, state: &mut AppState) {
         .plan
         .as_ref()
         .is_some_and(|plan| plan_indicator_should_show(plan, state.is_busy()));
-    let strip_rows: u16 = u16::from(status_has_content || plan_visible);
+    // Any painted cell earns the row: the runtime's own line, a live plan, a
+    // running background task, or an active issue. (Visibility here and the
+    // renderer's own filters must agree, or a cell would be counted for a row
+    // it never gets to paint on.)
+    let background_visible = crate::activity::running_background_count(state) > 0;
+    let issue_visible = !crate::issue::issue_summary(state).is_empty();
+    let strip_rows: u16 =
+        u16::from(status_has_content || plan_visible || background_visible || issue_visible);
     // Breathing room around the input box: blank above only when live chrome
     // (the state strip / attachments / 待发送) sits on top of it; blank below
     // always so Context footer is not flush on the composer border.
@@ -486,12 +493,12 @@ fn repo_basename(repo: &str) -> String {
 
 // ── State strip (runtime status + plan indicator, one row) ──────────────────
 
-/// Columns between the runtime status and the plan indicator.
+/// Columns between two painted cells of the strip.
 ///
 /// Three cells either way: ` · ` when the runtime side has been squeezed to
 /// its bare label (a narrow row reads as one line better with a separator),
 /// and plain spacing when the runtime still carries its own metrics. The
-/// constant width keeps the plan's x position stable across the two forms.
+/// constant width keeps every later cell's x position stable.
 const STRIP_GAP: usize = 3;
 
 /// Between the plan's progress and its current step / state word.
@@ -500,71 +507,329 @@ const STRIP_DETAIL_SEP: &str = " · ";
 /// The plan's entry to the full Plan page, including its leading space.
 const STRIP_ARROW: &str = " ↗";
 
-/// The merged state strip: `◉ 命令运行中 · 15s · 20 次工具   ● 计划 3/4 · 步骤 ↗`.
+/// Below this the runtime's live state stops being readable; every claim
+/// leaves at least this much for it.
+const STRIP_LABEL_FLOOR: usize = 6;
+
+/// What a painted strip cell opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripTarget {
+    Background,
+    Issue,
+    Plan,
+}
+
+/// One painted cell of the strip: its spans, its width, and what it opens.
+struct StripItem {
+    target: StripTarget,
+    spans: Vec<Span<'static>>,
+    width: usize,
+}
+
+/// The state strip: `◉ 命令运行中 · 15s · 20 次工具 · 后台 2 ↗ · ⚠ 后台失败 1 ↗ · ● 计划 3/4 ↗`.
 ///
-/// One row, one paint. The runtime keeps its own rendering and hit-free
-/// behaviour; the plan indicator is a separate value whose only interaction is
-/// the click/Enter target published into [`AppState::plan_hit`]. Sizing runs
-/// in priority order — runtime live state, plan progress, the plan's entry
-/// arrow, the current step, then the runtime's secondary numbers — so a narrow
-/// terminal drops the least important cell first and never wraps.
+/// One row, one paint, four cells with independent data and interaction:
+/// runtime status (left, keeps its own rendering and animation), then the
+/// background indicator, the issue indicator and the plan indicator — each a
+/// real fact from its own owner, each publishing its painted range as a hit
+/// region. Nothing here merges the underlying state; the strip only decides
+/// who gets columns.
+///
+/// Claims follow the product's priority: a blocking issue, the runtime's live
+/// state, active issues, the plan's progress and entry, the background entry,
+/// then the runtime's secondary numbers. A claim either fits or is skipped
+/// (the issue and plan degrade within their own claim first), so the row never
+/// wraps and a later cell never paints over an earlier one.
 fn render_state_strip(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if area.height == 0 || area.width == 0 {
+        state.background_hit = None;
+        state.issue_hit = None;
         state.plan_hit = None;
         return;
     }
     let width = area.width as usize;
     let live = state.is_busy();
+
+    // Facts, each from its owner.
+    let running = crate::activity::running_background_count(state);
+    let issues = crate::issue::issue_summary(state);
     let indicator = state
         .plan
         .as_ref()
         .filter(|plan| plan_indicator_should_show(plan, live))
         .map(|plan| plan_strip(state, plan, live));
 
-    // The runtime's live state is the row's floor: the plan sizes its claim
-    // against the fitted label, never against the label plus statistics.
+    // The runtime label is measured first and forms every later budget:
+    // statistics are negotiable, the live state word is not.
     let label = crate::status_line::status_strip_line(state, width, false);
-    let label_w = label.width();
-    let gap = if label_w > 0 { STRIP_GAP } else { 0 };
-    let plan_budget = width.saturating_sub(label_w + gap);
-    let plan = indicator
-        .as_ref()
-        .and_then(|ind| fit_plan_strip(state, ind, plan_budget));
+    let label_natural_w = label.width();
+    let label_present = label.spans.iter().any(|span| !span.content.is_empty());
+    let label_floor = if label_present {
+        label_natural_w.min(STRIP_LABEL_FLOOR)
+    } else {
+        0
+    };
+    // `committed` counts the claimed cells plus the gaps around them (one
+    // before the first claim — the label's own gap — and one between cells).
+    // The label's floor is checked on top of it, so no claim can squeeze the
+    // runtime's live state out.
+    let mut committed = 0usize;
+    let mut claimed: Vec<StripItem> = Vec::new();
+    let claim = |item: StripItem, committed: &mut usize, claimed: &mut Vec<StripItem>| {
+        let gap = if claimed.is_empty() && !label_present {
+            0
+        } else {
+            STRIP_GAP
+        };
+        if label_floor + *committed + gap + item.width <= width {
+            *committed += gap + item.width;
+            claimed.push(item);
+            true
+        } else {
+            false
+        }
+    };
 
-    // Statistics refill whatever the plan left. The label cannot shrink here:
-    // `plan` was fitted into `width - label_w - gap`, so the budget still
-    // holds the whole label and only the numbers are negotiable.
-    let plan_w = plan.as_ref().map(|(_, w)| *w).unwrap_or(0);
-    let gap = if label_w > 0 && plan_w > 0 { STRIP_GAP } else { 0 };
+    // 1. Blocking issue. It outranks everything: the label is truncated to
+    //    whatever survives, and only when even a few columns are impossible
+    //    does it retreat to its count form.
+    let severe_claimed = issues
+        .severe
+        .as_deref()
+        .and_then(|severe| severe_strip(state, &issues, severe, width.saturating_sub(label_floor)))
+        .is_some_and(|item| claim(item, &mut committed, &mut claimed));
+    // 2. Active issues (when no blocking one owns the cell): the active issue
+    //    outranks the plan. Labelled when it fits, the count form otherwise. A
+    //    seen issue is exactly as active as an unread one — only its marker
+    //    differs, and that lives on the page.
+    if !severe_claimed && !issues.is_empty() {
+        // Claim first, degrade on failure: the labelled form is offered to the
+        // budget itself, never predicted (a prediction that ignores the gap
+        // let the labelled cell win the choice and then fail the claim,
+        // leaving the issues unstated while the background entry took the
+        // columns). A blocking issue never wears a counting label.
+        let placed = !issues.severe_active
+            && claim(
+                issue_strip(state, &issues, true),
+                &mut committed,
+                &mut claimed,
+            );
+        if !placed {
+            claim(
+                issue_strip(state, &issues, false),
+                &mut committed,
+                &mut claimed,
+            );
+        }
+    }
+    // 3. The plan's progress and entry (`● 计划 k/n ↗`) — its floor, claimed
+    //    before the plan's detail and before the background entry.
+    let plan_pos = indicator.as_ref().and_then(|ind| {
+        let item = plan_floor_strip(state, ind);
+        claim(item, &mut committed, &mut claimed).then(|| claimed.len() - 1)
+    });
+    // 4. Background entry (running tasks only): an entry, not a report.
+    if running > 0 {
+        claim(background_strip(state, running), &mut committed, &mut claimed);
+    }
+
+    // The label takes what is left after every claim; the plan's detail then
+    // refills from THAT leftover, and the runtime's statistics from what the
+    // plan leaves. Both are the strip's last two priorities.
+    let label_budget = width.saturating_sub(committed);
+    let label_line = crate::status_line::status_strip_line(state, label_budget, false);
+    let label_w = label_line.width();
+    let plan_item = plan_pos.and_then(|pos| {
+        let ind = indicator.as_ref()?;
+        let floor_w = claimed[pos].width;
+        let budget = label_budget.saturating_sub(label_w) + floor_w;
+        let (line, width) = fit_plan_strip(state, ind, budget)?;
+        Some(StripItem {
+            target: StripTarget::Plan,
+            spans: line.spans,
+            width,
+        })
+    });
+    let plan_extra = plan_item
+        .as_ref()
+        .zip(plan_pos)
+        .map(|(item, pos)| item.width.saturating_sub(claimed[pos].width))
+        .unwrap_or(0);
+    // `label_budget` is the label's own pool (width minus the claimed cells):
+    // the plan's detail and the runtime's statistics share only what the label
+    // does not use, and the label is never squeezed below its own budget.
     let runtime = crate::status_line::status_strip_line(
         state,
-        width.saturating_sub(plan_w + gap),
+        label_budget.saturating_sub(plan_extra),
         true,
     );
-
     let runtime_w = runtime.width();
+
+    // Assemble in reading order: runtime, background, issues, plan.
     let mut spans = runtime.spans;
-    if gap > 0 {
-        let separator = if runtime_w > label_w {
-            " ".repeat(gap)
-        } else {
-            " · ".to_string()
+    let mut hits: Vec<(StripTarget, u16, u16)> = Vec::new();
+    let mut cursor = runtime_w;
+    let mut first = true;
+    for target in [
+        StripTarget::Background,
+        StripTarget::Issue,
+        StripTarget::Plan,
+    ] {
+        let item = match target {
+            StripTarget::Plan => plan_item.as_ref(),
+            _ => claimed.iter().find(|item| item.target == target),
         };
-        spans.push(Span::raw(separator));
-    }
-    if let Some((line, _)) = &plan {
-        spans.extend(line.spans.iter().cloned());
+        let Some(item) = item else {
+            continue;
+        };
+        if cursor > 0 || !first {
+            let separator = if first && runtime_w > label_w {
+                " ".repeat(STRIP_GAP)
+            } else {
+                " · ".to_string()
+            };
+            spans.push(Span::raw(separator));
+            cursor += STRIP_GAP;
+        }
+        let x0 = area.x.saturating_add(cursor as u16);
+        let x1 = x0.saturating_add(item.width as u16);
+        hits.push((item.target, x0, x1));
+        spans.extend(item.spans.iter().cloned());
+        cursor += item.width;
+        first = false;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
-    // The hit starts where the plan is actually PAINTED — after the whole
-    // runtime line, statistics included, plus the gap — never after the bare
-    // label: the two differ whenever a statistic fits, and a hit offset by
-    // that difference would open the plan from under the runtime's numbers.
-    state.plan_hit = plan.map(|(_, plan_w)| {
-        let x0 = area.x.saturating_add((runtime_w + gap) as u16);
-        (area.y, x0, x0.saturating_add(plan_w as u16))
-    });
+    // Hits are the PAINTED ranges, one per cell: a click can never open the
+    // plan from under the runtime's numbers, nor the issues from the plan.
+    let find = |target: StripTarget| {
+        hits.iter()
+            .find(|(kind, _, _)| *kind == target)
+            .map(|(_, x0, x1)| (area.y, *x0, *x1))
+    };
+    state.background_hit = find(StripTarget::Background);
+    state.issue_hit = find(StripTarget::Issue);
+    state.plan_hit = find(StripTarget::Plan);
+}
+
+/// `后台 N ↗` — RUNNING background tasks only. A finished task is history (the
+/// list page keeps it) and a failed one is an issue, never a count here.
+///
+/// The keyboard focus reads the same as the plan's: reversed while
+/// `WorkbenchFocus::Background` owns the keys (Enter opens the jobs list).
+fn background_strip(state: &AppState, running: usize) -> StripItem {
+    let mut ink = Style::default().fg(state.theme.accent.primary);
+    if state.workbench_focus == crate::state::WorkbenchFocus::Background {
+        ink = ink.add_modifier(Modifier::REVERSED);
+    }
+    let label = state
+        .t()
+        .background_running_count
+        .replace("{}", &running.to_string());
+    let text = format!("{label}{STRIP_ARROW}");
+    let width = UnicodeWidthStr::width(text.as_str());
+    StripItem {
+        target: StripTarget::Background,
+        spans: vec![Span::styled(text, ink)],
+        width,
+    }
+}
+
+/// The issue cell in its two non-blocking forms: `⚠ 后台失败 N ↗` names the
+/// kind and its count, and the bare `⚠ N ↗` is the compact form when the
+/// labelled one does not fit. Every form counts real active issues; none of
+/// them clears anything. (A blocking issue owns its own cell — see
+/// [`severe_strip`] — because "问题 3" would hide which failure it is.)
+fn issue_strip(state: &AppState, summary: &crate::issue::IssueSummary, labeled: bool) -> StripItem {
+    let t = state.t();
+    let (glyph, ink) = if summary.severe_active {
+        ("✕ ", Style::default().fg(state.theme.status.error))
+    } else {
+        ("⚠ ", Style::default().fg(state.theme.status.warning))
+    };
+    let body = if !labeled {
+        summary.total.to_string()
+    } else {
+        t.background_failed_only
+            .replace("{}", &summary.total.to_string())
+    };
+    let text = format!("{glyph}{body}");
+    let width = UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(STRIP_ARROW);
+    StripItem {
+        target: StripTarget::Issue,
+        spans: vec![
+            Span::styled(text, ink),
+            Span::styled(STRIP_ARROW, ink),
+        ],
+        width,
+    }
+}
+
+/// The BLOCKING issue's cell: `✕ <failure summary> ↗`, truncated to the room
+/// it is offered, and only when even a truncated label cannot be stated does
+/// it retreat to `✕ N ↗`. `None` when not even that fits — at which point the
+/// runtime label owns the row. The label is the transcript failure block's own
+/// summary: one fact, one wording.
+fn severe_strip(
+    state: &AppState,
+    summary: &crate::issue::IssueSummary,
+    severe: &str,
+    room: usize,
+) -> Option<StripItem> {
+    let ink = Style::default().fg(state.theme.status.error);
+    let head = "✕ ";
+    // The named failure alone hides how many OTHER issues are active; a
+    // `+N` suffix keeps the count without stealing the line. `N` is real
+    // (the active list's length), never a repeat of the same fact.
+    let rest = summary.total.saturating_sub(1);
+    let suffix = (rest > 0).then(|| format!(" +{rest}")).unwrap_or_default();
+    let chrome = UnicodeWidthStr::width(head)
+        + UnicodeWidthStr::width(STRIP_ARROW)
+        + UnicodeWidthStr::width(suffix.as_str());
+    let avail = room.saturating_sub(chrome);
+    if avail >= 2 {
+        let text = format!(
+            "{head}{}{suffix}",
+            crate::render::truncate_display(severe, avail)
+        );
+        let width = UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(STRIP_ARROW);
+        return Some(StripItem {
+            target: StripTarget::Issue,
+            spans: vec![
+                Span::styled(text, ink),
+                Span::styled(STRIP_ARROW, ink),
+            ],
+            width,
+        });
+    }
+    let text = format!("{head}{}", summary.total);
+    let width = UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(STRIP_ARROW);
+    (width <= room).then(|| StripItem {
+        target: StripTarget::Issue,
+        spans: vec![
+            Span::styled(text, ink),
+            Span::styled(STRIP_ARROW, ink),
+        ],
+        width,
+    })
+}
+
+/// The plan's progress and entry at its floor form: glyph, `计划 k/n`, arrow —
+/// no step name. Claimed as a floor so the plan's own detail never decides
+/// whether the entry exists.
+fn plan_floor_strip(state: &AppState, ind: &PlanStrip) -> StripItem {
+    let budget = plan_core_width(ind) + UnicodeWidthStr::width(STRIP_ARROW);
+    let (line, width) = fit_plan_strip(state, ind, budget)
+        .expect("core + arrow always fits its own budget");
+    StripItem {
+        target: StripTarget::Plan,
+        spans: line.spans,
+        width,
+    }
+}
+
+fn plan_core_width(ind: &PlanStrip) -> usize {
+    UnicodeWidthStr::width(ind.glyph) + 1 + UnicodeWidthStr::width(ind.core.as_str())
 }
 
 /// Fit the plan indicator into `budget` columns, degrading in priority order:
@@ -946,13 +1211,11 @@ fn render_input(frame: &mut Frame, area: Rect, state: &mut AppState) {
 /// appearing or disappearing never reflow the transcript.
 fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if area.height == 0 || area.width == 0 {
-        state.background_footer_hit = None;
         return;
     }
     let width = area.width as usize;
     let dim = Style::default().fg(state.theme.text.secondary);
-    // Breathing room between the hints, the background summary, the usage chips
-    // and the clock.
+    // Breathing room between the hints, the usage chips and the clock.
     const GAP: usize = 2;
 
     let clock = state.clock_label.clone();
@@ -969,71 +1232,29 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .flatten();
     let usage_w = usage.as_ref().map(Line::width).unwrap_or(0);
 
-    // The background summary is placed before the usage/clock chips. It is the
-    // only place background work is visible on the main screen, so a long task
-    // label is clipped to keep the right-side chips on screen rather than
-    // pushing them off. An unread failure outranks those chips entirely: a
-    // failure the user cannot see is the one thing the footer must not hide.
-    let has_failure = crate::activity::footer_summary(state).is_some_and(|s| s.unread_failed > 0);
-    let right_reserve = if has_failure {
-        0
-    } else {
-        (if clock_w > 0 { clock_w + GAP } else { 0 })
-            + (if usage_w > 0 { usage_w + GAP } else { 0 })
-    };
-    let bg_cap = width
-        .saturating_sub(right_reserve)
-        .saturating_sub(if right_reserve > 0 { GAP } else { 0 })
-        .max(1);
-    let bg_spans = crate::render::background_footer_spans(state, bg_cap);
-    let bg_w = bg_spans
-        .as_ref()
-        .map(|spans| {
-            spans
-                .iter()
-                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-
-    // Place from the right: clock, then usage, then the summary. An unread
-    // failure owns the row over those chips: the badge must never be the thing
-    // squeezed out.
-    let reserve_chips = !has_failure;
+    // Place from the right: clock, then usage chips. Background work is NOT
+    // here: the state strip's background and issue cells are its one place,
+    // and a second summary on this row is what made a long command squat on
+    // the footer.
     let mut cursor = width;
-    let clock_start = if reserve_chips && clock_w > 0 && clock_w <= cursor {
+    let clock_start = if clock_w > 0 && clock_w <= cursor {
         cursor -= clock_w;
         Some(cursor)
     } else {
         None
     };
-    let usage_start = if reserve_chips && usage_w > 0 && cursor >= GAP + usage_w {
+    let usage_start = if usage_w > 0 && cursor >= GAP + usage_w {
         cursor -= GAP + usage_w;
         Some(cursor)
     } else {
         None
     };
-    let sep = if clock_start.is_some() || usage_start.is_some() {
-        GAP
-    } else {
-        0
-    };
-    let bg_start = if bg_w > 0 && cursor >= sep + bg_w {
-        cursor -= sep + bg_w;
-        Some(cursor)
-    } else {
-        None
-    };
-    let any_right = clock_start.is_some() || usage_start.is_some() || bg_start.is_some();
+    let any_right = clock_start.is_some() || usage_start.is_some();
     let left_limit = if any_right {
         cursor.saturating_sub(GAP)
     } else {
         width
     };
-
-    // Record the painted summary for click-to-open; the mouse handler reads it.
-    state.background_footer_hit =
-        bg_start.map(|start| (area.y, start as u16, (start + bg_w) as u16));
 
     if show_secondary
         && left_limit > 0
@@ -1047,17 +1268,6 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 x: area.x,
                 y: area.y,
                 width: left_limit as u16,
-                height: 1,
-            },
-        );
-    }
-    if let (Some(start), Some(spans)) = (bg_start, bg_spans) {
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: area.x + start as u16,
-                y: area.y,
-                width: bg_w as u16,
                 height: 1,
             },
         );
@@ -4022,6 +4232,229 @@ mod tests {
         );
     }
 
+    fn bg_running_task(label: &str, started: u64) -> crate::state::BackgroundTaskChrome {
+        crate::state::BackgroundTaskChrome::running(label, started)
+    }
+
+    fn bg_failed_task(label: &str, started: u64, exit_code: i32) -> crate::state::BackgroundTaskChrome {
+        crate::state::BackgroundTaskChrome {
+            ok: Some(false),
+            exit_code: Some(exit_code),
+            duration_ms: Some(90_000),
+            ..crate::state::BackgroundTaskChrome::running(label, started)
+        }
+    }
+
+    /// All four cells on ONE row, each with its own painted hit region: the
+    /// runtime's live state, the running count, the active issues and the plan.
+    #[test]
+    fn the_strip_paints_all_four_cells_on_one_row() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.activity = Some("运行 cargo test".into());
+        state
+            .background_task_labels
+            .insert("b1".into(), bg_running_task("make up", 3));
+        state
+            .background_task_labels
+            .insert("b2".into(), bg_running_task("npm run dev", 5));
+        state
+            .background_task_labels
+            .insert("f1".into(), bg_failed_task("go test -race ./...", 7, 1));
+
+        let buf = strip_buffer(&mut state, Some(sample_plan()), 140);
+        let rows = strip_rows(&mut state, Some(sample_plan()), 140);
+        let line = rows[0].trim_end();
+        assert!(line.contains("运行 cargo test"), "{line}");
+        assert!(line.contains("后台 2 ↗"), "{line}");
+        assert!(line.contains("后台失败 1 ↗"), "{line}");
+        assert!(line.contains("计划 1/3"), "{line}");
+        assert!(
+            !line.contains("go test -race"),
+            "the failed task's command is not chrome: {line}"
+        );
+
+        // Reading order Background → Issue → Plan, hit ranges exactly the
+        // painted run of each cell, and never overlapping.
+        let (brow, bx0, bx1) = state.background_hit.expect("background hit");
+        let (irow, ix0, ix1) = state.issue_hit.expect("issue hit");
+        let (prow, px0, px1) = state.plan_hit.expect("plan hit");
+        assert!(brow == irow && irow == prow && brow == 0, "one row");
+        assert!(bx1 <= ix0, "cells do not overlap: b={bx0}..{bx1} i={ix0}..{ix1}");
+        assert!(ix1 <= px0, "cells do not overlap: i={ix0}..{ix1} p={px0}..{px1}");
+        assert_eq!(painted_text(&buf, bx0 as usize, bx1 as usize), "后台 2 ↗");
+        assert_eq!(
+            painted_text(&buf, ix0 as usize, ix1 as usize),
+            "⚠ 后台失败 1 ↗"
+        );
+        assert!(
+            painted_text(&buf, px0 as usize, px1 as usize).starts_with("● 计划 1/3"),
+            "plan hit covers the painted indicator"
+        );
+    }
+
+    /// A failed turn is the blocking cell: red, named with the failure's own
+    /// summary — never hidden behind a bare count.
+    #[test]
+    fn a_blocking_turn_failure_is_named_on_the_strip() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Error;
+        state.theme = crate::theme::Theme::dark();
+        state.transcript.push_failure(crate::transcript::FailureBlock {
+            display: crate::fold::DisplayMode::Collapsed,
+            title: "请求失败".into(),
+            summary: "模型认证失败".into(),
+            subtitle: Some("deepseek · authentication · HTTP 401".into()),
+            detail: String::new(),
+        });
+        let buf = strip_buffer(&mut state, None, 120);
+        let rows = strip_rows(&mut state, None, 120);
+        let line = rows[0].trim_end();
+        assert!(line.contains("✕ 模型认证失败 ↗"), "{line}");
+        assert!(!line.contains('⚠'), "blocking is not a warning glyph: {line}");
+        let glyph = (0..buf.area.width)
+            .map(|x| buf[(x, 0)].clone())
+            .find(|cell| cell.symbol() == "✕")
+            .expect("blocking glyph painted");
+        assert_eq!(glyph.fg, state.theme.status.error);
+
+        // Other active issues are not hidden behind the named one: they are
+        // the count suffix, and the Issue page lists them.
+        state
+            .background_task_labels
+            .insert("f1".into(), bg_failed_task("npm start", 7, 1));
+        let rows = strip_rows(&mut state, None, 120);
+        let line = rows[0].trim_end();
+        assert!(line.contains("✕ 模型认证失败 +1 ↗"), "{line}");
+        assert!(
+            !line.contains("⚠ 后台失败"),
+            "the blocking cell owns the issue slot: {line}"
+        );
+        state.background_task_labels.clear();
+
+        // A later turn clears the cell — the block stays in the transcript.
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        let rows = strip_rows(&mut state, None, 120);
+        assert!(
+            !rows[0].contains('✕') && !rows[0].contains("模型认证失败"),
+            "a running turn is not a failure: {rows:?}"
+        );
+        assert!(state.transcript.last_failure_block().is_some());
+    }
+
+    /// Width is the only variable this row has, so the rules are exact:
+    /// nothing overflows, the runtime's state word never vanishes, the active
+    /// issue outranks the plan (a plan cell without an issue cell is
+    /// impossible), the issue degrades to its count form before it drops, and
+    /// the same width always paints the same row.
+    #[test]
+    fn the_strip_degrades_deterministically_as_it_narrows() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Busy;
+        state.activity = Some("运行 cargo test".into());
+        state
+            .background_task_labels
+            .insert("b1".into(), bg_running_task("make up", 3));
+        state
+            .background_task_labels
+            .insert("f1".into(), bg_failed_task("npm start", 7, 1));
+        let plan = running_plan(4, 2);
+
+        let mut rows_by_width = Vec::new();
+        let mut previous: Option<(bool, bool)> = None;
+        for width in 18..140u16 {
+            let rows = strip_rows(&mut state, Some(plan.clone()), width);
+            let line = rows[0].trim_end().to_string();
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= width as usize,
+                "w={width}: never overflows: {line:?}"
+            );
+            assert!(
+                line.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "w={width}: the runtime state never vanishes: {line:?}"
+            );
+            // Labelled (`⚠ 后台失败 1`) or compact (`⚠ 1`): the ink is the
+            // cell's identity at every width.
+            let has_issue = line.contains('⚠') || line.contains('✕');
+            let has_plan = line.contains("计划 ");
+            assert!(
+                !has_plan || has_issue,
+                "w={width}: the issue outranks the plan: {line:?}"
+            );
+            // Presence curves are monotone in width: once the issue (or the
+            // plan, which yields to it) is shown, a wider row still shows it.
+            // The background cell is claimed LAST, so it may appear in a band
+            // where the plan's floor cannot fit — it can never displace the
+            // plan, but it legitimately fills room the plan cannot use.
+            if let Some((issue_before, plan_before)) = previous {
+                assert!(
+                    !issue_before || has_issue,
+                    "w={width}: the issue must not vanish as the row widens: {line:?}"
+                );
+                assert!(
+                    !plan_before || has_plan,
+                    "w={width}: the plan must not vanish as the row widens: {line:?}"
+                );
+            }
+            previous = Some((has_issue, has_plan));
+            rows_by_width.push(line);
+        }
+        // Deterministic: the same width repaints the same row.
+        let again = strip_rows(&mut state, Some(plan.clone()), 77);
+        assert_eq!(again[0].trim_end(), rows_by_width[77 - 18]);
+
+        // Wide: all four cells. Wide-mid: the background yields to the plan.
+        // Narrow: the issue keeps a count while the plan is gone.
+        let wide = strip_rows(&mut state, Some(plan.clone()), 139);
+        let wide = wide[0].trim_end();
+        assert!(
+            wide.contains("后台 1") && wide.contains("后台失败 1") && wide.contains("计划 2/4"),
+            "{wide:?}"
+        );
+        let mid = strip_rows(&mut state, Some(plan.clone()), 40);
+        let mid = mid[0].trim_end();
+        assert!(mid.contains("计划 2/4"), "{mid:?}");
+        assert!(mid.contains("后台失败 1"), "{mid:?}");
+        let narrow = strip_rows(&mut state, Some(plan.clone()), 24);
+        let narrow = narrow[0].trim_end();
+        assert!(narrow.contains("后台失败 1"), "{narrow:?}");
+        assert!(!narrow.contains("后台 1"), "{narrow:?}");
+        let narrowest = strip_rows(&mut state, Some(plan), 19);
+        let narrowest = narrowest[0].trim_end();
+        assert!(narrowest.contains("⚠ 1 ↗"), "{narrowest:?}");
+        assert!(!narrowest.contains("计划"), "{narrowest:?}");
+    }
+
+    /// Running count only: a settled task leaves the background cell, and a
+    /// failed one is an issue instead — never both.
+    #[test]
+    fn a_settled_task_leaves_the_background_cell() {
+        let mut state = test_state();
+        state.status = leveler_client_protocol::RuntimeStatus::Idle;
+        state.background_task_labels.insert(
+            "b1".into(),
+            crate::state::BackgroundTaskChrome {
+                ok: Some(true),
+                ..bg_running_task("make up", 3)
+            },
+        );
+        let rows = strip_rows(&mut state, None, 100);
+        assert!(!rows[0].contains("后台"), "{rows:?}");
+        assert!(state.background_hit.is_none());
+
+        state
+            .background_task_labels
+            .insert("f1".into(), bg_failed_task("npm start", 7, 1));
+        let rows = strip_rows(&mut state, None, 100);
+        assert!(rows[0].contains("后台失败 1"), "{rows:?}");
+        assert!(
+            !rows[0].contains("后台 1"),
+            "a failed task is not a running count: {rows:?}"
+        );
+        assert!(state.background_hit.is_none());
+        assert!(state.issue_hit.is_some());
+    }
+
     /// A settled plan outside its turn is history, not chrome: the strip is
     /// the runtime status alone and the plan publishes no hit region.
     #[test]
@@ -4357,8 +4790,8 @@ mod tests {
             .collect()
     }
 
-    /// Case A — nothing running, no unread failure: no background section at
-    /// all, and the footer stays the single existing row.
+    /// Nothing running and nothing failed: neither the background nor the
+    /// issue cell exists, and the footer stays the single existing row.
     #[test]
     fn no_background_tasks_add_nothing_to_the_footer() {
         let lines =
@@ -4370,9 +4803,10 @@ mod tests {
         assert_eq!(row_of(&lines, "09:30"), row_of(&lines, "Ctrl+?"));
     }
 
-    /// Case B — one running task shows its name in the footer, not a body row.
+    /// One running task is ONE count cell on the state strip — never its raw
+    /// command, and never a row of its own anywhere in the chrome.
     #[test]
-    fn one_running_task_is_named_in_the_footer_only() {
+    fn one_running_task_is_a_count_cell_not_a_command() {
         let lines = render_background_case(
             100,
             30,
@@ -4381,19 +4815,18 @@ mod tests {
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
-        assert!(all.contains("make up"), "{all}");
-        assert_eq!(
-            lines.iter().filter(|l| l.contains("make up")).count(),
-            1,
-            "the task appears once, in the footer: {all}"
+        assert!(all.contains("后台 1"), "{all}");
+        assert!(
+            !all.contains("make up"),
+            "the raw command belongs to the jobs list, not the chrome: {all}"
         );
-        assert!(lines[row_of(&lines, "make up")].contains('↗'), "{all}");
+        let strip = row_of(&lines, "后台 1");
+        assert!(lines[strip].contains('↗'), "{all}");
     }
 
-    /// Case C — several running tasks aggregate into a single count, never one
-    /// row per task, and the whole block occupies the existing footer row.
+    /// Several running tasks aggregate into one count; no task is ever named.
     #[test]
-    fn several_running_tasks_aggregate_into_one_footer_block() {
+    fn several_running_tasks_aggregate_into_one_strip_cell() {
         let lines = render_background_case(
             100,
             30,
@@ -4408,9 +4841,9 @@ mod tests {
         let all = lines.join("\n");
         assert!(all.contains("后台 3"), "{all}");
         assert_eq!(
-            lines.iter().filter(|l| l.contains('↗')).count(),
+            lines.iter().filter(|l| l.contains("后台 3")).count(),
             1,
-            "one aggregate block: {all}"
+            "one aggregate cell: {all}"
         );
         for label in ["make up", "cargo test", "dev server"] {
             assert!(
@@ -4420,9 +4853,10 @@ mod tests {
         }
     }
 
-    /// Case D — running and failed are separate counts with separate inks.
+    /// Running and failed are separate cells with separate inks: a failed task
+    /// is an issue, never folded into the running count.
     #[test]
-    fn running_and_failed_are_separate_counts() {
+    fn running_and_failed_are_separate_cells() {
         let lines = render_background_case(
             120,
             30,
@@ -4436,16 +4870,16 @@ mod tests {
         );
         let all = lines.join("\n");
         assert!(all.contains("后台 2"), "{all}");
-        assert!(all.contains("失败 1"), "{all}");
+        assert!(all.contains("后台失败 1"), "{all}");
         assert!(
             !all.contains("后台 3"),
             "failed is not folded into running: {all}"
         );
     }
 
-    /// Case E — only failures: the short failure block, not a count of tasks.
+    /// Only failures: the issue cell names the kind and its count.
     #[test]
-    fn failures_alone_read_as_a_failure_block() {
+    fn failures_alone_read_as_an_issue_cell() {
         let lines = render_background_case(
             120,
             30,
@@ -4457,11 +4891,12 @@ mod tests {
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
+        assert!(all.contains('⚠'), "{all}");
         assert!(all.contains("后台失败 2"), "{all}");
         assert!(!all.contains("后台 2"), "{all}");
     }
 
-    /// A completed task never lingers in the footer — its history is the list.
+    /// A completed task never lingers in the chassis — its history is the list.
     #[test]
     fn a_completed_task_does_not_linger_in_the_footer() {
         let lines = render_background_case(
@@ -4473,10 +4908,11 @@ mod tests {
         );
         let all = lines.join("\n");
         assert!(!all.contains("cargo check"), "{all}");
+        assert!(!all.contains("后台"), "{all}");
         assert!(!all.contains('↗'), "{all}");
     }
 
-    /// A stopped task is not a failure: no badge, no error ink.
+    /// A stopped task is not a failure: no issue cell, no error ink.
     #[test]
     fn a_stopped_task_is_not_counted_as_a_failure() {
         let lines = render_background_case(
@@ -4491,9 +4927,10 @@ mod tests {
         assert!(!all.contains('↗'), "{all}");
     }
 
-    /// An acknowledged failure stops reminding; the task itself is untouched.
+    /// Acknowledged means READ, not solved: the issue stays on the strip; only
+    /// its "new" marker on the issue page goes away.
     #[test]
-    fn acknowledged_failures_leave_the_footer() {
+    fn acknowledged_failures_stay_active_on_the_strip() {
         let lines = render_background_case(
             120,
             30,
@@ -4502,12 +4939,13 @@ mod tests {
             crate::state::WorkbenchFocus::Input,
         );
         let all = lines.join("\n");
-        assert!(!all.contains("失败"), "{all}");
-        assert!(!all.contains('↗'), "{all}");
+        assert!(
+            all.contains("后台失败 1"),
+            "a seen failure is still active: {all}"
+        );
     }
 
-    /// A focused summary is reachable: it carries the `→` marker and the hint
-    /// row names Enter.
+    /// A focused background cell is reachable: the hint row names Enter.
     #[test]
     fn a_focused_background_summary_advertises_enter() {
         let lines = render_background_case(
@@ -4518,13 +4956,14 @@ mod tests {
             crate::state::WorkbenchFocus::Background,
         );
         let all = lines.join("\n");
-        assert!(all.contains("→ ● make up"), "{all}");
+        assert!(all.contains("后台 1"), "{all}");
         assert!(all.contains("Enter 后台任务"), "{all}");
     }
 
-    /// Long command labels truncate; the clock and the right chips survive.
+    /// A long command label cannot eat the row: the strip counts the task,
+    /// and the clock and the right chips keep their cells.
     #[test]
-    fn a_long_command_truncates_before_the_right_chips() {
+    fn a_long_command_cannot_push_the_right_chips() {
         let label = "API_PROXY_TARGET=http://localhost:8080 exec npm start -- --watch";
         let lines = render_background_case(
             60,
@@ -4533,10 +4972,12 @@ mod tests {
             &[],
             crate::state::WorkbenchFocus::Input,
         );
+        let all = lines.join("\n");
+        assert!(!all.contains("API_PROXY_TARGET"), "{all}");
         let row = &lines[row_of(&lines, "09:30")];
         assert!(row.contains("09:30"), "the clock survives: {row:?}");
         assert!(row.chars().count() <= 60, "no overflow: {row:?}");
-        assert!(!row.contains("--watch"), "the tail is dropped: {row:?}");
+        assert!(all.contains("后台 1"), "the task is still reachable as a count: {all}");
     }
 
     /// CJK labels are measured in display columns, not bytes, and never panic.

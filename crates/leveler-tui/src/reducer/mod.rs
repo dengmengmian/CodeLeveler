@@ -790,10 +790,14 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         .iter()
         .find(|(y, _)| *y == mouse.row)
         .map(|(_, id)| id.clone());
-    // The footer background summary opens the jobs list; the row was published
-    // by the last footer paint.
-    let footer_hit = state
-        .background_footer_hit
+    // Each state-strip cell is its own target, published by the last paint as
+    // the cell's painted range: the background indicator opens the jobs list,
+    // the issue indicator opens the issue page, the plan indicator the plan.
+    let background_hit = state
+        .background_hit
+        .is_some_and(|(row, x0, x1)| mouse.row == row && (x0..x1).contains(&mouse.column));
+    let issue_hit = state
+        .issue_hit
         .is_some_and(|(row, x0, x1)| mouse.row == row && (x0..x1).contains(&mouse.column));
     let plan_hit = state
         .plan_hit
@@ -867,10 +871,19 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                 }
                 return crate::activity::open(state, id);
             }
-            if footer_hit {
+            if background_hit {
+                // An observational entry: opening the list acknowledges the
+                // failures (the existing seen-marker) and cancels nothing.
+                state.workbench_focus = WorkbenchFocus::Background;
                 interaction::clear_selection_drag(state);
                 state.conv.selection.clear();
                 crate::activity::open_background_list(state);
+                return Vec::new();
+            }
+            if issue_hit {
+                interaction::clear_selection_drag(state);
+                state.conv.selection.clear();
+                screen_nav::open_issue_screen(state);
                 return Vec::new();
             }
             if plan_hit {
@@ -1501,7 +1514,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
                 }
                 WorkbenchFocus::Command => ensure_activity_focus(state),
                 WorkbenchFocus::Activity => {
-                    if crate::activity::footer_summary(state).is_some() {
+                    if crate::activity::running_background_count(state) > 0 {
                         WorkbenchFocus::Background
                     } else {
                         WorkbenchFocus::Input
@@ -1735,9 +1748,9 @@ fn ensure_activity_focus(state: &mut AppState) -> WorkbenchFocus {
     if crate::activity::has_status_activities(state) {
         crate::activity::ensure_selection(state);
         WorkbenchFocus::Activity
-    } else if crate::activity::footer_summary(state).is_some() {
-        // No child rows in the status strip, but background work is running or
-        // a failure is unread: the footer summary is the reachable focus.
+    } else if crate::activity::running_background_count(state) > 0 {
+        // No child rows, but the strip's background cell is painted: that
+        // cell is the reachable focus (Enter opens the jobs list there).
         WorkbenchFocus::Background
     } else {
         WorkbenchFocus::Input

@@ -455,12 +455,17 @@ pub struct AppState {
     pub team_hits: Vec<(ratatui::layout::Rect, String)>,
     pub background_list_selected: Option<String>,
     /// Task ids whose failure the user has already seen. Session-local: it
-    /// suppresses the footer `×失败 N` reminder, never the task's terminal
-    /// state or history. Deliberately not persisted — "unread" is a live
+    /// marks the issue "read", never solved — the task's terminal state,
+    /// history and its place in the active issue list all stay until the
+    /// source fact does. Deliberately not persisted — "unread" is a live
     /// attention signal, not durable data.
     pub background_failures_seen: std::collections::HashSet<String>,
-    /// Last-painted footer background-summary hit (row, x_start, x_end).
-    pub background_footer_hit: Option<(u16, u16, u16)>,
+    /// Last-painted state-strip background-indicator hit (row, x_start, x_end).
+    pub background_hit: Option<(u16, u16, u16)>,
+    /// Last-painted state-strip issue-indicator hit (row, x_start, x_end).
+    pub issue_hit: Option<(u16, u16, u16)>,
+    /// Selected row on the Issue page, by issue key (stable, never text).
+    pub issue_selected: Option<String>,
     /// Painted stop controls, bound to their screen and exact task identity.
     /// These are hit regions only; cancellation rechecks the live projection.
     pub background_list_hits: Vec<(ratatui::layout::Rect, String)>,
@@ -684,7 +689,9 @@ impl AppState {
             team_hits: Vec::new(),
             background_list_selected: None,
             background_failures_seen: std::collections::HashSet::new(),
-            background_footer_hit: None,
+            background_hit: None,
+            issue_hit: None,
+            issue_selected: None,
             background_list_hits: Vec::new(),
             background_list_rect: None,
             background_output_rect: None,

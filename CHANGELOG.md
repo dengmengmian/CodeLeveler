@@ -8,6 +8,10 @@ Release notes: [`docs/RELEASE.md`](docs/RELEASE.md).
 
 ### Changed
 
+- The TUI's bottom state strip is four independent cells — runtime status, the running background count (`后台 2 ↗`), active issues (`⚠ 后台失败 1 ↗`, or a failed turn named in full as `✕ …`), and the plan indicator — each built from its own owner's real state, each painted range its own click target (jobs list / issue page / plan page). A background task's raw command no longer sits on the footer and a failed task no longer raises a standing banner: the failure is an active issue while its exit code and output stay on the task's own page, and looking at one marks it read without clearing it. Issue state derives from the runtime's own `Error` status and the background projection; an ordinary tool failure stays in the execution timeline
+
+### Changed
+
 - The TUI's bottom chrome spends one row on the turn's state: the runtime status keeps the live label, elapsed time and tool/token counts on the left, and the plan indicator sits on the right of the same row — its own violet identity, a breathing dot while the turn runs, a static green ✓ when declared complete, red ✕ on failure, muted ○ for a last record. Plan progress is stated once (the runtime line no longer repeats the current step), and the whole indicator, arrow included, is the click/Enter target for the Plan page
 
 ## [1.0.15] - 2026-10-13

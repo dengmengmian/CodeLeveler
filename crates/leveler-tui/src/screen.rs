@@ -29,6 +29,11 @@ pub enum Screen {
     /// overflow row. Enter on a row opens its [`Screen::Activity`] detail.
     /// Observational like the roster itself: nothing here cancels work.
     Team,
+    /// Active issues, opened from the state strip's issue cell: a failed turn
+    /// and the failed background tasks the projection still holds. Read-only —
+    /// Enter on a task issue opens its [`Screen::Activity`] detail, and nothing
+    /// here cancels work or clears a failure.
+    Issue,
     /// Full active plan, opened from the workbench's one-line plan summary.
     Plan,
     /// Full active objective, opened from the bounded header summary.
@@ -1217,7 +1222,10 @@ mod reachability_tests {
             Screen::Remote => Some("`/remote` — reducer/mod.rs"),
             Screen::Shell => Some("`!command` — reducer/submit.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
-            Screen::ActivityList => Some("Enter on the footer background summary — reducer/mod.rs"),
+            Screen::ActivityList => {
+                Some("clicking the strip's background cell or Enter under its focus — reducer/mod.rs")
+            }
+            Screen::Issue => Some("clicking the strip's issue cell — reducer/mod.rs"),
             Screen::Team => Some("the roster's overflow row — reducer/mod.rs"),
             Screen::Plan => Some("Enter or click on the plan summary — reducer/mod.rs"),
             Screen::Goal => Some("Enter or click on the header goal — reducer/mod.rs"),

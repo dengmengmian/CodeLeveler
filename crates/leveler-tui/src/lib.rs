@@ -35,6 +35,7 @@ pub mod fold;
 pub mod help;
 pub mod history_search;
 pub mod i18n;
+mod issue;
 mod layout;
 pub mod markdown;
 pub mod motion;

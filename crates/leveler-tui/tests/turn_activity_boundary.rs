@@ -570,8 +570,13 @@ fn a_cross_turn_background_task_keeps_running_into_the_next_turn() {
     );
     let frame = rendered(&mut s, 120, 40);
     assert!(
-        strip_has_activity_row(&frame, "cargo test"),
-        "the background task still shows as live activity:\n{frame}"
+        strip_has_activity_row(&frame, "后台 1"),
+        "the background task still shows as live activity (a count cell, not \
+         its raw command):\n{frame}"
+    );
+    assert!(
+        !strip_has_activity_row(&frame, "cargo test"),
+        "the strip never names the command:\n{frame}"
     );
 }
 
