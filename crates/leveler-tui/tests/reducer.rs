@@ -4825,8 +4825,9 @@ fn clicking_the_plan_summary_opens_the_same_scrollable_plan_page() {
 }
 
 /// The strip's background and issue cells are real targets, each opening its
-/// own surface: the jobs list and the issue page. The runtime half opens
-/// nothing, and the issue page reaches a failed task's REAL detail.
+/// own surface: the jobs list and the issue page. A row on the issue page
+/// expands in place, and its detail entry reaches the task's REAL page —
+/// which returns to the issue page, not the conversation.
 #[test]
 fn the_strip_cells_open_the_jobs_list_and_the_issue_page() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -4853,17 +4854,20 @@ fn the_strip_cells_open_the_jobs_list_and_the_issue_page() {
     let (irow, ix0, _) = s.issue_hit.expect("issue cell hit");
     assert_eq!(brow, irow, "one strip row:\n{workbench}");
     assert!(bx1 <= ix0, "cells do not overlap:\n{workbench}");
-    let click = |column: u16| {
-        Action::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row: brow,
-            modifiers: KeyModifiers::empty(),
-        })
+    let click_at = |s: &mut AppState, column: u16, row: u16| {
+        reduce(
+            s,
+            Action::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }),
+        )
     };
 
     // A click inside the issue cell is NOT the background's target.
-    reduce(&mut s, click(bx0));
+    click_at(&mut s, bx0, brow);
     assert_eq!(s.active_screen, Screen::ActivityList);
     reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
@@ -4872,14 +4876,42 @@ fn the_strip_cells_open_the_jobs_list_and_the_issue_page() {
     let workbench = rendered(&mut s, 140, 30);
     let (_, _, ix1) = s.issue_hit.expect("issue cell hit");
     assert!(workbench.contains("后台失败 1"), "{workbench}");
-    reduce(&mut s, click(ix1 - 1));
+    click_at(&mut s, ix1 - 1, irow);
     assert_eq!(s.active_screen, Screen::Issue);
+    assert!(
+        s.background_failures_seen.contains("bg-bad"),
+        "opening the page acknowledges the failure it shows"
+    );
     let page = rendered(&mut s, 100, 24);
     assert!(page.contains("npm start"), "the task label is real:\n{page}");
-    assert!(page.contains("exit 1"), "the exit code is real:\n{page}");
+    assert!(page.contains('▸'), "a collapsed row shows the expander:\n{page}");
 
-    // Enter reaches that task's own detail — command, output and all.
-    reduce(&mut s, key(KeyCode::Enter));
+    // Clicking the row selects it and expands it in place.
+    let (row, x0, x1, key_bg) = s
+        .issue_row_hits
+        .iter()
+        .find(|(_, _, _, k)| k == "bg-bad")
+        .cloned()
+        .expect("row hit published");
+    assert!(x0 < x1);
+    click_at(&mut s, x0 + 2, row);
+    assert_eq!(s.issue_selected.as_deref(), Some(key_bg.as_str()));
+    let page = rendered(&mut s, 100, 24);
+    assert!(page.contains('▾'), "the clicked row is expanded:\n{page}");
+    assert!(page.contains("exit 1"), "the row's real facts:\n{page}");
+    assert!(
+        page.contains("查看任务详情"),
+        "the expanded row offers its detail:\n{page}"
+    );
+
+    // The detail entry opens the task's existing page — output and all.
+    let (drow, dx0, _, _) = s
+        .issue_detail_hits
+        .iter()
+        .find(|(_, _, _, k)| k == "bg-bad")
+        .cloned()
+        .expect("detail entry hit published");
+    click_at(&mut s, dx0 + 1, drow);
     assert_eq!(s.active_screen, Screen::Activity);
     let detail = rendered(&mut s, 100, 30);
     assert!(detail.contains("EADDRINUSE"), "{detail}");
@@ -4888,18 +4920,334 @@ fn the_strip_cells_open_the_jobs_list_and_the_issue_page() {
         "opening a failure never deletes it"
     );
 
-    // Esc back to the conversation; nothing was cancelled or cleared.
+    // Esc returns to the ISSUE page (the opener), with its expansion kept —
+    // and only the next Esc leaves for the conversation.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Issue);
+    let back_page = rendered(&mut s, 100, 24);
+    assert!(
+        back_page.contains('▾'),
+        "the expansion survived the return:\n{back_page}"
+    );
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(
+        s.active_screen,
+        Screen::Issue,
+        "Esc collapses the open row before it leaves the page"
+    );
     reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
+
+    // Home: the running count is untouched, the viewed failure stopped
+    // reminding, and every record survives.
+    let back = rendered(&mut s, 140, 30);
+    assert!(back.contains("后台 1"), "{back}");
+    assert!(
+        !back.contains("后台失败"),
+        "the viewed failure stopped reminding:\n{back}"
+    );
     assert!(s.background_task_labels.contains_key("bg-run"));
     assert!(s.background_task_labels.contains_key("bg-bad"));
-    let back = rendered(&mut s, 140, 30);
-    assert!(back.contains("后台 1") && back.contains("后台失败 1"), "{back}");
+}
+
+/// Opening the Issue page acknowledges exactly what that visit shows: a
+/// failure arriving while the page is open was not part of it, stays unread,
+/// and still reminds after the page closes.
+#[test]
+fn the_issue_page_acknowledges_what_it_shows_and_not_later_arrivals() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    s.background_task_labels.insert(
+        "bg-bad".into(),
+        leveler_tui::state::BackgroundTaskChrome {
+            ok: Some(false),
+            exit_code: Some(1),
+            duration_ms: Some(30_000),
+            ..leveler_tui::state::BackgroundTaskChrome::running("npm start", 5)
+        },
+    );
+    rendered(&mut s, 140, 30);
+    let (row, _, x1) = s.issue_hit.expect("issue cell hit");
+    reduce(
+        &mut s,
+        Action::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x1 - 1,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }),
+    );
+    assert_eq!(s.active_screen, Screen::Issue);
+    assert!(
+        s.background_failures_seen.contains("bg-bad"),
+        "the shown failure is acknowledged when the page opens"
+    );
+
+    // A new failure arrives while the page is still open.
+    s.background_task_labels.insert(
+        "bg-late".into(),
+        leveler_tui::state::BackgroundTaskChrome {
+            ok: Some(false),
+            exit_code: Some(2),
+            duration_ms: Some(1_000),
+            ..leveler_tui::state::BackgroundTaskChrome::running("vite build", 9)
+        },
+    );
+    assert!(
+        !s.background_failures_seen.contains("bg-late"),
+        "an arrival after opening was not part of what the user saw"
+    );
+    let page = rendered(&mut s, 110, 24);
+    assert!(page.contains("vite build"), "the arrival is visible:\n{page}");
+
+    // Leaving: the arrival still reminds; the viewed one does not.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+    let home = rendered(&mut s, 140, 30);
+    assert!(
+        home.contains("后台失败 1"),
+        "only the unviewed arrival reminds:\n{home}"
+    );
+    // And nothing was deleted.
+    assert!(s.background_task_labels.contains_key("bg-bad"));
+    assert!(s.background_task_labels.contains_key("bg-late"));
+}
+
+/// The issue page's pointer contract, held at every width: rows expand
+/// independently (▸ ↔ ▾, no overlap), the detail entry is its own target, the
+/// header's `←` runs the same one-level back as Esc, and returning from the
+/// detail restores selection, expansion and scroll.
+#[test]
+fn the_issue_page_mouse_and_layered_back_hold_at_every_width() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    for width in [40u16, 60, 80, 120] {
+        let mut s = opened();
+        s.status = RuntimeStatus::Busy;
+        for i in 0..8 {
+            s.background_task_labels.insert(
+                format!("bg-{i}"),
+                leveler_tui::state::BackgroundTaskChrome {
+                    ok: Some(false),
+                    exit_code: Some(i as i32 + 1),
+                    duration_ms: Some(30_000),
+                    ..leveler_tui::state::BackgroundTaskChrome::running(
+                        format!("npm run job{i}"),
+                        i * 3,
+                    )
+                },
+            );
+        }
+        let click = |s: &mut AppState, column: u16, row: u16| {
+            reduce(
+                s,
+                Action::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::empty(),
+                }),
+            )
+        };
+
+        // Open the page from the strip's issue cell.
+        rendered(&mut s, width, 30);
+        let (srow, _, sx1) = s.issue_hit.expect("issue cell hit");
+        click(&mut s, sx1 - 1, srow);
+        assert_eq!(s.active_screen, Screen::Issue);
+
+        // Every painted row publishes exactly one hit, in order, inside the
+        // viewport — no two rows share a line. Collapsed, all five fit.
+        rendered(&mut s, width, 30);
+        let row_hits = s.issue_row_hits.clone();
+        assert_eq!(row_hits.len(), 8, "one hit per painted row at {width}");
+        for pair in row_hits.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "rows are ordered at {width}");
+        }
+        for (row, x0, x1, _) in &row_hits {
+            assert!(*x0 < *x1 && *x1 <= width, "hit inside the page at {width}");
+            assert!(*row < 30, "hit inside the viewport at {width}");
+        }
+
+        // Two rows expand independently — both open, no overlap. Each click
+        // re-reads the freshly painted hits, exactly like a real pointer
+        // following the layout as it grows.
+        for key in ["bg-0", "bg-1"] {
+            let page = rendered(&mut s, width, 30);
+            let (row, x0, _, _) = s
+                .issue_row_hits
+                .iter()
+                .find(|(_, _, _, k)| k == key)
+                .cloned()
+                .unwrap_or_else(|| panic!("{key} row hit at {width}:\n{page}"));
+            click(&mut s, x0 + 1, row);
+        }
+        assert_eq!(s.issue_expanded.len(), 2, "two rows open at {width}");
+        let page = rendered(&mut s, width, 30);
+        let visible_open = s
+            .issue_row_hits
+            .iter()
+            .filter(|(_, _, _, k)| s.issue_expanded.contains(k))
+            .count();
+        assert_eq!(
+            page.matches('▾').count(),
+            visible_open,
+            "every visible open row shows its state at {width}:\n{page}"
+        );
+        assert!(
+            !s.issue_detail_hits.is_empty(),
+            "an expanded row offers its entry at {width}"
+        );
+        for (row, x0, x1, key) in &s.issue_detail_hits {
+            assert!(*x0 < *x1 && *x1 <= width, "entry inside the page at {width}");
+            assert!(*row < 30);
+            assert!(
+                s.issue_expanded.contains(key),
+                "an entry belongs to an open row at {width}"
+            );
+        }
+
+        // The wheel scrolls the page; the hits move with it.
+        reduce(
+            &mut s,
+            Action::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: width / 2,
+                row: 12,
+                modifiers: KeyModifiers::empty(),
+            }),
+        );
+        let scrolled_any = s.screen_scroll > 0;
+        assert!(scrolled_any, "the wheel scrolls the page at {width}");
+        for _ in 0..10 {
+            reduce(
+                &mut s,
+                Action::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: width / 2,
+                    row: 12,
+                    modifiers: KeyModifiers::empty(),
+                }),
+            );
+        }
+        assert_eq!(s.screen_scroll, 0, "the wheel scrolls back to the top");
+
+        // Open the selected row's detail entry; the return glyph on the
+        // detail brings the user back HERE, with selection, expansion and
+        // scroll exactly as they were.
+        rendered(&mut s, width, 30);
+        let target = s.issue_selected.clone().expect("a selected row");
+        let (erow, ex0, _, _) = s
+            .issue_detail_hits
+            .iter()
+            .find(|(_, _, _, key)| key == &target)
+            .cloned()
+            .expect("the selected row's entry");
+        click(&mut s, ex0 + 1, erow);
+        assert_eq!(s.active_screen, Screen::Activity, "the entry opens detail");
+        let detail = rendered(&mut s, width, 24);
+        assert!(detail.contains("npm run"), "{detail}");
+        assert!(
+            detail.contains('←'),
+            "the detail page shows its way back:\n{detail}"
+        );
+
+        // The header's ← is the mouse's Esc: one level, back to the Issue page.
+        let (brow, bx0, _) = s.back_hit.expect("back glyph published");
+        click(&mut s, bx0, brow);
+        assert_eq!(
+            s.active_screen,
+            Screen::Issue,
+            "the detail returns to the page that opened it at {width}"
+        );
+        assert_eq!(s.issue_selected.as_deref(), Some(target.as_str()));
+        assert_eq!(s.issue_expanded.len(), 2, "expansion survives the return");
+        assert_eq!(s.screen_scroll, 0, "scroll position survives the return");
+
+        // The page's own ← glyph mirrors Esc: first press collapses the open
+        // selected row, the next leaves — never two levels at once.
+        let (brow, bx0, _) = s.back_hit.expect("issue page back glyph");
+        click(&mut s, bx0, brow);
+        assert_eq!(s.active_screen, Screen::Issue);
+        assert!(!s.issue_expanded.contains(&target), "the ← collapsed the row");
+        let (brow, bx0, _) = s.back_hit.expect("issue page back glyph");
+        click(&mut s, bx0, brow);
+        assert_eq!(s.active_screen, Screen::Conversation);
+
+        // The records are untouched by all of it.
+        assert!(s.background_task_labels.contains_key("bg-0"));
+        assert_eq!(
+            s.background_failures_seen.len(),
+            8,
+            "viewing the page acknowledged its failures at {width}"
+        );
+    }
+}
+
+/// Session switching keeps the three facts apart: reminders belong to the
+/// session that produced them (another session's snapshot shows none of
+/// them), a detail's return target never leaks across, and no failure record
+/// is deleted by the switch.
+#[test]
+fn a_session_switch_never_carries_reminders_or_return_targets() {
+    let mut s = opened();
+    s.status = RuntimeStatus::Busy;
+    s.background_task_labels.insert(
+        "bg-bad".into(),
+        leveler_tui::state::BackgroundTaskChrome {
+            ok: Some(false),
+            exit_code: Some(1),
+            duration_ms: Some(30_000),
+            ..leveler_tui::state::BackgroundTaskChrome::running("npm start", 5)
+        },
+    );
+    // The user is inside the failure's detail, opened from the issue page.
+    s.active_screen = Screen::Activity;
+    s.activity_open = Some(leveler_tui::activity::ActivityId::Background(
+        "bg-bad".into(),
+    ));
+    s.detail_return = Some(Screen::Issue);
+
+    // Switch to another session.
+    let mut other = snapshot();
+    other.id = SessionId::new("s2");
+    other.goal = "another session".into();
+    reduce(
+        &mut s,
+        Action::Runtime(RuntimeEvent::SessionOpened { session: other }),
+    );
+
+    assert_eq!(
+        s.detail_return, None,
+        "a return target never survives into another session"
+    );
+    // Leaving the now-stale page goes to the conversation, never back into
+    // the previous session's issue page.
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
+    let home = rendered(&mut s, 140, 30);
+    assert!(
+        !home.contains("后台失败"),
+        "the other session's snapshot has no failures, so nothing reminds:\n{home}"
+    );
+
+    // The client projection belongs to the session on screen and is rebuilt
+    // on a switch; the failure's durable record lives in the runtime's
+    // registry. The read marks are keyed by stable task id and survive, so
+    // switching back re-alerts only what was never viewed.
+    assert!(
+        !s.background_task_labels.contains_key("bg-bad"),
+        "the projection is the on-screen session's own"
+    );
+    assert!(
+        !s.background_failures_seen.contains("bg-bad"),
+        "the switch deletes no read marks either"
+    );
 }
 
 /// A failed turn is a blocking issue: the strip names it, the issue page
-/// carries its typed subtitle, and Enter returns to the conversation where the
-/// failure block (and its disclosure) lives.
+/// carries its typed subtitle, and expanding the row keeps the user on the
+/// page — viewing never clears it, and only the runtime recovering does.
 #[test]
 fn a_failed_turn_is_a_blocking_issue_with_a_way_back() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -4930,12 +5278,23 @@ fn a_failed_turn_is_a_blocking_issue_with_a_way_back() {
     let page = rendered(&mut s, 110, 24);
     assert!(page.contains("provider rejected the request"), "{page}");
 
+    // Enter expands the row in place: the typed machine detail appears here,
+    // and the page stays put.
     reduce(&mut s, key(KeyCode::Enter));
-    assert!(
-        s.jump_to_bottom,
-        "Enter on the failed turn returns to its conversation block"
-    );
+    assert_eq!(s.active_screen, Screen::Issue, "Enter never jumps pages");
+    let expanded = rendered(&mut s, 110, 24);
+    assert!(expanded.contains('▾'), "{expanded}");
+
+    // The failed turn survives viewing: it is a persistent fault, cleared
+    // only by the runtime's own status change.
+    reduce(&mut s, key(KeyCode::Esc));
+    reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
+    let home = rendered(&mut s, 140, 30);
+    assert!(
+        home.contains("provider rejected the request"),
+        "the failed turn still stands after being viewed:\n{home}"
+    );
 
     // The evidence survives: the failure block is still in the transcript.
     assert!(
@@ -6493,15 +6852,18 @@ fn activity_enter_opens_detail_and_esc_closes_without_cancel() {
     );
 }
 
-/// The full three-level flow: conversation → footer summary → list → detail.
-/// Opening the list acknowledges the current failures and never deletes them.
+/// The full three-level flow: conversation → footer summary → list → a task's
+/// own detail. Opening the list alone acknowledges nothing — it is an index.
+/// Viewing one task's detail acknowledges exactly that task, and the records
+/// (terminal state, exit code, output) are never deleted.
 #[test]
-fn the_background_list_acknowledges_failures_and_keeps_history() {
+fn viewing_a_tasks_detail_acknowledges_only_that_failure() {
     let mut s = opened();
     s.locale = leveler_tui::Locale::En;
     for (id, program, args) in [
         ("bg-run", "make", vec!["up"]),
         ("bg-fail", "npm", vec!["start"]),
+        ("bg-fail2", "vite", vec!["build"]),
     ] {
         reduce(
             &mut s,
@@ -6513,42 +6875,71 @@ fn the_background_list_acknowledges_failures_and_keeps_history() {
             }),
         );
     }
-    reduce(
-        &mut s,
-        Action::Runtime(RuntimeEvent::BackgroundTaskExited {
-            task_id: "bg-fail".into(),
-            exit_code: Some(1),
-            duration_ms: 30_000,
-            ok: false,
-            stopped: false,
-            output: "Error: listen EADDRINUSE\n".into(),
-        }),
-    );
-    assert!(!s.background_failures_seen.contains("bg-fail"));
+    for id in ["bg-fail", "bg-fail2"] {
+        reduce(
+            &mut s,
+            Action::Runtime(RuntimeEvent::BackgroundTaskExited {
+                task_id: id.into(),
+                exit_code: Some(1),
+                duration_ms: 30_000,
+                ok: false,
+                stopped: false,
+                output: "Error: listen EADDRINUSE\n".into(),
+            }),
+        );
+    }
 
-    // Footer focus → Enter opens the list; opening is the acknowledgement.
+    // Footer focus → Enter opens the list. The list is an index, not a
+    // viewing: nothing is acknowledged yet.
     s.workbench_focus = leveler_tui::state::WorkbenchFocus::Background;
     let effects = reduce(&mut s, key(KeyCode::Enter));
     assert!(effects.is_empty(), "opening sends nothing: {effects:?}");
     assert_eq!(s.active_screen, Screen::ActivityList);
     assert!(
-        s.background_failures_seen.contains("bg-fail"),
-        "opening the list acknowledges the failure"
+        !s.background_failures_seen.contains("bg-fail")
+            && !s.background_failures_seen.contains("bg-fail2"),
+        "opening the list does not acknowledge anything"
     );
-    // The history is untouched: the terminal record and its output survive.
-    assert!(s.background_task_labels.contains_key("bg-fail"));
-    assert!(s.background_task_labels.contains_key("bg-run"));
 
     let frame = render_screen_text(&mut s);
     assert!(frame.contains("Running"), "{frame}");
     assert!(frame.contains("Recently finished"), "{frame}");
     assert!(frame.contains("npm") && frame.contains("make"), "{frame}");
 
+    // Enter on the failed task focuses its own detail (command, exit code,
+    // retained output): that acknowledges THAT task, and only that one.
+    s.background_list_selected = Some("bg-fail".into());
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::ActivityList);
+    assert!(
+        s.background_failures_seen.contains("bg-fail"),
+        "viewing the task's own detail acknowledges it"
+    );
+    assert!(
+        !s.background_failures_seen.contains("bg-fail2"),
+        "another task's failure is not acknowledged by viewing this one"
+    );
+    // The history is untouched: the terminal records and their output survive.
+    assert!(s.background_task_labels.contains_key("bg-fail"));
+    assert!(s.background_task_labels.contains_key("bg-run"));
+
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(
+        s.background_list_focus,
+        leveler_tui::activity::BackgroundPane::List
+    );
     reduce(&mut s, key(KeyCode::Esc));
     assert_eq!(s.active_screen, Screen::Conversation);
     assert!(
         s.background_task_labels.contains_key("bg-fail"),
         "returning keeps the history"
+    );
+
+    // Back home: the viewed failure no longer reminds, the unviewed one does.
+    let back = render_screen_text(&mut s);
+    assert!(
+        back.contains("background failed 1"),
+        "the still-unviewed failure reminds:\n{back}"
     );
 }
 
@@ -10105,6 +10496,25 @@ fn child_detail_state(status: leveler_tui::multi_agent::ChildStatus) -> AppState
     s.activity_open = Some(leveler_tui::activity::ActivityId::Child("c1".into()));
     s.active_screen = Screen::Activity;
     s
+}
+
+/// A child's detail opened from the Team page returns to the Team page —
+/// the same rule the issue page's task detail follows.
+#[test]
+fn a_child_detail_returns_to_the_team_page() {
+    let mut s = child_detail_state(leveler_tui::multi_agent::ChildStatus::Running);
+    s.active_screen = Screen::Team;
+    s.team_selected = Some("c1".into());
+    reduce(&mut s, key(KeyCode::Enter));
+    assert_eq!(s.active_screen, Screen::Activity);
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(
+        s.active_screen,
+        Screen::Team,
+        "the child detail returns to the Team page that opened it"
+    );
+    reduce(&mut s, key(KeyCode::Esc));
+    assert_eq!(s.active_screen, Screen::Conversation);
 }
 
 /// In a running child's detail, `x` stops exactly that child; Esc only

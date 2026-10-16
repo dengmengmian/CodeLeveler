@@ -782,7 +782,11 @@ fn severe_strip(
     // `+N` suffix keeps the count without stealing the line. `N` is real
     // (the active list's length), never a repeat of the same fact.
     let rest = summary.total.saturating_sub(1);
-    let suffix = (rest > 0).then(|| format!(" +{rest}")).unwrap_or_default();
+    let suffix = if rest > 0 {
+        format!(" +{rest}")
+    } else {
+        String::new()
+    };
     let chrome = UnicodeWidthStr::width(head)
         + UnicodeWidthStr::width(STRIP_ARROW)
         + UnicodeWidthStr::width(suffix.as_str());
@@ -4927,10 +4931,21 @@ mod tests {
         assert!(!all.contains('↗'), "{all}");
     }
 
-    /// Acknowledged means READ, not solved: the issue stays on the strip; only
-    /// its "new" marker on the issue page goes away.
+    /// Acknowledged means READ, not solved: the reminder leaves the strip, and
+    /// the failure itself stays as an active record on its page and in the
+    /// jobs list. An unviewed one still reminds.
     #[test]
-    fn acknowledged_failures_stay_active_on_the_strip() {
+    fn a_viewed_failure_stops_reminding_an_unviewed_one_does_not() {
+        let lines = render_background_case(
+            120,
+            30,
+            vec![("bg-1", bg_terminal("npm start", false, false, 0, 30_000))],
+            &[],
+            crate::state::WorkbenchFocus::Input,
+        );
+        let all = lines.join("\n");
+        assert!(all.contains("后台失败 1"), "an unseen failure reminds: {all}");
+
         let lines = render_background_case(
             120,
             30,
@@ -4940,8 +4955,8 @@ mod tests {
         );
         let all = lines.join("\n");
         assert!(
-            all.contains("后台失败 1"),
-            "a seen failure is still active: {all}"
+            !all.contains("后台失败"),
+            "a viewed one-shot failure stops reminding: {all}"
         );
     }
 

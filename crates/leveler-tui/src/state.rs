@@ -466,6 +466,24 @@ pub struct AppState {
     pub issue_hit: Option<(u16, u16, u16)>,
     /// Selected row on the Issue page, by issue key (stable, never text).
     pub issue_selected: Option<String>,
+    /// Issue rows the user has expanded, by issue key. Presentation state
+    /// keyed by stable identity, so a resize, a return from a detail or new
+    /// failures never lose or duplicate an expansion.
+    pub issue_expanded: std::collections::HashSet<String>,
+    /// Last-painted Issue-page row hits: (row, x_start, x_end, issue key).
+    /// A click selects the row and toggles its expansion.
+    pub issue_row_hits: Vec<(u16, u16, u16, String)>,
+    /// Last-painted Issue-page detail-entry hits (the expanded row's
+    /// "task detail" affordance): (row, x_start, x_end, issue key). Checked
+    /// before the row hit so the entry never toggles its own row.
+    pub issue_detail_hits: Vec<(u16, u16, u16, String)>,
+    /// Last-painted `←` back-glyph hit on a Secondary Surface's header row:
+    /// (row, x_start, x_end). Clicking it runs the SAME one-level back as Esc.
+    pub back_hit: Option<(u16, u16, u16)>,
+    /// Where the open Activity detail returns to. Set by the opener (the
+    /// issue page, the background list); `None` means the conversation. The
+    /// detail page itself never guesses its parent — it reads this.
+    pub detail_return: Option<Screen>,
     /// Painted stop controls, bound to their screen and exact task identity.
     /// These are hit regions only; cancellation rechecks the live projection.
     pub background_list_hits: Vec<(ratatui::layout::Rect, String)>,
@@ -692,6 +710,11 @@ impl AppState {
             background_hit: None,
             issue_hit: None,
             issue_selected: None,
+            issue_expanded: std::collections::HashSet::new(),
+            issue_row_hits: Vec::new(),
+            issue_detail_hits: Vec::new(),
+            back_hit: None,
+            detail_return: None,
             background_list_hits: Vec::new(),
             background_list_rect: None,
             background_output_rect: None,

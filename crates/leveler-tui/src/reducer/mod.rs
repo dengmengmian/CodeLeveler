@@ -777,6 +777,71 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         }
         return Vec::new();
     }
+    // The header's `←` glyph is the mouse's Esc: on the pages that publish it
+    // (Issue, the detail, the jobs list) a click runs the same one-level back,
+    // so a detail opened from the issue page returns to the issue page.
+    if matches!(
+        state.active_screen,
+        Screen::Issue | Screen::Activity | Screen::ActivityList
+    ) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some((row, x0, x1)) = state.back_hit
+        && mouse.row == row
+        && (x0..x1).contains(&mouse.column)
+    {
+        return screen_nav::back(state);
+    }
+    if state.active_screen == Screen::Issue {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // The expanded row's detail entry wins over its row: the entry
+                // opens the task's existing page, the row toggles.
+                if let Some((_, _, _, key)) = state
+                    .issue_detail_hits
+                    .iter()
+                    .find(|(row, x0, x1, _)| {
+                        *row == mouse.row && (*x0..*x1).contains(&mouse.column)
+                    })
+                    .cloned()
+                {
+                    let effects =
+                        crate::activity::open(state, crate::activity::ActivityId::Background(key));
+                    // The opener records where the detail returns to — the
+                    // detail itself never guesses. (`open` resets the field,
+                    // so this must come after it.)
+                    state.detail_return = Some(Screen::Issue);
+                    return effects;
+                }
+                if let Some((_, _, _, key)) = state
+                    .issue_row_hits
+                    .iter()
+                    .find(|(row, x0, x1, _)| {
+                        *row == mouse.row && (*x0..*x1).contains(&mouse.column)
+                    })
+                    .cloned()
+                {
+                    state.issue_selected = Some(key);
+                    crate::issue::toggle_expanded(state);
+                }
+                return Vec::new();
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                // The page is a full viewport with a single scrollable body;
+                // any wheel over it scrolls that body.
+                let delta: isize = if mouse.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                };
+                state.screen_scroll = if delta < 0 {
+                    state.screen_scroll.saturating_sub(delta.unsigned_abs())
+                } else {
+                    state.screen_scroll.saturating_add(delta as usize)
+                };
+                return Vec::new();
+            }
+            _ => return Vec::new(),
+        }
+    }
     if state.active_screen != Screen::Conversation {
         return Vec::new();
     }

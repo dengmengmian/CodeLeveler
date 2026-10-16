@@ -23,9 +23,12 @@
 //! Lifecycle: an issue is active exactly as long as its source fact is. A
 //! failed turn stops being active when a later turn reports `Busy`/`Idle`; a
 //! failed task stops being active when its entry leaves the projection (the
-//! bounded terminal window, a session switch). Looking at an issue marks it
-//! seen — it never clears it, and nothing here silently "recovers" without the
-//! source state changing.
+//! bounded terminal window, a session switch). The STRIP's reminder, however,
+//! is an attention signal, not a durable fact: an unviewed one-shot failure
+//! reminds, and viewing it — opening the issue page, or that task's own detail
+//! — clears the reminder while the record stays active and listed as history.
+//! A failed turn is a persistent fault: only the runtime's own status leaving
+//! `Error` clears it, never a viewing.
 
 use leveler_client_protocol::RuntimeStatus;
 
@@ -71,9 +74,13 @@ pub(crate) struct Issue {
     pub unread: bool,
 }
 
-/// Summary of the active issues, for the state strip.
+/// Summary of the issues the strip must REMIND about: the persistent failed
+/// turn (always) and the unviewed one-shot failures. Viewed failures are
+/// history, not reminders — they stay on the page, never on the strip.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IssueSummary {
+    /// What the strip's issue cell counts: the severe issue plus the unviewed
+    /// background failures.
     pub total: usize,
     /// The severe issue's label — a failed turn. The strip shows it in full
     /// (truncated) instead of hiding it behind a count.
@@ -90,7 +97,8 @@ impl IssueSummary {
 
 /// Every active issue, in display order: the failed turn first, then failed
 /// background tasks oldest-first (the projection's own start clock, so the
-/// order is deterministic and never a hash iteration order).
+/// order is deterministic and never a hash iteration order). Unviewed failures
+/// lead their viewed history, so what needs attention is what the eye lands on.
 pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
     let mut issues = Vec::new();
     if state.status == RuntimeStatus::Error {
@@ -125,8 +133,10 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
         .filter(|(_, chrome)| chrome.is_failed())
         .collect();
     failed.sort_by(|a, b| {
-        a.1.started_elapsed_secs
-            .cmp(&b.1.started_elapsed_secs)
+        let unread = |id: &String| !state.background_failures_seen.contains(id);
+        unread(b.0)
+            .cmp(&unread(a.0))
+            .then_with(|| a.1.started_elapsed_secs.cmp(&b.1.started_elapsed_secs))
             .then_with(|| a.0.cmp(b.0))
     });
     for (id, chrome) in failed {
@@ -149,31 +159,33 @@ pub(crate) fn active_issues(state: &AppState) -> Vec<Issue> {
     issues
 }
 
-/// Sum up the active issues for the strip: total, distinct kinds, and the
-/// severe label when a failed turn is active.
+/// Sum up what the strip must remind about: the severe label when a failed
+/// turn is active, and the count of issues that still need attention.
 pub(crate) fn issue_summary(state: &AppState) -> IssueSummary {
     let issues = active_issues(state);
     let severe = issues
         .iter()
         .find(|issue| issue.kind == IssueKind::TurnFailure)
         .map(|issue| issue.label.clone());
+    let unread = issues
+        .iter()
+        .filter(|issue| issue.kind == IssueKind::BackgroundFailure && issue.unread)
+        .count();
     IssueSummary {
-        total: issues.len(),
+        total: usize::from(severe.is_some()) + unread,
         severe_active: severe.is_some(),
         severe,
     }
 }
 
-/// The issue the page has selected, by its stable key.
-pub(crate) fn selected_issue(state: &AppState) -> Option<Issue> {
-    let key = state.issue_selected.as_deref()?;
-    active_issues(state).into_iter().find(|issue| issue.key == key)
-}
-
 /// Keep the page's cursor on a row that still exists; the first active issue
-/// when the old pick is gone. A cleared issue leaves no dangling selection.
+/// when the old pick is gone. A cleared issue leaves no dangling selection,
+/// and an expansion for a row that is no longer active is dropped with it.
 pub(crate) fn ensure_selection(state: &mut AppState) {
     let issues = active_issues(state);
+    state
+        .issue_expanded
+        .retain(|key| issues.iter().any(|issue| &issue.key == key));
     if state
         .issue_selected
         .as_ref()
@@ -181,6 +193,34 @@ pub(crate) fn ensure_selection(state: &mut AppState) {
     {
         state.issue_selected = issues.first().map(|issue| issue.key.clone());
     }
+}
+
+/// Whether the issue's row is expanded on the page.
+pub(crate) fn is_expanded(state: &AppState, key: &str) -> bool {
+    state.issue_expanded.contains(key)
+}
+
+/// Toggle the selected issue's expansion. Selecting and expanding are the
+/// same interaction: the selected (clicked) row is the row acted on, and the
+/// state is keyed by stable identity so it survives returns and resizes.
+pub(crate) fn toggle_expanded(state: &mut AppState) {
+    ensure_selection(state);
+    let Some(key) = state.issue_selected.clone() else {
+        return;
+    };
+    if !state.issue_expanded.remove(&key) {
+        state.issue_expanded.insert(key);
+    }
+}
+
+/// Collapse the selected row when it is expanded; `true` when it was. Esc's
+/// first level on the page is the open row, the second leaves for the
+/// conversation — and the back glyph runs the same rule.
+pub(crate) fn collapse_selected(state: &mut AppState) -> bool {
+    let Some(key) = state.issue_selected.clone() else {
+        return false;
+    };
+    state.issue_expanded.remove(&key)
 }
 
 /// Move the page's selection over the active issues.
@@ -283,16 +323,62 @@ mod tests {
     }
 
     /// Looking at a failure is not solving it: acknowledging clears the
-    /// "new" marker only, and the issue stays active.
+    /// "new" marker and the reminder, and the issue stays active on the page.
     #[test]
     fn seen_is_not_solved() {
         let mut state = state();
         failed_task(&mut state, "t1", 3, 1);
+        assert_eq!(issue_summary(&state).total, 1, "an unseen failure reminds");
         crate::activity::acknowledge_failures(&mut state);
         let issues = active_issues(&state);
         assert_eq!(issues.len(), 1, "an acknowledged failure is still active");
         assert!(!issues[0].unread, "but it is no longer new");
-        assert_eq!(issue_summary(&state).total, 1);
+        assert!(
+            issue_summary(&state).is_empty(),
+            "and it stops reminding; the record is what stays, not the reminder"
+        );
+        assert!(
+            state.background_task_labels.contains_key("t1"),
+            "the failed record is never deleted by viewing it"
+        );
+    }
+
+    /// One viewed failure does not swallow the next: a new failure is a new
+    /// stable identity, so it reminds on its own.
+    #[test]
+    fn a_new_failure_reminds_after_earlier_ones_were_viewed() {
+        let mut state = state();
+        failed_task(&mut state, "t1", 3, 1);
+        crate::activity::acknowledge_failures(&mut state);
+        assert!(issue_summary(&state).is_empty());
+        failed_task(&mut state, "t2", 9, 2);
+        let summary = issue_summary(&state);
+        assert_eq!(summary.total, 1, "only the unviewed failure counts");
+        let issues = active_issues(&state);
+        assert_eq!(issues[0].key, "t2", "unread failures lead the page");
+        assert_eq!(issues[1].key, "t1", "viewed ones follow as history");
+        assert!(issues[0].unread);
+        assert!(!issues[1].unread);
+    }
+
+    /// Viewing failures never clears the failed turn: its activity is the
+    /// runtime's status, and only the status changing is recovery.
+    #[test]
+    fn viewing_never_clears_a_failed_turn() {
+        let mut state = state();
+        state.status = RuntimeStatus::Error;
+        failed_task(&mut state, "t1", 3, 1);
+        assert_eq!(issue_summary(&state).total, 2);
+        crate::activity::acknowledge_failures(&mut state);
+        let summary = issue_summary(&state);
+        assert!(summary.severe_active, "the failed turn still stands");
+        assert_eq!(summary.total, 1, "only the unviewed failure was cleared");
+        assert_eq!(summary.severe.as_deref(), Some("请求失败"));
+        state.status = RuntimeStatus::Idle;
+        assert!(
+            issue_summary(&state).is_empty(),
+            "recovery is the runtime's own status change, nothing else"
+        );
     }
 
     /// The failed turn is the severe issue; its label and machine line come
