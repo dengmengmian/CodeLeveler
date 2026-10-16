@@ -322,7 +322,7 @@ fn rc_cmd(lab: &Lab, sha: &str, run: &str) -> CommandSpec {
     .env("DOGFOOD_ROOT", lab.root.display().to_string())
 }
 
-fn ensure_in_lab(
+pub(crate) fn ensure_in_lab(
     host: &dyn Host,
     repo: &Path,
     lab: &Path,

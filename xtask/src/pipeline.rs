@@ -1447,6 +1447,19 @@ fn run_layers(
     layers_requested: &str,
     layers_required: &[&str],
 ) -> Result<(Vec<String>, String), Fail> {
+    // The lab reads the candidate out of its own clone, so the frozen commit
+    // has to be in it before the gate is asked to qualify it. A version commit
+    // is new by definition, and `git fetch` of one object is cheap.
+    let mut detail = Vec::new();
+    if let Some(note) = qualify::ensure_in_lab(
+        context.host,
+        &context.repo,
+        &context.lab.root,
+        &transaction.candidate_sha,
+    )? {
+        println!("{note}");
+        detail.push(note);
+    }
     let spec = dogfood_cmd(
         context,
         &transaction.candidate_sha,
@@ -1492,7 +1505,6 @@ fn run_layers(
     // wherever it is needed, so there is one representation of one fact.
     let run_id = state::bare_run_id(&run_id);
     transaction.dogfood_run_id = Some(run_id.clone());
-    let mut detail = Vec::new();
     let mut reused_any = false;
     for layer in layers_required {
         let path = state::lab_run_dir(&context.lab.root, state::RELEASE_RUN_KIND, &run_id)
