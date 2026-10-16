@@ -108,7 +108,6 @@ pub(crate) fn layout(area: Rect, composer_rows: u16) -> SecondaryLayout {
     }
 }
 
-
 /// Draw the identity header, its right-aligned parent status, and the rule
 /// below it — and publish the painted `← title` nav region as the page's back
 /// hit.
@@ -197,10 +196,7 @@ fn paint_header(
     draw_rule(frame, l.rule_top, theme);
     // The hit is the glyph + title as painted (truncation included), never the
     // whole row: the right half belongs to the status.
-    let painted = crate::render::truncate_display(
-        &left_text,
-        left_room.min(inner.width as usize),
-    );
+    let painted = crate::render::truncate_display(&left_text, left_room.min(inner.width as usize));
     let nav_w = UnicodeWidthStr::width(painted.as_str()) as u16;
     (nav_w > 0).then_some(Rect {
         x: inner.x,

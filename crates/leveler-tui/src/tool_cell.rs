@@ -2109,13 +2109,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut App
     frame.render_widget(list_block, list_area);
     let mut hits = Vec::new();
     crate::render::render_list_rows(
-        frame,
-        list_inner,
-        rows,
-        &row_hits,
-        selected,
-        theme,
-        &mut hits,
+        frame, list_inner, rows, &row_hits, selected, theme, &mut hits,
     );
     state.screen_rows = hits;
 

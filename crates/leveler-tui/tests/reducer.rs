@@ -4883,8 +4883,14 @@ fn the_strip_cells_open_the_jobs_list_and_the_issue_page() {
         "opening the page acknowledges the failure it shows"
     );
     let page = rendered(&mut s, 100, 24);
-    assert!(page.contains("npm start"), "the task label is real:\n{page}");
-    assert!(page.contains('▸'), "a collapsed row shows the expander:\n{page}");
+    assert!(
+        page.contains("npm start"),
+        "the task label is real:\n{page}"
+    );
+    assert!(
+        page.contains('▸'),
+        "a collapsed row shows the expander:\n{page}"
+    );
 
     // Clicking the row selects it and expands it in place.
     let (row, x0, x1, key_bg) = s
@@ -4999,7 +5005,10 @@ fn the_issue_page_acknowledges_what_it_shows_and_not_later_arrivals() {
         "an arrival after opening was not part of what the user saw"
     );
     let page = rendered(&mut s, 110, 24);
-    assert!(page.contains("vite build"), "the arrival is visible:\n{page}");
+    assert!(
+        page.contains("vite build"),
+        "the arrival is visible:\n{page}"
+    );
 
     // Leaving: the arrival still reminds; the viewed one does not.
     reduce(&mut s, key(KeyCode::Esc));
@@ -5099,7 +5108,10 @@ fn the_issue_page_mouse_and_layered_back_hold_at_every_width() {
             "an expanded row offers its entry at {width}"
         );
         for (row, x0, x1, key) in &s.issue_detail_hits {
-            assert!(*x0 < *x1 && *x1 <= width, "entry inside the page at {width}");
+            assert!(
+                *x0 < *x1 && *x1 <= width,
+                "entry inside the page at {width}"
+            );
             assert!(*row < 30);
             assert!(
                 s.issue_expanded.contains(key),
@@ -5169,7 +5181,10 @@ fn the_issue_page_mouse_and_layered_back_hold_at_every_width() {
         let (brow, bx0, _) = s.back_hit.expect("issue page back glyph");
         click(&mut s, bx0, brow);
         assert_eq!(s.active_screen, Screen::Issue);
-        assert!(!s.issue_expanded.contains(&target), "the ← collapsed the row");
+        assert!(
+            !s.issue_expanded.contains(&target),
+            "the ← collapsed the row"
+        );
         let (brow, bx0, _) = s.back_hit.expect("issue page back glyph");
         click(&mut s, bx0, brow);
         assert_eq!(s.active_screen, Screen::Conversation);

@@ -1224,9 +1224,9 @@ mod reachability_tests {
             Screen::Remote => Some("`/remote` — reducer/mod.rs"),
             Screen::Shell => Some("`!command` — reducer/submit.rs"),
             Screen::Activity => Some("clicking an activity row — activity.rs"),
-            Screen::ActivityList => {
-                Some("clicking the strip's background cell or Enter under its focus — reducer/mod.rs")
-            }
+            Screen::ActivityList => Some(
+                "clicking the strip's background cell or Enter under its focus — reducer/mod.rs",
+            ),
             Screen::Issue => Some("clicking the strip's issue cell — reducer/mod.rs"),
             Screen::Team => Some("the roster's overflow row — reducer/mod.rs"),
             Screen::Plan => Some("Enter or click on the plan summary — reducer/mod.rs"),

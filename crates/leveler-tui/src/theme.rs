@@ -981,7 +981,10 @@ mod tests {
     fn the_plan_indicator_owns_its_purple() {
         for id in ThemeId::FIXED {
             let t = Theme::named(id);
-            assert_ne!(t.plan.primary, t.accent.primary, "{id}: plan is its own ink");
+            assert_ne!(
+                t.plan.primary, t.accent.primary,
+                "{id}: plan is its own ink"
+            );
             assert_ne!(
                 t.plan.primary, t.plan.dim,
                 "{id}: the breath needs two shades"

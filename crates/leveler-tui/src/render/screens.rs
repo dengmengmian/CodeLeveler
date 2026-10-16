@@ -8,8 +8,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::state::AppState;
 use crate::theme::Theme;
 
-use super::{render_list_focused, render_scrolled};
 use super::text::{sanitize_terminal_line, truncate_display, wrap};
+use super::{render_list_focused, render_scrolled};
 
 pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let zh = state.locale == crate::i18n::Locale::Zh;
@@ -71,15 +71,7 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &mut AppS
         }));
     }
     let mut hits = Vec::new();
-    crate::render::render_list_rows(
-        frame,
-        layout.content,
-        lines,
-        &rows,
-        focus,
-        theme,
-        &mut hits,
-    );
+    crate::render::render_list_rows(frame, layout.content, lines, &rows, focus, theme, &mut hits);
     state.screen_rows = hits;
     search_cursor(frame, layout.composer, &state.help.query, zh);
 }
@@ -256,13 +248,7 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     frame.render_widget(list_block, list_area);
     let mut hits = Vec::new();
     crate::render::render_list_rows(
-        frame,
-        list_inner,
-        rows,
-        &row_hits,
-        selected,
-        theme,
-        &mut hits,
+        frame, list_inner, rows, &row_hits, selected, theme, &mut hits,
     );
     state.screen_rows = hits;
 
