@@ -365,6 +365,22 @@ async fn wait_for_turn_end(rx: &mut tokio::sync::broadcast::Receiver<RuntimeEven
     }
 }
 
+/// The main request of the last turn, as the provider received it.
+///
+/// A successful turn also asks for its recap and its next-step suggestion.
+/// Those are tool-less auxiliary calls, `request_bodies` appends them
+/// alongside the main request, and the order the two land in is not the
+/// caller's to assume — so the main request is the one carrying tools.
+async fn main_request_body(server: &MockServer) -> serde_json::Value {
+    let bodies: Vec<String> = server
+        .request_bodies()
+        .await
+        .into_iter()
+        .filter(|body| body.contains("\"tools\""))
+        .collect();
+    serde_json::from_str(bodies.last().expect("the main request was recorded")).unwrap()
+}
+
 /// Ask for `/context` and read the answer the runtime cached from the last
 /// request it assembled.
 async fn query_context(
@@ -471,8 +487,7 @@ async fn thinking_session_override_reaches_wire_and_survives_reconnect_without_c
             .await
             .unwrap();
         wait_for_turn_end(&mut rx).await;
-        let bodies = server.request_bodies().await;
-        let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+        let body = main_request_body(&server).await;
         assert_eq!(
             body.get("reasoning_effort").and_then(|v| v.as_str()),
             expected,
@@ -509,8 +524,7 @@ async fn thinking_session_override_reaches_wire_and_survives_reconnect_without_c
             .await
             .unwrap();
         wait_for_turn_end(&mut rx).await;
-        let bodies = server.request_bodies().await;
-        let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+        let body = main_request_body(&server).await;
         assert_eq!(
             body["reasoning_effort"], expected,
             "reconnect/new session must preserve its own canonical source"
@@ -623,8 +637,7 @@ async fn thinking_reset_returns_to_the_models_configured_level_not_the_global_de
         .await
         .unwrap();
     wait_for_turn_end(&mut rx).await;
-    let bodies = server.request_bodies().await;
-    let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+    let body = main_request_body(&server).await;
     assert_eq!(
         body["reasoning_effort"], "low",
         "a fresh session sends its configured level: {body}"
@@ -663,8 +676,7 @@ async fn thinking_reset_returns_to_the_models_configured_level_not_the_global_de
             .await
             .unwrap();
         wait_for_turn_end(&mut rx).await;
-        let bodies = server.request_bodies().await;
-        let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+        let body = main_request_body(&server).await;
         assert_eq!(
             body.get("reasoning_effort")
                 .and_then(|value| value.as_str()),
@@ -723,8 +735,7 @@ async fn thinking_reset_returns_to_the_models_configured_level_not_the_global_de
         .await
         .unwrap();
     wait_for_turn_end(&mut rx).await;
-    let bodies = server.request_bodies().await;
-    let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+    let body = main_request_body(&server).await;
     assert_eq!(
         body["reasoning_effort"], "high",
         "the global default reaches the wire for a model that sets none"
@@ -860,8 +871,7 @@ async fn thinking_model_switch_preserves_canonical_intent_and_reprojects_each_wi
                 .await
                 .unwrap();
             wait_for_turn_end(&mut rx).await;
-            let bodies = server.request_bodies().await;
-            let body: serde_json::Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+            let body = main_request_body(&server).await;
             assert_eq!(
                 body.get("reasoning_effort").and_then(|v| v.as_str()),
                 if level == ThinkingLevel::Max {
