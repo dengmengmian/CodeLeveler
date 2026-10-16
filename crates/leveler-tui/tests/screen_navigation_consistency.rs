@@ -487,6 +487,32 @@ fn a_wheel_notch_moves_the_same_cursor_the_keys_move() {
     }
 }
 
+/// A selection the user cannot see is a selection the user does not have: the
+/// Issue page's cursor drags the window with it when it moves, exactly as the
+/// other list pages' does.
+#[test]
+fn the_issue_page_keeps_its_cursor_on_screen() {
+    let mut s = opened();
+    seed(&mut s, Screen::Issue);
+    let rows = s.background_task_labels.len();
+    assert!(rows >= 8, "the fixture needs a list taller than the viewport");
+    // The page's own opener picks the first issue; stand in for it here.
+    s.issue_selected = Some("bg-0".into());
+    // A window too short for the whole list, so the cursor has to move it.
+    let cursor_row = |page: &Page| page.lines.iter().position(|l| l.trim_start().starts_with("→"));
+    assert!(cursor_row(&Page::of(&mut s, 80, 10)).is_some(), "no cursor");
+
+    for step in 0..rows {
+        let page = Page::of(&mut s, 80, 10);
+        assert!(
+            cursor_row(&page).is_some(),
+            "step {step}: the cursor left the screen entirely:\n{}",
+            page.lines.join("\n")
+        );
+        reduce(&mut s, key(KeyCode::Down));
+    }
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 /// Every page that paints the shell's `← <title>` header — which is now every

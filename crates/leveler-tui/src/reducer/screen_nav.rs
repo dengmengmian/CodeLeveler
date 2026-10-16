@@ -605,6 +605,9 @@ pub(super) fn open_issue_screen(state: &mut AppState) {
     crate::activity::acknowledge_failures(state);
     state.active_screen = crate::screen::Screen::Issue;
     state.screen_scroll = 0;
+    // Forget where the cursor sat on the previous visit, so the first frame
+    // follows it: reopening the page on a row below the fold must show it.
+    state.issue_selected_line = None;
 }
 
 pub(super) fn open_plan_screen(state: &mut AppState) {

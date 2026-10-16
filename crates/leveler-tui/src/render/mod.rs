@@ -1493,6 +1493,26 @@ fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
     let issues = crate::issue::active_issues(state);
     let view = issue_page_view(state, &issues, body.width as usize);
+    // Follow the cursor when it MOVES — the rule every other list page gets
+    // from `list_scroll_offset` — without stealing the wheel: a scroll the user
+    // asked for is theirs, and undoing it on the next frame would make the
+    // wheel unusable. A row the cursor left behind, though, is a selection
+    // nobody can see.
+    let selected_line = state
+        .issue_selected
+        .as_deref()
+        .and_then(|key| view.rows.iter().find(|(_, k)| k == key).map(|(l, _)| *l));
+    if selected_line != state.issue_selected_line {
+        state.issue_selected_line = selected_line;
+        if let Some(line) = selected_line {
+            let height = body.height as usize;
+            if line < state.screen_scroll {
+                state.screen_scroll = line;
+            } else if line >= state.screen_scroll.saturating_add(height) {
+                state.screen_scroll = (line + 1).saturating_sub(height);
+            }
+        }
+    }
     // Publish exactly the painted rows: a row scrolled out of the viewport owns
     // no hit, and a resize republishes against the new geometry on the next
     // frame.
