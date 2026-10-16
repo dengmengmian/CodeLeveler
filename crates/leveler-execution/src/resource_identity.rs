@@ -171,14 +171,29 @@ pub async fn resolve_git_grant_with_environment(
     // (`GIT_DIR`, `GIT_SSH_COMMAND`) makes the resolved repository the wrong
     // one, so it keeps exact-call approval.
     let commands = crate::executed_commands(program, args);
-    if commands.commands.is_empty() || commands.env_prefixed {
+    // A parsed list that is not complete is gating evidence only — the
+    // granted argv must never be derived from it (`ExecutedCommands::complete`).
+    if commands.commands.is_empty() || commands.env_prefixed || !commands.complete {
         return Ok(None);
     }
     let mut selections = Vec::new();
     let mut explicit_urls = Vec::new();
     let mut saw_remote = false;
     for command in &commands.commands {
-        if command.first().map(String::as_str) != Some("git") {
+        let Some((name, rest)) = command.split_first() else {
+            continue;
+        };
+        if name != "git" {
+            // A sibling must not ride the Git grant: reuse is offered only
+            // when every sibling is provably harmless. Anything the
+            // classifier cannot call Safe keeps exact-call approval.
+            if crate::approval::classify_command(&crate::approval::CommandView {
+                program: name,
+                args: rest,
+            }) == crate::approval::CommandClass::Dangerous
+            {
+                return Ok(None);
+            }
             continue;
         }
         let remote = crate::git_effects::git_command_effects(command)
@@ -784,5 +799,38 @@ mod tests {
                 .is_none(),
             "active hook has unbound executable effects"
         );
+    }
+
+    #[tokio::test]
+    async fn a_dangerous_sibling_keeps_exact_call_approval() {
+        let dir = repo();
+        // The wrapper support that lets a harmless sibling reuse a grant
+        // stays: a provably harmless sibling does not disable reuse.
+        let harmless = resolve_git_grant(
+            "sh",
+            &["-c".into(), "git fetch origin; echo extra".into()],
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(harmless.is_some(), "harmless sibling keeps reuse");
+
+        // A sibling the classifier cannot call Safe must not ride the Git
+        // grant: the user approved the Git call, not the whole script.
+        for script in [
+            "git fetch origin; rm -rf /abs/path",
+            "git push origin main; rm -rf /abs/path",
+            "git fetch origin; rm -rf \"$TARGET\"",
+            "git fetch origin; sudo rm -rf /x",
+            "git fetch origin && open /tmp/file",
+        ] {
+            let got = resolve_git_grant("sh", &["-c".into(), script.to_string()], dir.path())
+                .await
+                .unwrap();
+            assert!(
+                got.is_none(),
+                "a dangerous sibling must keep exact-call approval: {script}"
+            );
+        }
     }
 }

@@ -742,7 +742,12 @@ impl Executor {
             && profile != leveler_execution::PermissionProfile::FullAccess
             && command_view.is_some()
         {
-            match self.resolve_resource_request(call, ctx).await {
+            // The request's identity, not the reusable-consent view: a
+            // credential-only request (an explicit URL whose host has a
+            // stored credential) has no frozen remote, so the consent gate
+            // discards it — but its use still has to be approved, and that
+            // is exactly what must escalate here.
+            match self.resolve_request_identity(call, ctx).await {
                 Ok(Some(request))
                     if request.bindings.iter().any(|binding| {
                         binding.capability == leveler_core::Capability::CredentialUse
@@ -850,6 +855,25 @@ impl Executor {
         call: &ToolCall,
         ctx: &ToolContext,
     ) -> Result<Option<leveler_core::GrantRequest>, String> {
+        let Some(request) = self.resolve_request_identity(call, ctx).await? else {
+            return Ok(None);
+        };
+        // Reusable consent is offered only for consumers whose execution layer
+        // binds the approved identity to the real side effect. Everything else
+        // keeps exact-call approval.
+        if !Self::execution_bound_request(&request) {
+            return Ok(None);
+        }
+        Ok(Some(request))
+    }
+
+    /// The request's identity, before the reusable-consent gate: resolving
+    /// what a call would touch is not offering standing consent for it.
+    async fn resolve_request_identity(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> Result<Option<leveler_core::GrantRequest>, String> {
         use leveler_core::GrantRequest;
         let Some(tool) = self.registry.get(&call.name) else {
             return Ok(None);
@@ -879,12 +903,6 @@ impl Executor {
                 }
             }
         };
-        // Reusable consent is offered only for consumers whose execution layer
-        // binds the approved identity to the real side effect. Everything else
-        // keeps exact-call approval.
-        if !Self::execution_bound_request(&request) {
-            return Ok(None);
-        }
         Ok(Some(request))
     }
 
@@ -3739,5 +3757,76 @@ mod authorize_tests {
             !Executor::execution_bound_request(&raw_read),
             "credential.raw.read is never a reusable Git grant"
         );
+    }
+
+    /// A stored credential for an explicit URL produces credential-only
+    /// bindings: there is no configured remote to freeze, but the credential
+    /// use still has to be approved (`resolve_git_grant`'s explicit-URL arm
+    /// says so in as many words). The Phase 4 lookup must see that request —
+    /// when it went through the reusable-consent gate, the credential-only
+    /// request was discarded and the call reached Auto unapproved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_explicit_url_with_a_stored_credential_still_asks() {
+        use leveler_core::EnvSnapshot;
+        use leveler_execution::PolicyResolution;
+        use std::ffi::OsString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git fixture setup failed: {init:?}");
+
+        // A global credential helper that answers for any host, so the
+        // explicit URL's host has a stored credential.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[credential]\n\thelper = \"!f() { echo username=leveler-test; echo password=s3cret; }; f\"\n",
+        )
+        .unwrap();
+        // HOME only: the install-less test process's `leveler_core::environment()`
+        // carries no PATH, and `resolve_git_grant` refuses an environment whose
+        // PATH differs from it. Git itself is still found through the parent's
+        // PATH at spawn time.
+        let env = EnvSnapshot::new(
+            [(
+                OsString::from("HOME"),
+                OsString::from(home.path().as_os_str()),
+            )],
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+        );
+
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let tool_context =
+            ToolContext::with_environment(workspace, PermissionProfile::Assisted, Arc::new(env));
+        let exec = Executor::new(
+            Arc::new(StubRuntime),
+            Arc::new(default_registry()),
+            tool_context,
+            ModelRef::new("mock", "m"),
+            10,
+        );
+
+        match resolve(
+            &exec,
+            &call(
+                "shell_command",
+                serde_json::json!({"cmd": "git fetch https://example.com/private.git"}),
+            ),
+        )
+        .await
+        {
+            PolicyResolution::Ask(_) => {}
+            other => panic!(
+                "an explicit URL with a stored credential must ask before it uses it: {other:?}"
+            ),
+        }
     }
 }

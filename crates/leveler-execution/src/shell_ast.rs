@@ -155,6 +155,10 @@ pub(crate) fn opaque_git_security_ask(args: &[Option<String>]) -> bool {
         return false;
     }
     let mut index = 0;
+    // A relocation whose value is unreadable renames the repository the
+    // remote-side subcommands below would talk to; for them it counts the
+    // same as an unreadable remote word.
+    let mut opaque_relocation = false;
     while index < args.len() {
         let Some(arg) = args[index].as_deref() else {
             return true;
@@ -167,6 +171,9 @@ pub(crate) fn opaque_git_security_ask(args: &[Option<String>]) -> bool {
             break;
         }
         if let Some(separate_value) = relocation_option(arg) {
+            if separate_value && args.get(index + 1).is_some_and(Option::is_none) {
+                opaque_relocation = true;
+            }
             index += if separate_value { 2 } else { 1 };
             continue;
         }
@@ -206,7 +213,7 @@ pub(crate) fn opaque_git_security_ask(args: &[Option<String>]) -> bool {
         subcommand,
         "fetch" | "pull" | "push" | "ls-remote" | "clone" | "archive" | "remote"
     ) {
-        return args[index + 1..].iter().any(Option::is_none);
+        return opaque_relocation || args[index + 1..].iter().any(Option::is_none);
     }
     if subcommand == "config" {
         return args[index + 1..].iter().any(Option::is_none)
