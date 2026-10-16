@@ -658,14 +658,29 @@ fn write_feature_coverage(out: &mut String, context: &Context, transaction: &Tra
     }
     out.push('\n');
     // Four denominators, stated so the numbers cannot be read as one another.
+    // A coverage artifact written before `coverage_core_percent` existed has no
+    // such key; derive it rather than print a misleading 0.0%.
     let percent = |key: &str| summary.at(key).as_f64().unwrap_or(0.0);
+    let core_percent = {
+        let recorded = percent("coverage_core_percent");
+        if recorded > 0.0 {
+            recorded
+        } else {
+            let total = number("core_total");
+            if total > 0 {
+                100.0 * number("core_covered") as f64 / total as f64
+            } else {
+                0.0
+            }
+        }
+    };
     out.push_str(&format!(
         "| 覆盖率口径 | 数值 | 定义 |\n| --- | --- | --- |\n\
          | 核心功能覆盖率 | {:.1}% | 核心 COVERED / 核心总数（{}/{}）——**发布阻断指标** |\n\
          | 本次候选有效证据覆盖率 | {:.1}% | 全部 COVERED / 全部功能（{}/{}），分母含 product/extended/out_of_scope |\n\
          | 功能映射覆盖率 | {:.1}% | 有任意证据引用的功能 / 全部功能 |\n\
          | 真实 E2E 覆盖率 | {:.1}% | 证据含 pty/eval/rc/l2 的功能 / 全部功能 |\n\n",
-        percent("coverage_core_percent"),
+        core_percent,
         number("core_covered"),
         number("core_total"),
         percent("coverage_candidate_evidence_percent"),
