@@ -622,7 +622,7 @@ fn seed(state: &mut AppState, screen: Screen) {
         }
         Screen::Tools => {
             for i in 0..6 {
-                let call = leveler_client_protocol::ToolCallId::new(&format!("c{i}"));
+                let call = leveler_client_protocol::ToolCallId::new(format!("c{i}"));
                 state.transcript.push_tool_started(
                     call.clone(),
                     "run_command".into(),
