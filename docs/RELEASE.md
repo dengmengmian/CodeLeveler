@@ -1,4 +1,4 @@
-# CodeLeveler 1.0.17
+# CodeLeveler 1.0.18
 
 Chinese: [`RELEASE.zh-CN.md`](RELEASE.zh-CN.md)
 
