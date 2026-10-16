@@ -653,6 +653,7 @@ fn start(host: &dyn Host, repo: &Path, env: &Env, opts: &PublishOpts) -> Result<
         ));
     }
 
+    fetch_release_tags(host, repo);
     let lab = root::resolve_lab(repo, &opts.gate, env)?;
     let baseline = qualify::read_baseline(&lab.root)?;
     bump_version_files(repo, &plan)?;
@@ -821,6 +822,25 @@ fn porcelain_paths(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Bring the release tags this checkout is missing into it.
+///
+/// The tag for a release is created on origin by the release workflow, so a
+/// clone that has not fetched it cannot name the previous release for the
+/// change comparison, and `git tag --list` does not show the version it just
+/// published. Fetching tags only adds refs: it never moves HEAD, the index or the
+/// working tree, so it cannot change the candidate being qualified. A failure is
+/// not fatal — a release must not stop because the report cannot be compared.
+fn fetch_release_tags(host: &dyn Host, repo: &Path) {
+    if let Ok(out) = host.run(&exec::git(repo, &["fetch", "--tags", "origin"]))
+        && out.status != 0
+    {
+        println!(
+            "note: could not fetch origin's tags for the release comparison\n  {}",
+            first_line(&out.stderr)
+        );
+    }
+}
+
 fn rustc_version(host: &dyn Host, repo: &Path) -> Result<String, Fail> {
     let out = host.run(&CommandSpec::new("rustc", ["--version"], repo))?;
     if out.status != 0 {
@@ -935,6 +955,7 @@ fn resume(host: &dyn Host, repo: &Path, env: &Env, opts: &PublishOpts) -> Result
             ),
         ));
     }
+    fetch_release_tags(host, repo);
     let head = exec::ok_stdout(host, exec::git(repo, &["rev-parse", "HEAD"]), "GIT_FAILED")?;
     if head != transaction.candidate_sha {
         note_candidate_change(host, repo, &mut transaction, &head)?;
