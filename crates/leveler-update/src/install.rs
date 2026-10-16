@@ -41,8 +41,8 @@ pub async fn download(
     url: &str,
     mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<Vec<u8>, UpdateError> {
-    let response = client
-        .get(url)
+    let token = crate::source::github_token()?;
+    let response = crate::source::authorized(client, url, token.as_ref())
         .send()
         .await
         .map_err(|e| UpdateError::Network(e.to_string()))?;
@@ -68,8 +68,8 @@ pub async fn download(
 
 /// Fetch a small text body (the `.sha256` sibling).
 pub async fn download_text(client: &reqwest::Client, url: &str) -> Result<String, UpdateError> {
-    let response = client
-        .get(url)
+    let token = crate::source::github_token()?;
+    let response = crate::source::authorized(client, url, token.as_ref())
         .send()
         .await
         .map_err(|e| UpdateError::Network(e.to_string()))?;
@@ -392,5 +392,44 @@ mod tests {
         let reported = parse_version("1.0.0").unwrap();
         assert_eq!(expected, reported);
         assert_ne!(expected, parse_version("1.0.1").unwrap());
+    }
+
+    /// The GITHUB_TOKEN is GitHub's credential. A mirror is a third party that
+    /// merely relays our files — the same reason its contents are never
+    /// trusted — so a request that goes to a mirror host must not carry the
+    /// token. A `default_headers` token would follow the download wherever the
+    /// candidate list points.
+    #[tokio::test]
+    async fn a_download_never_sends_the_token_to_a_mirror() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        // SAFETY: a single-threaded test process for this variable.
+        unsafe { std::env::set_var("GITHUB_TOKEN", "ghp_test_token") };
+        let client = crate::source::download_client().unwrap();
+        let body = download(
+            &client,
+            &format!("http://127.0.0.1:{port}/mirror.tgz"),
+            |_, _| {},
+        )
+        .await;
+        unsafe { std::env::remove_var("GITHUB_TOKEN") };
+
+        assert!(body.is_ok(), "{body:?}");
+        let request = received.join().unwrap();
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization"),
+            "a mirror request must not carry the token: {request}"
+        );
     }
 }

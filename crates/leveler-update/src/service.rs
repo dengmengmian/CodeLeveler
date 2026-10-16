@@ -148,7 +148,11 @@ impl<S: ReleaseSource> UpdateService<S> {
         // The canonical URL, then any mirrors the environment names. A mirror
         // only rescues the transfer; `verify_sha256` below still decides
         // whether what arrived is the artifact that was published.
-        let urls = crate::source::download_candidates(&assets.download_url, &assets.asset_name);
+        let urls = crate::source::download_candidates(
+            &assets.download_url,
+            &assets.asset_name,
+            &release.version.to_string(),
+        );
         let bytes = download_candidates(&self.download_client, &urls, |received, total| {
             on_step(UpdateStep::Downloading {
                 asset: asset_name.clone(),
