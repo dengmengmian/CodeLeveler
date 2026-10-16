@@ -2029,7 +2029,7 @@ fn preview_lines(preview: &str, width: usize) -> Vec<String> {
     out
 }
 
-pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let area = crate::secondary::legacy_frame(frame, area, state);
     let theme = &state.theme;
     let t = state.t();
@@ -2056,6 +2056,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
         )));
     }
     let list_width = list_area.width.saturating_sub(2).max(1) as usize;
+    let mut row_hits: Vec<(usize, String)> = Vec::new();
     for (i, block) in calls.iter().enumerate() {
         let cursor = if i == selected { "› " } else { "  " };
         let dur = block
@@ -2083,6 +2084,7 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
             Span::raw(truncate_display(&label, label_width)),
             Span::styled(format!("  {dur}"), Style::default().fg(theme.text.muted)),
         ]));
+        row_hits.push((rows.len() - 1, i.to_string()));
     }
     let list_block = Block::default()
         .borders(Borders::RIGHT)
@@ -2093,7 +2095,17 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &AppStat
         ));
     let list_inner = list_block.inner(list_area);
     frame.render_widget(list_block, list_area);
-    crate::render::render_list_focused(frame, list_inner, rows, selected, theme);
+    let mut hits = Vec::new();
+    crate::render::render_list_rows(
+        frame,
+        list_inner,
+        rows,
+        &row_hits,
+        selected,
+        theme,
+        &mut hits,
+    );
+    state.screen_rows = hits;
 
     let mut detail: Vec<Line> = Vec::new();
     if let Some(block) = calls.get(selected) {

@@ -679,6 +679,39 @@ fn snapshot_awaits_interaction(
         })
 }
 
+/// Mouse handling for every page that is not the conversation.
+///
+/// The pages that own a viewport of their own (the activity detail, the jobs
+/// list) answer above this and never reach here. What is left is the shape
+/// every other page shares: the wheel scrolls the body under the pointer, and
+/// a click selects the row under it. Both are the page's own actions — the
+/// same ones its keyboard bindings run — so the two inputs cannot diverge.
+fn screen_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let point = (mouse.column, mouse.row).into();
+            let hit = state
+                .screen_rows
+                .iter()
+                .find(|(rect, _)| rect.contains(point))
+                .map(|(_, key)| key.clone());
+            match hit {
+                Some(key) => screen_nav::select_row(state, &key),
+                None => Vec::new(),
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            screen_nav::wheel_page(state, -1);
+            Vec::new()
+        }
+        MouseEventKind::ScrollDown => {
+            screen_nav::wheel_page(state, 1);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Mouse: wheel scrolls Conversation; drag selects text with edge auto-scroll; release copies.
 ///
 /// `Shift`+mouse is ignored so the terminal can offer native selection as a fallback
@@ -736,6 +769,21 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
     {
         return screen_nav::cancel_background_task(state, task_id);
     }
+    // The header's `←` glyph is the mouse's Esc: a click runs the same
+    // one-level back, so a detail opened from the issue page returns to the
+    // issue page. Which pages have a `←` is not listed here — a page publishes
+    // `back_hit` when it paints the glyph, so the click resolves against
+    // exactly what is on screen and a page inherits the binding by drawing the
+    // shell's header. Checked before any page's body hits: the nav is chrome,
+    // and a page's own regions must never swallow it.
+    if state.active_screen != Screen::Conversation
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some((row, x0, x1)) = state.back_hit
+        && mouse.row == row
+        && (x0..x1).contains(&mouse.column)
+    {
+        return screen_nav::back(state);
+    }
     if state.active_screen == Screen::ActivityList {
         let point = (mouse.column, mouse.row).into();
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
@@ -777,19 +825,6 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         }
         return Vec::new();
     }
-    // The header's `←` glyph is the mouse's Esc: on the pages that publish it
-    // (Issue, the detail, the jobs list) a click runs the same one-level back,
-    // so a detail opened from the issue page returns to the issue page.
-    if matches!(
-        state.active_screen,
-        Screen::Issue | Screen::Activity | Screen::ActivityList
-    ) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-        && let Some((row, x0, x1)) = state.back_hit
-        && mouse.row == row
-        && (x0..x1).contains(&mouse.column)
-    {
-        return screen_nav::back(state);
-    }
     if state.active_screen == Screen::Issue {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -803,13 +838,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
                     })
                     .cloned()
                 {
-                    let effects =
-                        crate::activity::open(state, crate::activity::ActivityId::Background(key));
-                    // The opener records where the detail returns to — the
-                    // detail itself never guesses. (`open` resets the field,
-                    // so this must come after it.)
-                    state.detail_return = Some(Screen::Issue);
-                    return effects;
+                    return screen_nav::open_issue_detail(state, &key);
                 }
                 if let Some((_, _, _, key)) = state
                     .issue_row_hits
@@ -843,7 +872,7 @@ fn handle_mouse(state: &mut AppState, mouse: MouseEvent) -> Vec<Effect> {
         }
     }
     if state.active_screen != Screen::Conversation {
-        return Vec::new();
+        return screen_mouse(state, mouse);
     }
     state.disarm_ctrlc();
     clear_quit_confirm_notification(state);

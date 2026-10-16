@@ -1216,7 +1216,7 @@ fn context_window_footer_and_inspector_frames() {
     write_dump("context-window-footer-100x24", &frame);
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     terminal
-        .draw(|frame| crate::context::render_context_screen(frame, frame.area(), &state))
+        .draw(|frame| crate::context::render_context_screen(frame, frame.area(), &mut state))
         .unwrap();
     let mut detail = String::new();
     for y in 0..24 {

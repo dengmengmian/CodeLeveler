@@ -5,13 +5,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::render::{render_list_focused, render_scrolled, screen_title};
+use crate::render::{render_scrolled, screen_title};
 use crate::state::AppState;
 use crate::status_line::fmt_tokens_compact;
 
 use super::model::TraceTab;
 
-pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let area = crate::secondary::legacy_frame(frame, area, state);
     let theme = &state.theme;
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -45,8 +45,16 @@ pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &AppState) {
     )));
 
     if state.trace.tab == TraceTab::Trace {
-        let focus = 3usize.saturating_add(state.trace.selected); // header rows
-        render_list_focused(frame, area, lines, focus, theme);
+        // The request rows start under the title, the tab line and a blank —
+        // the same three header rows the focus offset has always used.
+        const HEADER_ROWS: usize = 3;
+        let focus = HEADER_ROWS.saturating_add(state.trace.selected);
+        let rows: Vec<(usize, String)> = (0..state.trace.filtered().len())
+            .map(|i| (HEADER_ROWS + i, i.to_string()))
+            .collect();
+        let mut hits = Vec::new();
+        crate::render::render_list_rows(frame, area, lines, &rows, focus, theme, &mut hits);
+        state.screen_rows = hits;
     } else {
         render_scrolled(frame, area, state, lines);
     }

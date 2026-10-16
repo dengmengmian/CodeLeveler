@@ -68,13 +68,32 @@ impl HelpSearch {
             })
             .collect()
     }
+    /// Point the selection at a row the page painted. Clamped to the current
+    /// result set, so a click can never leave the cursor past the end of a
+    /// list that shrank.
+    pub fn select(&mut self, index: usize, t: &UiText) {
+        self.selected = index.min(self.matches(t).len().saturating_sub(1));
+    }
+
+    /// Move the selection by `delta` rows over the current result set. The
+    /// keyboard's ↑↓/PageUp/PageDown and the wheel all run this one move, so
+    /// the two inputs cannot disagree about where the list ends.
+    pub fn move_selection(&mut self, delta: isize, t: &UiText) {
+        let max = self.matches(t).len().saturating_sub(1);
+        self.selected = if delta < 0 {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected.saturating_add(delta as usize).min(max)
+        };
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent, t: &UiText, page: usize) {
         let max = self.matches(t).len().saturating_sub(1);
         match key.code {
-            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = self.selected.saturating_add(1).min(max),
-            KeyCode::PageUp => self.selected = self.selected.saturating_sub(page),
-            KeyCode::PageDown => self.selected = self.selected.saturating_add(page).min(max),
+            KeyCode::Up => self.move_selection(-1, t),
+            KeyCode::Down => self.move_selection(1, t),
+            KeyCode::PageUp => self.move_selection(-(page as isize), t),
+            KeyCode::PageDown => self.move_selection(page as isize, t),
             KeyCode::Home => self.selected = 0,
             KeyCode::End => self.selected = max,
             KeyCode::Backspace => {

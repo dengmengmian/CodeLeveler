@@ -554,7 +554,9 @@ fn handle_slash(state: &mut AppState, command: &str) -> Vec<Effect> {
         "btw" => run_btw(state, command),
         "trace" => {
             let id = command.split_whitespace().nth(1).map(str::to_string);
-            open_trace(state, id)
+            // A slash command is typed in the conversation, so that is where
+            // the observatory's `←` goes back to.
+            open_trace(state, id, crate::screen::Screen::Conversation)
         }
         "context" => open_context(state),
         "clean" => open_clean(state),

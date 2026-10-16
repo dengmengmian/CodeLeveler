@@ -40,6 +40,49 @@ pub(crate) fn render_list_focused(
     render_pane_filled(frame, area, lines, offset, theme);
 }
 
+/// Render a selectable list and publish one hit per painted row.
+///
+/// The hit is the row's whole line, and its row number comes from the SAME
+/// scroll offset the paint used — so a click can never land on a different row
+/// than the one under the pointer, after a scroll, a resize or a data update.
+/// A row scrolled out of the pane owns no hit at all.
+///
+/// `rows` is (line index within `lines`, the page's own row key). Pages whose
+/// cursor is positional pass the index as the key; pages with stable row
+/// identities pass the identity.
+pub(crate) fn render_list_rows(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    rows: &[(usize, String)],
+    focus: usize,
+    theme: &crate::theme::Theme,
+    hits: &mut Vec<(Rect, String)>,
+) {
+    let offset = list_scroll_offset(lines.len(), area.height as usize, focus);
+    if area.width > 0 {
+        for (line, key) in rows {
+            if *line < offset {
+                continue;
+            }
+            let y = area.y + (*line - offset) as u16;
+            if y >= area.y.saturating_add(area.height) {
+                continue;
+            }
+            hits.push((
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                key.clone(),
+            ));
+        }
+    }
+    render_pane_filled(frame, area, lines, offset, theme);
+}
+
 /// Paint a scrollable pane by materialising every visible row (padded to the
 /// full width). Paragraph alone only writes glyphs, so shorter content can leave
 /// previous frame tails if Clear is skipped or cells get out of sync; filling

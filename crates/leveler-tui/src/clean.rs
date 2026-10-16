@@ -16,7 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::i18n::UiText;
-use crate::render::{render_list_focused, render_scrolled};
+use crate::render::render_scrolled;
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -247,8 +247,7 @@ fn pad_label(label: &str, width: usize) -> String {
 }
 
 /// Render the `/clean` page.
-pub fn render_clean_screen(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = &state.theme;
+pub fn render_clean_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
         title: t.clean.title,
@@ -256,13 +255,21 @@ pub fn render_clean_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         hint: t.clean.footer_hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
     let body = layout.content;
 
-    let (lines, focus) = body_lines(&state.clean, state.tick, body.width as usize, theme, t);
+    let (lines, focus, action_rows) =
+        body_lines(&state.clean, state.tick, body.width as usize, theme, t);
     match focus {
-        Some(focus) => render_list_focused(frame, body, lines, focus, theme),
+        Some(focus) => {
+            let rows: Vec<(usize, String)> =
+                action_rows.iter().map(|i| (*i, i.to_string())).collect();
+            let mut hits = Vec::new();
+            crate::render::render_list_rows(frame, body, lines, &rows, focus, theme, &mut hits);
+            state.screen_rows = hits;
+        }
         None => render_scrolled(frame, body, state, lines),
     }
 }
@@ -273,7 +280,7 @@ fn body_lines(
     _width: usize,
     theme: &Theme,
     t: &UiText,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<Line<'static>>, Option<usize>, Vec<usize>) {
     let dim = Style::default().fg(theme.text.muted);
     let secondary = Style::default().fg(theme.text.secondary);
     let accent = Style::default()
@@ -284,6 +291,9 @@ fn body_lines(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut selected_row: Option<usize> = None;
+    // The line each action was painted on, so a click resolves against the
+    // frame on screen rather than against a remembered position.
+    let mut action_rows: Vec<usize> = Vec::new();
 
     match clean.stage {
         CleanStage::Idle | CleanStage::Scanning => {
@@ -374,11 +384,12 @@ fn body_lines(
             if selected {
                 selected_row = Some(lines.len());
             }
+            action_rows.push(lines.len());
             lines.push(Line::from(Span::styled(format!("{marker} {label}"), style)));
         }
     }
 
-    (lines, selected_row)
+    (lines, selected_row, action_rows)
 }
 
 fn render_summary(lines: &mut Vec<Line<'static>>, clean: &CleanState, theme: &Theme, t: &UiText) {

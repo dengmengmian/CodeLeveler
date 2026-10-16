@@ -23,7 +23,7 @@ use ratatui::text::{Line, Span};
 use crate::context_grid::{self, GridShape};
 use crate::i18n::UiText;
 use crate::render::{
-    pad_display, pad_line_to_width, render_list_focused, render_scrolled, truncate_display,
+    pad_display, pad_line_to_width, render_scrolled, truncate_display,
 };
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -130,10 +130,16 @@ pub fn clamp(view: &mut ContextView) {
 }
 
 /// The built screen: rendered lines plus the line the selection sits on, so
-/// `render_list_focused` can keep it visible.
+/// the list can keep it visible.
 struct ContextScreen {
     lines: Vec<Line<'static>>,
     focus: Option<usize>,
+    /// The composed line each selectable row was painted on, in the same order
+    /// as the visible rows — so a click resolves against the frame on screen.
+    row_lines: Vec<usize>,
+    /// Columns in from the body's left edge that the rows start at: the
+    /// breakdown is a pane of its own when the map shares the row.
+    row_offset_x: usize,
 }
 
 /// The map colour for each top-level category, in the snapshot's own display
@@ -155,8 +161,7 @@ fn top_colors(acc: &ContextAccounting, theme: &Theme) -> HashMap<String, Color> 
         .collect()
 }
 
-pub fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = &state.theme;
+pub fn render_context_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
 
     // Shared Secondary Surface chrome: identity + parent status on top, hints
@@ -167,8 +172,9 @@ pub fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppState) {
         hint: t.context_footer_hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
     let body = layout.content;
 
     let Some(acc) = state.context.loaded.as_ref() else {
@@ -187,7 +193,31 @@ pub fn render_context_screen(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let screen = context_screen(acc, &state.context, body.width as usize, theme, t);
     match screen.focus {
-        Some(focus) => render_list_focused(frame, body, screen.lines, focus, theme),
+        Some(focus) => {
+            let pane_x = body.x.saturating_add(screen.row_offset_x as u16);
+            let pane_w = body.width.saturating_sub(screen.row_offset_x as u16);
+            let rows: Vec<(usize, String)> = screen
+                .row_lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| (*line, i.to_string()))
+                .collect();
+            let mut hits = Vec::new();
+            crate::render::render_list_rows(
+                frame,
+                Rect {
+                    x: pane_x,
+                    width: pane_w,
+                    ..body
+                },
+                screen.lines,
+                &rows,
+                focus,
+                theme,
+                &mut hits,
+            );
+            state.screen_rows = hits;
+        }
         None => render_scrolled(frame, body, state, screen.lines),
     }
 }
@@ -332,8 +362,11 @@ fn context_screen(
     let breakdown = breakdown_lines(acc, view, &rows, &colors, total, right_w, theme, t);
 
     let header = lines.len();
-    let (body, focus) = compose_body(grid, breakdown, side_by_side, left_w, header, view.selected);
-    lines.extend(body);
+    let composed = compose_body(grid, breakdown, side_by_side, left_w, header, view.selected);
+    let row_lines = composed.row_lines;
+    let row_offset_x = composed.row_offset_x;
+    let focus = composed.focus;
+    lines.extend(composed.lines);
 
     lines.push(Line::from(""));
     if let Some(at) = acc.compact_at_tokens {
@@ -370,12 +403,27 @@ fn context_screen(
         .into_iter()
         .map(|line| pad_line_to_width(line, width))
         .collect();
-    ContextScreen { lines, focus }
+    ContextScreen {
+        lines,
+        focus,
+        row_lines,
+        row_offset_x,
+    }
+}
+
+/// A composed body: the lines, the line the selection lands on, and where each
+/// selectable row was painted.
+struct ComposedBody {
+    lines: Vec<Line<'static>>,
+    focus: Option<usize>,
+    row_lines: Vec<usize>,
+    row_offset_x: usize,
 }
 
 /// Compose the map and the breakdown. `side_by_side` is decided by the caller
 /// (it needs the breakdown's width before the rows are laid out). Returns the
-/// body lines and the index (into the returned lines) the selection lands on.
+/// body lines, the index (into the returned lines) the selection lands on, and
+/// the line each selectable row was painted on.
 fn compose_body(
     grid: Option<Vec<Line<'static>>>,
     breakdown: Vec<Line<'static>>,
@@ -383,8 +431,11 @@ fn compose_body(
     left_w: usize,
     header: usize,
     selected: usize,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> ComposedBody {
     const GAP: usize = 3;
+    // The breakdown's own row 0 is its heading, so category `i` is one line
+    // below it — the same `1 + i` the focus has always used.
+    let row_lines = |start: usize| -> Vec<usize> { (0..breakdown.len().saturating_sub(1)).map(|i| start + 1 + i).collect() };
 
     if side_by_side {
         let grid = grid.expect("side-by-side needs a map");
@@ -410,7 +461,12 @@ fn compose_body(
         }
         // Heading sits at breakdown row 0, so the selected category is at
         // `1 + selected`.
-        return (body, Some(header + 1 + selected));
+        return ComposedBody {
+            lines: body,
+            focus: Some(header + 1 + selected),
+            row_lines: row_lines(0),
+            row_offset_x: left_w + GAP,
+        };
     }
 
     let mut body = Vec::new();
@@ -423,8 +479,14 @@ fn compose_body(
     }
     // Heading at breakdown row 0, so the selected category is at `start + 1`.
     let focus = header + start + 1 + selected;
+    let row_lines = row_lines(start);
     body.extend(breakdown);
-    (body, Some(focus))
+    ComposedBody {
+        lines: body,
+        focus: Some(focus),
+        row_lines,
+        row_offset_x: 0,
+    }
 }
 
 /// Render the map as rows of glyphs, each row joined by one space.

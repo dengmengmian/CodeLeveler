@@ -65,6 +65,20 @@ fn col_of(line: &str, needle: &str) -> Option<usize> {
     line.find(needle).map(|b| line[..b].chars().count())
 }
 
+/// The shell's safe horizontal margin, as the product specifies it: two
+/// columns from 80 up, one in the 40–79 band, none below — where every column
+/// is needed for the content and the nav to stay readable.
+///
+/// Spelled out rather than read from the code under test: this is the
+/// user-facing contract, so a change to it should fail here and be argued for.
+fn gutter(width: u16) -> usize {
+    match width {
+        w if w >= 80 => 2,
+        w if w >= 40 => 1,
+        _ => 0,
+    }
+}
+
 fn btw_state(question: &str, answer: &str) -> AppState {
     let mut s = opened();
     s.surface = SurfaceFocus::Btw;
@@ -107,8 +121,10 @@ fn btw_wraps_continuation_under_the_message_text() {
         .iter()
         .position(|l| l.contains('●'))
         .expect("assistant marker");
-    // Text begins after "page padding (2) + marker + gap".
-    assert_eq!(col_of(&lines[asst_row], "第"), Some(4));
+    // Text begins after "page padding + marker + gap"; 60 columns is in the
+    // narrow band, so the padding is one column.
+    let text_col = gutter(60) + 2;
+    assert_eq!(col_of(&lines[asst_row], "第"), Some(text_col));
     let next = &lines[asst_row + 1];
     assert!(
         !next.trim().is_empty(),
@@ -117,8 +133,8 @@ fn btw_wraps_continuation_under_the_message_text() {
     );
     assert!(!next.contains('●'));
     assert_eq!(
-        next.chars().take(4).collect::<String>(),
-        "    ",
+        next.chars().take(text_col).collect::<String>(),
+        " ".repeat(text_col),
         "continuation aligns under the text: {next:?}"
     );
 }
@@ -201,14 +217,18 @@ fn btw_shell_renders_at_narrow_widths() {
         let mut s = btw_state("问题", "回答内容");
         let lines = frame(&mut s, w, 20);
         assert_eq!(lines.len(), 20, "w={w}");
-        assert!(
-            lines[0].contains('←'),
-            "w={w}: identity header missing:\n{}",
+        assert_eq!(
+            lines[0].find('←'),
+            Some(gutter(w)),
+            "w={w}: header off the safe margin:\n{}",
             lines.join("\n")
         );
         assert!(
-            lines.iter().any(|l| l.starts_with('─')),
-            "w={w}: shell rule missing"
+            lines
+                .iter()
+                .any(|l| l.len() >= gutter(w) && l[gutter(w)..].starts_with('─')),
+            "w={w}: shell rule missing or off the safe margin:\n{}",
+            lines.join("\n")
         );
         assert!(
             lines.iter().any(|l| l.contains("Esc")),
@@ -231,7 +251,17 @@ fn secondary_pages_use_the_shared_shell() {
         lines[0]
     );
     assert!(!lines[0].contains("CodeLeveler"), "no stacked app header");
-    assert!(lines[1].starts_with('─'), "rule under the header");
+    // The rule shares the header's and the body's safe margin.
+    assert!(
+        lines[1][gutter(100)..].starts_with('─'),
+        "rule under the header, on the page gutter: {:?}",
+        lines[1]
+    );
+    assert!(
+        !lines[1].starts_with('─'),
+        "the rule does not run out to the terminal edge: {:?}",
+        lines[1]
+    );
     // Help now owns a search box, so its footer teaches searching rather than
     // plain scrolling.
     assert!(

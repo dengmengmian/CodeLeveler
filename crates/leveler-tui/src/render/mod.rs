@@ -19,7 +19,6 @@ use crate::tool_cell::render_tools_screen;
 /// gutter.
 fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
     use crate::transcript::UserShellStatus;
-    let theme = &state.theme;
     let t = state.t();
     let hint = if state
         .focused_user_shell()
@@ -35,8 +34,9 @@ fn render_shell_screen(frame: &mut Frame, area: ratatui::layout::Rect, state: &m
         hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
@@ -221,10 +221,7 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
                 .get(task_id)
                 .is_some_and(|task| task.is_running()) =>
         {
-            background_stop_rect(
-                crate::layout::horizontal_inset(layout.footer, crate::secondary::PADDING_X),
-                t,
-            )
+            background_stop_rect(layout.footer, t)
             .map(|rect| (rect, task_id.clone()))
         }
         _ => None,
@@ -249,13 +246,8 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
         status: crate::secondary::main_status_spans(state, area.width as usize),
         hint: &hint,
     };
-    let back = {
-        let theme = &state.theme;
-        let back = crate::secondary::draw_header(frame, &layout, &page, theme);
-        crate::secondary::draw_footer(frame, &layout, &page, theme);
-        back
-    };
-    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
     let offset = state
         .activity_view
         .scroll
@@ -270,7 +262,6 @@ fn render_activity_screen(frame: &mut Frame, area: ratatui::layout::Rect, state:
 /// A closed / retired activity: still inside the shared shell, so the chrome
 /// never flickers between two layouts.
 fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut AppState) {
-    let theme = &state.theme;
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
         title: t.activity_title_background,
@@ -278,17 +269,13 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         hint: t.activity_esc,
     };
     let layout = crate::secondary::layout(area, 0);
-    let back = crate::secondary::draw_header(frame, &layout, &page, theme);
-    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
-    {
-        let theme = &state.theme;
-        crate::secondary::draw_footer(frame, &layout, &page, theme);
-        let lines = vec![Line::from(Span::styled(
-            t.activity_stale.to_string(),
-            Style::default().fg(theme.text.muted),
-        ))];
-        frame.render_widget(Paragraph::new(lines), layout.content);
-    }
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let lines = vec![Line::from(Span::styled(
+        t.activity_stale.to_string(),
+        Style::default().fg(state.theme.text.muted),
+    ))];
+    frame.render_widget(Paragraph::new(lines), layout.content);
 }
 
 /// The Background Tasks page: a master/detail console.
@@ -307,7 +294,6 @@ fn render_activity_stale(frame: &mut Frame, area: ratatui::layout::Rect, state: 
 /// exactly like two. It is observational, like the roster: Enter opens a child's
 /// detail, `x` stops a running one, and nothing here cancels work by itself.
 fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let theme = &state.theme;
     let t = state.t();
     let hint = if state.team.children.is_empty() {
         t.team_page_hint_empty
@@ -317,19 +303,28 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let counts = state.team.children.len().to_string();
     let page = crate::secondary::SecondaryPage {
         title: t.team_page_title,
-        status: vec![Span::styled(counts, Style::default().fg(theme.text.muted))],
+        status: vec![Span::styled(
+            counts,
+            Style::default().fg(state.theme.text.muted),
+        )],
         hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
     }
 
     // One list, one detail, one rule between — the split the Diff page uses.
-    let list_width = ((body.width as usize) * 40 / 100).clamp(24, 64) as u16;
+    // The list yields to the body before its own floor does: a viewport too
+    // narrow for both panes gives every column it has to the one that is
+    // always there, rather than pushing the detail pane past the right margin.
+    let list_width = ((body.width as usize) * 40 / 100)
+        .clamp(12, 64)
+        .min(body.width.saturating_sub(1) as usize) as u16;
     let list_area = Rect {
         width: list_width,
         ..body
@@ -340,7 +335,7 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..body
     };
 
-    state.team_hits.clear();
+    state.screen_rows.clear();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut row_starts: Vec<(usize, String)> = Vec::new();
     if state.team.children.is_empty() {
@@ -394,7 +389,7 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .min(max_offset);
     for (line, id) in &row_starts {
         if *line >= offset && *line + 1 < offset + visible {
-            state.team_hits.push((
+            state.screen_rows.push((
                 Rect {
                     y: list_area.y + (*line - offset) as u16,
                     height: 2,
@@ -436,7 +431,6 @@ fn render_team_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
 }
 
 fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let theme = &state.theme;
     let t = state.t();
     let list = crate::activity::background_job_list(state);
     let counts = format!(
@@ -449,14 +443,16 @@ fn render_background_list_screen(frame: &mut Frame, area: Rect, state: &mut AppS
     let hint = background_page_hint(state, &list, t);
     let page = crate::secondary::SecondaryPage {
         title: t.background_list_title,
-        status: vec![Span::styled(counts, Style::default().fg(theme.text.muted))],
+        status: vec![Span::styled(
+            counts,
+            Style::default().fg(state.theme.text.muted),
+        )],
         hint: &hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    let back = crate::secondary::draw_header(frame, &layout, &page, &state.theme);
-    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
     let theme = &state.theme;
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
@@ -1329,7 +1325,7 @@ pub(crate) use transcript_lines::{
 };
 
 pub(crate) use panes::pad_line_to_width;
-pub(crate) use panes::{render_list_focused, render_scrolled};
+pub(crate) use panes::{render_list_focused, render_list_rows, render_scrolled};
 pub(crate) use screens::screen_title;
 pub(crate) use text::{pad_display, sanitize_terminal_line, truncate_display, wrap};
 
@@ -1346,6 +1342,10 @@ use screens::{render_diff_screen, render_help_screen, render_sessions_screen};
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     state.background_stop_hits.clear();
     state.background_list_hits.clear();
+    // Every page republishes its own row hits, so a page that publishes none
+    // leaves none behind: a click can only ever land on what this frame drew.
+    state.screen_rows.clear();
+    state.back_hit = None;
     state.background_list_rect = None;
     state.background_output_rect = None;
     let area = frame.area();
@@ -1402,7 +1402,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
 }
 
 fn render_goal_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let theme = &state.theme;
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
         title: t.goal_detail_title,
@@ -1410,8 +1409,9 @@ fn render_goal_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         hint: t.goal_detail_hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
@@ -1484,13 +1484,8 @@ fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         hint: t.issue_page_hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    let back = {
-        let theme = &state.theme;
-        let back = crate::secondary::draw_header(frame, &layout, &page, theme);
-        crate::secondary::draw_footer(frame, &layout, &page, theme);
-        back
-    };
-    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
     let body = layout.content;
     state.issue_row_hits.clear();
     state.issue_detail_hits.clear();
@@ -1502,29 +1497,47 @@ fn render_issue_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Publish exactly the painted rows: a row scrolled out of the viewport owns
     // no hit, and a resize republishes against the new geometry on the next
     // frame.
+    //
+    // The `line < scroll` guard comes FIRST and the row arithmetic is checked:
+    // computing a row's screen line before knowing the row is on screen is how
+    // a scroll subtracts past zero and wraps the rectangle onto a neighbouring
+    // row (or panics outright in a debug build).
     let max = view.lines.len().saturating_sub(body.height as usize);
-    let scroll = state.screen_scroll.min(max) as u16;
+    let scroll = state.screen_scroll.min(max);
+    let bottom = body.y.saturating_add(body.height);
+    let right = body.x.saturating_add(body.width);
     for (line, key) in &view.rows {
-        let y = body.y + (*line as u16).wrapping_sub(scroll);
-        if !(body.y..body.y + body.height).contains(&y) || *line < scroll as usize {
+        if *line < scroll {
             continue;
         }
-        state
-            .issue_row_hits
-            .push((y, body.x, body.x + body.width, key.clone()));
+        let Ok(offset) = u16::try_from(*line - scroll) else {
+            continue;
+        };
+        let Some(y) = body.y.checked_add(offset) else {
+            continue;
+        };
+        if y >= bottom {
+            continue;
+        }
+        state.issue_row_hits.push((y, body.x, right, key.clone()));
     }
     for (line, x0, x1, key) in &view.details {
-        if *line < scroll as usize {
+        if *line < scroll {
             continue;
         }
-        let y = body.y + (*line as u16) - scroll;
-        if !(body.y..body.y + body.height).contains(&y) {
+        let Ok(offset) = u16::try_from(*line - scroll) else {
+            continue;
+        };
+        let Some(y) = body.y.checked_add(offset) else {
+            continue;
+        };
+        if y >= bottom {
             continue;
         }
         state.issue_detail_hits.push((
             y,
-            body.x + *x0 as u16,
-            body.x + *x1 as u16,
+            body.x.saturating_add(*x0 as u16),
+            body.x.saturating_add(*x1 as u16),
             key.clone(),
         ));
     }
@@ -1678,7 +1691,6 @@ fn issue_page_view(
 /// open, the exact plan just archived in the transcript remains readable until
 /// the user returns.
 fn render_plan_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let theme = &state.theme;
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
         title: t.active_plan,
@@ -1686,8 +1698,9 @@ fn render_plan_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
         hint: t.plan_detail_hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
     let body = layout.content;
     if body.width == 0 || body.height == 0 {
         return;
@@ -2839,9 +2852,12 @@ mod tests {
             .iter()
             .find(|l| l.contains("Background Task"))
             .expect("identity header");
-        assert!(
-            header.starts_with('←'),
-            "back nav owns the edge: {header:?}"
+        // The nav sits ON the page's safe margin, not on the terminal edge:
+        // header, rule, body and footer all start in the same column.
+        assert_eq!(
+            header.find('←'),
+            Some(crate::secondary::padding_x(90) as usize),
+            "back nav shares the content gutter: {header:?}"
         );
         for expected in [
             "  cargo test --workspace",
@@ -2953,7 +2969,14 @@ mod tests {
         let mut state = running_child_with_activity();
         for (w, h) in [(100u16, 40u16), (40, 12), (80, 24), (30, 8)] {
             let text = render_text(&mut state, w, h);
-            assert!(text.starts_with('←'), "w={w}: nav at the edge:\n{text}");
+            // The nav shares the page's safe margin at every size, so it is
+            // always visible and never the thing that gets clipped.
+            let nav = text.lines().next().unwrap_or("");
+            assert_eq!(
+                nav.find('←'),
+                Some(crate::secondary::padding_x(w) as usize),
+                "w={w}: nav off the content gutter:\n{text}"
+            );
             assert!(
                 text.contains("Sub-agent"),
                 "w={w}: page identity survives resize:\n{text}"

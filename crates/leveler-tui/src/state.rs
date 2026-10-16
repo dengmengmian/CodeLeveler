@@ -451,8 +451,6 @@ pub struct AppState {
     /// Selected child agent on the Team page, by runtime id. Selection only:
     /// the page owns no scroll state, so a resize cannot strand the row.
     pub team_selected: Option<String>,
-    /// Click targets for the Team page's rows.
-    pub team_hits: Vec<(ratatui::layout::Rect, String)>,
     pub background_list_selected: Option<String>,
     /// Task ids whose failure the user has already seen. Session-local: it
     /// marks the issue "read", never solved — the task's terminal state,
@@ -484,6 +482,12 @@ pub struct AppState {
     /// issue page, the background list); `None` means the conversation. The
     /// detail page itself never guesses its parent — it reads this.
     pub detail_return: Option<Screen>,
+    /// The rows the active page painted this frame: (rect, the page's own row
+    /// key). Republished every frame, so a click resolves against exactly what
+    /// is on screen — after a scroll, a resize or a data update — and a row
+    /// that was never painted owns no hit. The key's meaning belongs to the
+    /// page: a stable id where one exists, the row's index otherwise.
+    pub screen_rows: Vec<(ratatui::layout::Rect, String)>,
     /// Painted stop controls, bound to their screen and exact task identity.
     /// These are hit regions only; cancellation rechecks the live projection.
     pub background_list_hits: Vec<(ratatui::layout::Rect, String)>,
@@ -704,7 +708,6 @@ impl AppState {
             activity_view: crate::activity::ActivityView::default(),
             activity_hits: Vec::new(),
             team_selected: None,
-            team_hits: Vec::new(),
             background_list_selected: None,
             background_failures_seen: std::collections::HashSet::new(),
             background_hit: None,
@@ -715,6 +718,7 @@ impl AppState {
             issue_detail_hits: Vec::new(),
             back_hit: None,
             detail_return: None,
+            screen_rows: Vec::new(),
             background_list_hits: Vec::new(),
             background_list_rect: None,
             background_output_rect: None,

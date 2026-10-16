@@ -223,6 +223,13 @@ pub(crate) fn collapse_selected(state: &mut AppState) -> bool {
     state.issue_expanded.remove(&key)
 }
 
+/// The issue the page's cursor is on, if it still exists. Keyed by stable
+/// identity, so a failure that left the projection is never acted on.
+pub(crate) fn selected_issue(state: &AppState) -> Option<Issue> {
+    let key = state.issue_selected.as_deref()?;
+    active_issues(state).into_iter().find(|issue| issue.key == key)
+}
+
 /// Move the page's selection over the active issues.
 pub(crate) fn move_selection(state: &mut AppState, delta: isize) {
     ensure_selection(state);

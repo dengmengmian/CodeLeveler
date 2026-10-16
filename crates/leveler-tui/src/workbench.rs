@@ -3516,7 +3516,7 @@ mod tests {
                 "fixture sanity: {id}"
             );
         }
-        let listed = state.team_hits.len();
+        let listed = state.screen_rows.len();
         assert_eq!(listed, 6, "all six children are on the page: {screen}");
 
         // Enter opens the selected child's Activity detail and keeps the work.
