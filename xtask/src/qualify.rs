@@ -39,17 +39,6 @@ pub fn run_dogfood(
     Ok(format_dogfood(&snap.head, &qual))
 }
 
-pub fn run_release(
-    host: &dyn Host,
-    repo: &Path,
-    env: &Env,
-    opts: &GateOpts,
-) -> Result<Report, Fail> {
-    let snap = git::snapshot(host, repo)?;
-    git::require_clean(&snap)?;
-    run_release_locked(host, repo, env, opts, &snap)
-}
-
 pub(crate) fn run_pre_release_locked(
     host: &dyn Host,
     repo: &Path,
@@ -125,18 +114,6 @@ pub(crate) fn run_dogfood_locked(
         baseline,
         notes,
     })
-}
-
-pub(crate) fn run_release_locked(
-    host: &dyn Host,
-    repo: &Path,
-    env: &Env,
-    opts: &GateOpts,
-    locked: &Snapshot,
-) -> Result<Report, Fail> {
-    let pre = run_pre_release_locked(host, repo, env, opts, locked)?;
-    let qual = run_dogfood_locked(host, repo, env, opts, locked)?;
-    Ok(format_release(&locked.head, &pre, &qual))
 }
 
 pub(crate) fn dogfood_exit(release_exit: i32, rc_exit: Option<i32>) -> i32 {
@@ -388,7 +365,7 @@ fn object_exists(host: &dyn Host, clone: &Path, sha: &str) -> Result<bool, Fail>
     Ok(host.run(&spec)?.status == 0)
 }
 
-fn read_baseline(lab: &Path) -> Result<String, Fail> {
+pub(crate) fn read_baseline(lab: &Path) -> Result<String, Fail> {
     let path = lab.join("eval/release/BASELINE");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -462,37 +439,6 @@ fn format_dogfood(sha: &str, qual: &Qualification) -> Report {
         ),
         format!("RC Qualification: {rc}"),
         format!("Dogfood: {}", verdict(qual.exit_code)),
-    ];
-    lines.extend(qual.notes.iter().cloned());
-    Report::with_code(qual.exit_code, lines.join("\n"))
-}
-
-fn format_release(sha: &str, pre: &Report, qual: &Qualification) -> Report {
-    let detail = pre
-        .text
-        .lines()
-        .filter(|line| {
-            line.starts_with("L0:")
-                || line.starts_with("L1:")
-                || line.starts_with("L2:")
-                || line.starts_with("Release run:")
-                || line.starts_with("fetched ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let ready = match qual.exit_code {
-        0 => "YES",
-        2 => "CONDITIONAL",
-        _ => "NO",
-    };
-    let rc = qual.rc_exit.map(verdict).unwrap_or("NOT_STARTED");
-    let mut lines = vec![
-        format!("Candidate: {sha}"),
-        "Release Gate: PASS".to_string(),
-        detail,
-        format!("Dogfood: {}", verdict(qual.release_exit)),
-        format!("RC Qualification: {rc}"),
-        format!("Ready to release: {ready}"),
     ];
     lines.extend(qual.notes.iter().cloned());
     Report::with_code(qual.exit_code, lines.join("\n"))
