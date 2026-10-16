@@ -235,31 +235,6 @@ pub(crate) fn draw_footer(
     );
 }
 
-/// Chrome for a view that has not adopted the shell yet: the app header strip,
-/// the runtime status strip, and the body in between. Keeps the pre-shell frame
-/// so a surface is not forced into the Secondary Surface language before it
-/// fits (split panes, QR decisions, live execution).
-pub(crate) fn legacy_frame(frame: &mut Frame, area: Rect, state: &AppState) -> Rect {
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    frame.render_widget(
-        Paragraph::new(crate::status_line::header_line(state, area.width as usize)),
-        chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new(crate::status_line::status_line_content(
-            state,
-            area.width as usize,
-        )),
-        chunks[2],
-    );
-    chunks[1]
-}
-
 /// A full-width horizontal rule.
 fn draw_rule(frame: &mut Frame, area: Rect, theme: &Theme) {
     if area.width == 0 || area.height == 0 {

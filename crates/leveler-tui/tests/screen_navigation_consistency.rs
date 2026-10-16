@@ -489,10 +489,9 @@ fn a_wheel_notch_moves_the_same_cursor_the_keys_move() {
 
 // ---- helpers ---------------------------------------------------------------
 
-/// Every page that paints the shell's `← <title>` header.
-///
-/// The legacy-framed views (Tools, Diff, Remote, Trace) are absent on purpose:
-/// they draw the pre-shell app header, which has no `←` at all.
+/// Every page that paints the shell's `← <title>` header — which is now every
+/// independent page: the last four to keep the pre-shell app frame (Tools,
+/// Diff, Remote, Trace) draw the same header as the rest.
 fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
     vec![
         (Screen::Plan, "Plan"),
@@ -506,6 +505,10 @@ fn pages_with_a_back_glyph() -> Vec<(Screen, &'static str)> {
         (Screen::Context, "Context"),
         (Screen::Clean, "Clean"),
         (Screen::Shell, "Shell"),
+        (Screen::Tools, "Tools"),
+        (Screen::Diff, "Diff"),
+        (Screen::Remote, "Remote"),
+        (Screen::Trace, "Trace"),
     ]
 }
 

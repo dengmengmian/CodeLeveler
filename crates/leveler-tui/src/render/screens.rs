@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use unicode_width::UnicodeWidthStr;
@@ -157,21 +157,24 @@ fn search_cursor(frame: &mut Frame, area: Rect, query: &str, zh: bool) {
     }
 }
 
-pub(crate) fn screen_title(title: &str, theme: &Theme) -> Line<'static> {
-    Line::from(Span::styled(
-        title.to_string(),
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD),
-    ))
-}
-
 pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    // Split panes with their own pane titles: the single-header shell does not
-    // fit, so this view keeps the legacy app frame.
-    let area = crate::secondary::legacy_frame(frame, area, state);
-    let theme = &state.theme;
+    // The shared shell, with the split inside its body: the page's identity
+    // and its way back are the header, the hint is the footer, and the two
+    // panes keep their own titles inside the content rect.
     let t = state.t();
+    // A diff is always "of something": the branch and repo are this page's own
+    // summary, and they belong on the header rather than in a second strip the
+    // rest of the pages do not have.
+    let page = crate::secondary::SecondaryPage {
+        title: t.screen_diff,
+        status: crate::status_line::header_line(state, area.width as usize).spans,
+        hint: t.diff_footer_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
+    let area = layout.content;
     // Wipe the whole split first so a shorter file/list can't leave ghosts
     // from the previous selection or scroll position.
     theme.paint_canvas(frame, area);
@@ -290,11 +293,8 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &mut AppS
             ))),
         }
     }
-    detail.push(Line::from(""));
-    detail.push(Line::from(Span::styled(
-        t.diff_footer_hint,
-        Style::default().fg(theme.text.secondary),
-    )));
+    // The binding hints are the shell's footer now; the patch pane ends on its
+    // own content rather than repeating them.
     render_scrolled(frame, detail_area, state, detail);
 }
 

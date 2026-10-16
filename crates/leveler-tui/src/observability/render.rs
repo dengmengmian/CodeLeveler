@@ -5,18 +5,28 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::render::{render_scrolled, screen_title};
+use crate::render::render_scrolled;
 use crate::state::AppState;
 use crate::status_line::fmt_tokens_compact;
 
 use super::model::TraceTab;
 
 pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let area = crate::secondary::legacy_frame(frame, area, state);
-    let theme = &state.theme;
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The shared shell: the page's identity, its status and its way back live
+    // in the header, the tabs open the body, and the hint is the footer — the
+    // same chrome every other independent page draws.
     let t = state.t();
-    lines.push(screen_title(t.trace_title, theme));
+    let page = crate::secondary::SecondaryPage {
+        title: t.trace_title,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.trace_hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
+    let area = layout.content;
+    let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(tab_line(state));
     lines.push(Line::from(""));
 
@@ -38,16 +48,10 @@ pub fn render_trace_screen(frame: &mut Frame, area: Rect, state: &mut AppState) 
         TraceTab::Recovery => recovery(&mut lines, state, loaded),
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        t.trace_hint,
-        Style::default().fg(theme.text.muted),
-    )));
-
     if state.trace.tab == TraceTab::Trace {
-        // The request rows start under the title, the tab line and a blank —
-        // the same three header rows the focus offset has always used.
-        const HEADER_ROWS: usize = 3;
+        // The request rows start under the tab line and its blank; the page's
+        // own title now lives in the shell's header, not in the body.
+        const HEADER_ROWS: usize = 2;
         let focus = HEADER_ROWS.saturating_add(state.trace.selected);
         let rows: Vec<(usize, String)> = (0..state.trace.filtered().len())
             .map(|i| (HEADER_ROWS + i, i.to_string()))

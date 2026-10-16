@@ -1326,7 +1326,6 @@ pub(crate) use transcript_lines::{
 
 pub(crate) use panes::pad_line_to_width;
 pub(crate) use panes::{render_list_focused, render_list_rows, render_scrolled};
-pub(crate) use screens::screen_title;
 pub(crate) use text::{pad_display, sanitize_terminal_line, truncate_display, wrap};
 
 pub(crate) use footer::{
@@ -1803,26 +1802,27 @@ fn plan_detail_lines(
 /// Title + subtitle, a centered QR, labeled address/fingerprint, then either
 /// the waiting/paste copy or the pending y/n decision. Footer always reminds
 /// Esc returns to the conversation without cancelling the invite.
-fn render_remote_screen(frame: &mut Frame, area: Rect, state: &AppState) {
-    let area = crate::secondary::legacy_frame(frame, area, state);
-    let theme = &state.theme;
+fn render_remote_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    // The shared shell: the page's identity and the way back are the header,
+    // Esc's promise is the footer, and the QR is the body.
     let t = state.t();
+    let page = crate::secondary::SecondaryPage {
+        title: t.screen_remote,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: t.remote_footer,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
+    let area = layout.content;
     let width = area.width as usize;
 
     let Some(remote) = &state.remote else {
-        let lines = vec![
-            screens::screen_title(t.screen_remote, theme),
-            Line::from(""),
-            Line::from(Span::styled(
-                t.remote_preparing.to_string(),
-                Style::default().fg(theme.text.secondary),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                t.remote_footer.to_string(),
-                Style::default().fg(theme.text.muted),
-            )),
-        ];
+        let lines = vec![Line::from(Span::styled(
+            t.remote_preparing.to_string(),
+            Style::default().fg(theme.text.secondary),
+        ))];
         render_scrolled(frame, area, state, lines);
         return;
     };
@@ -1856,8 +1856,6 @@ fn remote_screen_lines(
         .add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = vec![
-        screens::screen_title(t.screen_remote, theme),
-        Line::from(""),
         Line::from(Span::styled(t.remote_scan_heading.to_string(), bold_text)),
         Line::from(Span::styled(t.remote_scan_sub.to_string(), muted)),
         Line::from(""),
@@ -1952,17 +1950,6 @@ fn remote_screen_lines(
         }
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "─".repeat(width.clamp(8, 48)),
-        dim,
-    )));
-    lines.push(Line::from(Span::styled(
-        t.remote_footer.to_string(),
-        Style::default()
-            .fg(theme.accent.primary)
-            .add_modifier(Modifier::BOLD),
-    )));
     lines
 }
 
@@ -3201,7 +3188,7 @@ mod tests {
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Busy;
         s.activity = Some("运行 cargo test".into());
-        let text = line_str(&crate::status_line::status_line_content(&s, 80));
+        let text = line_str(&crate::status_line::status_lines(&s, 80)[0]);
         assert!(
             text.contains("运行 cargo test"),
             "the real activity must be shown, not a whimsy word: {text:?}"
@@ -3727,7 +3714,7 @@ mod tests {
     fn error_status_does_not_reference_missing_command() {
         let mut s = test_state();
         s.status = leveler_client_protocol::RuntimeStatus::Error;
-        let text = line_str(&crate::status_line::status_line_content(&s, 80));
+        let text = line_str(&crate::status_line::status_lines(&s, 80)[0]);
         assert!(
             !text.contains("/status"),
             "/status is not implemented; the hint must not point at it: {text:?}"
@@ -4999,7 +4986,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_screen_shows_title_qr_meta_and_esc_footer() {
+    fn remote_screen_shows_qr_meta_and_paste_payload() {
         let theme = Theme::dark();
         let t = crate::i18n::Locale::Zh.text();
         let lines = super::remote_screen_lines(&sample_remote(), 72, &theme, t);
@@ -5007,7 +4994,14 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
-        assert!(text.contains(t.screen_remote), "title: {text}");
+        // The page's identity and Esc's promise are the shell's header and
+        // footer; the body carries only what the shell cannot. Repeating them
+        // in the body would be the second chrome this page used to have.
+        assert!(!text.contains(t.screen_remote), "title in the body: {text}");
+        assert!(
+            !text.contains(t.remote_footer),
+            "the footer hint belongs to the shell: {text}"
+        );
         assert!(text.contains(t.remote_scan_heading), "heading: {text}");
         assert!(
             text.contains("http://172.20.54.97:18443"),
@@ -5017,11 +5011,6 @@ mod tests {
         assert!(
             text.contains("LV1|rt_test|payload"),
             "paste payload: {text}"
-        );
-        assert!(text.contains("Esc"), "Esc footer required: {text}");
-        assert!(
-            text.contains(t.remote_footer) || text.contains("返回对话"),
-            "footer must tell the user Esc returns to chat: {text}"
         );
         // QR card frame
         assert!(text.contains('┌') && text.contains('└'), "QR frame: {text}");
@@ -5048,6 +5037,5 @@ mod tests {
             text.contains("y ") || text.contains("y接受") || text.contains(t.remote_yn),
             "{text}"
         );
-        assert!(text.contains("Esc"), "{text}");
     }
 }
