@@ -98,6 +98,21 @@ CodeLeveler can start without it, but commands that require Linux isolation fail
 
 Daily commands are `./dev`. `./dev fmt` formats only the Rust files owned by the current task and does not run `cargo fmt --all`. Release eligibility is the external lab: `release_check.py`, then `rc_check.py`. `./dev` invokes those scripts and does not replace them. Run `./dev help` for the command list.
 
+### Releasing
+
+`./dev publish` is one release transaction: it bumps the version and commits it, then runs four stages and stops at the first failure.
+
+| Stage | What it runs |
+| --- | --- |
+| 1 build & static | fmt, clippy, the release build, the supply-chain checks, the frozen binary's identity |
+| 2 automated tests | the full workspace suite, the release contracts, the permission gates, TUI and PTY |
+| 3 real dogfood | the model-driven cases and performance evidence, then the RC qualification |
+| 4 CI/CD & publish | push the frozen commit, wait for the required CI on exactly that commit, dispatch the release workflow once, then verify the tag, the release, the published assets and their SHA-256 |
+
+Each stage records the inputs it decided on and a digest of the evidence it accepted. `./dev publish --resume` re-earns only the stages whose inputs changed and keeps the version already in progress, so a fix after a failed stage 3 still ships as the same version. `--status` reports where the transaction stands, `--report` rewrites the report, `--dry-run` prints the plan, and `--stop-after <1..4>` stops early.
+
+A release is only `RELEASED` in the report once the tag, the GitHub release and the published assets have been verified; a dispatch is never treated as a result. Reports are written to `.dev/release/<version>/RELEASE_REPORT.md` and `release.json`, and archived next to the dogfood evidence when there is a run.
+
 ### Mirrors (AtomGit, GitHub proxies)
 
 Every stable release is also published on AtomGit (`atomgit.com/dengmengmian/CodeLeveler`),
