@@ -1133,6 +1133,25 @@ fn a_tag_that_only_origin_has_still_counts_as_released() {
 }
 
 #[test]
+fn the_version_bump_resolves_so_the_lockfile_is_committed_with_it() {
+    // Every historical `release: vX` commit contains Cargo.lock: the bump has to
+    // reach it, or the candidate builds from a lockfile nobody committed and
+    // stage 4's frozen-commit check fails.
+    let world = World::new();
+    let (code, rendered, log) = world.run(&["publish", "--stop-after", "1"]);
+    assert_eq!(code, 0, "{rendered}");
+    let metadata = log
+        .iter()
+        .find(|spec| spec.program == "cargo")
+        .expect("the bump resolves the workspace");
+    assert_eq!(
+        metadata.args,
+        vec!["metadata", "--format-version", "1"],
+        "the resolve must be complete so Cargo.lock is written"
+    );
+}
+
+#[test]
 fn a_stage_fetches_the_frozen_commit_into_the_lab_before_the_gate_runs() {
     // The lab reads the candidate out of its own clone and a version commit is
     // new by definition, so the pipeline must put it there. Without this the

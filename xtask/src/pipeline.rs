@@ -739,11 +739,13 @@ fn bump_version_files(repo: &Path, plan: &Plan) -> Result<(), Fail> {
 /// Commit the version files. From here on the release candidate is a frozen
 /// commit; the transaction records it before anything is qualified.
 fn commit_version_files(host: &dyn Host, repo: &Path, plan: &Plan) -> Result<(), Fail> {
-    // `cargo metadata` proves the manifest is still parseable before it is
-    // committed: a half-written version file must not become a candidate.
+    // A full `cargo metadata` resolve, not `--no-deps`: the version bump has to
+    // reach Cargo.lock too, and a `--no-deps` resolve leaves the lockfile on the
+    // previous version. It also proves the manifest is still parseable before it
+    // is committed, so a half-written version file cannot become a candidate.
     let metadata = host.run(&CommandSpec::new(
         "cargo",
-        ["metadata", "--format-version", "1", "--no-deps"],
+        ["metadata", "--format-version", "1"],
         repo,
     ))?;
     if metadata.status != 0 {
