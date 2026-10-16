@@ -416,13 +416,6 @@ pub(crate) fn status_phase(state: &AppState) -> StatusPhase {
 
 /// First status-strip row. Prefer [`status_lines`] when the wait disclosure
 /// may occupy more than one row.
-pub(crate) fn status_line_content(state: &AppState, width: usize) -> Line<'static> {
-    status_lines(state, width)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| Line::from(""))
-}
-
 /// Status strip: one headline, then a compact disclosure of the wait target.
 pub(crate) fn status_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     status_lines_with(state, width, true)
@@ -1138,7 +1131,7 @@ mod tests {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
         state.goal_mode_active = true;
-        let status = status_line_content(&state, 120).to_string();
+        let status = status_lines(&state, 120)[0].to_string();
         assert!(status.contains("目标模式"), "status: {status}");
         assert!(status.contains("等待模型"), "status: {status}");
     }
@@ -1156,7 +1149,7 @@ mod tests {
         state
             .transcript
             .append_thought(&"先确认环境，再决定怎么落盘……".repeat(20));
-        let status = status_line_content(&state, 120).to_string();
+        let status = status_lines(&state, 120)[0].to_string();
         assert!(status.contains("思考"), "status: {status}");
         assert!(!status.contains("等待模型"), "status: {status}");
     }
@@ -1169,7 +1162,7 @@ mod tests {
         state.status = RuntimeStatus::Busy;
         state.transcript.append_thought(&"……".repeat(40));
         state.activity = Some("运行 cargo test".into());
-        let status = status_line_content(&state, 120).to_string();
+        let status = status_lines(&state, 120)[0].to_string();
         assert!(status.contains("运行 cargo test"), "status: {status}");
     }
 
@@ -1178,7 +1171,7 @@ mod tests {
     fn an_idle_model_call_still_reads_as_waiting() {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
-        let status = status_line_content(&state, 120).to_string();
+        let status = status_lines(&state, 120)[0].to_string();
         assert!(status.contains("等待模型"), "status: {status}");
     }
 
@@ -1191,7 +1184,7 @@ mod tests {
         state.token_input = 224_318;
         state.token_output = 3_563;
 
-        let line = status_line_content(&state, 120);
+        let line = status_lines(&state, 120)[0].clone();
         let label = line
             .spans
             .iter()
@@ -1212,7 +1205,7 @@ mod tests {
         let mut state = test_state();
         state.status = RuntimeStatus::Busy;
         state.finalization_stage = Some(FinalizationStage::Review);
-        let status = status_line_content(&state, 120).to_string();
+        let status = status_lines(&state, 120)[0].to_string();
         assert!(status.contains("正在完成评审"), "status: {status}");
         assert!(!status.contains("等待模型"), "status: {status}");
     }
@@ -1364,7 +1357,7 @@ mod tests {
     fn status_phase_idle_when_nothing_running() {
         let state = test_state();
         assert_eq!(status_phase(&state), StatusPhase::Idle);
-        let text = status_line_content(&state, 120).to_string();
+        let text = status_lines(&state, 120)[0].to_string();
         assert!(
             text.is_empty() || !SPINNER.iter().any(|s| text.contains(s)),
             "idle must not look busy: {text}"
@@ -1378,7 +1371,7 @@ mod tests {
         state.activity = Some("running tools".into());
         state.tick = 0;
         assert_eq!(status_phase(&state), StatusPhase::Busy);
-        let text = status_line_content(&state, 120).to_string();
+        let text = status_lines(&state, 120)[0].to_string();
         assert!(
             text.contains(SPINNER[0]) && text.contains("running tools"),
             "busy status: {text}"
@@ -1404,7 +1397,7 @@ mod tests {
         // Widths from a cramped pane up to a full terminal: the live part
         // never fits one of them, and the metadata never fits all of them.
         for width in [5usize, 8, 16, 24, 40, 80, 120] {
-            let text = status_line_content(&state, width).to_string();
+            let text = status_lines(&state, width)[0].to_string();
             assert!(
                 text.contains(SPINNER[0]),
                 "the busy row must still exist at width {width}: {text:?}"
@@ -1437,7 +1430,7 @@ mod tests {
             }),
         )));
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);
-        let text = status_line_content(&state, 120).to_string();
+        let text = status_lines(&state, 120)[0].to_string();
         assert!(
             !text.contains(state.t().overlay_approval) && !text.contains("等待审批"),
             "the approval card is the wait; the strip must not repeat it: {text}"
@@ -1468,7 +1461,7 @@ mod tests {
             )),
         )));
         assert_eq!(status_phase(&state), StatusPhase::AwaitingUser);
-        let text = status_line_content(&state, 120).to_string();
+        let text = status_lines(&state, 120)[0].to_string();
         // The card carries the wait. The strip must not say it a second time —
         // which is why the copy it used to print is gone from the locale too —
         // and it must not imply the model is still working while the turn is
@@ -1486,7 +1479,7 @@ mod tests {
         // question IS the question (`询问 …`, taken from the call's arguments),
         // so printing it one row above the card is the reported duplication.
         state.activity = Some("询问 上一条「弹个窗户」你想让我开哪个？".into());
-        let text = status_line_content(&state, 120).to_string();
+        let text = status_lines(&state, 120)[0].to_string();
         assert!(
             !text.contains("询问") && !text.contains("弹个窗户"),
             "the strip repeats the question: {text}"
@@ -1509,7 +1502,7 @@ mod tests {
         state.token_output = 633;
         // Current round is streaming reasoning and nothing else yet.
         state.transcript.append_thought(&"思考".repeat(400));
-        let status = status_line_content(&state, 160).to_string();
+        let status = status_lines(&state, 160)[0].to_string();
         assert!(
             status.contains('~'),
             "a live round must show a live estimate, not only frozen totals: {status}"

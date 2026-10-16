@@ -2030,9 +2030,21 @@ fn preview_lines(preview: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let area = crate::secondary::legacy_frame(frame, area, state);
-    let theme = &state.theme;
+    // The shared shell, with the split inside its body: page identity and the
+    // way back are the header, the bindings are the footer, and the two panes
+    // keep their own titles inside the content rect.
     let t = state.t();
+    let hint = tools_footer_hint(area.width as usize, t);
+    let page = crate::secondary::SecondaryPage {
+        title: t.screen_tools,
+        status: crate::secondary::main_status_spans(state, area.width as usize),
+        hint: &hint,
+    };
+    let layout = crate::secondary::layout(area, 0);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
+    let area = layout.content;
     let filter = state.tools_screen.filter;
     let calls: Vec<&ToolCallBlock> = state
         .transcript
@@ -2157,12 +2169,8 @@ pub(crate) fn render_tools_screen(frame: &mut Frame, area: Rect, state: &mut App
             }
         }
     }
-    detail.push(Line::from(""));
-    let footer = tools_footer_hint(detail_area.width.saturating_sub(1).max(1) as usize, t);
-    detail.push(Line::from(Span::styled(
-        footer,
-        Style::default().fg(theme.text.secondary),
-    )));
+    // The bindings are the shell's footer now; the detail pane ends on its own
+    // content rather than repeating them.
     crate::render::render_scrolled(frame, detail_area, state, detail);
 }
 
