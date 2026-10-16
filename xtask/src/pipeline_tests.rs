@@ -315,11 +315,18 @@ fn scripted(script: Arc<Mutex<Script>>, repo: PathBuf, lab: PathBuf) -> FakeHost
                 )
                 .unwrap();
             }
+            // The real gate names the run as a repo-relative path with `/`
+            // separators (`eval/release/<id>`), and the pipeline reads exactly
+            // that shape out of the gate's output. `Path::display()` would
+            // spell it `eval\release\<id>` on Windows and name nothing, which
+            // is a harness defect, not a gate the pipeline should guess at.
             let relative = run_dir
                 .strip_prefix(&lab)
                 .unwrap_or(&run_dir)
-                .display()
-                .to_string();
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let slowest = script.status("L0") != "PASS";
             let exit = if slowest || script.status("L1") != "PASS" || script.status("L2") != "PASS"
             {
