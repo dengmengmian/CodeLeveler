@@ -79,6 +79,9 @@ struct Script {
     dead_owner: bool,
     /// `git status --porcelain` reports this when it is not empty.
     dirty: String,
+    /// The version's tag exists on origin but not in the local clone, which is
+    /// what a release workflow-created tag looks like before a fetch.
+    origin_tags_only: bool,
     /// Layers this run refuses to write, to model a gate that named a run but
     /// produced no evidence for one of its layers.
     omit_layers: Vec<String>,
@@ -114,6 +117,7 @@ impl Script {
             layer_invocations: 0,
             dead_owner: false,
             dirty: String::new(),
+            origin_tags_only: false,
             omit_layers: Vec::new(),
         }
     }
@@ -374,8 +378,22 @@ fn git_response(script: &mut Script, spec: &CommandSpec) -> Result<ProcessOut, c
         }
         "status" => Ok(text(&script.dirty.clone())),
         "remote" => Ok(text("origin\n")),
-        "tag" => Ok(text("v1.0.8\n")),
+        "tag" => {
+            if script.origin_tags_only {
+                Ok(text("v1.0.7\n"))
+            } else {
+                Ok(text("v1.0.8\n"))
+            }
+        }
         "ls-remote" => {
+            if script.origin_tags_only {
+                // No refspec: the whole tag list, the way the version guard asks.
+                return Ok(text(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.0.8\n\
+                     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v1.0.8^{}\n\
+                     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/v1.0.7\n",
+                ));
+            }
             let path = spec.args.get(2).cloned().unwrap_or_default();
             if path.starts_with("refs/tags/") {
                 // The tag is created by the workflow, after the commit is
@@ -1074,6 +1092,19 @@ fn status_says_so_when_nothing_is_in_progress() {
 }
 
 // ── transaction integrity ───────────────────────────────────────────────────
+
+#[test]
+fn a_tag_that_only_origin_has_still_counts_as_released() {
+    // The release workflow creates the tag remotely. A clone that has not
+    // fetched it sees the version it just released as unreleased, and used to
+    // refuse the next release with VERSION_MISMATCH until someone ran
+    // `git fetch --tags` by hand.
+    let world = World::new();
+    world.set(|script| script.origin_tags_only = true);
+    let (code, rendered, _) = world.run(&["publish", "--dry-run"]);
+    assert_eq!(code, 0, "{rendered}");
+    assert!(rendered.contains("next:       1.0.9"), "{rendered}");
+}
 
 #[test]
 fn a_second_publish_is_refused_while_one_is_in_progress() {
