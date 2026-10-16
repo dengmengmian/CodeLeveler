@@ -46,6 +46,15 @@ impl Shell {
     }
 }
 
+/// The shell the product runs on this platform, taken from the wrapper the
+/// product itself builds, so this cannot drift from what executes.
+fn platform_shell() -> Shell {
+    match leveler_execution::shell_invocation("").0.as_str() {
+        "cmd" => Shell::Cmd,
+        _ => Shell::Bash,
+    }
+}
+
 /// The requirement one shell produces for one command line.
 fn requirement(shell: Shell, profile: PermissionProfile, command_line: &str) -> Requirement {
     let (program, args) = shell.invocation(command_line);
@@ -205,6 +214,12 @@ fn auto_allows_read_only_git_in_every_ordinary_spelling() {
 fn auto_allows_temporary_and_workspace_file_operations() {
     // The policy layer allows these; the sandbox must too (see the companion
     // execution test).
+    //
+    // The shared temp root is a platform fact — `shared_temp_write_roots()` is
+    // `/tmp` on unix and empty on Windows, where confined writes are ACL-scoped
+    // instead — so these entries are asserted for the shell this platform runs
+    // and spelled the way this platform names its temp directory.
+    let shell = platform_shell();
     for command_line in [
         "echo hi > /tmp/codeleveler-auto-test.txt",
         "echo hi >> /tmp/codeleveler-auto-test.txt",
@@ -226,7 +241,15 @@ fn auto_allows_temporary_and_workspace_file_operations() {
         "cargo build",
         "npm run build",
     ] {
-        assert_both_allow(command_line);
+        // `shell_invocation` executes cmd on Windows: exercise native temporary
+        // destinations there instead of POSIX /tmp and $TMPDIR spellings.
+        #[cfg(windows)]
+        let native_command_line = command_line
+            .replace("/tmp/", "%TEMP%\\")
+            .replace("$TMPDIR/", "%TEMP%\\");
+        #[cfg(windows)]
+        let command_line = native_command_line.as_str();
+        assert_allow(shell, command_line);
     }
 }
 
