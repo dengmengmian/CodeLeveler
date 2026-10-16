@@ -4,7 +4,7 @@ use crate::clean;
 use crate::error::{Fail, Report};
 use crate::exec::{self, CommandSpec, Host, SystemHost};
 use crate::fmt;
-use crate::publish;
+use crate::pipeline;
 use crate::qualify;
 use crate::root::{self, Env};
 use crate::scope::{self, Affected};
@@ -47,8 +47,8 @@ pub fn dispatch_with(repo: &Path, args: &[String], env: &Env, host: &dyn Host) -
         "clean" => clean::parse_args(rest).and_then(|mode| clean::apply(host, &repo, mode)),
         "pre-release" => gate(host, &repo, env, rest, GateKind::PreRelease),
         "dogfood" => gate(host, &repo, env, rest, GateKind::Dogfood),
-        "release" => gate(host, &repo, env, rest, GateKind::Release),
-        "publish" => publish::run(host, &repo, env, rest),
+        "release" => pipeline::qualify_only(host, &repo, env, rest),
+        "publish" => pipeline::run(host, &repo, env, rest),
         other => return unknown(other),
     };
     from_result(result)
@@ -57,7 +57,6 @@ pub fn dispatch_with(repo: &Path, args: &[String], env: &Env, host: &dyn Host) -
 enum GateKind {
     PreRelease,
     Dogfood,
-    Release,
 }
 
 fn gate(
@@ -74,7 +73,6 @@ fn gate(
     match kind {
         GateKind::PreRelease => qualify::run_pre_release(host, repo, env, &opts),
         GateKind::Dogfood => qualify::run_dogfood(host, repo, env, &opts),
-        GateKind::Release => qualify::run_release(host, repo, env, &opts),
     }
 }
 
@@ -252,11 +250,15 @@ Maintenance
 Release
   pre-release       L0-L2 of the dogfood release gate; check only
   dogfood           release qualification, then RC qualification
-  release           pre-release, then dogfood, on one frozen commit
-  publish           bump, qualify, tag, and push (--patch is the default)
+  release           stages 1-3 on the current commit: build & static, tests, real dogfood
+  publish           one release transaction: bump, qualify, CI, publish (--patch is the default)
   publish --minor
   publish --major
+  publish --resume  continue the release in progress, keeping its version
+  publish --status  where the release in progress stands
+  publish --report  rewrite the report from the recorded evidence
   publish --dry-run
+  publish --stop-after <1..4>   stop after a stage (CI/CD is stage 4)
 "
     .to_string()
 }

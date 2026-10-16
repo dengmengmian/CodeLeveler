@@ -9,17 +9,17 @@ use crate::qualify::{self, dogfood_exit};
 use crate::root::{self, Env, GateOpts};
 use crate::version::{self, Level};
 
-const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const BASELINE: &str = "0123456789abcdef0123456789abcdef01234567";
-const RUN: &str = "eval/release/20260101-000000-aaaaaaaaaaaa";
+pub(crate) const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(crate) const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+pub(crate) const BASELINE: &str = "0123456789abcdef0123456789abcdef01234567";
+pub(crate) const RUN: &str = "eval/release/20260101-000000-aaaaaaaaaaaa";
 
-struct Tmp {
-    path: PathBuf,
+pub(crate) struct Tmp {
+    pub path: PathBuf,
 }
 
 impl Tmp {
-    fn new() -> Self {
+    pub fn new() -> Self {
         static SEQ: AtomicU64 = AtomicU64::new(1);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -42,11 +42,11 @@ impl Drop for Tmp {
     }
 }
 
-fn args(values: &[&str]) -> Vec<String> {
+pub(crate) fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
-fn is_cmd(spec: &CommandSpec, program: &str, expected: &[&str]) -> bool {
+pub(crate) fn is_cmd(spec: &CommandSpec, program: &str, expected: &[&str]) -> bool {
     spec.program == program
         && spec
             .args
@@ -55,21 +55,21 @@ fn is_cmd(spec: &CommandSpec, program: &str, expected: &[&str]) -> bool {
             .eq(expected.iter().copied())
 }
 
-fn arg_after(spec: &CommandSpec, flag: &str) -> Option<String> {
+pub(crate) fn arg_after(spec: &CommandSpec, flag: &str) -> Option<String> {
     spec.args
         .windows(2)
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].clone())
 }
 
-fn touch(path: &Path) {
+pub(crate) fn touch(path: &Path) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(path, b"x").unwrap();
 }
 
-fn git(repo: &Path, git_args: &[&str]) {
+pub(crate) fn git(repo: &Path, git_args: &[&str]) {
     let status = std::process::Command::new("git")
         .args(git_args)
         .current_dir(repo)
@@ -78,7 +78,7 @@ fn git(repo: &Path, git_args: &[&str]) {
     assert!(status.success(), "git {git_args:?}");
 }
 
-fn git_commit(repo: &Path) {
+pub(crate) fn git_commit(repo: &Path) {
     let status = std::process::Command::new("git")
         .args([
             "-c",
@@ -95,7 +95,7 @@ fn git_commit(repo: &Path) {
     assert!(status.success(), "git commit");
 }
 
-fn write_versions(repo: &Path, version: &str) {
+pub(crate) fn write_versions(repo: &Path, version: &str) {
     std::fs::write(
         repo.join("Cargo.toml"),
         format!(
@@ -116,7 +116,7 @@ fn write_versions(repo: &Path, version: &str) {
     .unwrap();
 }
 
-fn write_lab(lab: &Path, baseline: &str) {
+pub(crate) fn write_lab(lab: &Path, baseline: &str) {
     std::fs::create_dir_all(lab.join("eval/scripts")).unwrap();
     std::fs::write(lab.join("eval/scripts/release_check.py"), b"# marker\n").unwrap();
     std::fs::write(lab.join("eval/scripts/rc_check.py"), b"# marker\n").unwrap();
@@ -125,7 +125,7 @@ fn write_lab(lab: &Path, baseline: &str) {
     std::fs::write(lab.join("eval/release/BASELINE"), format!("{baseline}\n")).unwrap();
 }
 
-fn point_config(repo: &Path, lab: &Path, model: &str) {
+pub(crate) fn point_config(repo: &Path, lab: &Path, model: &str) {
     std::fs::create_dir_all(repo.join(".dev")).unwrap();
     std::fs::write(
         repo.join(".dev/config"),
@@ -134,7 +134,7 @@ fn point_config(repo: &Path, lab: &Path, model: &str) {
     .unwrap();
 }
 
-fn pass_layers(lab: &Path) {
+pub(crate) fn pass_layers(lab: &Path) {
     let dir = lab.join(RUN);
     std::fs::create_dir_all(&dir).unwrap();
     let l0 = r#"{"status":"PASS","checks":[{"id":"fmt","status":"PASS"}]}"#;
@@ -143,7 +143,7 @@ fn pass_layers(lab: &Path) {
     std::fs::write(dir.join("L2.json"), r#"{"status":"PASS","checks":[]}"#).unwrap();
 }
 
-fn process(status: i32, stdout: &str) -> ProcessOut {
+pub(crate) fn process(status: i32, stdout: &str) -> ProcessOut {
     ProcessOut {
         status,
         stdout: stdout.to_string(),
@@ -151,11 +151,11 @@ fn process(status: i32, stdout: &str) -> ProcessOut {
     }
 }
 
-fn text(stdout: &str) -> ProcessOut {
+pub(crate) fn text(stdout: &str) -> ProcessOut {
     process(0, stdout)
 }
 
-fn assert_fail(outcome: &Outcome, code: &str) {
+pub(crate) fn assert_fail(outcome: &Outcome, code: &str) {
     assert!(
         outcome.stderr.contains(&format!("FAIL {code}")),
         "expected {code}, got code {} stderr {} stdout {}",
@@ -165,7 +165,7 @@ fn assert_fail(outcome: &Outcome, code: &str) {
     );
 }
 
-fn unformatted() -> &'static str {
+pub(crate) fn unformatted() -> &'static str {
     "fn demo() {\nlet _ = 1;\n}\n"
 }
 
@@ -411,29 +411,48 @@ fn publish_levels_malformed_mismatch_and_existing_tag() {
 
 #[test]
 fn publish_dry_run_does_not_mutate_or_invoke_gates() {
-    let tmp = Tmp::new();
-    let repo = tmp.path.as_path();
-    write_versions(repo, "1.0.8");
+    let repo_tmp = Tmp::new();
+    let lab_tmp = Tmp::new();
+    let repo = repo_tmp.path.canonicalize().unwrap();
+    let lab = lab_tmp.path.canonicalize().unwrap();
+    write_versions(&repo, "1.0.8");
+    write_lab(&lab, BASELINE);
+    point_config(&repo, &lab, "example/model");
     let before = std::fs::read(repo.join("Cargo.toml")).unwrap();
     let host = publish_host("", "v1.0.8\n", "v1.0.8\n");
     let outcome = dispatch_with(
-        repo,
+        &repo,
         &args(&["publish", "--minor", "--dry-run"]),
         &Env::default(),
         &host,
     );
-    assert_eq!(outcome.code, 0, "{}", outcome.stderr);
-    assert!(outcome.stdout.contains("next: 1.1.0"), "{}", outcome.stdout);
-    assert!(outcome.stdout.contains("WOULD_RUN: pre-release"));
-    assert!(outcome.stdout.contains("WOULD_RUN: dogfood"));
-    assert!(outcome.stdout.contains("READY_TO_PUBLISH: NO"));
+    assert_eq!(outcome.code, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        outcome.stdout.contains("next:       1.1.0"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("Stage 1: Build & Static"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("READY_TO_PUBLISH: NO"),
+        "{}",
+        outcome.stdout
+    );
     assert_eq!(std::fs::read(repo.join("Cargo.toml")).unwrap(), before);
+    assert!(
+        !repo.join(".dev/release").exists(),
+        "dry-run must not create release state"
+    );
     for spec in host.log() {
         assert_ne!(spec.program, "python3");
         assert_ne!(spec.program, "cargo");
+        assert_ne!(spec.program, "rustc");
         assert_ne!(spec.args.first().map(String::as_str), Some("commit"));
         assert_ne!(spec.args.first().map(String::as_str), Some("push"));
-        assert!(!spec.args.iter().any(|arg| arg == "-a" || arg == "--force"));
     }
 }
 
@@ -459,211 +478,6 @@ fn publish_refuses_conflicting_levels_and_dirty_tree() {
     );
     assert_fail(&outcome, "WORKTREE_DIRTY");
     assert!(host.log().iter().all(|spec| spec.program != "python3"));
-}
-
-#[test]
-fn publish_qualification_failure_does_not_tag_or_push() {
-    let repo_tmp = Tmp::new();
-    let lab_tmp = Tmp::new();
-    let repo = repo_tmp.path.canonicalize().unwrap();
-    let lab = lab_tmp.path.canonicalize().unwrap();
-    write_versions(&repo, "1.0.8");
-    write_lab(&lab, BASELINE);
-    point_config(&repo, &lab, "example/model");
-    let state = Mutex::new((false, false));
-    let host = FakeHost::new(move |spec| {
-        let mut state = state.lock().expect("state");
-        if is_cmd(spec, "git", &["rev-parse", "HEAD"]) {
-            return Ok(text(if state.1 { SHA_B } else { SHA_A }));
-        }
-        if is_cmd(spec, "git", &["status", "--porcelain"]) {
-            if state.0 && !state.1 {
-                return Ok(text(
-                    " M Cargo.toml\n M docs/RELEASE.md\n M docs/RELEASE.zh-CN.md\n",
-                ));
-            }
-            return Ok(text(""));
-        }
-        if is_cmd(spec, "git", &["rev-parse", "--abbrev-ref", "HEAD"]) {
-            return Ok(text("main"));
-        }
-        if is_cmd(spec, "git", &["remote"]) {
-            return Ok(text("origin"));
-        }
-        if is_cmd(spec, "git", &["tag", "--list"]) {
-            return Ok(text("v1.0.8\n"));
-        }
-        if spec.program == "gh" {
-            return Ok(text("v1.0.8\n"));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("ls-remote") {
-            return Ok(text(""));
-        }
-        if spec.program == "cargo" {
-            state.0 = true;
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("add") {
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("commit") {
-            assert_eq!(
-                spec.args.get(2).map(String::as_str),
-                Some("release: v1.0.9")
-            );
-            state.1 = true;
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("cat-file") {
-            return Ok(text(""));
-        }
-        if spec.program == "python3" {
-            pass_layers(&lab);
-            let l0 = lab.join(RUN).join("L0.json");
-            std::fs::write(
-                l0,
-                r#"{"status":"FAIL","checks":[{"id":"fmt","status":"PASS"}]}"#,
-            )
-            .unwrap();
-            return Ok(process(1, &format!("written: {RUN}/\n")));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("push") {
-            panic!("qualification failure must not push: {:?}", spec.args);
-        }
-        if spec.program == "git"
-            && spec.args.first().map(String::as_str) == Some("tag")
-            && spec.args.iter().any(|arg| arg == "-a")
-        {
-            panic!(
-                "qualification failure must not create a tag: {:?}",
-                spec.args
-            );
-        }
-        Ok(text(""))
-    });
-    let outcome = dispatch_with(&repo, &args(&["publish"]), &Env::default(), &host);
-    assert_ne!(outcome.code, 0);
-    let rendered = format!("{}{}", outcome.stdout, outcome.stderr);
-    assert!(
-        rendered.contains("did not tag, push, or reset"),
-        "{rendered}"
-    );
-    assert!(
-        std::fs::read_to_string(repo.join("Cargo.toml"))
-            .unwrap()
-            .contains("version = \"1.0.9\"")
-    );
-    assert!(host.log().iter().all(|spec| {
-        spec.args.first().map(String::as_str) != Some("push")
-            && !(spec.args.first().map(String::as_str) == Some("tag")
-                && spec.args.iter().any(|arg| arg == "-a"))
-    }));
-}
-
-#[test]
-fn publish_dispatches_the_release_workflow_and_creates_no_local_tag() {
-    let repo_tmp = Tmp::new();
-    let lab_tmp = Tmp::new();
-    let repo = repo_tmp.path.canonicalize().unwrap();
-    let lab = lab_tmp.path.canonicalize().unwrap();
-    write_versions(&repo, "1.0.8");
-    write_lab(&lab, BASELINE);
-    point_config(&repo, &lab, "example/model");
-    let state = Mutex::new((false, false));
-    let host = FakeHost::new(move |spec| {
-        let mut state = state.lock().expect("state");
-        if is_cmd(spec, "git", &["rev-parse", "HEAD"]) {
-            return Ok(text(if state.1 { SHA_B } else { SHA_A }));
-        }
-        if is_cmd(spec, "git", &["status", "--porcelain"]) {
-            if state.0 && !state.1 {
-                return Ok(text(
-                    " M Cargo.toml\n M docs/RELEASE.md\n M docs/RELEASE.zh-CN.md\n",
-                ));
-            }
-            return Ok(text(""));
-        }
-        if is_cmd(spec, "git", &["rev-parse", "--abbrev-ref", "HEAD"]) {
-            return Ok(text("main"));
-        }
-        if is_cmd(spec, "git", &["remote"]) {
-            return Ok(text("origin"));
-        }
-        if is_cmd(spec, "git", &["tag", "--list"]) {
-            return Ok(text("v1.0.8\n"));
-        }
-        if spec.program == "gh" && spec.args.first().map(String::as_str) == Some("release") {
-            return Ok(text("v1.0.8\n"));
-        }
-        if spec.program == "gh" {
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("ls-remote") {
-            return Ok(text(""));
-        }
-        if spec.program == "cargo" {
-            state.0 = true;
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("add") {
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("commit") {
-            assert_eq!(
-                spec.args.get(2).map(String::as_str),
-                Some("release: v1.0.9")
-            );
-            state.1 = true;
-            return Ok(text(""));
-        }
-        if spec.program == "git" && spec.args.first().map(String::as_str) == Some("cat-file") {
-            return Ok(text(""));
-        }
-        if spec.program == "python3" {
-            pass_layers(&lab);
-            return Ok(process(0, &format!("written: {RUN}/\n")));
-        }
-        Ok(text(""))
-    });
-    let outcome = dispatch_with(&repo, &args(&["publish"]), &Env::default(), &host);
-    assert_eq!(outcome.code, 0, "{}{}", outcome.stdout, outcome.stderr);
-    assert!(
-        outcome.stdout.contains("READY_TO_PUBLISH: YES"),
-        "{}",
-        outcome.stdout
-    );
-    assert!(
-        outcome
-            .stdout
-            .contains("dispatched: release.yml version=1.0.9"),
-        "{}",
-        outcome.stdout
-    );
-    let log = host.log();
-    assert!(
-        log.iter()
-            .any(|spec| is_cmd(spec, "git", &["push", "origin", "HEAD"])),
-        "expected the version commit to be pushed"
-    );
-    assert!(
-        log.iter().any(|spec| {
-            spec.program == "gh"
-                && spec.args.first().map(String::as_str) == Some("workflow")
-                && spec.args.iter().any(|a| a == "version=1.0.9")
-                && spec.args.iter().any(|a| a.starts_with("commit="))
-        }),
-        "expected a release workflow dispatch"
-    );
-    let tag_touched = log.iter().any(|spec| {
-        (spec.args.first().map(String::as_str) == Some("tag")
-            && spec.args.iter().any(|arg| arg == "-a"))
-            || (spec.args.first().map(String::as_str) == Some("push")
-                && spec.args.iter().any(|arg| arg.contains("refs/tags/")))
-    });
-    assert!(
-        !tag_touched,
-        "publish must let the workflow create the tag, not create one itself"
-    );
 }
 
 #[test]
@@ -766,62 +580,6 @@ fn dogfood_does_not_start_when_the_locked_sha_already_changed() {
     )
     .expect_err("changed");
     assert_eq!(err.code, "CANDIDATE_CHANGED");
-}
-
-#[test]
-fn release_does_not_start_dogfood_after_the_candidate_changes() {
-    let repo_tmp = Tmp::new();
-    let lab_tmp = Tmp::new();
-    let repo = repo_tmp.path.canonicalize().unwrap();
-    let lab = lab_tmp.path.canonicalize().unwrap();
-    write_versions(&repo, "1.0.8");
-    write_lab(&lab, BASELINE);
-    point_config(&repo, &lab, "example/model");
-    let revs_after_layers = Mutex::new(0u32);
-    let saw_layers = Mutex::new(false);
-    let host = FakeHost::new(move |spec| {
-        if spec.program == "python3" && spec.args.iter().any(|arg| arg == "--layers") {
-            *saw_layers.lock().expect("flag") = true;
-            pass_layers(&lab);
-            return Ok(process(1, &format!("written: {RUN}/\n")));
-        }
-        if spec.program == "python3" {
-            panic!("full dogfood gate must not start: {:?}", spec.args);
-        }
-        if is_cmd(spec, "git", &["rev-parse", "HEAD"]) {
-            if *saw_layers.lock().expect("flag") {
-                let mut count = revs_after_layers.lock().expect("count");
-                *count += 1;
-                if *count > 1 {
-                    return Ok(text(SHA_B));
-                }
-            }
-            return Ok(text(SHA_A));
-        }
-        if is_cmd(spec, "git", &["status", "--porcelain"])
-            || spec.program == "git" && spec.args.first().map(String::as_str) == Some("cat-file")
-        {
-            return Ok(text(""));
-        }
-        Ok(text(""))
-    });
-    let err = qualify::run_release_locked(
-        &host,
-        &repo,
-        &Env::default(),
-        &GateOpts::default(),
-        &Snapshot {
-            head: SHA_A.to_string(),
-            porcelain: String::new(),
-        },
-    )
-    .expect_err("changed between stages");
-    assert_eq!(err.code, "CANDIDATE_CHANGED");
-    assert!(
-        host.log()
-            .iter()
-            .any(|spec| spec.args.iter().any(|arg| arg == "--layers"))
-    );
 }
 
 #[test]
