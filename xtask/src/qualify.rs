@@ -318,6 +318,7 @@ fn release_cmd(lab: &Lab, sha: &str, baseline: &str, layers: Option<&str>) -> Co
     // 90% of the CPU count, so without this the dogfood stage could never start
     // on a machine that had just finished its own pre-release.
     args.push("--force".to_string());
+    eprintln!("PROBE release_cmd: {:?}", args);
     CommandSpec::new("python3", args, &lab.root).env("DOGFOOD_ROOT", lab.root.display().to_string())
 }
 
