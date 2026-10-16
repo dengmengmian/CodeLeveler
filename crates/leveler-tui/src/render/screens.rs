@@ -8,11 +8,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::state::AppState;
 use crate::theme::Theme;
 
-use super::panes::{render_list_focused, render_scrolled};
+use super::{render_list_focused, render_scrolled};
 use super::text::{sanitize_terminal_line, truncate_display, wrap};
 
-pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = &state.theme;
+pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let zh = state.locale == crate::i18n::Locale::Zh;
     let page = crate::secondary::SecondaryPage {
         title: state.t().help_title,
@@ -24,8 +23,9 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
         },
     };
     let layout = crate::secondary::layout(area, 1);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
     frame.render_widget(
         ratatui::widgets::Paragraph::new(sanitize_terminal_line(&format!(
             "{}{}",
@@ -36,12 +36,16 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
     );
     let matches = state.help.matches(state.t());
     let mut lines = Vec::new();
+    let mut rows: Vec<(usize, String)> = Vec::new();
     let mut focus = 0;
     for (index, entry) in matches.iter().enumerate() {
         let selected = index == state.help.selected;
         if selected {
             focus = lines.len();
         }
+        // An entry can wrap, so its hit starts at its first line and covers
+        // the entry: the index is the binding's position in the result set.
+        rows.push((lines.len(), index.to_string()));
         let text = sanitize_terminal_line(&format!(
             "{}{}  {}",
             if selected { "› " } else { "  " },
@@ -66,7 +70,17 @@ pub(super) fn render_help_screen(frame: &mut Frame, area: Rect, state: &AppState
             "No matches"
         }));
     }
-    render_list_focused(frame, layout.content, lines, focus, theme);
+    let mut hits = Vec::new();
+    crate::render::render_list_rows(
+        frame,
+        layout.content,
+        lines,
+        &rows,
+        focus,
+        theme,
+        &mut hits,
+    );
+    state.screen_rows = hits;
     search_cursor(frame, layout.composer, &state.help.query, zh);
 }
 
@@ -152,7 +166,7 @@ pub(crate) fn screen_title(title: &str, theme: &Theme) -> Line<'static> {
     ))
 }
 
-pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState) {
+pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Split panes with their own pane titles: the single-header shell does not
     // fit, so this view keeps the legacy app frame.
     let area = crate::secondary::legacy_frame(frame, area, state);
@@ -182,6 +196,7 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
     let list_w = list_inner.width as usize;
 
     let mut rows: Vec<Line> = Vec::new();
+    let mut row_hits: Vec<(usize, String)> = Vec::new();
     if files.is_empty() {
         // Loading is not empty, and a failed read is not empty either. Saying
         // "无改动" while a diff of thousands of files is still being computed —
@@ -233,9 +248,20 @@ pub(super) fn render_diff_screen(frame: &mut Frame, area: Rect, state: &AppState
                 Style::default().fg(theme.status.error),
             ),
         ]));
+        row_hits.push((rows.len() - 1, i.to_string()));
     }
     frame.render_widget(list_block, list_area);
-    render_list_focused(frame, list_inner, rows, selected, theme);
+    let mut hits = Vec::new();
+    crate::render::render_list_rows(
+        frame,
+        list_inner,
+        rows,
+        &row_hits,
+        selected,
+        theme,
+        &mut hits,
+    );
+    state.screen_rows = hits;
 
     let mut detail: Vec<Line> = Vec::new();
     if let Some(f) = files.get(selected) {
@@ -285,8 +311,7 @@ fn session_status_dot(status: &str, theme: &Theme) -> (&'static str, ratatui::st
     }
 }
 
-pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppState) {
-    let theme = &state.theme;
+pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let t = state.t();
     let page = crate::secondary::SecondaryPage {
         title: t.screen_sessions,
@@ -294,8 +319,9 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
         hint: t.sessions_footer_hint,
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, theme);
-    crate::secondary::draw_footer(frame, &layout, &page, theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
+    crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
+    let theme = &state.theme;
 
     let mut lines: Vec<Line> = Vec::new();
     if state.sessions.is_empty() {
@@ -304,7 +330,11 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
             Style::default().fg(theme.text.secondary),
         )));
     }
+    let mut rows: Vec<(usize, String)> = Vec::new();
     for (i, s) in state.sessions.iter().enumerate() {
+        // The row's key is its index: this page's cursor is positional, and a
+        // click selects the row that was painted, not a remembered one.
+        rows.push((lines.len(), i.to_string()));
         let cursor = if i == state.sessions_selected {
             "› "
         } else {
@@ -332,7 +362,17 @@ pub(super) fn render_sessions_screen(frame: &mut Frame, area: Rect, state: &AppS
             Span::styled(s.model.clone(), Style::default().fg(theme.text.secondary)),
         ]));
     }
-    render_list_focused(frame, layout.content, lines, state.sessions_selected, theme);
+    let mut hits = Vec::new();
+    crate::render::render_list_rows(
+        frame,
+        layout.content,
+        lines,
+        &rows,
+        state.sessions_selected,
+        theme,
+        &mut hits,
+    );
+    state.screen_rows = hits;
 }
 
 #[cfg(test)]
@@ -358,7 +398,7 @@ mod search_tests {
             },
         )
     }
-    fn help_text(state: &AppState, width: u16, height: u16) -> String {
+    fn help_text(state: &mut AppState, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| render_help_screen(frame, frame.area(), state))
@@ -410,7 +450,7 @@ mod search_tests {
         let mut state = state();
         state.help.selected = state.help.matches(state.t()).len() - 1;
         for (width, height) in [(80, 24), (28, 10), (18, 7)] {
-            let text = help_text(&state, width, height);
+            let text = help_text(&mut state, width, height);
             assert!(
                 text.contains("› Esc"),
                 "selected row missing at {width}x{height}: {text}"
@@ -418,8 +458,8 @@ mod search_tests {
         }
         state.help.query = "ctrl+j".into();
         state.help.selected = 0;
-        assert!(help_text(&state, 28, 10).contains("Ctrl+J"));
+        assert!(help_text(&mut state, 28, 10).contains("Ctrl+J"));
         state.help.query = "missing-binding".into();
-        assert!(help_text(&state, 28, 10).contains("No matches"));
+        assert!(help_text(&mut state, 28, 10).contains("No matches"));
     }
 }

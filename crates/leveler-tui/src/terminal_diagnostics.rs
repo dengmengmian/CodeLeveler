@@ -115,7 +115,7 @@ impl TerminalDiagnostics {
 pub fn render_screen(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
-    state: &crate::state::AppState,
+    state: &mut crate::state::AppState,
 ) {
     let zh = state.locale == crate::i18n::Locale::Zh;
     let page = crate::secondary::SecondaryPage {
@@ -132,7 +132,7 @@ pub fn render_screen(
         },
     };
     let layout = crate::secondary::layout(area, 0);
-    crate::secondary::draw_header(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
     crate::secondary::draw_footer(frame, &layout, &page, &state.theme);
     let text = format!(
         "{}\n{}: {} ({})",

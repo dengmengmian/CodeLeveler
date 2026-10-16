@@ -34,8 +34,126 @@ fn scroll_screen_key(state: &mut AppState, key: &KeyEvent, line_keys: bool) -> b
     }
 }
 
+/// Move a list page's cursor by `delta` rows, clamped to the list. Keyboard
+/// and wheel share it, so a page cannot have two different ideas of where its
+/// own list ends.
+pub(super) fn move_list_cursor(state: &mut AppState, delta: isize) {
+    let len = match state.active_screen {
+        Screen::Sessions => state.sessions.len(),
+        Screen::Diff => state.diff.as_ref().map(|d| d.files.len()).unwrap_or(0),
+        Screen::Tools => state
+            .transcript
+            .tool_calls()
+            .into_iter()
+            .filter(|b| state.tools_screen.filter.matches(b))
+            .count(),
+        _ => return,
+    };
+    if len == 0 {
+        return;
+    }
+    let current = match state.active_screen {
+        Screen::Sessions => state.sessions_selected,
+        Screen::Diff => state.diff_selected,
+        Screen::Tools => state.tools_screen.selected,
+        _ => return,
+    };
+    let next = if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current + delta as usize).min(len - 1)
+    };
+    match state.active_screen {
+        Screen::Sessions => state.sessions_selected = next,
+        Screen::Diff => state.diff_selected = next,
+        Screen::Tools => state.tools_screen.selected = next,
+        _ => {}
+    }
+}
+
+/// One wheel notch over a page. A page whose body is a cursor over rows
+/// scrolls by moving that cursor — the page's own way of bringing a row into
+/// view; a page whose body is a document moves its own scroll offset. The
+/// lists move one row per notch and the documents three lines, which is the
+/// same split the jobs list already uses between its list and its log.
+pub(super) fn wheel_page(state: &mut AppState, notches: isize) {
+    match state.active_screen {
+        Screen::Sessions | Screen::Diff | Screen::Tools => move_list_cursor(state, notches),
+        Screen::Team => crate::multi_agent::select_team_delta(state, notches),
+        Screen::Issue => crate::issue::move_selection(state, notches),
+        Screen::Trace => state.trace.move_sel(notches),
+        Screen::Context => crate::context::move_sel(&mut state.context, notches),
+        Screen::Clean => state.clean.move_selection(notches),
+        Screen::Help => {
+            let t = state.t();
+            state.help.move_selection(notches, t);
+        }
+        // Everything else (Plan, Goal, Doctor, Shell, Remote) is a document
+        // under a `screen_scroll` offset.
+        _ => {
+            let lines = (notches * 3).unsigned_abs() as usize;
+            state.screen_scroll = if notches < 0 {
+                state.screen_scroll.saturating_sub(lines)
+            } else {
+                state.screen_scroll.saturating_add(lines)
+            };
+        }
+    }
+}
+
+/// A click landed on a page row the page itself published.
+///
+/// Selecting is the only thing a row click means on these pages: what a
+/// SECOND click or an Enter does is the page's Enter binding, which the
+/// keyboard already owns. A row whose key does not parse back into an index
+/// selects nothing — the page never guesses which row the user meant.
+pub(super) fn select_row(state: &mut AppState, key: &str) -> Vec<Effect> {
+    match state.active_screen {
+        // The child list is keyed by stable identity, not by position.
+        Screen::Team => state.team_selected = Some(key.to_string()),
+        Screen::Sessions => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.sessions_selected = index;
+            }
+        }
+        Screen::Diff => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.diff_selected = index;
+            }
+        }
+        Screen::Tools => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.tools_screen.selected = index;
+                state.screen_scroll = 0;
+            }
+        }
+        Screen::Trace => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.trace.selected = index;
+            }
+        }
+        Screen::Context => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.context.selected = index;
+            }
+        }
+        Screen::Clean => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.clean.selected = index;
+            }
+        }
+        Screen::Help => {
+            if let Ok(index) = key.parse::<usize>() {
+                state.help.select(index, state.t());
+            }
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
 /// Handle keys for a full-screen view (Tools today). Esc returns to the
-/// conversation .
+/// conversation.
 pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     match state.active_screen {
         // The one screen where a keystroke is a security decision, so only an
@@ -43,7 +161,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         Screen::Remote => {
             let waiting = state.remote.as_ref().is_some_and(|r| r.pending.is_some());
             match key.code {
-                KeyCode::Esc => close_screen(state),
+                KeyCode::Esc => return back(state),
                 KeyCode::Char('y') | KeyCode::Char('Y') if waiting => {
                     return vec![Effect::AnswerPairing { accept: true }];
                 }
@@ -58,7 +176,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         // Shell Details: Esc backs out (the shell keeps running); `x` stops
         // exactly the shown execution — back and stop are different actions.
         Screen::Shell => match key.code {
-            KeyCode::Esc => close_screen(state),
+            KeyCode::Esc => return back(state),
             KeyCode::Char('x') | KeyCode::Char('X') => {
                 if let Some(shell) = state.focused_user_shell()
                     && shell.status == crate::transcript::UserShellStatus::Running
@@ -76,20 +194,14 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         },
         Screen::Tools => {
-            let len = state
-                .transcript
-                .tool_calls()
-                .into_iter()
-                .filter(|b| state.tools_screen.filter.matches(b))
-                .count();
             match key.code {
-                KeyCode::Esc => close_screen(state),
+                KeyCode::Esc => return back(state),
                 KeyCode::Up | KeyCode::Char('k') => {
-                    state.tools_screen.move_up();
+                    move_list_cursor(state, -1);
                     state.screen_scroll = 0;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    state.tools_screen.move_down(len);
+                    move_list_cursor(state, 1);
                     state.screen_scroll = 0;
                 }
                 KeyCode::Tab | KeyCode::Char('f') => {
@@ -103,15 +215,14 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         }
         Screen::Diff => {
-            let len = state.diff.as_ref().map(|d| d.files.len()).unwrap_or(0);
             match key.code {
-                KeyCode::Esc => close_screen(state),
+                KeyCode::Esc => return back(state),
                 KeyCode::Up | KeyCode::Char('k') => {
-                    state.diff_selected = state.diff_selected.saturating_sub(1);
+                    move_list_cursor(state, -1);
                     state.screen_scroll = 0;
                 }
-                KeyCode::Down | KeyCode::Char('j') if len > 0 && state.diff_selected + 1 < len => {
-                    state.diff_selected += 1;
+                KeyCode::Down | KeyCode::Char('j') => {
+                    move_list_cursor(state, 1);
                     state.screen_scroll = 0;
                 }
                 // PageUp/PageDown scroll the patch pane.
@@ -121,17 +232,10 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         }
         Screen::Sessions => {
-            let len = state.sessions.len();
             match key.code {
-                KeyCode::Esc => close_screen(state),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    state.sessions_selected = state.sessions_selected.saturating_sub(1)
-                }
-                KeyCode::Down | KeyCode::Char('j')
-                    if len > 0 && state.sessions_selected + 1 < len =>
-                {
-                    state.sessions_selected += 1;
-                }
+                KeyCode::Esc => return back(state),
+                KeyCode::Up | KeyCode::Char('k') => move_list_cursor(state, -1),
+                KeyCode::Down | KeyCode::Char('j') => move_list_cursor(state, 1),
                 KeyCode::Enter => {
                     if let Some(s) = state.sessions.get(state.sessions_selected) {
                         let id = s.id.clone();
@@ -156,7 +260,11 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
                 }
                 KeyCode::Char('t') => {
                     if let Some(s) = state.sessions.get(state.sessions_selected) {
-                        return open_trace(state, Some(s.id.as_str().to_string()));
+                        return open_trace(
+                            state,
+                            Some(s.id.as_str().to_string()),
+                            Screen::Sessions,
+                        );
                     }
                 }
                 _ => {}
@@ -201,7 +309,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             _ => {}
         },
         Screen::Team => match key.code {
-            KeyCode::Esc => close_team(state),
+            KeyCode::Esc => return back(state),
             KeyCode::Up | KeyCode::Char('k') => crate::multi_agent::select_team_delta(state, -1),
             KeyCode::Down | KeyCode::Char('j') => crate::multi_agent::select_team_delta(state, 1),
             KeyCode::Enter => open_selected_child(state),
@@ -256,27 +364,43 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             // expand/collapse in place. The task's own page stays behind the
             // expanded row's explicit detail entry, so Enter never jumps.
             KeyCode::Enter => crate::issue::toggle_expanded(state),
+            // The detail entry is a control the page paints, so the keyboard
+            // reaches it too: `→` enters the selected expanded row's detail and
+            // `←` collapses it — the same one-level pair the header's `←`
+            // glyph and Esc run. A row with no painted entry has no binding.
+            KeyCode::Right => {
+                let entry = crate::issue::selected_issue(state).filter(|issue| {
+                    issue.kind == crate::issue::IssueKind::BackgroundFailure
+                        && crate::issue::is_expanded(state, &issue.key)
+                });
+                if let Some(issue) = entry {
+                    return open_issue_detail(state, &issue.key);
+                }
+            }
+            KeyCode::Left => {
+                crate::issue::collapse_selected(state);
+            }
             _ => {
                 scroll_screen_key(state, &key, false);
             }
         },
         Screen::Plan => {
             if key.code == KeyCode::Esc {
-                close_screen(state);
+                return back(state);
             } else {
                 scroll_screen_key(state, &key, true);
             }
         }
         Screen::Goal => {
             if key.code == KeyCode::Esc {
-                close_screen(state);
+                return back(state);
             } else {
                 scroll_screen_key(state, &key, true);
             }
         }
         Screen::Help => {
             if key.code == KeyCode::Esc {
-                close_screen(state);
+                return back(state);
             } else {
                 let page = page_size(state);
                 let t = state.t();
@@ -285,7 +409,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
         }
         Screen::Doctor => {
             if key.code == KeyCode::Esc {
-                close_screen(state);
+                return back(state);
             } else {
                 scroll_screen_key(state, &key, true);
             }
@@ -294,7 +418,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             use crate::observability::TraceTab;
             match key.code {
                 KeyCode::Esc if state.trace.inspect => state.trace.inspect = false,
-                KeyCode::Esc => close_screen(state),
+                KeyCode::Esc => return back(state),
                 KeyCode::Left | KeyCode::BackTab => {
                     state.trace.tab = state.trace.tab.prev();
                     state.screen_scroll = 0;
@@ -353,7 +477,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             }
         }
         Screen::Context => match key.code {
-            KeyCode::Esc => close_screen(state),
+            KeyCode::Esc => return back(state),
             KeyCode::Up | KeyCode::Char('k') => crate::context::move_sel(&mut state.context, -1),
             KeyCode::Down | KeyCode::Char('j') => crate::context::move_sel(&mut state.context, 1),
             KeyCode::Enter => crate::context::toggle_selected(&mut state.context),
@@ -365,7 +489,7 @@ pub(super) fn handle_screen_key(state: &mut AppState, key: KeyEvent) -> Vec<Effe
             // Esc leaves the page. It never cancels foreground Agent work, and
             // a cleanup already running keeps running: the page owns no work
             // lifecycle, only a view over the host's plan.
-            KeyCode::Esc => close_screen(state),
+            KeyCode::Esc => return back(state),
             KeyCode::Up | KeyCode::Char('k') => state.clean.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => state.clean.move_selection(1),
             KeyCode::Enter => match state.clean.selected_action() {
@@ -415,9 +539,37 @@ pub(super) fn back(state: &mut AppState) -> Vec<Effect> {
                 crate::activity::close_background_list(state);
             }
         }
-        _ => close_screen(state),
+        // The child list clears its own selection on the way out.
+        Screen::Team => close_team(state),
+        // A page that was opened FROM another page returns there: the opener
+        // recorded itself, so the page never guesses its parent. Pages with no
+        // opener (the ones the workbench, a slash command or the state strip
+        // opens) have no target and leave for the conversation.
+        _ => match state.detail_return.take() {
+            Some(parent) => {
+                state.active_screen = parent;
+                state.screen_scroll = 0;
+            }
+            None => close_screen(state),
+        },
     }
     Vec::new()
+}
+
+/// Enter the task detail a selected issue row advertises.
+///
+/// This is the ONE action behind both the mouse's click on the row's
+/// `查看任务详情 ↗` entry and the keyboard's `→`, so the two inputs can never
+/// diverge. The opener records where the detail returns to — the detail itself
+/// never guesses its parent. (`activity::open` resets the field, so the record
+/// must come after it.)
+pub(super) fn open_issue_detail(state: &mut AppState, key: &str) -> Vec<Effect> {
+    let effects = crate::activity::open(
+        state,
+        crate::activity::ActivityId::Background(key.to_string()),
+    );
+    state.detail_return = Some(Screen::Issue);
+    effects
 }
 
 /// Keyboard and mouse share the same live-state check and runtime command.
@@ -485,7 +637,7 @@ pub(super) fn open_team(state: &mut AppState) -> Vec<Effect> {
 fn close_team(state: &mut AppState) {
     state.active_screen = crate::screen::Screen::Conversation;
     state.team_selected = None;
-    state.team_hits.clear();
+    state.screen_rows.clear();
 }
 
 /// The child the Team page has selected, if it still exists.
@@ -562,11 +714,21 @@ pub(super) fn open_diff_screen(state: &mut AppState) -> Vec<Effect> {
 }
 
 /// Open the observatory for `session_id` (current session when `None`).
-pub(super) fn open_trace(state: &mut AppState, session_id: Option<String>) -> Vec<Effect> {
+///
+/// `opener` is the page the observatory was opened FROM — the sessions list
+/// when a row's `t` opened it, [`Screen::Conversation`] when a slash command
+/// did. It becomes the page's back target, so Esc returns to the list rather
+/// than skipping it.
+pub(super) fn open_trace(
+    state: &mut AppState,
+    session_id: Option<String>,
+    opener: Screen,
+) -> Vec<Effect> {
     let session_id = session_id
         .map(leveler_client_protocol::SessionId::new)
         .unwrap_or_else(|| state.session_id.clone());
     state.active_screen = Screen::Trace;
+    state.detail_return = (opener != Screen::Conversation).then_some(opener);
     state.screen_scroll = 0;
     state.trace.inspect = false;
     state.trace.selected = 0;

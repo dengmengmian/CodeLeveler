@@ -293,7 +293,19 @@ fn dogfood_background_task_detail_page() {
 
     let before = render_text(&mut s, 90, 24);
     println!("--- BACKGROUND TASK (running) ---\n{before}");
-    assert!(before.starts_with('←'), "nav owns the edge: {before}");
+    // One safe margin for the whole page: the nav glyph, the rule above it and
+    // the body all start in the same column, and the nav never sits on the
+    // terminal edge.
+    let header = before.lines().next().expect("a header row");
+    assert_eq!(
+        header.find('←'),
+        Some(2),
+        "nav shares the page's content gutter: {before}"
+    );
+    assert!(
+        before.lines().nth(1).is_some_and(|l| l.starts_with("  ─")),
+        "the rule under the header shares that gutter: {before}"
+    );
     assert!(
         before.contains("  make up"),
         "object on the gutter: {before}"

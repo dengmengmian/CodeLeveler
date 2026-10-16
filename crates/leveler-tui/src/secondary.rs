@@ -18,13 +18,16 @@
 //! ```
 //!
 //! Ownership: the shell owns the viewport split, header identity, the two
-//! full-width rules, the horizontal content padding, the footer hint, and the
-//! content rect. It owns no page logic, no business state, and no key handling
-//! — each surface still builds its own body and (optionally) its own composer.
+//! rules, the horizontal safe margin, the footer hint, and the content rect.
+//! It owns no page logic, no business state, and no key handling — each
+//! surface still builds its own body and (optionally) its own composer.
 //!
-//! The navigation header is the one element that owns the terminal edge: the
-//! back glyph sits at column 0 and only the content (and the footer hints) are
-//! inset, so the page hierarchy reads nav → body → nested detail.
+//! ONE content rect bounds every slot. The nav glyph, the title, the parent
+//! status, both rules, the body and the footer hints all start and end on the
+//! same safe margin, so the page reads as one column of content rather than as
+//! chrome that owns the terminal edge and a body that does not. The margin
+//! shrinks with the terminal ([`padding_x`]), and nothing is drawn twice
+//! inset — a nested component may add its own indent, but never the page's.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -37,9 +40,23 @@ use crate::state::AppState;
 use crate::status_line::{StatusPhase, status_lines, status_phase};
 use crate::theme::Theme;
 
-/// Horizontal breathing room for Secondary Surface content and footer hints.
-/// The rules and the navigation header touch the edge; the body does not.
-pub(crate) const PADDING_X: u16 = 2;
+/// The safe horizontal margin for a page at `width`, applied to EVERY slot —
+/// nav glyph, title, status, rules, body and footer hints.
+///
+/// The margin follows the terminal so a wide screen gets breathing room while
+/// a narrow one keeps its usable columns: 2 columns from 80 up, 1 in the
+/// 40–79 band, and none below that, where every column is needed for the
+/// content and the nav to stay readable. One function, so no page can pick a
+/// different margin from its neighbour's.
+pub(crate) fn padding_x(width: u16) -> u16 {
+    if width >= 80 {
+        crate::layout::WORKSPACE_GUTTER_X
+    } else if width >= 40 {
+        1
+    } else {
+        0
+    }
+}
 
 /// One Secondary Surface's identity and interaction contract.
 pub(crate) struct SecondaryPage<'a> {
@@ -51,9 +68,9 @@ pub(crate) struct SecondaryPage<'a> {
     pub hint: &'a str,
 }
 
-/// The rects a Secondary Surface draws into. `content` and `composer` are
-/// already horizontally padded; `header` / `footer` are full width but their
-/// text is drawn with the same padding.
+/// The rects a Secondary Surface draws into. EVERY slot is already inset by
+/// the page's safe margin, so a page (or the shell itself) must never inset a
+/// slot again.
 pub(crate) struct SecondaryLayout {
     pub header: Rect,
     pub rule_top: Rect,
@@ -64,6 +81,10 @@ pub(crate) struct SecondaryLayout {
 }
 
 /// Split `area` into the shared Secondary Surface slots.
+///
+/// The vertical split happens first, then the safe margin is applied once, to
+/// every slot — the rules included, so a rule never runs past the content it
+/// separates.
 pub(crate) fn layout(area: Rect, composer_rows: u16) -> SecondaryLayout {
     let composer_rows = composer_rows.min(area.height.saturating_sub(4));
     let chunks = Layout::vertical([
@@ -75,21 +96,46 @@ pub(crate) fn layout(area: Rect, composer_rows: u16) -> SecondaryLayout {
         Constraint::Length(1), // footer hints
     ])
     .split(area);
+    let pad = padding_x(area.width);
+    let inset = |r: Rect| crate::layout::horizontal_inset(r, pad);
     SecondaryLayout {
-        header: chunks[0],
-        rule_top: chunks[1],
-        content: crate::layout::horizontal_inset(chunks[2], PADDING_X),
-        composer: crate::layout::horizontal_inset(chunks[3], PADDING_X),
-        rule_bottom: chunks[4],
-        footer: chunks[5],
+        header: inset(chunks[0]),
+        rule_top: inset(chunks[1]),
+        content: inset(chunks[2]),
+        composer: inset(chunks[3]),
+        rule_bottom: inset(chunks[4]),
+        footer: inset(chunks[5]),
     }
 }
 
+
 /// Draw the identity header, its right-aligned parent status, and the rule
-/// below it. Returns the painted `← title` nav region — the page's clickable
-/// back glyph — so a page can publish it as a hit target; clicking it runs the
-/// same one-level back as Esc.
+/// below it — and publish the painted `← title` nav region as the page's back
+/// hit.
+///
+/// Drawing and publishing are the same call on purpose: the nav glyph is the
+/// page's only control, so a page must not be able to paint a `←` the mouse
+/// cannot use. The hit is exactly the painted glyph + title (truncation
+/// included), never the whole row, because the right half is the status.
+///
+/// Returns the painted region for callers that need the geometry; clicking it
+/// runs the same one-level back as Esc.
 pub(crate) fn draw_header(
+    frame: &mut Frame,
+    state: &mut AppState,
+    l: &SecondaryLayout,
+    page: &SecondaryPage,
+) -> Option<Rect> {
+    let theme = &state.theme;
+    let back = paint_header(frame, l, page, theme);
+    state.back_hit = back.map(|rect| (rect.y, rect.x, rect.x + rect.width));
+    back
+}
+
+/// The header's paint, without the hit publication — the body of
+/// [`draw_header`], kept separate only so the borrow of `state.theme` ends
+/// before the hit is recorded.
+fn paint_header(
     frame: &mut Frame,
     l: &SecondaryLayout,
     page: &SecondaryPage,
@@ -175,7 +221,7 @@ pub(crate) fn draw_footer(
     if l.footer.height == 0 {
         return;
     }
-    let inner = crate::layout::horizontal_inset(l.footer, PADDING_X);
+    let inner = l.footer;
     if inner.width == 0 {
         return;
     }

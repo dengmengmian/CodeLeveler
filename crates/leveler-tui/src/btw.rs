@@ -205,7 +205,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
     let inner_width = area
         .width
-        .saturating_sub(crate::secondary::PADDING_X.saturating_mul(2));
+        .saturating_sub(crate::secondary::padding_x(area.width).saturating_mul(2));
     let composer_rows = crate::render::composer_visible_rows(state, inner_width as usize) as u16;
     let page = crate::secondary::SecondaryPage {
         title: state.t().btw_surface_title,
@@ -219,7 +219,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         },
     };
     let layout = crate::secondary::layout(area, composer_rows);
-    crate::secondary::draw_header(frame, &layout, &page, &state.theme);
+    crate::secondary::draw_header(frame, state, &layout, &page);
 
     let lines = body_lines(state, layout.content.width as usize);
     let view = window(&lines, layout.content.height as usize, state.btw.scroll);
